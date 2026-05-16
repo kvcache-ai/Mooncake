@@ -179,10 +179,13 @@ class WrappedMasterService {
     PromotionObjectHeartbeat(const UUID& client_id);
 
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const std::string& key, uint64_t size,
+        const UUID& client_id, const std::string& key, uint64_t size,
         const std::vector<std::string>& preferred_segments);
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key);
 
     tl::expected<UUID, ErrorCode> CreateDrainJob(

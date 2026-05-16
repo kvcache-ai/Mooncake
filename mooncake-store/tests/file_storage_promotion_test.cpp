@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <set>
 #include <thread>
 
 #include "client_service.h"
@@ -110,11 +111,23 @@ class FakeClient : public Client {
         return {};
     }
 
+    // NotifyPromotionFailure: records calls so tests can assert that
+    // post-AllocStart failure paths in ProcessPromotionTasks actually
+    // notify the master.
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key) override {
+        notify_failure_calls.fetch_add(1);
+        notify_failure_keys.push_back(key);
+        return {};
+    }
+
     std::atomic<int> heartbeat_calls{0};
     std::atomic<int> alloc_calls{0};
     std::atomic<int> write_calls{0};
     std::atomic<int> notify_calls{0};
+    std::atomic<int> notify_failure_calls{0};
     std::vector<std::string> notify_keys;
+    std::vector<std::string> notify_failure_keys;
     std::string last_alloc_key;
 };
 
@@ -292,6 +305,65 @@ TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
     EXPECT_TRUE(res.has_value());
     // All three reach AllocStart.
     EXPECT_EQ(fake->alloc_calls.load(), 3);
+}
+
+// 10. Failure-notification: every post-admission failure path (including
+//     PromotionAllocStart's own failure) must call NotifyPromotionFailure
+//     so the master immediately releases the task slot. Without this the
+//     slot stays pinned until put_start_release_timeout_sec_ (~10 min),
+//     turning a transient DRAM-pressure spike into a sustained outage
+//     of promotion_queue_limit_.
+TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
+    fake->heartbeat_queue = {{"k_alloc_fail", 1024}};
+    fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
+    auto res = CallProcessPromotionTasks();
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 1);
+    EXPECT_EQ(fake->notify_calls.load(), 0)
+        << "Success-notify must not fire on AllocStart failure.";
+    EXPECT_EQ(fake->notify_failure_calls.load(), 1)
+        << "AllocStart failure must invoke NotifyPromotionFailure so the "
+        << "master can release the task slot immediately. Without this "
+        << "the slot is pinned for ~10 min and transient DRAM pressure "
+        << "saturates promotion_queue_limit_ for the same window.";
+    ASSERT_EQ(fake->notify_failure_keys.size(), 1u);
+    EXPECT_EQ(fake->notify_failure_keys[0], "k_alloc_fail");
+}
+
+// 11. Failure-notification: same invariant on the post-AllocStart paths
+//     (BatchLoad / TransferWrite / Notify-Success). Each failure mode
+//     must release the master slot. We exercise three modes (AllocStart
+//     itself, missing-file BatchLoad, override on Notify) by draining
+//     them across successive heartbeats (the FakeClient mirrors the
+//     master's kMaxPerHeartbeat = 1 cap) and verify each one releases.
+TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
+    fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
+    // k_load_fail: no override -> AllocStart succeeds, but BatchLoad
+    // will fail because no SSD file exists for this key in data_path.
+    // k_notify_fail: AllocStart and BatchLoad and TransferWrite all
+    // succeed; Notify is overridden to fail.
+    fake->notify_overrides["k_notify_fail"] = ErrorCode::OBJECT_NOT_FOUND;
+
+    auto res = DrainAllPromotionTasks({
+        {"k_alloc_fail", 1024},
+        {"k_load_fail", 1024},
+        {"k_notify_fail", 1024},
+    });
+    EXPECT_TRUE(res.has_value());
+    EXPECT_EQ(fake->alloc_calls.load(), 3);
+
+    // Every failed key must have its slot released via Notify-Failure.
+    // k_notify_fail also counts: Notify-Success failed, so we still
+    // need to free the slot.
+    EXPECT_EQ(fake->notify_failure_calls.load(), 3)
+        << "All three failed promotions must each invoke "
+        << "NotifyPromotionFailure. If this fires with <3, one of the "
+        << "failure paths is still leaking the master slot.";
+    std::set<std::string> got(fake->notify_failure_keys.begin(),
+                              fake->notify_failure_keys.end());
+    EXPECT_EQ(got.count("k_alloc_fail"), 1u);
+    EXPECT_EQ(got.count("k_load_fail"), 1u);
+    EXPECT_EQ(got.count("k_notify_fail"), 1u);
 }
 
 }  // namespace mooncake

@@ -2497,12 +2497,18 @@ tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,
     const std::vector<std::string>& preferred_segments) {
-    return master_client_.PromotionAllocStart(key, size, preferred_segments);
+    return master_client_.PromotionAllocStart(client_id_, key, size,
+                                              preferred_segments);
 }
 
 tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     const std::string& key) {
     return master_client_.NotifyPromotionSuccess(client_id_, key);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key) {
+    return master_client_.NotifyPromotionFailure(client_id_, key);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,

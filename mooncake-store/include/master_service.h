@@ -542,8 +542,15 @@ class MasterService {
      * DRAM via the existing AllocationStrategy, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
      * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
+     *
+     * Only the holder client (the one owning the source LOCAL_DISK replica)
+     * is authorized to call this. Other clients receive INVALID_PARAMS.
+     * `size` must match the source replica's object_size captured at task
+     * admission; mismatch returns INVALID_PARAMS to avoid allocating an
+     * arbitrary buffer size from a buggy or malicious caller.
      */
-    auto PromotionAllocStart(const std::string& key, uint64_t size,
+    auto PromotionAllocStart(const UUID& client_id, const std::string& key,
+                             uint64_t size,
                              const std::vector<std::string>& preferred_segments)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
 
@@ -553,6 +560,27 @@ class MasterService {
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Holder-side failure notification: the client got past
+     * PromotionAllocStart but a downstream step (local SSD read, RDMA
+     * write, etc.) failed and it will not be calling
+     * NotifyPromotionSuccess. Releases the master-side task state
+     * immediately rather than waiting put_start_release_timeout_sec_
+     * for the reaper to do it. Without this call every transient
+     * client-side error (SSD throttling, RDMA flake, etc.) pins a
+     * task slot and a staged DRAM buffer for the full reaper TTL,
+     * which can saturate promotion_queue_limit_ on busy clusters.
+     *
+     * Authorization is the same as NotifyPromotionSuccess: only the
+     * holder client may release a task. Effects mirror the reaper's
+     * expiry path: drop source LOCAL_DISK refcnt, pop the staged
+     * PROCESSING MEMORY replica if alloc_id was recorded, erase the
+     * task, decrement the global in-flight counter, and clear the
+     * holder's promotion_objects entry.
+     */
+    auto NotifyPromotionFailure(const UUID& client_id, const std::string& key)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1437,11 +1465,7 @@ class MasterService {
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
     // Global in-flight task counter, checked against promotion_queue_limit_
-    // as the gate cap. A previous per-shard heuristic (shard->size() *
-    // kNumShards) was effectively right for uniform workloads but ~1024x
-    // tight on skewed workloads, where hot keys cluster in a few shards and
-    // would saturate one shard's projection of the cap while the cluster
-    // had near-zero in-flight tasks. Promotion specifically targets skewed
+    // as the gate cap. Promotion specifically targets skewed
     // access (hot keys re-accessed after eviction), so the global counter
     // is the correct primitive. Incremented in TryPushPromotionQueue after
     // successful enqueue; decremented in NotifyPromotionSuccess and in the

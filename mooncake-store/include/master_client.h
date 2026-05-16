@@ -435,8 +435,17 @@ class MasterClient {
      * via Transfer Engine.
      */
     [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
-    PromotionAllocStart(const std::string& key, uint64_t size,
+    PromotionAllocStart(const UUID& client_id, const std::string& key,
+                        uint64_t size,
                         const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Release master-side promotion task state after a client-side
+     * failure that prevents the holder from calling NotifyPromotionSuccess.
+     * Idempotent; returns OK if the task was already swept by the reaper.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key);
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the

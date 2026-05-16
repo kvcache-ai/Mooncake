@@ -1795,12 +1795,12 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
-    const std::string& key, uint64_t size,
+    const UUID& client_id, const std::string& key, uint64_t size,
     const std::vector<std::string>& preferred_segments) {
     ScopedVLogTimer timer(1, "PromotionAllocStart");
     timer.LogRequest("action=promotion_alloc_start");
-    auto result =
-        master_service_.PromotionAllocStart(key, size, preferred_segments);
+    auto result = master_service_.PromotionAllocStart(client_id, key, size,
+                                                      preferred_segments);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1810,6 +1810,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
     ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
     timer.LogRequest("action=notify_promotion_success");
     auto result = master_service_.NotifyPromotionSuccess(client_id, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "NotifyPromotionFailure");
+    timer.LogRequest("action=notify_promotion_failure");
+    auto result = master_service_.NotifyPromotionFailure(client_id, key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1943,6 +1952,9 @@ void RegisterRpcService(
             &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyPromotionSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionFailure>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);

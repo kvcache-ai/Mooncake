@@ -683,13 +683,6 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects);
 
-    // Test/observability hook: increments every time
-    // batch_get_into_offload_object_internal is invoked, which is the
-    // single chokepoint for LOCAL_DISK reads served via peer offload RPC.
-    // After a key gets promoted to MEMORY, subsequent reads should NOT
-    // bump this counter (SelectBestReplica picks the MEMORY replica and
-    // routes through Client::Get instead). The promotion-on-hit e2e test
-    // uses this to prove the post-promotion read served from MEMORY.
     int64_t get_offload_rpc_read_count() const {
         return offload_rpc_read_count_.load(std::memory_order_relaxed);
     }
@@ -841,9 +834,7 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
-    // Counts every call to batch_get_into_offload_object_internal — i.e.,
-    // every LOCAL_DISK read served via peer offload-RPC. Used by the
-    // promotion-on-hit e2e to assert that post-promotion reads avoid SSD.
+    // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};
 
     // Dummy Client manage related members

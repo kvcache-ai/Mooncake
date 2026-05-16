@@ -91,8 +91,7 @@ struct LocalDiskSegment {
     // Promotion-on-hit pending work for this client. Populated by master's
     // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
     // client. Drained by PromotionObjectHeartbeat. Same locking as
-    // offloading_objects (offloading_mutex_) to keep call-site discipline
-    // identical to #1899's offload path.
+    // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         promotion_objects;
     explicit LocalDiskSegment(bool enable_offloading)

@@ -576,11 +576,48 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         auto alloc_result = client_->PromotionAllocStart(
             key, static_cast<uint64_t>(size), preferred_segments);
         if (!alloc_result) {
+            // AllocStart failed (typically NO_AVAILABLE_HANDLE under DRAM
+            // pressure). No staged buffer to release, but the task entry
+            // and its slot in promotion_in_flight_ were claimed back in
+            // TryPushPromotionQueue when the gate admitted us. Without
+            // an explicit release the slot stays pinned for up to
+            // put_start_release_timeout_sec_ (default 10 min), which
+            // turns transient DRAM pressure into a sustained outage of
+            // promotion_queue_limit_. Notify is idempotent and handles
+            // the alloc_id == 0 case correctly (just erases the task
+            // entry and decrements the counter; the EraseReplicaByID
+            // branch is gated on alloc_id != 0).
             VLOG(1) << "PromotionAllocStart failed for key=" << key
                     << ", error=" << alloc_result.error()
-                    << " (likely no free DRAM); master will reap";
+                    << " (likely no free DRAM); releasing master slot";
+            auto release = client_->NotifyPromotionFailure(key);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
             continue;
         }
+
+        // Every failure path past this point has a master-side staged
+        // PROCESSING MEMORY buffer attached to the object and an
+        // incremented promotion_in_flight_ slot. If we just `continue`
+        // without notifying the master, the buffer and slot stay pinned
+        // until the reaper TTL (~10 min default). Transient SSD throttling
+        // or RDMA flakes would then saturate promotion_queue_limit_ for
+        // 10 minutes and silently disable the feature. Eagerly notify the
+        // master so the buffer is reclaimed and the slot is freed for
+        // subsequent admissions. NotifyPromotionFailure is idempotent and
+        // best-effort; if it itself fails, the reaper is still the
+        // long-stop safety net.
+        auto release_master_state = [this, &key]() {
+            auto release = client_->NotifyPromotionFailure(key);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+        };
 
         // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
         // from the local SSD backend into it. AllocateBatch returns a
@@ -592,6 +629,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         if (!allocate_res) {
             LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
                          << ", error=" << allocate_res.error();
+            release_master_state();
             continue;
         }
         auto staging = allocate_res.value();
@@ -599,6 +637,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         if (!load_res) {
             LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
                          << ", error=" << load_res.error();
+            release_master_state();
             continue;
         }
 
@@ -608,6 +647,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         auto slice_it = staging->slices.find(key);
         if (slice_it == staging->slices.end()) {
             LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
+            release_master_state();
             continue;
         }
         std::vector<Slice> tx_slices{slice_it->second};
@@ -616,6 +656,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         if (write_err != ErrorCode::OK) {
             LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
                          << ", error=" << write_err;
+            release_master_state();
             continue;
         }
 
@@ -623,8 +664,15 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // becomes visible to readers.
         auto notify_res = client_->NotifyPromotionSuccess(key);
         if (!notify_res) {
+            // The write landed but the commit failed. We can't retry the
+            // commit (the success path is one-shot via alloc_id), and we
+            // don't know whether the failure was transient or structural.
+            // Release the master-side state so the slot is reusable; the
+            // bytes we wrote become stranded under a soon-to-be-erased
+            // PROCESSING replica, which is harmless.
             LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
                          << key << ", error=" << notify_res.error();
+            release_master_state();
             continue;
         }
 

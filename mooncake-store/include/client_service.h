@@ -437,6 +437,13 @@ class Client {
         const std::string& key);
 
     /**
+     * @brief Release master-side promotion task after a client-side failure
+     * between PromotionAllocStart and the transfer's completion. Idempotent.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key);
+
+    /**
      * @brief Write `slices` into the memory replica described by
      * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
      * PROCESSING memory replica staged by PromotionAllocStart before calling

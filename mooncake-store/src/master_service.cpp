@@ -574,10 +574,22 @@ void MasterService::ClearInvalidHandles(
             if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
-                // replication_tasks, and offloading_tasks.
+                // replication_tasks, offloading_tasks, and promotion_tasks.
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                // Promotion task cleanup: if the holder client expired, the
+                // LOCAL_DISK source is gone and the metadata is being erased
+                // here. Without this erase the dangling promotion_tasks
+                // entry stays pinned for up to put_start_release_timeout_sec_
+                // (~10 min default), inflating the global in-flight counter
+                // and blocking new admissions on busy clusters where many
+                // holders expire together (e.g. inference-worker rolling
+                // restarts).
+                if (shard->promotion_tasks.erase(it->first) > 0) {
+                    promotion_in_flight_.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                }
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -2922,7 +2934,7 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
 }
 
 auto MasterService::PromotionAllocStart(
-    const std::string& key, uint64_t size,
+    const UUID& client_id, const std::string& key, uint64_t size,
     const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2950,6 +2962,28 @@ auto MasterService::PromotionAllocStart(
     auto task_it = shard->promotion_tasks.find(key);
     if (task_it == shard->promotion_tasks.end()) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Authorize caller: only the holder client (the one whose LOCAL_DISK
+    // segment owns the source replica) is allowed to stage the MEMORY
+    // copy. Without this gate any client that knows the key could drain
+    // another's promotion_objects queue (PromotionObjectHeartbeat is
+    // unauthenticated in the current trust model) and then call us here
+    // to allocate arbitrary DRAM buffers on the destination segment,
+    // which would sit pinned until the reaper TTL.
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Defensive size check: the size must match what TryPushPromotionQueue
+    // captured from the source LOCAL_DISK replica's descriptor. A mismatch
+    // would let a buggy caller request an arbitrarily larger or smaller
+    // allocation than the actual object — smaller risks the subsequent
+    // RDMA write overflowing into adjacent allocator state (the MR will
+    // typically catch this but defense-in-depth is cheap), and larger
+    // wastes DRAM that stays pinned until the reaper TTL.
+    if (task_it->second.object_size != size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Allocate a single MEMORY replica via the existing strategy, biased to
@@ -3074,6 +3108,70 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
+    return {};
+}
+
+auto MasterService::NotifyPromotionFailure(const UUID& client_id,
+                                           const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        // No task to release. Either the reaper already swept it, or the
+        // client never had a task here. Return OK to keep this RPC
+        // idempotent — repeated failure notifications on the same key
+        // should be safe.
+        return {};
+    }
+
+    // Same authorization gate as NotifyPromotionSuccess: only the holder
+    // may release. A spurious failure notification from another client
+    // should not be allowed to free state that legitimate holder still
+    // intends to commit.
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Mirror the reaper's expiry path:
+    //   - Drop source LOCAL_DISK refcnt so it can be evicted normally.
+    //   - If AllocStart already staged a PROCESSING MEMORY replica
+    //     (alloc_id != 0), pop it via EraseReplicaByID. That buffer is
+    //     not in shard->processing_keys, so only this path (and the
+    //     reaper) can reap it.
+    //   - Erase the task entry and decrement the global in-flight
+    //     counter so the slot is immediately available to other admissions.
+    auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    if (task_it->second.alloc_id != 0) {
+        metadata.EraseReplicaByID(task_it->second.alloc_id);
+    }
+    shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+
+    // Clear the holder's per-client promotion_objects entry. Same
+    // best-effort cleanup pattern as NotifyPromotionSuccess — the
+    // heartbeat may have already drained it.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto it = client_local_disk_segment.find(client_id);
+        if (it != client_local_disk_segment.end()) {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            it->second->promotion_objects.erase(key);
+        }
+    }
+
     return {};
 }
 

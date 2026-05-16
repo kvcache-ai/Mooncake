@@ -248,6 +248,11 @@ struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailure> {
+    static constexpr const char* value = "NotifyPromotionFailure";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CopyStart> {
     static constexpr const char* value = "CopyStart";
 };
@@ -978,14 +983,14 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 MasterClient::PromotionAllocStart(
-    const std::string& key, uint64_t size,
+    const UUID& client_id, const std::string& key, uint64_t size,
     const std::vector<std::string>& preferred_segments) {
     ScopedVLogTimer timer(1, "MasterClient::PromotionAllocStart");
-    timer.LogRequest("key=", key, ", size=", size,
+    timer.LogRequest("client_id=", client_id, ", key=", key, ", size=", size,
                      ", preferred_count=", preferred_segments.size());
-    auto result =
-        invoke_rpc<&WrappedMasterService::PromotionAllocStart,
-                   PromotionAllocStartResponse>(key, size, preferred_segments);
+    auto result = invoke_rpc<&WrappedMasterService::PromotionAllocStart,
+                             PromotionAllocStartResponse>(client_id, key, size,
+                                                          preferred_segments);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -996,6 +1001,17 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
     timer.LogRequest("client_id=", client_id, ", key=", key);
     auto result =
         invoke_rpc<&WrappedMasterService::NotifyPromotionSuccess, void>(
+            client_id, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionFailure");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
             client_id, key);
     timer.LogResponseExpected(result);
     return result;

@@ -1947,11 +1947,6 @@ PYBIND11_MODULE(store, m) {
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
         .def("get_offload_rpc_read_count",
              [](MooncakeStorePyWrapper &self) -> int64_t {
-                 // Monotonically-increasing count of LOCAL_DISK reads served
-                 // via peer offload-RPC (i.e., batch_get_into_offload_object_
-                 // internal invocations). Promotion-on-hit e2e uses this to
-                 // prove that post-promotion reads avoid SSD and serve from
-                 // MEMORY instead. Returns 0 for non-RealClient backends.
                  auto real_client =
                      std::dynamic_pointer_cast<RealClient>(self.store_);
                  return real_client ? real_client->get_offload_rpc_read_count()
