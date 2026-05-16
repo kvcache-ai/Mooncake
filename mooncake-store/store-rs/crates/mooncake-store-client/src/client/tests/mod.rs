@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
-    flatten_slices, now_ms, payload_checksum, record_success_metric, scatter_into_buffers,
+    flatten_slices, now_ms, record_success_metric, scatter_into_buffers,
     shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
     LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
     PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
@@ -12831,12 +12831,11 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
     assert!(metrics.contains(
         "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"retire_segment\",result=\"ok\"}"
     ));
-    assert!(
-        metrics.contains("mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"}")
-    );
-    assert!(
-        metrics.contains("mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"}")
-    );
+    assert!(metrics.contains(
+        "mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"}"
+    ));
+    assert!(metrics
+        .contains("mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"}"));
 }
 
 #[test]
