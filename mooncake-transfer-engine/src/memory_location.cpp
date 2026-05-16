@@ -36,7 +36,8 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     std::vector<MemoryLocationEntry> entries;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
     cudaPointerAttributes attributes;
     cudaError_t result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {

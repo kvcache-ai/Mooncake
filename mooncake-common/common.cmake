@@ -65,6 +65,8 @@ option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
+option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -220,6 +222,24 @@ if (USE_MUSA)
   include_directories(/usr/local/musa/include)
   link_directories(
     /usr/local/musa/lib
+  )
+endif()
+
+if (USE_HYGON)
+  add_compile_definitions(USE_HYGON)
+  message(STATUS "Hygon DCU/DTK support is enabled")
+  include_directories(/opt/dtk/cuda/cuda-11/include)
+  link_directories(
+    /opt/dtk/cuda/cuda-11/lib64
+  )
+endif()
+
+if (USE_COREX)
+  add_compile_definitions(USE_COREX)
+  message(STATUS "Iluvatar CoreX support is enabled")
+  include_directories(/usr/local/corex/include)
+  link_directories(
+    /usr/local/corex/lib
   )
 endif()
 
