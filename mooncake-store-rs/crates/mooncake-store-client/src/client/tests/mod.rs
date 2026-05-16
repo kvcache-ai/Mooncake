@@ -12,7 +12,7 @@ use mooncake_store_core::{
     ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
     NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
     TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
     TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
@@ -531,20 +531,6 @@ impl MetadataBackend for RecoverableMetadataBackend {
         }))
     }
 
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        let hidden = self
-            .state
-            .lock()
-            .expect("recoverable metadata state lock should succeed")
-            .hidden_segments
-            .clone();
-        let owner = self.inner.get_segment_owner(segment)?;
-        Ok(owner.filter(|owner| !hidden.contains(&Self::segment_key(owner, segment))))
-    }
-
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -833,13 +819,6 @@ impl MetadataBackend for NoHotPathMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1362,13 +1341,6 @@ impl MetadataBackend for CountingMetadataBackend {
         self.inner.get_segment(owner, segment)
     }
 
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
-    }
-
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,
@@ -1624,13 +1596,6 @@ impl MetadataBackend for FinalizeFailureMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -1893,13 +1858,6 @@ impl MetadataBackend for BlockingCasMetadataBackend {
         segment: &SegmentName,
     ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
         self.inner.get_segment(owner, segment)
-    }
-
-    fn get_segment_owner(
-        &self,
-        segment: &SegmentName,
-    ) -> mooncake_store_core::Result<Option<ClientRuntimeId>> {
-        self.inner.get_segment_owner(segment)
     }
 
     fn list_segments(
@@ -2329,20 +2287,6 @@ fn publish_labeled_storage_node_with_capacity(
         .expect("labeled storage lease should upsert");
     test_storage_nodes().lock().push(storage);
     runtime
-}
-
-fn test_segment_target_chunks(
-    transport: &TestTransport,
-    segment_name: &str,
-) -> Vec<SegmentTargetChunk> {
-    let (base, len) = transport
-        .segment_bounds(segment_name)
-        .expect("test transport segment should expose target bounds");
-    vec![SegmentTargetChunk {
-        logical_offset: 0,
-        target_offset: base,
-        length_bytes: len,
-    }]
 }
 
 fn test_storage_nodes() -> &'static Mutex<Vec<Arc<StoreClient>>> {
@@ -8560,7 +8504,6 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     let transport = Arc::new(TestTransport::new("writer-prefer-segment"));
     let remote_transport = Arc::new(transport.peer("seg-prefer"));
     remote_transport.add_external_segment("seg-prefer", 8);
-    let remote_target_chunks = test_segment_target_chunks(&remote_transport, "seg-prefer");
     let remote_owner = ClientRuntimeId::new("storage-prefer", ClientEpoch(1));
     let remote_allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
     remote_allocator.lock().upsert(&SegmentAnnouncement {
@@ -8568,7 +8511,6 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         segment_name: SegmentName::new("seg-prefer"),
         capacity_bytes: 8,
         used_bytes: 0,
-        target_chunks: remote_target_chunks.clone(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 1,
         tags: vec!["dram".to_string()],
@@ -8619,7 +8561,6 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
             segment_name: SegmentName::new("seg-prefer"),
             capacity_bytes: 8,
             used_bytes: 0,
-            target_chunks: remote_target_chunks,
             state: SegmentLifecycleState::Active,
             alignment_bytes: 1,
             tags: vec!["dram".to_string()],
@@ -11411,7 +11352,6 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary.clone(),
-                target_chunks: Vec::new(),
             }],
             std::slice::from_ref(&reservation),
         )
@@ -11421,7 +11361,6 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary,
-                target_chunks: Vec::new(),
             }],
             &[],
         ),
@@ -13206,7 +13145,6 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         segment_name: SegmentName::new("alloc-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
-        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
@@ -13281,7 +13219,6 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
         used_bytes: 64,
-        target_chunks: Vec::new(),
         alignment_bytes: 1,
         state: SegmentLifecycleState::Active,
         tags: vec!["nvme".to_string()],
@@ -13497,7 +13434,6 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         segment_name: SegmentName::new("pending-primary"),
         capacity_bytes: 128,
         used_bytes: 0,
-        target_chunks: Vec::new(),
         state: SegmentLifecycleState::Active,
         alignment_bytes: 16,
         tags: vec!["dram".to_string()],
