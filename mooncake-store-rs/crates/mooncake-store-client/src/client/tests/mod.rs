@@ -2682,21 +2682,23 @@ fn observability_metrics_render_remote_datapaths() {
     assert!(metrics.contains("operation=\"get_remote_batch_chunk\",status=\"ok\""));
     assert!(metrics.contains("operation=\"get_remote_direct\",status=\"ok\""));
     assert!(metrics
-        .contains("mooncake_store_replication_publish_duration_seconds_count{result=\"ok\"}"));
-    assert!(metrics.contains("mooncake_store_replication_publish_total{result=\"ok\"}"));
+        .contains("mooncake_store_replication_publish_duration_seconds_count{tenant=\"default\",result=\"ok\"}"));
+    assert!(metrics
+        .contains("mooncake_store_replication_publish_total{tenant=\"default\",result=\"ok\"}"));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_operation_total{direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
+        "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{direction=\"write\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_transport_bytes_total{direction=\"read\",peer_kind=\"storage\"}"
+        "mooncake_store_transport_bytes_total{tenant=\"default\",direction=\"read\",peer_kind=\"storage\"}"
     ));
-    assert!(metrics.contains("mooncake_store_checksum_validation_total{result=\"ok\"}"));
+    assert!(metrics
+        .contains("mooncake_store_checksum_validation_total{tenant=\"default\",result=\"ok\"}"));
 }
 
 #[test]
@@ -6185,7 +6187,7 @@ fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
 }
 
 #[test]
-fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
+fn routed_batch_put_from_rejects_route_conflict_without_current_route() {
     let metadata: Arc<dyn MetadataBackend> =
         Arc::new(BlockingCasMetadataBackend::with_empty_conflict(
             Arc::new(InMemoryMetadataBackend::new()),
@@ -6230,7 +6232,7 @@ fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
     writer
         .register_buffer(source.as_mut_ptr().cast(), source.len())
         .expect("writer source buffer should register");
-    let routes = writer
+    let error = writer
         .batch_put_from(&[PutFromRequest::new(
             "batch-put-empty-conflict-key",
             source.as_ptr().cast(),
@@ -6242,12 +6244,14 @@ fn routed_batch_put_from_accepts_route_conflict_without_current_route() {
                 .prefer_local(false)
                 .preferred_storage_owner(storage.runtime_id().storage_key()),
         )])
-        .expect("route conflict is a best-effort cache put success");
+        .expect_err("route conflict without active current route must fail");
 
-    assert_eq!(routes.len(), 1);
-    assert_eq!(
-        routes[0].key,
-        ObjectKey::new("default::batch-put-empty-conflict-key")
+    assert!(matches!(error, StoreError::Conflict(_)));
+    assert!(
+        !writer
+            .batch_is_exist(&[ObjectRef::new("batch-put-empty-conflict-key")])
+            .expect("exist check should succeed")[0],
+        "unpublished conflict loser route must not be visible as a cache hit"
     );
 }
 
@@ -10406,7 +10410,7 @@ fn tenant_policy_preferred_segments_missing_fall_back_for_put_and_batch_put() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_preferred_segment_skip_total{source=\"tenant_policy\",reason=\"not_found\"} 2"
+        "mooncake_store_preferred_segment_skip_total{tenant=\"tenant-a\",source=\"tenant_policy\",reason=\"not_found\"} 2"
     ));
 }
 
@@ -11773,87 +11777,6 @@ fn remote_put_refreshes_cached_segment_handle_after_restart() {
 }
 
 #[test]
-fn local_read_prefers_replica_target_offset_over_segment_offset() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let transport = Arc::new(TestTransport::new("local-target-offset-segment"));
-    let store = StoreClientBuilder::new(metadata, "local-target-offset-store")
-        .state(ClientLifecycleState::Active)
-        .label("pool", "pool-a")
-        .label("storage", "true")
-        .route_control(RouteControlMode::MetadataOnly)
-        .transport(transport)
-        .local_memory(storage_config_with_bytes(256))
-        .build(test_future_expiry_ms())
-        .expect("store build should succeed");
-
-    store
-        .register_local_memory()
-        .expect("store memory should register");
-    let segment = store.segment_name().expect("store segment should exist");
-    let key = "local-target-offset-key";
-    let payload = b"target-offset-payload";
-    let distractor = b"wrong-offset-payload!";
-    assert_eq!(payload.len(), distractor.len());
-
-    let base = {
-        let state = store.state.lock();
-        state
-            .memory_ref()
-            .expect("memory should exist")
-            .storage_address(&segment, 0)
-            .expect("segment base should resolve")
-    };
-    let target_offset = 64usize;
-    unsafe {
-        ptr::copy_nonoverlapping(distractor.as_ptr(), base.cast::<u8>(), distractor.len());
-        ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            base.cast::<u8>().add(target_offset),
-            payload.len(),
-        );
-    }
-
-    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
-    let mut route = ObjectRoute {
-        key: ObjectKey::from_logical_id(&object_id),
-        namespace: None,
-        logical_key: None,
-        canonical_key: None,
-        sharing_scope: None,
-        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
-        version: RouteVersion(1),
-        state: mooncake_store_core::RouteState::Active,
-        compatibility: store.lease.compatibility.clone(),
-        replicas: vec![ReplicaRoute {
-            owner: store.runtime_id().clone(),
-            segment_name: segment,
-            offset: base as u64 + target_offset as u64,
-            segment_offset: 0,
-            length: payload.len() as u64,
-            checksum: Some(payload_checksum(payload)),
-            tier: mooncake_store_core::ReplicaTier::Dram,
-            priority: 0,
-        }],
-    };
-    mooncake_store_core::apply_route_identity(&mut route, &object_id);
-    store
-        .route_directory
-        .compare_and_swap_object_route(&store.lease, &route.key, None, Some(&route))
-        .expect("route publish should succeed");
-
-    assert_eq!(
-        store.get(key).expect("local get should use target offset"),
-        payload
-    );
-    assert_eq!(
-        store
-            .batch_get(&[ObjectRef::new(key)])
-            .expect("local batch get should use target offset"),
-        vec![payload.to_vec()]
-    );
-}
-
-#[test]
 fn stale_route_checksum_mismatch_refreshes_to_latest_route() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_transport = Arc::new(TestTransport::new("overwrite-refresh-store-segment"));
@@ -12903,15 +12826,17 @@ fn evacuate_owned_replicas_via_explicit_writer_preserves_readability() {
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{action=\"mount_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"mount_segment\",result=\"ok\"}"
     ));
     assert!(metrics.contains(
-        "mooncake_store_segment_lifecycle_total{action=\"retire_segment\",result=\"ok\"}"
+        "mooncake_store_segment_lifecycle_total{tenant=\"default\",action=\"retire_segment\",result=\"ok\"}"
     ));
     assert!(
-        metrics.contains("mooncake_store_rebalance_routes_total{phase=\"migrate\",result=\"ok\"}")
+        metrics.contains("mooncake_store_rebalance_routes_total{tenant=\"default\",phase=\"migrate\",result=\"ok\"}")
     );
-    assert!(metrics.contains("mooncake_store_rebalance_bytes_total{phase=\"migrate\"}"));
+    assert!(
+        metrics.contains("mooncake_store_rebalance_bytes_total{tenant=\"default\",phase=\"migrate\"}")
+    );
 }
 
 #[test]

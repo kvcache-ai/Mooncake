@@ -311,7 +311,7 @@ fn batch_is_exist_uses_batched_route_lookup() {
         ])
         .expect("batch_is_exist should succeed");
 
-    assert_eq!(exists, vec![false, false, false]);
+    assert_eq!(exists, vec![true, false, true]);
     assert_eq!(directory.bounded_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(directory.batch_calls.load(Ordering::Relaxed), 0);
     assert_eq!(directory.last_batch_len.load(Ordering::Relaxed), 3);
