@@ -24,8 +24,7 @@
 #endif
 
 #if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) && \
-    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE) && \
-    !defined(USE_HYGON) && !defined(USE_COREX)
+    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE)
 #include <string>
 const static std::string GPU_PREFIX = "cuda:";
 #endif

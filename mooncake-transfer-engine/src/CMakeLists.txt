@@ -83,12 +83,12 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
-  target_include_directories(transfer_engine PRIVATE /opt/dtk/cuda/cuda-11/include)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
 if(USE_COREX)
-  target_include_directories(transfer_engine PRIVATE /usr/local/corex/include)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 

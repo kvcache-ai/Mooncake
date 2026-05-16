@@ -226,21 +226,53 @@ if (USE_MUSA)
 endif()
 
 if (USE_HYGON)
+  if (NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
+    if (DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
+      set(DTK_ROOT "$ENV{DTK_HOME}" CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    else()
+      set(DTK_ROOT "/opt/dtk" CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    endif()
+  endif()
+
+  if (NOT DEFINED DTK_INCLUDE_DIR OR DTK_INCLUDE_DIR STREQUAL "")
+    set(DTK_INCLUDE_DIR "${DTK_ROOT}/cuda/cuda-11/include")
+  endif()
+
+  if (NOT DEFINED DTK_LIB_DIR OR DTK_LIB_DIR STREQUAL "")
+    set(DTK_LIB_DIR "${DTK_ROOT}/cuda/cuda-11/lib64")
+  endif()
+
   add_compile_definitions(USE_HYGON)
   message(STATUS "Hygon DCU/DTK support is enabled")
-  include_directories(/opt/dtk/cuda/cuda-11/include)
-  link_directories(
-    /opt/dtk/cuda/cuda-11/lib64
-  )
+  include_directories(${DTK_INCLUDE_DIR})
+  if (EXISTS "${DTK_LIB_DIR}")
+    link_directories(${DTK_LIB_DIR})
+  endif()
 endif()
 
 if (USE_COREX)
+  if (NOT DEFINED COREX_ROOT OR COREX_ROOT STREQUAL "")
+    if (DEFINED ENV{COREX_HOME} AND NOT "$ENV{COREX_HOME}" STREQUAL "")
+      set(COREX_ROOT "$ENV{COREX_HOME}" CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    else()
+      set(COREX_ROOT "/usr/local/corex" CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    endif()
+  endif()
+
+  if (NOT DEFINED COREX_INCLUDE_DIR OR COREX_INCLUDE_DIR STREQUAL "")
+    set(COREX_INCLUDE_DIR "${COREX_ROOT}/include")
+  endif()
+
+  if (NOT DEFINED COREX_LIB_DIR OR COREX_LIB_DIR STREQUAL "")
+    set(COREX_LIB_DIR "${COREX_ROOT}/lib")
+  endif()
+
   add_compile_definitions(USE_COREX)
   message(STATUS "Iluvatar CoreX support is enabled")
-  include_directories(/usr/local/corex/include)
-  link_directories(
-    /usr/local/corex/lib
-  )
+  include_directories(${COREX_INCLUDE_DIR})
+  if (EXISTS "${COREX_LIB_DIR}")
+    link_directories(${COREX_LIB_DIR})
+  endif()
 endif()
 
 if (USE_HIP)
