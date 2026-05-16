@@ -199,8 +199,7 @@ Behavior boundary:
 
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
-- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when metadata returns or an exact bounded recheck finds an already published active route, releases its own temporary reservation, and returns that route entry without failing the batch
-- `segment_offset` is the durable storage coordinate for the payload; remote reads, local reads, and drain migration all derive the live TE target offset from `segment_offset` and the segment's published storage target chunks, then verify the target range is present in the current TE segment buffers before touching storage
+- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races, releases its own temporary reservation, and returns a route entry for that key without failing the batch
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
 ## Hugepage-Backed Local Memory
@@ -256,7 +255,6 @@ Common calls:
 `evacuate_owned_replicas()` drains the local client, rewrites every live route that still references it, immediately reclaims old allocations, and retires emptied local segments.
 
 During evacuation, payload copy is pinned to the exact local replica being removed. The writer does not satisfy the migration read from another live mirror, because that would publish the wrong bytes when replicas temporarily diverge during a shrink.
-The migration read uses the replica's durable `segment_offset`, derives the live transport target offset through the selected segment's published storage target chunks, verifies the range against the current TE segment buffers, and only then touches local memory.
 
 Before returning, the draining client also mirrors any route-authority records that were only present locally to active route authorities. If its cached live-client snapshot cannot find a mirror, it refreshes membership and retries the mirror pass.
 

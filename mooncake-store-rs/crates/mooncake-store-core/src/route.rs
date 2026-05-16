@@ -1,7 +1,6 @@
-use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::marker::PhantomData;
 
 use crate::compat::CompatibilityDescriptor;
 use crate::identity::{
@@ -141,24 +140,12 @@ pub struct SegmentAnnouncement {
     pub segment_name: SegmentName,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_segment_target_chunks_or_object"
-    )]
-    pub target_chunks: Vec<SegmentTargetChunk>,
     #[serde(default)]
     pub state: SegmentLifecycleState,
     #[serde(default = "default_segment_alignment_bytes")]
     pub alignment_bytes: u64,
     #[serde(default, deserialize_with = "deserialize_string_vec_or_object")]
     pub tags: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SegmentTargetChunk {
-    pub logical_offset: u64,
-    pub target_offset: u64,
-    pub length_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -671,45 +658,19 @@ fn default_segment_alignment_bytes() -> u64 {
     1
 }
 
-fn deserialize_segment_target_chunks_or_object<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<SegmentTargetChunk>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_vec_or_object(deserializer, "a segment target chunk array or an object")
-}
-
 fn deserialize_string_vec_or_object<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_vec_or_object(deserializer, "a string array or an object")
-}
+    struct StringVecVisitor;
 
-fn deserialize_vec_or_object<'de, D, T>(
-    deserializer: D,
-    expected: &'static str,
-) -> std::result::Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct VecOrObjectVisitor<T> {
-        expected: &'static str,
-        _item: PhantomData<T>,
-    }
-
-    impl<'de, T> Visitor<'de> for VecOrObjectVisitor<T>
-    where
-        T: Deserialize<'de>,
-    {
-        type Value = Vec<T>;
+    impl<'de> Visitor<'de> for StringVecVisitor {
+        type Value = Vec<String>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.expected)
+            formatter.write_str("a string array or an object")
         }
 
         fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
@@ -728,17 +689,14 @@ where
             A: MapAccess<'de>,
         {
             let mut items = Vec::new();
-            while let Some((_key, value)) = map.next_entry::<IgnoredAny, T>()? {
+            while let Some((_key, value)) = map.next_entry::<String, String>()? {
                 items.push(value);
             }
             Ok(items)
         }
     }
 
-    deserializer.deserialize_any(VecOrObjectVisitor {
-        expected,
-        _item: PhantomData,
-    })
+    deserializer.deserialize_any(StringVecVisitor)
 }
 
 #[cfg(test)]
@@ -748,8 +706,8 @@ mod tests {
     use super::{
         default_segment_alignment_bytes, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier,
         RoutePolicy, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-        SegmentName, SegmentTargetChunk, TenantObjectAccountingState, TenantPolicyScope,
-        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantRoutePolicy,
+        SegmentName, TenantObjectAccountingState, TenantPolicyScope, TenantPolicySpec,
+        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantRoutePolicy,
     };
     use crate::NamespaceScope;
     use crate::{
@@ -855,53 +813,6 @@ mod tests {
         }))
         .expect("announcement should deserialize");
         assert!(announcement.tags.is_empty());
-    }
-
-    #[test]
-    fn segment_announcement_deserializes_empty_object_target_chunks_for_redis_compat() {
-        let announcement: SegmentAnnouncement = serde_json::from_value(json!({
-            "owner": {
-                "stable_id": "runtime-a",
-                "epoch": 1
-            },
-            "segment_name": "segment-a",
-            "capacity_bytes": 4096,
-            "used_bytes": 0,
-            "target_chunks": {},
-            "tags": []
-        }))
-        .expect("announcement should deserialize");
-        assert!(announcement.target_chunks.is_empty());
-    }
-
-    #[test]
-    fn segment_announcement_deserializes_object_target_chunks_for_redis_compat() {
-        let announcement: SegmentAnnouncement = serde_json::from_value(json!({
-            "owner": {
-                "stable_id": "runtime-a",
-                "epoch": 1
-            },
-            "segment_name": "segment-a",
-            "capacity_bytes": 4096,
-            "used_bytes": 0,
-            "target_chunks": {
-                "1": {
-                    "logical_offset": 0,
-                    "target_offset": 8192,
-                    "length_bytes": 4096
-                }
-            },
-            "tags": []
-        }))
-        .expect("announcement should deserialize");
-        assert_eq!(
-            announcement.target_chunks,
-            vec![SegmentTargetChunk {
-                logical_offset: 0,
-                target_offset: 8192,
-                length_bytes: 4096,
-            }]
-        );
     }
 
     #[test]

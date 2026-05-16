@@ -1,42 +1,4 @@
 impl StoreClient {
-    fn replica_write_target(
-        &self,
-        storage_runtime: &ClientRuntimeId,
-        segment_name: &SegmentName,
-    ) -> Result<ReplicaWriteTarget> {
-        let segment = self.segment_announcement(storage_runtime, segment_name)?;
-        Ok(ReplicaWriteTarget {
-            storage_runtime: storage_runtime.clone(),
-            segment_name: segment_name.clone(),
-            target_chunks: segment.target_chunks,
-        })
-    }
-
-    fn segment_announcement(
-        &self,
-        storage_runtime: &ClientRuntimeId,
-        segment_name: &SegmentName,
-    ) -> Result<SegmentAnnouncement> {
-        if let Some(segment) = self.allocator.lock().announcement(segment_name) {
-            if segment.owner == *storage_runtime {
-                return Ok(segment);
-            }
-        }
-        let segment = self
-            .metadata
-            .get_segment(storage_runtime, segment_name)?
-            .ok_or_else(|| {
-                StoreError::NotFound(format!(
-                    "segment {} for runtime {} not found",
-                    segment_name.0, storage_runtime
-                ))
-            })?;
-        if segment.owner == self.lease.runtime {
-            self.allocator.lock().upsert(&segment);
-        }
-        Ok(segment)
-    }
-
     fn reserve_specific_segment(
         &self,
         storage_runtime: &ClientRuntimeId,
@@ -50,8 +12,13 @@ impl StoreClient {
             length_bytes as u64,
             require_local_memory,
         )?;
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        Ok((
+            ReplicaWriteTarget {
+                storage_runtime: storage_runtime.clone(),
+                segment_name: reservation.segment_name.clone(),
+            },
+            reservation,
+        ))
     }
 
     fn reserve_storage_runtime_segments_batch(
@@ -88,12 +55,14 @@ impl StoreClient {
                         request.length_bytes,
                         request.require_local_memory,
                     )
-                    .and_then(|reservation| {
-                        let target = self.replica_write_target(
-                            &request.storage_runtime,
-                            &reservation.segment_name,
-                        )?;
-                        Ok((target, reservation))
+                    .map(|reservation| {
+                        (
+                            ReplicaWriteTarget {
+                                storage_runtime: request.storage_runtime.clone(),
+                                segment_name: reservation.segment_name.clone(),
+                            },
+                            reservation,
+                        )
                     }),
                 );
                 continue;
@@ -154,13 +123,13 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
                         }
                     }
                     Err(error) => {
@@ -214,13 +183,13 @@ impl StoreClient {
                                     continue;
                                 }
                             };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
+                            resolved[index] = Some(Ok((
+                                ReplicaWriteTarget {
+                                    storage_runtime: storage_runtime.clone(),
+                                    segment_name: reservation.segment_name.clone(),
+                                },
+                                reservation,
+                            )));
                         }
                     }
                     Err(error) => {
@@ -643,7 +612,15 @@ impl StoreClient {
             state = ?segment.state,
             "publishing local segment"
         );
-        let announcement = segment.announcement(self.lease.runtime.clone(), used_bytes);
+        let announcement = SegmentAnnouncement {
+            owner: self.lease.runtime.clone(),
+            segment_name: segment.segment_name.clone(),
+            capacity_bytes: segment.capacity_bytes,
+            used_bytes,
+            state: segment.state,
+            alignment_bytes: segment.alignment_bytes,
+            tags: segment.tags.clone(),
+        };
         self.allocator.lock().upsert(&announcement);
         self.metadata.publish_segment(&announcement)
     }
@@ -687,8 +664,13 @@ impl StoreClient {
             length_bytes = reservation.length_bytes,
             "reserved segment space"
         );
-        let target = self.replica_write_target(storage_runtime, &reservation.segment_name)?;
-        Ok((target, reservation))
+        Ok((
+            ReplicaWriteTarget {
+                storage_runtime: storage_runtime.clone(),
+                segment_name: reservation.segment_name.clone(),
+            },
+            reservation,
+        ))
     }
 
     fn release_route_allocations(&self, route: &ObjectRoute) -> Result<()> {

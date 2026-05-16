@@ -145,26 +145,10 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
-Segment-announcement metadata faults such as missing or non-contiguous published storage target
-chunks are treated as stale segment state first. The client invalidates cached segment state and
-may retry the write, but it does not quarantine the touched storage runtimes on that signal alone.
-
-Remote transfer planning splits each request at both local registration limits and the storage
-target chunks published in the target segment announcement. The route still records one logical
-replica, but the transport only receives slices that fit inside one registered storage target
-chunk, matching classic RDMA transfer-engine requirements when a segment is backed by multiple
-contiguous registrations.
-
-Replica routes use `segment_offset` as the durable storage coordinate: it is allocated by the
-segment allocator, survives route publication, drives reclaim, and is the single source of truth
-for every read. Segment announcements publish the exact storage target buffers derived during local
-registration. At each read boundary, the client derives the current TE/TENT target coordinate from
-`segment_offset` and the selected segment's published storage target chunks, then verifies that the
-target range is present in the current TE segment buffers. Scratch buffers are registered for
-staging only and are never published as object-addressable storage. Remote reads, local direct
-reads, batch reads, and drain migration all use this same resolver, so TE and local memory observe
-identical bytes even when a segment is backed by multiple transport buffers or re-opened in a
-different process.
+Remote transfer planning splits each request at both local registration limits and remote segment
+buffer boundaries. The route still records one logical replica, but the transport only receives
+slices that fit inside one registered target buffer, matching classic RDMA transfer-engine
+requirements when a segment is backed by multiple contiguous registrations.
 
 ```mermaid
 sequenceDiagram
@@ -218,29 +202,7 @@ This lets each storage owner update its local eviction clock from the published 
 
 ## Read Path
 
-For reads, the client first resolves the object route, filters replicas to currently readable
-owners, derives the selected replica's TE target coordinate from `segment_offset` and the selected
-segment's published storage target chunks, then groups remote reads by segment and submits
-transfer requests through TE/TENT. A local replica is readable only when the local storage segment
-is still registered; a remote replica is readable only when its owner is in the live membership
-snapshot. When the selected replica is local, the client uses the same derived target coordinate
-and maps it back to the local storage registration.
-
-Successful route lookup APIs are also access signals: `query_route`, `get_size`, `is_exist`,
-and `batch_is_exist` report hits only to readable storage owners, using the same local/CLOCK and
-control-plane hit-report path as completed reads. `is_exist` and `batch_is_exist` return true only
-when at least one active route replica is currently readable. This keeps prefix-probe workloads
-from letting recently observed replicas age out before the caller issues the matching restore read,
-without adding metadata-backend traffic to the request path.
-
-Remote batch reads are isolated by storage owner before they enter TE/TENT. A failed or killed
-storage owner therefore only affects the keys assigned to that owner instead of stalling a mixed
-batch that also contains healthy owners. Before a remote owner batch is submitted, the client
-checks the shared suspect-runtime cache and uses a short, rate-limited control-plane probe against
-the cached peer endpoint. This probe never refreshes metadata; Redis and etcd stay outside the
-steady-state read hot path. Inconclusive probes fall through to the transport path, while confirmed
-unreachable owners are quarantined locally and handled through the normal replica failover or
-cache-miss policy.
+For reads, the client first resolves the object route, then groups reads by remote segment and submits transfer requests through TE/TENT.
 
 ```mermaid
 sequenceDiagram
