@@ -121,6 +121,11 @@ if(STORE_USE_REDIS)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
+if(STORE_USE_K8S_LEASE)
+  target_sources(
+    high_availability_test
+    PRIVATE ha/leadership/backends/k8s/high_availability_k8s_test.cpp)
+endif()
 target_link_libraries(
   high_availability_test
   PUBLIC mooncake_store
@@ -131,7 +136,11 @@ target_link_libraries(
          gtest
          gtest_main
          pthread)
-if(STORE_USE_ETCD OR STORE_USE_REDIS)
+if(STORE_USE_K8S_LEASE)
+  target_link_libraries(high_availability_test
+                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+endif()
+if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 
