@@ -395,8 +395,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             cudaSuccess) {
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
-            ;
+        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
 
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
