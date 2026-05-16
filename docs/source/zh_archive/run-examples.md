@@ -56,7 +56,8 @@ Mooncake 支持在执行 `cmake` 命令期间添加下列高级编译选项：
 - `-DUSE_CXL=[ON|OFF]`：编译 Transfer Engine 时启用或关闭 CXL 协议的支持。默认关闭。
 - `-DWITH_P2P_STORE=[ON|OFF]`：编译 P2P Store 及示例程序，默认开启。
 - `-DWITH_ALLOCATOR=[ON|OFF]`：编译 Managed Store 所用的中心分配器模块，默认开启。
-- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`：编译 Transfer Engine 时启用或关闭 Rust 语言支持，默认关闭。
+- `-DWITH_RUST_EXAMPLE=[ON|OFF]`：编译 Transfer Engine Rust 接口与示例代码，默认关闭。
+- `-DWITH_STORE_RUST=[ON|OFF]`：编译 Mooncake Store Rust 绑定和 CMake Rust targets，默认开启。
 
 
 ## Transfer Engine Bench 使用方法
