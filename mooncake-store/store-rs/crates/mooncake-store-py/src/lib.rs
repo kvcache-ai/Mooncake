@@ -1221,9 +1221,9 @@ impl PyMooncakeDistributedStore {
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
-    fn batch_get<'py>(
+    fn batch_get(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         keys: Vec<String>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
@@ -1254,9 +1254,9 @@ impl PyMooncakeDistributedStore {
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
-    fn batch_get_buffer<'py>(
+    fn batch_get_buffer(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         keys: Vec<String>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<Py<PyBytes>>> {
@@ -1387,11 +1387,7 @@ impl PyMooncakeDistributedStore {
     }
 
     #[pyo3(signature = (storage_bytes))]
-    fn expand_local_memory<'py>(
-        &self,
-        py: Python<'py>,
-        storage_bytes: usize,
-    ) -> PyResult<Py<PyAny>> {
+    fn expand_local_memory(&self, py: Python<'_>, storage_bytes: usize) -> PyResult<Py<PyAny>> {
         let dispatcher = self.real_dispatcher()?;
         let announcement = run_without_gil(move || {
             dispatcher.run(move |client| client.expand_local_memory(storage_bytes))
@@ -1420,7 +1416,7 @@ impl PyMooncakeDistributedStore {
         run_without_gil(move || dispatcher.evacuate_owned_replicas()).map_err(store_error_to_py)
     }
 
-    fn list_segments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Py<PyAny>>> {
+    fn list_segments(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let dispatcher = self.real_dispatcher()?;
         run_without_gil(move || dispatcher.run(|client| client.list_segments()))
             .map_err(store_error_to_py)?
@@ -1430,9 +1426,9 @@ impl PyMooncakeDistributedStore {
     }
 
     #[pyo3(signature = (key, *, tenant = None))]
-    fn query_route<'py>(
+    fn query_route(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         key: &str,
         tenant: Option<&str>,
     ) -> PyResult<Option<Py<PyAny>>> {
