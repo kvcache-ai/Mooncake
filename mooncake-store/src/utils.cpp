@@ -2,6 +2,7 @@
 #include "mmap_arena.h"
 #include "config.h"
 #include "common.h"
+#include "ub_allocator.h"
 
 #include <Slab.h>
 #include <gflags/gflags.h>
@@ -118,16 +119,7 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
-        int node = (numa_node >= 0) ? numa_node: 0;
-        void *ptr = numa_alloc_onnode(total_size, node);
-        if (!ptr) {
-            LOG(ERROR) << "numa_alloc_onnode failed for UB protocal, size="
-                       << total_size;
-        } else {
-            LOG(INFO) << "UB: numa_alloc_onnode allocated " << total_size
-                      << " bytes at " << ptr;
-        }
-        return ptr;
+        return mooncake::ub_allocate_memory(total_size, numa_node);
     }
 #endif
     // Allocate aligned memory
@@ -384,8 +376,7 @@ void free_memory(const std::string &protocol, void *ptr, size_t size) {
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
-        munmap(ptr, size);  // for urma
-        numa_free(ptr, size);
+        mooncake::ub_free_memory(ptr, size);
         return;
     }
 #endif
