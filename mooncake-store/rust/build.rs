@@ -235,18 +235,6 @@ fn main() {
     push_env_paths(&mut search_dirs, "LD_LIBRARY_PATH");
     push_env_paths(&mut search_dirs, "LIBRARY_PATH");
 
-    // CUDA stubs contain libcuda.so (driver API); add them so has_library() can
-    // detect the stub and emit -lcuda for cuInit/cuPointerGetAttribute etc.
-    let cuda_home_for_search = env::var("CUDA_HOME")
-        .or_else(|_| env::var("CUDA_PATH"))
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-    for stubs_dir in [
-        PathBuf::from(format!("{}/lib64/stubs", cuda_home_for_search)),
-        PathBuf::from(format!("{}/targets/x86_64-linux/lib/stubs", cuda_home_for_search)),
-    ] {
-        push_existing_dir(&mut search_dirs, stubs_dir);
-    }
-
     let asan_runtime_so = compiler_runtime_library("libasan.so");
     if let Some(path) = asan_runtime_so.as_ref() {
         if let Some(parent) = path.parent() {
