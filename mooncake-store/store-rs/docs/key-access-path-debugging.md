@@ -231,8 +231,9 @@ Field meanings:
   authority owner.
 - `replicas[*].segment_name` is the storage segment containing the object.
 - `replicas[*].segment_offset` is the offset inside that segment.
-- `replicas[*].offset` is the transport-visible absolute address recorded for
-  the replica.
+- `replicas[*].offset` is the optional transport-visible absolute address recorded for
+  the replica. Routes written before this field existed omit it; readers then remap
+  from `segment_offset`.
 - `replicas[*].length` is the object length in bytes.
 - `replicas[*].priority` is the replica priority; lower priority is preferred.
 - `replicas[*].tier` is the storage tier.

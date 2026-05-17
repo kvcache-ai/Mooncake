@@ -3668,8 +3668,11 @@ fn routed_batch_put_publishes_replicated_route_with_absolute_offsets() {
         let (base, len) = transport
             .segment_bounds(&replica.segment_name.0)
             .expect("segment bounds should exist");
-        assert!(replica.offset >= base);
-        assert!(replica.offset + replica.length <= base + len);
+        let offset = replica
+            .offset
+            .expect("new writes should publish target offset");
+        assert!(offset >= base);
+        assert!(offset + replica.length <= base + len);
         assert_eq!(replica.length as usize, payload.len());
     }
 
@@ -5070,7 +5073,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
     let replica = ReplicaRoute {
         owner: store.runtime_id().clone(),
         segment_name: SegmentName::new("deadline-store-segment"),
-        offset: 0,
+        offset: Some(0),
         segment_offset: 0,
         length: 4,
         checksum: None,
@@ -5876,7 +5879,9 @@ fn embedded_wrh_query_route_repairs_divergent_authorities_from_old_authority() {
     divergent_route.replicas[0].owner =
         ClientRuntimeId::new("zzzz-divergent-old-owner", ClientEpoch(99));
     divergent_route.replicas[0].segment_name = SegmentName::new("zzzz-divergent-old-segment");
-    divergent_route.replicas[0].offset = divergent_route.replicas[0].offset.saturating_add(1);
+    divergent_route.replicas[0].offset = divergent_route.replicas[0]
+        .offset
+        .map(|offset| offset.saturating_add(1));
     divergent_route.replicas[0].segment_offset =
         divergent_route.replicas[0].segment_offset.saturating_add(1);
 
@@ -11879,7 +11884,7 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
         replicas: vec![ReplicaRoute {
             owner: store.runtime_id().clone(),
             segment_name: segment,
-            offset: base as u64 + target_offset as u64,
+            offset: Some(base as u64 + target_offset as u64),
             segment_offset: 0,
             length: payload.len() as u64,
             checksum: Some(payload_checksum(payload)),
@@ -12369,7 +12374,7 @@ fn readable_replica_selection_prefers_local_survivor() {
             ReplicaRoute {
                 owner: remote.runtime_id().clone(),
                 segment_name: remote_segment,
-                offset: 0,
+                offset: Some(0),
                 segment_offset: 0,
                 length: 8,
                 checksum: None,
@@ -12379,7 +12384,7 @@ fn readable_replica_selection_prefers_local_survivor() {
             ReplicaRoute {
                 owner: local.runtime_id().clone(),
                 segment_name: local_segment.clone(),
-                offset: 0,
+                offset: Some(0),
                 segment_offset: 0,
                 length: 8,
                 checksum: None,
@@ -13317,7 +13322,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: primary.segment_name.clone(),
-            offset: 0,
+            offset: Some(0),
             segment_offset: reused.offset_bytes,
             length: reused.length_bytes,
             checksum: None,
@@ -13523,7 +13528,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: published.segment_name.clone(),
-            offset: 0,
+            offset: Some(0),
             segment_offset: published.offset_bytes,
             length: published.length_bytes,
             checksum: None,

@@ -794,7 +794,7 @@ impl StoreClient {
                     replicas.push(ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
-                        offset,
+                        offset: Some(offset),
                         segment_offset: reservation.offset_bytes,
                         length: entry.value.len() as u64,
                         checksum: Some(checksum),

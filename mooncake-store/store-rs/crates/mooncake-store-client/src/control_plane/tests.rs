@@ -903,7 +903,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
         replicas: vec![ReplicaRoute {
             owner: owner.clone(),
             segment_name: SegmentName::new("segment-a"),
-            offset: 128,
+            offset: Some(128),
             segment_offset: 128,
             length: 16,
             checksum: Some(9),
@@ -1509,7 +1509,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let replica_error = try_replica_route(pb::ReplicaRoute {
         owner: None,
         segment_name: "segment-a".to_string(),
-        offset: 0,
+        offset: Some(0),
         segment_offset: 0,
         length: 1,
         checksum: None,
@@ -1527,6 +1527,14 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     assert_eq!(
         try_replica_route(pb_replica).expect("replica should round-trip"),
         route.replicas[0]
+    );
+
+    let mut legacy_replica = route.replicas[0].clone();
+    legacy_replica.offset = None;
+    assert_eq!(
+        try_replica_route(pb_replica_route(&legacy_replica))
+            .expect("legacy replica should round-trip"),
+        legacy_replica
     );
 }
 
@@ -1546,7 +1554,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
         replicas: vec![ReplicaRoute {
             owner,
             segment_name: SegmentName::new("segment-a"),
-            offset: 128,
+            offset: Some(128),
             segment_offset: 64,
             length: 16,
             checksum: None,

@@ -44,7 +44,7 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
         replicas: vec![ReplicaRoute {
             segment_name: SegmentName::new(segment),
             owner: make_creator(),
-            offset: 0,
+            offset: Some(0),
             segment_offset: 0,
             length: 64,
             checksum: None,
