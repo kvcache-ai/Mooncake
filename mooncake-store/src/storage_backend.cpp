@@ -284,6 +284,40 @@ bool StorageBackend::InitQuotaEvict() {
     return true;
 }
 
+
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+
+    const std::string& path, const std::vector<Slice>& slices, const std::string& key) {
+    // Store to GDS KV instead of local file
+    // ObjectKey key = ExtractKeyFromPath(path);
+    uint64_t blockId = objectKeyToUint64(key);
+
+    // Calculate total size and copy data to a single buffer
+    size_t total_size = 0;
+    for (const auto& slice : slices) {
+        total_size += slice.size;
+    }
+
+    // Allocate buffer for combined data
+    std::vector<uint8_t> buffer(total_size);
+    size_t offset = 0;
+    for (const auto& slice : slices) {
+        std::memcpy(buffer.data() + offset, slice.ptr, slice.size);
+        offset += slice.size;
+    }
+
+    // Write data to GDS
+    int32_t gds_result = NDS::put(blockId, buffer.data(), 0, total_size);
+    if (gds_result != 0) {
+        LOG(ERROR) << "Failed to write data to GDS: " << gds_result;
+        return tl::unexpected(ErrorCode::WRITE_FAIL);
+    }
+
+    VLOG(0) << "Successfully wrote data to GDS for key: " << key;
+    return {};
+}
+#if 0
+
 tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     const std::string& path, const std::vector<Slice>& slices,
     const std::string& key) {
@@ -330,6 +364,7 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
 
     return evicted_keys;
 }
+#endif
 
 tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     const std::string& path, const std::string& str, const std::string& key) {

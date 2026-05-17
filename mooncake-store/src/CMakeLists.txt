@@ -129,7 +129,7 @@ target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 # mooncake_master). Targets that need transfer_engine should link it explicitly.
 target_link_libraries(
   mooncake_store
-  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
+  PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags ndsclient
          ${EXTRA_LIBS} asio_shared
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
