@@ -479,7 +479,7 @@ impl StoreClient {
                     .map(|(priority, (target, offset))| ReplicaRoute {
                         owner: target.storage_runtime.clone(),
                         segment_name: target.segment_name.clone(),
-                        offset: *offset,
+                        offset: Some(*offset),
                         segment_offset: reservations[priority].offset_bytes,
                         length: value.len() as u64,
                         checksum: Some(checksum),
@@ -1010,7 +1010,7 @@ impl StoreClient {
             .map(|(priority, (target, offset))| ReplicaRoute {
                 owner: target.storage_runtime.clone(),
                 segment_name: target.segment_name.clone(),
-                offset: *offset,
+                offset: Some(*offset),
                 segment_offset: reservations[priority].offset_bytes,
                 length: payload.len() as u64,
                 checksum: Some(checksum),
@@ -2362,10 +2362,11 @@ impl StoreClient {
                         entry.replica.segment_name.0
                     ))
                 })?;
+                let target_offset = Self::remote_replica_target_offset(target_info, &entry.replica)?;
                 memory.copy_storage_target_to(
                     &entry.replica.segment_name,
                     target_info,
-                    entry.replica.offset,
+                    target_offset,
                     buffer.as_mut_ptr(),
                     entry.replica.length as usize,
                     transport.max_registration_bytes(),
@@ -3011,8 +3012,10 @@ impl StoreClient {
     }
 
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
-        if Self::segment_info_covers_target(info, replica.offset, replica.length) {
-            return Ok(replica.offset);
+        if let Some(offset) = replica.offset {
+            if Self::segment_info_covers_target(info, offset, replica.length) {
+                return Ok(offset);
+            }
         }
         Self::segment_relative_target_offset(
             info,
@@ -3586,10 +3589,11 @@ impl StoreClient {
         {
             let state = self.state.lock();
             let memory = state.memory_ref()?;
+            let target_offset = Self::remote_replica_target_offset(&target_info, replica)?;
             memory.copy_storage_target_to(
                 &replica.segment_name,
                 &target_info,
-                replica.offset,
+                target_offset,
                 buffer.as_mut_ptr(),
                 length,
                 transport.max_registration_bytes(),
@@ -4065,7 +4069,7 @@ mod runtime_io_tests {
     // -----------------------------------------------------------------------
     // remote_replica_target_offset tests — this function is the entry point
     // for all read-path offset resolution and has two code paths:
-    //   1. Fast path: replica.offset is already covered by buffers → return it
+    //   1. Fast path: replica.offset is present and already covered by buffers → return it
     //   2. Fallback: re-map via segment_relative_target_offset using
     //      replica.segment_offset
     // -----------------------------------------------------------------------
@@ -4079,7 +4083,7 @@ mod runtime_io_tests {
         ReplicaRoute {
             owner: ClientRuntimeId::new("test-runtime", ClientEpoch(0)),
             segment_name: SegmentName::new(segment_name),
-            offset,
+            offset: Some(offset),
             segment_offset,
             length,
             checksum: None,
@@ -4114,6 +4118,20 @@ mod runtime_io_tests {
             result.expect("fallback should remap using segment_offset"),
             1024,
             "fallback must compute base + segment_offset"
+        );
+    }
+
+    #[test]
+    fn remote_replica_target_offset_missing_offset_remaps_even_when_zero_is_valid() {
+        let info = memory_segment(&[(0, 128)]);
+        let mut replica = make_replica("seg", 0, 24, 32);
+        replica.offset = None;
+
+        let result = StoreClient::remote_replica_target_offset(&info, &replica);
+        assert_eq!(
+            result.expect("legacy route should remap using segment_offset"),
+            24,
+            "missing offset must not be treated as absolute target address 0"
         );
     }
 

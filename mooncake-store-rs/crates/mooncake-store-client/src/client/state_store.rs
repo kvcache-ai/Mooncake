@@ -424,7 +424,7 @@ mod state_store_tests {
             replicas: vec![ReplicaRoute {
                 owner: runtime.clone(),
                 segment_name: SegmentName("seg-0".to_string()),
-                offset: 0,
+                offset: Some(0),
                 segment_offset: 0,
                 length: 1024,
                 checksum: None,

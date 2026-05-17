@@ -126,7 +126,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: crate::ClientRuntimeId::new("runtime-a", crate::ClientEpoch(1)),
                 segment_name: crate::SegmentName::new("segment-a"),
-                offset: 0,
+                offset: Some(0),
                 segment_offset: 0,
                 length: 1,
                 checksum: None,

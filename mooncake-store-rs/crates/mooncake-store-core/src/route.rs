@@ -99,7 +99,8 @@ pub enum SegmentLifecycleState {
 pub struct ReplicaRoute {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
-    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
     #[serde(default)]
     pub segment_offset: u64,
     pub length: u64,
@@ -1155,7 +1156,7 @@ mod tests {
             replicas: vec![ReplicaRoute {
                 owner: ClientRuntimeId::new("node", ClientEpoch(1)),
                 segment_name: SegmentName::new("seg"),
-                offset: 0,
+                offset: Some(0),
                 segment_offset: 0,
                 length: 1024,
                 checksum: None,
@@ -1166,6 +1167,35 @@ mod tests {
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, route);
+    }
+
+    #[test]
+    fn object_route_serde_accepts_legacy_replica_without_offset() {
+        let encoded = r#"{
+            "key":"tenant::key",
+            "version":1,
+            "state":"Active",
+            "compatibility":{
+                "store_api_version":1,
+                "metadata_schema_version":1,
+                "transport_api_version":1,
+                "capabilities":[],
+                "store_api_minor_version":0
+            },
+            "replicas":[{
+                "owner":{"stable_id":"node","epoch":1},
+                "segment_name":"seg",
+                "segment_offset":64,
+                "length":16,
+                "checksum":null,
+                "tier":"Dram",
+                "priority":0
+            }]
+        }"#;
+
+        let decoded: ObjectRoute = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded.replicas[0].offset, None);
+        assert_eq!(decoded.replicas[0].segment_offset, 64);
     }
 
     #[test]
