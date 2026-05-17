@@ -4220,6 +4220,124 @@ fn batch_get_fails_over_within_same_request_after_primary_transport_failure() {
 }
 
 #[test]
+fn registered_batch_get_fails_over_after_primary_transport_failure() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new(
+        "registered-batch-transport-failed-a-segment",
+    ));
+    let store_b_transport =
+        Arc::new(store_a_transport.peer("registered-batch-transport-failed-b-segment"));
+    let writer_transport =
+        Arc::new(store_a_transport.peer("registered-batch-transport-failed-writer-segment"));
+    let reader_transport =
+        Arc::new(store_a_transport.peer("registered-batch-transport-failed-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "registered-batch-failed-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "registered-batch-failed-pool")
+        .label("storage", "true")
+        .label("route_scope", "registered-batch-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "registered-batch-failed-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "registered-batch-failed-pool")
+        .label("storage", "true")
+        .label("route_scope", "registered-batch-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "registered-batch-failed-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "registered-batch-failed-pool")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "registered-batch-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "registered-batch-failed-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "registered-batch-failed-pool")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "registered-batch-failed-scope")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    for (key, payload) in [
+        ("registered-batch-failed-key-a", b"registered-a".as_slice()),
+        ("registered-batch-failed-key-b", b"registered-b".as_slice()),
+    ] {
+        writer
+            .put_with_policy(
+                key,
+                payload,
+                &ReplicationPolicy::new()
+                    .replica_count(2)
+                    .prefer_local(false)
+                    .preferred_storage_owners([
+                        store_a.runtime_id().storage_key(),
+                        store_b.runtime_id().storage_key(),
+                    ]),
+            )
+            .expect("replicated put should succeed");
+    }
+
+    {
+        let mut state = store_a_transport.state.lock();
+        let handle = state
+            .segments_by_name
+            .remove("registered-batch-transport-failed-a-segment")
+            .expect("primary segment handle should exist");
+        state.segments_by_handle.remove(&handle);
+    }
+
+    let mut target = [0u8; 32];
+    reader
+        .register_buffer(target.as_mut_ptr().cast(), target.len())
+        .expect("reader register buffer should succeed");
+    let (first, tail) = target.split_at_mut(12);
+    let (_, second) = tail.split_at_mut(4);
+    let sizes = reader
+        .batch_get_into(&mut [
+            GetRequest::new("registered-batch-failed-key-a", first),
+            GetRequest::new("registered-batch-failed-key-b", &mut second[..12]),
+        ])
+        .expect("registered batch_get_into should fail over to surviving replicas");
+
+    assert_eq!(sizes, vec![12, 12]);
+    assert_eq!(&target[..12], b"registered-a");
+    assert_eq!(&target[16..28], b"registered-b");
+}
+
+#[test]
 fn route_lookup_many_stays_ok_when_live_replica_survives_and_snapshot_converges() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();

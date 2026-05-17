@@ -2437,14 +2437,31 @@ impl StoreClient {
                 }
                 if direct_end > cursor {
                     let direct_chunk = &fairness_slice[cursor..direct_end];
-                    self.execute_remote_batch_get_direct_chunk(
+                    match self.execute_remote_batch_get_direct_chunk(
                         transport,
                         resolved,
                         &buffer_ptrs,
                         direct_chunk,
                         request_deadline,
-                    )?;
-                    remote_registered_batch_chunks += 1;
+                    ) {
+                        Ok(()) => {
+                            remote_registered_batch_chunks += 1;
+                        }
+                        Err(_) => {
+                            for index in direct_chunk {
+                                let buffer = &mut *buffers[*index];
+                                self.read_single_object_with_failover(
+                                    transport,
+                                    &mut resolved[*index],
+                                    buffer,
+                                    &mut checked_remote_runtimes,
+                                    request_deadline,
+                                    "remote_batch_get_fallback",
+                                )?;
+                                remote_direct_fallbacks += 1;
+                            }
+                        }
+                    }
                     cursor = direct_end;
                     continue;
                 }
