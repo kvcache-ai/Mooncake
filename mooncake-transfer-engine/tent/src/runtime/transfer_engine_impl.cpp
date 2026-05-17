@@ -304,6 +304,8 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
+    enable_auto_failover_on_poll_ =
+        conf_->get("enable_auto_failover_on_poll", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -1304,6 +1306,18 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
+void TransferEngineImpl::updateTaskStatusFromPoll(Batch* batch, size_t task_id,
+                                                  TransferStatus& task_status) {
+    auto& task = batch->task_list[task_id];
+    task.status = task_status.s;
+    if (!enable_auto_failover_on_poll_ || task_status.s != FAILED) return;
+
+    if (resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        task.status = PENDING;
+    }
+}
+
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
                                             const Notification& notifi) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -1368,12 +1382,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
     }
-    batch->task_list[task_id].status = task_status.s;
-
-    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        batch->task_list[task_id].status = PENDING;
-    }
+    updateTaskStatusFromPoll(batch, task_id, task_status);
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1448,17 +1457,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
-        // memorize task result
-        task.status = task_status.s;
-
-        // Attempt failover before status aggregation so that a
-        // successfully resubmitted task appears as PENDING and does not
-        // latch the batch to a terminal state while retries are in-flight.
-        if (task_status.s == FAILED &&
-            resubmitTransferTask(batch, task_id).ok()) {
-            task.status = PENDING;
-            task_status.s = PENDING;
-        }
+        // Preserve legacy auto-failover-on-poll before aggregating status.
+        updateTaskStatusFromPoll(batch, task_id, task_status);
 
         if (task_status.s == COMPLETED) {
             success_tasks++;
