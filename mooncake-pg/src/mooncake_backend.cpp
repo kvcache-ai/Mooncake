@@ -181,6 +181,14 @@ MooncakeBackend::MooncakeBackend(
     auto store = std::move(distBackendOpts.store);
     const int rank = distBackendOpts.group_rank;
     const int size = distBackendOpts.group_size;
+    const int max_size = (options_ && options_->maxWorldSize_ > 0)
+                             ? options_->maxWorldSize_
+                             : size;
+
+    TORCH_CHECK(max_size >= 0 && static_cast<size_t>(max_size) <= kMaxNumRanks,
+                "max_world_size out of range");
+    TORCH_CHECK(max_size >= size,
+                "max_world_size must be >= process group size");
     const auto& globalRanks = distBackendOpts.global_ranks_in_group;
 
     // Memory location for device specific buffers
@@ -212,6 +220,11 @@ MooncakeBackend::MooncakeBackend(
         for (int i = 0; i < size; ++i) {
             local2global_rank_map_[i] = i;
         }
+    }
+
+    // Fill the remaining slots for polling / future joiners.
+    for (int i = size; i < max_size; ++i) {
+        local2global_rank_map_[i] = i;
     }
 
     // Register buffers
@@ -308,6 +321,10 @@ MooncakeBackend::MooncakeBackend(
         backendIndex_, rank, size, options_ && options_->isExtension_,
         local2global_rank_map_, store, meta_, p2p_proxy_, engine_);
 
+    if (max_size != size) {
+        connection_ctx_->setPollingLimitTo(max_size);
+    }
+
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
     rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
     rank_info.recv_buffer[0] = (uint64_t)recv_buffer_[0];
@@ -327,7 +344,18 @@ MooncakeBackend::MooncakeBackend(
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
     meta_->rank = rank;
-    meta_->size = size;
+    // NOTE: meta_->size is intentionally initialized to max_world_size (when
+    // provided) so that healthy ranks can activate joiners via recoverRanks()
+    // without calling extendGroupSizeTo(). Inactive slots are masked by
+    // meta_->activeRanks / meta_->activeRanksTensor.
+    meta_->size = max_size;
+    // activeSize tracks the visible group size (returned by getSize() /
+    // dist.get_world_size()). It starts at the actual member count and grows
+    // when extendGroupSizeTo() or recoverRanks() expands the group.
+    // For extension ranks, activeSize equals world_size (= max_world_size);
+    // the local-only behavior before joinGroup() is ensured by activeRanks
+    // masking, not by a smaller activeSize.
+    meta_->activeSize = size;
     meta_->taskCount = 0;
     if (isCpu) {
         meta_->activeRanks = new bool[kMaxNumRanks];
@@ -340,6 +368,11 @@ MooncakeBackend::MooncakeBackend(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_->activeRanks[i] = true;
     }
+
+    // Reserve extra slots as inactive so collectives won't wait on them.
+    for (int i = size; i < max_size; ++i) {
+        meta_->activeRanks[i] = false;
+    }
     if (options_ && options_->activeRanks_.defined()) {
         TORCH_CHECK(options_->activeRanks_.dtype() == at::kInt,
                     "activeRanks must be int.");
@@ -350,11 +383,19 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
                         "activeRanks must be on CUDA.");
         }
+        if (max_size != size) {
+            TORCH_CHECK(options_->activeRanks_.numel() == max_size,
+                        "activeRanks must be sized to max_world_size when "
+                        "max_world_size is set");
+        }
         meta_->activeRanksTensor = options_->activeRanks_;
     } else {
-        meta_->activeRanksTensor =
-            at::ones({size}, torch::dtype(torch::kInt32)
-                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
+        meta_->activeRanksTensor = at::ones(
+            {max_size}, torch::dtype(torch::kInt32)
+                            .device(isCpu ? torch::kCPU : torch::kCUDA));
+        if (max_size != size) {
+            meta_->activeRanksTensor.slice(0, size, max_size).fill_(0);
+        }
     }
     meta_->engine = engine_;
     meta_->store = store;
@@ -610,15 +651,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     if (isCpu_) {
-        auto numRanks = meta_->size;
         return worker_->putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
             connection_ctx_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
             },
-            [=](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+            [=, this](void* src, size_t pos, size_t realSize) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     memcpy(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize);
@@ -637,7 +678,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
             },
             [=, this](void* src, size_t pos, size_t realSize,
                       const at::cuda::CUDAStream& enq_stream) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     cudaMemcpyAsync(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize,
@@ -656,8 +698,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         return worker_->putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             connection_ctx_,
-            [=](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(numRanks)) {
+            [=, this](void* dst, size_t pos, size_t realSize) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     memcpy((char*)dst + j * realSize,
                            (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
                            realSize);
@@ -676,7 +719,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             connection_ctx_, stream,
             [=, this](void* dst, size_t pos, size_t realSize,
                       const at::cuda::CUDAStream& enq_stream) {
-                for (const auto j : c10::irange(meta_->size)) {
+                for (int j = 0; j < meta_->size; ++j) {
+                    if (!meta_->activeRanks[j]) continue;
                     cudaMemcpyAsync(
                         (char*)dst + j * realSize,
                         (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
@@ -1041,6 +1085,15 @@ void MooncakeBackend::waitForExtensionState() {
         meta_->activeRanks[i] = state.activeRanks[i];
     }
     syncActiveRanksTensor();
+
+    // activeSize: count the number of active ranks (contiguous from 0)
+    int newActiveSize = 0;
+    for (int i = 0; i < meta_->size; ++i) {
+        if (meta_->activeRanks[i]) {
+            newActiveSize = i + 1;
+        }
+    }
+    meta_->activeSize = newActiveSize;
 }
 
 int MooncakeBackend::getNumSyncedRanks() {
@@ -1063,6 +1116,7 @@ int MooncakeBackend::getNumSyncedRanks() {
 
 void MooncakeBackend::extendGroupSizeTo(int newSize) {
     const int oldSize = meta_->size;
+    const int oldActiveSize = meta_->activeSize;
     if (newSize == oldSize) return;
 
     TORCH_CHECK(newSize >= 0 && static_cast<size_t>(newSize) < kMaxNumRanks,
@@ -1073,17 +1127,26 @@ void MooncakeBackend::extendGroupSizeTo(int newSize) {
               << ": Group size extend to " << newSize;
 
     meta_->size = newSize;
+    meta_->activeSize = newSize;
     meta_->taskCount = 0;
 
     // Initialize new rank's metadata
     for (int i = oldSize; i < newSize; ++i) {
         local2global_rank_map_[i] = i;
-        meta_->activeRanks[i] = true;
+        // IMPORTANT: Newly-extended ranks must start as inactive.
+        // They will only participate in collectives after healthy ranks
+        // explicitly activate them via recoverRanks(). This enables a
+        // two-phase scale-up protocol (extend capacity -> poll readiness
+        // -> recover/activate) and avoids collectives including ranks that
+        // haven't joined yet.
+        meta_->activeRanks[i] = false;
     }
 
     auto& tensor = meta_->activeRanksTensor;
-    tensor.resize_({newSize});
-    tensor.slice(0, oldSize, newSize).fill_(1);
+    if (newSize > tensor.numel()) {
+        tensor.resize_({newSize});
+    }
+    tensor.slice(0, oldSize, newSize).fill_(0);
 
     connection_ctx_->extendGroupSizeTo(newSize);
     p2p_proxy_->extendGroupSizeTo(newSize);
@@ -1145,6 +1208,14 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
                     "Rank out of range");
         TORCH_CHECK(meta_->peerConnected[rank]);
         meta_->activeRanks[rank] = true;
+    }
+
+    // Expand activeSize if any recovered rank is beyond the current boundary.
+    if (!ranks.empty()) {
+        const int max_rank = *std::max_element(ranks.begin(), ranks.end());
+        if (max_rank >= meta_->activeSize) {
+            meta_->activeSize = max_rank + 1;
+        }
     }
 
     syncActiveRanksTensor();
