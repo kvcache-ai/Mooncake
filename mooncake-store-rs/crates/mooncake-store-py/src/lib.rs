@@ -3466,6 +3466,7 @@ mod tests {
             segment_name: SegmentName::new("segment-z"),
             capacity_bytes: 256,
             used_bytes: 32,
+            target_chunks: Vec::new(),
             state: SegmentLifecycleState::Active,
             alignment_bytes: 8,
             tags: vec!["dram".to_string()],
