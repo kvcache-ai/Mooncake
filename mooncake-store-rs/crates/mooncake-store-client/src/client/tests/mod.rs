@@ -1055,6 +1055,15 @@ impl MetadataBackend for HotPathBlockedMetadataBackend {
         self.inner.unpublish_segment(owner, segment)
     }
 
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> mooncake_store_core::Result<Option<SegmentAnnouncement>> {
+        self.hot_path_error("get_segment")?;
+        self.inner.get_segment(owner, segment)
+    }
+
     fn list_segments(
         &self,
         owner: Option<&ClientRuntimeId>,

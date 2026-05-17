@@ -39,6 +39,8 @@ impl StoreState {
     fn invalidate_remote_segment(&mut self, segment_name: &str) {
         self.remote_segments.remove(segment_name);
         self.remote_segment_infos.remove(segment_name);
+        self.segment_target_chunks
+            .retain(|(_, segment), _| segment.0 != segment_name);
     }
 
     fn reopen_segment(
@@ -47,10 +49,32 @@ impl StoreState {
         segment_name: &str,
     ) -> Result<u64> {
         self.remote_segment_infos.remove(segment_name);
+        self.segment_target_chunks
+            .retain(|(_, segment), _| segment.0 != segment_name);
         if let Some(handle) = self.remote_segments.remove(segment_name) {
             let _ = transport.close_segment(handle);
         }
         self.open_segment(transport, segment_name)
+    }
+
+    fn cached_segment_target_chunks(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+    ) -> Option<Vec<SegmentTargetChunk>> {
+        self.segment_target_chunks
+            .get(&(owner.clone(), segment_name.clone()))
+            .cloned()
+    }
+
+    fn cache_segment_target_chunks(
+        &mut self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+        target_chunks: &[SegmentTargetChunk],
+    ) {
+        self.segment_target_chunks
+            .insert((owner.clone(), segment_name.clone()), target_chunks.to_vec());
     }
 
     fn open_segment_with_info(
@@ -986,6 +1010,10 @@ fn remote_segment_cache_stale(error: &StoreError) -> bool {
         | StoreError::InvalidState(message) => {
             message.contains("segment handle")
                 || message.contains("is outside segment")
+                || message.contains("has no published storage target chunks")
+                || message.contains("crosses an unpublished target chunk")
+                || message.contains("target chunks are not contiguous")
+                || message.contains("target chunk has zero length")
         }
         _ => false,
     }
