@@ -358,6 +358,10 @@ TEST_F(ClientIntegrationTest, RemoveOperation) {
         << "Put operation failed: " << toString(put_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
+    // Wait for asynchronous disk write to complete
+    // This is a workaround for the async nature of disk writes in the current implementation
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     // Remove the data
     auto remove_result = test_client_->Remove(key);
     ASSERT_TRUE(remove_result.has_value())

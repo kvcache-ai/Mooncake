@@ -4,11 +4,13 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <filesystem>
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -140,6 +142,41 @@ using BufHandleList = std::vector<std::shared_ptr<AllocatedBuffer>>;
 using ReplicaList = std::unordered_map<uint32_t, Replica>;
 using BufferResources =
     std::map<SegmentId, std::vector<std::shared_ptr<BufferAllocatorBase>>>;
+
+/**
+ * @brief Convert ObjectKey to uint64_t using hash function
+ * @param key ObjectKey to convert
+ * @return uint64_t hash value of the key
+ */
+inline uint64_t objectKeyToUint64(const ObjectKey& key) {
+    return static_cast<uint64_t>(std::hash<ObjectKey>{}(key));
+}
+
+/**
+ * @brief Convert uint64_t to ObjectKey as hex string
+ * @param value uint64_t value to convert
+ * @return ObjectKey (string) representation of the value
+ */
+inline ObjectKey uint64ToObjectKey(uint64_t value) {
+    std::stringstream ss;
+    ss << std::hex << value;
+    return ss.str();
+}
+
+/**
+ * @brief Extract key from a full file path
+ * @param full_path Full file path in the format root_fs_dir/cluster_id/xx/xx/key
+ * @return ObjectKey extracted from the path (ignores SanitizeKey)
+ */
+inline ObjectKey ExtractKeyFromPath(const std::string& full_path) {
+    namespace fs = std::filesystem;
+    fs::path path(full_path);
+    
+    // The key is the filename (last component)
+    return path.filename().string();
+}
+
+
 // Mapping between c++ and go types
 #ifdef STORE_USE_ETCD
 using EtcdRevisionId = GoInt64;
