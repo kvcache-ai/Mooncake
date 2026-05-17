@@ -4,22 +4,30 @@ impl StoreClient {
         storage_runtime: &ClientRuntimeId,
         segment_name: &SegmentName,
     ) -> Result<ReplicaWriteTarget> {
-        let segment = self.segment_announcement(storage_runtime, segment_name)?;
+        let target_chunks = self.replica_write_target_chunks(storage_runtime, segment_name)?;
         Ok(ReplicaWriteTarget {
             storage_runtime: storage_runtime.clone(),
             segment_name: segment_name.clone(),
-            target_chunks: segment.target_chunks,
+            target_chunks,
         })
     }
 
-    fn segment_announcement(
+    fn replica_write_target_chunks(
         &self,
         storage_runtime: &ClientRuntimeId,
         segment_name: &SegmentName,
-    ) -> Result<SegmentAnnouncement> {
+    ) -> Result<Vec<SegmentTargetChunk>> {
         if let Some(segment) = self.allocator.lock().announcement(segment_name) {
             if segment.owner == *storage_runtime {
-                return Ok(segment);
+                return Ok(segment.target_chunks);
+            }
+        }
+        {
+            let state = self.state.lock();
+            if let Some(target_chunks) =
+                state.cached_segment_target_chunks(storage_runtime, segment_name)
+            {
+                return Ok(target_chunks);
             }
         }
         let segment = self
@@ -31,10 +39,17 @@ impl StoreClient {
                     segment_name.0, storage_runtime
                 ))
             })?;
+        let target_chunks = segment.target_chunks.clone();
         if segment.owner == self.lease.runtime {
             self.allocator.lock().upsert(&segment);
+        } else if !target_chunks.is_empty() {
+            self.state.lock().cache_segment_target_chunks(
+                storage_runtime,
+                segment_name,
+                &target_chunks,
+            );
         }
-        Ok(segment)
+        Ok(target_chunks)
     }
 
     fn reserve_specific_segment(

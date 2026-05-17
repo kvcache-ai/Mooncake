@@ -25,6 +25,7 @@ pub struct OperationCounts {
     pub list_live_clients: AtomicU64,
     pub publish_segment: AtomicU64,
     pub unpublish_segment: AtomicU64,
+    pub get_segment: AtomicU64,
     pub list_segments: AtomicU64,
     pub update_segment_state: AtomicU64,
     pub reserve_segment: AtomicU64,
@@ -125,6 +126,15 @@ impl MetadataBackend for CountingMetadataBackend {
             .unpublish_segment
             .fetch_add(1, Ordering::Relaxed);
         self.inner.unpublish_segment(owner, segment)
+    }
+
+    fn get_segment(
+        &self,
+        owner: &ClientRuntimeId,
+        segment: &SegmentName,
+    ) -> Result<Option<SegmentAnnouncement>> {
+        self.counts.get_segment.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_segment(owner, segment)
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {

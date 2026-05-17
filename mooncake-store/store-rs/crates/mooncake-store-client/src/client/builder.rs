@@ -467,6 +467,12 @@ impl StoreClientBuilder {
                 "live_client_snapshot_prewarm",
             )?;
         }
+        prewarm_segment_target_chunk_cache(
+            runtime_metadata.as_ref(),
+            &live_client_cache,
+            &state,
+            &lease,
+        )?;
         live_client_cache.lock().store_tenant_quota_policy(
             self.default_tenant.clone(),
             None,
@@ -677,6 +683,54 @@ fn prewarm_live_client_cache(
         }
         Err(error) => Err(error),
     }
+}
+
+fn prewarm_segment_target_chunk_cache(
+    metadata: &dyn MetadataBackend,
+    live_client_cache: &SharedLiveClientCache,
+    state: &Mutex<StoreState>,
+    local_lease: &ClientLease,
+) -> Result<()> {
+    let leases = cached_live_client_snapshot(live_client_cache)?;
+    for lease in leases {
+        if lease.runtime == local_lease.runtime
+            || !compatibility_matches(local_lease, &lease)
+            || !lease.state.allows_new_writes()
+            || lease
+                .endpoints
+                .labels
+                .get("storage")
+                .is_none_or(|value| value != "true")
+        {
+            continue;
+        }
+        let Some(segment_name) = lease.endpoints.segment_name.as_ref() else {
+            continue;
+        };
+        match metadata.get_segment(&lease.runtime, segment_name) {
+            Ok(Some(segment))
+                if segment.state == SegmentLifecycleState::Active
+                    && !segment.target_chunks.is_empty() =>
+            {
+                state.lock().cache_segment_target_chunks(
+                    &lease.runtime,
+                    segment_name,
+                    &segment.target_chunks,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                debug!(
+                    runtime = %local_lease.runtime,
+                    storage_runtime = %lease.runtime,
+                    segment = %segment_name.0,
+                    error = %error,
+                    "segment target chunk prewarm skipped"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn startup_prewarm_max_delay_from_env() -> Duration {

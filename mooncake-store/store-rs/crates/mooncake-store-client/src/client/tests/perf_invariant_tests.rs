@@ -33,12 +33,14 @@ use std::sync::Arc;
 
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
-    MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaPolicy,
+    ClientLifecycleState, MetadataBackend, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaPolicy,
 };
+use mooncake_store_test_utils::fixtures::test_future_expiry_ms;
 use mooncake_store_test_utils::metadata::{CountingMetadataBackend, OperationCounts};
 use mooncake_store_test_utils::transport::TestTransport;
 
-use crate::MooncakeCompatibilityFacade;
+use crate::{MooncakeCompatibilityFacade, PlacementPlanner, ReplicationPolicy, StoreClientBuilder};
 
 mod helpers {
     include!("perf_invariant_helpers.rs");
@@ -165,6 +167,66 @@ fn get_hot_path_does_not_touch_quota_or_policy_metadata() {
     assert_eq!(
         after.list_tenant_policies, baseline.list_tenant_policies,
         "get hot path must not call list_tenant_policies"
+    );
+}
+
+#[test]
+fn routed_put_reuses_prewarmed_segment_target_chunks() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let (backend, counts) = CountingMetadataBackend::wrap(inner);
+    let metadata = backend.clone() as Arc<dyn MetadataBackend>;
+
+    let storage_transport = Arc::new(TestTransport::new("perf-target-storage-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "perf-target-storage")
+        .state(ClientLifecycleState::Active)
+        .tenant("tenant-target")
+        .label("pool", "perf-target-pool")
+        .label("storage", "true")
+        .transport(storage_transport.clone())
+        .local_memory(helpers::perf_storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer_transport = Arc::new(storage_transport.peer("perf-target-writer-segment"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "perf-target-writer")
+        .state(ClientLifecycleState::Active)
+        .tenant("tenant-target")
+        .label("pool", "perf-target-pool")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(helpers::perf_storage_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata.clone()).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let baseline_get_segment = counts.get_segment.load(Ordering::Relaxed);
+    let baseline_list_segments = counts.list_segments.load(Ordering::Relaxed);
+    let policy = ReplicationPolicy::new().prefer_local(false);
+    for i in 0..32u64 {
+        let key = format!("target-k-{i}");
+        writer
+            .put_in_tenant_with_policy("tenant-target", &key, b"v", &policy)
+            .expect("routed put should succeed");
+    }
+
+    assert_eq!(
+        counts.get_segment.load(Ordering::Relaxed),
+        baseline_get_segment,
+        "routed put hot path must not fetch segment announcements after build prewarm"
+    );
+    assert_eq!(
+        counts.list_segments.load(Ordering::Relaxed),
+        baseline_list_segments,
+        "routed put hot path must not fall back to segment listing"
     );
 }
 
