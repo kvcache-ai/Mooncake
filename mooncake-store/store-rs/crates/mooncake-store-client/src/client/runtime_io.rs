@@ -990,7 +990,7 @@ impl StoreClient {
             self.reserve_explicit_migration_targets(&object_ref, payload.len(), plan)?;
         let offsets =
             match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
-            Ok(offsets) => offsets,
+                Ok(offsets) => offsets,
             Err(error) => {
                 self.best_effort_release_reserved_allocations(
                     &targets,

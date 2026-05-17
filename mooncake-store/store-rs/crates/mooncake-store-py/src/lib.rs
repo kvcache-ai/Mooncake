@@ -804,7 +804,7 @@ impl PyMooncakeDistributedStore {
                                     .map(|(key, buffer_ptr, size)| {
                                         let mut request = PutFromRequest::new(
                                             key,
-                                            (*buffer_ptr as *const c_void).cast(),
+                                            (*buffer_ptr as *mut c_void).cast_const(),
                                             *size,
                                         )
                                         .tenant(scope.tenant.as_str());
