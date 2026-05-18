@@ -274,7 +274,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
-- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
+- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter significantly improves GPUDirect RDMA performance. Values: 0 (disabled), 1 (enable if supported), 2 (auto, same as 1). **Default value 0 for backward compatibility**. **Recommendation**: Set to 1 or 2 for optimal GPU RDMA performance when using GPUDirect RDMA. This flag is critical for achieving high bandwidth (~47 GB/s) instead of degraded performance (~15 GB/s) when transferring GPU memory over RDMA.
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
 - `MC_PKEY_INDEX` The QP `pkey_index` (partition key table index) used when transitioning the QP to the INIT state. Valid range: 0 to 65535. Default value 0. Set this when the partition key required for your fabric is not at index 0 of the HCA's pkey table
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
