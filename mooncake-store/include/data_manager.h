@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <functional>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -21,6 +22,7 @@
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "utils.h"
 #include "client_rpc_types.h"
 
 namespace mooncake {
@@ -254,13 +256,18 @@ class DataManager {
     struct PinnedKeyShard;
 
     struct KeyCtx {
-        std::string_view key;
-        std::string key_string;
+        // Stable copy of the logical key. Incoming std::string_view often
+        // points at RPC/coro request buffers and is only valid for the lifetime
+        // of that handler; BuildKeyCtx copies immediately so async work, maps,
+        // and locks never retain dangling views.
+        std::string key;
         size_t hash = 0;
         size_t pending_write_shard_idx = 0;
         size_t pinned_key_shard_idx = 0;
     };
 
+    // `key` must still point at valid storage for the duration of this call
+    // only (typically RPC/coro request buffers).
     KeyCtx BuildKeyCtx(std::string_view key) const;
     PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
     PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
@@ -282,8 +289,7 @@ class DataManager {
                                    const UUID& write_operation_id);
 
     std::shared_mutex& GetKeyLock(std::string_view key) {
-        size_t hash = std::hash<std::string_view>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
+        return lock_shards_[StringHash{}(key) % lock_shard_count_];
     }
 
     /**
@@ -449,19 +455,20 @@ class DataManager {
 
     struct PendingWriteShard {
         mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, PendingWriteRecord> by_key;
+        std::unordered_map<std::string, PendingWriteRecord,
+                           StringHash, std::equal_to<>>
+            by_key;
         OrderedDeadlineList ordered_list;
     };
 
     struct PinnedKeyShard {
         mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, PinnedKeyRecord> by_key;
+        std::unordered_map<std::string, PinnedKeyRecord,
+                           StringHash, std::equal_to<>>
+            by_key;
         OrderedDeadlineList ordered_list;
     };
 
-    size_t HashKey(std::string_view key) const;
-    PendingWriteShard& GetPendingWriteShard(std::string_view key);
-    PinnedKeyShard& GetPinnedKeyShard(std::string_view key);
     const std::chrono::milliseconds& lease_duration() const {
         return lease_duration_;
     }
@@ -473,15 +480,15 @@ class DataManager {
     size_t ScanExpiredPendingWrites(PendingWriteShard& shard, TimePoint now);
     size_t ScanExpiredPinnedKeys(PinnedKeyShard& shard, TimePoint now);
     bool ErasePendingWriteLocked(PendingWriteShard& shard,
-                                 const std::string& key);
-    bool ErasePinnedKeyLocked(PinnedKeyShard& shard, const std::string& key);
+                                 std::string_view key);
+    bool ErasePinnedKeyLocked(PinnedKeyShard& shard, std::string_view key);
     bool RemoveExpiredPendingWriteLocked(PendingWriteShard& shard,
-                                         const std::string& key, TimePoint now);
+                                         std::string_view key, TimePoint now);
     bool RemoveExpiredPinnedKeyLocked(PinnedKeyShard& shard,
-                                      const std::string& key, TimePoint now);
+                                      std::string_view key, TimePoint now);
     void TouchOrderedDeadlineNode(OrderedDeadlineList& ordered_list,
                                   OrderedDeadlineListIt it,
-                                  const std::string& key, TimePoint deadline);
+                                  std::string_view key, TimePoint deadline);
 
     tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandle(
         std::string_view key, const UUID& write_operation_id);

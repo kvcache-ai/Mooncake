@@ -295,7 +295,8 @@ TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
     ASSERT_FALSE(second_prewrite.has_value());
     EXPECT_EQ(second_prewrite.error(), ErrorCode::OBJECT_HAS_LEASE);
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
@@ -318,7 +319,8 @@ TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
         << "WriteCommit failed: " << toString(commit_result.error());
     EXPECT_TRUE(data_manager_->Exist(key));
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
         EXPECT_EQ(shard.by_key.count(key), 0U);
@@ -338,7 +340,8 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     ASSERT_FALSE(wrong_commit.has_value());
     EXPECT_EQ(wrong_commit.error(), ErrorCode::INVALID_WRITE);
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
@@ -366,7 +369,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         << "Second PinKey failed: " << toString(second_pin.error());
     EXPECT_EQ(first_pin->read_operation_id, second_pin->read_operation_id);
 
-    auto& shard = data_manager_->GetPinnedKeyShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
@@ -412,7 +416,8 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     ASSERT_FALSE(wrong_unpin.has_value());
     EXPECT_EQ(wrong_unpin.error(), ErrorCode::INVALID_READ);
 
-    auto& shard = data_manager_->GetPinnedKeyShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
@@ -431,7 +436,8 @@ TEST_F(DataManagerTest,
     ASSERT_TRUE(prewrite_result.has_value())
         << "PreWrite failed: " << toString(prewrite_result.error());
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::unique_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
@@ -472,7 +478,8 @@ TEST_F(DataManagerTest,
     ASSERT_TRUE(pin_result.has_value())
         << "PinKey failed: " << toString(pin_result.error());
 
-    auto& shard = data_manager_->GetPinnedKeyShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::unique_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
