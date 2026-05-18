@@ -100,6 +100,8 @@ pub struct BenchArgs {
     pub duration: Option<u64>,
     #[arg(long, default_value_t = 32, env = "MC_BENCH_WARMUP")]
     pub warmup: usize,
+    #[arg(long, default_value_t = false, env = "MC_BENCH_NO_PREFILL")]
+    pub no_prefill: bool,
     #[arg(long, default_value_t = 70, env = "MC_BENCH_READ_RATIO")]
     pub read_ratio: u8,
     #[arg(long, default_value_t = 5, env = "MC_BENCH_REPORT_INTERVAL")]

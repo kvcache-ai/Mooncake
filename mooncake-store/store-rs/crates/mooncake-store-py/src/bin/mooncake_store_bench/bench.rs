@@ -498,6 +498,7 @@ pub fn run_bench(
     let global_seed = global.seed;
     let tenant = global.tenant.clone();
     let warmup = args.warmup;
+    let no_prefill = args.no_prefill;
     let replica_count = global.replica_count;
     let mode = args.mode;
     let write_interface = args.write_interface;
@@ -618,7 +619,8 @@ pub fn run_bench(
                 let mut batch_put_from_buffers = batch_put_from_buffers;
 
                 // Pre-populate keys for get-only or mixed modes.
-                if matches!(worker_mode, BenchMode::Get | BenchMode::Mixed) {
+                // Skip if --no-prefill is set (data was pre-filled by a previous run).
+                if !no_prefill && matches!(worker_mode, BenchMode::Get | BenchMode::Mixed) {
                     let prefill_shard = if matches!(worker_mode, BenchMode::Mixed) {
                         mixed_read_shard
                     } else {
