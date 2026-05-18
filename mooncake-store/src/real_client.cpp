@@ -1057,6 +1057,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_dummy_client_monitor();
     stop_http_server();
 
     if (!client_) {
@@ -5145,6 +5146,13 @@ int RealClient::start_dummy_client_monitor() {
     return 0;
 }
 
+void RealClient::stop_dummy_client_monitor() {
+    dummy_client_monitor_running_ = false;
+    if (dummy_client_monitor_thread_.joinable()) {
+        dummy_client_monitor_thread_.join();
+    }
+    LOG(INFO) << "dummy_client_monitor_thread stopped";
+}
 int RealClient::start_ipc_server() {
     ipc_running_ = true;
     ipc_thread_ = std::jthread(&RealClient::ipc_server_func, this);
