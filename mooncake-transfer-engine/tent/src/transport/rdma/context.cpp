@@ -516,13 +516,33 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
         // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
-        cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                              (CUdeviceptr)addr);
+        result = cuPointerGetAttribute(
+            &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device ordinal: " << result;
+            return nullptr;
+        }
+
         CUdevice cuDev;
+        result = cuDeviceGet(&cuDev, devOrd);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device: " << result;
+            return nullptr;
+        }
+
         CUcontext cuCtx;
-        cuDeviceGet(&cuDev, devOrd);
-        cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
-        cuCtxSetCurrent(cuCtx);
+        result = cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to retain CUDA primary context: " << result;
+            return nullptr;
+        }
+
+        result = cuCtxSetCurrent(cuCtx);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to set CUDA context current: " << result;
+            cuDevicePrimaryCtxRelease(cuDev);
+            return nullptr;
+        }
 
         // Register GPU memory
         ibv_mr* entry =

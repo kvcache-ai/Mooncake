@@ -89,7 +89,7 @@ int FIFOEndpointStore::remove(RdmaEndPoint* ep) {
          ++iter) {
         if (iter->second.get() == ep) {
             waiting_list_.insert(iter->second);
-            iter->second->beginDestroy();
+            iter->second->beginDestroyNoLock();
             auto fifo_iter = fifo_map_[iter->first];
             fifo_list_.erase(fifo_iter);
             fifo_map_.erase(iter->first);
@@ -213,7 +213,7 @@ int SIEVEEndpointStore::remove(RdmaEndPoint* ep) {
         if (iter->second.first.get() == ep) {
             waiting_list_len_++;
             waiting_list_.insert(iter->second.first);
-            iter->second.first->beginDestroy();
+            iter->second.first->beginDestroyNoLock();
             auto fifo_iter = fifo_map_[iter->first];
             if (hand_.has_value() && hand_.value() == fifo_iter) {
                 fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt

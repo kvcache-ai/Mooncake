@@ -203,7 +203,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     RWSpinlock lock_;
 
     // Two-phase destruction: timestamp when EP entered EP_DESTROYING
-    volatile uint64_t destroy_start_time_;
+    std::atomic<uint64_t> destroy_start_time_;
 
     std::string peer_server_name_;
     std::string peer_nic_name_;
