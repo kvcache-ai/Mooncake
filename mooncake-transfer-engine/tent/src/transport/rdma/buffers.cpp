@@ -78,7 +78,8 @@ LocalBufferManager::LocalBufferManager() {}
 
 LocalBufferManager::~LocalBufferManager() { clear(); }
 
-static inline int getAccessFlags(Permission perm, bool relaxed_ordering = false) {
+static inline int getAccessFlags(Permission perm,
+                                 bool relaxed_ordering = false) {
     int access = IBV_ACCESS_LOCAL_WRITE;
     if (perm == kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -211,8 +212,8 @@ Status LocalBufferManager::addDevice(RdmaContext* context) {
     for (auto& buffer : buffer_list_) {
         auto range = buffer.first;
         auto& options = buffer.second.options;
-        auto access = getAccessFlags(options.perm,
-                                     context->isRelaxedOrderingEnabled());
+        auto access =
+            getAccessFlags(options.perm, context->isRelaxedOrderingEnabled());
         if (buffer.second.mem_reg_map.count(context)) continue;
         auto mem_reg =
             context->registerMemReg(range.addr, range.length, access);

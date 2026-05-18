@@ -164,7 +164,8 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
 }
 
 static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
-    auto disable_gpu_direct = conf->get("transports/rdma/disable_gpu_direct_rdma", false);
+    auto disable_gpu_direct =
+        conf->get("transports/rdma/disable_gpu_direct_rdma", false);
     if (disable_gpu_direct) {
         return false;
     }

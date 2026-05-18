@@ -85,11 +85,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // forward through states and never return. Failed or discarded endpoints
     // enter EP_DESTROYING and are reclaimed - they are never reset or reused.
     enum EndPointStatus {
-        EP_UNINIT,      // Initial state, not yet constructed
-        EP_HANDSHAKING, // Connection in progress
-        EP_READY,       // Connected and operational
-        EP_DESTROYING,  // Being destroyed (failed or discarded)
-        EP_DESTROYED,   // Fully destroyed
+        EP_UNINIT,       // Initial state, not yet constructed
+        EP_HANDSHAKING,  // Connection in progress
+        EP_READY,        // Connected and operational
+        EP_DESTROYING,   // Being destroyed (failed or discarded)
+        EP_DESTROYED,    // Fully destroyed
     };
 
     int reset();
@@ -116,7 +116,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     Status accept(const BootstrapDesc& peer_desc, BootstrapDesc& local_desc);
 
-    EndPointStatus status() const { return status_.load(std::memory_order_relaxed); }
+    EndPointStatus status() const {
+        return status_.load(std::memory_order_relaxed);
+    }
 
     std::vector<uint32_t> qpNum();
 

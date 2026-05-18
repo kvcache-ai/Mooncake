@@ -390,7 +390,8 @@ int RdmaContext::enable() {
 
     // Check PCIe Relaxed Ordering support from config
     // Mode: 0 = disabled, 1 = enabled if supported, 2 = auto (default)
-    auto mode = transport_.config()->get("transports/rdma/pci_relaxed_ordering", 1);
+    auto mode =
+        transport_.config()->get("transports/rdma/pci_relaxed_ordering", 1);
     if (mode != 0) {
         // Check if ibv_reg_mr_iova2 symbol is available (IBVERBS_1.8+)
         void* sym = dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2");
@@ -401,8 +402,8 @@ int RdmaContext::enable() {
         } else {
             if (mode == 1) {
                 LOG(WARNING) << "[RDMA] Relaxed ordering requested but NOT "
-                              << "supported (ibv_reg_mr_iova2 missing). "
-                              << "Falling back to strict ordering.";
+                             << "supported (ibv_reg_mr_iova2 missing). "
+                             << "Falling back to strict ordering.";
             }
             relaxed_ordering_enabled_ = false;
         }
@@ -563,8 +564,7 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
         return -1;
     }
     int access_flags = IBV_ACCESS_LOCAL_WRITE;
-    if (relaxed_ordering_enabled_) 
-        access_flags |= IBV_ACCESS_RELAXED_ORDERING;
+    if (relaxed_ordering_enabled_) access_flags |= IBV_ACCESS_RELAXED_ORDERING;
     ibv_mr* entry =
         verbs_.ibv_reg_mr_default(native_pd_, addr, length, access_flags);
     if (!entry) {

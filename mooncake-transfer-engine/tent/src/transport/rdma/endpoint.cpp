@@ -33,7 +33,8 @@
 
 namespace mooncake {
 namespace tent {
-static inline const std::string statusToString(RdmaEndPoint::EndPointStatus status) {
+static inline const std::string statusToString(
+    RdmaEndPoint::EndPointStatus status) {
     switch (status) {
         case RdmaEndPoint::EP_UNINIT:
             return "EP_UNINIT";
@@ -55,8 +56,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    uint16_t peer_lid, uint32_t peer_qp_num,
                                    uint16_t pkey_index);
 
-RdmaEndPoint::RdmaEndPoint()
-    : status_(EP_UNINIT) {}
+RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
     if (status_.load(std::memory_order_relaxed) != EP_UNINIT) deconstruct();
@@ -231,7 +231,8 @@ void RdmaEndPoint::beginDestroy() {
 
 void RdmaEndPoint::beginDestroyNoLock() {
     auto current_status = status_.load(std::memory_order_relaxed);
-    if (current_status == EP_DESTROYING || current_status == EP_DESTROYED) return;
+    if (current_status == EP_DESTROYING || current_status == EP_DESTROYED)
+        return;
 
     destroy_start_time_ = getCurrentTimeInNano();
     status_.store(EP_DESTROYING, std::memory_order_release);
@@ -282,7 +283,8 @@ bool RdmaEndPoint::finishDestroy() {
             }
         }
         if (has_outstanding) {
-            double elapsed = (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
+            double elapsed =
+                (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
             if (elapsed < kFinishDestroyTimeoutSec) {
                 return false;  // Still waiting for WRs to drain
             }
@@ -472,9 +474,10 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         // Endpoint already connected to a different peer - reject the request
         // instead of resetting. Endpoints have unidirectional lifecycle and
         // are never reset or reused. The caller should create a new endpoint.
-        LOG(ERROR) << "Endpoint already established with " << peer_nic_name_
-                   << " of " << peer_server_name_
-                   << ", cannot accept new connection (unidirectional lifecycle)";
+        LOG(ERROR)
+            << "Endpoint already established with " << peer_nic_name_ << " of "
+            << peer_server_name_
+            << ", cannot accept new connection (unidirectional lifecycle)";
         return mooncake::tent::Status::InternalError(
             "Endpoint already connected to different peer" LOC_MARK);
     }
@@ -548,7 +551,8 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
     {
         RWSpinlock::WriteGuard guard(lock_);
         auto curr_status = status_.load(std::memory_order_acquire);
-        if (curr_status == EP_DESTROYING || curr_status == EP_DESTROYED) return 0;
+        if (curr_status == EP_DESTROYING || curr_status == EP_DESTROYED)
+            return 0;
         if (curr_status != EP_HANDSHAKING && curr_status != EP_READY) return 0;
 
         destroy_start_time_ = getCurrentTimeInNano();
@@ -614,8 +618,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
     // Check endpoint status before submitting
-    if (status_.load(std::memory_order_relaxed) != EP_READY)
-        return 0;
+    if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
     int wr_count =
         std::min(cq->maxCqe() - cq->getQuota(),
@@ -682,8 +685,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     RWSpinlock::ReadGuard guard(lock_);
     // Check endpoint status before submitting
-    if (status_.load(std::memory_order_relaxed) != EP_READY)
-        return 0;
+    if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     if (qp_index < 0 || qp_index >= (int)qp_list_.size()) return 0;
     ibv_recv_wr wr, *bad_wr;
     memset(&wr, 0, sizeof(ibv_recv_wr));
