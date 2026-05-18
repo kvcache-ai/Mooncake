@@ -154,7 +154,6 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
     lease_scan_interval_ = std::chrono::milliseconds(
         std::max<uint32_t>(1, GetEnvOr<uint32_t>("P2P_RPC_LEASE_SCAN_INTERVAL",
                                                  kDefaultLeaseScanIntervalMs)));
-    lease_scanner_thread_ = std::thread(&DataManager::LeaseScannerMain, this);
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
               << " lock shards, local_transfer_mode="
@@ -166,6 +165,9 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
               << local_transfer_config_.local_memcpy_async_worker_num
               << ", lease_duration_ms=" << lease_duration_.count()
               << ", lease_scan_interval_ms=" << lease_scan_interval_.count();
+
+    // Start background work only after synchronous initialization completes.
+    lease_scanner_thread_ = std::thread(&DataManager::LeaseScannerMain, this);
 }
 
 DataManager::~DataManager() { Stop(); }
@@ -229,31 +231,6 @@ DataManager::PendingWriteShard& DataManager::GetPendingWriteShard(
 DataManager::PinnedKeyShard& DataManager::GetPinnedKeyShard(
     std::string_view key) {
     return pinned_key_shards_[HashKey(key) % pinned_key_shards_.size()];
-}
-
-uint64_t DataManager::TimePointToDeadlineMs(TimePoint deadline) const {
-    const auto remaining =
-        std::max(std::chrono::milliseconds::zero(),
-                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                     deadline - std::chrono::steady_clock::now()));
-    const auto system_deadline = std::chrono::system_clock::now() + remaining;
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            system_deadline.time_since_epoch())
-            .count());
-}
-
-DataManager::TimePoint DataManager::DeadlineMsToTimePoint(
-    uint64_t deadline_ms) const {
-    const auto system_deadline = std::chrono::system_clock::time_point(
-        std::chrono::milliseconds(static_cast<int64_t>(deadline_ms)));
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            system_deadline - std::chrono::system_clock::now());
-    if (remaining <= std::chrono::milliseconds::zero()) {
-        return std::chrono::steady_clock::now();
-    }
-    return std::chrono::steady_clock::now() + remaining;
 }
 
 bool DataManager::IsExpired(TimePoint deadline) const {
@@ -976,10 +953,8 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
 
     PreWriteResult result;
     result.remote_buffer = BuildRemoteBufferDesc(handle);
-    result.deadline_ms = TimePointToDeadlineMs(deadline);
     result.pending_write_token = pending_write_token;
-    timer.LogResponse("error_code=", ErrorCode::OK,
-                      "deadline_ms=", result.deadline_ms);
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
 
@@ -1077,7 +1052,6 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
 
         PinKeyResult result;
         result.remote_buffer = BuildRemoteBufferDesc(record_it->second.handle);
-        result.deadline_ms = TimePointToDeadlineMs(deadline);
         result.pin_token = record_it->second.pin_token;
         timer.LogResponse("error_code=", ErrorCode::OK,
                           "ref_count=", record_it->second.ref_count);
@@ -1105,10 +1079,8 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
 
     PinKeyResult result;
     result.remote_buffer = BuildRemoteBufferDesc(handle);
-    result.deadline_ms = TimePointToDeadlineMs(deadline);
     result.pin_token = pin_token_value;
-    timer.LogResponse("error_code=", ErrorCode::OK,
-                      "deadline_ms=", result.deadline_ms);
+    timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
 

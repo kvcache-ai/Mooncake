@@ -69,13 +69,11 @@ class DataManager {
 
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
-        uint64_t deadline_ms = 0;
         UUID pending_write_token{0, 0};
     };
 
     struct PinKeyResult {
         RemoteBufferDesc remote_buffer;
-        uint64_t deadline_ms = 0;
         UUID pin_token{0, 0};
     };
 
@@ -460,8 +458,6 @@ class DataManager {
     const std::chrono::milliseconds& lease_duration() const {
         return lease_duration_;
     }
-    uint64_t TimePointToDeadlineMs(TimePoint deadline) const;
-    TimePoint DeadlineMsToTimePoint(uint64_t deadline_ms) const;
     bool IsExpired(TimePoint deadline) const;
     RemoteBufferDesc BuildRemoteBufferDesc(
         const AllocationHandle& handle) const;
