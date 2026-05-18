@@ -5150,8 +5150,8 @@ void RealClient::stop_dummy_client_monitor() {
     dummy_client_monitor_running_ = false;
     if (dummy_client_monitor_thread_.joinable()) {
         dummy_client_monitor_thread_.join();
+        LOG(INFO) << "dummy_client_monitor_thread stopped";
     }
-    LOG(INFO) << "dummy_client_monitor_thread stopped";
 }
 int RealClient::start_ipc_server() {
     ipc_running_ = true;
