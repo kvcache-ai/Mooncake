@@ -115,7 +115,7 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
     return ErrorCode::OK;
 }
 
-bool IsZeroUuid(const UUID& uuid) {
+bool IsZeroUUID(const UUID& uuid) {
     return uuid.first == 0 && uuid.second == 0;
 }
 
@@ -149,11 +149,16 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
             local_transfer_config_.local_memcpy_async_worker_num);
     }
 
-    lease_duration_ = std::chrono::milliseconds(GetEnvOr<uint32_t>(
-        "P2P_RPC_LEASE_DURATION_MS", kDefaultLeaseDurationMs));
+    lease_duration_ = std::chrono::milliseconds(
+        local_transfer_config_.p2p_key_lease_duration_ms > 0
+            ? local_transfer_config_.p2p_key_lease_duration_ms
+            : kDefaultLeaseDurationMs);
+    const uint32_t scan_ms =
+        local_transfer_config_.p2p_key_lease_scan_interval_ms > 0
+            ? local_transfer_config_.p2p_key_lease_scan_interval_ms
+            : kDefaultLeaseScanIntervalMs;
     lease_scan_interval_ = std::chrono::milliseconds(
-        std::max<uint32_t>(1, GetEnvOr<uint32_t>("P2P_RPC_LEASE_SCAN_INTERVAL",
-                                                 kDefaultLeaseScanIntervalMs)));
+        std::max<uint32_t>(1, scan_ms));
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
               << " lock shards, local_transfer_mode="
@@ -163,8 +168,8 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
               << ", te_endpoint=" << local_transfer_config_.te_endpoint
               << ", async_memcpy_workers="
               << local_transfer_config_.local_memcpy_async_worker_num
-              << ", lease_duration_ms=" << lease_duration_.count()
-              << ", lease_scan_interval_ms=" << lease_scan_interval_.count();
+              << ", p2p_key_lease_duration_ms=" << lease_duration_.count()
+              << ", p2p_key_lease_scan_interval_ms=" << lease_scan_interval_.count();
 
     // Start background work only after synchronous initialization completes.
     lease_scanner_thread_ = std::thread(&DataManager::LeaseScannerMain, this);
@@ -350,14 +355,14 @@ size_t DataManager::ScanExpiredPinnedKeys(PinnedKeyShard& shard,
 }
 
 tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPendingWriteHandle(
-    std::string_view key, const UUID& pending_write_token) {
+    std::string_view key, const UUID& write_operation_id) {
     return LookupPendingWriteHandleInternal(BuildKeyCtx(key),
-                                            pending_write_token);
+                                            write_operation_id);
 }
 
 tl::expected<AllocationHandle, ErrorCode>
 DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
-                                              const UUID& pending_write_token) {
+                                              const UUID& write_operation_id) {
     const auto now = std::chrono::steady_clock::now();
     auto& shard = GetPendingWriteShard(ctx);
     std::shared_lock shard_lock(shard.mutex);
@@ -368,20 +373,20 @@ DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
     if (it->second.deadline <= now) {
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
-    if (it->second.pending_write_token != pending_write_token) {
+    if (it->second.write_operation_id != write_operation_id) {
         return tl::unexpected(ErrorCode::INVALID_WRITE);
     }
     return it->second.handle;
 }
 
 tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPinnedKeyHandle(
-    std::string_view key, const UUID& pin_token) {
-    return LookupPinnedKeyHandleInternal(BuildKeyCtx(key), pin_token);
+    std::string_view key, const UUID& read_operation_id) {
+    return LookupPinnedKeyHandleInternal(BuildKeyCtx(key), read_operation_id);
 }
 
 tl::expected<AllocationHandle, ErrorCode>
 DataManager::LookupPinnedKeyHandleInternal(const KeyCtx& ctx,
-                                           const UUID& pin_token) {
+                                           const UUID& read_operation_id) {
     const auto now = std::chrono::steady_clock::now();
     auto& shard = GetPinnedKeyShard(ctx);
     std::shared_lock shard_lock(shard.mutex);
@@ -392,26 +397,26 @@ DataManager::LookupPinnedKeyHandleInternal(const KeyCtx& ctx,
     if (it->second.deadline <= now) {
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
-    if (it->second.pin_token != pin_token) {
+    if (it->second.read_operation_id != read_operation_id) {
         return tl::unexpected(ErrorCode::INVALID_READ);
     }
     return it->second.handle;
 }
 
 void DataManager::AbortPendingWrite(std::string_view key,
-                                    const UUID& pending_write_token) {
-    AbortPendingWriteInternal(BuildKeyCtx(key), pending_write_token);
+                                    const UUID& write_operation_id) {
+    AbortPendingWriteInternal(BuildKeyCtx(key), write_operation_id);
 }
 
 void DataManager::AbortPendingWriteInternal(const KeyCtx& ctx,
-                                            const UUID& pending_write_token) {
-    if (ctx.key.empty() || IsZeroUuid(pending_write_token)) return;
+                                            const UUID& write_operation_id) {
+    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) return;
     std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
     auto& shard = GetPendingWriteShard(ctx);
     std::unique_lock shard_lock(shard.mutex);
     auto it = shard.by_key.find(ctx.key_string);
     if (it == shard.by_key.end()) return;
-    if (it->second.pending_write_token != pending_write_token) return;
+    if (it->second.write_operation_id != write_operation_id) return;
     shard.ordered_list.erase(it->second.list_it);
     shard.by_key.erase(it);
 }
@@ -499,12 +504,12 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     if (!prewrite_result) {
         return tl::unexpected(prewrite_result.error());
     }
-    const UUID pending_write_token = prewrite_result->pending_write_token;
+    const UUID write_operation_id = prewrite_result->write_operation_id;
 
     auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, pending_write_token);
+        LookupPendingWriteHandleInternal(kctx, write_operation_id);
     if (!handle_result) {
-        AbortPendingWriteInternal(kctx, pending_write_token);
+        AbortPendingWriteInternal(kctx, write_operation_id);
         return tl::unexpected(handle_result.error());
     }
     AllocationHandle alloc_handle = handle_result.value();
@@ -515,13 +520,13 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         LOG(ERROR) << "SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
-        AbortPendingWriteInternal(kctx, pending_write_token);
+        AbortPendingWriteInternal(kctx, write_operation_id);
         return tl::unexpected(submit_result.error());
     }
 
     return CallableTaskHandle<void>::Create(
         [this, ctx = std::move(*submit_result), alloc_handle, kctx,
-         pending_write_token]() mutable -> tl::expected<void, ErrorCode> {
+         write_operation_id]() mutable -> tl::expected<void, ErrorCode> {
             ScopedVLogTimer timer(1, "DataManager::PutViaTe");
             timer.LogRequest("key=", kctx.key);
 
@@ -530,7 +535,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                 LOG(ERROR) << "WaitAllTransferBatches failed"
                            << ", key=" << kctx.key
                            << ", error_code=" << toString(wait_result.error());
-                AbortPendingWriteInternal(kctx, pending_write_token);
+                AbortPendingWriteInternal(kctx, write_operation_id);
                 return tl::unexpected(wait_result.error());
             }
 
@@ -547,12 +552,12 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                         << "CopyFromDRAMBuffer failed"
                         << ", key=" << kctx.key
                         << ", error_code=" << toString(copy_result.error());
-                    AbortPendingWriteInternal(kctx, pending_write_token);
+                    AbortPendingWriteInternal(kctx, write_operation_id);
                     return tl::unexpected(copy_result.error());
                 }
             }
 
-            auto commit_result = WriteCommitInternal(kctx, pending_write_token);
+            auto commit_result = WriteCommitInternal(kctx, write_operation_id);
             if (!commit_result) {
                 return tl::unexpected(commit_result.error());
             }
@@ -574,18 +579,18 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     if (!prewrite_result) {
         return tl::unexpected(prewrite_result.error());
     }
-    const UUID pending_write_token = prewrite_result->pending_write_token;
+    const UUID write_operation_id = prewrite_result->write_operation_id;
 
     auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, pending_write_token);
+        LookupPendingWriteHandleInternal(kctx, write_operation_id);
     if (!handle_result) {
-        AbortPendingWriteInternal(kctx, pending_write_token);
+        AbortPendingWriteInternal(kctx, write_operation_id);
         return tl::unexpected(handle_result.error());
     }
     AllocationHandle alloc_handle = handle_result.value();
 
     auto write_fn = [this, kctx, slice, alloc_handle,
-                     pending_write_token]() -> tl::expected<void, ErrorCode> {
+                     write_operation_id]() -> tl::expected<void, ErrorCode> {
         DataSource source;
         source.buffer = std::make_unique<RefBuffer>(slice.ptr, slice.size);
         source.type = MemoryType::DRAM;
@@ -594,15 +599,15 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         if (!write_result.has_value()) {
             LOG(ERROR) << "Failed to write data for key: " << kctx.key
                        << ", error: " << write_result.error();
-            AbortPendingWriteInternal(kctx, pending_write_token);
+            AbortPendingWriteInternal(kctx, write_operation_id);
             return tl::make_unexpected(write_result.error());
         }
         return {};
     };
 
     auto commit_fn = [this, kctx,
-                      pending_write_token]() -> tl::expected<void, ErrorCode> {
-        auto commit_result = WriteCommitInternal(kctx, pending_write_token);
+                      write_operation_id]() -> tl::expected<void, ErrorCode> {
+        auto commit_result = WriteCommitInternal(kctx, write_operation_id);
         if (!commit_result) {
             LOG(ERROR) << "Failed to commit data for key: " << kctx.key
                        << ", error: " << commit_result.error();
@@ -869,12 +874,12 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
         timer.LogResponse("error_code=", prewrite_result.error());
         return tl::make_unexpected(prewrite_result.error());
     }
-    const UUID pending_write_token = prewrite_result->pending_write_token;
+    const UUID write_operation_id = prewrite_result->write_operation_id;
 
     auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, pending_write_token);
+        LookupPendingWriteHandleInternal(kctx, write_operation_id);
     if (!handle_result) {
-        AbortPendingWriteInternal(kctx, pending_write_token);
+        AbortPendingWriteInternal(kctx, write_operation_id);
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
@@ -884,12 +889,12 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     // Transfer phase — no long key lock held.
     auto transfer_result = TransferDataFromRemote(handle, src_buffers);
     if (!transfer_result) {
-        AbortPendingWriteInternal(kctx, pending_write_token);
+        AbortPendingWriteInternal(kctx, write_operation_id);
         timer.LogResponse("error_code=", transfer_result.error());
         return tl::make_unexpected(transfer_result.error());
     }
 
-    auto commit_result = WriteCommitInternal(kctx, pending_write_token);
+    auto commit_result = WriteCommitInternal(kctx, write_operation_id);
     if (!commit_result) {
         timer.LogResponse("error_code=", commit_result.error());
         return tl::make_unexpected(commit_result.error());
@@ -943,9 +948,9 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
                                               ctx.key_string, deadline);
 
-    const UUID pending_write_token = generate_uuid();
+    const UUID write_operation_id = generate_uuid();
     PendingWriteRecord record;
-    record.pending_write_token = pending_write_token;
+    record.write_operation_id = write_operation_id;
     record.deadline = deadline;
     record.handle = handle;
     record.list_it = list_it;
@@ -953,22 +958,22 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
 
     PreWriteResult result;
     result.remote_buffer = BuildRemoteBufferDesc(handle);
-    result.pending_write_token = pending_write_token;
+    result.write_operation_id = write_operation_id;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteCommit(
-    std::string_view key, const UUID& pending_write_token) {
-    return WriteCommitInternal(BuildKeyCtx(key), pending_write_token);
+    std::string_view key, const UUID& write_operation_id) {
+    return WriteCommitInternal(BuildKeyCtx(key), write_operation_id);
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
-    const KeyCtx& ctx, const UUID& pending_write_token) {
+    const KeyCtx& ctx, const UUID& write_operation_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteCommit");
     timer.LogRequest("key=", ctx.key);
 
-    if (ctx.key.empty() || IsZeroUuid(pending_write_token)) {
+    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -990,7 +995,7 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
         timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
         return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
     }
-    if (record_it->second.pending_write_token != pending_write_token) {
+    if (record_it->second.write_operation_id != write_operation_id) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_WRITE);
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
@@ -1052,7 +1057,7 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
 
         PinKeyResult result;
         result.remote_buffer = BuildRemoteBufferDesc(record_it->second.handle);
-        result.pin_token = record_it->second.pin_token;
+        result.read_operation_id = record_it->second.read_operation_id;
         timer.LogResponse("error_code=", ErrorCode::OK,
                           "ref_count=", record_it->second.ref_count);
         return result;
@@ -1068,9 +1073,9 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
                                               ctx.key_string, deadline);
 
-    const UUID pin_token_value = generate_uuid();
+    const UUID read_operation_id_value = generate_uuid();
     PinnedKeyRecord record;
-    record.pin_token = pin_token_value;
+    record.read_operation_id = read_operation_id_value;
     record.deadline = deadline;
     record.handle = handle;
     record.ref_count = 1;
@@ -1079,22 +1084,22 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
 
     PinKeyResult result;
     result.remote_buffer = BuildRemoteBufferDesc(handle);
-    result.pin_token = pin_token_value;
+    result.read_operation_id = read_operation_id_value;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
 
 tl::expected<void, ErrorCode> DataManager::UnPinKey(std::string_view key,
-                                                    const UUID& pin_token) {
-    return UnPinKeyInternal(BuildKeyCtx(key), pin_token);
+                                                    const UUID& read_operation_id) {
+    return UnPinKeyInternal(BuildKeyCtx(key), read_operation_id);
 }
 
 tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
-    const KeyCtx& ctx, const UUID& pin_token) {
+    const KeyCtx& ctx, const UUID& read_operation_id) {
     ScopedVLogTimer timer(1, "DataManager::UnPinKey");
     timer.LogRequest("key=", ctx.key);
 
-    if (ctx.key.empty() || IsZeroUuid(pin_token)) {
+    if (ctx.key.empty() || IsZeroUUID(read_operation_id)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1116,7 +1121,7 @@ tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
         timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
         return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
     }
-    if (record_it->second.pin_token != pin_token) {
+    if (record_it->second.read_operation_id != read_operation_id) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_READ);
         return tl::make_unexpected(ErrorCode::INVALID_READ);
     }

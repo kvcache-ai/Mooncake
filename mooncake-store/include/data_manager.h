@@ -51,6 +51,13 @@ struct LocalTransferConfig {
     // When mode == MEMCPY, the following parameters are used:
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
+
+    // PreWrite / PinKey key lease: max lifetime (ms) of intermediate state on a
+    // key. 0 means use DataManager built-in default.
+    uint32_t p2p_key_lease_duration_ms = 0;
+    // Background scan interval (ms) for expired key leases. 0 means use
+    // DataManager built-in default.
+    uint32_t p2p_key_lease_scan_interval_ms = 0;
 };
 
 /**
@@ -69,12 +76,12 @@ class DataManager {
 
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
-        UUID pending_write_token{0, 0};
+        UUID write_operation_id{0, 0};
     };
 
     struct PinKeyResult {
         RemoteBufferDesc remote_buffer;
-        UUID pin_token{0, 0};
+        UUID read_operation_id{0, 0};
     };
 
     /**
@@ -206,13 +213,13 @@ class DataManager {
         std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
-                                              const UUID& pending_write_token);
+                                              const UUID& write_operation_id);
 
     tl::expected<PinKeyResult, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<void, ErrorCode> UnPinKey(std::string_view key,
-                                           const UUID& pin_token);
+                                           const UUID& read_operation_id);
 
     // ================================================================
     // Utilities
@@ -261,18 +268,18 @@ class DataManager {
     tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
         const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id);
     tl::expected<void, ErrorCode> WriteCommitInternal(
-        const KeyCtx& ctx, const UUID& pending_write_token);
+        const KeyCtx& ctx, const UUID& write_operation_id);
     tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
         const KeyCtx& ctx, std::optional<UUID> tier_id);
     tl::expected<void, ErrorCode> UnPinKeyInternal(const KeyCtx& ctx,
-                                                   const UUID& pin_token);
+                                                   const UUID& read_operation_id);
 
     tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandleInternal(
-        const KeyCtx& ctx, const UUID& pending_write_token);
+        const KeyCtx& ctx, const UUID& write_operation_id);
     tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandleInternal(
-        const KeyCtx& ctx, const UUID& pin_token);
+        const KeyCtx& ctx, const UUID& read_operation_id);
     void AbortPendingWriteInternal(const KeyCtx& ctx,
-                                   const UUID& pending_write_token);
+                                   const UUID& write_operation_id);
 
     std::shared_mutex& GetKeyLock(std::string_view key) {
         size_t hash = std::hash<std::string_view>{}(key);
@@ -426,14 +433,14 @@ class DataManager {
     using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
 
     struct PendingWriteRecord {
-        UUID pending_write_token{0, 0};
+        UUID write_operation_id{0, 0};
         TimePoint deadline{};
         AllocationHandle handle;
         OrderedDeadlineListIt list_it;
     };
 
     struct PinnedKeyRecord {
-        UUID pin_token{0, 0};
+        UUID read_operation_id{0, 0};
         TimePoint deadline{};
         AllocationHandle handle;
         uint32_t ref_count = 1;
@@ -477,11 +484,11 @@ class DataManager {
                                   const std::string& key, TimePoint deadline);
 
     tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandle(
-        std::string_view key, const UUID& pending_write_token);
+        std::string_view key, const UUID& write_operation_id);
     tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandle(
-        std::string_view key, const UUID& pin_token);
+        std::string_view key, const UUID& read_operation_id);
     void AbortPendingWrite(std::string_view key,
-                           const UUID& pending_write_token);
+                           const UUID& write_operation_id);
 
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager

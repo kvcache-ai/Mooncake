@@ -7,6 +7,7 @@
 #include "real_client.h"
 
 #include <cstdlib>  // for atexit
+#include <cstdint>
 #include <map>
 
 #include "integration_utils.h"
@@ -1109,6 +1110,8 @@ PYBIND11_MODULE(store, m) {
                size_t async_sender_thread_count = 0,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
+               uint32_t p2p_key_lease_duration_ms = 2000,
+               uint32_t p2p_key_lease_scan_interval_ms = 500,
                const py::object& engine = py::none()) {
                 auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = false;
@@ -1134,7 +1137,8 @@ PYBIND11_MODULE(store, m) {
                     local_transfer_mode, local_memcpy_async_worker_num,
                     metrics_port, enable_metrics_http, {},
                     async_sender_thread_count, async_max_batch_size,
-                    async_route_queue_size);
+                    async_route_queue_size, p2p_key_lease_duration_ms,
+                    p2p_key_lease_scan_interval_ms);
 
                 auto ret = real_client->setup(config);
                 self.store_ = real_client;
@@ -1155,6 +1159,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("async_sender_thread_count") = 0,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
+            py::arg("p2p_key_lease_duration_ms") = 2000,
+            py::arg("p2p_key_lease_scan_interval_ms") = 500,
             py::arg("engine") = py::none(),
             "Setup the store in P2P architecture.")
         .def(

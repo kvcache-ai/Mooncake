@@ -254,6 +254,10 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         local_transfer_config.local_memcpy_async_worker_num =
             config.local_memcpy_async_worker_num;
     }
+    local_transfer_config.p2p_key_lease_duration_ms =
+        config.p2p_key_lease_duration_ms;
+    local_transfer_config.p2p_key_lease_scan_interval_ms =
+        config.p2p_key_lease_scan_interval_ms;
 
     data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
                           config.lock_shard_count, local_transfer_config);

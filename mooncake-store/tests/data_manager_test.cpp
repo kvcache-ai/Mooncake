@@ -300,8 +300,8 @@ TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
         ASSERT_NE(it, shard.by_key.end());
-        EXPECT_EQ(it->second.pending_write_token,
-                  prewrite_result->pending_write_token);
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
     }
 }
 
@@ -313,7 +313,7 @@ TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
         << "PreWrite failed: " << toString(prewrite_result.error());
 
     auto commit_result =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_TRUE(commit_result.has_value())
         << "WriteCommit failed: " << toString(commit_result.error());
     EXPECT_TRUE(data_manager_->Exist(key));
@@ -332,7 +332,7 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     ASSERT_TRUE(prewrite_result.has_value())
         << "PreWrite failed: " << toString(prewrite_result.error());
 
-    UUID wrong_token = prewrite_result->pending_write_token;
+    UUID wrong_token = prewrite_result->write_operation_id;
     wrong_token.first += 1;
     auto wrong_commit = data_manager_->WriteCommit(key, wrong_token);
     ASSERT_FALSE(wrong_commit.has_value());
@@ -343,8 +343,8 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
         std::shared_lock shard_lock(shard.mutex);
         auto it = shard.by_key.find(key);
         ASSERT_NE(it, shard.by_key.end());
-        EXPECT_EQ(it->second.pending_write_token,
-                  prewrite_result->pending_write_token);
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
     }
 }
 
@@ -364,7 +364,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     auto second_pin = data_manager_->PinKey(key, GetTierId());
     ASSERT_TRUE(second_pin.has_value())
         << "Second PinKey failed: " << toString(second_pin.error());
-    EXPECT_EQ(first_pin->pin_token, second_pin->pin_token);
+    EXPECT_EQ(first_pin->read_operation_id, second_pin->read_operation_id);
 
     auto& shard = data_manager_->GetPinnedKeyShard(key);
     {
@@ -374,7 +374,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         EXPECT_EQ(it->second.ref_count, 2U);
     }
 
-    auto first_unpin = data_manager_->UnPinKey(key, first_pin->pin_token);
+    auto first_unpin = data_manager_->UnPinKey(key, first_pin->read_operation_id);
     ASSERT_TRUE(first_unpin.has_value())
         << "First UnPinKey failed: " << toString(first_unpin.error());
     {
@@ -384,7 +384,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         EXPECT_EQ(it->second.ref_count, 1U);
     }
 
-    auto second_unpin = data_manager_->UnPinKey(key, second_pin->pin_token);
+    auto second_unpin = data_manager_->UnPinKey(key, second_pin->read_operation_id);
     ASSERT_TRUE(second_unpin.has_value())
         << "Second UnPinKey failed: " << toString(second_unpin.error());
     {
@@ -406,7 +406,7 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     ASSERT_TRUE(pin_result.has_value())
         << "PinKey failed: " << toString(pin_result.error());
 
-    UUID wrong_token = pin_result->pin_token;
+    UUID wrong_token = pin_result->read_operation_id;
     wrong_token.first += 1;
     auto wrong_unpin = data_manager_->UnPinKey(key, wrong_token);
     ASSERT_FALSE(wrong_unpin.has_value());
@@ -418,7 +418,7 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
         auto it = shard.by_key.find(key);
         ASSERT_NE(it, shard.by_key.end());
         EXPECT_EQ(it->second.ref_count, 1U);
-        EXPECT_EQ(it->second.pin_token, pin_result->pin_token);
+        EXPECT_EQ(it->second.read_operation_id, pin_result->read_operation_id);
     }
 }
 
@@ -443,7 +443,7 @@ TEST_F(DataManagerTest,
     }
 
     auto commit_result =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_FALSE(commit_result.has_value());
     EXPECT_EQ(commit_result.error(), ErrorCode::LEASE_EXPIRED);
 
@@ -483,7 +483,7 @@ TEST_F(DataManagerTest,
         it->second.list_it->second = expired_deadline;
     }
 
-    auto unpin_result = data_manager_->UnPinKey(key, pin_result->pin_token);
+    auto unpin_result = data_manager_->UnPinKey(key, pin_result->read_operation_id);
     ASSERT_FALSE(unpin_result.has_value());
     EXPECT_EQ(unpin_result.error(), ErrorCode::LEASE_EXPIRED);
 
