@@ -31,6 +31,18 @@ MasterMetricManager::MasterMetricManager()
       mem_total_capacity_per_segment_(
           "segment_total_capacity_bytes",
           "Total memory capacity of the mounted segment", {"segment"}),
+      nof_allocated_size_(
+          "master_nof_allocated_bytes",
+          "Total nof ssd bytes currently allocated across all segments"),
+      nof_total_capacity_("master_total_nof_capacity_bytes",
+                          "Total nof ssd capacity across all mounted segments"),
+      nof_allocated_size_per_segment_(
+          "nof_segment_allocated_bytes",
+          "Total nof ssd bytes currently allocated of the segment",
+          {"segment"}),
+      nof_total_capacity_per_segment_(
+          "nof_segment_total_capacity_bytes",
+          "Total nof ssd capacity of the mounted segment", {"segment"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
@@ -113,10 +125,44 @@ MasterMetricManager::MasterMetricManager()
       remount_segment_failures_(
           "master_remount_segment_failures_total",
           "Total number of failed RemountSegment requests"),
+      mount_nof_segment_requests_(
+          "master_mount_nof_segment_requests_total",
+          "Total number of MountNoFSegment requests received"),
+      mount_nof_segment_failures_(
+          "master_mount_nof_segment_failures_total",
+          "Total number of failed MountNoFSegment requests"),
+      unmount_nof_segment_requests_(
+          "master_unmount_nof_segment_requests_total",
+          "Total number of UnmountNoFSegment requests received"),
+      unmount_nof_segment_failures_(
+          "master_unmount_nof_segment_failures_total",
+          "Total number of failed UnmountNoFSegment requests"),
+      remount_nof_segment_requests_(
+          "master_remount_nof_segment_requests_total",
+          "Total number of RemountNoFSegment requests received"),
+      remount_nof_segment_failures_(
+          "master_remount_nof_segment_failures_total",
+          "Total number of failed RemountNoFSegment requests"),
       ping_requests_("master_ping_requests_total",
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+      nof_heartbeat_success_total_(
+          "master_nof_heartbeat_success_total",
+          "Total number of successful NoF heartbeat probes"),
+      nof_heartbeat_failure_total_(
+          "master_nof_heartbeat_failure_total",
+          "Total number of failed NoF heartbeat probes"),
+      nof_heartbeat_timeout_total_(
+          "master_nof_heartbeat_timeout_total",
+          "Total number of timed out NoF heartbeat probes"),
+      nof_segments_unmounted_by_heartbeat_total_(
+          "master_nof_segments_unmounted_by_heartbeat_total",
+          "Total number of NoF segments unmounted due to heartbeat failures"),
+      nof_heartbeat_probe_latency_ms_(
+          "master_nof_heartbeat_probe_latency_ms",
+          "Latency distribution of NoF heartbeat probes in milliseconds",
+          {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000}),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -236,6 +282,7 @@ MasterMetricManager::MasterMetricManager()
       total_get_nums_("total_get_nums_", "Total number of get operations"),
 
       // Initialize Eviction Counters
+      // total eviction
       eviction_success_("master_successful_evictions_total",
                         "Total number of successful eviction operations"),
       eviction_attempts_("master_attempted_evictions_total",
@@ -244,6 +291,28 @@ MasterMetricManager::MasterMetricManager()
                          "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects"),
+      // mem eviction
+      mem_eviction_success_(
+          "master_successful_evictions_mem",
+          "Total number of successful eviction operations in mem"),
+      mem_eviction_attempts_(
+          "master_attempted_evictions_mem",
+          "Total number of attempted eviction operations in mem"),
+      mem_evicted_key_count_("master_evicted_key_count_mem",
+                             "Total number of keys evicted in mem"),
+      mem_evicted_size_("master_evicted_size_bytes_mem",
+                        "Total bytes of evicted objects in mem"),
+      // nof eviction
+      nof_eviction_success_(
+          "master_successful_evictions_nof",
+          "Total number of successful eviction operations in nof"),
+      nof_eviction_attempts_(
+          "master_attempted_evictions_nof",
+          "Total number of attempted eviction operations in nof"),
+      nof_evicted_key_count_("master_evicted_key_count_nof",
+                             "Total number of keys evicted in nof"),
+      nof_evicted_size_("master_evicted_size_bytes_nof",
+                        "Total bytes of evicted objects in nof"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -454,6 +523,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
+    nof_heartbeat_probe_latency_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -535,6 +605,76 @@ double MasterMetricManager::get_segment_mem_used_ratio(
     const std::string& segment) {
     double allocated = get_segment_allocated_mem_size(segment);
     double capacity = get_segment_total_mem_capacity(segment);
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+// NoF segment Metrics
+void MasterMetricManager::inc_allocated_nof_size(const std::string& segment,
+                                                 int64_t val) {
+    nof_allocated_size_.inc(val);
+    if (!segment.empty()) nof_allocated_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_nof_size(const std::string& segment,
+                                                 int64_t val) {
+    nof_allocated_size_.dec(val);
+    if (!segment.empty()) nof_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_allocated_nof_size() {
+    nof_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_nof_capacity(const std::string& segment,
+                                                 int64_t val) {
+    nof_total_capacity_.inc(val);
+    if (!segment.empty()) nof_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_nof_capacity(const std::string& segment,
+                                                 int64_t val) {
+    nof_total_capacity_.dec(val);
+    if (!segment.empty()) nof_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_nof_capacity() {
+    nof_total_capacity_.reset();
+}
+
+int64_t MasterMetricManager::get_allocated_nof_size() {
+    return nof_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_nof_capacity() {
+    return nof_total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_nof_used_ratio(void) {
+    double allocated = nof_allocated_size_.value();
+    double capacity = nof_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_nof_size(
+    const std::string& segment) {
+    return nof_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_nof_capacity(
+    const std::string& segment) {
+    return nof_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_nof_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_nof_size(segment);
+    double capacity = get_segment_total_nof_capacity(segment);
     if (capacity == 0) {
         return 0.0;
     }
@@ -697,11 +837,23 @@ void MasterMetricManager::inc_mount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_mount_segment_failures(int64_t val) {
     mount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_mount_nof_segment_requests(int64_t val) {
+    mount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_mount_nof_segment_failures(int64_t val) {
+    mount_nof_segment_failures_.inc(val);
+}
 void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
     unmount_segment_requests_.inc(val);
 }
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
+}
+void MasterMetricManager::inc_unmount_nof_segment_requests(int64_t val) {
+    unmount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_unmount_nof_segment_failures(int64_t val) {
+    unmount_nof_segment_failures_.inc(val);
 }
 void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
     remount_segment_requests_.inc(val);
@@ -709,11 +861,39 @@ void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
     remount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_remount_nof_segment_requests(int64_t val) {
+    remount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_remount_nof_segment_failures(int64_t val) {
+    remount_nof_segment_failures_.inc(val);
+}
 void MasterMetricManager::inc_ping_requests(int64_t val) {
     ping_requests_.inc(val);
 }
 void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_success_total(int64_t val) {
+    nof_heartbeat_success_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_failure_total(int64_t val) {
+    nof_heartbeat_failure_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_timeout_total(int64_t val) {
+    nof_heartbeat_timeout_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_segments_unmounted_by_heartbeat_total(
+    int64_t val) {
+    nof_segments_unmounted_by_heartbeat_total_.inc(val);
+}
+
+void MasterMetricManager::observe_nof_heartbeat_probe_latency_ms(
+    int64_t latency_ms) {
+    nof_heartbeat_probe_latency_ms_.observe(latency_ms);
 }
 
 // Batch Operation Statistics (Counters)
@@ -1091,6 +1271,30 @@ void MasterMetricManager::inc_eviction_success(int64_t key_count,
 
 void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
 
+void MasterMetricManager::inc_mem_eviction_success(int64_t key_count,
+                                                   int64_t size) {
+    mem_evicted_key_count_.inc(key_count);
+    mem_evicted_size_.inc(size);
+    mem_eviction_success_.inc();
+    mem_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_mem_eviction_fail() {
+    mem_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_nof_eviction_success(int64_t key_count,
+                                                   int64_t size) {
+    nof_evicted_key_count_.inc(key_count);
+    nof_evicted_size_.inc(size);
+    nof_eviction_success_.inc();
+    nof_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_nof_eviction_fail() {
+    nof_eviction_attempts_.inc();
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -1105,6 +1309,38 @@ int64_t MasterMetricManager::get_evicted_key_count() {
 
 int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_mem_eviction_success() {
+    return mem_eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_mem_eviction_attempts() {
+    return mem_eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_mem_evicted_key_count() {
+    return mem_evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_mem_evicted_size() {
+    return mem_evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_nof_eviction_success() {
+    return nof_eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_nof_eviction_attempts() {
+    return nof_eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_nof_evicted_key_count() {
+    return nof_evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_nof_evicted_size() {
+    return nof_evicted_size_.value();
 }
 
 // PutStart Discard Metrics Getters
@@ -1329,6 +1565,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(remount_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
+    serialize_metric(nof_heartbeat_success_total_);
+    serialize_metric(nof_heartbeat_failure_total_);
+    serialize_metric(nof_heartbeat_timeout_total_);
+    serialize_metric(nof_segments_unmounted_by_heartbeat_total_);
+    serialize_metric(nof_heartbeat_probe_latency_ms_);
 
     // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // Counters
@@ -1474,6 +1715,8 @@ std::string MasterMetricManager::get_summary_string(
     // --- Get current values ---
     int64_t mem_allocated = mem_allocated_size_.value();
     int64_t mem_capacity = mem_total_capacity_.value();
+    int64_t nof_allocated = nof_allocated_size_.value();
+    int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
@@ -1575,10 +1818,21 @@ std::string MasterMetricManager::get_summary_string(
         batch_replica_clear_failed_items_.value();
 
     // Eviction counters
+    // Total counters
     int64_t eviction_success = eviction_success_.value();
     int64_t eviction_attempts = eviction_attempts_.value();
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
+    // Mem eviction counters
+    int64_t mem_eviction_success = mem_eviction_success_.value();
+    int64_t mem_eviction_attempts = mem_eviction_attempts_.value();
+    int64_t mem_evicted_key_count = mem_evicted_key_count_.value();
+    int64_t mem_evicted_size = mem_evicted_size_.value();
+    // NoF eviction counters
+    int64_t nof_eviction_success = nof_eviction_success_.value();
+    int64_t nof_eviction_attempts = nof_eviction_attempts_.value();
+    int64_t nof_evicted_key_count = nof_evicted_key_count_.value();
+    int64_t nof_evicted_size = nof_evicted_size_.value();
 
     // Ping counters
     int64_t ping = ping_requests_.value();
@@ -1683,6 +1937,14 @@ std::string MasterMetricManager::get_summary_string(
     current_counters.eviction_attempts = eviction_attempts;
     current_counters.evicted_key_count = evicted_key_count;
     current_counters.evicted_size = evicted_size;
+    current_counters.mem_eviction_success = mem_eviction_success;
+    current_counters.mem_eviction_attempts = mem_eviction_attempts;
+    current_counters.mem_evicted_key_count = mem_evicted_key_count;
+    current_counters.mem_evicted_size = mem_evicted_size;
+    current_counters.nof_eviction_success = nof_eviction_success;
+    current_counters.nof_eviction_attempts = nof_eviction_attempts;
+    current_counters.nof_evicted_key_count = nof_evicted_key_count;
+    current_counters.nof_evicted_size = nof_evicted_size;
     current_counters.ping = ping;
     current_counters.ping_fails = ping_fails;
     current_counters.mark_task_to_complete_requests =
@@ -1744,6 +2006,12 @@ std::string MasterMetricManager::get_summary_string(
     if (mem_capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
+    }
+    ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
+       << byte_size_to_string(nof_capacity);
+    if (nof_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
@@ -1959,6 +2227,20 @@ std::string MasterMetricManager::get_summary_string(
        << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
        << "keys=" << delta(&SummaryCounters::evicted_key_count) << ", "
        << "size=" << byte_size_to_string(delta(&SummaryCounters::evicted_size));
+    // mem eviction
+    ss << " | Mem Eviction: "
+       << "Success/Attempts=" << delta(&SummaryCounters::mem_eviction_success)
+       << "/" << delta(&SummaryCounters::mem_eviction_attempts) << ", "
+       << "keys=" << delta(&SummaryCounters::mem_evicted_key_count) << ", "
+       << "size="
+       << byte_size_to_string(delta(&SummaryCounters::mem_evicted_size));
+    // nof eviction
+    ss << " | NoF Eviction: "
+       << "Success/Attempts=" << delta(&SummaryCounters::nof_eviction_success)
+       << "/" << delta(&SummaryCounters::nof_eviction_attempts) << ", "
+       << "keys=" << delta(&SummaryCounters::nof_evicted_key_count) << ", "
+       << "size="
+       << byte_size_to_string(delta(&SummaryCounters::nof_evicted_size));
 
     // Discard summary
     ss << " | Discard: "
