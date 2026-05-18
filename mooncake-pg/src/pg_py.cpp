@@ -103,7 +103,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"));
+             py::arg("is_extension"))
+        .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
+             py::arg("is_extension"), py::arg("max_world_size"));
 }
 
 }  // namespace mooncake

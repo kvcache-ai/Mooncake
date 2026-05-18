@@ -61,11 +61,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
             : activeRanks_{activeRanks} {}
         MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
             : activeRanks_{activeRanks}, isExtension_{isExtension} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxWorldSize)
+            : activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxWorldSize_{maxWorldSize} {}
 
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
         bool isExtension_ = false;
+        // Optional upper bound for connection polling / reserved rank slots.
+        // When > 0, the backend may pre-size internal rank metadata to this
+        // value (while PyTorch's group_size() remains unchanged).
+        int maxWorldSize_ = -1;
     };
 
     /**
@@ -87,7 +96,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const override { return meta_ ? meta_->size : size_; }
+    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.

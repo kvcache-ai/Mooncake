@@ -183,7 +183,8 @@
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
 - `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+
-- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: 启用 Rust 支持
+- `-DWITH_RUST_EXAMPLE=[ON|OFF]`: 编译 Transfer Engine Rust 接口与示例代码，默认关闭。
+- `-DWITH_STORE_RUST=[ON|OFF]`: 编译 Mooncake Store Rust 绑定和 CMake Rust targets，默认开启。
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
 - `-DUSE_ETCD=[ON|OFF]`: 启用基于 etcd 的元数据服务，需要 go 1.23+

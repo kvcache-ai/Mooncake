@@ -208,6 +208,47 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
+    const UUID& segment_id) {
+    auto it = segment_manager_->mounted_segments_.find(segment_id);
+    if (it == segment_manager_->mounted_segments_.end()) {
+        LOG(WARNING) << "segment_id=" << segment_id
+                     << ", warn=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto status = it->second.status;
+    if (status == SegmentStatus::UNMOUNTING) {
+        LOG(ERROR) << "segment_id=" << segment_id
+                   << ", error=segment_is_unmounting";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (status == SegmentStatus::GRACEFULLY_UNMOUNTING) {
+        // Idempotent: already in graceful unmount state
+        return ErrorCode::OK;
+    }
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
+        LOG(ERROR) << "segment_id=" << segment_id
+                   << ", error=unavailable_in_current_status, status="
+                   << status;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    auto& mounted_segment = it->second;
+    auto& segment = mounted_segment.segment;
+
+    // Remove the allocator from the segment manager
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        mounted_segment.buf_allocator;
+    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
+                     allocator)) {
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             allocator);
+    }
+    // Set the segment status to GRACEFULLY_UNMOUNTING
+    mounted_segment.status = SegmentStatus::GRACEFULLY_UNMOUNTING;
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     const size_t& metrics_dec_capacity) {
@@ -237,9 +278,14 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
-        // Also remove from segment_name_client_id_map_
-        segment_manager_->client_by_name_.erase(segment_name);
-        segment_manager_->segment_id_by_name_.erase(segment_name);
+        auto segment_id_by_name_it =
+            segment_manager_->segment_id_by_name_.find(segment_name);
+        if (segment_id_by_name_it !=
+                segment_manager_->segment_id_by_name_.end() &&
+            segment_id_by_name_it->second == segment_id) {
+            segment_manager_->segment_id_by_name_.erase(segment_id_by_name_it);
+            segment_manager_->client_by_name_.erase(segment_name);
+        }
         is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_
@@ -946,6 +992,17 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
     }
     auto mounted_segment_it =
         segment_manager_->mounted_segments_.find(segment_id_it->second);
+    if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted_segment_it->second.status;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::GetSegmentStatusById(
+    const UUID& segment_id, SegmentStatus& status) const {
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id);
     if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }

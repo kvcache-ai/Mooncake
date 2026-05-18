@@ -588,6 +588,25 @@ Gets the list of pending transfer notifications received from other nodes.
 **Returns:**
 - `List[TransferNotify]`: List of notification objects containing name and message
 
+#### send_probe()
+
+```python
+send_probe(peer_server_name)
+```
+
+Sends a lightweight JSON-RPC probe to a peer to verify reachability. Used to
+test whether a previously-unreachable peer has recovered (e.g. SGLang's
+`MooncakeKVManager` uses this to clear entries from its `failed_sessions`
+blacklist).
+
+**Parameters:**
+- `peer_server_name` (str): Peer hostname in `host:port` form, as registered
+  with the metadata server.
+
+**Returns:**
+- `int`: 0 on success, non-zero on failure (peer unknown, unreachable, or
+  RPC error).
+
 ## Environment Variables
 
 The Transfer Engine respects the following environment variables:

@@ -100,6 +100,10 @@ class MasterService {
     auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
+    auto GracefulUnmountSegment(const UUID& segment_id, const UUID& client_id,
+                                uint64_t grace_period_ms)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
@@ -494,6 +498,12 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+
+    /**
+     * @brief Query current segment lifecycle state by segment id.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
 
     /**
      * @brief Query the status of a task
@@ -938,6 +948,36 @@ class MasterService {
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       Replica& replica);
+
+    // Graceful unmount scheduler
+    class GracefulUnmountScheduler {
+       public:
+        explicit GracefulUnmountScheduler(MasterService* service);
+        ~GracefulUnmountScheduler();
+        void Schedule(const UUID& segment_id, const UUID& client_id,
+                      std::chrono::steady_clock::time_point expire_time);
+        void RemoveClientRecords(const UUID& client_id);
+        void Stop();
+
+       private:
+        void TimerLoop();
+        struct Record {
+            UUID segment_id;
+            UUID client_id;
+            std::chrono::steady_clock::time_point expire_time;
+            bool operator>(const Record& other) const {
+                return expire_time > other.expire_time;
+            }
+        };
+        MasterService* service_;
+        std::mutex mutex_;
+        std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
+            queue_;
+        std::thread timer_thread_;
+        std::atomic<bool> timer_running_{false};
+        bool stopping_{false};
+        std::condition_variable timer_cv_;
+    } graceful_unmount_scheduler_;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
