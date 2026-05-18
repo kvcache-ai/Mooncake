@@ -34,6 +34,8 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    # Copy async_store.py
+    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
