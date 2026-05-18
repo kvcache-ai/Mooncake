@@ -26,6 +26,14 @@ class PromotionOnHitTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
+    // Friend access to MasterService::promotion_admission_threshold_, which
+    // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
+    // subclasses are not, hence this static funnel.
+    static uint32_t GetPromotionAdmissionThresholdForTesting(
+        MasterService* service) {
+        return service->promotion_admission_threshold_;
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
@@ -1499,6 +1507,150 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
         << "saturated by the dead holder's task for "
         << "put_start_release_timeout_sec_ seconds, and this admission "
         << "is dropped.";
+
+    service->RemoveAll();
+}
+
+// promotion_admission_threshold=0 would silently bypass the frequency
+// gate (`freq < 0` is never true for uint8_t freq), letting every Get
+// on a LOCAL_DISK-only key admit a promotion. master.cpp clamps the
+// flag at parse time, and MasterService's constructor adds a
+// defense-in-depth clamp for direct-construction paths (tests,
+// embedded users). Verify the clamp lifts 0 → 1.
+TEST_F(PromotionOnHitTest, AdmissionThresholdZeroClampsToOne) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 0;  // would bypass the gate
+    auto service = std::make_unique<MasterService>(config);
+    EXPECT_EQ(GetPromotionAdmissionThresholdForTesting(service.get()), 1u)
+        << "threshold=0 must be clamped to 1; otherwise every Get-on-"
+        << "LOCAL_DISK admits a promotion and the frequency gate is "
+        << "silently disabled.";
+}
+
+// promotion_admission_threshold above the CountMinSketch saturating
+// max (255) would make the gate unreachable (freq saturates at 255,
+// `255 < 256` is true forever → no admissions). Verify the constructor
+// clamps high too.
+TEST_F(PromotionOnHitTest, AdmissionThresholdAboveMaxClampsToMax) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1000;  // > 255
+    auto service = std::make_unique<MasterService>(config);
+    EXPECT_EQ(GetPromotionAdmissionThresholdForTesting(service.get()), 255u)
+        << "threshold above the CountMinSketch counter max (255) must "
+        << "be clamped to 255; otherwise the gate is unreachable.";
+}
+
+// Remove(force=true) on a key with an in-flight PromotionTask must
+// drop the task entry alongside the metadata, so promotion_in_flight_
+// is decremented immediately rather than pinned for ~10 min until the
+// reaper sweeps. With queue_limit=1, the test admits one task, removes
+// the key, then admits a second task on a different key — only
+// succeeds if the slot was freed.
+TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;  // makes the slot observable
+    config.default_kv_lease_ttl = 5000;
+    // Long task TTL so any cap-slot reclaim must come from the
+    // metadata-erase path, not the reaper.
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
+                                       1024, holder.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
+                                       1024, holder.segment_name));
+
+    // Admit task 1.
+    {
+        auto r = service->GetReplicaList("k_first");
+        ASSERT_TRUE(r.has_value());
+    }
+    {
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_EQ(pending->count("k_first"), 1u);
+    }
+
+    // Remove k_first with force=true. With the fix, this also wipes
+    // k_first's promotion_tasks entry and decrements
+    // promotion_in_flight_ back to 0.
+    auto rm = service->Remove("k_first", /*force=*/true);
+    ASSERT_TRUE(rm.has_value())
+        << "Remove should succeed; error=" << rm.error();
+
+    // Now admit a different key. With queue_limit=1, this only succeeds
+    // if the slot was freed by Remove (pre-fix it would sit pinned for
+    // the full 300s TTL).
+    {
+        auto r = service->GetReplicaList("k_second");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(pending_post.has_value());
+    EXPECT_EQ(pending_post->count("k_second"), 1u)
+        << "k_second must be admittable after Remove of k_first — Remove "
+        << "must erase the in-flight promotion_tasks entry and decrement "
+        << "promotion_in_flight_, otherwise queue_limit=1 stays saturated.";
+
+    service->RemoveAll();
+}
+
+// RemoveByRegex on a key with an in-flight PromotionTask must drop the
+// task entry, same as Remove. Mirror of RemoveErasesPromotionTask, but
+// exercises the regex path which iterates shards directly without an
+// accessor object.
+TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "regex_k1",
+                                       1024, holder.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "other_k2",
+                                       1024, holder.segment_name));
+
+    // Admit task on regex_k1.
+    {
+        auto r = service->GetReplicaList("regex_k1");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // RemoveByRegex matches regex_k1 only.
+    auto removed = service->RemoveByRegex("^regex_", /*force=*/true);
+    ASSERT_TRUE(removed.has_value())
+        << "RemoveByRegex should succeed; error=" << removed.error();
+    EXPECT_EQ(removed.value(), 1) << "exactly one key (regex_k1) should match";
+
+    // Slot must be free — admit on other_k2 (different shard or same,
+    // doesn't matter because counter is global).
+    {
+        auto r = service->GetReplicaList("other_k2");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(pending_post.has_value());
+    EXPECT_EQ(pending_post->count("other_k2"), 1u)
+        << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
+        << "— RemoveByRegex must erase the in-flight promotion_tasks "
+        << "entry. Otherwise queue_limit=1 stays saturated.";
 
     service->RemoveAll();
 }

@@ -244,6 +244,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
     promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
     promotion_admission_threshold_ = config.promotion_admission_threshold;
     promotion_queue_limit_ = config.promotion_queue_limit;
+    // Defense-in-depth clamp: master.cpp clamps threshold into [1, 255]
+    // at flag-parse time, but direct MasterServiceConfig construction
+    // (tests, embedded users) bypasses that. Without the clamp here,
+    // threshold=0 would silently bypass the frequency gate entirely
+    // (freq < 0 is never true for uint8_t).
+    if (promotion_admission_threshold_ == 0) {
+        promotion_admission_threshold_ = 1;
+    } else if (promotion_admission_threshold_ > 255) {
+        promotion_admission_threshold_ = 255;
+    }
     if (config.promotion_on_hit && !enable_offload_) {
         LOG(WARNING) << "promotion_on_hit=true was requested but "
                      << "enable_offload=false; promotion is silently "
@@ -1611,6 +1621,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (it != shard->metadata.end() &&
         CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
+        ErasePromotionTaskIfPresent(shard, key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
     }
@@ -1651,6 +1662,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                ErasePromotionTaskIfPresent(shard, key);
                 shard->metadata.erase(it);
                 it = shard->metadata.end();
             }
@@ -2318,6 +2330,7 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     accessor.Erase();
+    ErasePromotionTaskIfPresent(accessor.GetShard(), key);
     return {};
 }
 
@@ -2371,6 +2384,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                ErasePromotionTaskIfPresent(shard, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -2814,8 +2828,9 @@ void MasterService::TryPushPromotionQueue(const std::string& key) {
 
     // Frequency gate: bump and compare against the threshold. The sketch
     // returns uint8_t (saturating at 255); promotion_admission_threshold_
-    // is clamped into [1, 255] at config parse time, so direct comparison
-    // is well-defined.
+    // is clamped into [1, 255] at config parse time (see master.cpp), so
+    // direct comparison is well-defined and threshold=0 (which would
+    // bypass the gate entirely since freq is uint8_t) cannot reach here.
     const uint8_t freq = promotion_sketch_->increment(key);
     if (freq < promotion_admission_threshold_) {
         return;

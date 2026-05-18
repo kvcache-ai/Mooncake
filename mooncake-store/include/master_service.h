@@ -47,6 +47,12 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+// Friended so the promotion-on-hit tests can drive a serialize/reset/
+// deserialize cycle directly via the otherwise-private
+// MetadataSerializer, and inspect private clamp fields. This avoids
+// standing up a full snapshot catalog + child-process harness, and
+// exposing test-only accessors on MasterService itself.
+class PromotionOnHitTest;
 }  // namespace test
 
 /*
@@ -60,6 +66,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
+    friend class test::PromotionOnHitTest;
 
    public:
     using NoFProbeFn =
@@ -1188,6 +1195,19 @@ class MasterService {
      */
     void TryPushPromotionQueue(const std::string& key);
 
+    // Erase any in-flight PromotionTask for `key` and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists.
+    // Call from any path that erases an ObjectMetadata entry, so the
+    // task doesn't pin a promotion_in_flight_ slot for the full
+    // put_start_release_timeout_sec_ until the reaper sweeps.
+    void ErasePromotionTaskIfPresent(MetadataShardAccessorRW& shard,
+                                     const std::string& key)
+        NO_THREAD_SAFETY_ANALYSIS {
+        if (shard->promotion_tasks.erase(key) > 0) {
+            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -1250,6 +1270,7 @@ class MasterService {
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
+                    service_->ErasePromotionTaskIfPresent(shard_guard_, key_);
                 }
             }
         }
