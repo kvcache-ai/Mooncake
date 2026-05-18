@@ -163,8 +163,9 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     return Status::OK();
 }
 
-static bool isGpuDirectRdmaSupported() {
-    if (getenv("MC_DISABLE_GPU_DIRECT_RDMA")) {
+static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
+    auto disable_gpu_direct = conf->get("transports/rdma/disable_gpu_direct_rdma", false);
+    if (disable_gpu_direct) {
         return false;
     }
     std::ifstream modules("/proc/modules");
@@ -252,7 +253,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
 
     installed_ = true;
     caps.dram_to_dram = true;
-    if (isGpuDirectRdmaSupported()) {
+    if (isGpuDirectRdmaSupported(conf_)) {
         caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
@@ -558,10 +559,6 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     std::shared_ptr<RdmaEndPoint> endpoint;
     std::string peer_name = MakeNicPath(segment_desc->name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(endpoint.get());
-        endpoint = context->endpointStore()->getOrInsert(peer_name);
-    }
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;

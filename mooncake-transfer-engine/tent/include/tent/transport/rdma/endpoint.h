@@ -81,7 +81,16 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     ~RdmaEndPoint();
 
    public:
-    enum EndPointStatus { EP_UNINIT, EP_HANDSHAKING, EP_READY, EP_RESET };
+    // Endpoint lifecycle is unidirectional: once created, endpoints move
+    // forward through states and never return. Failed or discarded endpoints
+    // enter EP_DESTROYING and are reclaimed - they are never reset or reused.
+    enum EndPointStatus {
+        EP_UNINIT,      // Initial state, not yet constructed
+        EP_HANDSHAKING, // Connection in progress
+        EP_READY,       // Connected and operational
+        EP_DESTROYING,  // Being destroyed (failed or discarded)
+        EP_DESTROYED,   // Fully destroyed
+    };
 
     int reset();
 
@@ -91,13 +100,23 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     int deconstruct();
 
+    // Two-phase QP destruction to avoid use-after-free in concurrent
+    // submitPostSend. Phase 1 (beginDestroy): sets status_=EP_DESTROYING,
+    // transitions QPs to ERR state so hardware flushes inflight WRs to CQ.
+    // Does not block. Phase 2 (finishDestroy): called after all outstanding
+    // WRs have been drained, actually destroys QPs and frees resources.
+    // Returns true if destruction is complete, false if outstanding WRs remain.
+    void beginDestroy();
+    void beginDestroyNoLock();  // Internal version without locking
+    bool finishDestroy();
+
     Status connect(const std::string& peer_server_name,
                    const std::string& peer_nic_name,
                    const std::string& peer_rpc_server_addr = "");
 
     Status accept(const BootstrapDesc& peer_desc, BootstrapDesc& local_desc);
 
-    EndPointStatus status() const { return status_; }
+    EndPointStatus status() const { return status_.load(std::memory_order_relaxed); }
 
     std::vector<uint32_t> qpNum();
 
@@ -148,6 +167,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     }
 
    private:
+    int resetConnection(const std::string& reason);
     int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                     std::vector<uint32_t> peer_qp_num_list,
                     std::string* reply_msg = nullptr);
@@ -183,6 +203,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     uint32_t padding_[7];
     RWSpinlock lock_;
 
+    // Two-phase destruction: timestamp when EP entered EP_DESTROYING
+    volatile uint64_t destroy_start_time_;
+
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
@@ -203,6 +226,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int notify_pending_count_ = 0;    // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;  // Circular counter for wr_id
     bool notify_connected_ = false;
+
+    // Two-phase destruction constants (matching TE)
+    static constexpr double kFinishDestroyTimeoutSec = 30.0;
+    static constexpr int kFinishDestroyMaxRetries = 3;
+    int finish_destroy_retries_ = 0;  // Retry counter for finishDestroy
 };
 }  // namespace tent
 }  // namespace mooncake
