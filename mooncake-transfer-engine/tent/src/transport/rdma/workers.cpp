@@ -205,7 +205,7 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
-        ep->reset();
+        ep->resetConnection("Endpoint failed");
     }
 }
 

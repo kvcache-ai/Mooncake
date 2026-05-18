@@ -92,13 +92,13 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         EP_DESTROYED,    // Fully destroyed
     };
 
-    int reset();
-
     int construct(RdmaContext* context, EndPointParams* params,
                   const std::string& endpoint_name,
                   std::atomic<int>* endpoints_count = nullptr);
 
     int deconstruct();
+
+    int resetConnection(const std::string& reason);
 
     // Two-phase QP destruction to avoid use-after-free in concurrent
     // submitPostSend. Phase 1 (beginDestroy): sets status_=EP_DESTROYING,
@@ -156,8 +156,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         bool failed;
     };
 
-    int resetUnlocked();
-
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index);
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
@@ -169,7 +167,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     }
 
    private:
-    int resetConnection(const std::string& reason);
     int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                     std::vector<uint32_t> peer_qp_num_list,
                     std::string* reply_msg = nullptr);

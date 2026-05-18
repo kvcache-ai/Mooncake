@@ -532,15 +532,6 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     return mooncake::tent::Status::OK();
 }
 
-int RdmaEndPoint::reset() {
-    // Endpoints have unidirectional lifecycle and are never reset.
-    // This function is deprecated and always returns error.
-    // Use resetConnection() to mark an endpoint for destruction instead.
-    LOG(WARNING) << "reset() called on endpoint with unidirectional lifecycle, "
-                 << "use resetConnection() instead";
-    return -1;
-}
-
 int RdmaEndPoint::resetConnection(const std::string& reason) {
     // Mark endpoint for destruction due to failure or error.
     // Endpoints have unidirectional lifecycle - once marked for destruction,
