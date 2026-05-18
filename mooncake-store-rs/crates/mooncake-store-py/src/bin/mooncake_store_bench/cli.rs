@@ -870,6 +870,7 @@ mod tests {
             iterations: 1024,
             duration: None,
             warmup: 0,
+            no_prefill: false,
             read_ratio: 70,
             report_interval: 5,
             key_space_size: 10000,
