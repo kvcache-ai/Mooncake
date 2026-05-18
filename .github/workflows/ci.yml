@@ -594,6 +594,13 @@ jobs:
 
     - name: Check Mooncake Store Rust bindings, examples, and tests
       run: |
+        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
+        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd mooncake-store/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
         cargo test --lib
