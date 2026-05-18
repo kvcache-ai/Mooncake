@@ -26,6 +26,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/transport/rdma/context.h"
+#include "tent/transport/rdma/endpoint_store.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -41,8 +42,10 @@ static inline const std::string statusToString(
             return "EP_HANDSHAKING";
         case RdmaEndPoint::EP_READY:
             return "EP_READY";
-        case RdmaEndPoint::EP_RESET:
-            return "EP_RESET";
+        case RdmaEndPoint::EP_DESTROYING:
+            return "EP_DESTROYING";
+        case RdmaEndPoint::EP_DESTROYED:
+            return "EP_DESTROYED";
     }
     return "UNKNOWN";
 }
@@ -50,12 +53,13 @@ static inline const std::string statusToString(
 // Forward declaration for notification QP setup
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
-                                   uint16_t peer_lid, uint32_t peer_qp_num);
+                                   uint16_t peer_lid, uint32_t peer_qp_num,
+                                   uint16_t pkey_index);
 
 RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
-    if (status_ != EP_UNINIT) deconstruct();
+    if (status_.load(std::memory_order_relaxed) != EP_UNINIT) deconstruct();
     if (endpoints_count_)
         endpoints_count_->fetch_sub(1, std::memory_order_relaxed);
 }
@@ -118,7 +122,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     ibv_qp_attr qp_attr;
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.pkey_index = 0;
+    qp_attr.pkey_index = params_->pkey_index;
     qp_attr.port_num = context_->portNum();
     qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
 
@@ -160,7 +164,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         }
     }
 
-    status_ = EP_HANDSHAKING;
+    status_.store(EP_HANDSHAKING, std::memory_order_relaxed);
     return 0;
 }
 
@@ -170,8 +174,10 @@ int RdmaEndPoint::deconstruct() {
 }
 
 int RdmaEndPoint::deconstructUnlocked() {
-    if (status_ == EP_UNINIT) return 0;
-    status_ = EP_RESET;
+    auto current_status = status_.load(std::memory_order_relaxed);
+    // Idempotent: if already destroyed or never initialized, skip cleanup
+    if (current_status == EP_DESTROYED || current_status == EP_UNINIT) return 0;
+    status_.store(EP_DESTROYED, std::memory_order_relaxed);
     resetInflightSlices();
     peer_qp_num_list_.clear();
 
@@ -214,8 +220,96 @@ int RdmaEndPoint::deconstructUnlocked() {
     wr_depth_list_ = nullptr;
     peer_server_name_.clear();
     peer_nic_name_.clear();
-    status_ = EP_UNINIT;
+    // Status remains EP_DESTROYED (unidirectional lifecycle)
     return 0;
+}
+
+void RdmaEndPoint::beginDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    beginDestroyNoLock();
+}
+
+void RdmaEndPoint::beginDestroyNoLock() {
+    auto current_status = status_.load(std::memory_order_relaxed);
+    if (current_status == EP_DESTROYING || current_status == EP_DESTROYED)
+        return;
+
+    destroy_start_time_ = getCurrentTimeInNano();
+    status_.store(EP_DESTROYING, std::memory_order_release);
+
+    // Transition QPs to ERR state so hardware flushes inflight WRs to CQ
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_ERR;
+
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        int ret =
+            context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (ret) {
+            PLOG(ERROR) << "Failed to modify QP to ERR in beginDestroy";
+        }
+    }
+}
+
+bool RdmaEndPoint::finishDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto current_status = status_.load(std::memory_order_relaxed);
+
+    // Gate 1: already done
+    if (current_status == EP_DESTROYED) return true;
+
+    // Gate 2: non-two-phase path. Endpoint reached waiting_list_ without
+    // going through beginDestroy(). This handles edge cases and serves as
+    // a safety net. Endpoints that never reached construct() own no RDMA
+    // resources; drop them directly.
+    if (current_status != EP_DESTROYING) {
+        if (qp_list_.empty()) {
+            status_.store(EP_DESTROYED, std::memory_order_relaxed);
+            return true;
+        }
+        LOG(WARNING) << "finishDestroy called in unexpected state: "
+                     << statusToString(current_status)
+                     << ", forcing destruction to avoid waiting_list_ leak";
+        // Fall through to the unified destroy path
+    } else {
+        // Gate 3: two-phase path. Wait for inflight WRs to drain via CQ
+        // polling. If ibv_modify_qp-to-ERR failed in beginDestroy, WRs may
+        // never be flushed; enforce a timeout to avoid leaking forever.
+        bool has_outstanding = false;
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (wr_depth_list_[i].value != 0) {
+                has_outstanding = true;
+                break;
+            }
+        }
+        if (has_outstanding) {
+            double elapsed =
+                (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
+            if (elapsed < kFinishDestroyTimeoutSec) {
+                return false;  // Still waiting for WRs to drain
+            }
+            LOG(WARNING) << "finishDestroy timed out after " << elapsed
+                         << "s with outstanding WRs, forcing destruction";
+        }
+    }
+
+    // Unified destroy: tear down QPs and bound retries to avoid
+    // log flooding when ibv_destroy_qp fails permanently.
+    int ret = deconstructUnlocked();
+    if (ret) {
+        finish_destroy_retries_++;
+        LOG(ERROR) << "Failed to finish destroying endpoint (attempt "
+                   << finish_destroy_retries_ << "/" << kFinishDestroyMaxRetries
+                   << "): " << ret;
+        if (finish_destroy_retries_ < kFinishDestroyMaxRetries) {
+            return false;  // Retry later
+        }
+        LOG(ERROR) << "Giving up after " << finish_destroy_retries_
+                   << " retries (possible resource leak)";
+    }
+
+    status_.store(EP_DESTROYED, std::memory_order_relaxed);
+    return true;
 }
 
 Status RdmaEndPoint::connect(const std::string& peer_server_name,
@@ -234,13 +328,14 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     {
         RWSpinlock::WriteGuard guard(lock_);
         if (peer_server_name.empty() || peer_nic_name.empty()) {
-            return Status::InvalidArgument("Invalid peer path" LOC_MARK);
+            return mooncake::tent::Status::InvalidArgument(
+                "Invalid peer path" LOC_MARK);
         }
-        if (status_ == EP_READY) {
-            return Status::OK();
+        if (status_.load(std::memory_order_relaxed) == EP_READY) {
+            return mooncake::tent::Status::OK();
         }
-        if (status_ != EP_HANDSHAKING) {
-            return Status::InvalidArgument(
+        if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
+            return mooncake::tent::Status::InvalidArgument(
                 "Endpoint not in handshaking state" LOC_MARK);
         }
 
@@ -270,7 +365,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         // Same server, different NIC: call handler directly, bypass RPC
         int rc = transport.onSetupRdmaConnections(local_desc, peer_desc);
         if (rc != 0) {
-            return Status::InternalError(
+            return mooncake::tent::Status::InternalError(
                 "Local bootstrap failed: " + peer_desc.reply_msg + LOC_MARK);
         }
         qp_num = peer_desc.qp_num;
@@ -282,22 +377,24 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         if (rpc_server_addr.empty()) {
             SegmentDescRef segment_desc;
             auto& manager = transport.metadata_->segmentManager();
-            CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
+            auto status = manager.getRemote(segment_desc, peer_server_name);
+            if (!status.ok()) return status;
             rpc_server_addr = segment_desc->rpc_server_addr;
         }
         if (rpc_server_addr.empty()) {
-            return Status::InvalidArgument(
+            return mooncake::tent::Status::InvalidArgument(
                 "Missing peer RPC server address" LOC_MARK);
         }
-        CHECK_STATUS(
-            ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
+        auto bootstrap_status =
+            ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc);
+        if (!bootstrap_status.ok()) return bootstrap_status;
         qp_num = peer_desc.qp_num;
         peer_gid = peer_desc.local_gid;
         peer_lid = peer_desc.local_lid;
     }
 
     if (peer_gid.empty()) {
-        return Status::InvalidArgument(
+        return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
     }
 
@@ -306,11 +403,11 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     // connection while we were doing bootstrap without the lock.
     {
         RWSpinlock::WriteGuard guard(lock_);
-        if (status_ == EP_READY) {
-            return Status::OK();
+        if (status_.load(std::memory_order_relaxed) == EP_READY) {
+            return mooncake::tent::Status::OK();
         }
-        if (status_ != EP_HANDSHAKING) {
-            return Status::InvalidArgument(
+        if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
+            return mooncake::tent::Status::InvalidArgument(
                 "Endpoint state changed during bootstrap" LOC_MARK);
         }
 
@@ -319,7 +416,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         peer_nic_name_ = peer_nic_name;
         int rc = setupAllQPs(peer_gid, peer_lid, qp_num);
         if (rc) {
-            return Status::InternalError(
+            return mooncake::tent::Status::InternalError(
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
         peer_qp_num_list_ = qp_num;
@@ -327,7 +424,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
             rc = setupNotifyQpConnection(notify_qp_, context_, peer_gid,
-                                         peer_lid, peer_desc.notify_qp_num);
+                                         peer_lid, peer_desc.notify_qp_num,
+                                         params_->pkey_index);
             if (rc) {
                 LOG(WARNING)
                     << "Failed to setup notification QP, notification disabled";
@@ -340,13 +438,13 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         }
     }
 
-    return Status::OK();
+    return mooncake::tent::Status::OK();
 }
 
 Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                             BootstrapDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (status_ == EP_READY) {
+    if (status_.load(std::memory_order_relaxed) == EP_READY) {
         // Idempotency check: if the incoming bootstrap is from the same peer
         // and carries the same peer QP list as the established connection,
         // this is a duplicate request (e.g. from a concurrent connect() on
@@ -371,19 +469,22 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.local_lid = context_->lid();
             local_desc.local_gid = context_->gid();
             local_desc.notify_qp_num = notifyQpNum();
-            return Status::OK();
+            return mooncake::tent::Status::OK();
         }
-        LOG(WARNING) << "Endpoint is established with " << peer_nic_name_
-                     << " of " << peer_server_name_ << ", resetting first";
-        resetUnlocked();
-        status_ = EP_HANDSHAKING;
-    } else if (status_ == EP_RESET) {
-        resetUnlocked();
-        status_ = EP_HANDSHAKING;
-    } else if (status_ != EP_HANDSHAKING) {
+        // Endpoint already connected to a different peer - reject the request
+        // instead of resetting. Endpoints have unidirectional lifecycle and
+        // are never reset or reused. The caller should create a new endpoint.
+        LOG(ERROR)
+            << "Endpoint already established with " << peer_nic_name_ << " of "
+            << peer_server_name_
+            << ", cannot accept new connection (unidirectional lifecycle)";
+        return mooncake::tent::Status::InternalError(
+            "Endpoint already connected to different peer" LOC_MARK);
+    }
+    if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
         LOG(ERROR) << "Endpoint not in handshaking state: "
-                   << statusToString(status_);
-        return Status::InvalidArgument(
+                   << statusToString(status_.load(std::memory_order_relaxed));
+        return mooncake::tent::Status::InvalidArgument(
             "Endpoint not in handshaking state" LOC_MARK);
     }
     auto& transport = context_->transport_;
@@ -391,7 +492,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path);
     if (peer_server_name.empty() || peer_nic_name.empty())
-        return Status::InvalidArgument("Invalid peer path" LOC_MARK);
+        return mooncake::tent::Status::InvalidArgument(
+            "Invalid peer path" LOC_MARK);
     local_desc.local_nic_path =
         MakeNicPath(transport.local_segment_name_, context_->name());
     local_desc.peer_nic_path = peer_nic_path;
@@ -400,7 +502,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_gid = context_->gid();
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
     if (peer_desc.local_gid.empty()) {
-        return Status::InvalidArgument(
+        return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
     }
     peer_server_name_ = peer_server_name;
@@ -408,16 +510,16 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     int rc =
         setupAllQPs(peer_desc.local_gid, peer_desc.local_lid, peer_desc.qp_num);
     if (rc) {
-        return Status::InternalError(
+        return mooncake::tent::Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
     peer_qp_num_list_ = peer_desc.qp_num;
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
-        rc = setupNotifyQpConnection(notify_qp_, context_, peer_desc.local_gid,
-                                     peer_desc.local_lid,
-                                     peer_desc.notify_qp_num);
+        rc = setupNotifyQpConnection(
+            notify_qp_, context_, peer_desc.local_gid, peer_desc.local_lid,
+            peer_desc.notify_qp_num, params_->pkey_index);
         if (rc) {
             notify_connected_ = false;
         } else {
@@ -427,54 +529,40 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         }
     }
 
-    return Status::OK();
+    return mooncake::tent::Status::OK();
 }
 
-int RdmaEndPoint::reset() {
-    RWSpinlock::WriteGuard guard(lock_);
-    return resetUnlocked();
-}
+int RdmaEndPoint::resetConnection(const std::string& reason) {
+    // Mark endpoint for destruction due to failure or error.
+    // Endpoints have unidirectional lifecycle - once marked for destruction,
+    // they are never reused. The endpoint store will create a new endpoint
+    // for future connections.
+    RdmaEndPoint* endpoint_ptr = this;
 
-int RdmaEndPoint::resetUnlocked() {
-    if (status_ != EP_READY) return 0;
-    status_ = EP_RESET;
-    peer_qp_num_list_.clear();
-    resetInflightSlices();
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        auto curr_status = status_.load(std::memory_order_acquire);
+        if (curr_status == EP_DESTROYING || curr_status == EP_DESTROYED)
+            return 0;
+        if (curr_status != EP_HANDSHAKING && curr_status != EP_READY) return 0;
 
-    if (notify_qp_) {
-        // Keep the QP registered in the transport map — the qp_num doesn't
-        // change across resets, and the notify worker may still poll
-        // completions (flush errors) from the CQ between reset and reconnect.
-        // Unregistering here would cause "unknown QP" warnings.
-        notify_connected_ = false;
-        {
-            std::lock_guard<std::mutex> lock(notify_send_mutex_);
-            notify_pending_count_ = 0;
-        }
-        notify_send_cv_.notify_all();
+        destroy_start_time_ = getCurrentTimeInNano();
+        status_.store(EP_DESTROYING, std::memory_order_release);
+        LOG(INFO) << "Endpoint marked for destruction: " << reason;
     }
 
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int ret =
-            context_->verbs_.ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (ret) {
-            PLOG(ERROR) << "ibv_modify_qp(RESET)";
-            deconstructUnlocked();
-            return -1;
-        }
-        cancelQuota(i, wr_depth_list_[i].value);
-    }
+    // Delete from endpoint store so endpoint() won't return this endpoint.
+    // remove() calls beginDestroyNoLock() to avoid deadlocking when
+    // caller already holds lock_.
+    context_->endpointStore()->remove(endpoint_ptr);
     return 0;
 }
 
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
                               std::vector<uint32_t> peer_qp_num_list,
                               std::string* reply_msg) {
-    if (status_ == EP_READY) {
-        status_ = EP_RESET;
+    if (status_.load(std::memory_order_relaxed) == EP_READY) {
+        status_.store(EP_DESTROYING, std::memory_order_relaxed);
         return -1;
     }
 
@@ -485,7 +573,7 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
            << peer_nic_name_ << " of " << peer_server_name_;
         LOG(ERROR) << ss.str();
         if (reply_msg) *reply_msg = ss.str();
-        status_ = EP_RESET;
+        status_.store(EP_DESTROYING, std::memory_order_relaxed);
         return -1;
     }
 
@@ -493,12 +581,12 @@ int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
         int ret = setupOneQP(qp_index, peer_gid, peer_lid,
                              peer_qp_num_list[qp_index], reply_msg);
         if (ret) {
-            status_ = EP_RESET;
+            status_.store(EP_DESTROYING, std::memory_order_relaxed);
             return ret;
         }
     }
 
-    status_ = EP_READY;
+    status_.store(EP_READY, std::memory_order_relaxed);
     return 0;
 }
 
@@ -520,7 +608,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
     if (qp_list_.empty()) return 0;
     if (qp_index < 0) qp_index = 0;
     qp_index %= qp_list_.size();
-    if (status_ != EP_READY) return 0;
+    // Check endpoint status before submitting
+    if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     auto cq = context_->cq(qp_index % context_->cqCount());
     int wr_count =
         std::min(cq->maxCqe() - cq->getQuota(),
@@ -586,7 +675,8 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
 
 int RdmaEndPoint::submitRecvImmDataRequest(int qp_index, uint64_t id) {
     RWSpinlock::ReadGuard guard(lock_);
-    if (status_ != EP_READY) return 0;
+    // Check endpoint status before submitting
+    if (status_.load(std::memory_order_relaxed) != EP_READY) return 0;
     if (qp_index < 0 || qp_index >= (int)qp_list_.size()) return 0;
     ibv_recv_wr wr, *bad_wr;
     memset(&wr, 0, sizeof(ibv_recv_wr));
@@ -788,7 +878,8 @@ void RdmaEndPoint::repostAllNotifyRecvs() {
 
 static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
                                    const std::string& peer_gid_str,
-                                   uint16_t peer_lid, uint32_t peer_qp_num) {
+                                   uint16_t peer_lid, uint32_t peer_qp_num,
+                                   uint16_t pkey_index) {
     // Reconnect path may call this when QP is already in RTS; force a clean
     // state machine: RESET -> INIT -> RTR -> RTS.
     ibv_qp_attr qp_attr = {};
@@ -801,7 +892,7 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
 
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_INIT;
-    qp_attr.pkey_index = 0;
+    qp_attr.pkey_index = pkey_index;
     qp_attr.port_num = ctx->portNum();
     qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
     ret = ibv_modify_qp(
