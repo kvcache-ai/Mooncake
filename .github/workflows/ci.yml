@@ -634,6 +634,14 @@ jobs:
         sudo cmake --install .
       shell: bash
 
+    - name: Test (TENT)
+      run: |
+        cd build-tent
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        ctest -j --output-on-failure
+      shell: bash
+
     - name: Build nvlink_allocator.so
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
