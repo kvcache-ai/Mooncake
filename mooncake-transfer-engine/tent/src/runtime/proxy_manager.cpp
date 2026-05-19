@@ -319,6 +319,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                                    chunk.length, chunk.offset);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
+                    event_queue.push(id);
                 } else if (request.opcode == Request::READ && remote_staging) {
                     if (remote_locked.count(chunk.remote_buf)) {
                         event_queue.push(id);
@@ -330,10 +331,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
+                    event_queue.push(id);
                 } else {
                     chunk.state = StageState::CROSS;
+                    event_queue.push(id);
                 }
-                event_queue.push(id);
                 break;
             }
 
@@ -374,6 +376,9 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
                     event_queue.push(id);
+                } else {
+                    // No staging needed, mark as finished
+                    chunk.state = StageState::FINISH;
                 }
                 break;
             }
@@ -418,6 +423,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             }
 
             case StageState::FAILED: {
+                // Drain the queue to avoid losing chunks
+                while (!event_queue.empty()) {
+                    event_queue.pop();
+                }
                 return Status::InternalError(
                     "Proxy event loop in failed state");
             }
@@ -426,6 +435,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 auto& fut = remote_futures[id];
                 if (!fut.valid()) {
                     chunk.state = StageState::FAILED;
+                    event_queue.push(id);
                     break;
                 }
                 if (fut.wait_for(std::chrono::seconds(0)) ==
@@ -433,6 +443,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                     Status rs = fut.get();
                     if (!rs.ok()) {
                         chunk.state = StageState::FAILED;
+                        event_queue.push(id);
                         break;
                     }
                     if (chunk.prev_state == StageState::PRE) {
@@ -444,9 +455,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                             remote_staging) {
                             remote_locked.erase(chunk.remote_buf);
                         }
+                        event_queue.push(id);
                     }
+                } else {
+                    event_queue.push(id);
                 }
-                event_queue.push(id);
                 break;
             }
         }
