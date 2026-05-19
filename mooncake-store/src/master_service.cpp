@@ -873,6 +873,7 @@ auto MasterService::AllocateAndInsertMetadata(
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
             need_eviction_ = true;
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
