@@ -964,38 +964,6 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
 
-    // When using an external engine, we must not call unregister on it
-    // during shutdown because the external engine's lifetime is managed
-    // by the caller. Only clean up per-instance resources (proxy,
-    // connection context, buffers). Do NOT modify static state
-    // (engine_, engineInitialized_, externalEngine_) because other PG
-    // instances may still be using the same external engine.
-    if (externalEngine_) {
-        p2p_device_worker_->removeProxy(p2p_proxy_);
-        p2p_proxy_->abandonResources();
-        connection_ctx_->shutdown();
-        if (connectionPollerRegistered_) {
-            ConnectionPoller::GetInstance().removeContext(connection_ctx_);
-            connectionPollerRegistered_ = false;
-        }
-        connection_ctx_->abandonResources();
-
-        // Free CPU sync regions (not registered with external engine)
-        for (size_t i = 0; i < 2; i++) {
-            delete[] cpu_sync_send_region_[i];
-            delete[] cpu_sync_recv_region_[i];
-            if (isCpu_) {
-                free(send_buffer_[i]);
-                free(recv_buffer_[i]);
-            } else {
-                cudaFree(send_buffer_[i]);
-                cudaFree(recv_buffer_[i]);
-            }
-        }
-
-        return;
-    }
-
     // If we encounter any hung operations, don't release resources
     // to avoid potential crash. Instead, we allow those resources to leak
     // and rely on the OS to reclaim them later.
