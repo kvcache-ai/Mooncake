@@ -19,6 +19,7 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
+option(WITH_CONDUCTOR "build mooncake conductor and sample code" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
@@ -177,3 +178,9 @@ if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be built")
 endif()
+
+if (WITH_CONDUCTOR)
+  add_subdirectory(mooncake-conductor)
+  message(STATUS "Conductor will be built")
+endif()
+
