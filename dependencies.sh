@@ -112,7 +112,7 @@ SYSTEM_PACKAGES="build-essential \
                   libunwind-dev \
                   libnuma-dev \
                   libpython3-dev \
-                  libboost-all-dev \
+                  libboost-dev \
                   libssl-dev \
                   libgrpc-dev \
                   libgrpc++-dev \

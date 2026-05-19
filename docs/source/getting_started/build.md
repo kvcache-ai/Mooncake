@@ -70,7 +70,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libnuma-dev \
                        libunwind-dev \
                        libpython3-dev \
-                       libboost-all-dev \
+                       libboost-dev \
                        libssl-dev \
                        pybind11-dev \
                        libcurl4-openssl-dev \
@@ -228,6 +228,14 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DMACA_LIB_DIR=/path/to/lib64`: Override MACA library directory when `-DUSE_MACA=ON`.
 - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: Override MACA runtime libraries linked by `transfer_engine`.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
+- `-DUSE_HYGON=[ON|OFF]`: Enable Hygon DCU support via DTK SDK. **Default: OFF.** Uses CUDA-compatible runtime.
+- `-DDTK_ROOT=/path/to/dtk`: Override the default DTK SDK root used when `-DUSE_HYGON=ON`. If unset, Mooncake uses `DTK_HOME` or `/opt/dtk`.
+- `-DDTK_INCLUDE_DIR=/path/to/include`: Override the DTK include directory when `-DUSE_HYGON=ON`.
+- `-DDTK_LIB_DIR=/path/to/lib64`: Override the DTK library directory when `-DUSE_HYGON=ON`.
+- `-DUSE_COREX=[ON|OFF]`: Enable Iluvatar CoreX GPU support. **Default: OFF.** Uses CUDA-compatible runtime.
+- `-DCOREX_ROOT=/path/to/corex`: Override the default CoreX SDK root used when `-DUSE_COREX=ON`. If unset, Mooncake uses `COREX_HOME` or `/usr/local/corex`.
+- `-DCOREX_INCLUDE_DIR=/path/to/include`: Override the CoreX include directory when `-DUSE_COREX=ON`.
+- `-DCOREX_LIB_DIR=/path/to/lib`: Override the CoreX library directory when `-DUSE_COREX=ON`.
 - `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
 - `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.
 - `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.

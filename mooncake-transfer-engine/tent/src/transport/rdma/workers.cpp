@@ -178,10 +178,6 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     std::shared_ptr<RdmaEndPoint> endpoint;
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(endpoint.get());
-        endpoint = context->endpointStore()->getOrInsert(peer_name);
-    }
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;
@@ -209,7 +205,7 @@ void Workers::disableEndpoint(RdmaSlice* slice) {
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
-        ep->reset();
+        ep->resetConnection("Endpoint failed");
     }
 }
 
@@ -462,7 +458,25 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
 }
 
 void Workers::monitorThread() {
+    // Track time for periodic endpoint reclaim (1 Hz heartbeat)
+    auto last_reclaim_time = std::chrono::steady_clock::now();
+
     while (running_) {
+        // Periodic endpoint reclaim: runs every 1 second to drain waiting_list_
+        // Under failure load, insertions stall but endpoints still need cleanup
+        auto current_time = std::chrono::steady_clock::now();
+        auto time_since_last_reclaim =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_time - last_reclaim_time)
+                .count();
+
+        if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
+            for (auto& context : transport_->context_set_) {
+                context->endpointStore()->reclaim();
+            }
+            last_reclaim_time = current_time;
+        }
+
         for (auto& context : transport_->context_set_) {
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
