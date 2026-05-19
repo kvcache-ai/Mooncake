@@ -283,8 +283,6 @@ class DataManager {
 
     tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandleInternal(
         const KeyCtx& ctx, const UUID& write_operation_id);
-    tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandleInternal(
-        const KeyCtx& ctx, const UUID& read_operation_id);
     void AbortPendingWriteInternal(const KeyCtx& ctx,
                                    const UUID& write_operation_id);
 
@@ -473,30 +471,12 @@ class DataManager {
         return lease_duration_;
     }
     bool IsExpired(TimePoint deadline) const;
-    RemoteBufferDesc BuildRemoteBufferDesc(
+    tl::expected<RemoteBufferDesc, ErrorCode> BuildRemoteBufferDesc(
         const AllocationHandle& handle) const;
     void LeaseScannerMain();
     void ShutdownLeaseScanner();
     size_t ScanExpiredPendingWrites(PendingWriteShard& shard, TimePoint now);
     size_t ScanExpiredPinnedKeys(PinnedKeyShard& shard, TimePoint now);
-    bool ErasePendingWriteLocked(PendingWriteShard& shard,
-                                 std::string_view key);
-    bool ErasePinnedKeyLocked(PinnedKeyShard& shard, std::string_view key);
-    bool RemoveExpiredPendingWriteLocked(PendingWriteShard& shard,
-                                         std::string_view key, TimePoint now);
-    bool RemoveExpiredPinnedKeyLocked(PinnedKeyShard& shard,
-                                      std::string_view key, TimePoint now);
-    void TouchOrderedDeadlineNode(OrderedDeadlineList& ordered_list,
-                                  OrderedDeadlineListIt it,
-                                  std::string_view key, TimePoint deadline);
-
-    tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandle(
-        std::string_view key, const UUID& write_operation_id);
-    tl::expected<AllocationHandle, ErrorCode> LookupPinnedKeyHandle(
-        std::string_view key, const UUID& read_operation_id);
-    void AbortPendingWrite(std::string_view key,
-                           const UUID& write_operation_id);
-
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client

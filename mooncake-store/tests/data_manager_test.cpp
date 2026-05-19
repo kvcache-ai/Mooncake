@@ -284,6 +284,24 @@ TEST_F(DataManagerTest, DeleteWithTierId) {
     ASSERT_FALSE(data_manager_->Exist(key));
 }
 
+// BuildRemoteBufferDesc: null allocation buffer is an internal error.
+TEST_F(DataManagerTest, BuildRemoteBufferDescRejectsNullBuffer) {
+    auto alloc_result = tiered_backend_->Allocate(64, GetTierId());
+    ASSERT_TRUE(alloc_result.has_value())
+        << "Allocate failed: " << toString(alloc_result.error());
+
+    AllocationHandle handle = alloc_result.value();
+    auto saved_buffer = std::move(handle->loc.data.buffer);
+    ASSERT_EQ(handle->loc.data.buffer, nullptr);
+
+    auto desc_result = data_manager_->BuildRemoteBufferDesc(handle);
+    ASSERT_FALSE(desc_result.has_value());
+    EXPECT_EQ(desc_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    // Restore buffer so AllocationEntry destructor can release via tier.
+    handle->loc.data.buffer = std::move(saved_buffer);
+}
+
 // Test PreWrite: concurrent PreWrite should be rejected by a pending lease.
 TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
     const std::string key = "prewrite_lifecycle_key";
@@ -325,6 +343,22 @@ TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
         std::shared_lock shard_lock(shard.mutex);
         EXPECT_EQ(shard.by_key.count(key), 0U);
     }
+}
+
+// WriteCommit without a pending write (e.g. duplicate commit) is an error.
+TEST_F(DataManagerTest, WriteCommitWithoutPendingWriteFails) {
+    const std::string key = "write_commit_no_pending_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value());
+
+    auto first_commit =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_TRUE(first_commit.has_value());
+
+    auto second_commit =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_FALSE(second_commit.has_value());
+    EXPECT_EQ(second_commit.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 // Test WriteCommit: token mismatch should fail without erasing the record.

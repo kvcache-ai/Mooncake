@@ -228,74 +228,19 @@ bool DataManager::IsExpired(TimePoint deadline) const {
     return deadline <= std::chrono::steady_clock::now();
 }
 
-RemoteBufferDesc DataManager::BuildRemoteBufferDesc(
+tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
     const AllocationHandle& handle) const {
     const auto& loc_data = handle->loc.data;
+    if (!loc_data.buffer) {
+        LOG(ERROR) << "BuildRemoteBufferDesc: allocation handle has no buffer";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     RemoteBufferDesc remote_buffer;
     remote_buffer.segment_endpoint = local_transfer_config_.te_endpoint;
-    remote_buffer.addr = 0;
-    remote_buffer.size = 0;
-    if (loc_data.buffer) {
-        remote_buffer.addr =
-            reinterpret_cast<uintptr_t>(loc_data.buffer->data());
-        remote_buffer.size = loc_data.buffer->size();
-    }
+    remote_buffer.addr =
+        reinterpret_cast<uintptr_t>(loc_data.buffer->data());
+    remote_buffer.size = loc_data.buffer->size();
     return remote_buffer;
-}
-
-void DataManager::TouchOrderedDeadlineNode(OrderedDeadlineList& ordered_list,
-                                           OrderedDeadlineListIt it,
-                                           std::string_view key,
-                                           TimePoint deadline) {
-    it->first.assign(key.data(), key.size());
-    it->second = deadline;
-    ordered_list.splice(ordered_list.end(), ordered_list, it);
-}
-
-bool DataManager::ErasePendingWriteLocked(PendingWriteShard& shard,
-                                         std::string_view key) {
-    auto it = shard.by_key.find(key);
-    if (it == shard.by_key.end()) {
-        return false;
-    }
-    shard.ordered_list.erase(it->second.list_it);
-    shard.by_key.erase(it);
-    return true;
-}
-
-bool DataManager::ErasePinnedKeyLocked(PinnedKeyShard& shard,
-                                      std::string_view key) {
-    auto it = shard.by_key.find(key);
-    if (it == shard.by_key.end()) {
-        return false;
-    }
-    shard.ordered_list.erase(it->second.list_it);
-    shard.by_key.erase(it);
-    return true;
-}
-
-bool DataManager::RemoveExpiredPendingWriteLocked(PendingWriteShard& shard,
-                                                 std::string_view key,
-                                                 TimePoint now) {
-    auto it = shard.by_key.find(key);
-    if (it == shard.by_key.end() || it->second.deadline > now) {
-        return false;
-    }
-    shard.ordered_list.erase(it->second.list_it);
-    shard.by_key.erase(it);
-    return true;
-}
-
-bool DataManager::RemoveExpiredPinnedKeyLocked(PinnedKeyShard& shard,
-                                               const std::string& key,
-                                               TimePoint now) {
-    auto it = shard.by_key.find(key);
-    if (it == shard.by_key.end() || it->second.deadline > now) {
-        return false;
-    }
-    shard.ordered_list.erase(it->second.list_it);
-    shard.by_key.erase(it);
-    return true;
 }
 
 size_t DataManager::ScanExpiredPendingWrites(PendingWriteShard& shard,
@@ -340,71 +285,51 @@ size_t DataManager::ScanExpiredPinnedKeys(PinnedKeyShard& shard,
     return removed;
 }
 
-tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPendingWriteHandle(
-    std::string_view key, const UUID& write_operation_id) {
-    return LookupPendingWriteHandleInternal(BuildKeyCtx(key),
-                                            write_operation_id);
-}
-
 tl::expected<AllocationHandle, ErrorCode>
 DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
                                               const UUID& write_operation_id) {
     const auto now = std::chrono::steady_clock::now();
-    auto& shard = GetPendingWriteShard(ctx);
-    std::shared_lock shard_lock(shard.mutex);
-    auto it = shard.by_key.find(ctx.key);
-    if (it == shard.by_key.end()) {
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    std::shared_lock pending_write_shard_lock(pending_write_shard.mutex);
+    auto it = pending_write_shard.by_key.find(ctx.key);
+    if (it == pending_write_shard.by_key.end()) {
+        LOG(ERROR) << "LookupPendingWriteHandle: no pending write for key: "
+                   << ctx.key;
         return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     if (it->second.deadline <= now) {
+        LOG(ERROR) << "LookupPendingWriteHandle: lease expired for key: "
+                   << ctx.key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     if (it->second.write_operation_id != write_operation_id) {
+        LOG(ERROR) << "LookupPendingWriteHandle: write_operation_id mismatch "
+                      "for key: "
+                   << ctx.key;
         return tl::unexpected(ErrorCode::INVALID_WRITE);
     }
     return it->second.handle;
-}
-
-tl::expected<AllocationHandle, ErrorCode> DataManager::LookupPinnedKeyHandle(
-    std::string_view key, const UUID& read_operation_id) {
-    return LookupPinnedKeyHandleInternal(BuildKeyCtx(key), read_operation_id);
-}
-
-tl::expected<AllocationHandle, ErrorCode>
-DataManager::LookupPinnedKeyHandleInternal(const KeyCtx& ctx,
-                                           const UUID& read_operation_id) {
-    const auto now = std::chrono::steady_clock::now();
-    auto& shard = GetPinnedKeyShard(ctx);
-    std::shared_lock shard_lock(shard.mutex);
-    auto it = shard.by_key.find(ctx.key);
-    if (it == shard.by_key.end()) {
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    if (it->second.deadline <= now) {
-        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
-    }
-    if (it->second.read_operation_id != read_operation_id) {
-        return tl::unexpected(ErrorCode::INVALID_READ);
-    }
-    return it->second.handle;
-}
-
-void DataManager::AbortPendingWrite(std::string_view key,
-                                    const UUID& write_operation_id) {
-    AbortPendingWriteInternal(BuildKeyCtx(key), write_operation_id);
 }
 
 void DataManager::AbortPendingWriteInternal(const KeyCtx& ctx,
                                             const UUID& write_operation_id) {
     if (ctx.key.empty() || IsZeroUUID(write_operation_id)) return;
     std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-    auto& shard = GetPendingWriteShard(ctx);
-    std::unique_lock shard_lock(shard.mutex);
-    auto it = shard.by_key.find(ctx.key);
-    if (it == shard.by_key.end()) return;
-    if (it->second.write_operation_id != write_operation_id) return;
-    shard.ordered_list.erase(it->second.list_it);
-    shard.by_key.erase(it);
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    std::unique_lock pending_write_shard_lock(pending_write_shard.mutex);
+    auto it = pending_write_shard.by_key.find(ctx.key);
+    if (it == pending_write_shard.by_key.end()) {
+        LOG(WARNING) << "AbortPendingWrite: no pending write record for key: "
+                     << ctx.key;
+        return;
+    }
+    if (it->second.write_operation_id != write_operation_id) {
+        LOG(ERROR) << "AbortPendingWrite: write_operation_id mismatch for key: "
+                   << ctx.key;
+        return;
+    }
+    pending_write_shard.ordered_list.erase(it->second.list_it);
+    pending_write_shard.by_key.erase(it);
 }
 
 void DataManager::ShutdownLeaseScanner() {
@@ -488,6 +413,9 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
 
     auto prewrite_result = PreWriteInternal(kctx, total_size, std::nullopt);
     if (!prewrite_result) {
+        LOG(ERROR) << "PutViaTe: PreWrite failed"
+                   << ", key=" << key
+                   << ", error=" << toString(prewrite_result.error());
         return tl::unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
@@ -545,6 +473,9 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
 
             auto commit_result = WriteCommitInternal(kctx, write_operation_id);
             if (!commit_result) {
+                LOG(ERROR) << "PutViaTe: WriteCommit failed"
+                           << ", key=" << kctx.key
+                           << ", error=" << toString(commit_result.error());
                 return tl::unexpected(commit_result.error());
             }
             timer.LogResponse("error_code=", ErrorCode::OK);
@@ -563,6 +494,9 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
 
     auto prewrite_result = PreWriteInternal(kctx, slice.size, std::nullopt);
     if (!prewrite_result) {
+        LOG(ERROR) << "PutViaMemcpy: PreWrite failed"
+                   << ", key=" << key
+                   << ", error=" << toString(prewrite_result.error());
         return tl::unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
@@ -805,6 +739,9 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     // RDMA read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
     auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
+        LOG(ERROR) << "ReadRemoteData: Get failed"
+                   << ", key=" << key
+                   << ", error=" << toString(handle_result.error());
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
@@ -812,6 +749,9 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     auto transfer_result =
         TransferDataToRemote(handle_result.value(), dest_buffers);
     if (!transfer_result) {
+        LOG(ERROR) << "ReadRemoteData: TransferDataToRemote failed"
+                   << ", key=" << key
+                   << ", error=" << toString(transfer_result.error());
         timer.LogResponse("error_code=", transfer_result.error());
         return tl::make_unexpected(transfer_result.error());
     }
@@ -911,28 +851,45 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     const auto deadline = now + lease_duration_;
 
     std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-    auto& shard = GetPendingWriteShard(ctx);
-    std::unique_lock shard_lock(shard.mutex);
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    std::unique_lock pending_write_shard_lock(pending_write_shard.mutex);
 
-    RemoveExpiredPendingWriteLocked(shard, ctx.key, now);
-    if (shard.by_key.find(ctx.key) != shard.by_key.end()) {
-        timer.LogResponse("error_code=", ErrorCode::OBJECT_HAS_LEASE);
-        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    auto pending_it = pending_write_shard.by_key.find(ctx.key);
+    if (pending_it != pending_write_shard.by_key.end()) {
+        if (pending_it->second.deadline <= now) {
+            pending_write_shard.ordered_list.erase(pending_it->second.list_it);
+            pending_write_shard.by_key.erase(pending_it);
+        } else {
+            timer.LogResponse("error_code=", ErrorCode::OBJECT_HAS_LEASE);
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+        }
     }
     if (tiered_backend_->Exist(ctx.key)) {
+        LOG(ERROR) << "PreWrite: key already exists"
+                   << ", key=" << ctx.key
+                   << ", error=" << toString(ErrorCode::OBJECT_ALREADY_EXISTS);
         timer.LogResponse("error_code=", ErrorCode::OBJECT_ALREADY_EXISTS);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
     auto handle_result = tiered_backend_->Allocate(size_bytes, tier_id);
     if (!handle_result) {
+        LOG(ERROR) << "PreWrite: Allocate failed"
+                   << ", key=" << ctx.key
+                   << ", error=" << toString(handle_result.error());
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
 
     auto handle = std::move(handle_result.value());
-    auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
-                                              ctx.key, deadline);
+    auto remote_buffer_result = BuildRemoteBufferDesc(handle);
+    if (!remote_buffer_result) {
+        timer.LogResponse("error_code=", remote_buffer_result.error());
+        return tl::make_unexpected(remote_buffer_result.error());
+    }
+
+    auto list_it = pending_write_shard.ordered_list.emplace(
+        pending_write_shard.ordered_list.end(), ctx.key, deadline);
 
     const UUID write_operation_id = generate_uuid();
     PendingWriteRecord record;
@@ -940,10 +897,10 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     record.deadline = deadline;
     record.handle = handle;
     record.list_it = list_it;
-    shard.by_key.insert_or_assign(ctx.key, std::move(record));
+    pending_write_shard.by_key.insert_or_assign(ctx.key, std::move(record));
 
     PreWriteResult result;
-    result.remote_buffer = BuildRemoteBufferDesc(handle);
+    result.remote_buffer = std::move(remote_buffer_result.value());
     result.write_operation_id = write_operation_id;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
@@ -967,17 +924,19 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     const auto now = std::chrono::steady_clock::now();
 
     std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-    auto& shard = GetPendingWriteShard(ctx);
-    std::unique_lock shard_lock(shard.mutex);
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    std::unique_lock pending_write_shard_lock(pending_write_shard.mutex);
 
-    auto record_it = shard.by_key.find(ctx.key);
-    if (record_it == shard.by_key.end()) {
-        timer.LogResponse("error_code=", ErrorCode::OK, "idempotent=", true);
-        return {};
+    auto record_it = pending_write_shard.by_key.find(ctx.key);
+    if (record_it == pending_write_shard.by_key.end()) {
+        LOG(ERROR) << "WriteCommit: no pending write record for key: "
+                   << ctx.key;
+        timer.LogResponse("error_code=", ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     if (record_it->second.deadline <= now) {
-        shard.ordered_list.erase(record_it->second.list_it);
-        shard.by_key.erase(record_it);
+        pending_write_shard.ordered_list.erase(record_it->second.list_it);
+        pending_write_shard.by_key.erase(record_it);
         timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
         return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
     }
@@ -995,11 +954,12 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     // callback failure). The caller should restart a full write flow instead of
     // reusing a potentially stale prewrite context.
     //
-    // Note: after erasing the record, subsequent WriteCommit calls become
-    // idempotent no-ops (return OK) due to record absence.
+    // Note: after erasing the record, a duplicate WriteCommit without a new
+    // PreWrite returns OBJECT_NOT_FOUND (unlike UnPinKey, writes are not
+    // idempotent past commit).
     auto commit_result = tiered_backend_->Commit(ctx.key, handle);
-    shard.ordered_list.erase(record_it->second.list_it);
-    shard.by_key.erase(record_it);
+    pending_write_shard.ordered_list.erase(record_it->second.list_it);
+    pending_write_shard.by_key.erase(record_it);
 
     if (!commit_result) {
         timer.LogResponse("error_code=", commit_result.error(),
@@ -1030,34 +990,56 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     const auto deadline = now + lease_duration_;
 
     std::shared_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-    auto& shard = GetPinnedKeyShard(ctx);
-    std::unique_lock shard_lock(shard.mutex);
+    auto& pin_shard = GetPinnedKeyShard(ctx);
+    std::unique_lock pin_shard_lock(pin_shard.mutex);
 
-    RemoveExpiredPinnedKeyLocked(shard, ctx.key, now);
-    auto record_it = shard.by_key.find(ctx.key);
-    if (record_it != shard.by_key.end()) {
-        record_it->second.ref_count++;
-        record_it->second.deadline = deadline;
-        TouchOrderedDeadlineNode(shard.ordered_list, record_it->second.list_it,
-                                 ctx.key, deadline);
+    auto record_it = pin_shard.by_key.find(ctx.key);
+    if (record_it != pin_shard.by_key.end()) {
+        if (record_it->second.deadline <= now) {
+            pin_shard.ordered_list.erase(record_it->second.list_it);
+            pin_shard.by_key.erase(record_it);
+        } else {
+            auto remote_buffer_result =
+                BuildRemoteBufferDesc(record_it->second.handle);
+            if (!remote_buffer_result) {
+                timer.LogResponse("error_code=", remote_buffer_result.error());
+                return tl::make_unexpected(remote_buffer_result.error());
+            }
+            record_it->second.ref_count++;
+            record_it->second.deadline = deadline;
+            auto list_it = record_it->second.list_it;
+            list_it->first.assign(ctx.key.data(), ctx.key.size());
+            list_it->second = deadline;
+            pin_shard.ordered_list.splice(pin_shard.ordered_list.end(),
+                                          pin_shard.ordered_list, list_it);
 
-        PinKeyResult result;
-        result.remote_buffer = BuildRemoteBufferDesc(record_it->second.handle);
-        result.read_operation_id = record_it->second.read_operation_id;
-        timer.LogResponse("error_code=", ErrorCode::OK,
-                          "ref_count=", record_it->second.ref_count);
-        return result;
+            PinKeyResult result;
+            result.remote_buffer = std::move(remote_buffer_result.value());
+            result.read_operation_id = record_it->second.read_operation_id;
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              "ref_count=", record_it->second.ref_count);
+            return result;
+        }
     }
 
     auto handle_result = tiered_backend_->Get(ctx.key, tier_id);
     if (!handle_result) {
+        LOG(ERROR) << "PinKey: Get failed"
+                   << ", key=" << ctx.key
+                   << ", error=" << toString(handle_result.error());
         timer.LogResponse("error_code=", handle_result.error());
         return tl::make_unexpected(handle_result.error());
     }
 
     auto handle = std::move(handle_result.value());
-    auto list_it = shard.ordered_list.emplace(shard.ordered_list.end(),
-                                              ctx.key, deadline);
+    auto remote_buffer_result = BuildRemoteBufferDesc(handle);
+    if (!remote_buffer_result) {
+        timer.LogResponse("error_code=", remote_buffer_result.error());
+        return tl::make_unexpected(remote_buffer_result.error());
+    }
+
+    auto list_it = pin_shard.ordered_list.emplace(pin_shard.ordered_list.end(),
+                                                  ctx.key, deadline);
 
     const UUID read_operation_id_value = generate_uuid();
     PinnedKeyRecord record;
@@ -1066,10 +1048,10 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     record.handle = handle;
     record.ref_count = 1;
     record.list_it = list_it;
-    shard.by_key.insert_or_assign(ctx.key, std::move(record));
+    pin_shard.by_key.insert_or_assign(ctx.key, std::move(record));
 
     PinKeyResult result;
-    result.remote_buffer = BuildRemoteBufferDesc(handle);
+    result.remote_buffer = std::move(remote_buffer_result.value());
     result.read_operation_id = read_operation_id_value;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
@@ -1093,17 +1075,18 @@ tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
     const auto now = std::chrono::steady_clock::now();
 
     std::shared_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-    auto& shard = GetPinnedKeyShard(ctx);
-    std::unique_lock shard_lock(shard.mutex);
+    auto& pin_shard = GetPinnedKeyShard(ctx);
+    std::unique_lock pin_shard_lock(pin_shard.mutex);
 
-    auto record_it = shard.by_key.find(ctx.key);
-    if (record_it == shard.by_key.end()) {
+    auto record_it = pin_shard.by_key.find(ctx.key);
+    if (record_it == pin_shard.by_key.end()) {
+        LOG(WARNING) << "UnPinKey: no pinned key record for key: " << ctx.key;
         timer.LogResponse("error_code=", ErrorCode::OK, "idempotent=", true);
         return {};
     }
     if (record_it->second.deadline <= now) {
-        shard.ordered_list.erase(record_it->second.list_it);
-        shard.by_key.erase(record_it);
+        pin_shard.ordered_list.erase(record_it->second.list_it);
+        pin_shard.by_key.erase(record_it);
         timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
         return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
     }
@@ -1119,8 +1102,8 @@ tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
         return {};
     }
 
-    shard.ordered_list.erase(record_it->second.list_it);
-    shard.by_key.erase(record_it);
+    pin_shard.ordered_list.erase(record_it->second.list_it);
+    pin_shard.by_key.erase(record_it);
     timer.LogResponse("error_code=", ErrorCode::OK, "ref_count=", 0);
     return {};
 }
