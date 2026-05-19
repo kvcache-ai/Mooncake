@@ -90,6 +90,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
+    m.def("set_transfer_engine", &MooncakeBackend::setTransferEngine,
+          py::arg("engine"),
+          "Set an external TransferEngine to be used by MooncakeBackend. "
+          "Must be called before init_process_group(). The engine must already "
+          "be initialized. Pass None to reset to default behavior.");
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);

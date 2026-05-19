@@ -32,6 +32,8 @@ TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
 // worker_ is now owned per backend instance via MooncakeWorkerManager.
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
+TransferEngine* MooncakeBackend::externalEngine_ = nullptr;
+pybind11::object MooncakeBackend::externalEngineRef_;
 
 std::vector<uint8_t> serialize(const ExtensionState& state) {
     uint32_t rankCount = static_cast<uint32_t>(state.activeRanks.size());
@@ -206,7 +208,11 @@ MooncakeBackend::MooncakeBackend(
     }
 
     // Initialize transfer engine
-    if (!engineInitialized_) {
+    if (externalEngine_) {
+        // Use externally-provided engine (already initialized), skip init.
+        engine_ = externalEngine_;
+        engineInitialized_ = true;
+    } else if (!engineInitialized_) {
         engine_->init(P2PHANDSHAKE, hostIp_);
         engineInitialized_ = true;
     }
@@ -1247,5 +1253,20 @@ void MooncakeBackend::joinGroup() {
     }
     connection_ctx_->waitUntilAllConnected();
     waitForExtensionState();
+}
+
+void MooncakeBackend::setTransferEngine(pybind11::object engine_obj) {
+    if (engine_obj.is_none()) {
+        externalEngine_ = nullptr;
+        externalEngineRef_ = pybind11::object();
+        return;
+    }
+    // Extract raw TransferEngine* from the TransferEnginePy Python object.
+    auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
+    uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
+    externalEngine_ = reinterpret_cast<TransferEngine*>(ptr);
+    externalEngineRef_ = engine_obj;  // prevent Python GC
+    LOG(INFO) << "MooncakeBackend: external TransferEngine set (ptr="
+              << externalEngine_ << ")";
 }
 }  // namespace mooncake
