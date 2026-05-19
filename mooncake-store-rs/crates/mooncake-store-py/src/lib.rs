@@ -3466,6 +3466,7 @@ mod tests {
             owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
             segment_name: SegmentName::new("segment-z"),
             transport_endpoint: Some("10.0.0.8:12001".to_string()),
+            transport_segment_descriptor: None,
             capacity_bytes: 256,
             used_bytes: 32,
             target_chunks: Vec::new(),

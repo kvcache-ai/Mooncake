@@ -351,6 +351,11 @@ pub mod classic {
         free_batch_id: unsafe extern "C" fn(TransferEngineHandle, BatchId) -> c_int,
         sync_segment_cache: unsafe extern "C" fn(TransferEngineHandle) -> c_int,
         republish_local_metadata: unsafe extern "C" fn(TransferEngineHandle) -> c_int,
+        get_local_segment_descriptor_json_size: unsafe extern "C" fn(TransferEngineHandle) -> usize,
+        get_local_segment_descriptor_json:
+            unsafe extern "C" fn(TransferEngineHandle, *mut c_char, usize) -> c_int,
+        cache_segment_descriptor_json:
+            unsafe extern "C" fn(TransferEngineHandle, *const c_char, *const c_char) -> c_int,
         get_batch_transfer_status:
             unsafe extern "C" fn(TransferEngineHandle, BatchId, *mut TransferStatus) -> c_int,
         get_segment_first_buffer:
@@ -401,6 +406,18 @@ pub mod classic {
             republish_local_metadata: load_symbol(
                 shim,
                 "mooncake_classic_republish_local_metadata",
+            )?,
+            get_local_segment_descriptor_json_size: load_symbol(
+                shim,
+                "mooncake_classic_get_local_segment_descriptor_json_size",
+            )?,
+            get_local_segment_descriptor_json: load_symbol(
+                shim,
+                "mooncake_classic_get_local_segment_descriptor_json",
+            )?,
+            cache_segment_descriptor_json: load_symbol(
+                shim,
+                "mooncake_classic_cache_segment_descriptor_json",
             )?,
             get_batch_transfer_status: load_symbol(
                 shim,
@@ -567,6 +584,34 @@ pub mod classic {
         engine: TransferEngineHandle,
     ) -> c_int {
         api().map_or(-1, |api| (api.republish_local_metadata)(engine))
+    }
+
+    pub unsafe extern "C" fn mooncake_classic_get_local_segment_descriptor_json_size(
+        engine: TransferEngineHandle,
+    ) -> usize {
+        api().map_or(0, |api| {
+            (api.get_local_segment_descriptor_json_size)(engine)
+        })
+    }
+
+    pub unsafe extern "C" fn mooncake_classic_get_local_segment_descriptor_json(
+        engine: TransferEngineHandle,
+        buf_out: *mut c_char,
+        buf_len: usize,
+    ) -> c_int {
+        api().map_or(-1, |api| {
+            (api.get_local_segment_descriptor_json)(engine, buf_out, buf_len)
+        })
+    }
+
+    pub unsafe extern "C" fn mooncake_classic_cache_segment_descriptor_json(
+        engine: TransferEngineHandle,
+        segment_name: *const c_char,
+        descriptor_json: *const c_char,
+    ) -> c_int {
+        api().map_or(-1, |api| {
+            (api.cache_segment_descriptor_json)(engine, segment_name, descriptor_json)
+        })
     }
 
     pub unsafe extern "C" fn mooncake_classic_get_batch_transfer_status(

@@ -139,6 +139,14 @@ replica, but the transport only receives slices that fit inside one registered s
 chunk, matching classic RDMA transfer-engine requirements when a segment is backed by multiple
 contiguous registrations.
 
+Classic TE P2P deployments also publish the TE segment descriptor in the Store-RS segment
+announcement. The logical `segment_name` remains the allocator and route identity, while
+`transport_endpoint` names the peer RPC endpoint and `transport_segment_descriptor` carries the
+full TE RAM descriptor that Redis-backed TE metadata would otherwise store under
+`mooncake/ram/[segment_name]`. Before `openSegment`, Store-RS preloads that descriptor into the
+local TE cache so P2P opens have the same device/GID/buffer view as Redis metadata opens without
+adding a backend lookup to the request path.
+
 Replica routes keep two separate coordinates. `ReplicaRoute::offset` is the actual transport
 target address used by TE/TENT and is the byte location of the stored payload in the segment
 storage target map. `segment_offset` belongs to the local allocator and reclaim path. Segment

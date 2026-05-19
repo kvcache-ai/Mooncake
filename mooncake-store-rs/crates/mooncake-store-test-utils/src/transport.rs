@@ -75,6 +75,9 @@ pub struct TestTransportState {
     pub submitted_batch_hints: Vec<(Option<String>, TransferPacingMode, Option<u64>)>,
     pub submitted_request_sources: Vec<Vec<usize>>,
     pub submitted_request_opcodes: Vec<Vec<Opcode>>,
+    pub local_segment_descriptor: Option<String>,
+    pub local_segment_descriptors: BTreeMap<String, String>,
+    pub cached_segment_descriptors: Vec<(String, String)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +114,9 @@ impl TestTransport {
                 submitted_batch_hints: Vec::new(),
                 submitted_request_sources: Vec::new(),
                 submitted_request_opcodes: Vec::new(),
+                local_segment_descriptor: None,
+                local_segment_descriptors: BTreeMap::new(),
+                cached_segment_descriptors: Vec::new(),
             })),
         }
     }
@@ -197,6 +203,25 @@ impl TestTransport {
 
     pub fn republish_local_metadata_calls(&self) -> usize {
         self.state.lock().republish_local_metadata_calls
+    }
+
+    pub fn set_local_segment_descriptor(&self, descriptor: impl Into<String>) {
+        self.state.lock().local_segment_descriptor = Some(descriptor.into());
+    }
+
+    pub fn set_local_segment_descriptor_for_segment(
+        &self,
+        segment_name: impl Into<String>,
+        descriptor: impl Into<String>,
+    ) {
+        self.state
+            .lock()
+            .local_segment_descriptors
+            .insert(segment_name.into(), descriptor.into());
+    }
+
+    pub fn cached_segment_descriptors(&self) -> Vec<(String, String)> {
+        self.state.lock().cached_segment_descriptors.clone()
     }
 }
 
@@ -315,6 +340,27 @@ impl StoreTransport for TestTransport {
 
     fn republish_local_metadata(&self) -> Result<()> {
         self.state.lock().republish_local_metadata_calls += 1;
+        Ok(())
+    }
+
+    fn local_segment_descriptor(&self) -> Result<Option<String>> {
+        let state = self.state.lock();
+        Ok(state
+            .local_segment_descriptors
+            .get(&self.local_segment)
+            .cloned()
+            .or_else(|| state.local_segment_descriptor.clone()))
+    }
+
+    fn cache_remote_segment_descriptor(
+        &self,
+        segment_name: &str,
+        descriptor_json: &str,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .cached_segment_descriptors
+            .push((segment_name.to_string(), descriptor_json.to_string()));
         Ok(())
     }
 
@@ -736,6 +782,19 @@ impl StoreTransport for FaultyTransport {
 
     fn republish_local_metadata(&self) -> Result<()> {
         self.inner.republish_local_metadata()
+    }
+
+    fn local_segment_descriptor(&self) -> Result<Option<String>> {
+        self.inner.local_segment_descriptor()
+    }
+
+    fn cache_remote_segment_descriptor(
+        &self,
+        segment_name: &str,
+        descriptor_json: &str,
+    ) -> Result<()> {
+        self.inner
+            .cache_remote_segment_descriptor(segment_name, descriptor_json)
     }
 
     fn unregister_memory(&self, addr: *mut c_void, size: usize) -> Result<()> {

@@ -259,6 +259,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let segment = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
             transport_endpoint: self.local_transport_endpoint(&segment_name),
+            transport_segment_descriptor: self.local_transport_segment_descriptor(&segment_name),
             segment_name,
             capacity_bytes,
             used_bytes,
@@ -360,6 +361,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             let mut announcement = segment_info.announcement(self.lease.runtime.clone(), 0);
             announcement.transport_endpoint =
                 self.local_transport_endpoint(&announcement.segment_name);
+            announcement.transport_segment_descriptor =
+                self.local_transport_segment_descriptor(&announcement.segment_name);
             self.allocator.lock().upsert(&announcement);
             info!(
                 runtime = %self.lease.runtime,

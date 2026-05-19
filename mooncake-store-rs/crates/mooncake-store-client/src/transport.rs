@@ -1054,6 +1054,26 @@ impl StoreTransport for ClassicTeTransport {
         self.rebuild_engine_for_metadata_recovery()
     }
 
+    fn local_segment_descriptor(&self) -> Result<Option<String>> {
+        if !self.config.uses_p2p_handshake_metadata() {
+            return Ok(None);
+        }
+        self.engine.read().local_segment_descriptor_json()
+    }
+
+    fn cache_remote_segment_descriptor(
+        &self,
+        segment_name: &str,
+        descriptor_json: &str,
+    ) -> Result<()> {
+        if !self.config.uses_p2p_handshake_metadata() {
+            return Ok(());
+        }
+        self.engine
+            .read()
+            .cache_segment_descriptor_json(segment_name, descriptor_json)
+    }
+
     fn adopt_local_memory(&self, addr: *mut c_void, _size: usize, location: &str) -> Result<()> {
         self.allocations
             .lock()
@@ -2713,6 +2733,7 @@ mod tests {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
                 transport_endpoint: None,
+                transport_segment_descriptor: None,
                 capacity_bytes: remote_segment.len() as u64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -2814,6 +2835,7 @@ mod tests {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
                 transport_endpoint: None,
+                transport_segment_descriptor: None,
                 capacity_bytes: remote_segment.len() as u64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -2864,6 +2886,7 @@ mod tests {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
                 transport_endpoint: None,
+                transport_segment_descriptor: None,
                 capacity_bytes: 64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),

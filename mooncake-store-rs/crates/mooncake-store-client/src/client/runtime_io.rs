@@ -391,11 +391,11 @@ impl StoreClient {
             object_ref = object_ref.qos_tier(qos_tier);
         }
         let policy = self.resolve_replication_policy(policy)?;
-        let max_write_attempts = if policy.with_soft_pin {
-            DEFAULT_PUT_WRITE_RETRY_LIMIT
-        } else {
-            1
-        };
+        let ranked_candidate_count = self
+            .request_placement_planner()
+            .ranked_candidates(self, &object_ref)?
+            .len();
+        let max_write_attempts = self.write_retry_limit(&policy, ranked_candidate_count);
         let mut current = current.cloned();
         let mut attempt = 0usize;
         loop {
@@ -1914,7 +1914,7 @@ impl StoreClient {
         error: &StoreError,
         policy: &ResolvedReplicationPolicy,
     ) -> bool {
-        policy.with_soft_pin
+        policy.required_preferred_segments.is_empty()
             && matches!(
                 error,
                 StoreError::Transport(_) | StoreError::NotFound(_) | StoreError::InvalidState(_)
