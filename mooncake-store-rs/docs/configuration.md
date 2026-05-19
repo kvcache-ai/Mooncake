@@ -267,6 +267,7 @@ Notes:
 - `classic`, `classic-te`, and `te` are accepted as compatibility aliases by the parser
 - set `MC_STORE_RS_GID_INDEX=<n>` when `classic_te` over RDMA must use a non-default RoCE GID index; Store-RS forwards it to upstream `MC_GID_INDEX`
 - for `classic_te` with Redis-backed transport metadata, Store-RS derives the upstream TE Redis key prefix from the default tenant and forwards `tenants/<tenant>` as the Mooncake metadata cluster id
+- for `classic_te` with `P2PHANDSHAKE`, segment metadata keeps the configured logical `segment_name` and also publishes the TE `transport_endpoint` (`ip:rpc_port`) used when peers open the segment
 - low-level Rust transport construction remains explicit; runtime backend selection is only a compatibility-layer feature
 - current upstream SGLang Mooncake integration does not forward `transport_backend` from `--hicache-storage-backend-extra-config`; use `MC_STORE_RS_TRANSPORT_BACKEND` when SGLang real mode must select `tent` or `classic_te`
 
@@ -275,7 +276,7 @@ Reconnect behavior:
 - both backends repair local transport metadata after Redis connectivity returns and the heartbeat repair path runs
 - `classic_te` recreates its transport runtime before republishing local buffers
 - `tent` also recreates its transport runtime before re-registering the local buffers it still owns
-- peer restarts that invalidate a cached remote segment handle are repaired on demand: the read path drops the stale handle, reopens by segment name, and only quarantines that runtime if the fresh reopen still fails
+- peer restarts that invalidate a cached remote segment handle are repaired on demand: the read path drops the stale handle, reopens by the segment's transport open name, and only quarantines that runtime if the fresh reopen still fails
 - segment metadata lookup starts from live clients. In Redis, segment records share the owner client hash TTL with the lease; in every backend, a leftover segment record whose owner lease is gone is ignored for allocation, preferred-segment resolution, and HTTP remote-runtime resolution.
 - routed writes apply the same stale-handle refresh once before escalating to outer soft-pin retry or failover, so a restarted live peer does not poison the cached remote-segment state
 - if Redis restarts from an empty dataset, surviving storage clients republish both lease state and segment metadata into their client resource hash during recovery

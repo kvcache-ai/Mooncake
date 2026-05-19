@@ -524,6 +524,60 @@ impl StoreClient {
         }
     }
 
+    fn transport_open_segment_name<'a>(
+        segment_name: &'a SegmentName,
+        transport_endpoint: Option<&'a str>,
+    ) -> &'a str {
+        transport_endpoint
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .unwrap_or(&segment_name.0)
+    }
+
+    fn replica_transport_open_segment_name(&self, replica: &ReplicaRoute) -> Result<String> {
+        self.remote_transport_open_segment_name(&replica.owner, &replica.segment_name)
+    }
+
+    fn remote_transport_open_segment_name(
+        &self,
+        owner: &ClientRuntimeId,
+        segment_name: &SegmentName,
+    ) -> Result<String> {
+        if let Some(segment) = self.allocator.lock().announcement(segment_name) {
+            if segment.owner == *owner {
+                return Ok(Self::transport_open_segment_name(
+                    segment_name,
+                    segment.transport_endpoint.as_deref(),
+                )
+                .to_string());
+            }
+        }
+        if let Some(metadata) = self
+            .state
+            .lock()
+            .cached_segment_target_metadata(owner, segment_name)
+        {
+            return Ok(Self::transport_open_segment_name(
+                segment_name,
+                metadata.transport_endpoint.as_deref(),
+            )
+            .to_string());
+        }
+        let segment = self.metadata.get_segment(owner, segment_name)?;
+        Ok(Self::transport_open_segment_name(
+            segment_name,
+            segment
+                .as_ref()
+                .and_then(|segment| segment.transport_endpoint.as_deref()),
+        )
+        .to_string())
+    }
+
+    fn local_transport_open_segment_name(&self, segment_name: &SegmentName) -> String {
+        self.local_transport_endpoint(segment_name)
+            .unwrap_or_else(|| segment_name.0.clone())
+    }
+
     fn lookup_runtime_leases_once(
         &self,
         wanted: &BTreeSet<ClientRuntimeId>,

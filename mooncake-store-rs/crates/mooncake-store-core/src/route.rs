@@ -141,6 +141,8 @@ pub struct ClientLease {
 pub struct SegmentAnnouncement {
     pub owner: ClientRuntimeId,
     pub segment_name: SegmentName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_endpoint: Option<String>,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     #[serde(

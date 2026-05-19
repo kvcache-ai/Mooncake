@@ -225,9 +225,15 @@ struct StoreState {
     local_transports: BTreeMap<String, Arc<dyn StoreTransport>>,
     remote_segments: BTreeMap<String, u64>,
     remote_segment_infos: BTreeMap<String, SegmentInfo>,
-    segment_target_chunks: BTreeMap<(ClientRuntimeId, SegmentName), Vec<SegmentTargetChunk>>,
+    segment_target_metadata: BTreeMap<(ClientRuntimeId, SegmentName), SegmentTransportMetadata>,
     pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SegmentTransportMetadata {
+    target_chunks: Vec<SegmentTargetChunk>,
+    transport_endpoint: Option<String>,
 }
 
 struct StorageOwnerState {
@@ -494,6 +500,7 @@ impl SegmentAllocator {
     fn merge_announcement(&mut self, next: &SegmentAnnouncement) {
         self.announcement.owner = next.owner.clone();
         self.announcement.segment_name = next.segment_name.clone();
+        self.announcement.transport_endpoint = next.transport_endpoint.clone();
         self.announcement.capacity_bytes = next.capacity_bytes;
         self.announcement.target_chunks = next.target_chunks.clone();
         self.announcement.tags = next.tags.clone();
@@ -692,6 +699,7 @@ enum WriteMode {
 struct ReplicaWriteTarget {
     storage_runtime: ClientRuntimeId,
     segment_name: SegmentName,
+    transport_endpoint: Option<String>,
     target_chunks: Vec<mooncake_store_core::SegmentTargetChunk>,
 }
 

@@ -79,7 +79,13 @@ impl StoreClient {
                 )?;
                 let (handle, info) = {
                     let mut state = self.state.lock();
-                    state.open_segment_with_info(transport, &target.segment_name.0)?
+                    state.open_segment_with_info(
+                        transport,
+                        Self::transport_open_segment_name(
+                            &target.segment_name,
+                            target.transport_endpoint.as_deref(),
+                        ),
+                    )?
                 };
                 let target_offset = Self::storage_target_offset(
                     &target.target_chunks,
@@ -773,7 +779,13 @@ impl StoreClient {
                         }
                         let (handle, info) = {
                             let mut state = self.state.lock();
-                            state.open_segment_with_info(transport, &target.segment_name.0)?
+                            state.open_segment_with_info(
+                                transport,
+                                Self::transport_open_segment_name(
+                                    &target.segment_name,
+                                    target.transport_endpoint.as_deref(),
+                                ),
+                            )?
                         };
                         let target_offset = Self::storage_target_offset(
                             &target.target_chunks,

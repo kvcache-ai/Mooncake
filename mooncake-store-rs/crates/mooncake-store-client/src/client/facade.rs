@@ -255,9 +255,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
         )
         .entered();
         let tracker = OperationTracker::new("mount_segment").input_bytes(capacity_bytes);
+        let segment_name = self.segment_name()?;
         let segment = SegmentAnnouncement {
             owner: self.lease.runtime.clone(),
-            segment_name: self.segment_name()?,
+            transport_endpoint: self.local_transport_endpoint(&segment_name),
+            segment_name,
             capacity_bytes,
             used_bytes,
             target_chunks: Vec::new(),
@@ -355,7 +357,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         segment_name.0
                     ))
                 })?;
-            let announcement = segment_info.announcement(self.lease.runtime.clone(), 0);
+            let mut announcement = segment_info.announcement(self.lease.runtime.clone(), 0);
+            announcement.transport_endpoint =
+                self.local_transport_endpoint(&announcement.segment_name);
             self.allocator.lock().upsert(&announcement);
             info!(
                 runtime = %self.lease.runtime,

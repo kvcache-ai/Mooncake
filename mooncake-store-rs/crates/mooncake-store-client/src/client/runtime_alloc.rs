@@ -4,30 +4,32 @@ impl StoreClient {
         storage_runtime: &ClientRuntimeId,
         segment_name: &SegmentName,
     ) -> Result<ReplicaWriteTarget> {
-        let target_chunks = self.replica_write_target_chunks(storage_runtime, segment_name)?;
+        let (target_chunks, transport_endpoint) =
+            self.replica_write_target_metadata(storage_runtime, segment_name)?;
         Ok(ReplicaWriteTarget {
             storage_runtime: storage_runtime.clone(),
             segment_name: segment_name.clone(),
+            transport_endpoint,
             target_chunks,
         })
     }
 
-    fn replica_write_target_chunks(
+    fn replica_write_target_metadata(
         &self,
         storage_runtime: &ClientRuntimeId,
         segment_name: &SegmentName,
-    ) -> Result<Vec<SegmentTargetChunk>> {
+    ) -> Result<(Vec<SegmentTargetChunk>, Option<String>)> {
         if let Some(segment) = self.allocator.lock().announcement(segment_name) {
             if segment.owner == *storage_runtime {
-                return Ok(segment.target_chunks);
+                return Ok((segment.target_chunks, segment.transport_endpoint));
             }
         }
         {
             let state = self.state.lock();
-            if let Some(target_chunks) =
-                state.cached_segment_target_chunks(storage_runtime, segment_name)
+            if let Some(metadata) =
+                state.cached_segment_target_metadata(storage_runtime, segment_name)
             {
-                return Ok(target_chunks);
+                return Ok((metadata.target_chunks, metadata.transport_endpoint));
             }
         }
         let segment = self
@@ -40,16 +42,18 @@ impl StoreClient {
                 ))
             })?;
         let target_chunks = segment.target_chunks.clone();
+        let transport_endpoint = segment.transport_endpoint.clone();
         if segment.owner == self.lease.runtime {
             self.allocator.lock().upsert(&segment);
         } else if !target_chunks.is_empty() {
-            self.state.lock().cache_segment_target_chunks(
+            self.state.lock().cache_segment_target_metadata(
                 storage_runtime,
                 segment_name,
                 &target_chunks,
+                transport_endpoint.clone(),
             );
         }
-        Ok(target_chunks)
+        Ok((target_chunks, transport_endpoint))
     }
 
     fn reserve_specific_segment(
@@ -650,17 +654,32 @@ impl StoreClient {
     }
 
     fn publish_local_segment(&self, segment: &StorageExtentInfo, used_bytes: u64) -> Result<()> {
+        let transport_endpoint = self.local_transport_endpoint(&segment.segment_name);
         info!(
             runtime = %self.lease.runtime,
             segment = %segment.segment_name.0,
+            transport_endpoint = transport_endpoint.as_deref().unwrap_or(""),
             capacity_bytes = segment.capacity_bytes,
             used_bytes,
             state = ?segment.state,
             "publishing local segment"
         );
-        let announcement = segment.announcement(self.lease.runtime.clone(), used_bytes);
+        let mut announcement = segment.announcement(self.lease.runtime.clone(), used_bytes);
+        announcement.transport_endpoint = transport_endpoint;
         self.allocator.lock().upsert(&announcement);
         self.metadata.publish_segment(&announcement)
+    }
+
+    fn local_transport_endpoint(&self, segment_name: &SegmentName) -> Option<String> {
+        let transport = {
+            let state = self.state.lock();
+            state.local_transports.get(&segment_name.0).cloned()
+        }?;
+        transport
+            .segment_name()
+            .ok()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty() && endpoint != &segment_name.0)
     }
 
     fn refresh_lease_for_local_segment_publish(&self) -> Result<()> {

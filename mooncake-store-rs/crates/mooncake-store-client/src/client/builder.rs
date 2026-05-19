@@ -712,10 +712,11 @@ fn prewarm_segment_target_chunk_cache(
                 if segment.state == SegmentLifecycleState::Active
                     && !segment.target_chunks.is_empty() =>
             {
-                state.lock().cache_segment_target_chunks(
+                state.lock().cache_segment_target_metadata(
                     &lease.runtime,
                     segment_name,
                     &segment.target_chunks,
+                    segment.transport_endpoint.clone(),
                 );
             }
             Ok(_) => {}

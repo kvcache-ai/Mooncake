@@ -2317,6 +2317,37 @@ fn wait_for_membership_convergence(clients: &[&StoreClient]) {
     }
 }
 
+fn wait_for_storage_clock_hot(storage: &StoreClient, route: &ObjectRoute) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let hot = {
+            let clock = storage.storage_owner.clock.lock();
+            clock
+                .entries
+                .iter()
+                .filter_map(Option::as_ref)
+                .any(|entry| {
+                    entry.id.route_key == route.key
+                        && route.replicas.iter().any(|replica| {
+                            replica.owner == *storage.runtime_id()
+                                && replica.segment_name == entry.id.segment_name
+                                && replica.segment_offset == entry.id.segment_offset
+                        })
+                        && entry.hot
+                })
+        };
+        if hot {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "route {} did not become hot on storage owner {} in time",
+        route.key.0,
+        storage.runtime_id()
+    );
+}
+
 fn tc_replica2_payload(key: &str) -> Vec<u8> {
     format!("tc-replica2-payload::{key}").into_bytes()
 }
@@ -2349,6 +2380,89 @@ fn hot_upgrade_handoff_is_published_after_draining() {
     assert_eq!(stored.from.epoch, ClientEpoch(1));
     assert_eq!(stored.to.epoch, ClientEpoch(2));
     assert_eq!(stored.kind, HandoffKind::HotUpgrade);
+}
+
+#[test]
+fn register_local_memory_preserves_segment_name_and_publishes_transport_endpoint() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let logical_segment = SegmentName::new("logical-segment");
+    let transport_endpoint = "189.144.184.2:12001";
+    let transport = Arc::new(TestTransport::new(transport_endpoint));
+    let client = StoreClientBuilder::new(metadata.clone(), "p2p-publish")
+        .state(ClientLifecycleState::Active)
+        .segment_name(logical_segment.0.clone())
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("client build should succeed");
+
+    client
+        .register_local_memory()
+        .expect("local memory should register");
+
+    let segment = metadata
+        .get_segment(client.runtime_id(), &logical_segment)
+        .expect("segment lookup should succeed")
+        .expect("logical segment should be published");
+    assert_eq!(segment.segment_name, logical_segment);
+    assert_eq!(
+        segment.transport_endpoint.as_deref(),
+        Some(transport_endpoint)
+    );
+}
+
+#[test]
+fn routed_io_opens_transport_endpoint_while_routes_keep_segment_name() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let logical_segment = SegmentName::new("storage-logical-segment");
+    let transport_endpoint = "189.144.184.2:12001";
+    let storage_transport = Arc::new(TestTransport::new(transport_endpoint));
+    let writer_transport = Arc::new(storage_transport.peer("writer-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "p2p-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .segment_name(logical_segment.0.clone())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+
+    let writer = StoreClientBuilder::new(metadata.clone(), "p2p-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer scratch should register");
+
+    writer
+        .put("p2p-key", b"payload")
+        .expect("writer should put through transport endpoint");
+    assert_eq!(
+        writer
+            .get("p2p-key")
+            .expect("writer should read through transport endpoint"),
+        b"payload"
+    );
+
+    let route = writer
+        .query_route("p2p-key")
+        .expect("route query should succeed")
+        .expect("route should exist");
+    assert_eq!(route.replicas[0].segment_name, logical_segment);
 }
 
 #[test]
@@ -8339,6 +8453,7 @@ fn query_route_marks_local_replica_hot_for_eviction() {
 
 #[test]
 fn remote_hit_reports_drive_storage_owner_clock_eviction() {
+    let _guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("clock-remote-storage-segment"));
     let router_transport = Arc::new(storage_transport.peer("clock-remote-router-segment"));
@@ -8393,6 +8508,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
             .expect("remote hot get should succeed"),
         hot
     );
+    wait_for_storage_clock_hot(&storage, &hot_route);
 
     let fresh_route = router
         .put("remote-clock-fresh", fresh)
@@ -8412,6 +8528,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
 
 #[test]
 fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
+    let _guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("exists-hot-remote-storage-segment"));
     let router_transport = Arc::new(storage_transport.peer("exists-hot-remote-router-segment"));
@@ -8455,6 +8572,10 @@ fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
     router
         .put("remote-exists-hot", hot)
         .expect("hot put should succeed");
+    let hot_route = router
+        .query_route("remote-exists-hot")
+        .expect("hot route query should succeed")
+        .expect("hot route should exist");
     router
         .put("remote-exists-cold", cold)
         .expect("cold put should succeed");
@@ -8464,6 +8585,7 @@ fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
             .expect("batch_is_exist should succeed"),
         vec![true]
     );
+    wait_for_storage_clock_hot(&storage, &hot_route);
 
     let fresh_route = router
         .put("remote-exists-fresh", fresh)
@@ -8562,6 +8684,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
     remote_allocator.lock().upsert(&SegmentAnnouncement {
         owner: remote_owner.clone(),
         segment_name: SegmentName::new("seg-prefer"),
+        transport_endpoint: None,
         capacity_bytes: 8,
         used_bytes: 0,
         target_chunks: remote_target_chunks.clone(),
@@ -8613,6 +8736,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         .publish_segment(&SegmentAnnouncement {
             owner: remote_owner.clone(),
             segment_name: SegmentName::new("seg-prefer"),
+            transport_endpoint: None,
             capacity_bytes: 8,
             used_bytes: 0,
             target_chunks: remote_target_chunks,
@@ -11410,6 +11534,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary.clone(),
+                transport_endpoint: None,
                 target_chunks: Vec::new(),
             }],
             std::slice::from_ref(&reservation),
@@ -11420,6 +11545,7 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             &[ReplicaWriteTarget {
                 storage_runtime: client.runtime_id().clone(),
                 segment_name: primary,
+                transport_endpoint: None,
                 target_chunks: Vec::new(),
             }],
             &[],
@@ -13204,6 +13330,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     let primary = SegmentAnnouncement {
         owner: owner.clone(),
         segment_name: SegmentName::new("alloc-primary"),
+        transport_endpoint: None,
         capacity_bytes: 128,
         used_bytes: 0,
         target_chunks: Vec::new(),
@@ -13213,11 +13340,13 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     };
     let secondary = SegmentAnnouncement {
         segment_name: SegmentName::new("alloc-secondary"),
+        transport_endpoint: None,
         capacity_bytes: 64,
         ..primary.clone()
     };
     let draining = SegmentAnnouncement {
         segment_name: SegmentName::new("alloc-draining"),
+        transport_endpoint: None,
         state: SegmentLifecycleState::Draining,
         ..primary.clone()
     };
@@ -13280,6 +13409,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         )
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
+        transport_endpoint: None,
         used_bytes: 64,
         target_chunks: Vec::new(),
         alignment_bytes: 1,
@@ -13495,6 +13625,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
     let primary = SegmentAnnouncement {
         owner: owner.clone(),
         segment_name: SegmentName::new("pending-primary"),
+        transport_endpoint: None,
         capacity_bytes: 128,
         used_bytes: 0,
         target_chunks: Vec::new(),

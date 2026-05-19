@@ -2338,9 +2338,11 @@ impl StoreClient {
             if !*local || local_segment_infos.contains_key(&entry.replica.segment_name) {
                 continue;
             }
+            let open_segment_name =
+                self.local_transport_open_segment_name(&entry.replica.segment_name);
             let (_, info) = {
                 let mut state = self.state.lock();
-                state.open_segment_with_info(transport, &entry.replica.segment_name.0)?
+                state.open_segment_with_info(transport, &open_segment_name)?
             };
             local_segment_infos.insert(entry.replica.segment_name.clone(), info);
         }
@@ -2788,9 +2790,15 @@ impl StoreClient {
             for (runtime, segments) in failed_segments_by_runtime {
                 let should_mark = transport.as_ref().is_none_or(|transport| {
                     segments.iter().all(|segment_name| {
+                        let open_segment_name = self
+                            .remote_transport_open_segment_name(
+                                &runtime,
+                                &SegmentName::new(segment_name.clone()),
+                            )
+                            .unwrap_or_else(|_| segment_name.clone());
                         let mut state = self.state.lock();
                         state
-                            .open_segment_with_info(*transport, segment_name)
+                            .open_segment_with_info(*transport, &open_segment_name)
                             .is_err()
                     })
                 });
@@ -3163,18 +3171,28 @@ impl StoreClient {
         let tracker = OperationTracker::new("get_remote_batch_chunk");
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let requests = {
-                let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
                 for (position, index) in remote_indices.iter().enumerate() {
                     let entry = &resolved[*index];
-                    let (segment, info) = state
-                        .open_segment_with_info(transport, &entry.replica.segment_name.0)
+                    let open_segment_name = self
+                        .replica_transport_open_segment_name(&entry.replica)
                         .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
                             )
                         })?;
+                    let (segment, info) = {
+                        let mut state = self.state.lock();
+                        state
+                            .open_segment_with_info(transport, &open_segment_name)
+                            .map_err(|error| {
+                                (
+                                    error.clone(),
+                                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                                )
+                            })?
+                    };
                     let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
                         .map_err(|error| {
                             (
@@ -3296,18 +3314,28 @@ impl StoreClient {
         let tracker = OperationTracker::new("get_remote_batch_direct");
         let raw_result = (|| -> std::result::Result<(), (StoreError, bool)> {
             let requests = {
-                let mut state = self.state.lock();
                 let mut batch = Vec::with_capacity(remote_indices.len());
                 for index in remote_indices {
                     let entry = &resolved[*index];
-                    let (segment, info) = state
-                        .open_segment_with_info(transport, &entry.replica.segment_name.0)
+                    let open_segment_name = self
+                        .replica_transport_open_segment_name(&entry.replica)
                         .map_err(|error| {
                             (
                                 error.clone(),
                                 Self::remote_read_failure_marks_runtime_suspect(&error),
                             )
                         })?;
+                    let (segment, info) = {
+                        let mut state = self.state.lock();
+                        state
+                            .open_segment_with_info(transport, &open_segment_name)
+                            .map_err(|error| {
+                                (
+                                    error.clone(),
+                                    Self::remote_read_failure_marks_runtime_suspect(&error),
+                                )
+                            })?
+                    };
                     let target_offset = Self::remote_replica_target_offset(&info, &entry.replica)
                         .map_err(|error| {
                             (
@@ -3431,9 +3459,17 @@ impl StoreClient {
                 }
             }
             let requests = {
+                let open_segment_name = self
+                    .replica_transport_open_segment_name(&resolved.replica)
+                    .map_err(|error| {
+                        (
+                            error.clone(),
+                            Self::remote_read_failure_marks_runtime_suspect(&error),
+                        )
+                    })?;
                 let mut state = self.state.lock();
                 let (segment, info) = state
-                    .open_segment_with_info(transport, &resolved.replica.segment_name.0)
+                    .open_segment_with_info(transport, &open_segment_name)
                     .map_err(|error| {
                         (
                             error.clone(),
@@ -3582,9 +3618,10 @@ impl StoreClient {
         if !local {
             return Ok(false);
         }
+        let open_segment_name = self.local_transport_open_segment_name(&replica.segment_name);
         let (_, target_info) = {
             let mut state = self.state.lock();
-            state.open_segment_with_info(transport, &replica.segment_name.0)?
+            state.open_segment_with_info(transport, &open_segment_name)?
         };
         {
             let state = self.state.lock();

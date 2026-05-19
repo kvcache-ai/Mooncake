@@ -504,6 +504,7 @@ impl StorageExtentInfo {
         SegmentAnnouncement {
             owner,
             segment_name: self.segment_name.clone(),
+            transport_endpoint: None,
             capacity_bytes: self.capacity_bytes,
             used_bytes,
             target_chunks: self.target_chunks.clone(),
