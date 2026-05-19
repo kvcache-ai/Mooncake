@@ -966,8 +966,10 @@ void MooncakeBackend::shutdown() {
 
     // When using an external engine, we must not call unregister on it
     // during shutdown because the external engine's lifetime is managed
-    // by the caller. Instead, just abandon resources and reset the
-    // static pointer back to a fresh default engine.
+    // by the caller. Only clean up per-instance resources (proxy,
+    // connection context, buffers). Do NOT modify static state
+    // (engine_, engineInitialized_, externalEngine_) because other PG
+    // instances may still be using the same external engine.
     if (externalEngine_) {
         p2p_device_worker_->removeProxy(p2p_proxy_);
         p2p_proxy_->abandonResources();
@@ -991,15 +993,6 @@ void MooncakeBackend::shutdown() {
             }
         }
 
-        // Reset the static engine pointer back to the original leaky
-        // singleton so that subsequent PG instances (if any) use the
-        // default engine.  Do NOT create a new TransferEngine here —
-        // the original leaky singleton still exists and will be
-        // reused once engineInitialized_ is cleared.
-        static TransferEngine* defaultEngine = new TransferEngine(true);
-        engine_ = defaultEngine;
-        engineInitialized_ = false;
-        externalEngine_ = nullptr;
         return;
     }
 
