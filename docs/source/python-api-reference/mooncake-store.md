@@ -169,7 +169,7 @@ transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
 payload = StructuredObjectPayload(
     metadata={"step": 7, "layout": "rollout"},
     buffers={
-        "tokens": np.arange(24, dtype=np.int32).reshape(6, 4),
+        "tokens": np.array(range(24), dtype=np.int32).reshape(6, 4),
         "mask": np.ones((6, 4), dtype=np.int8),
         "prompt_ids": b"sample-ids",
     },
