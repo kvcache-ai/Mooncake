@@ -807,8 +807,7 @@ CentralizedClientService::InnerBatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err =
-            GetPreferredReplica(query_result->replicas, replica);
+        ErrorCode err = GetPreferredReplica(query_result->replicas, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;

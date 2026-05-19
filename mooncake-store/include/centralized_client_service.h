@@ -269,8 +269,10 @@ class CentralizedClientService
         }
     };
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
-    std::vector<std::unique_ptr<void, AscendSegmentDeleter>> ascend_segment_ptrs_;
-    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>> hugepage_segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
 
     CentralizedMasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;

@@ -2,6 +2,7 @@
     "local_segment_name": "",
     "metadata_type": "p2p",
     "metadata_servers": "127.0.0.1:2379",
+    "redis_db_index": 0,
     "rpc_server_hostname": "127.0.0.1",
     "rpc_server_port": 0,
     "topology": {

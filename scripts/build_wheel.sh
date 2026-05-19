@@ -10,7 +10,14 @@ set -x
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
+# Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
+CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
+if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
+    CUDA_VERSION=$(grep -Eo "[0-9]+\.[0-9]+" /usr/local/cuda/version.txt | head -n1)
+fi
+CUDA_VERSION=${CUDA_VERSION:-"0.0"}
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
+echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -97,7 +104,12 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         python setup.py build_ext --build-lib .
     else
         for version in ${EP_TORCH_VERSIONS//;/ }; do
-            pip install torch==$version
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION}0
+            else
+                pip install torch==$version
+            fi
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi

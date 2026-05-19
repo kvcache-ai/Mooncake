@@ -77,7 +77,8 @@ typedef struct tent_segment_info tent_segment_info_t;
 
 struct tent_notifi_record {
     tent_segment_id_t handle;
-    char content[4096];
+    char name[256];
+    char msg[4096];
 };
 
 struct tent_notifi_info {
@@ -124,8 +125,12 @@ int tent_free_batch(tent_engine_t engine, tent_batch_id_t batch_id);
 int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
                 tent_request_t* entries, size_t count);
 
+int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
+                      tent_request_t* entries, size_t count, const char* name,
+                      const char* message);
+
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
-                     const char* message);
+                     const char* name, const char* message);
 
 int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info);
 
@@ -220,7 +225,7 @@ class TransferEngine {
     Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
 
     Status registerLocalMemory(std::vector<void*> addr_list,
-                               std::vector<size_t> size_listlist,
+                               std::vector<size_t> size_list,
                                MemoryOptions& options);
 
    public:
@@ -230,6 +235,10 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
+
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification& notifi);
 
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 

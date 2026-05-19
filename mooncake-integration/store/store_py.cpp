@@ -1023,7 +1023,7 @@ PYBIND11_MODULE(store, m) {
                       &QueryTaskResponse::last_updated_at_ms_epoch)
         .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
         .def_readonly("message", &QueryTaskResponse::message)
-        .def("__repr__", [](const QueryTaskResponse &self) {
+        .def("__repr__", [](const QueryTaskResponse& self) {
             std::ostringstream oss;
             oss << "QueryTaskResponse(id=" << self.id
                 << ", type=" << static_cast<int>(self.type)
@@ -1688,8 +1688,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"))
         .def(
             "create_copy_task",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               const std::vector<std::string> &targets) -> py::tuple {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               const std::vector<std::string>& targets) -> py::tuple {
                 py::gil_scoped_release release;
                 auto result = self.store_->create_copy_task(key, targets);
                 py::gil_scoped_acquire acquire;
@@ -1711,9 +1711,9 @@ PYBIND11_MODULE(store, m) {
             "success, non-zero if failure)")
         .def(
             "create_move_task",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
-               const std::string &source,
-               const std::string &target) -> py::tuple {
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               const std::string& source,
+               const std::string& target) -> py::tuple {
                 py::gil_scoped_release release;
                 auto result =
                     self.store_->create_move_task(key, source, target);
@@ -1737,7 +1737,7 @@ PYBIND11_MODULE(store, m) {
             "success, non-zero if failure)")
         .def(
             "query_task",
-            [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {
+            [](MooncakeStorePyWrapper& self, const UUID& task_id) -> py::tuple {
                 py::gil_scoped_release release;
                 auto result = self.store_->query_task(task_id);
                 py::gil_scoped_acquire acquire;

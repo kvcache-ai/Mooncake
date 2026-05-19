@@ -144,20 +144,16 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     ~OffsetAllocator() = default;
 
     // Allocate memory and return a Handle (thread-safe)
-    [[nodiscard]]
-    std::optional<OffsetAllocationHandle> allocate(size_t size);
+    [[nodiscard]] std::optional<OffsetAllocationHandle> allocate(size_t size);
 
     // Get storage report (thread-safe)
-    [[nodiscard]]
-    OffsetAllocStorageReport storageReport() const;
+    [[nodiscard]] OffsetAllocStorageReport storageReport() const;
 
     // Get full storage report (thread-safe)
-    [[nodiscard]]
-    OffsetAllocStorageReportFull storageReportFull() const;
+    [[nodiscard]] OffsetAllocStorageReportFull storageReportFull() const;
 
     // Get comprehensive metrics including fragmentation analysis (thread-safe)
-    [[nodiscard]]
-    OffsetAllocatorMetrics get_metrics() const;
+    [[nodiscard]] OffsetAllocatorMetrics get_metrics() const;
 
     // Serialize the allocator with serializer.
     template <typename T>
@@ -173,8 +169,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     void freeAllocation(const OffsetAllocation& allocation, uint64_t size);
 
     // Internal method to get metrics without locking (caller must hold m_mutex)
-    [[nodiscard]]
-    OffsetAllocatorMetrics get_metrics_internal() const REQUIRES(m_mutex);
+    [[nodiscard]] OffsetAllocatorMetrics get_metrics_internal() const
+        REQUIRES(m_mutex);
 
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     uint64_t m_base;
@@ -310,7 +306,8 @@ void __Allocator::serialize_to(T& serializer) const {
     serializer.write(&m_binIndices, sizeof(m_binIndices));
     serializer.write(&m_freeOffset, sizeof(m_freeOffset));
     serializer.write(m_nodes.data(), m_current_capacity * sizeof(Node));
-    serializer.write(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+    serializer.write(m_freeNodes.data(),
+                     m_current_capacity * sizeof(NodeIndex));
 }
 
 template <typename T>
@@ -336,7 +333,8 @@ __Allocator::__Allocator(T& serializer) {
 
         // Deserialize the arrays
         serializer.read(m_nodes.data(), m_current_capacity * sizeof(Node));
-        serializer.read(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+        serializer.read(m_freeNodes.data(),
+                        m_current_capacity * sizeof(NodeIndex));
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
         throw std::runtime_error("Deserializing __Allocator failed");
