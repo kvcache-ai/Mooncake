@@ -1,0 +1,6 @@
+if (NCCL_HAS_HOST_RMA)
+    file(GLOB XPORT_SOURCES "*.cpp")
+    add_library(tent_xport_nccl STATIC ${XPORT_SOURCES})
+    target_link_libraries(tent_xport_nccl PUBLIC tent_common platform_cuda ${NCCL_LIB})
+    target_include_directories(tent_xport_nccl PUBLIC ${NCCL_INCLUDE_DIR})
+endif()

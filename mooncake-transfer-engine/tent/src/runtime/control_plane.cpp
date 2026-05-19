@@ -45,6 +45,32 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return Status::OK();
 }
 
+Status ControlClient::bootstrapNccl(const std::string& server_addr,
+                                    const NcclBootstrapDesc& request,
+                                    NcclBootstrapDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, BootstrapNccl, request_raw,
+                                   response_raw));
+    response = json::parse(response_raw).get<NcclBootstrapDesc>();
+    return response.reply_msg.empty() ? Status::OK()
+                                      : Status::RpcServiceError(response.reply_msg);
+}
+
+Status ControlClient::registerNcclWindow(const std::string& server_addr,
+                                         const NcclWindowDesc& request,
+                                         NcclWindowDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, RegisterNcclWindow,
+                                   request_raw, response_raw));
+    response = json::parse(response_raw).get<NcclWindowDesc>();
+    return response.reply_msg.empty() ? Status::OK()
+                                      : Status::RpcServiceError(response.reply_msg);
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -169,7 +195,11 @@ ControlService::ControlService(const std::string& type,
                                const std::string& username,
                                const std::string& password, uint8_t db_index,
                                TransferEngineImpl* impl)
-    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
+    : bootstrap_callback_(nullptr),
+      nccl_bootstrap_callback_(nullptr),
+      nccl_window_callback_(nullptr),
+      notify_callback_(nullptr),
+      impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -188,6 +218,16 @@ ControlService::ControlService(const std::string& type,
         BootstrapRdma,
         [this](const std::string_view& request, std::string& response) {
             onBootstrapRdma(request, response);
+        });
+    rpc_server_->registerFunction(
+        BootstrapNccl,
+        [this](const std::string_view& request, std::string& response) {
+            onBootstrapNccl(request, response);
+        });
+    rpc_server_->registerFunction(
+        RegisterNcclWindow,
+        [this](const std::string_view& request, std::string& response) {
+            onRegisterNcclWindow(request, response);
         });
     rpc_server_->registerFunction(
         SendData,
@@ -251,6 +291,37 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
         json::parse(std::string(request)).get<BootstrapDesc>();
     BootstrapDesc response_desc;
     if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onBootstrapNccl(const std::string_view& request,
+                                     std::string& response) {
+    NcclBootstrapDesc request_desc =
+        json::parse(std::string(request)).get<NcclBootstrapDesc>();
+    NcclBootstrapDesc response_desc;
+    response_desc.session_key = request_desc.session_key;
+    if (nccl_bootstrap_callback_) {
+        nccl_bootstrap_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg = "NCCL bootstrap callback not registered";
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onRegisterNcclWindow(const std::string_view& request,
+                                          std::string& response) {
+    NcclWindowDesc request_desc =
+        json::parse(std::string(request)).get<NcclWindowDesc>();
+    NcclWindowDesc response_desc;
+    response_desc.session_key = request_desc.session_key;
+    response_desc.window_key = request_desc.window_key;
+    if (nccl_window_callback_) {
+        nccl_window_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg = "NCCL window callback not registered";
+    }
     json j = response_desc;
     response = j.dump();
 }

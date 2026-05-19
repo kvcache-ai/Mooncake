@@ -87,6 +87,10 @@
         },
         "mnnvl": {
             "enable" : false
+        },
+        "nccl": {
+            "enable": false,
+            "allow_external_window_buffers": false
         }
     }
 }

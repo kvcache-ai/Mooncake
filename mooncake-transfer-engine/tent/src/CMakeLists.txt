@@ -35,6 +35,46 @@ else()
   message(STATUS "ROCm/HIP: Disabled")
 endif()
 
+# NCCL host-side RMA
+find_path(NCCL_INCLUDE_DIR nccl.h PATHS /usr/local/cuda/include /usr/include
+                                             /usr/local/include)
+find_library(NCCL_LIB nccl PATHS /usr/local/cuda/lib64 /usr/lib /usr/lib64
+                                 /usr/local/lib /usr/local/lib64)
+if(USE_CUDA
+   AND CUDAToolkit_FOUND
+   AND NCCL_INCLUDE_DIR
+   AND NCCL_LIB)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${NCCL_INCLUDE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES ${NCCL_LIB})
+  check_cxx_source_compiles("
+#include <cuda_runtime.h>
+#include <nccl.h>
+int main() {
+  ncclComm_t comm = nullptr;
+  ncclWindow_t win{};
+  void* ptr = nullptr;
+  (void)ncclMemAlloc(&ptr, 4096);
+  (void)ncclCommWindowRegister(comm, ptr, 4096, &win, NCCL_WIN_DEFAULT);
+  (void)ncclPutSignal(ptr, 1, ncclUint8, 0, win, 0, 0, 0, 0, comm, nullptr);
+  (void)ncclMemFree(ptr);
+  return 0;
+}
+" NCCL_HAS_HOST_RMA)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+  if(NCCL_HAS_HOST_RMA)
+    message(STATUS "NCCL host RMA: Enabled")
+    target_compile_definitions(tent_interface INTERFACE USE_NCCL)
+    target_include_directories(tent_interface INTERFACE ${NCCL_INCLUDE_DIR})
+    target_link_libraries(tent_interface INTERFACE ${NCCL_LIB})
+  else()
+    message(STATUS "NCCL host RMA: Disabled (ncclPutSignal unavailable)")
+  endif()
+else()
+  message(STATUS "NCCL host RMA: Disabled")
+endif()
+
 # GDS
 find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
 find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
@@ -134,6 +174,7 @@ foreach(
   tent_xport_uring
   tent_xport_bufio
   tent_xport_mnnvl
+  tent_xport_nccl
   tent_xport_nvlink
   tent_xport_rdma
   tent_xport_shm

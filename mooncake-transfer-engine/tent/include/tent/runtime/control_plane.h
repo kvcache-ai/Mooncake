@@ -59,8 +59,38 @@ struct XferDataDesc {
     size_t length;
 };
 
+struct NcclBootstrapDesc {
+    std::string session_key;
+    std::string unique_id;
+    int device_index = 0;
+    std::string reply_msg;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclBootstrapDesc, session_key, unique_id,
+                                   device_index, reply_msg);
+};
+
+struct NcclWindowDesc {
+    std::string session_key;
+    std::string window_key;
+    uint64_t addr = 0;
+    uint64_t length = 0;
+    int device_index = 0;
+    std::string reply_msg;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclWindowDesc, session_key, window_key,
+                                   addr, length, device_index, reply_msg);
+};
+
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;
+
+using OnReceiveNcclBootstrap = std::function<int(
+    const NcclBootstrapDesc& request, NcclBootstrapDesc& response)>;
+
+using OnReceiveNcclWindow =
+    std::function<int(const NcclWindowDesc& request, NcclWindowDesc& response)>;
 
 using OnNotify = std::function<int(const Notification&)>;
 
@@ -77,6 +107,14 @@ class ControlClient {
     static Status bootstrap(const std::string& server_addr,
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
+
+    static Status bootstrapNccl(const std::string& server_addr,
+                                const NcclBootstrapDesc& request,
+                                NcclBootstrapDesc& response);
+
+    static Status registerNcclWindow(const std::string& server_addr,
+                                     const NcclWindowDesc& request,
+                                     NcclWindowDesc& response);
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -133,6 +171,14 @@ class ControlService {
         bootstrap_callback_ = callback;
     }
 
+    void setBootstrapNcclCallback(const OnReceiveNcclBootstrap& callback) {
+        nccl_bootstrap_callback_ = callback;
+    }
+
+    void setNcclWindowCallback(const OnReceiveNcclWindow& callback) {
+        nccl_window_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback) {
         notify_callback_ = callback;
     }
@@ -145,6 +191,12 @@ class ControlService {
 
     void onBootstrapRdma(const std::string_view& request,
                          std::string& response);
+
+    void onBootstrapNccl(const std::string_view& request,
+                         std::string& response);
+
+    void onRegisterNcclWindow(const std::string_view& request,
+                              std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -173,6 +225,8 @@ class ControlService {
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
     OnReceiveBootstrap bootstrap_callback_;
+    OnReceiveNcclBootstrap nccl_bootstrap_callback_;
+    OnReceiveNcclWindow nccl_window_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;
 };

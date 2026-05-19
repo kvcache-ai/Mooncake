@@ -615,6 +615,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
+    if (transport_list_[NCCL]) result.push_back(NCCL);
     if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
@@ -834,6 +835,7 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
+            if (type == NCCL && request.opcode == Request::READ) continue;
             if (checkAvailability(transport_list_[type], local_mtype,
                                   remote_mtype)) {
                 if (priority-- == 0) return type;
@@ -861,6 +863,10 @@ static const char* transportTypeName(TransportType type) {
             return "TCP";
         case AscendDirect:
             return "AscendDirect";
+        case SUNRISE_LINK:
+            return "SUNRISE_LINK";
+        case NCCL:
+            return "NCCL";
         default:
             return "UNSPEC";
     }

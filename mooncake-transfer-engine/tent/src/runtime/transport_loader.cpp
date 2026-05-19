@@ -25,6 +25,10 @@
 #include "tent/transport/mnnvl/mnnvl_transport.h"
 #endif
 
+#ifdef USE_NCCL
+#include "tent/transport/nccl/nccl_transport.h"
+#endif
+
 #ifdef USE_GDS
 #include "tent/transport/gds/gds_transport.h"
 #endif
@@ -73,6 +77,11 @@ Status TransferEngineImpl::loadTransports() {
         if (conf_->get("transports/nvlink/enable", true))
             transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
     }
+#endif
+
+#ifdef USE_NCCL
+    if (conf_->get("transports/nccl/enable", false))
+        transport_list_[NCCL] = std::make_shared<NcclTransport>();
 #endif
 
 #ifdef USE_GDS
