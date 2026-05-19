@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -44,6 +45,8 @@ EfaContext::EfaContext(EfaTransport& engine, const std::string& device_name)
       fabric_(nullptr),
       domain_(nullptr),
       av_(nullptr),
+      eq_(nullptr),
+      eq_poller_stop_(false),
       active_(true),
       shared_ep_(nullptr),
       wr_depth_(0),
@@ -145,6 +148,34 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
         return ERR_CONTEXT;
     }
 
+    // Open the EQ before the endpoint so we can bind it in
+    // buildSharedEndpoint().  Without an EQ bound to the ep, the EFA
+    // provider's efa_base_ep_write_eq_error() falls back to fprintf+abort()
+    // for every internal fatal error path (implicit AV-insert from CQ poll,
+    // internal-flagged TXE failure, CQ-write-error fallback).  With an EQ
+    // bound, those errors land as readable entries instead of killing the
+    // process.
+    {
+        struct fi_eq_attr eq_attr = {};
+        eq_attr.size = 64;
+        eq_attr.flags = 0;
+        eq_attr.wait_obj = FI_WAIT_NONE;
+        ret = fi_eq_open(fabric_, &eq_attr, &eq_, nullptr);
+        if (ret) {
+            LOG(ERROR) << "fi_eq_open failed: " << fi_strerror(-ret);
+            fi_close(&domain_->fid);
+            fi_close(&fabric_->fid);
+            fi_freeinfo(fi_info_);
+            fi_freeinfo(hints_);
+            domain_ = nullptr;
+            fabric_ = nullptr;
+            fi_info_ = nullptr;
+            hints_ = nullptr;
+            eq_ = nullptr;
+            return ERR_CONTEXT;
+        }
+    }
+
     // Create address vector.  Capacity sized for the largest peer count we
     // expect to support in a single process.  AV entries are cheap (no QP
     // cost), so we over-provision.
@@ -157,16 +188,17 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // disconnected + removed) before adding a new one.  Without this cap,
     // schemes that embed volatile data in peer_nic_path (ip:port:timestamp)
     // cause peer_map_ to grow without bound across peer restarts.
-    peer_map_max_ =
-        max_endpoints > 0 ? static_cast<size_t>(max_endpoints) : 0;
+    peer_map_max_ = max_endpoints > 0 ? static_cast<size_t>(max_endpoints) : 0;
 
     ret = fi_av_open(domain_, &av_attr, &av_, nullptr);
     if (ret) {
         LOG(ERROR) << "fi_av_open failed: " << fi_strerror(-ret);
+        fi_close(&eq_->fid);
         fi_close(&domain_->fid);
         fi_close(&fabric_->fid);
         fi_freeinfo(fi_info_);
         fi_freeinfo(hints_);
+        eq_ = nullptr;
         domain_ = nullptr;
         fabric_ = nullptr;
         fi_info_ = nullptr;
@@ -234,6 +266,14 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
         return ERR_ENDPOINT;
     }
 
+    ret = fi_ep_bind(shared_ep_, &eq_->fid, 0);
+    if (ret) {
+        LOG(ERROR) << "fi_ep_bind(eq) failed: " << fi_strerror(-ret);
+        fi_close(&shared_ep_->fid);
+        shared_ep_ = nullptr;
+        return ERR_ENDPOINT;
+    }
+
     ret = fi_ep_bind(shared_ep_, &shared_cq_->cq->fid, FI_TRANSMIT);
     if (ret) {
         LOG(ERROR) << "fi_ep_bind(tx_cq) failed: " << fi_strerror(-ret);
@@ -270,6 +310,45 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
         return ERR_ENDPOINT;
     }
     local_ep_addr_.resize(addr_len);
+
+    // Start the EQ poller now that the endpoint is enabled.  Drain any
+    // events libfabric posts so the queue does not back up; on error
+    // entries, log enough provenance for triage.
+    eq_poller_stop_.store(false, std::memory_order_release);
+    eq_poller_thread_ = std::thread([this] {
+        uint32_t event = 0;
+        char buf[256];
+        while (!eq_poller_stop_.load(std::memory_order_acquire)) {
+            ssize_t n = fi_eq_read(eq_, &event, buf, sizeof(buf), 0);
+            if (n == -FI_EAVAIL) {
+                struct fi_eq_err_entry err_entry = {};
+                ssize_t en = fi_eq_readerr(eq_, &err_entry, 0);
+                if (en > 0) {
+                    const char* prov_msg =
+                        fi_eq_strerror(eq_, err_entry.prov_errno,
+                                       err_entry.err_data, nullptr, 0);
+                    LOG(ERROR) << "[EFA EQ] device=" << device_name_
+                               << " err=" << err_entry.err << " ("
+                               << fi_strerror(err_entry.err)
+                               << ") prov_errno=" << err_entry.prov_errno
+                               << " (" << (prov_msg ? prov_msg : "?") << ")"
+                               << " — intercepted; libfabric would have "
+                                  "abort()ed without this EQ bind";
+                }
+                continue;
+            }
+            if (n > 0) {
+                LOG(INFO) << "[EFA EQ] device=" << device_name_
+                          << " event=" << event << " bytes=" << n;
+                continue;
+            }
+            if (n == -FI_EAGAIN) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
     return 0;
 }
 
@@ -279,9 +358,19 @@ int EfaContext::deconstruct() {
     // fi_av_remove() after fi_close(ep) — the provider faults — so we just
     // clear the peer map (dropping shared_ptrs) and let fi_av_close() below
     // invalidate every AV slot in one shot.
+    eq_poller_stop_.store(true, std::memory_order_release);
+    if (eq_poller_thread_.joinable()) {
+        eq_poller_thread_.join();
+    }
+
     if (shared_ep_) {
         fi_close(&shared_ep_->fid);
         shared_ep_ = nullptr;
+    }
+
+    if (eq_) {
+        fi_close(&eq_->fid);
+        eq_ = nullptr;
     }
 
     {
@@ -547,8 +636,7 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     if (evicted_ep) {
         LOG(INFO) << "Evicting oldest EFA peer on " << nicPath()
                   << " to make room: " << evicted_path << " -> "
-                  << peer_nic_path
-                  << " (peer_count=" << post_evict_size
+                  << peer_nic_path << " (peer_count=" << post_evict_size
                   << ", peer_map_max=" << peer_map_max_ << ")";
         evicted_ep->disconnect();  // fi_av_remove(old_fi_addr)
     }

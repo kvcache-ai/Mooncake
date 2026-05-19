@@ -192,6 +192,15 @@ class EfaContext {
     struct fid_domain* domain_;
     struct fid_av* av_;  // Address vector for peer addressing
 
+    // Event queue bound to shared_ep_.  libfabric's EFA provider funnels every
+    // fatal error through efa_base_ep_write_eq_error(); without an EQ bound,
+    // that function calls abort() and kills the process.  Binding our own EQ
+    // turns those events into queued entries we can drain via fi_eq_readerr
+    // and recover from instead of crashing.
+    struct fid_eq* eq_;
+    std::thread eq_poller_thread_;
+    std::atomic<bool> eq_poller_stop_;
+
     bool active_;
 
     // ---- Shared endpoint (one per local NIC, serves ALL peers) ----
