@@ -91,10 +91,12 @@ std::string makeSessionKey(const std::string& local_name,
     return ss.str();
 }
 
-std::string makeWindowKey(const std::string& session_key, uint64_t base,
+std::string makeWindowKey(const std::string& session_key,
+                          const char* purpose, uint64_t base,
                           uint64_t length) {
     std::ostringstream ss;
-    ss << session_key << ":window:" << std::hex << base << ":" << length;
+    ss << session_key << ":window:" << purpose << ":" << std::hex << base
+       << ":" << length;
     return ss.str();
 }
 
@@ -139,10 +141,13 @@ struct NcclTransport::TransferContext {
     uint64_t target_base = 0;
     uint64_t target_length = 0;
     uint64_t target_offset = 0;
+    uint64_t source_base = 0;
+    uint64_t source_length = 0;
     int local_device = -1;
     int remote_device = -1;
     std::string session_key;
     std::string window_key;
+    std::string source_window_key;
 };
 
 NcclTransport::NcclTransport() = default;
@@ -196,6 +201,12 @@ Status NcclTransport::install(std::string& local_segment_name,
             if (!status.ok()) response.reply_msg = status.ToString();
             return status.ok() ? 0 : -1;
         });
+    metadata_->setNcclSignalCallback(
+        [this](const NcclSignalDesc& request, NcclSignalDesc& response) {
+            auto status = onWaitNcclSignal(request, response);
+            if (!status.ok()) response.reply_msg = status.ToString();
+            return status.ok() ? 0 : -1;
+        });
 
     // Host-side NCCL RMA maps WRITE to ncclPutSignal. READ is skipped by the
     // scheduler until device-side GIN get or delegated put is added.
@@ -214,6 +225,7 @@ Status NcclTransport::uninstall() {
     if (metadata_) {
         metadata_->setBootstrapNcclCallback(nullptr);
         metadata_->setNcclWindowCallback(nullptr);
+        metadata_->setNcclSignalCallback(nullptr);
     }
 
     std::vector<std::thread> background_threads;
@@ -366,13 +378,17 @@ Status NcclTransport::buildTransferContext(const Request& request,
     ctx.target_base = target_buffer.addr;
     ctx.target_length = target_buffer.length;
     ctx.target_offset = request.target_offset - target_buffer.addr;
+    ctx.source_base = reinterpret_cast<uint64_t>(request.source);
+    ctx.source_length = request.length;
     ctx.local_device = local_location.index();
     ctx.remote_device = remote_location.index();
     ctx.session_key = makeSessionKey(local_segment_name_,
                                      ctx.remote_segment_name,
                                      ctx.local_device, ctx.remote_device);
-    ctx.window_key = makeWindowKey(ctx.session_key, ctx.target_base,
+    ctx.window_key = makeWindowKey(ctx.session_key, "target", ctx.target_base,
                                    ctx.target_length);
+    ctx.source_window_key = makeWindowKey(ctx.session_key, "source",
+                                          ctx.source_base, ctx.source_length);
     return Status::OK();
 }
 
@@ -479,6 +495,8 @@ Status NcclTransport::ensureWindow(
         request.addr = ctx.target_base;
         request.length = ctx.target_length;
         request.device_index = ctx.remote_device;
+        request.win_flags = NCCL_WIN_DEFAULT;
+        request.allocate_local = false;
         NcclWindowDesc response;
         status = ControlClient::registerNcclWindow(ctx.remote_rpc_addr,
                                                    request, response);
@@ -516,6 +534,81 @@ Status NcclTransport::ensureWindow(
     std::unique_lock<std::mutex> lock(state->mu);
     state->cv.wait(lock, [&] { return state->ready || !state->status.ok(); });
     return state->status;
+}
+
+Status NcclTransport::ensureSourceWindow(
+    const TransferContext& ctx, const std::shared_ptr<CommState>& comm_state,
+    std::shared_ptr<WindowState>& state) {
+    bool should_init = false;
+    {
+        std::lock_guard<std::mutex> lock(window_mutex_);
+        auto& entry = windows_[ctx.source_window_key];
+        if (!entry) entry = std::make_shared<WindowState>();
+        state = entry;
+        std::lock_guard<std::mutex> state_lock(state->mu);
+        if (!state->ready && !state->initializing) {
+            state->initializing = true;
+            state->length = ctx.source_length;
+            state->device_index = ctx.local_device;
+            state->session_key = ctx.session_key;
+            should_init = true;
+        }
+    }
+
+    if (should_init) {
+        Status status;
+        NcclWindowDesc request;
+        request.session_key = ctx.session_key;
+        request.window_key = ctx.source_window_key;
+        request.length = ctx.source_length;
+        request.device_index = ctx.remote_device;
+        request.win_flags = NCCL_WIN_COLL_SYMMETRIC;
+        request.allocate_local = true;
+        NcclWindowDesc response;
+        status = ControlClient::registerNcclWindow(ctx.remote_rpc_addr,
+                                                   request, response);
+
+        int previous_device = 0;
+        bool device_changed = false;
+        if (status.ok()) {
+            status = setCudaDevice(ctx.local_device, previous_device);
+            device_changed = status.ok();
+        }
+        if (status.ok()) {
+            status = ncclStatus(
+                ncclCommWindowRegister(
+                    comm_state->comm, reinterpret_cast<void*>(ctx.source_base),
+                    ctx.source_length, &state->window,
+                    NCCL_WIN_COLL_SYMMETRIC),
+                "ncclCommWindowRegister(source)");
+        }
+        if (device_changed) cudaSetDevice(previous_device);
+
+        {
+            std::lock_guard<std::mutex> lock(state->mu);
+            state->status = status;
+            state->ready = status.ok();
+            state->initializing = false;
+        }
+        state->cv.notify_all();
+    }
+
+    std::unique_lock<std::mutex> lock(state->mu);
+    state->cv.wait(lock, [&] { return state->ready || !state->status.ok(); });
+    return state->status;
+}
+
+Status NcclTransport::postRemoteWaitSignal(const TransferContext& ctx) {
+    NcclSignalDesc request;
+    request.session_key = ctx.session_key;
+    request.peer = 0;
+    request.op_count = 1;
+    request.signal_index = 0;
+    request.context = 0;
+    request.device_index = ctx.remote_device;
+    NcclSignalDesc response;
+    return ControlClient::waitNcclSignal(ctx.remote_rpc_addr, request,
+                                         response);
 }
 
 Status NcclTransport::onBootstrapNccl(const NcclBootstrapDesc& request,
@@ -575,6 +668,8 @@ Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
     response.addr = request.addr;
     response.length = request.length;
     response.device_index = request.device_index;
+    response.win_flags = request.win_flags;
+    response.allocate_local = request.allocate_local;
 
     bool should_init = false;
     std::shared_ptr<WindowState> state;
@@ -603,12 +698,20 @@ Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
             status = setCudaDevice(request.device_index, previous_device);
             device_changed = status.ok();
         }
+        if (status.ok() && request.allocate_local) {
+            status = ncclStatus(ncclMemAlloc(&state->local_buffer,
+                                             request.length),
+                                "ncclMemAlloc(remote window dummy)");
+            state->owns_local_buffer = status.ok();
+        }
         if (status.ok()) {
+            void* buffer = request.allocate_local
+                               ? state->local_buffer
+                               : reinterpret_cast<void*>(request.addr);
             status = ncclStatus(
-                ncclCommWindowRegister(comm_state->comm,
-                                       reinterpret_cast<void*>(request.addr),
+                ncclCommWindowRegister(comm_state->comm, buffer,
                                        request.length, &state->window,
-                                       NCCL_WIN_DEFAULT),
+                                       request.win_flags),
                 "ncclCommWindowRegister(remote)");
         }
         if (device_changed) cudaSetDevice(previous_device);
@@ -619,6 +722,40 @@ Status NcclTransport::onRegisterNcclWindow(const NcclWindowDesc& request,
             state->initializing = false;
         }
         state->cv.notify_all();
+    });
+    return Status::OK();
+}
+
+Status NcclTransport::onWaitNcclSignal(const NcclSignalDesc& request,
+                                       NcclSignalDesc& response) {
+    response.session_key = request.session_key;
+    response.peer = request.peer;
+    response.op_count = request.op_count;
+    response.signal_index = request.signal_index;
+    response.context = request.context;
+    response.device_index = request.device_index;
+
+    startBackground([this, request]() {
+        std::shared_ptr<CommState> comm_state;
+        Status status = waitForComm(request.session_key, comm_state);
+        int previous_device = 0;
+        bool device_changed = false;
+        if (status.ok()) {
+            status = setCudaDevice(request.device_index, previous_device);
+            device_changed = status.ok();
+        }
+        if (status.ok()) {
+            ncclWaitSignalDesc_t desc{request.op_count, request.peer,
+                                      request.signal_index, request.context};
+            status = ncclStatus(ncclWaitSignal(1, &desc, comm_state->comm,
+                                               nullptr),
+                                "ncclWaitSignal(remote)");
+        }
+        if (device_changed) cudaSetDevice(previous_device);
+        if (!status.ok()) {
+            LOG(WARNING) << "NCCL remote wait-signal failed: "
+                         << status.ToString();
+        }
     });
     return Status::OK();
 }
@@ -651,6 +788,11 @@ Status NcclTransport::submitTransferTasks(
         if (status.ok()) status = ensureComm(ctx, comm_state);
         std::shared_ptr<WindowState> window_state;
         if (status.ok()) status = ensureWindow(ctx, comm_state, window_state);
+        std::shared_ptr<WindowState> source_window_state;
+        if (status.ok()) {
+            status = ensureSourceWindow(ctx, comm_state, source_window_state);
+        }
+        if (status.ok()) status = postRemoteWaitSignal(ctx);
         if (status.ok()) {
             int previous_device = 0;
             status = setCudaDevice(ctx.local_device, previous_device);

@@ -55,8 +55,10 @@ int main() {
   ncclWindow_t win{};
   void* ptr = nullptr;
   (void)ncclMemAlloc(&ptr, 4096);
-  (void)ncclCommWindowRegister(comm, ptr, 4096, &win, NCCL_WIN_DEFAULT);
+  (void)ncclCommWindowRegister(comm, ptr, 4096, &win, NCCL_WIN_COLL_SYMMETRIC);
   (void)ncclPutSignal(ptr, 1, ncclUint8, 0, win, 0, 0, 0, 0, comm, nullptr);
+  ncclWaitSignalDesc_t desc{1, 0, 0, 0};
+  (void)ncclWaitSignal(1, &desc, comm, nullptr);
   (void)ncclMemFree(ptr);
   return 0;
 }

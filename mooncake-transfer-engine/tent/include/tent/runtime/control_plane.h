@@ -76,11 +76,29 @@ struct NcclWindowDesc {
     uint64_t addr = 0;
     uint64_t length = 0;
     int device_index = 0;
+    int win_flags = 0;
+    bool allocate_local = false;
     std::string reply_msg;
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclWindowDesc, session_key, window_key,
-                                   addr, length, device_index, reply_msg);
+                                   addr, length, device_index, win_flags,
+                                   allocate_local, reply_msg);
+};
+
+struct NcclSignalDesc {
+    std::string session_key;
+    int peer = 0;
+    int op_count = 1;
+    int signal_index = 0;
+    int context = 0;
+    int device_index = 0;
+    std::string reply_msg;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(NcclSignalDesc, session_key, peer,
+                                   op_count, signal_index, context,
+                                   device_index, reply_msg);
 };
 
 using OnReceiveBootstrap =
@@ -91,6 +109,9 @@ using OnReceiveNcclBootstrap = std::function<int(
 
 using OnReceiveNcclWindow =
     std::function<int(const NcclWindowDesc& request, NcclWindowDesc& response)>;
+
+using OnReceiveNcclSignal =
+    std::function<int(const NcclSignalDesc& request, NcclSignalDesc& response)>;
 
 using OnNotify = std::function<int(const Notification&)>;
 
@@ -115,6 +136,10 @@ class ControlClient {
     static Status registerNcclWindow(const std::string& server_addr,
                                      const NcclWindowDesc& request,
                                      NcclWindowDesc& response);
+
+    static Status waitNcclSignal(const std::string& server_addr,
+                                 const NcclSignalDesc& request,
+                                 NcclSignalDesc& response);
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -179,6 +204,10 @@ class ControlService {
         nccl_window_callback_ = callback;
     }
 
+    void setNcclSignalCallback(const OnReceiveNcclSignal& callback) {
+        nccl_signal_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback) {
         notify_callback_ = callback;
     }
@@ -197,6 +226,9 @@ class ControlService {
 
     void onRegisterNcclWindow(const std::string_view& request,
                               std::string& response);
+
+    void onWaitNcclSignal(const std::string_view& request,
+                          std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -227,6 +259,7 @@ class ControlService {
     OnReceiveBootstrap bootstrap_callback_;
     OnReceiveNcclBootstrap nccl_bootstrap_callback_;
     OnReceiveNcclWindow nccl_window_callback_;
+    OnReceiveNcclSignal nccl_signal_callback_;
     OnNotify notify_callback_;
     TransferEngineImpl* impl_;
 };

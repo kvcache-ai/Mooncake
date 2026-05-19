@@ -111,12 +111,18 @@ class NcclTransport : public Transport {
     Status ensureWindow(const TransferContext& ctx,
                         const std::shared_ptr<CommState>& comm_state,
                         std::shared_ptr<WindowState>& state);
+    Status ensureSourceWindow(const TransferContext& ctx,
+                              const std::shared_ptr<CommState>& comm_state,
+                              std::shared_ptr<WindowState>& state);
+    Status postRemoteWaitSignal(const TransferContext& ctx);
     Status waitForComm(const std::string& session_key,
                        std::shared_ptr<CommState>& state);
     Status onBootstrapNccl(const NcclBootstrapDesc& request,
                            NcclBootstrapDesc& response);
     Status onRegisterNcclWindow(const NcclWindowDesc& request,
                                 NcclWindowDesc& response);
+    Status onWaitNcclSignal(const NcclSignalDesc& request,
+                            NcclSignalDesc& response);
     void startBackground(std::function<void()> fn);
 
    private:

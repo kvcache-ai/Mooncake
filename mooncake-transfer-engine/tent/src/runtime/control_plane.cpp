@@ -71,6 +71,19 @@ Status ControlClient::registerNcclWindow(const std::string& server_addr,
                                       : Status::RpcServiceError(response.reply_msg);
 }
 
+Status ControlClient::waitNcclSignal(const std::string& server_addr,
+                                     const NcclSignalDesc& request,
+                                     NcclSignalDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(tl_rpc_agent.call(server_addr, WaitNcclSignal, request_raw,
+                                   response_raw));
+    response = json::parse(response_raw).get<NcclSignalDesc>();
+    return response.reply_msg.empty() ? Status::OK()
+                                      : Status::RpcServiceError(response.reply_msg);
+}
+
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
@@ -198,6 +211,7 @@ ControlService::ControlService(const std::string& type,
     : bootstrap_callback_(nullptr),
       nccl_bootstrap_callback_(nullptr),
       nccl_window_callback_(nullptr),
+      nccl_signal_callback_(nullptr),
       notify_callback_(nullptr),
       impl_(impl) {
     if (type == "p2p") {
@@ -228,6 +242,11 @@ ControlService::ControlService(const std::string& type,
         RegisterNcclWindow,
         [this](const std::string_view& request, std::string& response) {
             onRegisterNcclWindow(request, response);
+        });
+    rpc_server_->registerFunction(
+        WaitNcclSignal,
+        [this](const std::string_view& request, std::string& response) {
+            onWaitNcclSignal(request, response);
         });
     rpc_server_->registerFunction(
         SendData,
@@ -317,10 +336,35 @@ void ControlService::onRegisterNcclWindow(const std::string_view& request,
     NcclWindowDesc response_desc;
     response_desc.session_key = request_desc.session_key;
     response_desc.window_key = request_desc.window_key;
+    response_desc.addr = request_desc.addr;
+    response_desc.length = request_desc.length;
+    response_desc.device_index = request_desc.device_index;
+    response_desc.win_flags = request_desc.win_flags;
+    response_desc.allocate_local = request_desc.allocate_local;
     if (nccl_window_callback_) {
         nccl_window_callback_(request_desc, response_desc);
     } else {
         response_desc.reply_msg = "NCCL window callback not registered";
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
+void ControlService::onWaitNcclSignal(const std::string_view& request,
+                                      std::string& response) {
+    NcclSignalDesc request_desc =
+        json::parse(std::string(request)).get<NcclSignalDesc>();
+    NcclSignalDesc response_desc;
+    response_desc.session_key = request_desc.session_key;
+    response_desc.peer = request_desc.peer;
+    response_desc.op_count = request_desc.op_count;
+    response_desc.signal_index = request_desc.signal_index;
+    response_desc.context = request_desc.context;
+    response_desc.device_index = request_desc.device_index;
+    if (nccl_signal_callback_) {
+        nccl_signal_callback_(request_desc, response_desc);
+    } else {
+        response_desc.reply_msg = "NCCL signal callback not registered";
     }
     json j = response_desc;
     response = j.dump();
