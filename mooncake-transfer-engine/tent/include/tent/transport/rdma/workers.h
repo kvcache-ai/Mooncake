@@ -29,11 +29,14 @@
 #include "rail_monitor.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/concurrent/bounded_mpsc_queue.h"
+#include "tent/common/types.h"
 
 namespace mooncake {
 namespace tent {
 
 class RdmaTransport;
+class DeviceSelector;
+
 class Workers {
    public:
     static constexpr size_t kCapacity = 1024 * 8;
@@ -53,6 +56,8 @@ class Workers {
     Status submit(RdmaSliceList &slice_list, int worker_id = -1);
 
     Status cancel(RdmaSliceList &slice_list);
+
+    DeviceSelector *getDeviceSelector() const { return device_selector_.get(); }
 
    private:
     using Task = std::function<void()>;
@@ -176,9 +181,11 @@ class Workers {
         PerfMetric inflight_lat;
     };
 
+    static constexpr int kNumPriorityLevels = PRIO_LOW + 1;
+
     struct WorkerContext {
         std::thread thread;
-        BoundedSliceQueue queue;
+        BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
         std::unordered_set<RdmaSlice *> inflight_slice_set;
         std::atomic<int64_t> inflight_slices = 0;
@@ -198,7 +205,7 @@ class Workers {
     WorkerContext *worker_context_;
     uint64_t slice_timeout_ns_;
 
-    std::unique_ptr<DeviceQuota> device_quota_;
+    std::unique_ptr<DeviceSelector> device_selector_;
     bool always_tier1_ = false;
 };
 }  // namespace tent
