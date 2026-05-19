@@ -265,10 +265,12 @@ size_t DataManager::ScanExpiredRecordShard(RecordShard<Record>& shard,
     return removed;
 }
 
-template size_t DataManager::ScanExpiredRecordShard<PendingWriteRecord>(
-    RecordShard<PendingWriteRecord>&, TimePoint);
-template size_t DataManager::ScanExpiredRecordShard<PinnedKeyRecord>(
-    RecordShard<PinnedKeyRecord>&, TimePoint);
+template size_t
+DataManager::ScanExpiredRecordShard<DataManager::PendingWriteRecord>(
+    RecordShard<DataManager::PendingWriteRecord>&, TimePoint);
+template size_t
+DataManager::ScanExpiredRecordShard<DataManager::PinnedKeyRecord>(
+    RecordShard<DataManager::PinnedKeyRecord>&, TimePoint);
 
 tl::expected<AllocationHandle, ErrorCode>
 DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
