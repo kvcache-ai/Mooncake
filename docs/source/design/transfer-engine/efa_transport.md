@@ -215,28 +215,28 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 #### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
-Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
-
-> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when the hardware is available again.
+Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group. Numbers below are post-SRD-shared-endpoint (#1944) on a fresh `main` build with the DLAMI pytorch env (CUDA 13).
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| block=1MB, threads=16, batch=128 | 701 GB/s | **697 GB/s** |
-| **block=1MB, threads=32, batch=64** | **752 GB/s** | 713 GB/s |
-| block=1MB, threads=32, batch=32 | 751 GB/s | - |
-| block=1MB, threads=64, batch=32 | 728 GB/s | - |
+| block=1MB, threads=16, batch=128 | 758.88 GB/s | 720.35 GB/s |
+| block=1MB, threads=32, batch=64 | 753.32 GB/s | **755.78 GB/s** |
+| **block=1MB, threads=32, batch=32** | **780.33 GB/s** | - |
+| block=1MB, threads=64, batch=32 | 780.23 GB/s | - |
 
-> **Peak: 752 GB/s write**, reaching ~94% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
+> **Peak: 780 GB/s write**, reaching ~97.5% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
 
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
+| **block=1MB, threads=32, batch=128** | **282.93 GB/s** | **270.47 GB/s** |
+| block=1MB, threads=16, batch=128 | 282.04 GB/s | 249.67 GB/s |
+| block=1MB, threads=32, batch=64 | 282.84 GB/s | 256.26 GB/s |
 
-> CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
+> CPU-to-CPU is bounded by DRAM bandwidth on the Xeon 8559C — write throughput is essentially flat across thread/batch combinations (~282 GB/s), confirming DRAM controller saturation rather than a NIC or in-flight-WR limit.
 
 #### 2. p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
