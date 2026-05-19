@@ -58,6 +58,9 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
     if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
 
     if (!smart_selection_enabled_) {
+        // Baseline mode: consistent with original TE behavior
+        // Use devices from the first non-empty rank only
+        thread_local uint64_t tl_rr_counter = 0;
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
             thread_local std::vector<int> tl_eligible;
             tl_eligible.clear();
@@ -66,10 +69,11 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 if ((device_mask & (1ULL << dev_id)) == 0) continue;
                 tl_eligible.push_back(dev_id);
             }
-            if (tl_eligible.empty()) break;
+            if (tl_eligible.empty()) continue;
+
+            // Found first non-empty rank, do round-robin within this rank
             uint64_t offset = 0;
             for (uint32_t i = 0; i < num_slices; ++i) {
-                thread_local uint64_t tl_rr_counter = 0;
                 int dev_id = tl_eligible[tl_rr_counter % tl_eligible.size()];
                 tl_rr_counter++;
                 slice_dev_ids.push_back(dev_id);
