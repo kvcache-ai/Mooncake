@@ -285,7 +285,8 @@ class ClientConfigBuilder {
             config.p2p_key_lease_duration_ms = p2p_key_lease_duration_ms;
         }
         if (p2p_key_lease_scan_interval_ms > 0) {
-            config.p2p_key_lease_scan_interval_ms = p2p_key_lease_scan_interval_ms;
+            config.p2p_key_lease_scan_interval_ms =
+                p2p_key_lease_scan_interval_ms;
         }
 
         return config;

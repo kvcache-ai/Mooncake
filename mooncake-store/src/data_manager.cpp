@@ -157,8 +157,8 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
         local_transfer_config_.p2p_key_lease_scan_interval_ms > 0
             ? local_transfer_config_.p2p_key_lease_scan_interval_ms
             : kDefaultLeaseScanIntervalMs;
-    lease_scan_interval_ = std::chrono::milliseconds(
-        std::max<uint32_t>(1, scan_ms));
+    lease_scan_interval_ =
+        std::chrono::milliseconds(std::max<uint32_t>(1, scan_ms));
 
     LOG(INFO) << "DataManager initialized with " << lock_shard_count_
               << " lock shards, local_transfer_mode="
@@ -169,7 +169,8 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
               << ", async_memcpy_workers="
               << local_transfer_config_.local_memcpy_async_worker_num
               << ", p2p_key_lease_duration_ms=" << lease_duration_.count()
-              << ", p2p_key_lease_scan_interval_ms=" << lease_scan_interval_.count();
+              << ", p2p_key_lease_scan_interval_ms="
+              << lease_scan_interval_.count();
 
     // Start background work only after synchronous initialization completes.
     lease_scanner_thread_ = std::thread(&DataManager::LeaseScannerMain, this);
@@ -237,8 +238,7 @@ tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
     }
     RemoteBufferDesc remote_buffer;
     remote_buffer.segment_endpoint = local_transfer_config_.te_endpoint;
-    remote_buffer.addr =
-        reinterpret_cast<uintptr_t>(loc_data.buffer->data());
+    remote_buffer.addr = reinterpret_cast<uintptr_t>(loc_data.buffer->data());
     remote_buffer.size = loc_data.buffer->size();
     return remote_buffer;
 }
@@ -858,8 +858,8 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
                 pending_write_shard.by_key.erase(pending_it);
             } else {
                 LOG(ERROR) << "PreWrite: key has active pending write lease"
-                           << ", key=" << ctx.key
-                           << ", error=" << toString(ErrorCode::OBJECT_HAS_LEASE);
+                           << ", key=" << ctx.key << ", error="
+                           << toString(ErrorCode::OBJECT_HAS_LEASE);
                 timer.LogResponse("error_code=", ErrorCode::OBJECT_HAS_LEASE);
                 return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
             }
@@ -948,7 +948,8 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     auto& pending_write_shard = GetPendingWriteShard(ctx);
     AllocationHandle handle;
 
-    // Pending: validate token, copy handle, remove lease (always, before Commit).
+    // Pending: validate token, copy handle, remove lease (always, before
+    // Commit).
     {
         std::unique_lock pending_write_shard_lock(pending_write_shard.mutex);
         auto record_it = pending_write_shard.by_key.find(ctx.key);
@@ -988,7 +989,8 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
 
     // Commit under key_lock to avoid concurrent Delete. Most commit failures
     // are not recoverable by retrying WriteCommit alone; caller must restart
-    // PreWrite -> transfer -> WriteCommit. Duplicate WriteCommit -> OBJECT_NOT_FOUND.
+    // PreWrite -> transfer -> WriteCommit. Duplicate WriteCommit ->
+    // OBJECT_NOT_FOUND.
     tl::expected<void, ErrorCode> commit_result;
     {
         std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
@@ -1114,8 +1116,8 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     return result;
 }
 
-tl::expected<void, ErrorCode> DataManager::UnPinKey(std::string_view key,
-                                                    const UUID& read_operation_id) {
+tl::expected<void, ErrorCode> DataManager::UnPinKey(
+    std::string_view key, const UUID& read_operation_id) {
     return UnPinKeyInternal(BuildKeyCtx(key), read_operation_id);
 }
 

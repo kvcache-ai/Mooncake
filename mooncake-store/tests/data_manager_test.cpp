@@ -412,7 +412,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         EXPECT_EQ(it->second.ref_count, 2U);
     }
 
-    auto first_unpin = data_manager_->UnPinKey(key, first_pin->read_operation_id);
+    auto first_unpin =
+        data_manager_->UnPinKey(key, first_pin->read_operation_id);
     ASSERT_TRUE(first_unpin.has_value())
         << "First UnPinKey failed: " << toString(first_unpin.error());
     {
@@ -422,7 +423,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         EXPECT_EQ(it->second.ref_count, 1U);
     }
 
-    auto second_unpin = data_manager_->UnPinKey(key, second_pin->read_operation_id);
+    auto second_unpin =
+        data_manager_->UnPinKey(key, second_pin->read_operation_id);
     ASSERT_TRUE(second_unpin.has_value())
         << "Second UnPinKey failed: " << toString(second_unpin.error());
     {
@@ -524,7 +526,8 @@ TEST_F(DataManagerTest,
         it->second.list_it->second = expired_deadline;
     }
 
-    auto unpin_result = data_manager_->UnPinKey(key, pin_result->read_operation_id);
+    auto unpin_result =
+        data_manager_->UnPinKey(key, pin_result->read_operation_id);
     ASSERT_FALSE(unpin_result.has_value());
     EXPECT_EQ(unpin_result.error(), ErrorCode::LEASE_EXPIRED);
 

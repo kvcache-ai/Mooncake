@@ -38,8 +38,8 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigKeyLeaseOverrides) {
     auto config = ClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
-        12345, 8, 2048, 512 * 1024 * 1024, 120000, "te", 32, 9003, true, {},
-        0, 2000, 0, 3333, 444);
+        12345, 8, 2048, 512 * 1024 * 1024, 120000, "te", 32, 9003, true, {}, 0,
+        2000, 0, 3333, 444);
 
     EXPECT_EQ(config.p2p_key_lease_duration_ms, 3333u);
     EXPECT_EQ(config.p2p_key_lease_scan_interval_ms, 444u);

@@ -303,8 +303,8 @@ class DataManager {
         const KeyCtx& ctx, const UUID& write_operation_id);
     tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
         const KeyCtx& ctx, std::optional<UUID> tier_id);
-    tl::expected<void, ErrorCode> UnPinKeyInternal(const KeyCtx& ctx,
-                                                   const UUID& read_operation_id);
+    tl::expected<void, ErrorCode> UnPinKeyInternal(
+        const KeyCtx& ctx, const UUID& read_operation_id);
 
     tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandleInternal(
         const KeyCtx& ctx, const UUID& write_operation_id);
