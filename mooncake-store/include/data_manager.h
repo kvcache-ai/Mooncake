@@ -251,10 +251,6 @@ class DataManager {
    private:
     void ClearLeaseRecords();
 
-    // Forward declarations for nested shard structs used by internal helpers.
-    struct PendingWriteShard;
-    struct PinnedKeyShard;
-
     struct KeyCtx {
         // Stable copy of the logical key. Incoming std::string_view often
         // points at RPC/coro request buffers and is only valid for the lifetime
@@ -265,6 +261,35 @@ class DataManager {
         size_t pending_write_shard_idx = 0;
         size_t pinned_key_shard_idx = 0;
     };
+
+    using OrderedDeadlineList = std::list<std::pair<std::string, TimePoint>>;
+    using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
+
+    struct PendingWriteRecord {
+        UUID write_operation_id{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        OrderedDeadlineListIt list_it;
+    };
+
+    struct PinnedKeyRecord {
+        UUID read_operation_id{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        uint32_t ref_count = 1;
+        OrderedDeadlineListIt list_it;
+    };
+
+    template <typename Record>
+    struct RecordShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, Record, StringHash, std::equal_to<>>
+            by_key;
+        OrderedDeadlineList ordered_list;
+    };
+
+    using PendingWriteShard = RecordShard<PendingWriteRecord>;
+    using PinnedKeyShard = RecordShard<PinnedKeyRecord>;
 
     // `key` must still point at valid storage for the duration of this call
     // only (typically RPC/coro request buffers).
@@ -433,40 +458,6 @@ class DataManager {
     // Wait for all tasks to reach a terminal state, then free the batch.
     void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
 
-    using OrderedDeadlineList = std::list<std::pair<std::string, TimePoint>>;
-    using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
-
-    struct PendingWriteRecord {
-        UUID write_operation_id{0, 0};
-        TimePoint deadline{};
-        AllocationHandle handle;
-        OrderedDeadlineListIt list_it;
-    };
-
-    struct PinnedKeyRecord {
-        UUID read_operation_id{0, 0};
-        TimePoint deadline{};
-        AllocationHandle handle;
-        uint32_t ref_count = 1;
-        OrderedDeadlineListIt list_it;
-    };
-
-    struct PendingWriteShard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, PendingWriteRecord,
-                           StringHash, std::equal_to<>>
-            by_key;
-        OrderedDeadlineList ordered_list;
-    };
-
-    struct PinnedKeyShard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<std::string, PinnedKeyRecord,
-                           StringHash, std::equal_to<>>
-            by_key;
-        OrderedDeadlineList ordered_list;
-    };
-
     const std::chrono::milliseconds& lease_duration() const {
         return lease_duration_;
     }
@@ -475,9 +466,9 @@ class DataManager {
         const AllocationHandle& handle) const;
     void LeaseScannerMain();
     void ShutdownLeaseScanner();
-    size_t ScanExpiredPendingWrites(PendingWriteShard& shard, TimePoint now);
-    size_t ScanExpiredPinnedKeys(PinnedKeyShard& shard, TimePoint now);
-   private:
+    template <typename Record>
+    size_t ScanExpiredRecordShard(RecordShard<Record>& shard, TimePoint now);
+
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 

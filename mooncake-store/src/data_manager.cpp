@@ -243,8 +243,9 @@ tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
     return remote_buffer;
 }
 
-size_t DataManager::ScanExpiredPendingWrites(PendingWriteShard& shard,
-                                             TimePoint now) {
+template <typename Record>
+size_t DataManager::ScanExpiredRecordShard(RecordShard<Record>& shard,
+                                           TimePoint now) {
     size_t removed = 0;
     while (!shard.ordered_list.empty()) {
         auto list_it = shard.ordered_list.begin();
@@ -264,26 +265,10 @@ size_t DataManager::ScanExpiredPendingWrites(PendingWriteShard& shard,
     return removed;
 }
 
-size_t DataManager::ScanExpiredPinnedKeys(PinnedKeyShard& shard,
-                                          TimePoint now) {
-    size_t removed = 0;
-    while (!shard.ordered_list.empty()) {
-        auto list_it = shard.ordered_list.begin();
-        if (list_it->second > now) {
-            break;
-        }
-        auto record_it = shard.by_key.find(list_it->first);
-        if (record_it == shard.by_key.end() ||
-            record_it->second.list_it != list_it) {
-            shard.ordered_list.erase(list_it);
-            continue;
-        }
-        shard.by_key.erase(record_it);
-        shard.ordered_list.erase(list_it);
-        ++removed;
-    }
-    return removed;
-}
+template size_t DataManager::ScanExpiredRecordShard<PendingWriteRecord>(
+    RecordShard<PendingWriteRecord>&, TimePoint);
+template size_t DataManager::ScanExpiredRecordShard<PinnedKeyRecord>(
+    RecordShard<PinnedKeyRecord>&, TimePoint);
 
 tl::expected<AllocationHandle, ErrorCode>
 DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
@@ -352,11 +337,11 @@ void DataManager::LeaseScannerMain() {
         wait_lock.unlock();
         for (auto& shard : pending_write_shards_) {
             std::unique_lock shard_lock(shard.mutex);
-            ScanExpiredPendingWrites(shard, now);
+            ScanExpiredRecordShard(shard, now);
         }
         for (auto& shard : pinned_key_shards_) {
             std::unique_lock shard_lock(shard.mutex);
-            ScanExpiredPinnedKeys(shard, now);
+            ScanExpiredRecordShard(shard, now);
         }
         wait_lock.lock();
     }
