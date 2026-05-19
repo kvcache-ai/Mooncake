@@ -226,6 +226,7 @@ struct StoreState {
     remote_segments: BTreeMap<String, u64>,
     remote_segment_infos: BTreeMap<String, SegmentInfo>,
     segment_target_metadata: BTreeMap<(ClientRuntimeId, SegmentName), SegmentTransportMetadata>,
+    segment_open_metadata: BTreeMap<String, SegmentTransportMetadata>,
     pending_reclaims: VecDeque<PendingReclaim>,
     next_local_segment_id: u64,
 }
@@ -234,6 +235,7 @@ struct StoreState {
 struct SegmentTransportMetadata {
     target_chunks: Vec<SegmentTargetChunk>,
     transport_endpoint: Option<String>,
+    transport_segment_descriptor: Option<String>,
 }
 
 struct StorageOwnerState {
@@ -501,6 +503,7 @@ impl SegmentAllocator {
         self.announcement.owner = next.owner.clone();
         self.announcement.segment_name = next.segment_name.clone();
         self.announcement.transport_endpoint = next.transport_endpoint.clone();
+        self.announcement.transport_segment_descriptor = next.transport_segment_descriptor.clone();
         self.announcement.capacity_bytes = next.capacity_bytes;
         self.announcement.target_chunks = next.target_chunks.clone();
         self.announcement.tags = next.tags.clone();
@@ -751,7 +754,6 @@ struct ResolvedReplicationPolicy {
     required_preferred_segments: Vec<SegmentName>,
     hint_preferred_segments: Vec<SegmentName>,
     preferred_storage_runtimes: Vec<ClientRuntimeId>,
-    with_soft_pin: bool,
     prefer_local: bool,
 }
 

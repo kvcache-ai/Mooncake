@@ -395,6 +395,29 @@ impl StoreClient {
         }
     }
 
+    fn write_retry_limit(
+        &self,
+        policy: &ResolvedReplicationPolicy,
+        ranked_candidate_count: usize,
+    ) -> usize {
+        if !policy.required_preferred_segments.is_empty() {
+            return 1;
+        }
+
+        let soft_candidate_count = policy
+            .hint_preferred_segments
+            .len()
+            .saturating_add(policy.preferred_storage_runtimes.len())
+            .saturating_add(ranked_candidate_count)
+            .saturating_add(usize::from(
+                policy.prefer_local && self.can_prefer_local_storage_for_write_mode(),
+            ));
+
+        DEFAULT_PUT_WRITE_RETRY_LIMIT
+            .max(policy.replica_count)
+            .max(soft_candidate_count)
+    }
+
     fn live_clients_snapshot(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
         if force_refresh {
             return refresh_live_client_cache(
@@ -545,6 +568,13 @@ impl StoreClient {
     ) -> Result<String> {
         if let Some(segment) = self.allocator.lock().announcement(segment_name) {
             if segment.owner == *owner {
+                self.state.lock().cache_segment_target_metadata(
+                    owner,
+                    segment_name,
+                    &segment.target_chunks,
+                    segment.transport_endpoint.clone(),
+                    segment.transport_segment_descriptor.clone(),
+                );
                 return Ok(Self::transport_open_segment_name(
                     segment_name,
                     segment.transport_endpoint.as_deref(),
@@ -564,6 +594,15 @@ impl StoreClient {
             .to_string());
         }
         let segment = self.metadata.get_segment(owner, segment_name)?;
+        if let Some(segment) = segment.as_ref() {
+            self.state.lock().cache_segment_target_metadata(
+                owner,
+                segment_name,
+                &segment.target_chunks,
+                segment.transport_endpoint.clone(),
+                segment.transport_segment_descriptor.clone(),
+            );
+        }
         Ok(Self::transport_open_segment_name(
             segment_name,
             segment
@@ -833,7 +872,6 @@ impl StoreClient {
             },
             preferred_storage_runtimes: self
                 .resolve_preferred_storage_owners(&policy.preferred_storage_owners)?,
-            with_soft_pin: policy.with_soft_pin,
             prefer_local: policy.prefer_local || policy.prefer_alloc_in_same_node,
         })
     }

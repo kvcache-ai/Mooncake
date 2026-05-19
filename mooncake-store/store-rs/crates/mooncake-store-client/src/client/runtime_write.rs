@@ -296,11 +296,6 @@ impl StoreClient {
             ));
         };
         let resolved_policy = self.resolve_replication_policy(policy)?;
-        let max_write_attempts = if resolved_policy.required_preferred_segments.is_empty() {
-            DEFAULT_PUT_WRITE_RETRY_LIMIT
-        } else {
-            1
-        };
         let mut write_attempt = 0usize;
 
         let object_refs = requests
@@ -326,6 +321,12 @@ impl StoreClient {
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
+        let ranked_candidate_count = plans
+            .iter()
+            .map(|plan| plan.owners.len())
+            .max()
+            .unwrap_or(0);
+        let max_write_attempts = self.write_retry_limit(&resolved_policy, ranked_candidate_count);
         let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
                 let _ =

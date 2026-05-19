@@ -564,6 +564,9 @@ fn test_transport_factory_creates_instances_sharing_segment_state() {
         submitted_batch_hints: Vec::new(),
         submitted_request_sources: Vec::new(),
         submitted_request_opcodes: Vec::new(),
+        local_segment_descriptor: None,
+        local_segment_descriptors: BTreeMap::new(),
+        cached_segment_descriptors: Vec::new(),
     }));
 
     let factory = TestTransportFactory { state };

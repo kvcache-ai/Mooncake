@@ -717,6 +717,7 @@ fn prewarm_segment_target_chunk_cache(
                     segment_name,
                     &segment.target_chunks,
                     segment.transport_endpoint.clone(),
+                    segment.transport_segment_descriptor.clone(),
                 );
             }
             Ok(_) => {}

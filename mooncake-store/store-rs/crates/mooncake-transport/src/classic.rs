@@ -372,6 +372,40 @@ impl ClassicTransferEngine {
         check_zero(rc, "mooncake_classic_republish_local_metadata")
     }
 
+    pub fn local_segment_descriptor_json(&self) -> Result<Option<String>> {
+        let len = unsafe { ffi::mooncake_classic_get_local_segment_descriptor_json_size(self.raw) };
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut buffer = vec![0i8; len];
+        let rc = unsafe {
+            ffi::mooncake_classic_get_local_segment_descriptor_json(
+                self.raw,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            )
+        };
+        check_zero(rc, "mooncake_classic_get_local_segment_descriptor_json")?;
+        Ok(Some(read_c_buffer(&buffer)))
+    }
+
+    pub fn cache_segment_descriptor_json(
+        &self,
+        segment_name: &str,
+        descriptor_json: &str,
+    ) -> Result<()> {
+        let segment_name = to_cstring("segment_name", segment_name)?;
+        let descriptor_json = to_cstring("descriptor_json", descriptor_json)?;
+        let rc = unsafe {
+            ffi::mooncake_classic_cache_segment_descriptor_json(
+                self.raw,
+                segment_name.as_ptr(),
+                descriptor_json.as_ptr(),
+            )
+        };
+        check_zero(rc, "mooncake_classic_cache_segment_descriptor_json")
+    }
+
     fn install_transport(&self, protocol: &str) -> Result<()> {
         let protocol = to_cstring("protocol", protocol)?;
         let transport =
@@ -685,6 +719,27 @@ mod tests {
             length: 1,
         };
         assert!(engine.submit(7, &[overflow]).is_err());
+    }
+
+    #[test]
+    fn p2p_cached_segment_descriptor_reuses_c_api_handle_width() {
+        let config = ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1");
+        let engine = ClassicTransferEngine::new(&config, "127.0.0.1")
+            .expect("classic p2p engine should start");
+        let descriptor = r#"{"name":"ignored","protocol":"tcp","tcp_data_port":0,"buffers":[{"name":"b0","addr":4096,"length":1024}]}"#;
+
+        engine
+            .cache_segment_descriptor_json("127.0.0.1:65530", descriptor)
+            .expect("descriptor should cache");
+        let handle = engine
+            .open_segment("127.0.0.1:65530")
+            .expect("cached descriptor should avoid P2P metadata exchange");
+        assert_eq!(
+            engine
+                .segment_buffers(handle)
+                .expect("cached descriptor should be found by returned handle"),
+            vec![(4096, 1024)]
+        );
     }
 
     #[test]

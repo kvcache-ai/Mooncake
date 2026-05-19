@@ -2387,7 +2387,9 @@ fn register_local_memory_preserves_segment_name_and_publishes_transport_endpoint
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let logical_segment = SegmentName::new("logical-segment");
     let transport_endpoint = "189.144.184.2:12001";
+    let transport_descriptor = r#"{"name":"189.144.184.2","protocol":"rdma","devices":[{"name":"mlx5_0","lid":0,"gid":"2001:db8::1"}],"buffers":[],"priority_matrix":{},"tcp_data_port":0}"#;
     let transport = Arc::new(TestTransport::new(transport_endpoint));
+    transport.set_local_segment_descriptor(transport_descriptor);
     let client = StoreClientBuilder::new(metadata.clone(), "p2p-publish")
         .state(ClientLifecycleState::Active)
         .segment_name(logical_segment.0.clone())
@@ -2409,6 +2411,10 @@ fn register_local_memory_preserves_segment_name_and_publishes_transport_endpoint
         segment.transport_endpoint.as_deref(),
         Some(transport_endpoint)
     );
+    assert_eq!(
+        segment.transport_segment_descriptor.as_deref(),
+        Some(transport_descriptor)
+    );
 }
 
 #[test]
@@ -2416,7 +2422,9 @@ fn routed_io_opens_transport_endpoint_while_routes_keep_segment_name() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let logical_segment = SegmentName::new("storage-logical-segment");
     let transport_endpoint = "189.144.184.2:12001";
+    let transport_descriptor = r#"{"name":"189.144.184.2","protocol":"rdma","devices":[{"name":"mlx5_0","lid":0,"gid":"2001:db8::1"}],"buffers":[],"priority_matrix":{},"tcp_data_port":0}"#;
     let storage_transport = Arc::new(TestTransport::new(transport_endpoint));
+    storage_transport.set_local_segment_descriptor(transport_descriptor);
     let writer_transport = Arc::new(storage_transport.peer("writer-segment"));
 
     let storage = StoreClientBuilder::new(metadata.clone(), "p2p-storage")
@@ -2436,7 +2444,7 @@ fn routed_io_opens_transport_endpoint_while_routes_keep_segment_name() {
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
-        .transport(writer_transport)
+        .transport(writer_transport.clone())
         .local_memory(rw_only_config())
         .routed_writes(
             PlacementPlanner::new(metadata).require_label("storage", "true"),
@@ -2463,6 +2471,15 @@ fn routed_io_opens_transport_endpoint_while_routes_keep_segment_name() {
         .expect("route query should succeed")
         .expect("route should exist");
     assert_eq!(route.replicas[0].segment_name, logical_segment);
+    assert!(
+        writer_transport
+            .cached_segment_descriptors()
+            .iter()
+            .any(|(segment_name, descriptor)| {
+                segment_name == transport_endpoint && descriptor == transport_descriptor
+            }),
+        "writer should preload the full TE descriptor before opening the P2P endpoint"
+    );
 }
 
 #[test]
@@ -5417,6 +5434,174 @@ fn routed_put_retries_after_mid_transfer_failure_and_uses_surviving_peer() {
             .expect("reader should see retried write"),
         b"put-retry-payload"
     );
+}
+
+#[test]
+fn routed_put_default_policy_retries_after_mid_transfer_failure() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("put-default-retry-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("put-default-retry-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("put-default-retry-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "put-default-retry-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "put-default-retry-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "put-default-retry-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer]);
+
+    let store_a_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    store_a_transport.fail_next_submit_for_segment(&store_a_segment.0);
+
+    let route = writer
+        .put_with_policy(
+            "put-default-retry-key",
+            b"put-default-retry-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("default put should retry after the first target fails mid-transfer");
+
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *store_b.runtime_id());
+    assert!(
+        writer
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "failed write target should be quarantined before retrying placement"
+    );
+}
+
+#[test]
+fn routed_put_retries_past_default_limit_for_soft_preferred_owners() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let root_transport = Arc::new(TestTransport::new("put-many-retry-store-0-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut stores = Vec::new();
+    let mut store_transports = Vec::new();
+    for index in 0..6 {
+        let transport = if index == 0 {
+            root_transport.clone()
+        } else {
+            Arc::new(root_transport.peer(&format!("put-many-retry-store-{index}-segment")))
+        };
+        let store = StoreClientBuilder::new(metadata.clone(), format!("put-many-retry-store-{index}"))
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .route_control(RouteControlMode::MetadataOnly)
+            .live_client_sync_interval(fast_live_client_sync_interval())
+            .transport(transport.clone())
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("store build should succeed");
+        store_transports.push(transport);
+        stores.push(store);
+    }
+
+    let writer_transport = Arc::new(root_transport.peer("put-many-retry-writer-segment"));
+    let writer = StoreClientBuilder::new(metadata, "put-many-retry-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    for store in &stores {
+        store
+            .register_local_memory()
+            .expect("store memory should register");
+    }
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+
+    let mut clients = stores.iter().collect::<Vec<_>>();
+    clients.push(&writer);
+    wait_for_membership_convergence(&clients);
+
+    for (store, transport) in stores.iter().zip(store_transports.iter()).take(5) {
+        let segment = store.segment_name().expect("store segment should exist");
+        transport.fail_next_submit_for_segment(&segment.0);
+    }
+    let preferred_owners = stores
+        .iter()
+        .map(|store| store.runtime_id().storage_key())
+        .collect::<Vec<_>>();
+
+    let route = writer
+        .put_with_policy(
+            "put-many-retry-key",
+            b"put-many-retry-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners(preferred_owners),
+        )
+        .expect("put should keep retrying soft owners until a live target succeeds");
+
+    assert_eq!(route.replicas.len(), 1);
+    assert_eq!(route.replicas[0].owner, *stores[5].runtime_id());
+    for store in stores.iter().take(5) {
+        assert!(
+            writer
+                .suspect_runtime_cache
+                .lock()
+                .contains(store.runtime_id()),
+            "failed write target should be quarantined before trying later soft owners"
+        );
+    }
 }
 
 #[test]
@@ -8685,6 +8870,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
         owner: remote_owner.clone(),
         segment_name: SegmentName::new("seg-prefer"),
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         capacity_bytes: 8,
         used_bytes: 0,
         target_chunks: remote_target_chunks.clone(),
@@ -8737,6 +8923,7 @@ fn preferred_storage_owner_overrides_local_default_and_falls_back_when_full() {
             owner: remote_owner.clone(),
             segment_name: SegmentName::new("seg-prefer"),
             transport_endpoint: None,
+            transport_segment_descriptor: None,
             capacity_bytes: 8,
             used_bytes: 0,
             target_chunks: remote_target_chunks,
@@ -13331,6 +13518,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         owner: owner.clone(),
         segment_name: SegmentName::new("alloc-primary"),
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         capacity_bytes: 128,
         used_bytes: 0,
         target_chunks: Vec::new(),
@@ -13341,12 +13529,14 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
     let secondary = SegmentAnnouncement {
         segment_name: SegmentName::new("alloc-secondary"),
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         capacity_bytes: 64,
         ..primary.clone()
     };
     let draining = SegmentAnnouncement {
         segment_name: SegmentName::new("alloc-draining"),
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         state: SegmentLifecycleState::Draining,
         ..primary.clone()
     };
@@ -13410,6 +13600,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         .expect("release should succeed");
     let next_announcement = SegmentAnnouncement {
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         used_bytes: 64,
         target_chunks: Vec::new(),
         alignment_bytes: 1,
@@ -13626,6 +13817,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         owner: owner.clone(),
         segment_name: SegmentName::new("pending-primary"),
         transport_endpoint: None,
+        transport_segment_descriptor: None,
         capacity_bytes: 128,
         used_bytes: 0,
         target_chunks: Vec::new(),

@@ -105,6 +105,12 @@ Runtime backend selection is implemented by the compatibility layer, not by `Sto
 - `mooncake-store-client --transport-backend tent|classic-te`
 - `MooncakeDistributedStore.setup(..., transport_backend="tent"|"classic_te")`
 
+For `classic_te` with `P2PHANDSHAKE` metadata, Store-RS separates the logical segment identity from
+the transport identity. Segment announcements keep the configured logical `segment_name`, publish
+the peer RPC address in `transport_endpoint`, and publish the full TE RAM descriptor in
+`transport_segment_descriptor`. Remote clients preload that descriptor into classic TE before
+calling `openSegment`, matching the descriptor shape TE normally obtains from Redis metadata.
+
 Redis authentication can come from URL-embedded credentials or from `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
 
 ## Enable Routed Writes

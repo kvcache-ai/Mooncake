@@ -30,10 +30,24 @@ impl StoreState {
         if let Some(handle) = self.remote_segments.get(segment_name) {
             return Ok(*handle);
         }
+        self.preload_remote_segment_descriptor(transport, segment_name)?;
         let handle = transport.open_segment(segment_name)?;
         self.remote_segments
             .insert(segment_name.to_string(), handle);
         Ok(handle)
+    }
+
+    fn preload_remote_segment_descriptor(
+        &self,
+        transport: &dyn StoreTransport,
+        segment_name: &str,
+    ) -> Result<()> {
+        if let Some(metadata) = self.segment_open_metadata.get(segment_name) {
+            if let Some(descriptor) = metadata.transport_segment_descriptor.as_deref() {
+                transport.cache_remote_segment_descriptor(segment_name, descriptor)?;
+            }
+        }
+        Ok(())
     }
 
     fn invalidate_remote_segment(&mut self, segment_name: &str) {
@@ -51,6 +65,7 @@ impl StoreState {
         for open_name in open_names {
             self.remote_segments.remove(&open_name);
             self.remote_segment_infos.remove(&open_name);
+            self.segment_open_metadata.remove(&open_name);
         }
         self.segment_target_metadata
             .retain(|(_, segment), _| segment.0 != segment_name);
@@ -86,14 +101,38 @@ impl StoreState {
         segment_name: &SegmentName,
         target_chunks: &[SegmentTargetChunk],
         transport_endpoint: Option<String>,
+        transport_segment_descriptor: Option<String>,
     ) {
-        self.segment_target_metadata.insert(
-            (owner.clone(), segment_name.clone()),
-            SegmentTransportMetadata {
-                target_chunks: target_chunks.to_vec(),
-                transport_endpoint,
-            },
-        );
+        let key = (owner.clone(), segment_name.clone());
+        if let Some(previous) = self.segment_target_metadata.remove(&key) {
+            for open_name in Self::segment_open_names(segment_name, &previous) {
+                self.segment_open_metadata.remove(&open_name);
+            }
+        }
+        let metadata = SegmentTransportMetadata {
+            target_chunks: target_chunks.to_vec(),
+            transport_endpoint,
+            transport_segment_descriptor,
+        };
+        for open_name in Self::segment_open_names(segment_name, &metadata) {
+            self.segment_open_metadata
+                .insert(open_name, metadata.clone());
+        }
+        self.segment_target_metadata.insert(key, metadata);
+    }
+
+    fn segment_open_names(
+        segment_name: &SegmentName,
+        metadata: &SegmentTransportMetadata,
+    ) -> Vec<String> {
+        let mut names = vec![segment_name.0.clone()];
+        if let Some(endpoint) = metadata.transport_endpoint.as_deref() {
+            let endpoint = endpoint.trim();
+            if !endpoint.is_empty() && endpoint != segment_name.0 {
+                names.push(endpoint.to_string());
+            }
+        }
+        names
     }
 
     fn open_segment_with_info(
@@ -251,6 +290,7 @@ mod state_store_tests {
         open_calls: usize,
         close_calls: usize,
         info_calls: usize,
+        cached_descriptors: Vec<(String, String)>,
     }
 
     #[derive(Default, Clone)]
@@ -262,6 +302,10 @@ mod state_store_tests {
         fn counts(&self) -> (usize, usize, usize) {
             let state = self.state.lock();
             (state.open_calls, state.close_calls, state.info_calls)
+        }
+
+        fn cached_descriptors(&self) -> Vec<(String, String)> {
+            self.state.lock().cached_descriptors.clone()
         }
     }
 
@@ -296,6 +340,18 @@ mod state_store_tests {
                     location: "cpu:0".to_string(),
                 }],
             })
+        }
+
+        fn cache_remote_segment_descriptor(
+            &self,
+            segment_name: &str,
+            descriptor_json: &str,
+        ) -> Result<()> {
+            self.state
+                .lock()
+                .cached_descriptors
+                .push((segment_name.to_string(), descriptor_json.to_string()));
+            Ok(())
         }
 
         fn allocate_memory(&self, _size: usize, _location: &str) -> Result<*mut c_void> {
@@ -379,6 +435,7 @@ mod state_store_tests {
             &segment_name,
             &[],
             Some("10.0.0.8:12001".to_string()),
+            None,
         );
 
         state
@@ -393,6 +450,41 @@ mod state_store_tests {
             .expect("endpoint should reopen after logical invalidation");
 
         assert_eq!(transport.counts(), (2, 0, 2));
+    }
+
+    #[test]
+    fn preload_remote_segment_descriptor_uses_exact_transport_endpoint_metadata() {
+        let transport = CountingTransport::default();
+        let mut state = StoreState::default();
+        let owner = ClientRuntimeId::new("remote-owner", ClientEpoch(1));
+        let primary = SegmentName::new("logical-segment");
+        let extra = SegmentName::new("logical-segment-ext-1");
+        state.cache_segment_target_metadata(
+            &owner,
+            &primary,
+            &[],
+            Some("10.0.0.8:12001".to_string()),
+            Some("primary-descriptor".to_string()),
+        );
+        state.cache_segment_target_metadata(
+            &owner,
+            &extra,
+            &[],
+            Some("10.0.0.8:12002".to_string()),
+            Some("extra-descriptor".to_string()),
+        );
+
+        state
+            .open_segment_with_info(&transport, "10.0.0.8:12002")
+            .expect("endpoint open should succeed");
+
+        assert_eq!(
+            transport.cached_descriptors(),
+            vec![(
+                "10.0.0.8:12002".to_string(),
+                "extra-descriptor".to_string()
+            )]
+        );
     }
 
     #[test]

@@ -599,6 +599,61 @@ fn startup_multi_segment_registration_preserves_future_segment_names() {
 }
 
 #[test]
+fn multi_segment_publish_uses_each_segments_transport_descriptor() {
+    let meta = Arc::new(InMemoryMetadataBackend::new());
+    with_test_numa_locations(&["cpu:0", "cpu:1"], || {
+        let primary_segment = "seg-startup-descriptor-seg";
+        let extra_segment = "seg-startup-descriptor-seg-ext-1";
+        let expanded_segment = "seg-startup-descriptor-seg-ext-2";
+        let transport = Arc::new(TestTransport::new(primary_segment));
+        transport.set_supports_parallel_startup_registration(true);
+        transport.set_local_segment_descriptor_for_segment(primary_segment, "primary-descriptor");
+        transport.set_local_segment_descriptor_for_segment(extra_segment, "extra-descriptor");
+        transport.set_local_segment_descriptor_for_segment(expanded_segment, "expanded-descriptor");
+
+        let client = build_storage_client_with_transport(
+            &meta,
+            "seg-startup-descriptor",
+            LocalMemoryConfig::new()
+                .storage_bytes(8 * 1024)
+                .scratch_bytes(4 * 1024)
+                .location("cpu:0")
+                .alignment(1)
+                .numa_aware(true)
+                .reclaim_grace_ms(0),
+            transport,
+        );
+
+        let primary = meta
+            .get_segment(client.runtime_id(), &SegmentName::new(primary_segment))
+            .expect("primary segment lookup")
+            .expect("primary segment should be published");
+        assert_eq!(
+            primary.transport_segment_descriptor.as_deref(),
+            Some("primary-descriptor")
+        );
+
+        let extra = meta
+            .get_segment(client.runtime_id(), &SegmentName::new(extra_segment))
+            .expect("extra segment lookup")
+            .expect("extra segment should be published");
+        assert_eq!(
+            extra.transport_segment_descriptor.as_deref(),
+            Some("extra-descriptor")
+        );
+
+        let expanded = client
+            .expand_local_memory(4 * 1024)
+            .expect("expand after startup registration");
+        assert_eq!(expanded.segment_name, SegmentName::new(expanded_segment));
+        assert_eq!(
+            expanded.transport_segment_descriptor.as_deref(),
+            Some("expanded-descriptor")
+        );
+    });
+}
+
+#[test]
 fn expand_local_memory_zero_bytes_fails() {
     let meta = Arc::new(InMemoryMetadataBackend::new());
     let client = build_storage_client(&meta, "seg-expand-zero", 8 * 1024);

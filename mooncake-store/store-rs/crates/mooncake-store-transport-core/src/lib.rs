@@ -25,6 +25,18 @@ pub trait StoreTransport: Send + Sync {
         Ok(())
     }
 
+    fn local_segment_descriptor(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn cache_remote_segment_descriptor(
+        &self,
+        _segment_name: &str,
+        _descriptor_json: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn adopt_local_memory(&self, _addr: *mut c_void, _size: usize, _location: &str) -> Result<()> {
         Ok(())
     }
