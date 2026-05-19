@@ -41,7 +41,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
         return;
     }
     // Align to 64 bytes(cache line size) for better cache performance
-    constexpr size_t alignment = 4096;
+    constexpr size_t alignment = 64;
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
@@ -93,7 +93,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_);
+            free_memory(protocol, buffer_, buffer_size_);
         }
     }
 }
