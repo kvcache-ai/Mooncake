@@ -20,7 +20,6 @@
 #include "tent/common/concurrent/thread_pool.h"
 
 #include "tent/runtime/transport.h"
-#include <chrono>
 
 // Beta version -- use with own risk
 
@@ -29,58 +28,6 @@ namespace tent {
 class TransferEngineImpl;
 class TaskInfo;
 struct StageBufferCache;
-
-struct ProxyManagerMetrics {
-    std::atomic<uint64_t> total_transfers{0};
-    std::atomic<uint64_t> total_bytes_transferred{0};
-    std::atomic<uint64_t> total_latency_us{0};
-    std::atomic<uint64_t> remote_staging_count{0};
-    std::atomic<uint64_t> pipeline_parallel_chunks{0};
-    std::atomic<uint64_t> retry_count{0};
-    std::atomic<int64_t> start_time{0};
-    std::atomic<int64_t> end_time{0};
-
-    void reset() {
-        total_transfers = 0;
-        total_bytes_transferred = 0;
-        total_latency_us = 0;
-        remote_staging_count = 0;
-        pipeline_parallel_chunks = 0;
-        retry_count = 0;
-        start_time = 0;
-        end_time = 0;
-    }
-
-    void markStartTime() {
-        start_time.store(
-            std::chrono::steady_clock::now().time_since_epoch().count(),
-            std::memory_order_relaxed);
-    }
-
-    void markEndTime() {
-        end_time.store(
-            std::chrono::steady_clock::now().time_since_epoch().count(),
-            std::memory_order_relaxed);
-    }
-
-    double getAvgLatencyMs() const {
-        uint64_t count = total_transfers.load();
-        return count > 0 ? (total_latency_us.load() / 1000.0) / count : 0.0;
-    }
-
-    double getThroughputGBps() const {
-        auto start = start_time.load();
-        auto end = end_time.load();
-        if (start == 0 || end == 0) return 0.0;
-
-        auto duration_us = end - start;
-        if (duration_us <= 0) return 0.0;
-
-        double duration_s = duration_us / 1e6;
-        double bytes_gb = total_bytes_transferred.load() / 1e9;
-        return bytes_gb / duration_s;
-    }
-};
 
 struct StagingTask {
     TaskInfo* native{nullptr};
@@ -98,7 +45,7 @@ class ProxyManager {
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
                           size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 64, int max_retries = 3);
+                          size_t chunk_count = 64);
 
     ~ProxyManager();
 
@@ -111,13 +58,6 @@ class ProxyManager {
     Status pinStageBuffer(const std::string& location, uint64_t& addr);
 
     Status unpinStageBuffer(uint64_t addr);
-
-    const ProxyManagerMetrics& getMetrics() const { return metrics_; }
-
-    void resetMetrics() {
-        metrics_.reset();
-        metrics_.markStartTime();
-    }
 
    private:
     void runner(size_t id);
@@ -157,11 +97,9 @@ class ProxyManager {
    private:
     const size_t chunk_size_;
     const size_t chunk_count_;
-    const int max_retries_;
     TransferEngineImpl* impl_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
-    ProxyManagerMetrics metrics_;
     struct WorkerShard {
         std::thread thread;
         std::mutex mu;
