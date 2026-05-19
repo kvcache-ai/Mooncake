@@ -584,11 +584,11 @@ impl ClassicTeTransport {
     fn new(config: ClassicEngineConfig, segment_name: &str) -> Result<Self> {
         let local_server_name = classic_te_local_server_name(&config, segment_name);
         let engine = ClassicTransferEngine::new(&config, &local_server_name)?;
-        let published_segment_name = if config.uses_p2p_handshake_metadata() {
-            engine.rpc_server_address_text()?
-        } else {
-            segment_name.to_string()
-        };
+        let published_segment_name = classic_te_published_segment_name(
+            &config,
+            segment_name,
+            &engine.rpc_server_address_text()?,
+        );
         Ok(Self {
             engine: RwLock::new(engine),
             max_registration_bytes: matches!(
@@ -704,6 +704,18 @@ fn classic_te_local_server_name(config: &ClassicEngineConfig, segment_name: &str
     match config.rpc_port_value() {
         Some(port) => format_host_port(config.rpc_bind_host(), port),
         None => config.rpc_bind_host().to_string(),
+    }
+}
+
+fn classic_te_published_segment_name(
+    config: &ClassicEngineConfig,
+    segment_name: &str,
+    rpc_server_address: &str,
+) -> String {
+    if config.uses_p2p_handshake_metadata() {
+        rpc_server_address.to_string()
+    } else {
+        segment_name.to_string()
     }
 }
 
@@ -1981,10 +1993,11 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        classic_buffer_location, classic_te_local_server_name, format_host_port,
-        parse_rpc_server_address, registration_chunks, system_page_size, wait_for_batch_completion,
-        wait_for_batch_completion_detailed, BatchWaitFailureKind, ClassicAllocationOwner,
-        ClassicAllocationRecord, HttpStoreTransport, HttpTransportServerHandle, StoreTransport,
+        classic_buffer_location, classic_te_local_server_name, classic_te_published_segment_name,
+        format_host_port, parse_rpc_server_address, registration_chunks, system_page_size,
+        wait_for_batch_completion, wait_for_batch_completion_detailed, BatchWaitFailureKind,
+        ClassicAllocationOwner, ClassicAllocationRecord, HttpStoreTransport,
+        HttpTransportServerHandle, StoreTransport,
     };
 
     struct ScriptedTransport {
@@ -2343,6 +2356,22 @@ mod tests {
             ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1").rpc_port(17111);
         assert_eq!(
             classic_te_local_server_name(&redis_config, "logical-segment"),
+            "logical-segment"
+        );
+    }
+
+    #[test]
+    fn classic_te_p2p_publishes_rpc_address_as_segment_name() {
+        let config = ClassicEngineConfig::new("P2PHANDSHAKE", "127.0.0.1").rpc_port(17111);
+        assert_eq!(
+            classic_te_published_segment_name(&config, "logical-segment", "127.0.0.1:17111"),
+            "127.0.0.1:17111"
+        );
+
+        let redis_config =
+            ClassicEngineConfig::new("redis://127.0.0.1:6379", "127.0.0.1").rpc_port(17111);
+        assert_eq!(
+            classic_te_published_segment_name(&redis_config, "logical-segment", "127.0.0.1:17111"),
             "logical-segment"
         );
     }
