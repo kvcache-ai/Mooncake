@@ -1019,30 +1019,28 @@ class MasterService {
         std::chrono::system_clock::time_point start_time;
     };
 
-    // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source LOCAL_DISK
-    // replica is refcnt-pinned for the duration of the task so it cannot be
-    // evicted. alloc_id pins down which staged replica
-    // NotifyPromotionSuccess should commit, so a concurrent Put creating
-    // another PROCESSING MEMORY replica cannot be confused with ours.
-    // alloc_id is 0 until PromotionAllocStart records the new replica.
+    // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
+    // LOCAL_DISK replica is refcnt-pinned for the duration of the task
+    // so it cannot be evicted.
     //
-    // start_time is the reaper deadline anchor. It is set at task
-    // admission (TryPushPromotionQueue) and reset at PromotionAllocStart
-    // so the reaper TTL covers the active-transfer phase
-    // (AllocStart -> SSD read -> RDMA write -> Notify) measured from
-    // when a master-allocated buffer becomes vulnerable, not consumed
-    // by queue waiting. Without the reset, a backlogged task could
-    // enter active transfer with little remaining TTL and the reaper
-    // could free the staged MEMORY replica via EraseReplicaByID while
-    // the client's RDMA write is still landing into it.
+    // alloc_id pins down which staged PROCESSING MEMORY replica
+    // NotifyPromotionSuccess should commit, so a concurrent Put on the
+    // same key cannot be confused with ours. 0 until
+    // PromotionAllocStart records the new replica.
     //
-    // holder_id is the client that owns the source LOCAL_DISK segment and
-    // is the *only* client authorized to call NotifyPromotionSuccess for
-    // this task. Captured at admission so the Notify path can reject
-    // calls from other clients that happen to know the key — without
-    // this check, any client could flip the staged PROCESSING replica
-    // to COMPLETE before the holder's RDMA write has landed, exposing
-    // torn data to readers.
+    // start_time is the reaper deadline anchor. Set at task admission
+    // and reset at PromotionAllocStart so each phase (queue-wait and
+    // active-transfer) gets its own full put_start_release_timeout_sec_
+    // window. Without the reset a backlogged task could enter active
+    // transfer with little TTL left, and the reaper could free the
+    // staged replica via EraseReplicaByID mid-RDMA-write.
+    //
+    // holder_id is the client owning the source LOCAL_DISK segment and
+    // the only one authorized to commit (NotifyPromotionSuccess) or
+    // abort (NotifyPromotionFailure) the task. Without it, any client
+    // knowing the key could flip the staged PROCESSING replica to
+    // COMPLETE before the holder's RDMA write landed, exposing torn
+    // data to readers.
     struct PromotionTask {
         ReplicaID source_id;    // the LOCAL_DISK replica being promoted
         ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart

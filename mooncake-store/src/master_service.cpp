@@ -2929,15 +2929,13 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    // Return at most kMaxPerHeartbeat tasks to the client. Each task does a
-    // synchronous SSD read + RDMA write on the client side; allowing more
-    // than one per heartbeat risks blocking past the heartbeat / client-
+    // Return at most kMaxPerHeartbeat tasks. Each task does a
+    // synchronous SSD read + RDMA write on the client side; allowing
+    // more than one per heartbeat risks blocking past the client-
     // liveness window and the master marking the client dead. The rest
-    // stay queued in promotion_objects for subsequent heartbeats — this
-    // preserves leftover work and avoids the prior bug where the client
-    // capped its own loop at 1 and silently dropped the remainder (their
-    // promotion_tasks entries would stay refcnt-pinned until the reaper
-    // TTL expired).
+    // stay queued in promotion_objects for subsequent heartbeats. The
+    // cap must live here (server side) rather than on the client so
+    // leftover work isn't silently dropped.
     constexpr size_t kMaxPerHeartbeat = 1;
     auto& src = local_disk_segment_it->second->promotion_objects;
     std::unordered_map<std::string, int64_t> result;
@@ -2959,44 +2957,32 @@ auto MasterService::PromotionAllocStart(
     }
     auto& metadata = accessor.Get();
 
-    // Verify the in-flight task still exists before allocating. The reaper
-    // can sweep a task between the holder's heartbeat and this AllocStart
-    // call (a hung client, GC pause, or HA failover can stall AllocStart
-    // for longer than put_start_release_timeout_sec_). If we allocated
-    // and AddReplicas'd unconditionally, the staged PROCESSING MEMORY
+    // Verify the in-flight task still exists before allocating. The
+    // reaper can sweep it between the holder's heartbeat and this
+    // AllocStart call (a hung client, GC pause, or HA failover can
+    // stall AllocStart past put_start_release_timeout_sec_). If we
+    // allocated and AddReplicas'd anyway, the staged PROCESSING MEMORY
     // replica would have no PromotionTask pointing at it: the generic
-    // PROCESSING reaper (DiscardExpiredProcessingReplicas) only iterates
-    // shard->processing_keys, which AllocStart never populates, and the
-    // promotion-task reaper has nothing left to iterate. The buffer would
-    // sit attached to the object until the object itself is removed or
-    // evicted — the same orphaned-staged-replica shape Issue 1's fix
-    // closed on the symmetric (task-still-exists-but-reaper-fires-first)
-    // path. The shard mutex is held through the rest of this function,
-    // so the iterator stays valid across the allocation step.
+    // PROCESSING reaper iterates shard->processing_keys (never
+    // populated by promotion) and the promotion-task reaper would have
+    // nothing left to iterate, leaking the buffer until the object is
+    // removed or evicted. The shard mutex is held for the rest of this
+    // function, so the iterator stays valid across the allocation step.
     auto& shard = accessor.GetShard();
     auto task_it = shard->promotion_tasks.find(key);
     if (task_it == shard->promotion_tasks.end()) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Authorize caller: only the holder client (the one whose LOCAL_DISK
-    // segment owns the source replica) is allowed to stage the MEMORY
-    // copy. Without this gate any client that knows the key could drain
-    // another's promotion_objects queue (PromotionObjectHeartbeat is
-    // unauthenticated in the current trust model) and then call us here
-    // to allocate arbitrary DRAM buffers on the destination segment,
-    // which would sit pinned until the reaper TTL.
+    // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Defensive size check: the size must match what TryPushPromotionQueue
-    // captured from the source LOCAL_DISK replica's descriptor. A mismatch
-    // would let a buggy caller request an arbitrarily larger or smaller
-    // allocation than the actual object — smaller risks the subsequent
-    // RDMA write overflowing into adjacent allocator state (the MR will
-    // typically catch this but defense-in-depth is cheap), and larger
-    // wastes DRAM that stays pinned until the reaper TTL.
+    // Defensive size check: must match the source LOCAL_DISK
+    // descriptor's object_size captured at admission. A mismatch would
+    // let a buggy caller request a wrong-sized allocation — smaller
+    // risks RDMA overflow, larger wastes DRAM pinned until reaper TTL.
     if (task_it->second.object_size != size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -3034,26 +3020,20 @@ auto MasterService::PromotionAllocStart(
     metadata.AddReplicas(std::move(to_add));
 
     // Record the new replica's ID on the in-flight PromotionTask so
-    // NotifyPromotionSuccess knows exactly which replica to commit (a
+    // NotifyPromotionSuccess knows exactly which replica to commit. A
     // concurrent Put on this key may stage other PROCESSING MEMORY
-    // replicas; finding "first PROCESSING memory" would be ambiguous).
+    // replicas; using alloc_id avoids the "first PROCESSING memory"
+    // ambiguity.
     //
-    // Also reset start_time. The task TTL exists to bound the
-    // *active-transfer* phase (AllocStart -> client SSD read -> RDMA
-    // write -> Notify). Pre-reset, the same start_time was set at queue
-    // admission and never bumped, so a task that sat queued behind a
-    // backlog on the holder client (kMaxPerHeartbeat = 1 serializes
-    // work) could enter the active-transfer phase with only a sliver of
-    // the original TTL remaining. If the SSD read + RDMA write of a
-    // large object then ran past expiry, the reaper would call
-    // EraseReplicaByID on this staged replica mid-transfer and the
-    // allocator could hand the buffer to a concurrent Put while the
-    // RDMA write is still landing into it. By resetting here we give
-    // the active-transfer phase its own full TTL window measured from
-    // the moment a buffer becomes vulnerable; the queue-waiting phase
-    // (alloc_id still 0) is bounded by its own original-start_time
-    // window during which the reaper's EraseReplicaByID branch is a
-    // no-op.
+    // Also reset start_time so the reaper TTL covers the active-
+    // transfer phase (AllocStart -> SSD read -> RDMA write -> Notify)
+    // measured from when a master-allocated buffer becomes vulnerable,
+    // rather than being consumed by queue-waiting. Without the reset,
+    // a backlogged task could enter active transfer with little TTL
+    // remaining and the reaper could free the staged replica via
+    // EraseReplicaByID mid-RDMA-write. The queue-waiting phase
+    // (alloc_id == 0) is bounded by its own original start_time window
+    // during which the reaper's EraseReplicaByID branch is a no-op.
     task_it->second.alloc_id = new_id;
     task_it->second.start_time = std::chrono::system_clock::now();
     return PromotionAllocStartResponse{std::move(desc)};
@@ -3081,11 +3061,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Only the holder client (the one owning the source LOCAL_DISK
-    // segment) is authorized to commit. Without this check any client
-    // knowing the key could flip the staged PROCESSING replica to
-    // COMPLETE before the holder's RDMA write has landed, exposing torn
-    // data to readers.
+    // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -3146,22 +3122,13 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         return {};
     }
 
-    // Same authorization gate as NotifyPromotionSuccess: only the holder
-    // may release. A spurious failure notification from another client
-    // should not be allowed to free state that legitimate holder still
-    // intends to commit.
+    // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Mirror the reaper's expiry path:
-    //   - Drop source LOCAL_DISK refcnt so it can be evicted normally.
-    //   - If AllocStart already staged a PROCESSING MEMORY replica
-    //     (alloc_id != 0), pop it via EraseReplicaByID. That buffer is
-    //     not in shard->processing_keys, so only this path (and the
-    //     reaper) can reap it.
-    //   - Erase the task entry and decrement the global in-flight
-    //     counter so the slot is immediately available to other admissions.
+    // Mirror the reaper's expiry path; see DiscardExpiredProcessingReplicas
+    // Part 4 for the full rationale on each step.
     auto* source = metadata.GetReplicaByID(task_it->second.source_id);
     if (source != nullptr) {
         source->dec_refcnt();
@@ -3379,30 +3346,21 @@ void MasterService::DiscardExpiredProcessingReplicas(
         task_it = shard->offloading_tasks.erase(task_it);
     }
 
-    // Part 4: Discard expired promotion-on-hit tasks. For each expired
-    // task:
-    //   - Drop the source LOCAL_DISK replica's refcnt so it can be
+    // Part 4: Discard expired promotion-on-hit tasks. For each:
+    //   - Drop the source LOCAL_DISK refcnt so the source can be
     //     evicted normally.
-    //   - If PromotionAllocStart already staged a PROCESSING MEMORY
-    //     replica (alloc_id != 0), pop it via EraseReplicaByID. The
-    //     staged replica is not in shard->processing_keys, so
-    //     DiscardExpiredProcessingReplicas would never reap it; this is
-    //     the only place that does. Without this the buffer leaks until
-    //     the object itself is removed or evicted.
-    //   - Erase the task entry and decrement the global in-flight
-    //     counter.
-    // The deadline anchor (task.start_time) is set at admission and
-    // reset at PromotionAllocStart, so the queue-wait phase
-    // (alloc_id == 0, no buffer) and the active-transfer phase
-    // (alloc_id != 0, master-allocated buffer in flight) each get a
-    // full put_start_release_timeout_sec_ window measured from when
-    // they started. The reaper does not need to distinguish the two
-    // phases here: alloc_id gates the EraseReplicaByID branch.
-    // The per-client promotion_objects map is best-effort garbage
-    // collected on the next heartbeat (entries for vanished tasks are
-    // harmless — the client will allocate, transfer, then
-    // NotifyPromotionSuccess will return REPLICA_IS_NOT_READY since the
-    // task entry is gone).
+    //   - If a PROCESSING MEMORY replica was staged (alloc_id != 0),
+    //     pop it via EraseReplicaByID. The staged replica is not in
+    //     shard->processing_keys, so this is the only place (besides
+    //     NotifyPromotionFailure) that reaps it; without this the
+    //     buffer leaks until the object is removed or evicted.
+    //   - Erase the task entry and decrement the in-flight counter.
+    // task.start_time is set at admission and reset at AllocStart, so
+    // queue-wait (alloc_id == 0) and active-transfer (alloc_id != 0)
+    // phases each get a full put_start_release_timeout_sec_ window.
+    // The per-client promotion_objects map is GC'd on the next
+    // heartbeat (entries for vanished tasks are harmless — Notify will
+    // return REPLICA_IS_NOT_READY since the task entry is gone).
     for (auto task_it = shard->promotion_tasks.begin();
          task_it != shard->promotion_tasks.end();) {
         const auto ttl =

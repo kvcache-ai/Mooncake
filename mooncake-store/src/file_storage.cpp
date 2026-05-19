@@ -557,7 +557,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
-    // No segment preference in v1: let master pick from any DRAM segment.
+    // No segment preference from the client: let master pick from any
+    // DRAM segment.
     const std::vector<std::string> preferred_segments;
 
     // The master caps per-heartbeat work via PromotionObjectHeartbeat,
@@ -576,17 +577,14 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         auto alloc_result = client_->PromotionAllocStart(
             key, static_cast<uint64_t>(size), preferred_segments);
         if (!alloc_result) {
-            // AllocStart failed (typically NO_AVAILABLE_HANDLE under DRAM
-            // pressure). No staged buffer to release, but the task entry
-            // and its slot in promotion_in_flight_ were claimed back in
-            // TryPushPromotionQueue when the gate admitted us. Without
-            // an explicit release the slot stays pinned for up to
-            // put_start_release_timeout_sec_ (default 10 min), which
-            // turns transient DRAM pressure into a sustained outage of
-            // promotion_queue_limit_. Notify is idempotent and handles
-            // the alloc_id == 0 case correctly (just erases the task
-            // entry and decrements the counter; the EraseReplicaByID
-            // branch is gated on alloc_id != 0).
+            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
+            // DRAM pressure). No staged buffer to release, but the
+            // task entry already claimed a promotion_in_flight_ slot
+            // at admission. Notify the master to release it
+            // immediately; otherwise the slot stays pinned for the
+            // reaper TTL (~10 min default), turning transient DRAM
+            // pressure into a sustained outage of promotion_queue_limit_.
+            // Notify is idempotent and handles alloc_id == 0 correctly.
             VLOG(1) << "PromotionAllocStart failed for key=" << key
                     << ", error=" << alloc_result.error()
                     << " (likely no free DRAM); releasing master slot";
@@ -600,16 +598,12 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         }
 
         // Every failure path past this point has a master-side staged
-        // PROCESSING MEMORY buffer attached to the object and an
-        // incremented promotion_in_flight_ slot. If we just `continue`
-        // without notifying the master, the buffer and slot stay pinned
-        // until the reaper TTL (~10 min default). Transient SSD throttling
-        // or RDMA flakes would then saturate promotion_queue_limit_ for
-        // 10 minutes and silently disable the feature. Eagerly notify the
-        // master so the buffer is reclaimed and the slot is freed for
-        // subsequent admissions. NotifyPromotionFailure is idempotent and
-        // best-effort; if it itself fails, the reaper is still the
-        // long-stop safety net.
+        // PROCESSING MEMORY buffer and an incremented in-flight slot.
+        // Eagerly notify the master on failure so the buffer is
+        // reclaimed and the slot is freed; otherwise transient SSD
+        // throttling or RDMA flakes saturate promotion_queue_limit_
+        // for the full reaper TTL. NotifyPromotionFailure is
+        // idempotent and best-effort — the reaper is the long-stop.
         auto release_master_state = [this, &key]() {
             auto release = client_->NotifyPromotionFailure(key);
             if (!release) {

@@ -77,42 +77,9 @@ class PromotionOnHitTest : public ::testing::Test {
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
-    // Force a key into the LOCAL_DISK-only state by:
-    //   1. Putting a MEMORY replica, then evicting it via RemoveByKey.
-    //   2. Re-creating the metadata via NotifyOffloadSuccess with a synthetic
-    //      LOCAL_DISK descriptor.
-    // Cleaner approach used here: do a full PutStart+PutEnd cycle with
-    // offload_on_evict=true, which leaves an offload task pending. We then
-    // simulate the heartbeat by calling NotifyOffloadSuccess directly to
-    // attach a LOCAL_DISK replica, and manually drop the MEMORY replica via
-    // a forced eviction. For a v1 unit test we cheat by using the simpler
-    // setup: NotifyOffloadSuccess on a key whose MEMORY replica we can let
-    // eviction naturally remove.
-    //
-    // Simplest path that doesn't require a real FileStorage: put a key, then
-    // call NotifyOffloadSuccess to add a LOCAL_DISK replica alongside, then
-    // evict the MEMORY (via lease expiry + watermark). For a unit test, we
-    // skip the eviction and instead test the trigger logic on a key with
-    // BOTH MEMORY and LOCAL_DISK replicas: the trigger should NOT fire
-    // because the gate requires no MEMORY replica. So we need a key with
-    // ONLY LOCAL_DISK.
-    //
-    // To get a clean LOCAL_DISK-only state we use this sequence:
-    //   1. PutStart + write + PutEnd → key has 1 MEMORY replica.
-    //   2. Master configured with offload_on_evict=false so PutEnd attempts
-    //      immediate offload via PushOffloadingQueue.
-    //   3. NotifyOffloadSuccess → adds LOCAL_DISK replica (now 2 replicas).
-    //   4. RemoveByKey is too coarse (drops everything). Instead we call
-    //      a helper EvictMemReplicas which we add in this test fixture by
-    //      poking the MasterService's eviction thread under high pressure.
-    //
-    // For v1 simplicity, we just test the trigger on a key with BOTH MEMORY
-    // and LOCAL_DISK replicas. We assert the inverted behavior: any_memory
-    // is true, so no promotion task is queued. That's still a meaningful
-    // gate test. For LOCAL_DISK-only behavior we'd need eviction to land,
-    // which the existing test infrastructure already exercises in
-    // offload_on_evict_test under near-full segment pressure; we mirror
-    // that pattern in the second test below.
+    // Inject a synthetic LOCAL_DISK replica for `key` on `client_id`'s
+    // segment via NotifyOffloadSuccess. Lets tests put a key into
+    // LOCAL_DISK-only state without running the full offload pipeline.
     bool InjectLocalDiskReplica(MasterService& service, const UUID& client_id,
                                 const std::string& key, int64_t size,
                                 const std::string& transport_endpoint) {
@@ -498,9 +465,9 @@ TEST_F(PromotionOnHitTest, MultiSegmentAllocPicksAvailableSegment) {
 }
 
 // preferred_segments is honored: promotion can be steered to a specific
-// DRAM segment (e.g., the reader's local one). v1 doesn't pass preferred_
-// segments from TryPushPromotionQueue, but PromotionAllocStart respects it
-// for clients that want to bias toward locality.
+// DRAM segment (e.g., the reader's local one). TryPushPromotionQueue
+// currently doesn't pass preferred_segments through, but
+// PromotionAllocStart respects them for clients biasing toward locality.
 TEST_F(PromotionOnHitTest, MultiSegmentAllocRespectsPreferred) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -939,17 +906,11 @@ TEST_F(PromotionOnHitTest, AllocStartResetsTaskDeadline) {
     service->RemoveAll();
 }
 
-// Issue 2 regression — success-path counter decrement. NotifyPromotionSuccess
-// must fetch_sub(1) on promotion_in_flight_; otherwise the global cap stays
-// saturated and every subsequent promotion is silently dropped once
-// queue_limit tasks have ever succeeded.
-//
-// This is also the only test in the suite that exercises
-// NotifyPromotionSuccess's *success* path end-to-end (every other call site
-// asserts an error path). It therefore also covers the const-drop fix: if
-// the alloc_id assignment in PromotionAllocStart was somehow broken,
-// NotifyPromotionSuccess would see alloc_id == 0 and return
-// REPLICA_IS_NOT_READY, failing this test.
+// NotifyPromotionSuccess must decrement the cluster-wide in-flight
+// counter so future admissions can use the slot; otherwise queue_limit
+// remains saturated forever after the first successful promotion. Also
+// exercises the only success-path end-to-end coverage of
+// NotifyPromotionSuccess in the suite.
 TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -983,10 +944,9 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
         << "AllocStart should succeed; error=" << alloc.error();
     auto notify = service->NotifyPromotionSuccess(seg.client_id, "k_first");
     ASSERT_TRUE(notify.has_value())
-        << "NotifyPromotionSuccess full happy path should succeed; "
-        << "if this fires, either AllocStart did not record alloc_id "
-        << "(Issue 3 regression) or the staged replica is missing/"
-        << "non-PROCESSING; error=" << notify.error();
+        << "NotifyPromotionSuccess happy path should succeed; if this "
+        << "fires, AllocStart did not record alloc_id, or the staged "
+        << "replica is missing/non-PROCESSING; error=" << notify.error();
 
     // Counter must now be 0. A second admission on a *different* key must
     // be allowed. If fetch_sub is missing on the success path, the cap is
@@ -1008,15 +968,14 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     service->RemoveAll();
 }
 
-// Bug 1 regression — PromotionAllocStart must reject when the in-flight
-// task has been reaped between heartbeat and AllocStart. Without this
-// check, AllocStart would allocate and AddReplicas a PROCESSING MEMORY
-// replica and then silently fail to record alloc_id; the staged replica
-// would then be invisible to both DiscardExpiredProcessingReplicas
-// (which iterates shard->processing_keys, never populated for promotion)
-// and the promotion-task reaper (the task entry it iterates is gone),
-// leaking the allocator buffer until the object itself is removed or
-// evicted.
+// PromotionAllocStart must reject when the in-flight task has been
+// reaped between the holder's heartbeat and the AllocStart RPC arriving
+// (e.g. client stall past put_start_release_timeout_sec_). Without the
+// check, AllocStart would allocate + AddReplicas a PROCESSING MEMORY
+// replica with nothing tracking it: the generic PROCESSING reaper only
+// iterates shard->processing_keys (never populated by promotion) and
+// the promotion-task reaper has nothing left to iterate, so the buffer
+// leaks until the object is removed or evicted.
 TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -1049,14 +1008,13 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     // removed. We can't easily poll for reap externally (the only
     // user-facing observable would be re-admitting through the gate,
     // which would create a fresh task and defeat the test), so use a
-    // fixed sleep with margin. Matches the StalePromotionReaper test
-    // pattern (TTL=1s, sleep=2s) which has held 17/17 in CI.
+    // fixed sleep with margin. Matches the StalePromotionReaper pattern
+    // (TTL=1s, sleep=2s).
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
-    // Now call AllocStart on the reaped task. Pre-fix this would allocate
-    // a buffer, AddReplicas a PROCESSING MEMORY replica, and return
-    // success with an orphaned replica attached to the object. Post-fix
-    // it must reject without allocating anything.
+    // AllocStart on a reaped task must reject without allocating.
+    // Allocating would leave an orphaned PROCESSING MEMORY replica
+    // attached to the object.
     auto alloc =
         service->PromotionAllocStart(ctx.client_id, "k_cold", 1024, {});
     ASSERT_FALSE(alloc.has_value())
@@ -1076,11 +1034,11 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     service->RemoveAll();
 }
 
-// Bug 2 regression — NotifyPromotionSuccess must reject calls from a
-// client that is not the holder of the source LOCAL_DISK replica.
-// Without this check, any client knowing the key could flip the staged
-// PROCESSING MEMORY replica to COMPLETE before the holder's RDMA write
-// has landed, exposing torn data to readers.
+// NotifyPromotionSuccess must reject calls from a client that is not
+// the holder of the source LOCAL_DISK replica. Without the check, any
+// client knowing the key could flip the staged PROCESSING MEMORY replica
+// to COMPLETE before the holder's RDMA write has landed, exposing torn
+// data to readers.
 TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -1104,9 +1062,8 @@ TEST_F(PromotionOnHitTest, NotifyRejectsNonHolder) {
         service->PromotionAllocStart(holder.client_id, "k_cold", 1024, {});
     ASSERT_TRUE(alloc.has_value());
 
-    // An unrelated client tries to Notify. Pre-fix this would flip the
-    // staged replica to COMPLETE; post-fix it must be rejected as
-    // INVALID_PARAMS.
+    // An unrelated client tries to Notify. Must be rejected as
+    // INVALID_PARAMS so the staged replica stays PROCESSING.
     UUID intruder_id = generate_uuid();
     ASSERT_NE(intruder_id, holder.client_id);
     auto bad_notify = service->NotifyPromotionSuccess(intruder_id, "k_cold");
@@ -1210,8 +1167,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
         << "removed or evicted.";
 
     // The slot must be freed: a second admission on a different key must
-    // succeed even though queue_limit=1. Pre-fix the cap stayed
-    // saturated until reaper TTL.
+    // succeed even though queue_limit=1. Without the failure-side
+    // decrement the cap would stay saturated until reaper TTL.
     {
         auto r = service->GetReplicaList("k_b");
         ASSERT_TRUE(r.has_value());
@@ -1589,8 +1546,8 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
         << "Remove should succeed; error=" << rm.error();
 
     // Now admit a different key. With queue_limit=1, this only succeeds
-    // if the slot was freed by Remove (pre-fix it would sit pinned for
-    // the full 300s TTL).
+    // if the slot was freed by Remove. Without the in-flight cleanup,
+    // it would stay pinned for the full 300s TTL.
     {
         auto r = service->GetReplicaList("k_second");
         ASSERT_TRUE(r.has_value());

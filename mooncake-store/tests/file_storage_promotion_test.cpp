@@ -200,7 +200,7 @@ class FileStoragePromotionTest : public ::testing::Test {
     }
 };
 
-// 1. Empty heartbeat queue: do nothing past the heartbeat call.
+// Empty heartbeat queue: do nothing past the heartbeat call.
 TEST_F(FileStoragePromotionTest, EmptyQueueIsNoOp) {
     fake->heartbeat_queue = {};
     auto res = CallProcessPromotionTasks();
@@ -211,8 +211,8 @@ TEST_F(FileStoragePromotionTest, EmptyQueueIsNoOp) {
     EXPECT_EQ(fake->notify_calls.load(), 0);
 }
 
-// 2. Heartbeat returns SEGMENT_NOT_FOUND (transient post-restart): swallow
-//    silently, no error to caller.
+// Heartbeat returns SEGMENT_NOT_FOUND (transient post-restart):
+// swallow silently, no error to caller.
 TEST_F(FileStoragePromotionTest, HeartbeatSegmentNotFoundIsBenign) {
     fake->heartbeat_result = tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     auto res = CallProcessPromotionTasks();
@@ -220,7 +220,7 @@ TEST_F(FileStoragePromotionTest, HeartbeatSegmentNotFoundIsBenign) {
     EXPECT_EQ(fake->alloc_calls.load(), 0);
 }
 
-// 3. Heartbeat returns a non-benign error: propagate it.
+// Heartbeat returns a non-benign error: propagate it.
 TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
     fake->heartbeat_result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     auto res = CallProcessPromotionTasks();
@@ -229,7 +229,7 @@ TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
     EXPECT_EQ(fake->alloc_calls.load(), 0);
 }
 
-// 4. Non-positive size in queue: skip that key, continue.
+// Non-positive size in queue: skip that key, continue.
 TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
     fake->heartbeat_queue = {{"k_bad", 0}, {"k_good", 1024}};
     auto res = CallProcessPromotionTasks();
@@ -239,8 +239,8 @@ TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
     EXPECT_EQ(fake->last_alloc_key, "k_good");
 }
 
-// 5. PromotionAllocStart fails (e.g. master out of DRAM): skip key, no
-//    write, no notify, advance to next.
+// PromotionAllocStart fails (e.g. master out of DRAM): skip key, no
+// write, no notify, advance to next.
 TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
     fake->alloc_overrides["k1"] = ErrorCode::NO_AVAILABLE_HANDLE;
     auto res = DrainAllPromotionTasks({{"k1", 1024}, {"k2", 1024}});
@@ -252,8 +252,8 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
     EXPECT_LE(fake->notify_calls.load(), 1);
 }
 
-// 6. BatchLoad failure (SSD file missing): no PromotionWrite, no Notify.
-//    Master-side reaper handles the orphaned PROCESSING replica.
+// BatchLoad failure (SSD file missing): no PromotionWrite, no Notify.
+// Master-side reaper handles the orphaned PROCESSING replica.
 TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
     fake->heartbeat_queue = {{"k_missing", 1024}};
     // Default alloc succeeds; BatchLoad will fail because there's no file
@@ -268,7 +268,7 @@ TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
         << "NotifyPromotionSuccess must not run if BatchLoad failed";
 }
 
-// 7. PromotionWrite failure: no Notify.
+// PromotionWrite failure: no Notify.
 TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
     fake->heartbeat_queue = {{"k_te_fail", 1024}};
     fake->default_write_result = ErrorCode::TRANSFER_FAIL;
@@ -281,8 +281,8 @@ TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
         << "NotifyPromotionSuccess must not run on TransferWrite failure";
 }
 
-// 8. NotifyPromotionSuccess failure: logged, but processing of remaining
-//    keys continues.
+// NotifyPromotionSuccess failure: logged, but processing of remaining
+// keys continues.
 TEST_F(FileStoragePromotionTest, NotifyFailureDoesNotAbortBatch) {
     fake->notify_overrides["k1"] = ErrorCode::OBJECT_NOT_FOUND;
     auto res = DrainAllPromotionTasks({{"k1", 1024}, {"k2", 1024}});
@@ -292,8 +292,8 @@ TEST_F(FileStoragePromotionTest, NotifyFailureDoesNotAbortBatch) {
         << "failure";
 }
 
-// 9. Per-key independence: failures on one key don't prevent attempts on
-//    others.
+// Per-key independence: failures on one key don't prevent attempts on
+// others.
 TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
     fake->write_overrides["k_write_fail"] = ErrorCode::TRANSFER_FAIL;
@@ -307,12 +307,11 @@ TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
     EXPECT_EQ(fake->alloc_calls.load(), 3);
 }
 
-// 10. Failure-notification: every post-admission failure path (including
-//     PromotionAllocStart's own failure) must call NotifyPromotionFailure
-//     so the master immediately releases the task slot. Without this the
-//     slot stays pinned until put_start_release_timeout_sec_ (~10 min),
-//     turning a transient DRAM-pressure spike into a sustained outage
-//     of promotion_queue_limit_.
+// Every post-admission failure path (including PromotionAllocStart's
+// own failure) must call NotifyPromotionFailure so the master releases
+// the task slot immediately. Without this, the slot stays pinned until
+// put_start_release_timeout_sec_ (~10 min default), turning a transient
+// DRAM-pressure spike into a sustained outage of promotion_queue_limit_.
 TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
     fake->heartbeat_queue = {{"k_alloc_fail", 1024}};
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
@@ -330,12 +329,12 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
     EXPECT_EQ(fake->notify_failure_keys[0], "k_alloc_fail");
 }
 
-// 11. Failure-notification: same invariant on the post-AllocStart paths
-//     (BatchLoad / TransferWrite / Notify-Success). Each failure mode
-//     must release the master slot. We exercise three modes (AllocStart
-//     itself, missing-file BatchLoad, override on Notify) by draining
-//     them across successive heartbeats (the FakeClient mirrors the
-//     master's kMaxPerHeartbeat = 1 cap) and verify each one releases.
+// Same invariant on the post-AllocStart paths (BatchLoad /
+// TransferWrite / Notify-Success). Each failure mode must release the
+// master slot. Exercises three modes (AllocStart itself, missing-file
+// BatchLoad, override on Notify) by draining across successive
+// heartbeats (the FakeClient mirrors the master's kMaxPerHeartbeat = 1
+// cap) and verifies each one releases.
 TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
     // k_load_fail: no override -> AllocStart succeeds, but BatchLoad
