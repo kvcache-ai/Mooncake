@@ -5,7 +5,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <pybind11/pybind11.h>
 #include <mooncake_worker.cuh>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
@@ -158,12 +157,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         engine_->setWhitelistFilters(std::move(filters));
     }
 
-    /// Set an external TransferEngine (from mooncake.engine.TransferEngine)
-    /// to be used by MooncakeBackend instead of creating its own.
-    /// Must be called before init_process_group(backend="mooncake").
-    /// The engine must already be initialized.
-    /// Pass None to reset to default (self-created) behavior.
-    static void setTransferEngine(pybind11::object engine_obj);
+    /// Set an external TransferEngine to be used by MooncakeBackend
+    /// instead of creating its own. Must be called before
+    /// init_process_group(backend="mooncake"). The engine must already
+    /// be initialized. The caller is responsible for ensuring the engine
+    /// outlives all MooncakeBackend instances. Pass nullptr to reset.
+    static void setExternalEngine(TransferEngine* engine);
 
     std::string getPreferredHca(std::string location) {
         static std::once_flag topo_once;
@@ -221,9 +220,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static int backendIndex_;
     // External engine injection: when set, MooncakeBackend uses this engine
     // instead of the default self-created one. Non-owning pointer.
+    // The caller is responsible for ensuring the engine outlives all
+    // MooncakeBackend instances.
     static TransferEngine* externalEngine_;
-    // Python reference to the external TransferEnginePy object to prevent GC.
-    static pybind11::object externalEngineRef_;
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;

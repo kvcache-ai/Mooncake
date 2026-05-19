@@ -33,7 +33,6 @@ TransferEngine* MooncakeBackend::engine_ = new TransferEngine(true);
 bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
 TransferEngine* MooncakeBackend::externalEngine_ = nullptr;
-pybind11::object MooncakeBackend::externalEngineRef_;
 
 std::vector<uint8_t> serialize(const ExtensionState& state) {
     uint32_t rankCount = static_cast<uint32_t>(state.activeRanks.size());
@@ -965,6 +964,45 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
 
+    // When using an external engine, we must not call unregister on it
+    // during shutdown because the external engine's lifetime is managed
+    // by the caller. Instead, just abandon resources and reset the
+    // static pointer back to a fresh default engine.
+    if (externalEngine_) {
+        p2p_device_worker_->removeProxy(p2p_proxy_);
+        p2p_proxy_->abandonResources();
+        connection_ctx_->shutdown();
+        if (connectionPollerRegistered_) {
+            ConnectionPoller::GetInstance().removeContext(connection_ctx_);
+            connectionPollerRegistered_ = false;
+        }
+        connection_ctx_->abandonResources();
+
+        // Free CPU sync regions (not registered with external engine)
+        for (size_t i = 0; i < 2; i++) {
+            delete[] cpu_sync_send_region_[i];
+            delete[] cpu_sync_recv_region_[i];
+            if (isCpu_) {
+                free(send_buffer_[i]);
+                free(recv_buffer_[i]);
+            } else {
+                cudaFree(send_buffer_[i]);
+                cudaFree(recv_buffer_[i]);
+            }
+        }
+
+        // Reset the static engine pointer back to the original leaky
+        // singleton so that subsequent PG instances (if any) use the
+        // default engine.  Do NOT create a new TransferEngine here —
+        // the original leaky singleton still exists and will be
+        // reused once engineInitialized_ is cleared.
+        static TransferEngine* defaultEngine = new TransferEngine(true);
+        engine_ = defaultEngine;
+        engineInitialized_ = false;
+        externalEngine_ = nullptr;
+        return;
+    }
+
     // If we encounter any hung operations, don't release resources
     // to avoid potential crash. Instead, we allow those resources to leak
     // and rely on the OS to reclaim them later.
@@ -1255,18 +1293,11 @@ void MooncakeBackend::joinGroup() {
     waitForExtensionState();
 }
 
-void MooncakeBackend::setTransferEngine(pybind11::object engine_obj) {
-    if (engine_obj.is_none()) {
-        externalEngine_ = nullptr;
-        externalEngineRef_ = pybind11::object();
-        return;
+void MooncakeBackend::setExternalEngine(TransferEngine* engine) {
+    externalEngine_ = engine;
+    if (engine) {
+        LOG(INFO) << "MooncakeBackend: external TransferEngine set (ptr="
+                  << engine << ")";
     }
-    // Extract raw TransferEngine* from the TransferEnginePy Python object.
-    auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
-    uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
-    externalEngine_ = reinterpret_cast<TransferEngine*>(ptr);
-    externalEngineRef_ = engine_obj;  // prevent Python GC
-    LOG(INFO) << "MooncakeBackend: external TransferEngine set (ptr="
-              << externalEngine_ << ")";
 }
 }  // namespace mooncake
