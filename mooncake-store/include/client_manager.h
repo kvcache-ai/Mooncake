@@ -122,6 +122,15 @@ class ClientManager {
     auto GetAllClients() -> std::vector<std::shared_ptr<ClientMeta>>;
 
     /**
+     * @brief Find the client that owns the segment with the given name.
+     * @param segment_name The segment name to look up.
+     * @return The UUID of the client owning the segment, or
+     *         ErrorCode::SEGMENT_NOT_FOUND if not found.
+     */
+    auto GetClientIdBySegmentName(const std::string& segment_name)
+        -> tl::expected<UUID, ErrorCode>;
+
+    /**
      * @brief Iterate clients in the order determined by strategy.
      * @param strategy Client iteration strategy
      * @param visitor Callback invoked for each client, return

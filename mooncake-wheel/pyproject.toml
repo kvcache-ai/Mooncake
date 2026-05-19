@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.7.post2"
+version = "0.3.8.post1"
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }

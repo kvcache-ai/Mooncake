@@ -331,6 +331,72 @@ WrappedCentralizedMasterService::BatchReplicaClear(
     return result;
 }
 
+tl::expected<UUID, ErrorCode> WrappedCentralizedMasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return execute_rpc(
+        "CreateCopyTask",
+        [&] { return master_service_.CreateCopyTask(key, targets); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", targets_size=", targets.size());
+        },
+        [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_copy_task_failures();
+        });
+}
+
+tl::expected<UUID, ErrorCode> WrappedCentralizedMasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return execute_rpc(
+        "CreateMoveTask",
+        [&] { return master_service_.CreateMoveTask(key, source, target); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", source=", source,
+                             ", target=", target);
+        },
+        [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_move_task_failures();
+        });
+}
+
+tl::expected<QueryTaskResponse, ErrorCode>
+WrappedCentralizedMasterService::QueryTask(const UUID& task_id) {
+    return execute_rpc(
+        "QueryTask", [&] { return master_service_.QueryTask(task_id); },
+        [&](auto& timer) { timer.LogRequest("task_id=", task_id); },
+        [] { MasterMetricManager::instance().inc_query_task_requests(); },
+        [] { MasterMetricManager::instance().inc_query_task_failures(); });
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+WrappedCentralizedMasterService::FetchTasks(const UUID& client_id,
+                                            size_t batch_size) {
+    return execute_rpc(
+        "FetchTasks",
+        [&] { return master_service_.FetchTasks(client_id, batch_size); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", batch_size=", batch_size);
+        },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_requests(); },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
+}
+
+tl::expected<void, ErrorCode>
+WrappedCentralizedMasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    return execute_rpc(
+        "MarkTaskToComplete",
+        [&] { return master_service_.MarkTaskToComplete(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", task_id=", request.id);
+        },
+        [] { MasterMetricManager::instance().inc_update_task_requests(); },
+        [] { MasterMetricManager::instance().inc_update_task_failures(); });
+}
+
 tl::expected<std::string, ErrorCode>
 WrappedCentralizedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
@@ -430,6 +496,22 @@ void RegisterCentralizedRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::CreateCopyTask>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::CreateMoveTask>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::QueryTask>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::FetchTasks>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::MarkTaskToComplete>(
         &wrapped_master_service);
 }
 

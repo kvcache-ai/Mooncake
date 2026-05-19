@@ -45,6 +45,15 @@ static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
+// Task manager constants
+static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+
 // Forward declarations
 class BufferAllocatorBase;
 class CachelibBufferAllocator;
@@ -170,16 +179,21 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
-    // Tiered backend errors (Range: -1400 to -1499)
-    EMPTY_REPLICAS = -1400,
-    TIER_NOT_FOUND = -1401,
-    DATA_COPY_FAILED = -1402,
+    // Task errors (Range: -1400 to -1499)
+    TASK_NOT_FOUND = -1400,  ///< Task not found.
+    TASK_PENDING_LIMIT_EXCEEDED =
+        -1401,  ///< Total pending tasks exceed the limit.
 
-    // Store errors (Range: -1500 to -1599)
-    SHUTTING_DOWN = -1500,  ///< Store is shutting down, rejecting new requests.
-    ASYNC_ENQUEUE_FAILED = -1501,  ///< Async metadata notifier enqueue failed
+    // Tiered backend errors (Range: -1500 to -1599)
+    EMPTY_REPLICAS = -1500,
+    TIER_NOT_FOUND = -1501,
+    DATA_COPY_FAILED = -1502,
+
+    // Store errors (Range: -1600 to -1699)
+    SHUTTING_DOWN = -1600,  ///< Store is shutting down, rejecting new requests.
+    ASYNC_ENQUEUE_FAILED = -1601,  ///< Async metadata notifier enqueue failed
                                    ///< (queue full/stopped).
-    INACCESSIBLE_MASTER = -1502
+    INACCESSIBLE_MASTER = -1602
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

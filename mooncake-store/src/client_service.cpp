@@ -116,11 +116,7 @@ void ClientService::StopHeartbeat() {
     }
 }
 
-void ClientService::Destroy() {
-    // Free global segment memory
-    segment_ptrs_.clear();
-    ascend_segment_ptrs_.clear();
-}
+void ClientService::Destroy() {}
 
 void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     if (heartbeat_running_) {
@@ -309,6 +305,13 @@ ErrorCode ClientService::InitTransferEngine(
         }
     }
 
+    if (protocol == "ascend") {
+        const char* ascend_use_fabric_mem =
+            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        if (ascend_use_fabric_mem) {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
     auto [hostname, port] = parseHostNameWithPort(endpoint);
     int rc =
         transfer_engine_->init(metadata_connstring, endpoint, hostname, port);
@@ -691,6 +694,32 @@ void ClientService::StopMetricsHttpServer() {
         metrics_http_server_->stop();
         metrics_http_server_.reset();
     }
+}
+
+tl::expected<UUID, ErrorCode> ClientService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<UUID, ErrorCode> ClientService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> ClientService::QueryTask(
+    const UUID& task_id) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> ClientService::FetchTasks(
+    size_t batch_size) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<void, ErrorCode> ClientService::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
 }
 
 }  // namespace mooncake

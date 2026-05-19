@@ -278,6 +278,55 @@ class ClientService {
     virtual std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys) = 0;
 
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    virtual tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    virtual tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    virtual tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    virtual tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    virtual tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
+
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
         ClientMetric* metrics = GetMetrics();
@@ -536,25 +585,6 @@ class ClientService {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
-    // Global segment pointers
-    struct SegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free(ptr);
-            }
-        }
-    };
-
-    struct AscendSegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free_memory("ascend", ptr);
-            }
-        }
-    };
-    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
-    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
-        ascend_segment_ptrs_;
 
     // Configuration
     const std::string local_ip_;

@@ -1,9 +1,11 @@
 #include <glog/logging.h>
 #include <numa.h>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "tiered_cache/tiers/dram_tier.h"
+#include "utils.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/copier_registry.h"
 #include "transfer_engine.h"
@@ -77,7 +79,50 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
     if (engine != nullptr) engine_ = engine;
 
     // Allocate a contiguous memory block.
-    if (numa_node_.has_value()) {
+    const bool use_hugepage = (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr);
+    if (use_hugepage) {
+        const size_t hugepage_size = get_hugepage_size_from_env();
+        const size_t mapped_size = align_up(capacity_, hugepage_size);
+
+        struct bitmask* saved_nodemask = nullptr;
+        if (numa_node_.has_value()) {
+            if (numa_available() < 0) {
+                LOG(ERROR) << "NUMA not available on this system.";
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            node = numa_node_.value();
+            if (node < 0 || node > numa_max_node()) {
+                LOG(ERROR) << "Invalid NUMA node " << node;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            saved_nodemask = numa_get_membind();
+            struct bitmask* nodemask = numa_allocate_nodemask();
+            numa_bitmask_setbit(nodemask, node);
+            numa_set_membind(nodemask);
+            numa_free_nodemask(nodemask);
+        }
+
+        char* hp_ptr = static_cast<char*>(
+            allocate_buffer_mmap_memory(mapped_size, hugepage_size));
+
+        if (saved_nodemask != nullptr) {
+            numa_set_membind(saved_nodemask);
+            numa_free_nodemask(saved_nodemask);
+        }
+
+        if (!hp_ptr) {
+            LOG(ERROR) << "Failed to allocate hugepage memory (" << mapped_size
+                       << " bytes) for DramCacheTier " << tier_id_;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        memory_buffer_ = std::unique_ptr<char[], std::function<void(char*)>>(
+            hp_ptr, [mapped_size](char* p) {
+                free_buffer_mmap_memory(p, mapped_size);
+            });
+        LOG(INFO) << "Allocated " << mapped_size << " bytes (hugepage"
+                  << (node != -1 ? ", NUMA node " + std::to_string(node) : "")
+                  << ") for DramCacheTier " << tier_id_;
+    } else if (numa_node_.has_value()) {
         if (numa_available() < 0) {
             LOG(ERROR) << "NUMA not available on this system.";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -94,14 +139,15 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
                        << " for DramCacheTier " << tier_id_;
             return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-        memory_buffer_ = std::unique_ptr<char[], void (*)(char*)>(
+        memory_buffer_ = std::unique_ptr<char[], std::function<void(char*)>>(
             mem_ptr, [](char* p) { numa_free(p, 0); });
         LOG(INFO) << "Allocated " << capacity_ << " bytes from NUMA node "
                   << node << " for DramCacheTier " << tier_id_;
     } else {
         try {
-            memory_buffer_ = std::unique_ptr<char[], void (*)(char*)>(
-                new char[capacity_], [](char* p) { delete[] p; });
+            memory_buffer_ =
+                std::unique_ptr<char[], std::function<void(char*)>>(
+                    new char[capacity_], [](char* p) { delete[] p; });
         } catch (const std::bad_alloc& e) {
             LOG(ERROR) << "Failed to allocate " << capacity_
                        << " bytes for DramCacheTier " << tier_id_ << ": "
@@ -115,7 +161,7 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
 
     // Register this newly allocated memory with the TransferEngine.
     if (engine_) {
-        if (numa_node_.has_value()) {
+        if (node != -1) {
             location = "cpu:" + std::to_string(node);
         } else {
             location = kWildcardLocation;

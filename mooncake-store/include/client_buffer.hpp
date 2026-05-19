@@ -28,7 +28,8 @@ class ClientBufferAllocator
    public:
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
-        size_t size, const std::string& protocol = "");
+        size_t size, const std::string& protocol = "",
+        bool use_hugepage = false);
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
@@ -52,7 +53,8 @@ class ClientBufferAllocator
 
    private:
     // Private constructors for different memory types
-    ClientBufferAllocator(size_t size, const std::string& protocol);
+    ClientBufferAllocator(size_t size, const std::string& protocol,
+                          bool use_hugepage);
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
@@ -61,6 +63,7 @@ class ClientBufferAllocator
     void* buffer_;
     size_t buffer_size_;
     bool is_external_memory_ = false;
+    bool use_hugepage_ = false;
 };
 
 /**

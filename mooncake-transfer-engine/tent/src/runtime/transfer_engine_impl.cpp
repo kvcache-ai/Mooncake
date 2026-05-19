@@ -16,8 +16,11 @@
 
 #include <fstream>
 #include <random>
+#include <cstdlib>
+#include <stdexcept>
 
 #include "tent/common/status.h"
+#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -39,6 +42,15 @@ struct Batch {
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::vector<TaskInfo> task_list;
     size_t max_size;
+
+    struct SubmitHook {
+        size_t start_task_id{0};
+        size_t end_task_id{0};  // [start, end)
+        Notification notifi;
+        bool fired{false};
+        std::unordered_set<SegmentID> targets;
+    };
+    std::vector<SubmitHook> submit_hooks;
 };
 
 TransferEngineImpl::TransferEngineImpl()
@@ -111,6 +123,27 @@ Status TransferEngineImpl::setupLocalSegment() {
 Status TransferEngineImpl::construct() {
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
+
+    // Get Redis password from environment variable for security
+    std::string redis_password;
+    const char* env_password = std::getenv("MC_REDIS_PASSWORD");
+    if (env_password && *env_password) {
+        redis_password = env_password;
+    }
+
+    // Get Redis DB index from environment variable or config
+    int redis_db_index_config = conf_->get("redis_db_index", 0);
+    const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
+    if (env_db_index && *env_db_index) {
+        try {
+            redis_db_index_config = std::stoi(env_db_index);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid REDIS_DB_INDEX environment variable: "
+                         << env_db_index
+                         << ", using config value: " << redis_db_index_config;
+        }
+    }
+
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
@@ -125,8 +158,19 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+    // Validate redis_db_index range (0-255)
+    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
+    if (redis_db_index_config >= 0 &&
+        redis_db_index_config <= REDIS_MAX_DB_INDEX) {
+        db_index = static_cast<uint8_t>(redis_db_index_config);
+    } else {
+        LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
+                     << ", using default "
+                     << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
+    }
+
+    metadata_ = std::make_shared<ControlService>(
+        metadata_type, metadata_servers, redis_password, db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -337,16 +381,14 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
-    return registerLocalMemory({addr}, {size}, permission);
+    MemoryOptions options;
+    options.perm = permission;
+    return registerLocalMemory({addr}, {size}, options);
 }
 
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                Permission permission) {
-    if (addr_list.size() != size_list.size()) {
-        return Status::InvalidArgument(
-            "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
-    }
     MemoryOptions options;
     options.perm = permission;
     return registerLocalMemory(addr_list, size_list, options);
@@ -372,7 +414,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
-    return local_segment_tracker_->addInBatch(
+    auto status = local_segment_tracker_->addInBatch(
         addr_list, size_list,
         [&](std::vector<BufferDesc>& desc_list) -> Status {
             if (options.location != kWildcardLocation)
@@ -381,12 +423,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 for (auto& desc : desc_list) desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
-                auto status =
+                auto s =
                     transport_list_[type]->addMemoryBuffer(desc_list, options);
-                if (!status.ok()) LOG(WARNING) << status.ToString();
+                if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
         });
+    if (!status.ok()) return status;
+    // Synchronize local segment to metadata server so remote peers can see the
+    // new buffers
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
@@ -476,7 +522,7 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
 }
 
 static MemoryType getTypeEnum(const std::string& type) {
-    if (type == "cpu") return MTYPE_CPU;
+    if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     return MTYPE_UNKNOWN;
@@ -748,6 +794,57 @@ Status TransferEngineImpl::submitTransfer(
     return Status::OK();
 }
 
+Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
+    for (auto& hook : batch->submit_hooks) {
+        if (hook.fired) continue;
+        bool all_completed = true;
+        if (check) {
+            for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
+                 ++tid) {
+                auto& t = batch->task_list[tid];
+                if (t.status == PENDING) {
+                    all_completed = false;
+                    break;
+                }
+                if (t.status != COMPLETED) {
+                    all_completed = false;
+                    break;
+                }
+            }
+        }
+        if (!all_completed) continue;
+        Status last = Status::OK();
+        for (auto target_id : hook.targets) {
+            last = sendNotification(target_id, hook.notifi);
+            if (!last.ok()) {
+                LOG(WARNING) << "sendNotification failed: " << last.ToString();
+                break;
+            }
+        }
+        if (last.ok()) hook.fired = true;
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::submitTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list,
+    const Notification& notifi) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    Batch* batch = (Batch*)(batch_id);
+    const size_t start_task_id = batch->task_list.size();
+    CHECK_STATUS(submitTransfer(batch_id, request_list));
+    const size_t end_task_id = start_task_id + request_list.size();
+    Batch::SubmitHook hook;
+    hook.start_task_id = start_task_id;
+    hook.end_task_id = end_task_id;
+    hook.notifi = notifi;
+    hook.fired = false;
+    for (const auto& request : request_list)
+        hook.targets.insert(request.target_id);
+    batch->submit_hooks.emplace_back(std::move(hook));
+    return Status::OK();
+}
+
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     if (task.staging)
@@ -818,6 +915,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.s = PENDING;
         task_status.transferred_bytes = 0;
     }
+    batch->task_list[task_id].status = task_status.s;
+    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 
@@ -888,6 +987,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         task.status = task_status.s;
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }
 

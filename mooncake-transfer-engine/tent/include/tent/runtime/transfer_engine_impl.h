@@ -129,6 +129,10 @@ class TransferEngineImpl {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification& notifi);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
@@ -172,6 +176,8 @@ class TransferEngineImpl {
 
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
+
+    Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
    private:
     struct AllocatedMemory {

@@ -53,6 +53,9 @@ class CentralSegmentRegistry : public SegmentRegistry {
    public:
     CentralSegmentRegistry(const std::string &type, const std::string &servers);
 
+    CentralSegmentRegistry(const std::string &type, const std::string &servers,
+                           const std::string &password, uint8_t db_index);
+
     virtual ~CentralSegmentRegistry() {}
 
    public:

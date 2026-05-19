@@ -637,6 +637,8 @@ The HTTP metadata server can be configured using the following parameters:
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
+- MC_STORE_USE_HUGEPAGE: Enables huge page support, disabled by default.
+- MC_STORE_HUGEPAGE_SIZE: Specifies the page size of the huge page to use, default 2M.
 #### Usage Example
 To start the master service with the HTTP metadata server enabled:
 ```bash
@@ -775,6 +777,8 @@ with specific parameters defined in the application.
 The **real** `Client` can be configured using the following parameters:
 
 - **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`port`**: (int, default: 50052): The port number the client service listens on.
 
 - **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
 

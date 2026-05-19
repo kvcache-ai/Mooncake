@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_set>
 #include <string_view>
 #include <chrono>
 #include <cstdint>
@@ -48,7 +49,7 @@ void CentralizedClientService::Destroy() {
     // Make a copy of mounted_segments_ to avoid modifying while iterating
     std::vector<Segment> segments_to_unmount;
     {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        SharedMutexLocker lock(&mounted_segments_mutex_);
         segments_to_unmount.reserve(mounted_segments_.size());
         for (auto& entry : mounted_segments_) {
             segments_to_unmount.emplace_back(entry.second);
@@ -71,9 +72,14 @@ void CentralizedClientService::Destroy() {
 
     // Clear any remaining segments
     {
-        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        SharedMutexLocker lock(&mounted_segments_mutex_);
         mounted_segments_.clear();
     }
+
+    // Free global segment memory
+    hugepage_segment_ptrs_.clear();
+    segment_ptrs_.clear();
+    ascend_segment_ptrs_.clear();
 
     ClientService::Destroy();
 }
@@ -174,6 +180,10 @@ ErrorCode CentralizedClientService::Init(
         uint64_t total_glbseg_size = config.global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                         // For logging
         uint64_t remaining_size = config.global_segment_size;
+        const bool use_hugepage =
+            (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr);
+        const bool should_use_hugepage =
+            use_hugepage && config.protocol != "ascend";
 
         while (remaining_size > 0) {
             size_t segment_size =
@@ -182,18 +192,30 @@ ErrorCode CentralizedClientService::Init(
             current_glbseg_size += segment_size;
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
-            void* ptr =
-                allocate_buffer_allocator_memory(segment_size, config.protocol);
+            size_t mapped_size = segment_size;
+            void* ptr = nullptr;
+            if (should_use_hugepage) {
+                mapped_size =
+                    align_up(segment_size, get_hugepage_size_from_env());
+                ptr = allocate_buffer_mmap_memory(mapped_size,
+                                                  get_hugepage_size_from_env());
+            } else {
+                ptr = allocate_buffer_allocator_memory(segment_size,
+                                                       config.protocol);
+            }
             if (!ptr) {
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return ErrorCode::INTERNAL_ERROR;
             }
             if (config.protocol == "ascend") {
                 ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (should_use_hugepage) {
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
-            auto mount_result = MountSegment(ptr, segment_size);
+            auto mount_result = MountSegment(ptr, mapped_size);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
@@ -681,7 +703,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::InnerGet(
     }
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    ErrorCode err = GetPreferredReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::INVALID_REPLICA) {
             LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
@@ -785,8 +807,7 @@ CentralizedClientService::InnerBatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err =
-            FindFirstCompleteReplica(query_result->replicas, replica);
+        ErrorCode err = GetPreferredReplica(query_result->replicas, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -875,7 +896,7 @@ CentralizedClientService::BatchGetWhenPreferSameNode(
             continue;
         }
         Replica::Descriptor replica;
-        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+        ErrorCode err = GetPreferredReplica(replica_list, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -1608,7 +1629,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
         return tl::unexpected(check_result.error());
     }
 
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    SharedMutexLocker lock(&mounted_segments_mutex_);
 
     // Check if the segment overlaps with any existing segment
     for (auto& it : mounted_segments_) {
@@ -1673,7 +1694,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::UnmountSegment(
 
 tl::expected<void, ErrorCode> CentralizedClientService::InnerUnmountSegment(
     const void* buffer, size_t size) {
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    SharedMutexLocker lock(&mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
@@ -1904,7 +1925,7 @@ CentralizedClientService::RegisterClient() {
     // otherwise there will be corner cases, e.g., a segment is
     // unmounted successfully first, and then registered again in
     // this thread.
-    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    SharedMutexLocker lock(&mounted_segments_mutex_);
     std::vector<Segment> segments;
     for (auto it : mounted_segments_) {
         auto& segment = it.second;
@@ -1925,19 +1946,69 @@ CentralizedClientService::RegisterClient() {
     return register_result;
 }
 
-ErrorCode CentralizedClientService::FindFirstCompleteReplica(
+ErrorCode CentralizedClientService::GetPreferredReplica(
     const std::vector<Replica::Descriptor>& replica_list,
     Replica::Descriptor& replica) {
-    // Find the first complete replica
-    for (size_t i = 0; i < replica_list.size(); ++i) {
-        if (replica_list[i].status == ReplicaStatus::COMPLETE) {
-            replica = replica_list[i];
-            return ErrorCode::OK;
+    std::unordered_set<std::string> local_endpoints;
+    {
+        SharedMutexLocker lock(&mounted_segments_mutex_, shared_lock);
+        local_endpoints.reserve(mounted_segments_.size());
+        for (const auto& [uuid, seg] : mounted_segments_) {
+            local_endpoints.insert(seg.GetCentralizedExtra().te_endpoint);
         }
     }
 
-    // No complete replica found
+    size_t first_complete_idx = replica_list.size();
+    for (size_t i = 0; i < replica_list.size(); ++i) {
+        const auto& rep = replica_list[i];
+        if (rep.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (first_complete_idx == replica_list.size()) {
+            first_complete_idx = i;
+        }
+        if (rep.is_memory_replica() && !local_endpoints.empty()) {
+            const auto& ep = rep.get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_;
+            if (local_endpoints.count(ep)) {
+                replica = replica_list[i];
+                return ErrorCode::OK;
+            }
+        }
+    }
+
+    if (first_complete_idx < replica_list.size()) {
+        replica = replica_list[first_complete_idx];
+        return ErrorCode::OK;
+    }
+
     return ErrorCode::INVALID_REPLICA;
+}
+
+tl::expected<UUID, ErrorCode> CentralizedClientService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> CentralizedClientService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> CentralizedClientService::QueryTask(
+    const UUID& task_id) {
+    return master_client_.QueryTask(task_id);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+CentralizedClientService::FetchTasks(size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
+}
+
+tl::expected<void, ErrorCode> CentralizedClientService::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
 }
 
 }  // namespace mooncake

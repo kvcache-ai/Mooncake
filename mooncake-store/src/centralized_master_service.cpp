@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <random>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -195,7 +196,8 @@ CentralizedMasterService::CentralizedMasterService(
                       config.memory_allocator, view_version_),
       memory_allocator_type_(config.memory_allocator),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
-      put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
+      put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
+      task_manager_(config.task_manager_config) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -224,6 +226,11 @@ CentralizedMasterService::CentralizedMasterService(
         std::thread(&CentralizedMasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
 
+    task_cleanup_running_ = true;
+    task_cleanup_thread_ =
+        std::thread(&CentralizedMasterService::TaskCleanupThreadFunc, this);
+    VLOG(1) << "action=start_task_cleanup_thread";
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -236,10 +243,17 @@ CentralizedMasterService::CentralizedMasterService(
 }
 
 CentralizedMasterService::~CentralizedMasterService() {
-    // Stop and join the threads
     eviction_running_ = false;
+    task_cleanup_running_ = false;
+
+    // Wake sleepers so join() doesn't block for long sleep intervals.
+    task_cleanup_cv_.notify_all();
+
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
+    }
+    if (task_cleanup_thread_.joinable()) {
+        task_cleanup_thread_.join();
     }
 }
 
@@ -1247,6 +1261,151 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
             }
         }
     }
+}
+
+void CentralizedMasterService::TaskCleanupThreadFunc() {
+    LOG(INFO) << "Task cleanup thread started";
+    while (task_cleanup_running_) {
+        // Wait for the next cleanup interval, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(task_cleanup_mutex_);
+            task_cleanup_cv_.wait_for(
+                lk, std::chrono::milliseconds(kTaskCleanupThreadSleepMs),
+                [&] { return !task_cleanup_running_.load(); });
+        }
+
+        if (!task_cleanup_running_) {
+            break;
+        }
+
+        auto write_access = task_manager_.get_write_access();
+        write_access.prune_expired_tasks();
+        write_access.prune_finished_tasks();
+    }
+    LOG(INFO) << "Task cleanup thread stopped";
+}
+
+tl::expected<UUID, ErrorCode> CentralizedMasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=empty_targets";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    for (const auto& target : targets) {
+        if (!client_manager_.QuerySegments(target).has_value()) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto& metadata = accessor.Get();
+    const auto segment_names = metadata.GetReplicaSegmentNames();
+    if (segment_names.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
+    const auto& source_name = segment_names[dis(gen)];
+
+    auto client_id_res = client_manager_.GetClientIdBySegmentName(source_name);
+    if (!client_id_res.has_value()) {
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source_name
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            client_id_res.value(), {.key = key, .targets = targets});
+}
+
+tl::expected<UUID, ErrorCode> CentralizedMasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (source == target) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", target_segment=" << target
+                   << ", error=source_target_segments_are_same";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (!client_manager_.QuerySegments(target).has_value()) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_mounted";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    const auto segment_names = metadata.GetReplicaSegmentNames();
+    if (std::find(segment_names.begin(), segment_names.end(), source) ==
+        segment_names.end()) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto client_id_res = client_manager_.GetClientIdBySegmentName(source);
+    if (!client_id_res.has_value()) {
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id_res.value(),
+            {.key = key, .source = source, .target = target});
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> CentralizedMasterService::QueryTask(
+    const UUID& task_id) {
+    const auto& task_option =
+        task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!task_option.has_value()) {
+        LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    return QueryTaskResponse(task_option.value());
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+CentralizedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
+    const auto& tasks =
+        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    std::vector<TaskAssignment> assignments;
+    for (const auto& task : tasks) {
+        assignments.emplace_back(task);
+    }
+    return assignments;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    auto write_access = task_manager_.get_write_access();
+    ErrorCode err = write_access.complete_task(client_id, request.id,
+                                               request.status, request.message);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "task_id=" << request.id
+                   << ", error=complete_task_failed";
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 }  // namespace mooncake
