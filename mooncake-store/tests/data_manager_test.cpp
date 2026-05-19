@@ -80,9 +80,17 @@ class DataManagerTest : public ::testing::Test {
         LocalTransferConfig transfer_config;
         transfer_config.mode = LocalTransferMode::MEMCPY;
         transfer_config.local_memcpy_async_worker_num = 32;
+
+        // Save raw pointer before move for tests that need direct backend
+        // access
+        TieredBackend* backend_raw_ptr = tiered_backend_.get();
         data_manager_ = std::make_unique<DataManager>(
             std::move(tiered_backend_), transfer_engine_, 1024,
             transfer_config);
+        // Keep the raw pointer accessible for tests that need direct backend
+        // access Note: The backend is now owned by DataManager, but tests can
+        // still use it
+        tiered_backend_raw_ptr_ = backend_raw_ptr;
     }
 
     void TearDown() override {
@@ -145,6 +153,8 @@ class DataManagerTest : public ::testing::Test {
 
     std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<TieredBackend> tiered_backend_;
+    TieredBackend* tiered_backend_raw_ptr_ =
+        nullptr;  // Raw pointer for tests that need direct backend access
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::optional<UUID> saved_tier_id_;
 };
@@ -286,7 +296,7 @@ TEST_F(DataManagerTest, DeleteWithTierId) {
 
 // BuildRemoteBufferDesc: null allocation buffer is an internal error.
 TEST_F(DataManagerTest, BuildRemoteBufferDescRejectsNullBuffer) {
-    auto alloc_result = tiered_backend_->Allocate(64, GetTierId());
+    auto alloc_result = tiered_backend_raw_ptr_->Allocate(64, GetTierId());
     ASSERT_TRUE(alloc_result.has_value())
         << "Allocate failed: " << toString(alloc_result.error());
 
