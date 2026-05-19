@@ -241,6 +241,7 @@ mod tests {
         SegmentAnnouncement {
             owner: ClientRuntimeId::new("stable".to_string(), ClientEpoch(1)),
             segment_name: SegmentName::new("segment"),
+            transport_endpoint: None,
             capacity_bytes: 1024,
             used_bytes: 0,
             target_chunks: Vec::new(),
@@ -414,6 +415,7 @@ mod tests {
         SegmentAnnouncement {
             owner: ClientRuntimeId::new("node", ClientEpoch(1)),
             segment_name: SegmentName::new("seg"),
+            transport_endpoint: None,
             capacity_bytes: capacity,
             used_bytes: 0,
             target_chunks: Vec::new(),

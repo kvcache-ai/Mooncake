@@ -37,9 +37,22 @@ impl StoreState {
     }
 
     fn invalidate_remote_segment(&mut self, segment_name: &str) {
-        self.remote_segments.remove(segment_name);
-        self.remote_segment_infos.remove(segment_name);
-        self.segment_target_chunks
+        let mut open_names = vec![segment_name.to_string()];
+        for ((_, cached_segment), metadata) in &self.segment_target_metadata {
+            if cached_segment.0 == segment_name {
+                if let Some(endpoint) = metadata.transport_endpoint.as_deref() {
+                    let endpoint = endpoint.trim();
+                    if !endpoint.is_empty() {
+                        open_names.push(endpoint.to_string());
+                    }
+                }
+            }
+        }
+        for open_name in open_names {
+            self.remote_segments.remove(&open_name);
+            self.remote_segment_infos.remove(&open_name);
+        }
+        self.segment_target_metadata
             .retain(|(_, segment), _| segment.0 != segment_name);
     }
 
@@ -49,7 +62,7 @@ impl StoreState {
         segment_name: &str,
     ) -> Result<u64> {
         self.remote_segment_infos.remove(segment_name);
-        self.segment_target_chunks
+        self.segment_target_metadata
             .retain(|(_, segment), _| segment.0 != segment_name);
         if let Some(handle) = self.remote_segments.remove(segment_name) {
             let _ = transport.close_segment(handle);
@@ -57,24 +70,30 @@ impl StoreState {
         self.open_segment(transport, segment_name)
     }
 
-    fn cached_segment_target_chunks(
+    fn cached_segment_target_metadata(
         &self,
         owner: &ClientRuntimeId,
         segment_name: &SegmentName,
-    ) -> Option<Vec<SegmentTargetChunk>> {
-        self.segment_target_chunks
+    ) -> Option<SegmentTransportMetadata> {
+        self.segment_target_metadata
             .get(&(owner.clone(), segment_name.clone()))
             .cloned()
     }
 
-    fn cache_segment_target_chunks(
+    fn cache_segment_target_metadata(
         &mut self,
         owner: &ClientRuntimeId,
         segment_name: &SegmentName,
         target_chunks: &[SegmentTargetChunk],
+        transport_endpoint: Option<String>,
     ) {
-        self.segment_target_chunks
-            .insert((owner.clone(), segment_name.clone()), target_chunks.to_vec());
+        self.segment_target_metadata.insert(
+            (owner.clone(), segment_name.clone()),
+            SegmentTransportMetadata {
+                target_chunks: target_chunks.to_vec(),
+                transport_endpoint,
+            },
+        );
     }
 
     fn open_segment_with_info(
@@ -345,6 +364,33 @@ mod state_store_tests {
         let (_handle_c, _info_c) = state
             .open_segment_with_info(&transport, "remote-a")
             .expect("reopen after invalidation should succeed");
+
+        assert_eq!(transport.counts(), (2, 0, 2));
+    }
+
+    #[test]
+    fn invalidate_remote_segment_clears_cached_transport_endpoint_handle() {
+        let transport = CountingTransport::default();
+        let mut state = StoreState::default();
+        let owner = ClientRuntimeId::new("remote-owner", ClientEpoch(1));
+        let segment_name = SegmentName::new("logical-segment");
+        state.cache_segment_target_metadata(
+            &owner,
+            &segment_name,
+            &[],
+            Some("10.0.0.8:12001".to_string()),
+        );
+
+        state
+            .open_segment_with_info(&transport, "10.0.0.8:12001")
+            .expect("endpoint open should succeed");
+        state.invalidate_remote_segment(&segment_name.0);
+        assert!(state
+            .cached_segment_target_metadata(&owner, &segment_name)
+            .is_none());
+        state
+            .open_segment_with_info(&transport, "10.0.0.8:12001")
+            .expect("endpoint should reopen after logical invalidation");
 
         assert_eq!(transport.counts(), (2, 0, 2));
     }

@@ -2712,6 +2712,7 @@ mod tests {
             segments: vec![mooncake_store_core::SegmentAnnouncement {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
+                transport_endpoint: None,
                 capacity_bytes: remote_segment.len() as u64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -2812,6 +2813,7 @@ mod tests {
             segments: vec![mooncake_store_core::SegmentAnnouncement {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
+                transport_endpoint: None,
                 capacity_bytes: remote_segment.len() as u64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -2861,6 +2863,7 @@ mod tests {
             segments: vec![mooncake_store_core::SegmentAnnouncement {
                 owner: runtime,
                 segment_name: mooncake_store_core::SegmentName::new("remote-segment"),
+                transport_endpoint: None,
                 capacity_bytes: 64,
                 used_bytes: 0,
                 target_chunks: Vec::new(),

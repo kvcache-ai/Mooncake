@@ -1225,6 +1225,7 @@ mod tests {
         SegmentAnnouncement {
             owner: owner.clone(),
             segment_name: SegmentName::new(name),
+            transport_endpoint: None,
             capacity_bytes: capacity,
             used_bytes: 0,
             target_chunks: Vec::new(),
@@ -1376,6 +1377,7 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: owner.clone(),
                 segment_name: SegmentName::new("seg-a"),
+                transport_endpoint: None,
                 capacity_bytes: 1024,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -1407,6 +1409,7 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: owner.clone(),
                 segment_name: SegmentName::new("seg-b"),
+                transport_endpoint: None,
                 capacity_bytes: 32,
                 used_bytes: 0,
                 target_chunks: Vec::new(),
@@ -1430,6 +1433,7 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: owner.clone(),
                 segment_name: SegmentName::new("seg-c"),
+                transport_endpoint: None,
                 capacity_bytes: 256,
                 used_bytes: 0,
                 target_chunks: Vec::new(),

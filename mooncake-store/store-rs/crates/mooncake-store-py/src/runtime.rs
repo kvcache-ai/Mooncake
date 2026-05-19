@@ -94,6 +94,7 @@ impl CompatRuntimeArgs {
             .activate_on_local_memory_registration()
             .compatibility(CompatibilityDescriptor::default())
             .tenant(plan.tenant)
+            .segment_name(segment_name.clone())
             .local_memory(local_memory)
             .transport(transport)
             .transport_factory(factory)

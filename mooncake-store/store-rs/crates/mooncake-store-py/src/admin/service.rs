@@ -2999,6 +2999,7 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: dead_runtime.clone(),
                 segment_name: SegmentName::new("dead-segment"),
+                transport_endpoint: None,
                 capacity_bytes: 256,
                 used_bytes: 64,
                 target_chunks: Vec::new(),
@@ -3063,6 +3064,7 @@ mod tests {
         let segment = SegmentAnnouncement {
             owner: live_runtime.clone(),
             segment_name: SegmentName::new("live-segment"),
+            transport_endpoint: None,
             capacity_bytes: 128,
             used_bytes: 0,
             target_chunks: Vec::new(),
@@ -3118,6 +3120,7 @@ mod tests {
             .publish_segment(&SegmentAnnouncement {
                 owner: dead_runtime.clone(),
                 segment_name: SegmentName::new("dead-segment"),
+                transport_endpoint: None,
                 capacity_bytes: 256,
                 used_bytes: 64,
                 target_chunks: Vec::new(),
@@ -3177,6 +3180,7 @@ mod tests {
         let segment = SegmentAnnouncement {
             owner: live_runtime.clone(),
             segment_name: SegmentName::new("live-segment"),
+            transport_endpoint: None,
             capacity_bytes: 128,
             used_bytes: 0,
             target_chunks: Vec::new(),

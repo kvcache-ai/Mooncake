@@ -1593,6 +1593,7 @@ fn segment_to_py(py: Python<'_>, segment: &SegmentAnnouncement) -> PyResult<Py<P
     let dict = PyDict::new(py);
     dict.set_item("owner", segment.owner.storage_key())?;
     dict.set_item("segment_name", segment.segment_name.0.clone())?;
+    dict.set_item("transport_endpoint", segment.transport_endpoint.clone())?;
     dict.set_item("capacity_bytes", segment.capacity_bytes)?;
     dict.set_item("used_bytes", segment.used_bytes)?;
     dict.set_item("state", format!("{:?}", segment.state))?;
@@ -3464,6 +3465,7 @@ mod tests {
         SegmentAnnouncement {
             owner: ClientRuntimeId::new("owner", ClientEpoch(2)),
             segment_name: SegmentName::new("segment-z"),
+            transport_endpoint: Some("10.0.0.8:12001".to_string()),
             capacity_bytes: 256,
             used_bytes: 32,
             target_chunks: Vec::new(),
@@ -3579,6 +3581,14 @@ mod tests {
                     .extract::<String>()
                     .expect("segment name should extract"),
                 "segment-z"
+            );
+            assert_eq!(
+                segment_any
+                    .get_item("transport_endpoint")
+                    .expect("segment field should exist")
+                    .extract::<String>()
+                    .expect("transport endpoint should extract"),
+                "10.0.0.8:12001"
             );
             assert_eq!(
                 route_any
