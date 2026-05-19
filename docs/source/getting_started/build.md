@@ -248,10 +248,11 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DWITH_RUST_EXAMPLE=[ON|OFF]`: Build the Transfer Engine Rust interface and sample code. **Default: OFF.**
 - `-DWITH_STORE_RUST=[ON|OFF]`: Build Mooncake Store Rust bindings and CMake Rust targets. **Default: ON.**
 - `-DWITH_EP=[ON|OFF]`: Build the EP (Expert Parallelism) and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` (semicolon-separated) to build for specific PyTorch versions, or leave empty to use the currently-installed torch. The CUDA version is detected automatically. **Default: OFF.**
-- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
+- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service for the Transfer Engine, require hiredis
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
 - `-DUSE_ETCD=[ON|OFF]`: Enable etcd-based metadata service, require go 1.23+
 - `-DSTORE_USE_ETCD=[ON|OFF]`: Enable etcd-based failover for Mooncake Store, require go 1.23+. **Note:** `-DUSE_ETCD` and `-DSTORE_USE_ETCD` are two independent options. Enabling `-DSTORE_USE_ETCD` does **not** depend on `-DUSE_ETCD`
+- `-DSTORE_USE_REDIS=[ON|OFF]`: Enable Redis-based failover for Mooncake Store, require hiredis. **Default: OFF.** **Note:** `-DUSE_REDIS` and `-DSTORE_USE_REDIS` are two independent options. Enabling `-DSTORE_USE_REDIS` does **not** depend on `-DUSE_REDIS`.
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
