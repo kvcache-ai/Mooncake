@@ -206,7 +206,7 @@ class Workers {
     };
 
     // Promote timed-out low priority requests to higher priority queues
-    void promoteTimedOutRequests(WorkerContext& worker);
+    void promoteTimedOutRequests(WorkerContext &worker);
 
     WorkerContext *worker_context_;
     uint64_t slice_timeout_ns_;

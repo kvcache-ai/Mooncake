@@ -116,7 +116,8 @@ Workers::Workers(RdmaTransport* transport)
     // Timeout after which low-priority requests get promoted (nanoseconds)
     // Default: 10ms (10000000 ns)
     priority_promotion_timeout_ns_ =
-        conf->get("transports/rdma/priority_promotion_timeout_us", 10000) * 1000ull;
+        conf->get("transports/rdma/priority_promotion_timeout_us", 10000) *
+        1000ull;
 
     // ============================================================
     // Global Slot Coordination (Multi-Process)
@@ -404,7 +405,8 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
     if (!promoted.empty()) {
         auto* slice = promoted.front().first;
         if (slice && slice->enqueue_ts > 0 &&
-            (current_ts - slice->enqueue_ts) >= priority_promotion_timeout_ns_) {
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
             for (auto& slice_list : promoted) {
                 worker.queues[PRIO_HIGH].push(slice_list);
             }
@@ -420,7 +422,8 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
     if (!promoted.empty()) {
         auto* slice = promoted.front().first;
         if (slice && slice->enqueue_ts > 0 &&
-            (current_ts - slice->enqueue_ts) >= priority_promotion_timeout_ns_) {
+            (current_ts - slice->enqueue_ts) >=
+                priority_promotion_timeout_ns_) {
             for (auto& slice_list : promoted) {
                 worker.queues[PRIO_MEDIUM].push(slice_list);
             }
