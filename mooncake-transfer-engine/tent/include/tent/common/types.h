@@ -49,6 +49,8 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    int priority =
+        PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
 };
 
 enum TransferStatusEnum {

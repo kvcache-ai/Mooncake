@@ -395,6 +395,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->word = PENDING;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
+            slice->priority = request.priority;  // Copy priority from request
             task->num_slices++;
             task->ref();  // Each slice holds a reference to the task
             if (slice_idx < slice_dev_ids.size())
