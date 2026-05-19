@@ -2816,7 +2816,7 @@ MasterService::ResolveSnapshotSequenceId() const {
 
     uint64_t sequence_id = 0;
     auto err = oplog_store.value()->GetLatestSequenceId(sequence_id);
-    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+    if (err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
         return ha::OpLogSequenceId{0};
     }
     if (err != ErrorCode::OK) {
