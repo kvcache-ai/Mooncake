@@ -70,7 +70,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libnuma-dev \
                        libunwind-dev \
                        libpython3-dev \
-                       libboost-all-dev \
+                       libboost-dev \
                        libssl-dev \
                        pybind11-dev \
                        libcurl4-openssl-dev \
