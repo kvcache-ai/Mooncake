@@ -154,10 +154,11 @@ class DeviceSelector {
 
     struct SchedulingParams {
         // NUMA tier penalties (rank 0 = local, should be smallest)
-        double numa_tier_weights[Topology::DevicePriorityRanks]
-            = {1.0, 5.0, 10.0};
+        double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
+                                                                   10.0};
 
-        // EWMA bandwidth learning rate (0.0 = no learning, 1.0 = full adaptation)
+        // EWMA bandwidth learning rate (0.0 = no learning, 1.0 = full
+        // adaptation)
         double bandwidth_learning_rate = 0.01;
 
         // Enable priority-based filtering

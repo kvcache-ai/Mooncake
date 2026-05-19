@@ -65,7 +65,8 @@ Workers::Workers(RdmaTransport* transport)
     // ============================================================
     DeviceSelector::SchedulingParams params;
 
-    auto numa_penalties = conf->get("transports/rdma/numa_penalties", std::vector<double>{});
+    auto numa_penalties =
+        conf->get("transports/rdma/numa_penalties", std::vector<double>{});
     if (numa_penalties.size() == Topology::DevicePriorityRanks) {
         for (size_t i = 0; i < Topology::DevicePriorityRanks; ++i) {
             params.numa_tier_weights[i] = numa_penalties[i];
@@ -95,8 +96,7 @@ Workers::Workers(RdmaTransport* transport)
         conf->get("transports/rdma/score_jitter_range", 1e-9);
 
     // Small value to prevent division by zero
-    params.score_epsilon =
-        conf->get("transports/rdma/score_epsilon", 1e-12);
+    params.score_epsilon = conf->get("transports/rdma/score_epsilon", 1e-12);
 
     // ============================================================
     // Priority-Based Filtering

@@ -40,7 +40,8 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
 
 Status DeviceSelector::enableSharedQuota(const std::string& shm_name) {
     slot_manager_ = std::make_shared<SharedSlotManager>(this);
-    slot_manager_->setRotationIntervalMs(sched_params_.slot_rotation_interval_ms);
+    slot_manager_->setRotationIntervalMs(
+        sched_params_.slot_rotation_interval_ms);
     auto status = slot_manager_->attach(shm_name);
     if (!status.ok()) slot_manager_.reset();
     return status;
@@ -125,7 +126,8 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
             static_cast<double>(inflight + slice_bytes) / ewma_bw;
         double rank_penalty = sched_params_.numa_tier_weights[rank];
         double score = predicted_time * rank_penalty;
-        score += (SimpleRandom::Get().next(10) * sched_params_.score_jitter_range);
+        score +=
+            (SimpleRandom::Get().next(10) * sched_params_.score_jitter_range);
         bool is_cross_numa = (rank > 0);
         Candidate c;
         c.dev_id = dev_id;
@@ -165,12 +167,13 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
         return Status::DeviceNotFound("no eligible devices");
     }
 
-    std::sort(candidates.begin(), candidates.end(),
-              [this](const Candidate& a, const Candidate& b) {
-                  if (std::abs(a.score - b.score) > sched_params_.score_jitter_range)
-                      return a.score < b.score;
-                  return a.dev_id < b.dev_id;
-              });
+    std::sort(
+        candidates.begin(), candidates.end(),
+        [this](const Candidate& a, const Candidate& b) {
+            if (std::abs(a.score - b.score) > sched_params_.score_jitter_range)
+                return a.score < b.score;
+            return a.dev_id < b.dev_id;
+        });
     return Status::OK();
 }
 
@@ -211,7 +214,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
         double max_weight = -1.0;
         int best_dev_idx = -1;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            double w = 1.0 / (candidates[i].score + sched_params_.score_epsilon);
+            double w =
+                1.0 / (candidates[i].score + sched_params_.score_epsilon);
             total_weight += w;
             if (w > max_weight) {
                 max_weight = w;
@@ -222,7 +226,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
             return;
         uint32_t remaining_slices = num_slices;
         for (size_t i = 0; i < candidates.size(); ++i) {
-            double w = 1.0 / (candidates[i].score + sched_params_.score_epsilon);
+            double w =
+                1.0 / (candidates[i].score + sched_params_.score_epsilon);
             uint32_t assigned =
                 static_cast<uint32_t>((w / total_weight) * num_slices);
             if (assigned > 0) {
@@ -284,8 +289,9 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
 
     double theoretical_bw = dev.getTheoreticalBandwidth();
-    new_ewma = std::max(sched_params_.ewma_min_multiplier * theoretical_bw,
-                        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
+    new_ewma = std::max(
+        sched_params_.ewma_min_multiplier * theoretical_bw,
+        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
 
     dev.ewma_bandwidth_bps.store(new_ewma, std::memory_order_relaxed);
 
