@@ -241,6 +241,11 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto availability = ha::ValidateHABackendAvailability(backend_type.value());
+    if (availability != ErrorCode::OK) {
+        return tl::make_unexpected(availability);
+    }
+
     return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
         .type = backend_type.value(),
         .connstring = master_server_entry.substr(delimiter_pos + 3),
