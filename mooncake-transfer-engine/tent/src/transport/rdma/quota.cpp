@@ -35,6 +35,8 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         info.ewma_bandwidth_bps.store(info.getTheoreticalBandwidth(),
                                       std::memory_order_relaxed);
     }
+    // Initialize device base priorities after all devices are loaded
+    fillDevicePriorities();
     return Status::OK();
 }
 

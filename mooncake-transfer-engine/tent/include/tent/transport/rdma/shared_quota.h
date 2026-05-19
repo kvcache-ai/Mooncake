@@ -63,8 +63,8 @@ class SharedSlotManager {
     Status detach();
 
     // Check if current process can send (global slot)
-    // Returns true if process priority is allowed in current global slot
-    bool canSend();
+    // Returns true if given priority is allowed in current global slot
+    bool canSend(int priority = PRIO_HIGH);
 
     // Set slot duration in milliseconds (must be > 0)
     void setRotationIntervalMs(int ms) { rotation_interval_ms_ = ms; }

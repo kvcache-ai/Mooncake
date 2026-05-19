@@ -137,15 +137,17 @@ Status SharedSlotManager::detach() {
     return Status::OK();
 }
 
-bool SharedSlotManager::canSend() {
+bool SharedSlotManager::canSend(int priority) {
     if (!hdr_) return true;
 
     // Get current global slot
     int current_slot = hdr_->current_slot.load(std::memory_order_acquire);
 
-    // All processes are treated as HIGH priority for global coordination
-    // Device-level filtering is handled in buildCandidates()
-    return isPriorityAllowedInSlot(PRIO_HIGH, current_slot);
+    // Check if the given priority is allowed in current global slot
+    // Slot 0: HIGH only (priority 0 <= 0)
+    // Slot 1: HIGH + MEDIUM (priority 0 or 1 <= 1)
+    // Slot 2: ALL (priority 0, 1, or 2 <= 2)
+    return isPriorityAllowedInSlot(priority, current_slot);
 }
 
 void SharedSlotManager::startBackgroundThread() {

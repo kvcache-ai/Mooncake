@@ -52,7 +52,15 @@ Each worker thread maintains separate queues for each priority level:
 2. Only process MEDIUM when HIGH is empty
 3. Only process LOW when both HIGH and MEDIUM are empty
 
-This ensures that high-priority requests never wait behind lower-priority work within the same worker.
+**Priority Promotion (Anti-Starvation)**:
+To prevent low-priority requests from starving indefinitely, TENT implements timeout-based priority promotion:
+- MEDIUM priority requests are promoted to HIGH after waiting too long
+- LOW priority requests are promoted to MEDIUM after waiting too long
+- Promotion checks run periodically (every 1ms by default)
+
+This ensures that:
+- High-priority requests normally never wait behind lower-priority work
+- Low-priority requests eventually get serviced even under continuous high-priority load
 
 ### Global Slot Coordination
 
@@ -101,7 +109,8 @@ struct SharedHeader {
   "transports": {
     "rdma": {
       "enable_priority_filtering": true,
-      "local_rotation_interval_us": 200
+      "local_rotation_interval_us": 200,
+      "priority_promotion_timeout_us": 10000
     }
   }
 }
@@ -111,6 +120,7 @@ struct SharedHeader {
 |-----------|------|---------|-------------|
 | `enable_priority_filtering` | bool | `true` | Enable priority-based device filtering |
 | `local_rotation_interval_us` | int | `200` | Local device priority rotation interval (microseconds) |
+| `priority_promotion_timeout_us` | int | `10000` | Timeout for priority promotion (microseconds) |
 
 ### Global Coordination
 
@@ -282,11 +292,18 @@ tent_submit(engine, batch_id, &req, 1);
 
 ### Starvation Prevention
 
-The global slot mechanism prevents starvation by design:
+TENT prevents starvation through two mechanisms:
 
-- **HIGH priority**: Never starved (always allowed in slot 0)
-- **MEDIUM priority**: Never starved (allowed in slots 1 and 2)
-- **LOW priority**: Never starved (always allowed in slot 2)
+1. **Global slot mechanism**:
+   - **HIGH priority**: Never starved (always allowed in slot 0)
+   - **MEDIUM priority**: Never starved (allowed in slots 1 and 2)
+   - **LOW priority**: Never starved (always allowed in slot 2)
+
+2. **Priority promotion timeout**:
+   - Low-priority requests waiting longer than `priority_promotion_timeout_us` are promoted
+   - MEDIUM → HIGH promotion ensures medium priority gets service
+   - LOW → MEDIUM promotion ensures low priority eventually gets service
+   - Configurable via `priority_promotion_timeout_us` (default 10ms)
 
 ### Tuning Guidelines
 

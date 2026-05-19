@@ -110,6 +110,15 @@ Workers::Workers(RdmaTransport* transport)
         conf->get("transports/rdma/local_rotation_interval_us", 200);
 
     // ============================================================
+    // Priority Promotion (Anti-Starvation)
+    // ============================================================
+
+    // Timeout after which low-priority requests get promoted (nanoseconds)
+    // Default: 10ms (10000000 ns)
+    priority_promotion_timeout_ns_ =
+        conf->get("transports/rdma/priority_promotion_timeout_us", 10000) * 1000ull;
+
+    // ============================================================
     // Global Slot Coordination (Multi-Process)
     // ============================================================
 
@@ -302,14 +311,14 @@ void Workers::asyncPostSend() {
     auto shared_quota =
         device_selector_ ? device_selector_->getSharedSlotManager() : nullptr;
 
-    // Global coordination: check if this process can send
-    bool can_send = shared_quota ? shared_quota->canSend() : true;
-    if (can_send) {
-        // Higher priority requests are submitted first when allowed
-        for (int prio = 0; prio < kNumPriorityLevels; ++prio) {
-            worker.queues[prio].pop(result);
-            if (!result.empty()) break;
-        }
+    // Promote timed-out low priority requests
+    promoteTimedOutRequests(worker);
+
+    // Priority selection: HIGH -> MEDIUM -> LOW
+    for (int prio = PRIO_HIGH; prio < kNumPriorityLevels; ++prio) {
+        if (shared_quota && !shared_quota->canSend(prio)) continue;
+        worker.queues[prio].pop(result);
+        if (!result.empty()) break;
     }
 
     for (auto& slice_list : result) {
@@ -378,6 +387,47 @@ void Workers::asyncPostSend() {
             worker.inflight_slice_set.insert(slices.begin(),
                                              slices.begin() + num_submitted);
             slices.erase(slices.begin(), slices.begin() + num_submitted);
+        }
+    }
+}
+
+void Workers::promoteTimedOutRequests(WorkerContext& worker) {
+    uint64_t current_ts = getCurrentTimeInNano();
+    if (current_ts < worker.next_promotion_check_ns) return;
+
+    // Set next check time (1ms from now)
+    worker.next_promotion_check_ns = current_ts + 1000000ull;
+
+    // Check MEDIUM -> HIGH promotion
+    std::vector<RdmaSliceList> promoted;
+    worker.queues[PRIO_MEDIUM].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >= priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_HIGH].push(slice_list);
+            }
+            return;
+        }
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_MEDIUM].push(slice_list);
+        }
+    }
+
+    // Check LOW -> MEDIUM promotion
+    worker.queues[PRIO_LOW].pop(promoted);
+    if (!promoted.empty()) {
+        auto* slice = promoted.front().first;
+        if (slice && slice->enqueue_ts > 0 &&
+            (current_ts - slice->enqueue_ts) >= priority_promotion_timeout_ns_) {
+            for (auto& slice_list : promoted) {
+                worker.queues[PRIO_MEDIUM].push(slice_list);
+            }
+            return;
+        }
+        for (auto& slice_list : promoted) {
+            worker.queues[PRIO_LOW].push(slice_list);
         }
     }
 }

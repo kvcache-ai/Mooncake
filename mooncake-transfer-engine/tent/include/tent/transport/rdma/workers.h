@@ -194,16 +194,23 @@ class Workers {
         std::condition_variable cv;
         volatile bool in_suspend = false;
 
+        // Next time to check for priority promotions (nanoseconds)
+        uint64_t next_promotion_check_ns = 0;
+
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
         // (see RdmaSlice::rail_monitor).
         std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
-        uint64_t padding[16];
+        uint64_t padding[15];
     };
+
+    // Promote timed-out low priority requests to higher priority queues
+    void promoteTimedOutRequests(WorkerContext& worker);
 
     WorkerContext *worker_context_;
     uint64_t slice_timeout_ns_;
+    uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
 
     std::unique_ptr<DeviceSelector> device_selector_;
     bool always_tier1_ = false;

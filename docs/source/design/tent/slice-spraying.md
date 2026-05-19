@@ -48,16 +48,17 @@ When `enable_smart_scheduling = true`, the selector uses an EWMA-based algorithm
 For each request:
   1. Calculate predicted completion time for each device:
      predicted_time = (inflight_bytes + request_length) / ewma_bandwidth
-  
+
   2. Apply NUMA penalty based on tier:
      score = predicted_time × numa_tier_weights[tier]
-  
+
   3. Select device(s) with minimum score:
      - Single slice: best device only
      - Multiple slices: weighted distribution across devices
-  
+
   4. Update EWMA bandwidth on completion:
      ewma_bandwidth = α × ewma_bandwidth + (1 - α) × observed_bandwidth
+     where α = bandwidth_learning_rate
 ```
 
 **Characteristics**:
@@ -88,10 +89,16 @@ initial_value = theoretical_bandwidth
 on_transfer_complete:
   observed_bandwidth = transfer_size / transfer_time
   ewma_bandwidth = α × ewma_bandwidth + (1 - α) × observed_bandwidth
-  ewma_bandwidth = clamp(ewma_bandwidth, 
-                        0.1 × theoretical, 
+  ewma_bandwidth = clamp(ewma_bandwidth,
+                        0.1 × theoretical,
                         10.0 × theoretical)
 ```
+
+where `α = bandwidth_learning_rate`.
+
+Note: This formula places higher weight on new observations when α is small.
+- α = 0: ewma_bandwidth = observed_bandwidth (full adaptation)
+- α = 1: ewma_bandwidth = ewma_bandwidth (no adaptation)
 
 The EWMA provides:
 - **Memory**: Recent observations have more influence than old ones
@@ -203,13 +210,13 @@ All slice spraying parameters are configurable via the configuration file:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `bandwidth_learning_rate` | float | `0.01` | EWMA learning rate (0.0 = no learning, 1.0 = full adaptation) |
+| `bandwidth_learning_rate` | float | `0.01` | EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
 | `ewma_min_bandwidth_multiplier` | float | `0.1` | Minimum bandwidth as fraction of theoretical |
 | `ewma_max_bandwidth_multiplier` | float | `10.0` | Maximum bandwidth as fraction of theoretical |
 
 **Guidelines**:
-- Lower learning rate = slower adaptation, more stable
-- Higher learning rate = faster adaptation, more volatile
+- Lower learning rate = faster adaptation, more volatile (α = 0 means always use new value)
+- Higher learning rate = slower adaptation, more stable (α = 1 means never update)
 - Multipliers constrain EWMA to reasonable range
 
 ### Device Selection Scoring
