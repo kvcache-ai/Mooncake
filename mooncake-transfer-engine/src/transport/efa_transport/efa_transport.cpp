@@ -33,6 +33,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/efa_transport/efa_context.h"
@@ -106,12 +107,12 @@ void EfaTransport::startWorkerThreads() {
     if (worker_running_) return;
 
     worker_running_ = true;
-    // One poller thread per context for responsive CQ draining under load
+    // Default: one poller thread per context. MC_EFA_CQ_THREADS caps this when
+    // multiple EFA consumers coexist (e.g., Mooncake KV transfer + DeepEP).
     size_t num_threads = context_list_.size();
-    const char* cq_env = std::getenv("MC_EFA_CQ_THREADS");
-    if (cq_env) {
-        size_t cq_val = std::stoull(cq_env);
-        if (cq_val > 0 && cq_val < num_threads) num_threads = cq_val;
+    int cq_cap = Environ::Get().GetEfaCqThreads();
+    if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
+        num_threads = static_cast<size_t>(cq_cap);
     }
     for (size_t i = 0; i < num_threads; i++) {
         worker_threads_.emplace_back(&EfaTransport::workerThreadFunc, this, i);
@@ -160,7 +161,7 @@ void EfaTransport::workerThreadFunc(int thread_id) {
 
         // If no work was done, yield CPU briefly
         if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            std::this_thread::yield();
         }
     }
 }

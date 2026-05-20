@@ -82,6 +82,7 @@ Environ::Environ() {
     intra_nvlink_ = GetBool("MC_INTRA_NVLINK", false);
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
     with_nvidia_peermem_ = GetBool("WITH_NVIDIA_PEERMEM", true);
+    efa_cq_threads_ = GetInt("MC_EFA_CQ_THREADS", 0);
 }
 
 }  // namespace mooncake
