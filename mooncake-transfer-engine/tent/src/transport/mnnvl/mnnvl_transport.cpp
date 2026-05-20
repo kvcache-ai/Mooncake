@@ -114,7 +114,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
         128;
 
     caps.dram_to_gpu = true;
-    if (Platform::getLoader().type() == "cuda") caps.gpu_to_gpu = true;
+    if (Platform::getLoader().type() != "cpu") caps.gpu_to_gpu = true;
 
     installed_ = true;
     supported_ = true;
