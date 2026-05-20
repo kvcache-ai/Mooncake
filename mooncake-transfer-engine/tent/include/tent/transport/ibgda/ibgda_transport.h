@@ -22,9 +22,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cuda_runtime.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include "tent/transport/ibgda/detail/memheap.h"
+#include "tent/transport/ibgda/detail/mlx5gda.h"
 #include "tent/runtime/device_transport.h"
 #include "tent/runtime/transport.h"
 
@@ -115,6 +118,25 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     size_t controlBufferSize() const { return ctrl_buf_size_; }
     mlx5dv_devx_umem* controlBufferUmem() const { return ctrl_buf_umem_; }
 
+    // Create/destroy the GPU-initiated RC QPs backed by the TENT-owned control
+    // buffer.  This is still mlx5/CUDA today, but EP only consumes the stable
+    // handles and device-context bytes so future TENT backends can replace the
+    // queue builder behind this boundary.
+    Status createQueuePairs(int num_qps, int wqe, cudaStream_t stream,
+                            void* qp_devctxs);
+
+    Status recreateQueuePairs(int num_qps, int wqe, cudaStream_t stream,
+                              void* qp_devctxs);
+
+    Status destroyQueuePairs();
+
+    Status connectQueuePair(int qp_index, const ibv_ah_attr& ah_attr,
+                            uint32_t remote_qpn, ibv_mtu mtu);
+
+    int queuePairCount() const { return static_cast<int>(qps_.size()); }
+    uint32_t queuePairQpn(int qp_index) const;
+    uint16_t queuePairLid(int qp_index) const;
+
     // Stage-C bridge: lets an existing IBGDA host setup hand a GPU-visible
     // backend context to the TENT DeviceTransport interface. The full Stage-D
     // transport will allocate and populate this context internally.
@@ -150,6 +172,9 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     void* ctrl_buf_ = nullptr;
     size_t ctrl_buf_size_ = 0;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
+
+    memheap* ctrl_buf_heap_ = nullptr;
+    std::vector<mlx5gda_qp*> qps_;
 };
 
 }  // namespace tent

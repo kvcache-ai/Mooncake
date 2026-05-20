@@ -7,16 +7,17 @@
 #include <cuda_runtime.h>
 #include <fstream>
 #include <memory>
+#ifdef MOONCAKE_EP_USE_TENT
+#include <tent/transport/ibgda/ibgda_transport.h>
+#else
 #include <mooncake_ibgda/memheap.h>
 #include <mooncake_ibgda/mlx5gda.h>
+#endif
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <tent/runtime/device_resources.h>
-#ifdef MOONCAKE_EP_USE_TENT
-#include <tent/transport/ibgda/ibgda_transport.h>
-#endif
 #include <torch/torch.h>
 
 namespace mooncake {
@@ -82,7 +83,9 @@ struct MooncakeEpBuffer {
     // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
     // fails.
     ibv_mr* mr = nullptr;
+#ifndef MOONCAKE_EP_USE_TENT
     std::vector<mlx5gda_qp*> qps;
+#endif
     ibv_gid gid;
     void* raddrs = nullptr;
     void* rkeys = nullptr;
@@ -97,7 +100,9 @@ struct MooncakeEpBuffer {
     mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
     ibv_pd* pd = nullptr;
     mlx5dv_pd mpd = {};
+#ifndef MOONCAKE_EP_USE_TENT
     memheap* ctrl_buf_heap = nullptr;
+#endif
 #ifdef MOONCAKE_EP_USE_TENT
     std::unique_ptr<tent::IbGdaTransport> tent_ibgda_transport_;
 #endif
@@ -206,7 +211,12 @@ struct MooncakeEpBuffer {
     std::vector<int32_t> get_local_qpns() {
         std::vector<int32_t> local_qpns;
         for (int i = 0; i < USE_QP_COUNT; ++i) {
+#ifdef MOONCAKE_EP_USE_TENT
+            local_qpns.push_back(
+                (int32_t)tent_ibgda_transport_->queuePairQpn(i));
+#else
             local_qpns.push_back((int32_t)qps[i]->qpn);
+#endif
         }
         return local_qpns;
     }
@@ -214,7 +224,12 @@ struct MooncakeEpBuffer {
     std::vector<int32_t> get_local_lids() {
         std::vector<int32_t> local_lids;
         for (int i = 0; i < USE_QP_COUNT; ++i) {
+#ifdef MOONCAKE_EP_USE_TENT
+            local_lids.push_back(
+                (int32_t)tent_ibgda_transport_->queuePairLid(i));
+#else
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
+#endif
         }
         return local_lids;
     }

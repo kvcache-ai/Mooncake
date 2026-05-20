@@ -189,6 +189,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
+#ifndef MOONCAKE_EP_USE_TENT
     for (auto* qp : qps) {
         if (qp && ctrl_buf_heap) {
             mlx5gda_destroy_qp(ctrl_buf_heap, qp);
@@ -196,11 +197,11 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     }
     qps.clear();
     if (ctrl_buf_heap) memheap_destroy(ctrl_buf_heap);
+#endif
 #ifdef MOONCAKE_EP_USE_TENT
-    // The TENT bridge owns the verbs context/PD/MR in the migration path.  It
-    // must outlive QP/heap teardown, but be destroyed before gdr_buffer free so
-    // its control-buffer umem and MR are deregistered while their GPU buffers
-    // are still valid.
+    // TENT owns QP/heap/control-buffer/PD/MR in the migration path. It must be
+    // destroyed before gdr_buffer free so its MR is deregistered while the GPU
+    // buffer is still valid.
     if (tent_ibgda_transport_) tent_ibgda_transport_.reset();
 #else
     if (ctrl_buf_umem) mlx5dv_devx_umem_dereg(ctrl_buf_umem);
@@ -604,6 +605,16 @@ int MooncakeEpBuffer::init_ibgda() {
         return -1;
     }
 #endif
+#ifdef MOONCAKE_EP_USE_TENT
+    status = tent_ibgda_transport_->createQueuePairs(
+        USE_QP_COUNT, 16384, comm_stream.stream(), qp_devctxs);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] TENT IBGDA QP creation failed: "
+                   << status.ToString();
+        return -1;
+    }
+    is_roce_ = tent_ibgda_transport_->isRoce();
+#else
     ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
@@ -640,10 +651,22 @@ int MooncakeEpBuffer::init_ibgda() {
                    sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
         qps.push_back(qp);
     }
+#endif
     return 0;
 }
 
 void MooncakeEpBuffer::update_local_qpns() {
+#ifdef MOONCAKE_EP_USE_TENT
+    auto status = tent_ibgda_transport_->recreateQueuePairs(
+        USE_QP_COUNT, 16384, comm_stream.stream(), qp_devctxs);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] TENT IBGDA QP recreation failed: "
+                   << status.ToString();
+        ibgda_disabled_ = true;
+        return;
+    }
+    is_roce_ = tent_ibgda_transport_->isRoce();
+#else
     for (int i = 0; i < USE_QP_COUNT; ++i) {
         if (qps[i]) {
             mlx5gda_destroy_qp(ctrl_buf_heap, qps[i]);
@@ -682,6 +705,7 @@ void MooncakeEpBuffer::update_local_qpns() {
                    sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
         qps[i] = qp;
     }
+#endif
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
@@ -696,6 +720,15 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
             .dlid = (uint16_t)remote_lids[i],
             .port_num = 0,
         };
+#ifdef MOONCAKE_EP_USE_TENT
+        auto status = tent_ibgda_transport_->connectQueuePair(
+            i, ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096);
+        if (!status.ok()) {
+            LOG(ERROR) << "[EP] TENT IBGDA QP connect failed: "
+                       << status.ToString();
+            exit(1);
+        }
+#else
         if (mlx5gda_modify_rc_qp_init2rtr(
                 qps[i], ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096)) {
             perror("Failed to mlx5gda_modify_rc_qp_init2rtr");
@@ -705,6 +738,7 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
             perror("Failed to mlx5gda_modify_rc_qp_rtr2rts");
             exit(1);
         }
+#endif
     }
     for (int i = 0; i < num_ranks; ++i) {
         if (active_ranks_mask[i] == 0) continue;
@@ -737,6 +771,16 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
             gid_index_;  // Use dynamically discovered GID index
         ah_attr.grh.hop_limit = 1;
         ah_attr.port_num = 1;
+#ifdef MOONCAKE_EP_USE_TENT
+        ah_attr.dlid = tent_ibgda_transport_->queuePairLid(i) | 0xC000;
+        auto status = tent_ibgda_transport_->connectQueuePair(
+            i, ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096);
+        if (!status.ok()) {
+            LOG(ERROR) << "[EP] TENT IBGDA QP connect failed: "
+                       << status.ToString();
+            exit(1);
+        }
+#else
         ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;
         if (mlx5gda_modify_rc_qp_init2rtr(
                 qps[i], ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096)) {
@@ -747,6 +791,7 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
             perror("Failed to mlx5gda_modify_rc_qp_rtr2rts");
             exit(1);
         }
+#endif
     }
     for (int i = 0; i < num_ranks; ++i) {
         if (active_ranks_mask[i] == 0) continue;

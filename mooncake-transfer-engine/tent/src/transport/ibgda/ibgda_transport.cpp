@@ -74,6 +74,7 @@ Status IbGdaTransport::install(std::string& local_segment_name,
 }
 
 Status IbGdaTransport::uninstall() {
+    (void)destroyQueuePairs();
     (void)releaseControlBuffer();
     for (auto& entry : registered_mrs_) {
         if (entry.second) ibv_dereg_mr(entry.second);
@@ -226,6 +227,8 @@ Status IbGdaTransport::allocateControlBuffer(size_t size) {
 }
 
 Status IbGdaTransport::releaseControlBuffer() {
+    auto destroy_status = destroyQueuePairs();
+    if (!destroy_status.ok()) return destroy_status;
     if (ctrl_buf_umem_) {
         if (mlx5dv_devx_umem_dereg(ctrl_buf_umem_)) {
             return Status::RdmaError(
@@ -244,6 +247,138 @@ Status IbGdaTransport::releaseControlBuffer() {
     }
     ctrl_buf_size_ = 0;
     return Status::OK();
+}
+
+Status IbGdaTransport::createQueuePairs(int num_qps, int wqe,
+                                        cudaStream_t stream,
+                                        void* qp_devctxs) {
+    if (num_qps <= 0) {
+        return Status::InvalidArgument("num_qps must be positive" LOC_MARK);
+    }
+    if (wqe <= 0) {
+        return Status::InvalidArgument("wqe must be positive" LOC_MARK);
+    }
+    if (!qp_devctxs) {
+        return Status::InvalidArgument("qp_devctxs is null" LOC_MARK);
+    }
+    if (!pd_ || !ctrl_buf_ || !ctrl_buf_umem_) {
+        return Status::InvalidArgument(
+            "IBGDA control resources are not initialized" LOC_MARK);
+    }
+    if (!qps_.empty() || ctrl_buf_heap_) {
+        return Status::InvalidArgument(
+            "IBGDA queue pairs have already been created" LOC_MARK);
+    }
+
+    ctrl_buf_heap_ = memheap_create(ctrl_buf_size_);
+    if (!ctrl_buf_heap_) {
+        return Status::RdmaError("failed to create IBGDA control heap" LOC_MARK);
+    }
+
+    qps_.reserve(num_qps);
+    for (int i = 0; i < num_qps; ++i) {
+        mlx5gda_qp* qp = mlx5gda_create_rc_qp(mpd_, ctrl_buf_, ctrl_buf_umem_,
+                                              ctrl_buf_heap_, pd_, wqe,
+                                              port_num_, stream);
+        if (!qp) {
+            (void)destroyQueuePairs();
+            return Status::RdmaError("failed to create IBGDA QP" LOC_MARK);
+        }
+        is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
+        if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
+            (void)mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+            (void)destroyQueuePairs();
+            return Status::RdmaError(
+                "failed to modify IBGDA QP RST->INIT" LOC_MARK);
+        }
+
+        auto err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            (void)mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+            (void)destroyQueuePairs();
+            return Status::CudaError(
+                std::string("cudaStreamSynchronize before QP devctx copy failed: ") +
+                cudaGetErrorString(err) + LOC_MARK);
+        }
+
+        mlx5gda_qp_devctx qp_devctx = {
+            .qpn = qp->qpn,
+            .wqeid_mask = qp->num_wqebb - 1,
+            .wq = reinterpret_cast<mlx5gda_wqebb*>(
+                static_cast<uint8_t*>(ctrl_buf_) + qp->wq_offset),
+            .cq = reinterpret_cast<mlx5_cqe64*>(
+                static_cast<uint8_t*>(ctrl_buf_) + qp->send_cq->cq_offset),
+            .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
+                static_cast<uint8_t*>(ctrl_buf_) + qp->dbr_offset),
+            .bf = static_cast<char*>(qp->uar->reg_addr),
+        };
+        err = cudaMemcpy(static_cast<uint8_t*>(qp_devctxs) +
+                             i * sizeof(mlx5gda_qp_devctx),
+                         &qp_devctx, sizeof(mlx5gda_qp_devctx),
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            (void)mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+            (void)destroyQueuePairs();
+            return Status::CudaError(
+                std::string("cudaMemcpy QP devctx failed: ") +
+                cudaGetErrorString(err) + LOC_MARK);
+        }
+        qps_.push_back(qp);
+    }
+    return Status::OK();
+}
+
+Status IbGdaTransport::recreateQueuePairs(int num_qps, int wqe,
+                                          cudaStream_t stream,
+                                          void* qp_devctxs) {
+    auto status = destroyQueuePairs();
+    if (!status.ok()) return status;
+    return createQueuePairs(num_qps, wqe, stream, qp_devctxs);
+}
+
+Status IbGdaTransport::destroyQueuePairs() {
+    for (auto* qp : qps_) {
+        if (qp && ctrl_buf_heap_) mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
+    }
+    qps_.clear();
+    if (ctrl_buf_heap_) {
+        memheap_destroy(ctrl_buf_heap_);
+        ctrl_buf_heap_ = nullptr;
+    }
+    return Status::OK();
+}
+
+Status IbGdaTransport::connectQueuePair(int qp_index,
+                                        const ibv_ah_attr& ah_attr,
+                                        uint32_t remote_qpn, ibv_mtu mtu) {
+    if (qp_index < 0 || qp_index >= static_cast<int>(qps_.size())) {
+        return Status::InvalidArgument("invalid IBGDA QP index" LOC_MARK);
+    }
+    auto* qp = qps_[qp_index];
+    if (!qp) return Status::InvalidArgument("IBGDA QP is null" LOC_MARK);
+    if (mlx5gda_modify_rc_qp_init2rtr(qp, ah_attr, remote_qpn, mtu)) {
+        return Status::RdmaError("failed to modify IBGDA QP INIT->RTR" LOC_MARK);
+    }
+    if (mlx5gda_modify_rc_qp_rtr2rts(qp)) {
+        return Status::RdmaError("failed to modify IBGDA QP RTR->RTS" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+uint32_t IbGdaTransport::queuePairQpn(int qp_index) const {
+    if (qp_index < 0 || qp_index >= static_cast<int>(qps_.size()) ||
+        !qps_[qp_index]) {
+        return 0;
+    }
+    return qps_[qp_index]->qpn;
+}
+
+uint16_t IbGdaTransport::queuePairLid(int qp_index) const {
+    if (qp_index < 0 || qp_index >= static_cast<int>(qps_.size()) ||
+        !qps_[qp_index]) {
+        return 0;
+    }
+    return qps_[qp_index]->port_attr.lid;
 }
 
 Status IbGdaTransport::getChannelResources(

@@ -7,7 +7,11 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
+#ifdef MOONCAKE_EP_USE_TENT
+#include <tent/transport/ibgda/detail/mlx5gda.h>
+#else
 #include <mooncake_ibgda/mlx5gda.h>
+#endif
 #include <mooncake_ep_utils.cuh>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>

@@ -22,6 +22,14 @@ use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "").upper() in {
     "YES",
 }
 
+sources = [
+    "src/ep_py.cpp",
+    "src/mooncake_ep_buffer.cpp",
+    "src/mooncake_ep_kernel.cu",
+]
+if not use_tent:
+    sources.append("src/mooncake_ibgda/mlx5gda.cpp")
+
 if CUDA_HOME is not None:
     cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
     cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
@@ -40,12 +48,7 @@ setup(
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
             ],
-            sources=[
-                "src/ep_py.cpp",
-                "src/mooncake_ep_buffer.cpp",
-                "src/mooncake_ep_kernel.cu",
-                "src/mooncake_ibgda/mlx5gda.cpp",
-            ],
+            sources=sources,
             extra_compile_args={
                 "cxx": [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
@@ -56,6 +59,7 @@ setup(
                 ],
                 "nvcc": [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    *( ["-DMOONCAKE_EP_USE_TENT=1"] if use_tent else [] ),
                     "-std=c++20",
                     "-Xcompiler",
                     "-O3",
