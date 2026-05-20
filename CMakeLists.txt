@@ -134,6 +134,7 @@ if (WITH_EP)
         "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+        "-DEP_USE_TENT=${USE_TENT}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"

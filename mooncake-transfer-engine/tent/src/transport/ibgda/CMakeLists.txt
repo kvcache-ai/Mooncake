@@ -1,5 +1,10 @@
 if(USE_CUDA AND IBVERBS_INCLUDE)
+  find_library(MLX5_LIB mlx5 PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                    /usr/local/lib64)
   file(GLOB XPORT_SOURCES "*.cpp")
   add_library(tent_xport_ibgda STATIC ${XPORT_SOURCES})
   target_link_libraries(tent_xport_ibgda PUBLIC tent_common tent_interface)
+  if(MLX5_LIB)
+    target_link_libraries(tent_xport_ibgda PUBLIC ${MLX5_LIB})
+  endif()
 endif()

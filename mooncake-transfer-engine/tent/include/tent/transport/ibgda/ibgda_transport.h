@@ -22,6 +22,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <infiniband/mlx5dv.h>
+#include <infiniband/verbs.h>
+
 #include "tent/runtime/device_transport.h"
 #include "tent/runtime/transport.h"
 
@@ -85,6 +88,21 @@ class IbGdaTransport : public Transport, public DeviceTransport {
 
     const DeviceCommCapabilities deviceCapabilities() const override;
 
+    // Initialize the verbs resources that are shared by host-side QP setup and
+    // device-side IBGDA resources.  This is the first ownership slice moved out
+    // of mooncake-ep: NIC selection, GID discovery, context open, and PD setup.
+    Status initializeDevice(const std::string& device_name,
+                            uint8_t port_num = 1);
+
+    ibv_context* verbsContext() const { return ctx_; }
+    ibv_pd* protectionDomain() const { return pd_; }
+    const mlx5dv_pd& mlx5ProtectionDomain() const { return mpd_; }
+    ibv_mr* memoryRegion() const { return mr_; }
+    const ibv_gid& gid() const { return gid_; }
+    int gidIndex() const { return gid_index_; }
+    bool isRoce() const { return is_roce_; }
+    uint8_t portNum() const { return port_num_; }
+
     // Stage-C bridge: lets an existing IBGDA host setup hand a GPU-visible
     // backend context to the TENT DeviceTransport interface. The full Stage-D
     // transport will allocate and populate this context internally.
@@ -105,6 +123,17 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     void* network_ctx_ = nullptr;
     int num_channels_ = 0;
     std::unordered_map<int, DevicePeerInfo> peer_info_;
+
+    std::string device_name_;
+    uint8_t port_num_ = 1;
+    ibv_context* ctx_ = nullptr;
+    ibv_pd* pd_ = nullptr;
+    mlx5dv_pd mpd_ = {};
+    ibv_mr* mr_ = nullptr;
+    ibv_gid gid_ = {};
+    int gid_index_ = -1;
+    bool is_roce_ = false;
+    std::unordered_map<void*, ibv_mr*> registered_mrs_;
 };
 
 }  // namespace tent

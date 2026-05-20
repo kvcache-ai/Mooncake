@@ -15,6 +15,12 @@ current_dir = os.path.abspath(os.path.dirname(__file__))
 # Try to link against the CUDA driver stub library if it exists.
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
+use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
 
 if CUDA_HOME is not None:
     cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
@@ -43,6 +49,7 @@ setup(
             extra_compile_args={
                 "cxx": [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    *( ["-DMOONCAKE_EP_USE_TENT=1"] if use_tent else [] ),
                     "-std=c++20",
                     "-O3",
                     "-g0",

@@ -6,6 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <fstream>
+#include <memory>
 #include <mooncake_ibgda/memheap.h>
 #include <mooncake_ibgda/mlx5gda.h>
 #include <mooncake_ep_api.cuh>
@@ -13,6 +14,9 @@
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <tent/runtime/device_resources.h>
+#ifdef MOONCAKE_EP_USE_TENT
+#include <tent/transport/ibgda/ibgda_transport.h>
+#endif
 #include <torch/torch.h>
 
 namespace mooncake {
@@ -90,10 +94,13 @@ struct MooncakeEpBuffer {
     int gid_index_ = -1;  // Dynamically discovered GID index
     int USE_QP_COUNT = MAX_QP_COUNT;
 
-    mlx5dv_devx_umem* ctrl_buf_umem;
-    ibv_pd* pd;
-    mlx5dv_pd mpd;
-    memheap* ctrl_buf_heap;
+    mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
+    ibv_pd* pd = nullptr;
+    mlx5dv_pd mpd = {};
+    memheap* ctrl_buf_heap = nullptr;
+#ifdef MOONCAKE_EP_USE_TENT
+    std::unique_ptr<tent::IbGdaTransport> tent_ibgda_transport_;
+#endif
 
     // Fabric memory (MNNVL)
     bool use_fabric_mem_ = false;

@@ -189,6 +189,24 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
+    for (auto* qp : qps) {
+        if (qp && ctrl_buf_heap) {
+            mlx5gda_destroy_qp(ctrl_buf_heap, qp);
+        }
+    }
+    qps.clear();
+    if (ctrl_buf_umem) mlx5dv_devx_umem_dereg(ctrl_buf_umem);
+    if (ctrl_buf_heap) memheap_destroy(ctrl_buf_heap);
+#ifdef MOONCAKE_EP_USE_TENT
+    // The TENT bridge owns the verbs context/PD/MR in the migration path.  It
+    // must outlive QP/umem teardown, but be destroyed before gdr_buffer free so
+    // its MR is deregistered while the GPU buffer is still valid.
+    if (tent_ibgda_transport_) tent_ibgda_transport_.reset();
+#else
+    if (mr) ibv_dereg_mr(mr);
+    if (pd) ibv_dealloc_pd(pd);
+#endif
+    if (ctrl_buf) cudaFree(ctrl_buf);
     if (use_fabric_mem_) {
         CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
         cuMemUnmap(dptr, fabric_alloc_size_);
@@ -462,6 +480,33 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 }
 
 int MooncakeEpBuffer::init_ibgda() {
+    ibv_context* ctx = nullptr;
+#ifdef MOONCAKE_EP_USE_TENT
+    tent_ibgda_transport_ = std::make_unique<tent::IbGdaTransport>();
+    auto status = tent_ibgda_transport_->initializeDevice(device_name, 1);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] TENT IBGDA device initialization failed: "
+                   << status.ToString();
+        return -1;
+    }
+    uint32_t lkey = 0;
+    uint32_t rkey = 0;
+    status = tent_ibgda_transport_->registerMemory(
+        gdr_buffer, num_ep_buffer_bytes, lkey, rkey);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] TENT IBGDA memory registration failed: "
+                   << status.ToString();
+        return -1;
+    }
+    ctx = tent_ibgda_transport_->verbsContext();
+    pd = tent_ibgda_transport_->protectionDomain();
+    mpd = tent_ibgda_transport_->mlx5ProtectionDomain();
+    mr = tent_ibgda_transport_->memoryRegion();
+    gid = tent_ibgda_transport_->gid();
+    gid_index_ = tent_ibgda_transport_->gidIndex();
+    LOG(INFO) << "[EP] GPU " << device_id << " uses TENT IBGDA NIC "
+              << device_name << " with GID index " << gid_index_;
+#else
     int num_devices;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
     int nic_id = -1;
@@ -478,7 +523,7 @@ int MooncakeEpBuffer::init_ibgda() {
     }
     LOG(INFO) << "[EP] GPU " << device_id << " uses NIC " << nic_id
               << " out of " << num_devices << " NIC(s)";
-    ibv_context* ctx = ibv_open_device(dev_list[nic_id]);
+    ctx = ibv_open_device(dev_list[nic_id]);
     if (!ctx) {
         perror("Failed to open device");
         return -1;
@@ -523,6 +568,7 @@ int MooncakeEpBuffer::init_ibgda() {
     if (!mr) {
         perror("Failed to reg mr");
     }
+#endif
 
     // Allocate ctrl_buf without zero-initialization. Individual regions will be
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
@@ -537,10 +583,16 @@ int MooncakeEpBuffer::init_ibgda() {
                 "does not support GPUDirect RDMA.\n");
         // Keep internal state consistent: IBGDA init failed, so `mr` must not
         // be treated as valid.
+#ifdef MOONCAKE_EP_USE_TENT
+        if (tent_ibgda_transport_) {
+            (void)tent_ibgda_transport_->unregisterMemory(gdr_buffer);
+        }
+#else
         if (mr) {
             ibv_dereg_mr(mr);
             mr = nullptr;
         }
+#endif
         return -1;
     }
     ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
