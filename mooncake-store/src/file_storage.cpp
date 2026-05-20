@@ -340,6 +340,9 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::unordered_map<std::string, int64_t>& offloading_objects) {
+    if (offloading_objects.empty()) {
+        return {};
+    }
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
@@ -513,6 +516,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
+    if (offloading_objects.empty()) {
+        return {};
+    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
