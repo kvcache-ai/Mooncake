@@ -149,12 +149,16 @@ int WorkerPool::submitPostSend(
         // If selected rail is paused, try alternative devices
         if (!isRailAvailable(peer_nic_path)) {
             bool found = false;
-            for (size_t alt_dev_id = 0; alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
+            for (size_t alt_dev_id = 0;
+                 alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id) continue;
-                auto alt_path = MakeNicPath(peer_segment_desc->name, peer_segment_desc->devices[alt_dev_id].name);
+                auto alt_path =
+                    MakeNicPath(peer_segment_desc->name,
+                                peer_segment_desc->devices[alt_dev_id].name);
                 if (isRailAvailable(alt_path)) {
                     device_id = alt_dev_id;
-                    slice->rdma.dest_rkey = peer_segment_desc->buffers[buffer_id].rkey[device_id];
+                    slice->rdma.dest_rkey =
+                        peer_segment_desc->buffers[buffer_id].rkey[device_id];
                     peer_nic_path = alt_path;
                     found = true;
                     break;
@@ -301,17 +305,19 @@ void WorkerPool::performPollCq(int thread_id) {
             if (wc[i].status != IBV_WC_SUCCESS) {
                 // All WC errors indicate path failure and should trigger
                 // redispatch to an alternate path (or fail if retry exhausted)
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR || globalConfig().trace) {
-                    LOG(ERROR) << "Worker: Process failed for slice (opcode: "
-                               << slice->opcode
-                               << ", source_addr: " << slice->source_addr
-                               << ", length: " << slice->length
-                               << ", dest_addr: " << (void *)slice->rdma.dest_addr
-                               << ", local_nic: " << context_.deviceName()
-                               << ", peer_nic: " << slice->peer_nic_path
-                               << ", dest_rkey: " << slice->rdma.dest_rkey
-                               << ", retry_cnt: " << slice->rdma.retry_cnt
-                               << "): " << ibv_wc_status_str(wc[i].status);
+                if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
+                    globalConfig().trace) {
+                    LOG(ERROR)
+                        << "Worker: Process failed for slice (opcode: "
+                        << slice->opcode
+                        << ", source_addr: " << slice->source_addr
+                        << ", length: " << slice->length
+                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
+                        << ", local_nic: " << context_.deviceName()
+                        << ", peer_nic: " << slice->peer_nic_path
+                        << ", dest_rkey: " << slice->rdma.dest_rkey
+                        << ", retry_cnt: " << slice->rdma.retry_cnt
+                        << "): " << ibv_wc_status_str(wc[i].status);
                 }
                 markRailFailed(slice->peer_nic_path);
                 if (slice->rdma.endpoint)

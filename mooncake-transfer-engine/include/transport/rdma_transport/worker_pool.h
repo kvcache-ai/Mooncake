@@ -82,7 +82,7 @@ class WorkerPool {
     std::mutex rail_state_lock_;
 
     // Rail monitor configuration
-    const static int kRailErrorThreshold = 5;      // Errors before pause
+    const static int kRailErrorThreshold = 5;            // Errors before pause
     const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
 };
 }  // namespace mooncake

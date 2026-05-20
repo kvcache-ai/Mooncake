@@ -97,7 +97,8 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
         if (iter->second.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
             waiting_list_len_++;
@@ -250,7 +251,8 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
 int SIEVEEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     // Find endpoint by pointer
-    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end(); ++iter) {
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
         if (iter->second.first.get() == endpoint_ptr) {
             std::string peer_nic_path = iter->first;
             iter->second.first->beginDestroy();
