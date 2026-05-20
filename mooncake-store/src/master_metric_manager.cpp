@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
+#include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
