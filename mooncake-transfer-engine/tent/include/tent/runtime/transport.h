@@ -33,6 +33,8 @@
 
 namespace mooncake {
 namespace tent {
+class DeviceTransport;
+
 struct Capabilities {
     bool dram_to_dram = false;
     bool dram_to_gpu = false;  // dram as local side, gpu as peer side
@@ -67,6 +69,8 @@ class Transport {
     virtual Status uninstall() { return Status::OK(); }
 
     virtual const Capabilities capabilities() const { return caps; }
+
+    virtual DeviceTransport* asDeviceTransport() { return nullptr; }
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::NotImplemented(

@@ -9,146 +9,19 @@
 #include <mooncake_ep_launch.cuh>
 #include <mooncake_ibgda/mlx5gda.h>
 #include <mooncake_ep_utils.cuh>
+#include <tent/device/network/ibgda/ibgda_ops.cuh>
+#include <tent/device/platform/cuda/cuda_ops.cuh>
 
 namespace mooncake {
 
-static __device__ void device_mutex_lock_system(uint32_t *mutex) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(*mutex);
-    // Spin until the mutex is acquired
-    while (lock.exchange(1, cuda::memory_order_acquire) != 0);
-}
+using mooncake::tent::device::cuda_platform::cudaDeviceOps;
+using mooncake::tent::device::ibgda::IbGdaCtx;
+using mooncake::tent::device::ibgda::IbGdaQpDevCtx;
+using mooncake::tent::device::ibgda::ibgda_put;
+using mooncake::tent::device::ibgda::ibgda_red_add;
 
-static __device__ void device_mutex_unlock_system(uint32_t *mutex) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(*mutex);
-    // Release the mutex
-    lock.store(0, cuda::memory_order_release);
-}
-
-static __device__ uint16_t device_byteswap(uint16_t x) {
-    return __byte_perm(x, x, 0x2301);
-}
-
-static __device__ uint32_t device_byteswap(uint32_t x) {
-    return __byte_perm(x, x, 0x0123);
-}
-
-static __device__ uint64_t device_byteswap(uint64_t x) {
-    uint32_t hi = (uint32_t)(x >> 32);
-    uint32_t lo = (uint32_t)(x);
-
-    hi = __byte_perm(hi, hi, 0x0123);
-    lo = __byte_perm(lo, lo, 0x0123);
-
-    return ((uint64_t)lo << 32) | hi;
-}
-
-__device__ static inline uint16_t ptx_ld16_acq_sys_na(uint16_t *ptr) {
-    uint16_t val;
-    asm volatile("ld.acquire.sys.global.L1::no_allocate.b16 %0, [%1];" : "=h"(val) : "l"(ptr));
-    return val;
-}
-
-// must be called with mutex locked
-static __device__ void __mlx5gda_device_poll_cq(struct mlx5gda_qp_devctx *ctx, uint16_t expect) {
-    uint16_t wq_tail = ctx->wq_tail;
-    while ((int16_t)(wq_tail - expect) <= 0) {
-        uint16_t cq_wqe_counter_be = ptx_ld16_acq_sys_na(&ctx->cq->wqe_counter);
-        // printf("cq_wqe_counter_be=0x%x, expect=0x%x\n", cq_wqe_counter_be, expect);
-        uint8_t opcode = ctx->cq->op_own >> 4;
-        if (opcode == 0xD) {
-            printf("Requester_Error: syndrome = 0x%lx\n", ctx->cq->timestamp >> 56);
-        }
-        EP_DEVICE_ASSERT(opcode == 0x0 || opcode == 0xF);
-        wq_tail = device_byteswap(cq_wqe_counter_be) + 1;
-    }
-    if (wq_tail != ctx->wq_tail) {
-        ctx->wq_tail = wq_tail;
-    }
-}
-
-__device__ static inline void ptx_st32_rel_sys_na(uint32_t *ptr, uint32_t val) {
-    asm volatile("st.release.sys.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
-}
-
-__device__ static inline void ptx_st64_rel_sys_na(uint64_t *ptr, uint64_t val) {
-    asm volatile("st.release.sys.global.L1::no_allocate.b64 [%0], %1;" : : "l"(ptr), "l"(val));
-}
-
-/**
- * Ring DB to post WQs up to last_posted_wqe.
- *
- * Must be called with mutex locked.
- */
-static __device__ void __mlx5gda_device_post_send_db(struct mlx5gda_qp_devctx *ctx) {
-    // 1. update dbr
-    uint32_t num_posted_wqe = (uint32_t)(ctx->wq_head);
-    ptx_st32_rel_sys_na(&ctx->dbr->send_counter, device_byteswap((uint32_t)ctx->wq_head));
-    // 2. ring db
-    struct mlx5gda_wqebb *last_wqe = ctx->wq + ((num_posted_wqe - 1) & ctx->wqeid_mask);
-    // printf("Last wqe=%lx -> bf=%p\n", *(uint64_t*)last_wqe, ctx->bf + ctx->bf_offset);
-    ptx_st64_rel_sys_na((uint64_t*)(ctx->bf + ctx->bf_offset), *(uint64_t*)last_wqe);
-    // 3. toggle bf
-    ctx->bf_offset ^= MLX5GDA_BF_SIZE;
-}
-
-static __device__ void __mlx5gda_device_write_rdma_write_wqe(
-    struct mlx5gda_qp_devctx *ctx, uint64_t laddr, __be32 lkey,
-    uint64_t raddr, __be32 rkey, uint32_t bytes) {
-    struct mlx5gda_rdma_write_wqe *wqe = (mlx5gda_rdma_write_wqe *)(ctx->wq + (ctx->wq_head & ctx->wqeid_mask));
-    struct mlx5_wqe_ctrl_seg &ctrl_seg = wqe->ctrl;
-    struct mlx5_wqe_raddr_seg &raddr_seg = wqe->raddr;
-    struct mlx5_wqe_data_seg &data_seg = wqe->data;
-
-    ctrl_seg = {};
-    ctrl_seg.qpn_ds = device_byteswap((ctx->qpn << 8) | 3);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = device_byteswap(((uint32_t)ctx->wq_head << 8) | MLX5_OPCODE_RDMA_WRITE);
-
-    raddr_seg.raddr = device_byteswap(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    data_seg.byte_count = device_byteswap(bytes);
-    data_seg.lkey = lkey;
-    data_seg.addr = device_byteswap(laddr);
-
-    ++ctx->wq_head;
-}
-
-struct mlx5_wqe_atomic_add_32_seg {
-    __be32		add_data;
-    __be32		field_boundary;
-    __be64		compare;
-};
-
-static __device__ void __mlx5gda_device_write_rdma_atomic_add_wqe(
-    struct mlx5gda_qp_devctx *ctx, const int& value, uint64_t laddr,
-    __be32 lkey, uint64_t raddr, __be32 rkey) {
-    struct mlx5gda_rdma_atomic_wqe *wqe = (mlx5gda_rdma_atomic_wqe *)(ctx->wq + (ctx->wq_head & ctx->wqeid_mask));
-    struct mlx5_wqe_ctrl_seg &ctrl_seg = wqe->ctrl;
-    struct mlx5_wqe_raddr_seg &raddr_seg = wqe->raddr;
-    struct mlx5_wqe_data_seg &data_seg = wqe->data;
-
-    ctrl_seg = {};
-    ctrl_seg.qpn_ds = device_byteswap((ctx->qpn << 8) | 4);
-    ctrl_seg.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    ctrl_seg.opmod_idx_opcode = device_byteswap(MLX5_OPCODE_ATOMIC_MASKED_FA | ((uint32_t)ctx->wq_head << 8) | 0x08000000);
-
-    raddr_seg.raddr = device_byteswap(raddr);
-    raddr_seg.rkey = rkey;
-    raddr_seg.reserved = 0;
-
-    auto atomic_add_32_seg = reinterpret_cast<mlx5_wqe_atomic_add_32_seg *>(&wqe->atomic);
-    atomic_add_32_seg->add_data = device_byteswap((uint32_t)value);
-    atomic_add_32_seg->field_boundary = 0;
-    atomic_add_32_seg->compare = 0;
-
-    data_seg.byte_count = device_byteswap((uint32_t)4);
-    data_seg.lkey = lkey;
-    data_seg.addr = device_byteswap(laddr);
-
-    ++ctx->wq_head;
-}
+static_assert(sizeof(IbGdaQpDevCtx) == sizeof(mlx5gda_qp_devctx),
+              "IbGdaQpDevCtx must stay ABI-compatible with mlx5gda_qp_devctx");
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
@@ -195,8 +68,19 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // IBGDA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
-    auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
+                          ctx_array,
+                          rkey_array,
+                          raddr_array,
+                          mxa_buffer,
+                          rdma_send_signal_buffer,
+                          rdma_recv_signal_buffer,
+                          rkey_array[rank],
+                          rank,
+                          static_cast<int>(num_qp_per_rank),
+                          num_ranks};
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -286,12 +170,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                     } else {
                         if (lane_id == 0) {
-                            uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
-                            device_mutex_lock_system(&ctx->mutex);
-                            __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
-                            __mlx5gda_device_post_send_db(ctx);
-                            device_mutex_unlock_system(&ctx->mutex);
+                            ibgda_put(&ibgda_ctx, dst_expert_local_idx,
+                                      reinterpret_cast<void*>(dst_ptr),
+                                      reinterpret_cast<const void*>(src_ptr),
+                                      num_bytes_per_msg, dst_rank);
                         }
                     }
                 } else {
@@ -362,13 +244,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
                 st_na_release(peer_signal_ptr, -num_tokens_sent - 1);
             } else {
-                uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-                uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-                auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
-                device_mutex_lock_system(&ctx->mutex);
-                __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
-                __mlx5gda_device_post_send_db(ctx);
-                device_mutex_unlock_system(&ctx->mutex);
+                ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
+                              rdma_recv_signal_buffer +
+                                  dst_expert_local_idx * num_ranks + rank,
+                              static_cast<uint64_t>(-num_tokens_sent - 1),
+                              dst_rank);
             }
         } else {
             st_na_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
@@ -555,8 +435,19 @@ combine(void* combined_x, int32_t* active_ranks,
     // IBGDA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
-    auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
+                          ctx_array,
+                          rkey_array,
+                          raddr_array,
+                          mxa_buffer,
+                          rdma_send_signal_buffer,
+                          rdma_recv_signal_buffer,
+                          rkey_array[rank],
+                          rank,
+                          static_cast<int>(num_qp_per_rank),
+                          num_ranks};
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -617,12 +508,10 @@ combine(void* combined_x, int32_t* active_ranks,
                     __syncwarp();
 
                     if (lane_id == 0) {
-                        uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
-                        device_mutex_lock_system(&ctx->mutex);
-                        __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
-                        __mlx5gda_device_post_send_db(ctx);
-                        device_mutex_unlock_system(&ctx->mutex);
+                        ibgda_put(&ibgda_ctx, local_expert_idx,
+                                  reinterpret_cast<void*>(dst_ptr),
+                                  reinterpret_cast<const void*>(buf_ptr),
+                                  num_bytes_per_slot, dst_rank);
                     }
                 }
             }
@@ -641,13 +530,9 @@ combine(void* combined_x, int32_t* active_ranks,
                     int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
                     st_na_release(peer_signal_ptr, 1);
                 } else {
-                    uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                    uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
-                    device_mutex_lock_system(&ctx->mutex);
-                    __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
-                    __mlx5gda_device_post_send_db(ctx);
-                    device_mutex_unlock_system(&ctx->mutex);
+                    ibgda_red_add(&ibgda_ctx, local_expert_idx,
+                                  rdma_recv_signal_buffer + global_expert_idx,
+                                  1, dst_rank);
                 }
             } else {
                 st_na_release(rdma_recv_signal_buffer + global_expert_idx, 1);

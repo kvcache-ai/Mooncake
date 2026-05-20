@@ -80,6 +80,7 @@ enum TransportType {
     TCP,
     AscendDirect,
     SUNRISE_LINK,
+    IBGDA,
     UNSPEC
 };
 const static int kSupportedTransportTypes = (int)TransportType::UNSPEC;

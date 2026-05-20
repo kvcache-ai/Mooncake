@@ -47,11 +47,34 @@ struct BootstrapDesc {
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
+    std::unordered_map<int, std::string> transport_attrs;
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    friend void to_json(nlohmann::json& j, const BootstrapDesc& desc) {
+        j = nlohmann::json{{"local_nic_path", desc.local_nic_path},
+                           {"peer_nic_path", desc.peer_nic_path},
+                           {"qp_num", desc.qp_num},
+                           {"local_lid", desc.local_lid},
+                           {"local_gid", desc.local_gid},
+                           {"reply_msg", desc.reply_msg},
+                           {"notify_qp_num", desc.notify_qp_num},
+                           {"transport_attrs", desc.transport_attrs}};
+    }
+
+    friend void from_json(const nlohmann::json& j, BootstrapDesc& desc) {
+        j.at("local_nic_path").get_to(desc.local_nic_path);
+        j.at("peer_nic_path").get_to(desc.peer_nic_path);
+        j.at("qp_num").get_to(desc.qp_num);
+        j.at("local_lid").get_to(desc.local_lid);
+        j.at("local_gid").get_to(desc.local_gid);
+        j.at("reply_msg").get_to(desc.reply_msg);
+        j.at("notify_qp_num").get_to(desc.notify_qp_num);
+        if (auto it = j.find("transport_attrs"); it != j.end()) {
+            it->get_to(desc.transport_attrs);
+        } else {
+            desc.transport_attrs.clear();
+        }
+    }
 };
 
 struct XferDataDesc {

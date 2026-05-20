@@ -30,4 +30,5 @@ find_package(Torch REQUIRED)
 include_directories(${TORCH_INCLUDE_DIRS})
 
 include_directories(include)
+include_directories(../mooncake-transfer-engine/tent/include)
 add_subdirectory(src)

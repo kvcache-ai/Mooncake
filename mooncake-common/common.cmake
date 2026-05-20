@@ -115,7 +115,7 @@ option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
-option(USE_TENT "option for building Mooncake TENT" OFF)
+option(USE_TENT "option for building Mooncake TENT" ON)
 option(ENABLE_MULTI_PROTOCOL "option for enabling multi-protocol support in transfer engine" OFF)
 if (ENABLE_MULTI_PROTOCOL)
     add_compile_definitions(ENABLE_MULTI_PROTOCOL)

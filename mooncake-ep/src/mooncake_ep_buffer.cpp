@@ -54,6 +54,16 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port,
     return -1;
 }
 
+void MooncakeEpBuffer::refresh_tent_ibgda_context() {
+    tent_ibgda_ctx_.abi_version = tent::kIbGdaDeviceContextAbiVersion;
+    tent_ibgda_ctx_.rank = rank;
+    tent_ibgda_ctx_.num_ranks = num_ranks;
+    tent_ibgda_ctx_.num_qps = USE_QP_COUNT;
+    tent_ibgda_ctx_.raddrs = raddrs;
+    tent_ibgda_ctx_.rkeys = rkeys;
+    tent_ibgda_ctx_.qp_devctxs = qp_devctxs;
+}
+
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    std::string device_name)
@@ -156,6 +166,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
         cudaMalloc(&qp_devctxs, USE_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
+    refresh_tent_ibgda_context();
 
     // Allocate NVLink P2P arrays
     CUDA_CHECK(cudaMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));

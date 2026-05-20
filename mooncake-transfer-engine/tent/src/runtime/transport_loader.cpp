@@ -20,6 +20,10 @@
 #include "tent/transport/rdma/rdma_transport.h"
 #endif
 
+#if defined(USE_CUDA) && defined(USE_RDMA)
+#include "tent/transport/ibgda/ibgda_transport.h"
+#endif
+
 #ifdef USE_CUDA
 #include "tent/transport/nvlink/nvlink_transport.h"
 #include "tent/transport/mnnvl/mnnvl_transport.h"
@@ -56,6 +60,13 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/rdma/enable", true) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
         transport_list_[RDMA] = std::make_shared<RdmaTransport>();
+    }
+#endif
+
+#if defined(USE_CUDA) && defined(USE_RDMA)
+    if (conf_->get("transports/ibgda/enable", false) &&
+        topology_->getNicCount(Topology::NIC_RDMA)) {
+        transport_list_[IBGDA] = std::make_shared<IbGdaTransport>();
     }
 #endif
 

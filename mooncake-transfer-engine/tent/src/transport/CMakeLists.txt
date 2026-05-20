@@ -1,5 +1,6 @@
 add_subdirectory(tcp)
 add_subdirectory(rdma)
+add_subdirectory(ibgda)
 add_subdirectory(shm)
 add_subdirectory(nvlink)
 add_subdirectory(mnnvl)
@@ -17,6 +18,7 @@ foreach(
   tent_xport_bufio
   tent_xport_mnnvl
   tent_xport_nvlink
+  tent_xport_ibgda
   tent_xport_rdma
   tent_xport_shm
   tent_xport_tcp

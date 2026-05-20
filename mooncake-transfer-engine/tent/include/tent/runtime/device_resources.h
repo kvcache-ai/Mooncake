@@ -1,0 +1,63 @@
+// Copyright 2026 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef TENT_RUNTIME_DEVICE_RESOURCES_H_
+#define TENT_RUNTIME_DEVICE_RESOURCES_H_
+
+#include <cstdint>
+
+namespace mooncake {
+namespace tent {
+
+struct DeviceCommCapabilities {
+    bool gpu_initiated_rdma = false;
+    bool symmetric_memory = false;
+    bool nvlink_p2p = false;
+    bool signal = false;
+    bool atomic = false;
+    int latency_tier_ns = 0;
+};
+
+struct DeviceChannelResources {
+    int channel_id = 0;
+    int num_channels = 0;
+    void* network_ctx = nullptr;
+};
+
+struct DevicePeerInfo {
+    uint64_t raddr = 0;
+    uint32_t rkey = 0;
+    uint32_t qp_num = 0;
+};
+
+inline constexpr uint32_t kIbGdaDeviceContextAbiVersion = 1;
+
+// GPU-visible IBGDA resources consumed by EP kernels.  TENT owns this ABI so
+// mooncake-ep can gradually stop depending on its legacy mlx5gda host layout.
+// The pointer fields refer to device allocations unless otherwise documented by
+// the transport implementation.
+struct IbGdaDeviceContext {
+    uint32_t abi_version = kIbGdaDeviceContextAbiVersion;
+    int rank = 0;
+    int num_ranks = 0;
+    int num_qps = 0;
+    void* raddrs = nullptr;
+    void* rkeys = nullptr;
+    void* qp_devctxs = nullptr;
+};
+
+}  // namespace tent
+}  // namespace mooncake
+
+#endif  // TENT_RUNTIME_DEVICE_RESOURCES_H_

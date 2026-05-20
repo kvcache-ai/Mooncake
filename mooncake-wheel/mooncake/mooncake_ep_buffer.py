@@ -62,6 +62,8 @@ class EventOverlap:
 
 
 class Buffer:
+    _metadata_session_counter = 0
+
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
         from mooncake import ep, pg
 
@@ -72,6 +74,9 @@ class Buffer:
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         # Get the index of the closest NIC
         self.backend = self.group
+        self._metadata_session = Buffer._metadata_session_counter
+        Buffer._metadata_session_counter += 1
+        self._metadata_epoch = 0
         preferred_hca = pg.get_preferred_hca(
             self.group, f"cuda:{torch.cuda.current_device()}"
         )
@@ -85,97 +90,303 @@ class Buffer:
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
         self.connect()
     
-    def connect(self, is_update: bool = False):
+    def _sync_ibgda_from_metadata(self, peers: List[dict]) -> None:
+        from mooncake import ep
+        from mooncake.ep import get_active_ranks
+
+        all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+        raddrs = [peer["raddr"] for peer in peers]
+        rkeys = [peer["rkey"] for peer in peers]
+        remote_qpns: List[int] = []
+        for peer in peers:
+            start = self.rank * all_to_all_size
+            end = start + all_to_all_size
+            remote_qpns.extend(peer["qpns"][start:end])
+
+        active_ranks_mask = get_active_ranks(self.backend).tolist()
+        if self.runtime.is_roce():
+            subnet_prefixes = [peer["subnet_prefix"] for peer in peers]
+            interface_ids = [peer["interface_id"] for peer in peers]
+            self.runtime.sync_roce(
+                raddrs,
+                rkeys,
+                remote_qpns,
+                subnet_prefixes,
+                interface_ids,
+                active_ranks_mask,
+            )
+        else:
+            remote_lids: List[int] = []
+            for peer in peers:
+                start = self.rank * all_to_all_size
+                end = start + all_to_all_size
+                remote_lids.extend(peer["lids"][start:end])
+            self.runtime.sync_ib(
+                raddrs, rkeys, remote_qpns, remote_lids, active_ranks_mask
+            )
+
+    def _local_ibgda_metadata(self) -> dict:
+        (raddr, rkey) = self.runtime.get_mr_info()
+        subnet_prefix, interface_id = (0, 0)
+        if self.runtime.is_roce():
+            (subnet_prefix, interface_id) = self.runtime.get_gid()
+        return {
+            "version": 1,
+            "rank": self.rank,
+            "raddr": int(raddr),
+            "rkey": int(rkey),
+            "is_roce": bool(self.runtime.is_roce()),
+            "subnet_prefix": int(subnet_prefix),
+            "interface_id": int(interface_id),
+            "qpns": [int(x) for x in self.runtime.get_local_qpns()],
+            "lids": [int(x) for x in self.runtime.get_local_lids()],
+        }
+
+    def _encode_ibgda_metadata(self, metadata: dict) -> torch.Tensor:
         from mooncake import ep
 
-        if not self._use_fallback:
-            (raddr, rkey) = self.runtime.get_mr_info()
+        payload = torch.zeros(8 + 2 * ep.MAX_QP_COUNT, dtype=torch.int64, device="cuda")
+        payload[0] = metadata["version"]
+        payload[1] = metadata["rank"]
+        payload[2] = metadata["raddr"]
+        payload[3] = metadata["rkey"]
+        payload[4] = 1 if metadata["is_roce"] else 0
+        payload[5] = metadata["subnet_prefix"]
+        payload[6] = metadata["interface_id"]
+        payload[7] = len(metadata["qpns"])
+        qpns = metadata["qpns"]
+        lids = metadata["lids"]
+        payload[8 : 8 + len(qpns)] = torch.tensor(qpns, dtype=torch.int64, device="cuda")
+        lid_base = 8 + ep.MAX_QP_COUNT
+        payload[lid_base : lid_base + len(lids)] = torch.tensor(
+            lids, dtype=torch.int64, device="cuda"
+        )
+        return payload
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
-            raddrs = [
+    def _decode_ibgda_metadata(self, payload: torch.Tensor, expected_rank: int) -> dict:
+        from mooncake import ep
+
+        values = payload.cpu().tolist()
+        version = int(values[0])
+        rank = int(values[1])
+        qp_count = int(values[7])
+        if version != 1:
+            raise RuntimeError(f"Unsupported IBGDA metadata version: {version}")
+        if rank != expected_rank:
+            raise RuntimeError(
+                f"IBGDA metadata rank mismatch: expected {expected_rank}, got {rank}"
+            )
+        if qp_count <= 0 or qp_count > ep.MAX_QP_COUNT:
+            raise RuntimeError(f"Invalid IBGDA metadata QP count: {qp_count}")
+        lid_base = 8 + ep.MAX_QP_COUNT
+        return {
+            "version": version,
+            "rank": rank,
+            "raddr": int(values[2]),
+            "rkey": int(values[3]),
+            "is_roce": bool(values[4]),
+            "subnet_prefix": int(values[5]),
+            "interface_id": int(values[6]),
+            "qpns": [int(x) for x in values[8 : 8 + qp_count]],
+            "lids": [int(x) for x in values[lid_base : lid_base + qp_count]],
+        }
+
+    def _exchange_ibgda_metadata_store_ordered(self, is_update: bool = False) -> None:
+        import json
+        import os
+        import time
+
+        if is_update:
+            self.runtime.update_local_qpns()
+
+        try:
+            from torch.distributed import distributed_c10d
+
+            store = distributed_c10d._get_default_store()
+        except Exception as exc:
+            raise RuntimeError(
+                "Ordered IBGDA metadata exchange requires a c10d default store. "
+                "Set MOONCAKE_EP_METADATA_EXCHANGE=broadcast or legacy to use "
+                "the collective fallback."
+            ) from exc
+
+        epoch = self._metadata_epoch
+        self._metadata_epoch += 1
+        prefix = (
+            f"mooncake_ep/ibgda/v1/world{self.group_size}/"
+            f"session{self._metadata_session}/epoch{epoch}"
+        )
+        local_key = f"{prefix}/rank{self.rank}"
+        store.set(local_key, json.dumps(self._local_ibgda_metadata()).encode("utf-8"))
+
+        timeout_s = float(os.getenv("MOONCAKE_EP_METADATA_TIMEOUT_SEC", "300"))
+        deadline = time.monotonic() + timeout_s
+        peers: List[dict] = []
+        for peer_rank in range(self.group_size):
+            key = f"{prefix}/rank{peer_rank}"
+            while not store.check([key]):
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for IBGDA metadata from rank {peer_rank} "
+                        f"under key {key}"
+                    )
+                time.sleep(0.01)
+            raw = store.get(key)
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8")
+            metadata = json.loads(bytes(raw).decode("utf-8"))
+            if int(metadata.get("version", -1)) != 1:
+                raise RuntimeError(
+                    f"Unsupported IBGDA metadata version from rank {peer_rank}: "
+                    f"{metadata.get('version')}"
+                )
+            if int(metadata.get("rank", -1)) != peer_rank:
+                raise RuntimeError(
+                    f"IBGDA metadata rank mismatch: expected {peer_rank}, "
+                    f"got {metadata.get('rank')}"
+                )
+            peers.append(metadata)
+
+        local_is_roce = bool(self.runtime.is_roce())
+        for peer in peers:
+            if bool(peer["is_roce"]) != local_is_roce:
+                raise RuntimeError(
+                    "Inconsistent IBGDA metadata: mixed IB and RoCE ranks"
+                )
+        self._sync_ibgda_from_metadata(peers)
+
+    def _exchange_ibgda_metadata_broadcast_ordered(
+        self, is_update: bool = False
+    ) -> None:
+        if is_update:
+            self.runtime.update_local_qpns()
+
+        local_payload = self._encode_ibgda_metadata(self._local_ibgda_metadata())
+        peers: List[dict] = []
+        for src_rank in range(self.group_size):
+            payload = (
+                local_payload.clone()
+                if src_rank == self.rank
+                else torch.empty_like(local_payload)
+            )
+            dist.broadcast(payload, src=src_rank, group=self.group)
+            peers.append(self._decode_ibgda_metadata(payload, src_rank))
+
+        local_is_roce = bool(self.runtime.is_roce())
+        for peer in peers:
+            if bool(peer["is_roce"]) != local_is_roce:
+                raise RuntimeError(
+                    "Inconsistent IBGDA metadata: mixed IB and RoCE ranks"
+                )
+        self._sync_ibgda_from_metadata(peers)
+
+    def _exchange_ibgda_metadata_legacy(self, is_update: bool = False) -> None:
+        from mooncake import ep
+        from mooncake.ep import get_active_ranks
+
+        (raddr, rkey) = self.runtime.get_mr_info()
+
+        raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+        raddrs = [
+            torch.empty(1, dtype=torch.int64, device="cuda")
+            for _ in range(self.group_size)
+        ]
+        dist.all_gather(raddrs, raddr, self.group)
+        raddrs = torch.cat(raddrs).tolist()
+
+        rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+        rkeys = [
+            torch.empty(1, dtype=torch.int32, device="cuda")
+            for _ in range(self.group_size)
+        ]
+        dist.all_gather(rkeys, rkey, self.group)
+        rkeys = torch.cat(rkeys).tolist()
+
+        all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+
+        if is_update:
+            self.runtime.update_local_qpns()
+
+        local_qpns = self.runtime.get_local_qpns()
+        local_qpns = list(
+            torch.unbind(
+                torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                    -1, all_to_all_size
+                )
+            )
+        )
+        remote_qpns = [
+            torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+            for _ in range(self.group_size)
+        ]
+        dist.all_to_all(remote_qpns, local_qpns, self.group)
+        remote_qpns = torch.cat(remote_qpns).tolist()
+
+        active_ranks_mask = get_active_ranks(self.backend).tolist()
+        if self.runtime.is_roce():
+            (subnet_prefix, interface_id) = self.runtime.get_gid()
+
+            subnet_prefix = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefixes = [
                 torch.empty(1, dtype=torch.int64, device="cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(raddrs, raddr, self.group)
-            raddrs = torch.cat(raddrs).tolist()
+            dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
+            subnet_prefixes = torch.cat(subnet_prefixes).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
-            rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
+            interface_id = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_ids = [
+                torch.empty(1, dtype=torch.int64, device="cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(rkeys, rkey, self.group)
-            rkeys = torch.cat(rkeys).tolist()
+            dist.all_gather(interface_ids, interface_id, self.group)
+            interface_ids = torch.cat(interface_ids).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
-            if is_update:
-                self.runtime.update_local_qpns()
-
-            local_qpns = self.runtime.get_local_qpns()
-            local_qpns = list(
+            self.runtime.sync_roce(
+                raddrs,
+                rkeys,
+                remote_qpns,
+                subnet_prefixes,
+                interface_ids,
+                active_ranks_mask,
+            )
+        else:
+            local_lids = self.runtime.get_local_lids()
+            local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
                         -1, all_to_all_size
                     )
                 )
             )
-            remote_qpns = [
+            remote_lids = [
                 torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_qpns, local_qpns, self.group)
-            remote_qpns = torch.cat(remote_qpns).tolist()
+            dist.all_to_all(remote_lids, local_lids, self.group)
+            remote_lids = torch.cat(remote_lids).tolist()
 
-            if self.runtime.is_roce():
-                (subnet_prefix, interface_id) = self.runtime.get_gid()
+            self.runtime.sync_ib(
+                raddrs, rkeys, remote_qpns, remote_lids, active_ranks_mask
+            )
 
-                subnet_prefix = torch.tensor(
-                    [subnet_prefix], dtype=torch.int64, device="cuda"
-                )
-                subnet_prefixes = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
-                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
+    def connect(self, is_update: bool = False):
+        if not self._use_fallback:
+            import os
 
-                interface_id = torch.tensor(
-                    [interface_id], dtype=torch.int64, device="cuda"
-                )
-                interface_ids = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(interface_ids, interface_id, self.group)
-                interface_ids = torch.cat(interface_ids).tolist()
-
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_roce(
-                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids,
-                    active_ranks_mask
-                )
+            mode = os.getenv("MOONCAKE_EP_METADATA_EXCHANGE", "ordered").lower()
+            if mode in ("ordered", "tent"):
+                self._exchange_ibgda_metadata_store_ordered(is_update)
+            elif mode in ("broadcast", "ordered-broadcast"):
+                self._exchange_ibgda_metadata_broadcast_ordered(is_update)
+            elif mode in ("legacy", "collective"):
+                self._exchange_ibgda_metadata_legacy(is_update)
             else:
-                local_lids = self.runtime.get_local_lids()
-                local_lids = list(
-                    torch.unbind(
-                        torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                            -1, all_to_all_size
-                        )
-                    )
+                raise ValueError(
+                    "MOONCAKE_EP_METADATA_EXCHANGE must be ordered, broadcast, "
+                    "or legacy, "
+                    f"got {mode!r}"
                 )
-                remote_lids = [
-                    torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_to_all(remote_lids, local_lids, self.group)
-                remote_lids = torch.cat(remote_lids).tolist()
-
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids,
-                                     active_ranks_mask)
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()

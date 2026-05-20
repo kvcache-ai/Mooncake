@@ -1,0 +1,5 @@
+if(USE_CUDA AND IBVERBS_INCLUDE)
+  file(GLOB XPORT_SOURCES "*.cpp")
+  add_library(tent_xport_ibgda STATIC ${XPORT_SOURCES})
+  target_link_libraries(tent_xport_ibgda PUBLIC tent_common tent_interface)
+endif()

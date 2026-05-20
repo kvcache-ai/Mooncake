@@ -12,6 +12,7 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
+#include <tent/runtime/device_resources.h>
 #include <torch/torch.h>
 
 namespace mooncake {
@@ -82,6 +83,7 @@ struct MooncakeEpBuffer {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
+    tent::IbGdaDeviceContext tent_ibgda_ctx_;
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
@@ -137,6 +139,8 @@ struct MooncakeEpBuffer {
                                           int hidden, int num_experts);
 
     int init_ibgda();
+
+    void refresh_tent_ibgda_context();
 
     bool ibgda_disabled() { return ibgda_disabled_; }
 
@@ -206,6 +210,16 @@ struct MooncakeEpBuffer {
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
         }
         return local_lids;
+    }
+
+    std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
+    get_tent_ibgda_context_info() {
+        return {static_cast<int32_t>(tent_ibgda_ctx_.abi_version),
+                static_cast<int32_t>(tent_ibgda_ctx_.num_ranks),
+                static_cast<int32_t>(tent_ibgda_ctx_.num_qps),
+                reinterpret_cast<int64_t>(tent_ibgda_ctx_.raddrs),
+                reinterpret_cast<int64_t>(tent_ibgda_ctx_.rkeys),
+                reinterpret_cast<int64_t>(tent_ibgda_ctx_.qp_devctxs)};
     }
 
     std::vector<int32_t> get_ipc_handle();

@@ -1,10 +1,9 @@
 import os
 import re
 
-from setuptools import setup
 import torch
+from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
-
 
 torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
 version_suffix = "_" + torch_version.replace(".", "_")
@@ -25,7 +24,6 @@ if CUDA_HOME is not None:
         cuda_library_dirs.append(cuda_stub_dir)
 
 
-
 setup(
     name=module_name,
     ext_modules=[
@@ -34,6 +32,7 @@ setup(
             include_dirs=[
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+                os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
             ],
             sources=[
                 "src/ep_py.cpp",
@@ -42,8 +41,20 @@ setup(
                 "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+                "cxx": [
+                    f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    "-std=c++20",
+                    "-O3",
+                    "-g0",
+                ],
+                "nvcc": [
+                    f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    "-std=c++20",
+                    "-Xcompiler",
+                    "-O3",
+                    "-Xcompiler",
+                    "-g0",
+                ],
             },
             libraries=cuda_libraries,
             library_dirs=cuda_library_dirs,
