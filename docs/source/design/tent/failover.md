@@ -8,7 +8,7 @@ The design has two layers:
 1. **Cross-transport failover** in `TransferEngineImpl`. When a transport fails a task at the completion stage, the engine moves that task to the next available transport (for example RDMA → TCP). Submit-stage failures are not retried today; see Known Gaps.
 2. **Intra-RDMA rail recovery** in `RailMonitor`. When a specific (local NIC, remote NIC) rail keeps failing, the monitor pauses it with exponential cooldown; a successful transfer or the cooldown expiry brings it back.
 
-Application code submits a batch and polls `getTransferStatus`. It never sees a `FAILED` task as long as any healthy path remains and the failover budget is not exhausted.
+Application code submits a batch and polls `getTransferStatus`. By default, it never sees a `FAILED` task as long as any healthy path remains and the failover budget is not exhausted.
 
 ## Fault Model
 
@@ -96,6 +96,7 @@ All knobs live in the top-level `transfer-engine.json`. Defaults are safe for pr
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `max_failover_attempts` | `3` | Upper bound on `resubmitTransferTask` calls per task. `0` disables cross-transport failover entirely. `1` allows exactly one switch. |
+| `enable_auto_failover_on_poll` | `true` | Controls whether status polling can trigger automatic cross-transport failover. Set to `false` to make `getTransferStatus` observational only. |
 | `transports/rdma/rail_error_threshold` | `3` | Number of failures inside `rail_error_window_secs` that trips a rail into the paused state. |
 | `transports/rdma/rail_error_window_secs` | `10` | Sliding window for counting rail errors. A failure older than the window resets `error_count` to 1. |
 | `transports/rdma/rail_cooldown_secs` | `30` | Initial cooldown after tripping. Doubles on each repeat failure, capped at 300 s. |
@@ -105,6 +106,7 @@ The RDMA keys are read by `RailMonitor::load`. Example:
 ```json
 {
   "max_failover_attempts": 3,
+  "enable_auto_failover_on_poll": true,
   "transports": {
     "rdma": {
       "rail_error_threshold": 3,
