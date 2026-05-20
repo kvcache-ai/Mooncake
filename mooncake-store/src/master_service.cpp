@@ -81,6 +81,33 @@ int64_t CurrentTimeMs() {
 
 }  // namespace
 
+// ---- Eviction predicates ----
+//
+// Hoisted out of BatchEvict so BatchEvictInTenant can reuse the same
+// definition of "evictable memory replica". Side-effect free except
+// EvictReplicas. Defined as MasterService static members because
+// ObjectMetadata is a private nested type.
+
+bool MasterService::CanEvictReplicas(
+    const MasterService::ObjectMetadata& metadata) {
+    return metadata.HasReplica([](const Replica& replica) {
+        return replica.is_memory_replica() && replica.is_completed() &&
+               replica.get_refcnt() == 0;
+    });
+}
+
+size_t MasterService::EvictReplicas(MasterService::ObjectMetadata& metadata) {
+    return metadata.EraseReplicas([](const Replica& replica) {
+        return replica.is_memory_replica() && replica.is_completed() &&
+               replica.get_refcnt() == 0;
+    });
+}
+
+bool MasterService::HasLocalDiskReplica(
+    const MasterService::ObjectMetadata& metadata) {
+    return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+}
+
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -101,6 +128,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
+      enable_tenant_quota_(config.enable_tenant_quota),
+      startup_tenant_quota_policy_(
+          TenantQuotaPolicy{config.default_tenant_quota_bytes}),
+      tenant_quotas_(startup_tenant_quota_policy_),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
@@ -392,11 +423,19 @@ void MasterService::ClearInvalidHandles(
             if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
-                // replication_tasks, and offloading_tasks.
+                // replication_tasks, and offloading_tasks. CleanupStaleHandles
+                // has already erased some replicas, so re-deriving the live
+                // bytes from the current replica list would underflow; read
+                // the snapshot captured at PutStart instead.
+                const std::string tenant_id_snapshot = it->second.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    it->second.quota_committed_bytes;
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                UnindexMetadata(shard.GetShard(), it->first, it->second);
                 it = shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
             } else {
                 ++it;
             }
@@ -702,7 +741,11 @@ auto MasterService::BatchReplicaClear(
                 });
 
             // Erase the entire metadata (all replicas will be deallocated)
+            const std::string tid = metadata.tenant_id;
+            const uint64_t committed = metadata.quota_committed_bytes;
+            UnindexMetadata(accessor.GetShardRef(), key, metadata);
             accessor.Erase();
+            ReleaseTenantBytes(tid, committed);
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
                        "for key="
@@ -725,10 +768,12 @@ auto MasterService::BatchReplicaClear(
                 return false;
             };
 
+            size_t memory_replicas_removed = 0;
             metadata.VisitReplicas(
                 match_replica_on_segment, [&](Replica& replica) {
                     has_replica_on_segment = true;
                     if (replica.is_memory_replica()) {
+                        ++memory_replicas_removed;
                         MasterMetricManager::instance().dec_mem_cache_nums();
                     } else if (replica.is_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
@@ -747,7 +792,38 @@ auto MasterService::BatchReplicaClear(
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
+                const std::string tid = metadata.tenant_id;
+                const uint64_t committed = metadata.quota_committed_bytes;
+                UnindexMetadata(accessor.GetShardRef(), key, metadata);
                 accessor.Erase();
+                ReleaseTenantBytes(tid, committed);
+            } else if (memory_replicas_removed > 0) {
+                // Partial removal: reconcile tenant quota for removed
+                // memory replicas while the object survives.
+                DCHECK(memory_replicas_removed <=
+                       std::numeric_limits<uint64_t>::max() / metadata.size)
+                    << "BatchReplicaClear: size * count would overflow";
+                const uint64_t freed_bytes =
+                    std::min(metadata.size *
+                                 static_cast<uint64_t>(memory_replicas_removed),
+                             metadata.quota_committed_bytes);
+                metadata.quota_committed_bytes -= freed_bytes;
+                ReleaseTenantBytesPartial(metadata.tenant_id, freed_bytes);
+                // No evictable memory replicas left; unindex so the
+                // per-tenant frontier no longer considers this object.
+                //
+                // Known limitation: if the in-flight refcnt later
+                // drops to zero and the object becomes evictable
+                // again, NO code path re-indexes it into the
+                // per-tenant frontier. The object is then invisible
+                // to BatchEvictInTenant (only the global BatchEvict
+                // sweep can still discover it). This is acceptable
+                // because BatchReplicaClear fires on segment
+                // unmount, where a surviving memory replica with
+                // refcnt > 0 is uncommon.
+                if (!CanEvictReplicas(metadata)) {
+                    UnindexMetadata(accessor.GetShardRef(), key, metadata);
+                }
             }
 
             cleared_keys.emplace_back(key);
@@ -850,6 +926,76 @@ auto MasterService::AllocateAndInsertMetadata(
     const ReplicateConfig& config,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    // ---- Step 1: reserve tenant quota up-front (no-op when gate off) ----
+    //
+    // The reservation budget is value_length * replica_num — the worst-case
+    // memory footprint we are about to allocate. If the allocator returns
+    // fewer replicas (or fails), we Abort the reservation below. On success
+    // we Commit exactly the live-byte count derived from the actual replicas
+    // (TenantBytesForMetadata).
+    const uint64_t reserve_bytes =
+        static_cast<uint64_t>(value_length) *
+        static_cast<uint64_t>(std::max<size_t>(config.replica_num, 1));
+    // ReplicateConfig.tenant_id defaults to "default"; an explicitly
+    // empty value is normalized to the same bucket. The Reserve / Commit
+    // / Abort helpers also normalize internally; we capture the
+    // normalized value here so BatchEvictInTenant below sees the same
+    // string the helpers used.
+    const std::string tenant_id =
+        config.tenant_id.empty() ? std::string("default") : config.tenant_id;
+
+    // Reserve -> evict -> Reserve loop.
+    //
+    // First-shot Reserve is the fast path. On failure we ask the quota
+    // table how many bytes are over budget and call BatchEvictInTenant
+    // to claw them back, then retry. The attempt budget
+    // (kMaxEvictAttempts) bounds worst-case latency: each attempt may
+    // free only a fraction of the target if the candidate batch is
+    // partially stale, so up to kMaxEvictAttempts * kMaxRefills *
+    // kBatchSize candidates may be examined before we surface
+    // NO_AVAILABLE_HANDLE.
+    bool reserved = ReserveTenantBytes(tenant_id, reserve_bytes);
+    if (!reserved && enable_tenant_quota_) {
+        for (size_t attempt = 0; !reserved && attempt < kMaxEvictAttempts;
+             ++attempt) {
+            const uint64_t evict_target =
+                ComputeTenantEvictTarget(tenant_id, reserve_bytes);
+            if (evict_target == 0) {
+                // Nothing to evict (unlimited tenant or quota
+                // already has headroom). The Reserve must have
+                // failed for a reason BatchEvictInTenant cannot
+                // address, so retrying is futile.
+                break;
+            }
+            // Pass the caller's own shard index so BatchEvictInTenant
+            // skips it -- AllocateAndInsertMetadata already holds that
+            // shard's writer lock (acquired by the entry-point
+            // PutStart / UpsertStart) and std::shared_mutex is not
+            // recursive.
+            const size_t caller_shard_index = getShardIndex(key);
+            const uint64_t freed =
+                BatchEvictInTenant(tenant_id, evict_target, caller_shard_index);
+            if (freed == 0) {
+                // No candidate could be reclaimed (everything
+                // hard-pinned, or every candidate had its lease
+                // bumped between refill and consumption, or the
+                // refill budget was exhausted). Bail out.
+                break;
+            }
+            reserved = ReserveTenantBytes(tenant_id, reserve_bytes);
+        }
+    }
+    if (!reserved) {
+        VLOG(1) << "key=" << key << ", tenant_id=" << tenant_id
+                << ", value_length=" << value_length
+                << ", replica_num=" << config.replica_num
+                << ", error=tenant_quota_exceeded";
+        tenant_quota_reject_total_.fetch_add(1, std::memory_order_relaxed);
+        MasterMetricManager::instance().inc_tenant_quota_reject_total(
+            tenant_id);
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
     std::vector<Replica> replicas;
     {
         ScopedAllocatorAccess allocator_access =
@@ -870,6 +1016,7 @@ auto MasterService::AllocateAndInsertMetadata(
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
                     << ", error: " << allocation_result.error();
+            AbortTenantBytes(tenant_id, reserve_bytes);
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -894,12 +1041,70 @@ auto MasterService::AllocateAndInsertMetadata(
         replica_list.emplace_back(replica.get_descriptor());
     }
 
-    shard->metadata.emplace(
+    auto [it, inserted] = shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin, config.with_hard_pin,
-                              config.data_type));
+                              config.data_type, tenant_id));
     shard->processing_keys.insert(key);
+    // Register the freshly-inserted object with the per-tenant
+    // frontier (hosted on tenant_quotas_). Hard-pinned objects skip
+    // the frontier (see ChooseFrontierBucket). Must run AFTER the
+    // emplace so it->second is the live ObjectMetadata.
+    if (inserted) {
+        IndexMetadata(shard.GetShard(), key, it->second);
+    }
+
+    // ---- Step 2: commit the live-byte cost of the actual object. ----
+    //
+    // We may have reserved more bytes than the object actually consumes (for
+    // example when the allocator picked fewer than replica_num replicas, or
+    // when only disk replicas were created). Reconcile by aborting the
+    // unused portion of the reservation and committing only the live bytes.
+    //
+    // Persist the committed amount on the metadata itself so that every
+    // erase path can release exactly what was committed without having to
+    // re-derive it from a replica list that may already have been popped
+    // (e.g. PutRevoke pops memory replicas before checking IsValid()).
+    if (inserted) {
+        const uint64_t committed_bytes = TenantBytesForMetadata(it->second);
+        // Defensive invariant: under the current allocation contract the
+        // allocator never returns more memory replicas than requested, so
+        // committed_bytes (= size * memory_replica_count) cannot exceed
+        // reserve_bytes (= value_length * max(replica_num, 1)). The clamp
+        // below is a runtime safety net; this DCHECK catches any future
+        // policy change (e.g. oversubscription / pre-fetch) that would
+        // silently bypass the quota by exceeding the reservation.
+        DCHECK_LE(committed_bytes, reserve_bytes)
+            << "tenant_id=" << tenant_id << ", key=" << key
+            << ", committed_bytes=" << committed_bytes
+            << ", reserve_bytes=" << reserve_bytes;
+        const uint64_t committed_clamped =
+            std::min(committed_bytes, reserve_bytes);
+        if (committed_clamped > 0) {
+            CommitTenantBytes(tenant_id, committed_clamped);
+        }
+        if (reserve_bytes > committed_clamped) {
+            AbortTenantBytes(tenant_id, reserve_bytes - committed_clamped);
+        }
+        it->second.quota_committed_bytes = committed_clamped;
+    } else {
+        // Unreachable under the documented caller contract: every entry
+        // path into AllocateAndInsertMetadata guarantees the key is absent
+        // from the shard before we get here -- PutStart's inline-discard
+        // branch erases any stale entry, UpsertStart Case A only enters
+        // when `it == shard->metadata.end()`, and UpsertStart Case C
+        // explicitly `shard->metadata.erase(it)` immediately before the
+        // tail-call. Hitting this branch means a future caller has been
+        // added that violates the contract; surface it loudly in debug
+        // builds (DFATAL crashes under DCHECK and logs ERROR in release)
+        // while still aborting the reservation so a release build leaks
+        // neither the reservation nor the in-flight request.
+        LOG(DFATAL) << "AllocateAndInsertMetadata: emplace failed because "
+                       "the key already exists. Caller contract violated: "
+                    << "tenant_id=" << tenant_id << ", key=" << key;
+        AbortTenantBytes(tenant_id, reserve_bytes);
+    }
 
     return replica_list;
 }
@@ -938,7 +1143,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
-        // go.
+        // go. Release the tenant bytes here so the lingering PutStart
+        // (whose client never called PutEnd or PutRevoke) does not leak
+        // its quota reservation across this discard.
         if (!metadata.HasReplica(&Replica::fn_is_completed) &&
             metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
@@ -948,8 +1155,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
+            const std::string tenant_id_snapshot = metadata.tenant_id;
+            const uint64_t live_bytes_snapshot = metadata.quota_committed_bytes;
             shard->processing_keys.erase(key);
+            UnindexMetadata(shard.GetShard(), key, metadata);
             shard->metadata.erase(it);
+            ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -1012,6 +1223,10 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+
+    // GrantLease may activate soft-pin for the first time; migrate
+    // the frontier entry to the correct bucket.
+    ReindexMetadataAfterPinChange(accessor.GetShardRef(), key, metadata);
     return {};
 }
 
@@ -1104,7 +1319,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
+        // Release the exact byte count we committed at PutStart. Note we
+        // CANNOT recompute it from replicas here: EraseReplicas above has
+        // already removed the memory replica we are accounting for, so a
+        // recomputation would yield 0 and leak the reservation.
+        const std::string tenant_id_snapshot = metadata.tenant_id;
+        const uint64_t live_bytes_snapshot = metadata.quota_committed_bytes;
+        UnindexMetadata(accessor.GetShardRef(), key, metadata);
         accessor.Erase();
+        ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
     }
     return {};
 }
@@ -1182,10 +1405,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
     // Also clean up local_disk replicas whose owner client has expired.
+    // Release the tenant bytes that the original PutStart had committed for
+    // this object before discarding the metadata.
     if (it != shard->metadata.end() &&
         CleanupStaleHandles(it->second, alive_clients)) {
+        const std::string tenant_id_snapshot = it->second.tenant_id;
+        const uint64_t live_bytes_snapshot = it->second.quota_committed_bytes;
         shard->processing_keys.erase(key);
+        UnindexMetadata(shard.GetShard(), key, it->second);
         shard->metadata.erase(it);
+        ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
         it = shard->metadata.end();
     }
 
@@ -1223,9 +1452,17 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             shard->processing_keys.erase(key);
 
             // If no COMPLETE replicas survive the preemption, this key
-            // effectively does not exist — fall through to Case A.
+            // effectively does not exist — fall through to Case A. The
+            // preempted writer's PutStart had Reserve+Commit'd quota for
+            // this object; release it here so the abandoned PutStart does
+            // not leak its tenant accounting.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                const std::string tenant_id_snapshot = metadata.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    metadata.quota_committed_bytes;
+                UnindexMetadata(shard.GetShard(), key, metadata);
                 shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
                 it = shard->metadata.end();
             }
         }
@@ -1261,15 +1498,25 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         metadata.put_start_time = now;
 
         // Reconcile soft_pin state with the incoming config.
+        bool soft_pin_flipped = false;
         {
             SpinLocker locker(&metadata.lock);
             if (config.with_soft_pin && !metadata.soft_pin_timeout) {
                 metadata.soft_pin_timeout.emplace();
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
+                soft_pin_flipped = true;
             } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
                 metadata.soft_pin_timeout.reset();
                 MasterMetricManager::instance().dec_soft_pin_key_count(1);
+                soft_pin_flipped = true;
             }
+        }
+        // A flipped soft_pin status moves this object between the
+        // no_pin and soft_pin frontiers; the ordering inside the
+        // destination set is unchanged because frontier_lease_snapshot
+        // is preserved across the migration (lazy-maintenance contract).
+        if (soft_pin_flipped) {
+            ReindexMetadataAfterPinChange(shard.GetShard(), key, metadata);
         }
 
         // Mark COMPLETE → PROCESSING so readers won't see stale data
@@ -1298,12 +1545,37 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // then allocate fresh buffers at the new size.
     //
     // Preserve hard_pin and soft_pin from the old metadata so that eviction
-    // protection survives a size-changing upsert (RFC §2.2.2).
+    // protection survives a size-changing upsert (existing eviction-protection
+    // semantics).
     ReplicateConfig merged_config = config;
     merged_config.with_hard_pin =
         merged_config.with_hard_pin || metadata.IsHardPinned();
     merged_config.with_soft_pin =
         merged_config.with_soft_pin || metadata.IsSoftPinned();
+
+    // Snapshot the OLD object's tenant accounting before we destroy it.
+    // The new object will be charged (Reserve/Commit) inside
+    // AllocateAndInsertMetadata against whatever tenant_id the caller
+    // supplied in `config` -- we deliberately do NOT force the new object
+    // to inherit the old tenant. Quota bytes therefore correctly move from
+    // the old tenant's bucket to the new tenant's bucket.
+    //
+    // Note: pin flags are merged into merged_config above, but
+    // merged_config.tenant_id is intentionally left as caller-provided and
+    // NOT overwritten with metadata.tenant_id. This is what makes the
+    // cross-tenant quota transfer work: the old tenant gets its bytes back
+    // via ReleaseTenantBytes(old_tenant_id, ...) below, and the new tenant
+    // gets charged inside AllocateAndInsertMetadata using
+    // merged_config.tenant_id.
+    //
+    // Per-tenant namespace isolation (so two tenants could independently
+    // own the same raw key) is out of scope: the shard map is keyed by
+    // the raw key string, so a cross-tenant upsert here replaces the
+    // existing entry. Quota accounting remains correct under that
+    // collision -- the old tenant's bytes are released and the new
+    // tenant is charged below.
+    const std::string old_tenant_id = metadata.tenant_id;
+    const uint64_t old_live_bytes = metadata.quota_committed_bytes;
 
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
@@ -1311,7 +1583,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         discarded_replicas_.emplace_back(std::move(old_replicas),
                                          now + put_start_release_timeout_sec_);
     }
+    UnindexMetadata(shard.GetShard(), key, metadata);
     shard->metadata.erase(it);
+    ReleaseTenantBytes(old_tenant_id, old_live_bytes);
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
@@ -1392,7 +1666,11 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     }
 
     if (!metadata.IsValid()) {
+        const std::string tid = metadata.tenant_id;
+        const uint64_t committed = metadata.quota_committed_bytes;
+        UnindexMetadata(accessor.GetShardRef(), key, metadata);
         accessor.Erase();
+        ReleaseTenantBytes(tid, committed);
     }
     return {};
 }
@@ -1408,6 +1686,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+// Quota scope: per-tenant accounting is admission-scoped (Put / Upsert
+// only). CopyStart allocates additional memory replicas for an existing
+// object without reserving extra tenant bytes, so used_bytes may
+// undercount the actual memory footprint while the extra replicas are
+// alive. Copy / Move are treated as operator-driven infrastructure
+// operations and intentionally bypass the quota check.
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
@@ -1546,8 +1830,11 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
         });
         accessor.EraseReplicationTask();
         if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
+            const std::string tid = metadata.tenant_id;
+            const uint64_t committed = metadata.quota_committed_bytes;
+            UnindexMetadata(accessor.GetShardRef(), key, metadata);
             accessor.Erase();
+            ReleaseTenantBytes(tid, committed);
         }
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
@@ -1621,13 +1908,22 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     accessor.EraseReplicationTask();
 
     if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
+        const std::string tid = metadata.tenant_id;
+        const uint64_t committed = metadata.quota_committed_bytes;
+        UnindexMetadata(accessor.GetShardRef(), key, metadata);
         accessor.Erase();
+        ReleaseTenantBytes(tid, committed);
     }
 
     return {};
 }
 
+// Quota scope (continued): MoveStart allocates a target memory replica
+// without reserving extra tenant bytes. MoveEnd removes the source
+// replica, so the net footprint is unchanged after a successful move.
+// Between MoveStart and MoveEnd the tenant temporarily holds two
+// replicas without the extra one being accounted -- same rationale as
+// CopyStart above.
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
@@ -1761,8 +2057,11 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
         });
         accessor.EraseReplicationTask();
         if (!metadata.IsValid()) {
-            // Remove the object if it does not have any replicas.
+            const std::string tid = metadata.tenant_id;
+            const uint64_t committed = metadata.quota_committed_bytes;
+            UnindexMetadata(accessor.GetShardRef(), key, metadata);
             accessor.Erase();
+            ReleaseTenantBytes(tid, committed);
         }
         return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
@@ -1851,8 +2150,11 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     accessor.EraseReplicationTask();
 
     if (!metadata.IsValid()) {
-        // Remove the object if it does not have any replicas.
+        const std::string tid = metadata.tenant_id;
+        const uint64_t committed = metadata.quota_committed_bytes;
+        UnindexMetadata(accessor.GetShardRef(), key, metadata);
         accessor.Erase();
+        ReleaseTenantBytes(tid, committed);
     }
 
     return {};
@@ -1890,8 +2192,15 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    // Snapshot tenant accounting before destroying the metadata. Use the
+    // committed amount captured at admission so the release exactly mirrors
+    // the commit (independent of any replica list mutations).
+    const std::string tenant_id_snapshot = metadata.tenant_id;
+    const uint64_t live_bytes_snapshot = metadata.quota_committed_bytes;
+    UnindexMetadata(accessor.GetShardRef(), key, metadata);
     // Remove object metadata
     accessor.Erase();
+    ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
     return {};
 }
 
@@ -1945,7 +2254,12 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                const std::string tenant_id_snapshot = it->second.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    it->second.quota_committed_bytes;
+                UnindexMetadata(shard.GetShard(), it->first, it->second);
                 it = shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
                 removed_count++;
             } else {
                 ++it;
@@ -1984,10 +2298,13 @@ long MasterService::RemoveAll(bool force) {
             if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !shard->replication_tasks.contains(it->first)) {
-                auto mem_rep_count =
-                    it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                total_freed_size += it->second.size * mem_rep_count;
+                const uint64_t live_bytes_snapshot =
+                    it->second.quota_committed_bytes;
+                const std::string tenant_id_snapshot = it->second.tenant_id;
+                total_freed_size += live_bytes_snapshot;
+                UnindexMetadata(shard.GetShard(), it->first, it->second);
                 it = shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
                 removed_count++;
             } else {
                 ++it;
@@ -2040,10 +2357,15 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove)
             if (CleanupStaleHandles(it->second, alive_clients)) {
+                const std::string tenant_id_snapshot = it->second.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    it->second.quota_committed_bytes;
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
+                UnindexMetadata(shard.GetShard(), key, it->second);
                 shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
@@ -2079,7 +2401,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Remove object metadata
+            const std::string tenant_id_snapshot = metadata.tenant_id;
+            const uint64_t live_bytes_snapshot = metadata.quota_committed_bytes;
+            UnindexMetadata(shard.GetShard(), key, metadata);
             shard->metadata.erase(it);
+            ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
             results[original_idx] = {};  // Success
         }
     }
@@ -2414,7 +2740,16 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
+                // The metadata is being destroyed before any replica
+                // graduated to COMPLETE. Release exactly what was committed
+                // at PutStart (read the snapshot field; the replica list is
+                // already gone so we cannot recompute).
+                const std::string tenant_id_snapshot = metadata.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    metadata.quota_committed_bytes;
+                UnindexMetadata(shard.GetShard(), *key_it, metadata);
                 shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
             }
             key_it = shard->processing_keys.erase(key_it);
             continue;
@@ -2435,8 +2770,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
-                // remove the whole object.
+                // remove the whole object. Replicas were already popped
+                // above, so use the snapshot captured at PutStart.
+                const std::string tenant_id_snapshot = metadata.tenant_id;
+                const uint64_t live_bytes_snapshot =
+                    metadata.quota_committed_bytes;
+                UnindexMetadata(shard.GetShard(), *key_it, metadata);
                 shard->metadata.erase(it);
+                ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
             }
 
             key_it = shard->processing_keys.erase(key_it);
@@ -2489,7 +2830,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
+            const std::string tenant_id_snapshot = metadata.tenant_id;
+            const uint64_t live_bytes_snapshot = metadata.quota_committed_bytes;
+            UnindexMetadata(shard.GetShard(), metadata_it->first, metadata);
             shard->metadata.erase(metadata_it);
+            ReleaseTenantBytes(tenant_id_snapshot, live_bytes_snapshot);
         }
 
         task_it = shard->replication_tasks.erase(task_it);
@@ -3299,6 +3644,18 @@ bool MasterService::TryRestoreStateFromSnapshot(
         return false;
     };
 
+    // Capture every tenant_id whose gauge labels currently exist so that,
+    // after the restore replaces the policy table, gauges of tenants that
+    // disappeared can be zeroed out. Captured BEFORE Deserialize to cover
+    // tenants seen in-process across earlier (possibly failed) restore
+    // attempts as well as the current explicit policies.
+    std::unordered_set<std::string> known_before_tenant_ids;
+    if (enable_tenant_quota_) {
+        for (const auto& snap : tenant_quotas_.ListAll()) {
+            known_before_tenant_ids.insert(snap.tenant_id);
+        }
+    }
+
     try {
         std::string manifest_content;
         auto manifest_result = snapshot_object_store_->DownloadString(
@@ -3478,6 +3835,20 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                                       .time_since_epoch())
                                                   .count())
                                         : "null");
+                            // This restore-time cleanup happens AFTER
+                            // DeserializeShard has already pushed each
+                            // restored object into the per-tenant
+                            // frontier and accumulated its bytes into the
+                            // tenant ledger. Both side effects must be
+                            // undone here -- omitting the byte release
+                            // leaves used_bytes inflated and would later
+                            // cause spurious NO_AVAILABLE_HANDLE
+                            // rejections on PutStart for the affected
+                            // tenant.
+                            UnindexMetadata(shard, it->first, it->second);
+                            ReleaseTenantBytes(
+                                it->second.tenant_id,
+                                it->second.quota_committed_bytes);
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -3561,6 +3932,16 @@ bool MasterService::TryRestoreStateFromSnapshot(
             }
         }
 
+        // Republish per-tenant quota gauges from the post-restore,
+        // post-cleanup ledger. Done here (not inside DeserializeTenantQuotas)
+        // for two reasons: (a) legacy snapshots that omit the
+        // tenant_quotas field still need their AccumulateUsage results to
+        // surface in /metrics; (b) restore-time cleanup runs AFTER
+        // Deserialize, so a refresh inside Deserialize would publish
+        // pre-cleanup values that the cleanup loop subsequently
+        // invalidates.
+        RefreshTenantQuotaMetrics(known_before_tenant_ids);
+
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
                   << state_id;
         return true;
@@ -3597,6 +3978,129 @@ ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
     return snapshot_catalog_store_.get();
 }
 
+uint64_t MasterService::TryEvictOrOffload(EvictCycleContext& ctx,
+                                          const std::string& key,
+                                          ObjectMetadata& metadata,
+                                          MetadataShardAccessorRW& shard) {
+    // Original (no offload-on-evict) behavior: simply erase memory
+    // replicas and return the freed bytes. metadata.size *
+    // (#replicas erased) is exactly the number of bytes leaving the
+    // tenant's live-byte usage on this call.
+    if (!ctx.offload_on_evict) {
+        return metadata.size * EvictReplicas(metadata);
+    }
+
+    // LOCAL_DISK replica already exists -- safe to delete MEMORY
+    // replicas immediately; the data survives via the on-disk copy.
+    if (HasLocalDiskReplica(metadata)) {
+        return metadata.size * EvictReplicas(metadata);
+    }
+
+    // Force-evict cap: when force_evict is enabled and the per-cycle
+    // offload queue cap is reached, force delete. Warning is
+    // aggregated at the end of the cycle to avoid log flooding.
+    if (ctx.offload_force_evict &&
+        ctx.offload_queued_this_cycle >= ctx.offload_cap) {
+        ctx.offload_cap_forced_count++;
+        return metadata.size * EvictReplicas(metadata);
+    }
+
+    // Queue one MEMORY replica for offload; remaining redundant
+    // replicas are evicted below to reclaim memory immediately.
+    bool queued = false;
+    metadata.VisitReplicas(
+        [](const Replica& r) {
+            return r.is_memory_replica() && r.is_completed() &&
+                   r.get_refcnt() == 0;
+        },
+        [this, &key, &shard, &queued, &ctx](Replica& replica) {
+            if (queued) return;  // only need to pin one replica for offload
+            auto result = PushOffloadingQueue(key, replica);
+            if (result) {
+                replica.inc_refcnt();
+                shard->offloading_tasks.emplace(
+                    key, OffloadingTask{replica.id(), ctx.now});
+                queued = true;
+            }
+        });
+
+    if (queued) {
+        ctx.offload_queued_this_cycle++;
+        ctx.offload_deferred_count++;
+        // Any remaining MEMORY replicas with refcnt==0 are redundant
+        // copies (data survives via the pinned replica → disk).
+        // Evict them now to reclaim memory immediately rather than
+        // waiting another cycle.
+        return metadata.size * EvictReplicas(metadata);
+    }
+
+    // PushOffloadingQueue failed. Default (data-preserving) behavior
+    // is to skip this cycle -- the outer eviction loop will retry
+    // after the offload queue drains. Only force-evict when explicitly
+    // opted in, to prevent silent data loss when the queue is
+    // unavailable.
+    if (ctx.offload_force_evict) {
+        ctx.offload_push_failed_forced++;
+        return metadata.size * EvictReplicas(metadata);
+    }
+    return 0;
+}
+
+std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+MasterService::TryEvictAndReconcile(
+    EvictCycleContext& ctx, MetadataShardAccessorRW& shard,
+    std::unordered_map<std::string, ObjectMetadata>::iterator it,
+    EvictReconcileResult& result) {
+    // Snapshot tenant_id and key BEFORE potential erase: after
+    // shard->metadata.erase(it) the iterator is invalidated.
+    const std::string tenant_id_snapshot = it->second.tenant_id;
+    const std::string key_snapshot = it->first;
+
+    const uint64_t freed = TryEvictOrOffload(ctx, it->first, it->second, shard);
+    result.freed_bytes = freed;
+
+    if (it->second.IsValid() == false) {
+        // All replicas gone -- erase the metadata entirely.
+        // UnindexMetadata MUST happen before erase: the frontier
+        // entry's lookup key derives from metadata fields that the
+        // erase will invalidate.
+        UnindexMetadata(shard.GetShard(), it->first, it->second);
+        auto next_it = shard->metadata.erase(it);
+        result.erased = true;
+        if (freed > 0) {
+            ReleaseTenantBytes(tenant_id_snapshot, freed);
+        }
+        return next_it;
+    }
+
+    // Object survives (e.g. a disk replica still holds the data, or
+    // offload-on-evict moved memory replicas to disk). Reconcile
+    // bookkeeping for the survive case.
+    if (freed > 0) {
+        // Subtle but critical: when memory replicas are erased but
+        // the metadata survives, quota_committed_bytes must be
+        // decremented by exactly `freed`. Otherwise a later Remove
+        // (which releases quota_committed_bytes wholesale) would
+        // double-release these bytes against the tenant's
+        // committed_count. The outer used_bytes is saved by the
+        // underflow clamp in TenantQuotaTable::Release, but
+        // committed_count would still drift.
+        it->second.quota_committed_bytes =
+            (it->second.quota_committed_bytes > freed)
+                ? it->second.quota_committed_bytes - freed
+                : 0;
+        // Drop the survived-but-evicted object from the tenant
+        // frontier: it no longer holds memory replicas, so future
+        // BatchEvictInTenant calls would waste retry budget on a
+        // candidate they cannot reclaim.
+        UnindexMetadata(shard.GetShard(), key_snapshot, it->second);
+
+        ReleaseTenantBytes(tenant_id_snapshot, freed);
+    }
+    result.erased = false;
+    return it;
+}
+
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
     if (evict_ratio_target < evict_ratio_lowerbound) {
@@ -3615,93 +4119,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
-    auto can_evict_replicas = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed() &&
-                   replica.get_refcnt() == 0;
-        });
-    };
-
-    auto evict_replicas = [](ObjectMetadata& metadata) {
-        return metadata.EraseReplicas([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed() &&
-                   replica.get_refcnt() == 0;
-        });
-    };
-
-    // --- Offload-on-evict support ---
-    long offload_queued_this_cycle = 0;
-    long offload_deferred_count = 0;
-    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
-    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
-    const long offload_cap =
+    // BatchEvict's per-cycle offload state lives in an
+    // EvictCycleContext on the stack. Promoting it from lambda
+    // captures lets BatchEvictInTenant reuse the same primitive
+    // without copy-pasting the eviction logic.
+    EvictCycleContext ctx{
+        /*offload_on_evict=*/offload_on_evict_,
+        /*offload_force_evict=*/offload_force_evict_,
+        /*offload_cap=*/
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
-            : 0;
-
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-    };
-
-    // Returns freed bytes. Returns 0 if offload-queued and no additional
-    // replicas were evicted (all MEMORY replicas of the key are now pinned).
-    auto try_evict_or_offload =
-        [&, this](const std::string& key, ObjectMetadata& metadata,
-                  MetadataShardAccessorRW& shard) -> uint64_t {
-        if (!offload_on_evict_) {
-            // Original behavior
-            return metadata.size * evict_replicas(metadata);
-        }
-
-        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
-        if (has_local_disk_replica(metadata)) {
-            return metadata.size * evict_replicas(metadata);
-        }
-
-        // Force-evict cap: if force_evict enabled and cap reached, force
-        // delete. Warning is aggregated at the end of the cycle to avoid log
-        // flooding.
-        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
-            offload_cap_forced_count++;
-            return metadata.size * evict_replicas(metadata);
-        }
-
-        // Queue one MEMORY replica for offload; others will be evicted below.
-        bool queued = false;
-        metadata.VisitReplicas(
-            [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            },
-            [this, &key, &shard, &queued, &now](Replica& replica) {
-                if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(key, replica);
-                if (result) {
-                    replica.inc_refcnt();
-                    shard->offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
-                    queued = true;
-                }
-            });
-
-        if (queued) {
-            offload_queued_this_cycle++;
-            offload_deferred_count++;
-            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
-            // (data survives via the pinned replica → disk). Evict them now to
-            // reclaim memory immediately rather than waiting another cycle.
-            return metadata.size * evict_replicas(metadata);
-        }
-
-        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
-        // skip this cycle — the outer eviction loop will retry after the
-        // offload queue drains. Only force-evict when explicitly opted in, to
-        // prevent silent data loss when the queue is unavailable.
-        if (offload_force_evict_) {
-            offload_push_failed_forced++;
-            return metadata.size * evict_replicas(metadata);
-        }
-        return 0;
+            : 0,
+        /*now=*/now,
     };
 
     // Randomly select a starting shard to avoid imbalance eviction between
@@ -3736,7 +4165,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             // Skip objects that are not expired or have incomplete replicas
             if (!it->second.IsLeaseExpired(now) ||
-                !can_evict_replicas(it->second)) {
+                !CanEvictReplicas(it->second)) {
                 continue;
             }
             if (!it->second.IsSoftPinned(now)) {
@@ -3771,22 +4200,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 if (it->second.IsHardPinned() ||
                     !it->second.IsLeaseExpired(now) ||
                     it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
+                    !CanEvictReplicas(it->second)) {
                     ++it;
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object (or defer for offload)
-                    uint64_t freed =
-                        try_evict_or_offload(it->first, it->second, shard);
-                    total_freed_size += freed;
-                    if (it->second.IsValid() == false) {
-                        it = shard->metadata.erase(it);
-                    } else {
-                        ++it;
-                    }
-                    if (freed > 0) {
+                    // TryEvictAndReconcile encapsulates the
+                    // try-evict + survive/erase + frontier unindex +
+                    // quota release contract that all three
+                    // BatchEvict passes share.
+                    EvictReconcileResult reconcile;
+                    it = TryEvictAndReconcile(ctx, shard, it, reconcile);
+                    total_freed_size += reconcile.freed_bytes;
+                    if (reconcile.freed_bytes > 0) {
                         shard_evicted_count++;
+                    }
+                    if (!reconcile.erased) {
+                        // Iterator still valid, advance manually.
+                        ++it;
                     }
                 } else {
                     // second pass candidates
@@ -3838,18 +4269,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
-                        can_evict_replicas(it->second)) {
-                        // Evict this object (or defer for offload)
-                        uint64_t freed =
-                            try_evict_or_offload(it->first, it->second, shard);
-                        total_freed_size += freed;
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        if (freed > 0) {
+                        CanEvictReplicas(it->second)) {
+                        // See pass-1 comment: TryEvictAndReconcile
+                        // owns the survive/erase + frontier + quota
+                        // contract.
+                        EvictReconcileResult reconcile;
+                        it = TryEvictAndReconcile(ctx, shard, it, reconcile);
+                        total_freed_size += reconcile.freed_bytes;
+                        if (reconcile.freed_bytes > 0) {
                             evicted_count++;
+                        }
+                        if (!reconcile.erased) {
+                            ++it;
                         }
                         target_evict_num--;
                     } else {
@@ -3882,7 +4313,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // Skip hard-pinned or not-yet-expired objects
                     if (it->second.IsHardPinned() ||
                         !it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
+                        !CanEvictReplicas(it->second)) {
                         ++it;
                         continue;
                     }
@@ -3890,17 +4321,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        // Evict this object (or defer for offload)
-                        uint64_t freed =
-                            try_evict_or_offload(it->first, it->second, shard);
-                        total_freed_size += freed;
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        if (freed > 0) {
+                        // See pass-1 comment: TryEvictAndReconcile
+                        // owns the survive/erase + frontier + quota
+                        // contract.
+                        EvictReconcileResult reconcile;
+                        it = TryEvictAndReconcile(ctx, shard, it, reconcile);
+                        total_freed_size += reconcile.freed_bytes;
+                        if (reconcile.freed_bytes > 0) {
                             evicted_count++;
+                        }
+                        if (!reconcile.erased) {
+                            ++it;
                         }
                         target_evict_num--;
                     } else {
@@ -3923,7 +4354,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     if (evicted_count > 0 || released_discarded_cnt > 0 ||
-        offload_deferred_count > 0) {
+        ctx.offload_deferred_count > 0) {
         // Offload-deferred counts as partial success: work was done (objects
         // queued for disk offload), so suppress re-triggering until the next
         // watermark breach or explicit need_eviction_ signal.
@@ -3938,24 +4369,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
-            << ", offload_deferred=" << offload_deferred_count
-            << ", offload_cap_forced=" << offload_cap_forced_count
-            << ", offload_push_failed_forced=" << offload_push_failed_forced
+            << ", offload_deferred=" << ctx.offload_deferred_count
+            << ", offload_cap_forced=" << ctx.offload_cap_forced_count
+            << ", offload_push_failed_forced=" << ctx.offload_push_failed_forced
             << ", total_freed_size=" << total_freed_size;
-    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+    if (offload_on_evict_ && evicted_count == 0 &&
+        ctx.offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
-                     << offload_deferred_count
+                     << ctx.offload_deferred_count
                      << " objects deferred for disk offload. "
                         "Consider lowering eviction_high_watermark_ratio.";
     }
-    if (offload_cap_forced_count > 0) {
-        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
-                     << ") reached; force-evicted " << offload_cap_forced_count
+    if (ctx.offload_cap_forced_count > 0) {
+        LOG(WARNING) << "[EVICT] Offload cap (" << ctx.offload_cap
+                     << ") reached; force-evicted "
+                     << ctx.offload_cap_forced_count
                      << " object(s) without disk offload this cycle.";
     }
-    if (offload_push_failed_forced > 0) {
+    if (ctx.offload_push_failed_forced > 0) {
         LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
-                     << offload_push_failed_forced
+                     << ctx.offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
     }
@@ -4075,9 +4508,14 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+    // Top-level map fields: "shards", "discarded_replicas",
+    // "replica_next_id", and "tenant_quotas".
+    //
+    // "tenant_quotas" is appended after the original three fields. Older
+    // snapshots that predate per-tenant quotas omit it entirely; the
+    // deserializer treats the missing key as "no policies in snapshot"
+    // and leaves whatever the master was started with intact.
+    packer.pack_map(4);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -4143,6 +4581,15 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
+    // 4. Serialize tenant quota policies
+    packer.pack("tenant_quotas");
+    auto tq_result = SerializeTenantQuotas(packer);
+    if (!tq_result) {
+        return tl::make_unexpected(SerializationError(
+            tq_result.error().code,
+            "Failed to serialize tenant_quotas: " + tq_result.error().message));
+    }
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -4172,10 +4619,13 @@ MasterService::MetadataSerializer::Deserialize(
     }
 
     // Expected format: top-level map with "shards", "discarded_replicas",
-    // and "replica_next_id"
+    // "replica_next_id", and (optionally) "tenant_quotas". The latter is
+    // tolerated as missing for backward compatibility with snapshots from
+    // before per-tenant quotas existed.
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
     const msgpack::object* replica_next_id_obj = nullptr;
+    const msgpack::object* tenant_quotas_obj = nullptr;
 
     // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
@@ -4188,6 +4638,8 @@ MasterService::MetadataSerializer::Deserialize(
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
             } else if (key == "replica_next_id") {
                 replica_next_id_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "tenant_quotas") {
+                tenant_quotas_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -4270,6 +4722,20 @@ MasterService::MetadataSerializer::Deserialize(
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
+    // Restore tenant quota policies if the snapshot carries them. Older
+    // snapshots that omit the field leave the in-memory default
+    // (operator-supplied at master startup) untouched, which is the
+    // documented backward-compatible behavior.
+    if (tenant_quotas_obj != nullptr) {
+        auto tq_result = DeserializeTenantQuotas(*tenant_quotas_obj);
+        if (!tq_result) {
+            return tl::make_unexpected(
+                SerializationError(tq_result.error().code,
+                                   "Failed to deserialize tenant_quotas: " +
+                                       tq_result.error().message));
+        }
+    }
+
     return {};
 }
 
@@ -4282,6 +4748,23 @@ void MasterService::MetadataSerializer::Reset() {
         service_->discarded_replicas_.clear();
     }
     Replica::next_id_.store(1);
+    if (service_->enable_tenant_quota_) {
+        // Wipe per-tenant usage counters; usage is rebuilt from the
+        // deserialized objects in DeserializeShard.
+        service_->tenant_quotas_.ResetUsage();
+        // Reinstate the startup-config policies. This matters when this
+        // Reset runs as part of ResetStateAfterFailedRestoreAttempt: a
+        // previous candidate may have applied snapshot-supplied policies
+        // via RestorePolicies() before failing mid-flight; if the next
+        // candidate happens to be a legacy snapshot that omits the quota
+        // field, DeserializeTenantQuotas() leaves the default unchanged
+        // and the leftover policies would silently survive across
+        // attempts. Restoring to the startup baseline guarantees each
+        // attempt starts from the same configuration the operator booted
+        // with.
+        service_->tenant_quotas_.RestorePolicies(
+            service_->startup_tenant_quota_policy_, /*explicit_policies=*/{});
+    }
 }
 
 tl::expected<void, SerializationError>
@@ -4375,16 +4858,40 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
+        std::string tenant_id_for_quota = metadata_ptr->tenant_id;
         auto [it, inserted] = shard.metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(std::move(key)),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
+                metadata_ptr->tenant_id));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        // Rebuild the per-tenant frontier index for the restored
+        // object. Must run AFTER lease_timeout / soft_pin_timeout are
+        // written back so ChooseFrontierBucket sees the same lease
+        // state the master observed before the snapshot was taken;
+        // this matches how the surrounding restore path rebuilds
+        // tenant_quotas_ usage.
+        if (inserted) {
+            service_->IndexMetadata(shard, it->first, it->second);
+        }
+
+        // Rebuild per-tenant live-byte usage so that Reserve/Commit invariants
+        // hold immediately after restore. We use the freshly-inserted
+        // metadata (it->second) to count memory replicas accurately.
+        if (service_->enable_tenant_quota_) {
+            const uint64_t live_bytes =
+                service_->TenantBytesForMetadata(it->second);
+            it->second.quota_committed_bytes = live_bytes;
+            if (live_bytes > 0) {
+                service_->tenant_quotas_.AccumulateUsage(tenant_id_for_quota,
+                                                         live_bytes);
+            }
+        }
     }
 
     return {};
@@ -4397,11 +4904,13 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned]
-
-    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
-                            // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count, data_type, hard_pinned
+    // replicas..., hard_pinned, tenant_id(optional)]
+    //
+    // When enable_tenant_quota is off, tenant_id is omitted so that older
+    // binaries (which know nothing about tenant_id) can still read the
+    // snapshot. The deserializer accepts all historical sizes (7/8/9/10 + N).
+    const bool emit_tenant_id = service_->enable_tenant_quota_;
+    size_t array_size = emit_tenant_id ? 10 : 9;
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4454,6 +4963,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
     }
 
     packer.pack(metadata.IsHardPinned());
+    if (emit_tenant_id) {
+        packer.pack(metadata.tenant_id);
+    }
 
     return {};
 }
@@ -4503,28 +5015,33 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
     // Format detection:
-    //   v1: 7 + replicas_count, no data_type or hard_pinned
-    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
-    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    //   v1:  7 + replicas_count, no data_type or hard_pinned
+    //   v2:  8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3:  9 + replicas_count, data_type plus trailing hard_pinned
+    //   v4: 10 + replicas_count, data_type + hard_pinned + tenant_id
     constexpr uint32_t kOldFieldCount = 7;
     constexpr uint32_t kOneExtraFieldCount = 8;
-    constexpr uint32_t kCurrentFieldCount = 9;
+    constexpr uint32_t kDataTypeAndHardPinCount = 9;
+    constexpr uint32_t kWithTenantIdCount = 10;
     const uint32_t total_elements = obj.via.array.size;
     const bool is_old_format =
         (total_elements == kOldFieldCount + replicas_count);
     const bool is_one_extra_format =
         (total_elements == kOneExtraFieldCount + replicas_count);
-    const bool is_current_format =
-        (total_elements == kCurrentFieldCount + replicas_count);
+    const bool is_data_type_hard_pin_format =
+        (total_elements == kDataTypeAndHardPinCount + replicas_count);
+    const bool is_tenant_id_format =
+        (total_elements == kWithTenantIdCount + replicas_count);
 
-    if (!is_current_format && !is_one_extra_format && !is_old_format) {
+    if (!is_tenant_id_format && !is_data_type_hard_pin_format &&
+        !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
     }
 
     ObjectDataType data_type = ObjectDataType::UNKNOWN;
-    if (is_current_format) {
+    if (is_tenant_id_format || is_data_type_hard_pin_format) {
         data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     } else if (is_one_extra_format &&
                array[index].type == msgpack::type::POSITIVE_INTEGER) {
@@ -4550,13 +5067,25 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         is_hard_pinned = array[index++].as<bool>();
     }
 
+    // Deserialize tenant_id (if present, otherwise default to "default" for
+    // backward compatibility with snapshots created before tenant_id was
+    // persisted).
+    std::string tenant_id_value = "default";
+    if (index < obj.via.array.size) {
+        tenant_id_value = array[index++].as<std::string>();
+        if (tenant_id_value.empty()) {
+            tenant_id_value = "default";
+        }
+    }
+
     // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
+        std::move(tenant_id_value));
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

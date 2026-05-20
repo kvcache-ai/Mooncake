@@ -6,9 +6,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <list>
 #include <memory>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -22,6 +25,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "tenant_quota.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
@@ -49,10 +53,44 @@ class SnapshotChildProcessTest;
 
 /*
  * @brief MasterService is the main class for the master server.
- * Lock order: To avoid deadlocks, the following lock order should be followed:
+ *
+ * Lock order. To avoid deadlocks, locks must be acquired in this order:
  * 1. client_mutex_
  * 2. metadata_shards_[shard_idx_].mutex
  * 3. segment_mutex_
+ * 4. ObjectMetadata::lock (per-object SpinLock; taken under shard.mutex
+ *    only -- see ReadLeaseSnapshot and GrantLease for the only two
+ *    places it is taken while another lock is held)
+ * 5. tenant_quotas_.mu_  (smallest granularity, shortest critical sections;
+ *    tenant_quotas_ helpers never call back into shard / client / segment
+ *    / metadata locks, so it is safe to acquire while holding any of the
+ *    above.)
+ *
+ * Frontier index lock domain: the per-tenant eviction frontier sets
+ * live INSIDE TenantQuotaTable::Entry and are protected by
+ * tenant_quotas_.mu_ (#5 above) -- the SAME mutex that guards quota
+ * accounting. Lifecycle helpers (IndexMetadata / UnindexMetadata /
+ * ReindexMetadataAfterPinChange) hold the owning shard's mutex while
+ * forwarding the frontier mutation to TenantQuotaTable, which then
+ * acquires its own mu_ briefly. RefillTenantFrontier is a thin
+ * wrapper over TenantQuotaTable::SnapshotTopK and does NOT walk
+ * shards.
+ *
+ * Cross-shard primitive:
+ *   - BatchEvictInTenant: pulls a candidate batch via SnapshotTopK
+ *     (single tenant_quotas_.mu_ acquisition), then for each
+ *     candidate takes that candidate's shard WRITER lock and releases
+ *     it before the next candidate. Single-shard invariant holds.
+ *
+ * Same-shard re-entry. std::shared_mutex is NOT recursive.
+ * AllocateAndInsertMetadata holds the writer lock for the inserting
+ * key's shard while invoking BatchEvictInTenant in its Reserve ->
+ * evict -> Reserve loop; re-acquiring the same shard would
+ * self-deadlock. Contract: any caller that already holds a shard
+ * writer lock MUST pass that shard's index as `excluded_shard_index`
+ * to BatchEvictInTenant (forwarded to RefillTenantFrontier). The
+ * primitive then skips that shard at the pull stage. The 1/kNumShards
+ * (~0.1%) loss in candidate space is absorbed by the near-LRU policy.
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
@@ -63,6 +101,12 @@ class MasterService {
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+    // Direct accessor for the per-tenant quota table. Used by the HTTP
+    // admin endpoints (via WrappedMasterService) to read state and apply
+    // policy CRUD, and by tests to inject policies and inspect usage.
+    TenantQuotaTable& GetTenantQuotas() { return tenant_quotas_; }
+    const TenantQuotaTable& GetTenantQuotas() const { return tenant_quotas_; }
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -526,6 +570,28 @@ class MasterService {
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
 
+    // ---- Test-only observability hooks ----
+    // Production observability is exposed via the Prometheus metrics on
+    // /metrics; the accessors below mirror those counters as plain atomics
+    // so unit tests can assert on them without scraping the metrics
+    // endpoint. Production callers MUST NOT depend on these; they are not
+    // part of the stable service contract.
+
+    // Mirrors mooncake_tenant_quota_reject_total: number of PutStart
+    // calls that returned NO_AVAILABLE_HANDLE because the tenant quota
+    // could not accommodate the request even after scoped eviction.
+    uint64_t TenantQuotaRejectTotal() const {
+        return tenant_quota_reject_total_.load(std::memory_order_relaxed);
+    }
+    // Total invocations of RefillTenantFrontier across the service's
+    // lifetime. The TenantEvictionContext cache amortises this across
+    // many NextVictim() calls within a single evict cycle. Each refill
+    // calls SnapshotTopK under tenant_quotas_.mu_, costing O(K log K)
+    // over the tenant's frontier set. Exposed for tests.
+    uint64_t RefillTenantFrontierCount() const {
+        return refill_tenant_frontier_count_.load(std::memory_order_relaxed);
+    }
+
    private:
     void SnapshotThreadFunc();
 
@@ -609,15 +675,20 @@ class MasterService {
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
-            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
+            std::string tenant_id_ = std::string("default"))
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               data_type(data_type_),
+              tenant_id(std::move(tenant_id_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
+            if (tenant_id.empty()) {
+                tenant_id = "default";
+            }
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
                 soft_pin_timeout.emplace();
@@ -637,6 +708,49 @@ class MasterService {
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+        // Tenant identity. Set at creation from ReplicateConfig.tenant_id;
+        // Case B reuses the existing buffers in place (so the field is not
+        // touched), and Case C destroys the old metadata and constructs a
+        // new one — quota is released from this object's tenant first, the
+        // new object is then charged to whatever tenant_id the caller passed.
+        //
+        // Note: the per-shard metadata map is keyed by the raw key string,
+        // so two tenants using the same raw key still collide in the
+        // underlying map. Quota accounting is correct across such a
+        // collision (Case C transfers bytes between tenants), but identical
+        // raw keys are not independently namespaced by tenant.
+        std::string tenant_id;
+
+        // Live-byte cost actually committed against the tenant quota when
+        // this object was admitted. Captured once at PutStart time (after
+        // the allocator returned and we counted memory replicas) and
+        // never recomputed afterwards: erase paths often pop replicas
+        // BEFORE deciding to release quota, which would zero the count if
+        // we re-derived it from the (now-empty) replica list. Reading this
+        // snapshot guarantees release amount == commit amount.
+        uint64_t quota_committed_bytes{0};
+
+        // ---- Per-tenant eviction frontier bookkeeping ----
+        //
+        // Frontier sets live inside TenantQuotaTable::Entry (one std::set
+        // per (tenant, bucket)) and are protected by tenant_quotas_.mu_.
+        // ObjectMetadata only remembers the snapshot triple
+        // (lease_timeout + bucket) used at indexing time so
+        // UnindexFrontier / DropStaleFrontier / MoveFrontier can locate
+        // the std::set node in O(log N) without scanning, and so
+        // evict-time consumers can detect stale entries (lease has been
+        // bumped since insertion).
+        //
+        // Concurrency: BOTH fields are read and written ONLY while the
+        // owning MetadataShard's mutex is held in write mode. The hot
+        // lease-renewal path (GrantLease) intentionally leaves them
+        // alone (lazy maintenance); the resulting staleness is
+        // reconciled at evict time by comparing frontier_lease_snapshot
+        // against the live lease_timeout. kNone is reserved for objects
+        // that must NEVER appear as eviction candidates (today: only
+        // hard-pinned ones).
+        FrontierBucket frontier_bucket{FrontierBucket::kNone};
+        std::chrono::system_clock::time_point frontier_lease_snapshot{};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -810,7 +924,8 @@ class MasterService {
         }
 
         // Check if is in soft pin status
-        bool IsSoftPinned(std::chrono::system_clock::time_point& now) const {
+        bool IsSoftPinned(
+            const std::chrono::system_clock::time_point& now) const {
             SpinLocker locker(&lock);
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
@@ -863,6 +978,16 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    // ---- Per-tenant eviction frontier index ----
+    //
+    // The frontier candidate sets live on TenantQuotaTable::Entry
+    // (one std::set<TenantFrontierEntry> per tenant per bucket),
+    // protected by tenant_quotas_.mu_. See tenant_quota.h for the
+    // entry struct, ordering and lazy-maintenance contract. Lifecycle
+    // helpers (IndexMetadata / UnindexMetadata) forward to the
+    // TenantQuotaTable API while still holding the owning shard's
+    // writer lock for the underlying ObjectMetadata mutation.
+
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
@@ -884,9 +1009,25 @@ class MasterService {
             : shard_(master_service->metadata_shards_[shard_index]),
               lock_(&shard_.mutex) {}
 
+        // Try-lock constructor: attempts to acquire the shard's writer
+        // lock without blocking. Caller MUST check owns_lock() before
+        // dereferencing.
+        MetadataShardAccessorRW(MasterService* master_service,
+                                size_t shard_index, std::try_to_lock_t)
+            : shard_(master_service->metadata_shards_[shard_index]),
+              lock_(&shard_.mutex, defer_lock) {
+            lock_.try_lock();
+        }
+
+        bool owns_lock() const NO_THREAD_SAFETY_ANALYSIS {
+            return lock_.is_locked();
+        }
+
         MetadataShard* operator->() { return &shard_; }
 
         const MetadataShard* operator->() const { return &shard_; }
+
+        MetadataShard& GetShard() { return shard_; }
 
        private:
         MetadataShard& shard_;
@@ -907,6 +1048,176 @@ class MasterService {
         const MetadataShard& shard_;
         SharedMutexLocker lock_;
     };
+
+    // ---- Per-tenant eviction context ----
+    //
+    // Stateful helper that drives BatchEvictInTenant across multiple
+    // attempts: it caches refilled candidates so a single Reserve()
+    // failure -> evict -> retry cycle does not fan out kNumShards-wide
+    // shared-lock acquisitions on every iteration.
+    //
+    // Lifecycle:
+    //   - Constructed lazily inside AllocateAndInsertMetadata when the
+    //     first ReserveTenantBytes call fails; lives for the duration
+    //     of the eviction attempt loop only.
+    //   - NextVictim(bucket) returns the next candidate from
+    //     the requested cache (no-pin or soft-pin), refilling from
+    //     RefillTenantFrontier when the cache is empty.
+    //   - Refill counts are tracked separately for the two passes;
+    //     once a pass exhausts kMaxRefills the helper returns nullopt
+    //     for that pass to bound worst-case work per allocation.
+    //
+    // Thread-safety: NOT thread-safe. The owning thread must serialize
+    // calls; this matches how AllocateAndInsertMetadata holds the
+    // shard write lock for the failing key throughout the retry loop.
+    // The helper itself only takes tenant_quotas_.mu_ briefly via
+    // SnapshotTopK and never any shard lock, so it is safe to call
+    // while holding any shard's write lock.
+    class TenantEvictionContext {
+       public:
+        // The two pull-stage tunables. See the consolidated tunables
+        // block right after this nested class for the full rationale
+        // (kBatchSize / kMaxRefills / kMaxEvictAttempts form one
+        // family). They are class-static so tests can read them in
+        // one place; they are compile-time constants on purpose --
+        // promoting any of them to a runtime gflag must come with a
+        // matching observability metric.
+        //
+        // kBatchSize: how many candidates SnapshotTopK returns in one
+        //   refill. 64 mirrors the global BatchEvict batch size; the
+        //   cost of a refill is one tenant_quotas_.mu_ acquisition +
+        //   an O(K) std::set walk.
+        // kMaxRefills: per-pass cap on refills. 4 sweeps * 64
+        //   candidates = 256 candidates examined per pass before we
+        //   give up on the tenant -- enough to absorb lazy-stale
+        //   skips (lease bumped between refill and consumption).
+        static constexpr size_t kBatchSize = 64;
+        static constexpr size_t kMaxRefills = 4;
+
+        TenantEvictionContext(const MasterService* master_service,
+                              std::string tenant_id);
+
+        // Returns the next candidate from the requested pass, or
+        // std::nullopt if the cache is empty AND the per-pass refill
+        // budget has been exhausted (or SnapshotTopK returned empty,
+        // meaning the tenant has no more frontier entries of that
+        // flavour anywhere in the system).
+        std::optional<TenantFrontierEntry> NextVictim(FrontierBucket bucket);
+
+        const std::string& tenant_id() const { return tenant_id_; }
+
+       private:
+        // Replenishes the requested cache from SnapshotTopK.
+        // Increments the matching refill counter. Returns true if at
+        // least one entry was added.
+        bool Refill(FrontierBucket bucket);
+
+        const MasterService* master_;
+        std::string tenant_id_;
+        std::deque<TenantFrontierEntry> cached_no_pin_;
+        std::deque<TenantFrontierEntry> cached_soft_pin_;
+        size_t refills_no_pin_{0};
+        size_t refills_soft_pin_{0};
+    };
+
+    // ---- Eviction primitive ----
+    //
+    // EvictCycleContext bundles the per-cycle offload state that used
+    // to live in BatchEvict's lambda captures. Promoting it to a named
+    // struct lets BatchEvictInTenant reuse the exact same eviction
+    // primitive without copy-pasting the lambda. Each top-level
+    // eviction call (BatchEvict / BatchEvictInTenant) constructs ONE
+    // EvictCycleContext on the stack; the counters scope to that call
+    // only.
+    struct EvictCycleContext {
+        // Inputs (set by the caller, not modified by the primitive):
+        bool offload_on_evict;
+        bool offload_force_evict;
+        long offload_cap;  // ignored when offload_on_evict is false
+        std::chrono::system_clock::time_point now;
+
+        // Counters maintained by TryEvictOrOffload across the cycle:
+        long offload_queued_this_cycle{0};
+        long offload_deferred_count{0};
+        long offload_cap_forced_count{0};
+        long offload_push_failed_forced{0};
+    };
+
+    // EvictReconcileResult captures the outcome of one
+    // TryEvictAndReconcile call so the calling loop can decide how to
+    // advance its iterator and how many objects it has reclaimed.
+    struct EvictReconcileResult {
+        // Bytes freed on the tenant's quota. Zero when the candidate
+        // could not be evicted (offload queued but no extra replicas
+        // erased, push-fail in soft mode, etc.).
+        uint64_t freed_bytes{0};
+        // True if the ObjectMetadata was erased from the shard map.
+        // The caller MUST advance its iterator via the returned
+        // iterator (see next_iterator) when this is true; otherwise
+        // it is a normal post-increment.
+        bool erased{false};
+    };
+
+    // Tries to evict (or offload-defer) one object's memory replicas
+    // and reconciles all the bookkeeping the surviving / erased paths
+    // need: tenant quota release, frontier unindex, and the "decrement
+    // quota_committed_bytes by `freed`" guard that all three of
+    // BatchEvict's passes share.
+    //
+    // Caller MUST hold the shard's WRITE lock (this function may erase
+    // from shard->metadata and mutate frontier sets).
+    //
+    // The iterator passed in `it` is consumed: on return,
+    // - if result.erased == true,  `it` has been invalidated; the
+    //   caller should NOT use it. The function returns the iterator
+    //   that "took its place" in shard->metadata (i.e. the result of
+    //   shard->metadata.erase(it)). The caller assigns this to its
+    //   loop iterator and must NOT post-increment.
+    // - if result.erased == false, `it` remains valid and unchanged;
+    //   the caller post-increments as normal.
+    std::unordered_map<std::string, ObjectMetadata>::iterator
+    TryEvictAndReconcile(
+        EvictCycleContext& ctx, MetadataShardAccessorRW& shard,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        EvictReconcileResult& result);
+
+    // Lower-level primitive: actually invoke offload-on-evict logic and
+    // return how many bytes were freed. Used by TryEvictAndReconcile;
+    // exposed here so callers that need to handle survive/erase
+    // bookkeeping in some non-standard way (currently none) can reuse
+    // it. Caller must hold the shard write lock.
+    uint64_t TryEvictOrOffload(EvictCycleContext& ctx, const std::string& key,
+                               ObjectMetadata& metadata,
+                               MetadataShardAccessorRW& shard);
+
+    // ---- Per-tenant eviction tunables ----
+    //
+    // kMaxEvictAttempts: outer-loop bound for the
+    //   AllocateAndInsertMetadata Reserve -> BatchEvictInTenant ->
+    //   Reserve cycle. Each attempt may free a fraction of the
+    //   requested target_bytes if the pulled batch is partially
+    //   stale (lazy maintenance discards bumped-lease candidates).
+    //   Bounding the attempts at 8 caps the worst-case allocation
+    //   latency at:
+    //
+    //       kMaxEvictAttempts * 2_passes * kMaxRefills * kBatchSize
+    //         = 8 * 2 * 4 * 64 = 4096 candidates examined
+    //
+    //   (each BatchEvictInTenant call creates a fresh
+    //   TenantEvictionContext whose two passes have independent
+    //   refill budgets: 2 * kMaxRefills * kBatchSize = 512 per call)
+    //
+    //   for a single failing PutStart, before we surface
+    //   NO_AVAILABLE_HANDLE to the client. Above that the tenant is
+    //   either fully pinned or genuinely over quota -- spinning more
+    //   would only hurt latency without changing the verdict.
+    //
+    // All three constants are compile-time. They can be promoted to
+    // gflags if operators need to tune quota-pressure behavior; the
+    // matching mooncake_tenant_quota_reject_total counter and the
+    // RefillTenantFrontierCount() observable already let callers
+    // correlate any tuning change with observed pressure.
+    static constexpr size_t kMaxEvictAttempts = 8;
 
     // Helper to get shard index from key
     size_t getShardIndex(const std::string& key) const {
@@ -934,6 +1245,187 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
+
+    // ---- Eviction predicates (pure helpers on ObjectMetadata) ----
+    //
+    // Hoisted out of BatchEvict so BatchEvictInTenant can reuse the
+    // same definition of "evictable memory replica". Side-effect free
+    // except EvictReplicas (which mutates), depend only on the
+    // metadata's own state. Declared as private static members because
+    // ObjectMetadata is a private nested type and free functions in an
+    // anonymous namespace would not have access to it.
+
+    // True when the object owns at least one MEMORY replica that is
+    // completed and currently has zero outstanding refcount, i.e. one
+    // we could erase right now without breaking an in-flight reader.
+    static bool CanEvictReplicas(const ObjectMetadata& metadata);
+
+    // Erase every MEMORY replica that currently satisfies the
+    // CanEvictReplicas predicate. Returns the number of replicas erased.
+    static size_t EvictReplicas(ObjectMetadata& metadata);
+
+    // True when the object owns at least one local-disk replica.
+    static bool HasLocalDiskReplica(const ObjectMetadata& metadata);
+
+    // Returns the frontier bucket this object should currently live in
+    // given its hard-pin / soft-pin state. kNone means "must NEVER
+    // appear as eviction candidate" (today: only hard-pinned ones).
+    static FrontierBucket ChooseFrontierBucket(
+        const ObjectMetadata& metadata,
+        const std::chrono::system_clock::time_point& now);
+
+    // Reads lease_timeout under the metadata SpinLock so the frontier
+    // entry's primary key is consistent with what GrantLease saw at
+    // indexing time. Subsequent GrantLease calls bump the live
+    // lease_timeout but leave the snapshot alone -- evict-time
+    // consumers reconcile via metadata.frontier_lease_snapshot.
+    static std::chrono::system_clock::time_point ReadLeaseSnapshot(
+        const ObjectMetadata& metadata);
+
+    // ---- Per-tenant frontier index helpers ----
+    //
+    // IndexMetadata / UnindexMetadata are the single entry / exit
+    // points for the per-tenant frontier sets that
+    // BatchEvictInTenant pops from. Every code path that inserts a
+    // new ObjectMetadata into a shard MUST call IndexMetadata
+    // exactly once after the insert, and every code path that
+    // removes an ObjectMetadata from a shard MUST call
+    // UnindexMetadata exactly once before the erase. Mismatched
+    // calls leak set entries and silently break the eviction
+    // algorithm.
+    //
+    // The frontier sets themselves live on TenantQuotaTable::Entry;
+    // these helpers translate the lifecycle event into IndexFrontier /
+    // UnindexFrontier calls on tenant_quotas_. They REQUIRE the
+    // caller to hold the owning shard's mutex in write mode (so the
+    // per-object snapshot triple they read off ObjectMetadata is
+    // consistent), but the frontier mutation itself runs under
+    // tenant_quotas_.mu_ -- callers MUST
+    // NOT already hold tenant_quotas_.mu_.
+    //
+    // Lazy-maintenance contract: lease-renewal hot paths
+    // (GrantLease / GetReplicaList) intentionally skip these
+    // helpers. The resulting staleness in
+    // frontier_lease_snapshot is reconciled at evict time
+    // (BatchEvictInTenant compares the snapshot against the live
+    // lease_timeout and drops stale candidates via
+    // DropStaleFrontier). Soft-pin state changes DO need to update
+    // the frontier (the candidate moves between buckets); that is
+    // the ReindexMetadataAfterPinChange helper.
+    void IndexMetadata(MetadataShard& shard, const std::string& key,
+                       ObjectMetadata& metadata);
+    void UnindexMetadata(MetadataShard& shard, const std::string& key,
+                         ObjectMetadata& metadata);
+    // Called when an object's soft-pin status flips. Migrates the
+    // object's frontier entry between buckets via
+    // TenantQuotaTable::MoveFrontier. No-op if the object is not
+    // currently indexed (e.g. hard-pinned, or never reached
+    // IndexMetadata).
+    void ReindexMetadataAfterPinChange(MetadataShard& shard,
+                                       const std::string& key,
+                                       ObjectMetadata& metadata);
+
+    // Sentinel for "no shard is excluded" -- used by the
+    // excluded_shard_index parameter of BatchEvictInTenant.
+    static constexpr size_t kInvalidShardIndex =
+        std::numeric_limits<size_t>::max();
+
+    // Try to evict at least `target_bytes` from `tenant_id`'s memory
+    // footprint by walking the per-tenant frontier sets stored on
+    // TenantQuotaTable::Entry.
+    //
+    // Two-pass strategy mirroring the global BatchEvict policy:
+    //   Pass 1 -- no-pin frontier: evict objects whose lease has the
+    //     earliest expiry first (snapshot ordering inside the std::set).
+    //   Pass 2 -- soft-pin frontier: only entered if Pass 1 freed less
+    //     than target_bytes AND allow_evict_soft_pinned_objects_ is
+    //     enabled at the service level.
+    //
+    // Per candidate returned by TenantEvictionContext::NextVictim:
+    //   1. Skip the candidate if its key hashes to excluded_shard_index.
+    //   2. Acquire the owning shard's WRITE lock.
+    //   3. Re-validate the candidate: key still present, not
+    //      hard-pinned, lease snapshot still matches metadata
+    //      (lazy-maintenance via the snapshot stored on the
+    //      ObjectMetadata), has evictable memory replicas via
+    //      CanEvictReplicas. On lease-bump miss the candidate is
+    //      cleaned up via TenantQuotaTable::DropStaleFrontier.
+    //   4. On success, call TryEvictAndReconcile to do the actual
+    //      eviction + frontier unindex + quota release.
+    //   5. Release the shard write lock.
+    //
+    // Returns the cumulative bytes freed across both passes. Caller
+    // (AllocateAndInsertMetadata) then re-tries ReserveTenantBytes.
+    //
+    // `excluded_shard_index`: when not equal to kInvalidShardIndex,
+    // candidates whose key hashes to that shard index are skipped.
+    // This is the deadlock-avoidance contract for callers that
+    // already hold a shard write lock (typically
+    // AllocateAndInsertMetadata): std::shared_mutex is NOT recursive,
+    // so re-acquiring the same shard's writer lock would
+    // self-deadlock. Skipping the caller's own shard preserves
+    // correctness with at most a 1/kNumShards = 0.1% reduction in
+    // candidate space.
+    //
+    // Caller MUST NOT hold any shard mutex EXCEPT the one whose
+    // index they pass as excluded_shard_index. The frontier pull
+    // itself runs under tenant_quotas_.mu_, which is acquired AFTER
+    // any shard mutex per the documented lock order, so the contract
+    // is satisfied automatically.
+    uint64_t BatchEvictInTenant(
+        const std::string& tenant_id, uint64_t target_bytes,
+        size_t excluded_shard_index = kInvalidShardIndex);
+
+    // Thin wrapper over TenantQuotaTable::SnapshotTopK. Bumps
+    // refill_tenant_frontier_count_ unconditionally so the perf-
+    // baseline test can assert how often TenantEvictionContext
+    // refills its cache.
+    //
+    // Caller must NOT hold tenant_quotas_.mu_; SnapshotTopK acquires
+    // it internally.
+    std::deque<TenantFrontierEntry> RefillTenantFrontier(
+        const std::string& tenant_id, FrontierBucket bucket,
+        size_t batch_size) const;
+
+    // ---- Per-tenant quota accounting helpers. ----
+    // These wrap TenantQuotaTable and respect the enable_tenant_quota_ feature
+    // gate: when the gate is OFF every helper is a strict no-op so that
+    // existing single-tenant deployments observe identical behavior.
+    //
+    // Lock order: callers usually hold a MetadataShard mutex; tenant_quotas_
+    // has the smallest granularity and shortest critical sections, so it MUST
+    // be acquired AFTER any shard / client / segment mutex. None of these
+    // helpers call back into shard locks, satisfying that invariant.
+    //
+    // Returns true if the reservation succeeded (or the feature gate is off);
+    // false means the tenant exceeded its quota and the caller must abort.
+    bool ReserveTenantBytes(const std::string& tenant_id, uint64_t bytes);
+    void CommitTenantBytes(const std::string& tenant_id, uint64_t bytes);
+    void AbortTenantBytes(const std::string& tenant_id, uint64_t bytes);
+    void ReleaseTenantBytes(const std::string& tenant_id, uint64_t bytes);
+    // Partial release for survive-after-evict / partial-replica-clear paths
+    // where the object is still alive. Decrements used_bytes only; does not
+    // touch committed_count. See TenantQuotaTable::ReleasePartial.
+    void ReleaseTenantBytesPartial(const std::string& tenant_id,
+                                   uint64_t bytes);
+    // How many bytes need to leave the tenant before it can fit
+    // `incoming_bytes`. Returns 0 when the tenant is unlimited or
+    // already has headroom. No-op + 0 when the feature gate is off.
+    uint64_t ComputeTenantEvictTarget(const std::string& tenant_id,
+                                      uint64_t incoming_bytes) const;
+    // Compute the live-byte cost of a single object for quota accounting.
+    // Only counts memory replicas (matches AccountLiveBytes semantics).
+    uint64_t TenantBytesForMetadata(const ObjectMetadata& metadata) const;
+
+    // Republish per-tenant quota gauges from the current TenantQuotaTable
+    // state. `known_before_tenant_ids` lists tenants whose gauges existed
+    // prior to the call site (typically captured before a snapshot
+    // restore); any tenant in this set that no longer appears in
+    // `tenant_quotas_.ListAll()` after the call has its gauges zeroed so
+    // /metrics does not retain stale labels for tenants that disappeared.
+    // No-op when enable_tenant_quota_ is false.
+    void RefreshTenantQuotaMetrics(
+        const std::unordered_set<std::string>& known_before_tenant_ids);
 
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -982,6 +1474,22 @@ class MasterService {
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+
+    // How many PutStart/UpsertStart calls have been rejected with
+    // NO_AVAILABLE_HANDLE specifically because the tenant could not
+    // be made to fit (Reserve failed AND BatchEvictInTenant could not
+    // free enough). Kept distinct from the global allocator-OOM path
+    // so operators can tell quota pressure apart from cluster-wide
+    // OOM.
+    mutable std::atomic<uint64_t> tenant_quota_reject_total_{0};
+
+    // Total RefillTenantFrontier invocations -- bumped at every entry
+    // into the helper (regardless of whether it returned candidates).
+    // Lets the perf-baseline test assert that the EvictionContext
+    // cache amortizes refills (~O(1) per evict cycle) instead of
+    // degenerating into a per-victim shard scan. mutable because
+    // RefillTenantFrontier is const.
+    mutable std::atomic<uint64_t> refill_tenant_frontier_count_{0};
 
     // Eviction related members
     std::atomic<bool> need_eviction_{
@@ -1032,7 +1540,13 @@ class MasterService {
                 });
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
+                    const std::string tid = it_->second.tenant_id;
+                    const uint64_t committed =
+                        it_->second.quota_committed_bytes;
+                    service_->UnindexMetadata(shard_guard_.GetShard(), key_,
+                                              it_->second);
                     this->Erase();
+                    service_->ReleaseTenantBytes(tid, committed);
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
@@ -1056,6 +1570,13 @@ class MasterService {
 
         MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
             return shard_guard_;
+        }
+
+        // Convenience accessor returning the underlying MetadataShard by
+        // reference. Avoids the verbose `*GetShard().operator->()` pattern
+        // that appears at every call site needing a MetadataShard&.
+        MetadataShard& GetShardRef() NO_THREAD_SAFETY_ANALYSIS {
+            return shard_guard_.GetShard();
         }
 
         // Get metadata (only call when Exists() is true)
@@ -1147,6 +1668,20 @@ class MasterService {
         // Deserialize discarded replicas
         tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
             const msgpack::object& obj);
+
+        // Serialize tenant quota policies (default + explicit overrides).
+        // Quota *usage* is intentionally excluded -- it is rebuilt from
+        // restored object metadata via AccumulateUsage during
+        // DeserializeShard.
+        tl::expected<void, SerializationError> SerializeTenantQuotas(
+            MsgpackPacker& packer) const;
+
+        // Deserialize and apply tenant quota policies. Tolerant of legacy
+        // snapshots that omit the field: callers detect that case (the
+        // top-level "tenant_quotas" key is absent) and skip the call,
+        // preserving whatever default the master was started with.
+        tl::expected<void, SerializationError> DeserializeTenantQuotas(
+            const msgpack::object& obj);
     };
 
     friend class MetadataAccessor;
@@ -1237,6 +1772,19 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
+
+    // Per-tenant quota
+    const bool enable_tenant_quota_;
+    // Captured at construction time so the failed-restore reset path can
+    // reinstate the operator-supplied default before retrying another
+    // snapshot candidate. Without this, a restore that ran
+    // RestorePolicies() on a snapshot and then failed mid-flight would
+    // leave the previous attempt's snapshot-default in place; if the
+    // next candidate happened to be a legacy snapshot (no quota field),
+    // the deserializer would skip the default-overwrite and the leftover
+    // policy would silently survive.
+    const TenantQuotaPolicy startup_tenant_quota_policy_;
+    TenantQuotaTable tenant_quotas_;
 
     bool use_disk_replica_{false};
 

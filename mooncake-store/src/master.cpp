@@ -122,10 +122,11 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "Seconds a client stays considered alive after the last heartbeat. "
-             "If this TTL elapses without a refresh, the master treats the "
-             "client as disconnected and may unmount its segments");
+DEFINE_int64(
+    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+    "Seconds a client stays considered alive after the last heartbeat. "
+    "If this TTL elapses without a refresh, the master treats the "
+    "client as disconnected and may unmount its segments");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -160,6 +161,11 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
+DEFINE_bool(
+    enable_tenant_quota, false,
+    "Enable per-tenant quota enforcement (default: false, metrics only)");
+DEFINE_uint64(default_tenant_quota_bytes, 0,
+              "Default per-tenant quota in bytes (0 = unlimited)");
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
@@ -343,6 +349,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetBool("enable_tenant_quota",
+                           &master_config.enable_tenant_quota,
+                           FLAGS_enable_tenant_quota);
+    default_config.GetUInt64("default_tenant_quota_bytes",
+                             &master_config.default_tenant_quota_bytes,
+                             FLAGS_default_tenant_quota_bytes);
 
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,

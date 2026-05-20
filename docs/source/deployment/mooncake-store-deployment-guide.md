@@ -34,6 +34,39 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
   - `--client_ttl` (int64, default `10` s): Seconds a client stays considered alive after the last heartbeat. If this TTL elapses without a refresh, the master treats the client as disconnected and may unmount its segments.
 
+- Per-Tenant Quota (optional)
+  - `--enable_tenant_quota` (bool, default `false`): Enable per-tenant byte quotas. When disabled, the master behaves as a single shared pool (existing single-tenant deployments are unaffected). When enabled, each `PutStart` is admitted via a Reserve / Commit two-phase handshake against the tenant identified by `ReplicateConfig.tenant_id`; an empty `tenant_id` is normalized to `"default"`.
+  - `--default_tenant_quota_bytes` (uint64, default `0`): Default maximum bytes per tenant when no explicit policy is set. `0` means unlimited (preserving the legacy global-pool semantics on a per-tenant basis). Operators can override per tenant at runtime through the HTTP admin API below.
+
+  Tenants exceeding their quota first trigger a tenant-scoped eviction of expired-lease objects belonging to the same tenant; only when no further bytes can be reclaimed does `PutStart` return `NO_AVAILABLE_HANDLE`. Cross-tenant evictions never happen.
+
+  HTTP admin endpoints (served on the same port as `/metrics`):
+
+  ```text
+  GET    /tenants/quota                               # list every tenant's policy + state
+  GET    /tenants/quota/query?tenant_id=<id>          # inspect one tenant
+  PUT    /tenants/quota/query?tenant_id=<id>          # body: {"max_bytes": <int64 >= 0>}
+  DELETE /tenants/quota/query?tenant_id=<id>          # remove explicit policy (revert to default)
+  GET    /tenants/quota/_default                      # read default policy
+  PUT    /tenants/quota/_default                      # body: {"max_bytes": <int64 >= 0>}
+  ```
+
+  Validation rules enforced by the handlers (all violations return `400`):
+  - `tenant_id` query parameter is required and may not begin with `_` (names starting with `_` are reserved for pseudo-tenants such as `_default`).
+  - `max_bytes` must be a non-negative integer; `0` means unlimited.
+
+  Prometheus metrics exposed on `/metrics` (one series per tenant):
+
+  ```text
+  mooncake_tenant_quota_max_bytes{tenant_id="..."}        # current effective limit; 0 = unlimited
+  mooncake_tenant_quota_used_bytes{tenant_id="..."}       # committed live bytes
+  mooncake_tenant_quota_reserved_bytes{tenant_id="..."}   # bytes reserved by in-flight PutStart
+  mooncake_tenant_quota_reject_total{tenant_id="..."}     # PutStart rejections after scoped evict failed
+  mooncake_tenant_evict_bytes_total{tenant_id="..."}      # bytes reclaimed by per-tenant eviction
+  ```
+
+  HA / snapshot interaction: tenant policies (default + explicit overrides) are persisted into the master metadata snapshot. After a restart with `--enable_snapshot_restore=true`, the snapshot's policies override `--default_tenant_quota_bytes` so any runtime changes made via the HTTP admin API survive failover. Quota *usage* is not snapshotted; it is rebuilt by walking restored object metadata.
+
 - High Availability (optional)
   - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.

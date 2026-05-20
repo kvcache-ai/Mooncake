@@ -4,6 +4,8 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
+    master_service_tenant_quota.cpp
+    tenant_quota.cpp
     client_service.cpp
     client_metric.cpp
     types.cpp
@@ -17,6 +19,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     rpc_service.cpp
+    tenant_quota_http.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp

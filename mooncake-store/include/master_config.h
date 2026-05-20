@@ -65,6 +65,10 @@ struct MasterConfig {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
 
+    // Per-tenant quota configuration
+    bool enable_tenant_quota = false;
+    uint64_t default_tenant_quota_bytes = 0;
+
     bool enable_snapshot_restore;
     bool enable_snapshot;
     std::string snapshot_backup_dir;
@@ -134,6 +138,8 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_tenant_quota = false;
+    uint64_t default_tenant_quota_bytes = 0;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -204,6 +210,8 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_tenant_quota = config.enable_tenant_quota;
+        default_tenant_quota_bytes = config.default_tenant_quota_bytes;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
@@ -300,6 +308,8 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_tenant_quota = false;
+    uint64_t default_tenant_quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -354,6 +364,8 @@ class WrappedMasterServiceConfig {
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_tenant_quota = config.enable_tenant_quota;
+        default_tenant_quota_bytes = config.default_tenant_quota_bytes;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -434,6 +446,8 @@ class WrappedMasterServiceConfig {
         memory_allocator = config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_tenant_quota = config.enable_tenant_quota;
+        default_tenant_quota_bytes = config.default_tenant_quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -487,6 +501,8 @@ class MasterServiceConfigBuilder {
         AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
+    bool enable_tenant_quota_ = false;
+    uint64_t default_tenant_quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
@@ -609,6 +625,16 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
         uint64_t put_start_release_timeout_sec) {
         put_start_release_timeout_sec_ = put_start_release_timeout_sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_tenant_quota(bool enable) {
+        enable_tenant_quota_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_default_tenant_quota_bytes(uint64_t bytes) {
+        default_tenant_quota_bytes_ = bytes;
         return *this;
     }
 
@@ -773,6 +799,8 @@ class MasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    bool enable_tenant_quota = false;
+    uint64_t default_tenant_quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -824,6 +852,8 @@ class MasterServiceConfig {
         allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        enable_tenant_quota = config.enable_tenant_quota;
+        default_tenant_quota_bytes = config.default_tenant_quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -881,6 +911,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_tenant_quota = enable_tenant_quota_;
+    config.default_tenant_quota_bytes = default_tenant_quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
     config.enable_snapshot = enable_snapshot_;
     config.snapshot_backup_dir = snapshot_backup_dir_;

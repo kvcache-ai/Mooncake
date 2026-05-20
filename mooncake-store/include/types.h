@@ -343,6 +343,9 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+
+    // Tenant quota errors (Range: -1600 to -1699)
+    TENANT_QUOTA_NOT_FOUND = -1600,  ///< Tenant quota entry not found.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

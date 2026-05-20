@@ -165,6 +165,25 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return service->PersistState(snapshot_id);
     }
 
+    // Lazily create the snapshot object/catalog stores on a MasterService
+    // that was built without --enable_snapshot. This lets a test write
+    // snapshots via CallPersistState() without having the auto-snapshot
+    // thread running in the background, eliminating the
+    // interval-vs-test-runtime race that would otherwise let a thread-
+    // initiated persist clobber the timestamped snapshot the test just
+    // created.
+    static void EnsureSnapshotStores(MasterService* service) {
+        if (!service->snapshot_object_store_) {
+            service->snapshot_object_store_ = SnapshotObjectStore::Create(
+                SnapshotObjectStoreType::LOCAL_FILE);
+        }
+        if (!service->snapshot_catalog_store_ &&
+            service->snapshot_object_store_) {
+            service->snapshot_catalog_store_ =
+                service->CreateSnapshotCatalogStore();
+        }
+    }
+
     // Generate unique snapshot ID (timestamp format)
     std::string GenerateSnapshotId() const {
         auto now = std::chrono::system_clock::now();
@@ -776,6 +795,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     std::unique_ptr<MasterService> service_;
     std::vector<Replica::Descriptor> replica_list;
 
+    // Tests whose scenario intentionally diverges the original snapshot
+    // from a restored-then-re-persisted snapshot (e.g. exercising
+    // restore-time cleanup of expired-lease objects) can set this to true
+    // to skip the byte-equality roundtrip in TearDown. The test is then
+    // responsible for asserting whatever invariant it actually cares about.
+    bool skip_teardown_roundtrip_ = false;
+
     // ==================== TearDown ====================
 
     void TearDown() override {
@@ -802,8 +828,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 service_->CreateSnapshotCatalogStore();
         }
 
-        // Test snapshot and restore functionality for all test cases
-        TestSnapshotAndRestore(service_);
+        // Test snapshot and restore functionality for all test cases unless
+        // the test explicitly opted out (see skip_teardown_roundtrip_).
+        if (!skip_teardown_roundtrip_) {
+            TestSnapshotAndRestore(service_);
+        }
         service_.reset();
 
         // Clean up temporary directory

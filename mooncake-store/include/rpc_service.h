@@ -211,11 +211,27 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type);
 
+    // ---- Tenant Quota Admin API ----
+    std::vector<TenantQuotaSnapshot> ListTenantQuotas();
+    std::optional<TenantQuotaSnapshot> GetTenantQuota(
+        const std::string& tenant_id);
+    TenantQuotaSnapshot UpsertTenantQuota(const std::string& tenant_id,
+                                          const TenantQuotaPolicy& policy);
+    bool EraseTenantQuota(const std::string& tenant_id);
+    TenantQuotaPolicy GetDefaultTenantQuota();
+    void SetDefaultTenantQuota(const TenantQuotaPolicy& policy);
+
    private:
     MasterService master_service_;
 };
 
 class MasterAdminServer {
+    // Allows the tenant-quota HTTP module (kept in a separate TU to
+    // avoid bloating rpc_service.cpp) to register its endpoints on
+    // the private http_server_ and use GetActiveService() for
+    // service-plane lookups.
+    friend void RegisterTenantQuotaAdminEndpoints(MasterAdminServer* admin);
+
    public:
     MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
 

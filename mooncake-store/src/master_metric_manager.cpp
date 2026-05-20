@@ -323,7 +323,25 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+
+      // Per-Tenant Quota Metrics
+      tenant_quota_max_bytes_("mooncake_tenant_quota_max_bytes",
+                              "Per-tenant quota limit in bytes (0 = unlimited)",
+                              {"tenant_id"}),
+      tenant_quota_used_bytes_("mooncake_tenant_quota_used_bytes",
+                               "Per-tenant committed live bytes",
+                               {"tenant_id"}),
+      tenant_quota_reserved_bytes_(
+          "mooncake_tenant_quota_reserved_bytes",
+          "Per-tenant reserved but not yet committed bytes", {"tenant_id"}),
+      tenant_quota_reject_total_(
+          "mooncake_tenant_quota_reject_total",
+          "Per-tenant total number of PutStart rejections due to quota",
+          {"tenant_id"}),
+      tenant_evict_bytes_total_(
+          "mooncake_tenant_evict_bytes_total",
+          "Per-tenant total bytes evicted by scoped eviction", {"tenant_id"}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -1273,6 +1291,52 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+// Per-Tenant Quota Metrics
+void MasterMetricManager::set_tenant_quota_max_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_max_bytes_.update({tenant_id}, bytes);
+}
+
+void MasterMetricManager::set_tenant_quota_used_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_used_bytes_.update({tenant_id}, bytes);
+}
+
+void MasterMetricManager::set_tenant_quota_reserved_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_reserved_bytes_.update({tenant_id}, bytes);
+}
+
+void MasterMetricManager::inc_tenant_quota_used_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_used_bytes_.inc({tenant_id}, bytes);
+}
+
+void MasterMetricManager::dec_tenant_quota_used_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_used_bytes_.dec({tenant_id}, bytes);
+}
+
+void MasterMetricManager::inc_tenant_quota_reserved_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_reserved_bytes_.inc({tenant_id}, bytes);
+}
+
+void MasterMetricManager::dec_tenant_quota_reserved_bytes(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_quota_reserved_bytes_.dec({tenant_id}, bytes);
+}
+
+void MasterMetricManager::inc_tenant_quota_reject_total(
+    const std::string& tenant_id, int64_t val) {
+    tenant_quota_reject_total_.inc({tenant_id}, val);
+}
+
+void MasterMetricManager::inc_tenant_evict_bytes_total(
+    const std::string& tenant_id, int64_t bytes) {
+    tenant_evict_bytes_total_.inc({tenant_id}, bytes);
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -1391,6 +1455,13 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
     serialize_metric(snapshot_fail_);
+
+    // Serialize Per-Tenant Quota Metrics
+    serialize_metric(tenant_quota_max_bytes_);
+    serialize_metric(tenant_quota_used_bytes_);
+    serialize_metric(tenant_quota_reserved_bytes_);
+    serialize_metric(tenant_quota_reject_total_);
+    serialize_metric(tenant_evict_bytes_total_);
 
     return ss.str();
 }
