@@ -105,8 +105,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
-    m.def("set_transfer_engine", &setTransferEnginePy,
-          py::arg("engine"),
+    m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
           "Set an external TransferEngine to be used by MooncakeBackend. "
           "Must be called before init_process_group(). The engine must already "
           "be initialized. Pass None to reset to default behavior. "
