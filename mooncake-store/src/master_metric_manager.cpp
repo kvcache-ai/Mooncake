@@ -556,15 +556,29 @@ void MasterMetricManager::dec_total_file_capacity(int64_t val) {
     file_total_capacity_.dec(val);
 }
 
+void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
+    dfs_capacity_unlimited_ = unlimited;
+}
+
+bool MasterMetricManager::is_dfs_capacity_unlimited() {
+    return dfs_capacity_unlimited_;
+}
+
 int64_t MasterMetricManager::get_allocated_file_size() {
     return file_allocated_size_.value();
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
+    if (dfs_capacity_unlimited_) {
+        return std::numeric_limits<int64_t>::max();
+    }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
+    if (dfs_capacity_unlimited_) {
+        return 0.0;
+    }
     double allocated = file_allocated_size_.value();
     double capacity = file_total_capacity_.value();
     if (capacity == 0) {
@@ -1745,8 +1759,11 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
+    int64_t file_display_capacity = dfs_capacity_unlimited_
+                                        ? std::numeric_limits<int64_t>::max()
+                                        : file_capacity;
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
-       << byte_size_to_string(file_capacity);
+       << byte_size_to_string(file_display_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
