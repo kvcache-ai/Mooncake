@@ -43,6 +43,15 @@ class WorkerPool {
 
     int doProcessContextEvents();
 
+    // Simplified rail monitor: pause problematic paths for a cooldown period
+    struct RailState {
+        int error_count = 0;
+        uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+    };
+
+    void markRailFailed(const std::string &peer_nic_path);
+    bool isRailAvailable(const std::string &peer_nic_path);
+
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
@@ -68,7 +77,13 @@ class WorkerPool {
 
     std::atomic<uint64_t> submitted_slice_count_, processed_slice_count_;
 
-    uint64_t success_nr_polls = 0, failed_nr_polls = 0;
+    // Rail state management: peer_nic_path -> RailState
+    std::unordered_map<std::string, RailState> rail_states_;
+    std::mutex rail_state_lock_;
+
+    // Rail monitor configuration
+    const static int kRailErrorThreshold = 5;      // Errors before pause
+    const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
 };
 }  // namespace mooncake
 
