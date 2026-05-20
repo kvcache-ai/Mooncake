@@ -24,6 +24,7 @@ const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
 const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const DUMMY_RPC_TIMEOUT_ENV: &str = "MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS";
+const CLASSIC_GID_INDEX_ENV: &str = "MC_STORE_RS_GID_INDEX";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompatTimeoutCliOverrides {
@@ -551,7 +552,7 @@ fn build_classic_config(
         if let Some(rpc_port) = rpc_port {
             config = config.rpc_port(rpc_port);
         }
-        return Ok(config);
+        return Ok(apply_classic_gid_index(config));
     }
 
     let redis = Url::parse(transport_metadata_uri)
@@ -581,12 +582,16 @@ fn build_classic_config(
     if let Some(password) = auth.password {
         config = config.redis_password(password);
     }
-    if let Ok(gid_index) = std::env::var("MC_STORE_RS_GID_INDEX") {
+    Ok(apply_classic_gid_index(config))
+}
+
+fn apply_classic_gid_index(mut config: ClassicEngineConfig) -> ClassicEngineConfig {
+    if let Ok(gid_index) = std::env::var(CLASSIC_GID_INDEX_ENV) {
         if !gid_index.trim().is_empty() {
             config = config.gid_index(gid_index);
         }
     }
-    Ok(config)
+    config
 }
 
 fn classic_metadata_cluster_id(tenant: &str) -> String {
@@ -785,6 +790,30 @@ mod tests {
         assert_eq!(config.redis_password_value(), None);
         assert_eq!(config.redis_db_index_value(), None);
         assert_eq!(config.metadata_cluster_id_value(), Some("tenants/tenant-a"));
+    }
+
+    #[test]
+    fn build_classic_config_applies_gid_index_for_p2p_handshake_metadata() {
+        let _guard = env_test_lock().lock();
+        let previous_gid_index = std::env::var_os(CLASSIC_GID_INDEX_ENV);
+        std::env::set_var(CLASSIC_GID_INDEX_ENV, "3");
+        let config = build_classic_config(
+            "node-a:17112",
+            "p2phandshake",
+            "rdma",
+            None,
+            sample_timeouts(),
+            "tenant-a",
+        )
+        .expect("classic config should accept p2p handshake metadata");
+        match previous_gid_index {
+            Some(value) => std::env::set_var(CLASSIC_GID_INDEX_ENV, value),
+            None => std::env::remove_var(CLASSIC_GID_INDEX_ENV),
+        }
+
+        assert_eq!(config.metadata_uri(), P2P_HANDSHAKE_METADATA);
+        assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Rdma);
+        assert_eq!(config.gid_index_value(), Some("3"));
     }
 
     #[test]
