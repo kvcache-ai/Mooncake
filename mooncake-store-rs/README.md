@@ -28,14 +28,21 @@ Use the document that matches what you are doing.
 | understand implemented capabilities | `docs/features.md` |
 | understand runtime flow and control plane behavior | `docs/architecture.md` |
 | add or review tests, run the suite, understand the fault-injection model | `docs/testing.md` |
-| onboard an AI agent or collaborator to the repo workflow | `docs/skills/mooncake-store-rs-dev/SKILL.md`, `scripts/install-dev-skill.sh` |
+| onboard an AI agent or collaborator to the repo workflow | `docs/skills/mooncake-store-rs-dev/SKILL.md`, `docs/skills/ha-regression-debugging/SKILL.md`, `docs/skills/stateful-boundary-invariants/SKILL.md`, `scripts/install-dev-skill.sh`, `scripts/install-total-skills.sh` |
 
-## AI Agent Skill
+## AI Agent Skills
 
-This repository ships a versioned development skill for collaborators and AI agents.
+This repository ships a main development skill plus companion skills for
+regression debugging and stateful boundary review.
 
-- canonical in-repo skill source: `docs/skills/mooncake-store-rs-dev/`
-- one-click local install: `./scripts/install-dev-skill.sh`
+- canonical in-repo skill sources:
+  - `docs/skills/mooncake-store-rs-dev/`
+  - `docs/skills/ha-regression-debugging/`
+  - `docs/skills/stateful-boundary-invariants/`
+- install only the primary development skill: `./scripts/install-dev-skill.sh`
+- install only the HA regression debugging skill: `./scripts/install-ha-regression-debugging-skill.sh`
+- install only the stateful boundary review skill: `./scripts/install-stateful-boundary-invariants-skill.sh`
+- install the full skill bundle: `./scripts/install-total-skills.sh`
 
 Typical setup:
 
@@ -43,6 +50,12 @@ Typical setup:
 ./scripts/install-dev-skill.sh
 git config core.hooksPath scripts/lib/git-hooks
 ```
+
+Recommended skill usage:
+
+- `mooncake-store-rs-dev`: repository workflow, validation, docs sync, and commit conventions
+- `ha-regression-debugging`: sequential, restart, and HA regression investigation
+- `stateful-boundary-invariants`: synchronization, default-derivation, and long-lived state review
 
 ## Project Map
 
@@ -655,8 +668,8 @@ python -m sglang.launch_server \
   --hicache-storage-prefetch-policy wait_complete \
   --hicache-storage-backend-extra-config '{
     "local_hostname": "10.0.0.21:17121",
-    "metadata_server": "redis://10.0.0.10:6379/0",
-    "master_server_address": "ignored-by-store-rs",
+    "metadata_server": "P2PHANDSHAKE",
+    "master_server_address": "redis://10.0.0.10:6379/0",
     "global_segment_size": 0,
     "protocol": "tcp",
     "device_name": "",
@@ -664,7 +677,7 @@ python -m sglang.launch_server \
   }'
 ```
 
-  SGLang's current Mooncake backend parser still requires `master_server_address` in real mode for upstream schema compatibility. Store-RS accepts the field but ignores it; the real control plane comes from `metadata_server=redis://...` or `etcd://...`. Do not leave `metadata_server` unset, or SGLang falls back to `P2PHANDSHAKE`, which Store-RS intentionally rejects.
+  The upstream sglang JSON keys `metadata_server` and `master_server_address` are accepted as aliases that map to `transport_metadata_url` and `metadata_url` respectively. `metadata_server` is forwarded to the Transfer Engine only (`redis://...` or `P2PHANDSHAKE`; defaults to `P2PHANDSHAKE` everywhere that supports defaults — Python dict-form, standalone CLI, bench. The Python positional `setup(...)` requires it explicitly because it precedes other required args). `master_server_address` carries the Store-RS metadata URL (`redis://...` or `etcd://...`, required); `master_server` and `master_server_addr` are equivalent aliases. The Python wrapper rejects setup if no metadata URL is supplied.
 
   Current upstream SGLang only forwards the legacy Mooncake fields from `--hicache-storage-backend-extra-config`: `local_hostname`, `metadata_server`, `global_segment_size`, `protocol`, `device_name`, `master_server_address`, `check_server`, `standalone_storage`, and `client_server_address`.
 
@@ -672,11 +685,12 @@ python -m sglang.launch_server \
 
 Use these environment variables for SGLang real mode:
 
+- `MC_STORE_RS_METADATA_URL` (dict-form `metadata_url` fallback) and `MC_STORE_RS_TRANSPORT_METADATA_URL` (dict-form `transport_metadata_url` fallback; defaults to `P2PHANDSHAKE`)
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`; default `classic_te`
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
-- `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port` to auto-start the Python real-client `/metrics` endpoint
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
@@ -899,12 +913,12 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 store = MooncakeDistributedStore()
 store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6380/0",
+    "P2PHANDSHAKE",                      # arg2: transport_metadata_url -> Transfer Engine (default for classic_te)
     128 * 1024 * 1024,
     16 * 1024 * 1024,
     "tcp",
     "",
-    "",
+    "redis://127.0.0.1:6380/0",          # arg7: metadata_url -> Store-RS metadata (required)
     stable_id="py-store-a",
     labels={"pool": "pool-a", "storage": "true"},
     transport_backend="classic_te",
@@ -943,7 +957,7 @@ For the complete configuration reference, read `docs/configuration.md`.
 | `EtcdMetadataBackend` | Store metadata on etcd | Supported |
 | `InMemoryMetadataBackend` | Unit tests and local-only testing | Test-only |
 
-If store metadata uses etcd in the Python compatibility layer, TENT transport metadata still uses Redis. Set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for that Redis endpoint. With `classic_te`, `transport_metadata_url=P2PHANDSHAKE` keeps Store-RS metadata on `metadata_url` and lets the transfer engine use peer handshake metadata.
+If `metadata_url` (arg7) is an etcd URL, the Transfer Engine still needs its own metadata at arg2: pass `P2PHANDSHAKE` (the default; only `classic_te` accepts it) or a `redis://...` URL. The `tent` backend always requires `redis://...`.
 
 For Redis authentication, use URL-embedded credentials or set `MC_REDIS_PASSWORD`; set `MC_REDIS_USERNAME` as well when Redis ACLs require a named user. Environment variables are preferred for passwords that contain URL-reserved characters such as `@`.
 

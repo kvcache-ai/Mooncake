@@ -81,7 +81,7 @@ Global admin knobs:
 
 | CLI flag | Environment variable | Default | Meaning |
 |----------|----------------------|---------|---------|
-| `--metadata-url` | `MC_STORE_RS_METADATA_URL` | required | Redis or etcd metadata endpoint for admin operations |
+| `--metadata-url` (alias `--metadata_url`) | `MC_STORE_RS_METADATA_URL` | required | Store-RS metadata URL (`redis://...` or `etcd://...`). Same naming as `mooncake-store-client` / `mooncake-store-bench`. |
 | `--admin-url` | `MC_STORE_ADMIN_URL` | command-dependent | admin HTTP endpoint used by route-migration client commands |
 | `--keyspace` | `MC_STORE_RS_KEYSPACE` | default keyspace | metadata keyspace |
 | `--trace-filter` | `MC_STORE_ADMIN_TRACE_FILTER` | tracing default | tracing filter for the admin process |
@@ -403,8 +403,7 @@ Notes:
 
 - HTTP metadata endpoints are not supported
 - Redis store metadata accepts URL-embedded credentials or `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`
-- when store metadata uses etcd, TENT transport metadata still needs Redis; classic_te can use P2PHANDSHAKE
-- set `transport_metadata_url` or `MC_STORE_RS_TENT_REDIS_URL` for the TENT Redis endpoint, or set `transport_metadata_url=P2PHANDSHAKE` with `classic_te`
+- when `metadata_url` (arg7) is etcd, the Transfer Engine still needs its own metadata at `transport_metadata_url` (arg2): pass `P2PHANDSHAKE` for `classic_te` (default) or `redis://...` for `tent`
 
 ### Redis authentication
 
@@ -445,8 +444,8 @@ no arguments still renders help.
 | CLI flag | Environment variable | Default | Meaning |
 |----------|----------------------|---------|---------|
 | `--local-hostname` | `MOONCAKE_LOCAL_HOSTNAME` | required | hostname or IP published for this runtime |
-| `--metadata-url` | `MC_STORE_RS_METADATA_URL` | required | Redis or etcd metadata endpoint for store state |
-| `--transport-metadata-url` | `MC_STORE_RS_TRANSPORT_METADATA_URL` | store metadata URL, with backend-specific fallback | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
+| `--metadata-url` (alias `--metadata_url`) | `MC_STORE_RS_METADATA_URL` | required | Store-RS metadata URL (`redis://...` or `etcd://...`). |
+| `--transport-metadata-url` (alias `--transport_metadata_url`) | `MC_STORE_RS_TRANSPORT_METADATA_URL` | `P2PHANDSHAKE` | Transfer Engine metadata input (`redis://...` or `P2PHANDSHAKE`). Defaults to `P2PHANDSHAKE` (classic_te peer handshake); `tent` requires `redis://...`. |
 | `--storage-bytes` | `MC_STORE_RS_STORAGE_BYTES` | `67108864` | local storage capacity published by this runtime |
 | `--scratch-bytes` | `MC_STORE_RS_SCRATCH_BYTES` | `4194304` | local scratch capacity for transfer staging |
 | `--protocol` | `MOONCAKE_PROTOCOL` | `tcp` | transport protocol such as `tcp` or `rdma` |
@@ -502,7 +501,6 @@ Important Python-only compatibility knobs:
 | `replica_count` | default replica count when routed writes are enabled |
 | `route_topk` | WRH route-authority fanout; must match the policy already stored in the metadata keyspace |
 | `transport_backend` | choose `tent` or `classic_te` for the real transport runtime |
-| `transport_metadata_url` | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `transport_rpc_port` | fixed real data-plane TCP port for real-mode peers |
 | `use_hugepage` | enable hugepage-backed local store memory |
 | `hugepage_size` | hugepage size for local store memory; accepts `2MB` or `1GB` |
@@ -524,7 +522,14 @@ Port role reminder:
 
 For cross-host or cross-container real-mode deployments, set a reachable `local_hostname` together with a fixed `transport_rpc_port`.
 
-`master_server` / `master_server_addr` remains accepted on the Python compatibility entry points for upstream API parity, but the current store-rs runtime does not use a master-based control path. Real deployments should configure metadata with `redis://...` or `etcd://...`.
+### Setup positional layout
+
+`setup(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol, rdma_devices, metadata_url)`.
+
+- **`transport_metadata_url`** — Transfer Engine metadata input. Accepts `redis://...` or `P2PHANDSHAKE`. **Default is `P2PHANDSHAKE`** wherever a default is expressible: the Python dict-form (the `MC_STORE_RS_TRANSPORT_METADATA_URL` env is honored as fallback before the default), the standalone CLI (no `--transport-metadata-url` flag and no env set), and the bench. The Python positional `setup(...)` requires it explicitly because Python disallows a defaulted positional before a required positional; pass the literal string `"P2PHANDSHAKE"` to use the default. The dict-form also accepts the upstream Mooncake key `metadata_server` as an alias.
+- **`metadata_url`** — Store-RS metadata URL. Required. Accepts `redis://...` or `etcd://...`. The dict-form `setup({...})` also accepts the upstream Mooncake keys `master_server`, `master_server_addr`, and `master_server_address` interchangeably as aliases; `setup()` raises a clear `TypeError` if none is provided.
+
+`transport_metadata_url` is for the Transfer Engine only and never influences Store-RS routing or metadata decisions.
 
 The compatibility client defaults `lease_ttl_ms` to `30000`. Keep the heartbeat interval comfortably below that TTL so dead peers converge quickly without triggering avoidable churn.
 
@@ -620,7 +625,8 @@ The current repository uses these environment variables.
 | `MOONCAKE_LOCAL_HOSTNAME` | standalone client and bench | hostname or IP published by the runtime |
 | `MOONCAKE_PROTOCOL` | standalone client and bench | transport protocol such as `tcp` or `rdma` |
 | `MC_STORE_RS_TRANSPORT_BACKEND` | compatibility layer, standalone client, Python wrapper | select `tent` or `classic_te` as the default real transport backend |
-| `MC_STORE_RS_METADATA_URL` | standalone client, standalone admin, and bench | store metadata endpoint used by `mooncake-store-client --metadata-url`, `mooncake-store-admin --metadata-url`, and `mooncake-store-bench --metadata-url` |
+| `MC_STORE_RS_METADATA_URL` | standalone client, standalone admin, and bench | Store-RS metadata URL. Backs `--metadata-url` on `mooncake-store-client`, `mooncake-store-admin`, and `mooncake-store-bench`. The Python wrapper `setup({...})` dict-form also honors it as a fallback when neither `metadata_url` nor any of the upstream aliases (`master_server` / `master_server_addr` / `master_server_address`) is provided. |
+| `MC_STORE_RS_TRANSPORT_METADATA_URL` | standalone client, bench, Python wrapper dict-form fallback | Transfer Engine metadata input. Backs `--transport-metadata-url` on `mooncake-store-client` and `mooncake-store-bench`. The Python wrapper `setup({...})` dict-form honors it as a fallback when neither `transport_metadata_url` nor the upstream alias `metadata_server` is provided (default value `P2PHANDSHAKE`). |
 | `MC_STORE_RS_STORAGE_BYTES` | standalone client | local storage bytes for `mooncake-store-client run` |
 | `MC_STORE_RS_SCRATCH_BYTES` | standalone client and bench | local scratch bytes for compatibility-managed clients |
 | `MC_STORE_RS_RDMA_DEVICES` | standalone client and Rust e2e | RDMA device list |
@@ -635,7 +641,6 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_REPLICA_COUNT` | standalone client, Python wrapper setup fallback, and bench | default routed-writer replica count |
 | `MC_STORE_RS_ROUTE_TOPK` | standalone client, Python wrapper setup fallback, and bench | WRH route-authority fanout; must be `>= 2` |
 | `MC_STORE_RS_ROUTE_CONTROL` | standalone client, Python wrapper setup fallback, and bench | route control mode, usually `embedded_wrh` |
-| `MC_STORE_RS_TRANSPORT_METADATA_URL` | standalone client, Python wrapper setup fallback, bench | transport metadata endpoint; Redis URL by default, or `P2PHANDSHAKE` with `classic_te` |
 | `MC_STORE_RS_GID_INDEX` | compatibility layer, standalone client, Python wrapper, and bench | `classic_te` RDMA GID index override; forwarded to upstream `MC_GID_INDEX` |
 | `MC_STORE_RS_TRANSPORT_RPC_PORT` | standalone client and Python wrapper setup fallback | fixed real data-plane transport port |
 | `MC_STORE_RS_LOCAL_SEGMENT_NAME` | standalone client and Python wrapper setup fallback | explicit local segment name |
@@ -678,7 +683,6 @@ The current repository uses these environment variables.
 | `MC_STORE_RS_VALUE_SIZE` | Rust e2e | payload size for validation and benchmark loops |
 | `MC_STORE_RS_BENCH_ITERS` | Rust e2e and local scripts | benchmark iteration count; default `64` |
 | `MC_STORE_RS_PRINT_METRICS` | Rust e2e | print the Prometheus text snapshot at the end of the run |
-| `MC_STORE_RS_TENT_REDIS_URL` | Python compatibility layer | Redis URL used by TENT when store metadata is etcd |
 | `MC_STORE_USE_HUGEPAGE` | local memory, standalone client, and Python shm allocator | enable hugepage-backed allocation; standalone client treats `0`, `false`, `no`, or `off` as an explicit disable |
 | `MC_STORE_HUGEPAGE_SIZE` | local memory and Python shm allocator | hugepage size; `2MB` or `1GB` |
 | `MOONCAKE_UPSTREAM_DIR` | local scripts | upstream Mooncake source tree |

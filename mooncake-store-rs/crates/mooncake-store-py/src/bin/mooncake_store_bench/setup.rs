@@ -263,10 +263,11 @@ fn log_relevant_env() {
 }
 
 fn bench_transfer_metadata_debug_url(global: &GlobalArgs) -> &str {
+    // Mirror the fallback chain used when building the CompatSetupArgs.
     global
         .transport_metadata_url
         .as_deref()
-        .unwrap_or(&global.metadata_url)
+        .unwrap_or("P2PHANDSHAKE")
 }
 
 fn redact_env_value(key: &str, value: &str) -> String {
@@ -748,10 +749,16 @@ fn build_runtime(
     labels.insert("role".to_string(), spec.role.to_string());
     labels.insert("storage".to_string(), spec.storage_label.to_string());
 
+    // TE metadata defaults to the classic_te peer-handshake mode when
+    // --transport-metadata-url is unset.
+    let transport_metadata_url = global
+        .transport_metadata_url
+        .clone()
+        .unwrap_or_else(|| "P2PHANDSHAKE".to_string());
     let setup = CompatSetupArgs {
         local_hostname: global.local_hostname.clone(),
+        transport_metadata_url,
         metadata_url: global.metadata_url.clone(),
-        transport_metadata_url: global.transport_metadata_url.clone(),
         global_segment_size: global.storage_bytes,
         local_buffer_size: global.scratch_bytes,
         eviction_high_watermark_percent: global.eviction_high_watermark_percent,
@@ -881,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_metadata_debug_url_prefers_explicit_transport_endpoint() {
+    fn transport_metadata_debug_url_prefers_explicit_transport_metadata_url() {
         let global = GlobalArgs {
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
             transport_metadata_url: Some("redis://127.0.0.1:6380/1".to_string()),
@@ -909,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_metadata_debug_url_falls_back_to_store_metadata_url() {
+    fn transport_metadata_debug_url_defaults_to_p2phandshake() {
         let global = GlobalArgs {
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
             transport_metadata_url: None,
@@ -930,10 +937,7 @@ mod tests {
             replica_count: 1,
         };
 
-        assert_eq!(
-            bench_transfer_metadata_debug_url(&global),
-            "redis://127.0.0.1:6379/0"
-        );
+        assert_eq!(bench_transfer_metadata_debug_url(&global), "P2PHANDSHAKE");
     }
 
     #[test]

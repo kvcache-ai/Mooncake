@@ -120,18 +120,27 @@ impl PyMooncakeDistributedStore {
 
     /// Starts the real Store-RS runtime behind the Python compatibility facade.
     ///
+    /// Positional layout:
+    ///   `setup(local_hostname, transport_metadata_url, global_segment_size,
+    ///          local_buffer_size, protocol, rdma_devices, metadata_url)`
+    ///
+    /// - `transport_metadata_url` is forwarded to the Transfer Engine only. Accepts
+    ///   `redis://...` or `P2PHANDSHAKE`.
+    /// - `metadata_url` is the Store-RS metadata URL. Accepts `redis://...` or
+    ///   `etcd://...` and is required.
+    ///
     /// Tenant-scoped routing and resource policy should be authored through
     /// `mooncake-store-admin policy ...` and durable metadata. `route_topk` and
     /// `route_control` are accepted here as compatibility/bootstrap fallbacks so
     /// existing Python integrations continue to work.
     #[pyo3(signature = (
         local_hostname,
-        metadata_url,
+        transport_metadata_url,
         global_segment_size,
         local_buffer_size,
         protocol = "tcp",
         rdma_devices = "",
-        master_server = "",
+        metadata_url = "",
         *,
         stable_id = None,
         initial_state = "active",
@@ -144,7 +153,6 @@ impl PyMooncakeDistributedStore {
         route_topk = 2,
         keyspace = None,
         worker_scope = None,
-        transport_metadata_url = None,
         transport_rpc_port = None,
         transport_backend = None,
         local_segment_name = None,
@@ -154,17 +162,17 @@ impl PyMooncakeDistributedStore {
         eviction_high_watermark_percent = None,
         eviction_low_watermark_percent = None,
         route_control = "embedded_wrh"
-    ), text_signature = "(local_hostname, metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', master_server='', *, stable_id=None, initial_state='active', tenant='default', domain=None, object_set=None, labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_metadata_url=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
+    ), text_signature = "(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol='tcp', rdma_devices='', metadata_url='', *, stable_id=None, initial_state='active', tenant='default', domain=None, object_set=None, labels=None, routed_writes=False, replica_count=1, route_topk=2, keyspace=None, worker_scope=None, transport_rpc_port=None, transport_backend=None, local_segment_name=None, expires_at_ms=None, use_hugepage=None, hugepage_size=None, eviction_high_watermark_percent=None, eviction_low_watermark_percent=None, route_control='embedded_wrh')")]
     #[allow(clippy::too_many_arguments)]
     fn setup(
         &mut self,
         local_hostname: &str,
-        metadata_url: &str,
+        transport_metadata_url: &str,
         global_segment_size: usize,
         local_buffer_size: usize,
         protocol: &str,
         rdma_devices: &str,
-        master_server: &str,
+        metadata_url: &str,
         stable_id: Option<String>,
         initial_state: &str,
         tenant: &str,
@@ -176,7 +184,6 @@ impl PyMooncakeDistributedStore {
         route_topk: usize,
         keyspace: Option<String>,
         worker_scope: Option<String>,
-        transport_metadata_url: Option<String>,
         transport_rpc_port: Option<u16>,
         transport_backend: Option<String>,
         local_segment_name: Option<String>,
@@ -194,8 +201,8 @@ impl PyMooncakeDistributedStore {
         let runtime = CompatRuntimeArgs {
             setup: config::CompatSetupArgs {
                 local_hostname: local_hostname.to_string(),
+                transport_metadata_url: transport_metadata_url.to_string(),
                 metadata_url: metadata_url.to_string(),
-                transport_metadata_url,
                 global_segment_size,
                 local_buffer_size,
                 eviction_high_watermark_percent,
@@ -224,7 +231,6 @@ impl PyMooncakeDistributedStore {
         }
         .build()
         .map_err(store_error_to_py)?;
-        let _ = master_server;
         let stable_id = runtime.stable_id.clone();
         let lease_ttl_ms = runtime.lease_ttl_ms;
         let default_scope = CompatNamespaceScope::new(tenant.to_string(), domain, object_set);

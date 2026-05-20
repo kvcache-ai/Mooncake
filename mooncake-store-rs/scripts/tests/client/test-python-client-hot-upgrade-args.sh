@@ -96,7 +96,7 @@ store._tracked_keys = set()
 
 store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6379/0",
+    "P2PHANDSHAKE",
     1024,
     512,
     stable_id="py-store-a",
@@ -110,7 +110,7 @@ assert kwargs["initial_state"] == "standby"
 
 store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6379/0",
+    "P2PHANDSHAKE",
     1024,
     512,
     stable_id="py-store-b",
@@ -123,7 +123,7 @@ assert "state" not in kwargs
 
 store.setup(
     "127.0.0.1:17111",
-    "redis://127.0.0.1:6379/0",
+    "P2PHANDSHAKE",
     1024,
     512,
     stable_id="py-store-port-a",
@@ -135,6 +135,7 @@ assert kwargs["transport_rpc_port"] == 17111
 store.setup(
     {
         "local_hostname": "127.0.0.1",
+        "transport_metadata_url": "P2PHANDSHAKE",
         "metadata_url": "redis://127.0.0.1:6379/0",
         "stable_id": "py-store-c",
         "initial_state": "standby",
@@ -151,7 +152,8 @@ assert kwargs["initial_state"] == "standby"
 store.setup(
     {
         "local_hostname": "127.0.0.1",
-        "metadata_server": "redis://127.0.0.1:6379/0",
+        "metadata_server": "P2PHANDSHAKE",
+        "master_server": "redis://127.0.0.1:6379/0",
         "stable_id": "py-store-d",
         "state": "offline",
     }
@@ -164,7 +166,8 @@ assert kwargs["initial_state"] == "offline"
 store.setup(
     {
         "local_hostname": "node-a:17112",
-        "metadata_server": "redis://127.0.0.1:6379/0",
+        "metadata_server": "P2PHANDSHAKE",
+        "master_server": "redis://127.0.0.1:6379/0",
         "stable_id": "py-store-e",
     }
 )
@@ -180,7 +183,6 @@ setup_env_vars = [
     "MC_STORE_RS_REPLICA_COUNT",
     "MC_STORE_RS_ROUTE_TOPK",
     "MC_STORE_RS_KEYSPACE",
-    "MC_STORE_RS_TRANSPORT_METADATA_URL",
     "MC_STORE_RS_TRANSPORT_RPC_PORT",
     "MC_STORE_RS_TRANSPORT_BACKEND",
     "MC_STORE_RS_LOCAL_SEGMENT_NAME",
@@ -204,7 +206,6 @@ try:
             "MC_STORE_RS_REPLICA_COUNT": "3",
             "MC_STORE_RS_ROUTE_TOPK": "5",
             "MC_STORE_RS_KEYSPACE": "env/keyspace",
-            "MC_STORE_RS_TRANSPORT_METADATA_URL": "redis://127.0.0.1:6380/1",
             "MC_STORE_RS_TRANSPORT_RPC_PORT": "17113",
             "MC_STORE_RS_TRANSPORT_BACKEND": "classic_te",
             "MC_STORE_RS_LOCAL_SEGMENT_NAME": "env-segment",
@@ -215,7 +216,7 @@ try:
     )
     store.setup(
         "127.0.0.1",
-        "redis://127.0.0.1:6379/0",
+        "P2PHANDSHAKE",
         0,
         512,
     )
@@ -228,7 +229,6 @@ try:
     assert kwargs["replica_count"] == 3
     assert kwargs["route_topk"] == 5
     assert kwargs["keyspace"] == "env/keyspace"
-    assert kwargs["transport_metadata_url"] == "redis://127.0.0.1:6380/1"
     assert kwargs["transport_rpc_port"] == 17113
     assert kwargs["transport_backend"] == "classic_te"
     assert kwargs["local_segment_name"] == "env-segment"
@@ -240,7 +240,8 @@ try:
     store.setup(
         {
             "local_hostname": "127.0.0.1",
-            "metadata_server": "redis://127.0.0.1:6379/0",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server": "redis://127.0.0.1:6379/0",
             "state": "offline",
             "rpc_server_port": 17114,
             "labels": {"pool": "explicit"},
@@ -280,7 +281,7 @@ os.environ["MC_STORE_RS_METRICS_ADDR"] = "127.0.0.1:19090"
 try:
     store.setup(
         "127.0.0.1",
-        "redis://127.0.0.1:6379/0",
+        "P2PHANDSHAKE",
         1024,
         512,
     )
@@ -290,7 +291,8 @@ try:
     store.setup(
         {
             "local_hostname": "127.0.0.1",
-            "metadata_server": "redis://127.0.0.1:6379/0",
+            "metadata_server": "P2PHANDSHAKE",
+            "master_server": "redis://127.0.0.1:6379/0",
         }
     )
     name, args, kwargs = store._worker.calls.pop()
@@ -305,7 +307,7 @@ os.environ["MC_STORE_RS_TRACE_FILTER"] = "info,mooncake_store_client::client=deb
 try:
     store.setup(
         "127.0.0.1",
-        "redis://127.0.0.1:6379/0",
+        "P2PHANDSHAKE",
         1024,
         512,
     )
@@ -320,7 +322,7 @@ os.environ["MC_STORE_RS_TRACE_FILE"] = "/tmp/mooncake-real-client.log"
 try:
     store.setup(
         "127.0.0.1",
-        "redis://127.0.0.1:6379/0",
+        "P2PHANDSHAKE",
         1024,
         512,
     )
@@ -333,7 +335,7 @@ finally:
 try:
     store.setup(
         "127.0.0.1:17111",
-        "redis://127.0.0.1:6379/0",
+        "P2PHANDSHAKE",
         1024,
         512,
         transport_rpc_port=17112,

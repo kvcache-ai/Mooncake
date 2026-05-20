@@ -88,9 +88,16 @@ impl TransportBackendArg {
 struct RunArgs {
     #[arg(long, env = "MOONCAKE_LOCAL_HOSTNAME")]
     local_hostname: String,
-    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
+    /// Store-RS metadata URL (`redis://...` or `etcd://...`).
+    #[arg(long, alias = "metadata_url", env = "MC_STORE_RS_METADATA_URL")]
     metadata_url: String,
-    #[arg(long, env = "MC_STORE_RS_TRANSPORT_METADATA_URL")]
+    /// Transfer Engine metadata input (`redis://...` or `P2PHANDSHAKE`).
+    /// Defaults to `P2PHANDSHAKE` (classic_te peer handshake) when unset.
+    #[arg(
+        long = "transport-metadata-url",
+        alias = "transport_metadata_url",
+        env = "MC_STORE_RS_TRANSPORT_METADATA_URL"
+    )]
     transport_metadata_url: Option<String>,
     #[arg(long, default_value_t = 64 * 1024 * 1024, env = "MC_STORE_RS_STORAGE_BYTES")]
     storage_bytes: usize,
@@ -605,11 +612,17 @@ fn parse_falsey_env_bool(value: &str) -> bool {
 }
 
 fn build_runtime_args(args: &RunArgs, timeouts: CompatTimeoutConfig) -> CompatRuntimeArgs {
+    // TE metadata defaults to the classic_te peer-handshake mode when
+    // --transport-metadata-url is unset.
+    let transport_metadata_url = args
+        .transport_metadata_url
+        .clone()
+        .unwrap_or_else(|| "P2PHANDSHAKE".to_string());
     CompatRuntimeArgs {
         setup: CompatSetupArgs {
             local_hostname: args.local_hostname.clone(),
+            transport_metadata_url,
             metadata_url: args.metadata_url.clone(),
-            transport_metadata_url: args.transport_metadata_url.clone(),
             global_segment_size: args.storage_bytes,
             local_buffer_size: args.scratch_bytes,
             eviction_high_watermark_percent: args.eviction_high_watermark_percent,
@@ -1629,11 +1642,11 @@ mod tests {
 
         let runtime_args = build_runtime_args(&args, sample_timeouts());
         assert_eq!(runtime_args.setup.local_hostname, "127.0.0.1");
-        assert_eq!(runtime_args.setup.metadata_url, "redis://127.0.0.1:6379/0");
         assert_eq!(
-            runtime_args.setup.transport_metadata_url.as_deref(),
-            Some("redis://127.0.0.1:6380/1")
+            runtime_args.setup.transport_metadata_url,
+            "redis://127.0.0.1:6380/1"
         );
+        assert_eq!(runtime_args.setup.metadata_url, "redis://127.0.0.1:6379/0");
         assert_eq!(runtime_args.setup._rdma_devices, "mlx5_0");
         assert_eq!(runtime_args.setup.transport_rpc_port, Some(17112));
         assert_eq!(

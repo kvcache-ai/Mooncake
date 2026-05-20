@@ -234,11 +234,14 @@ mod tests {
     }
 
     fn sample_args(protocol: &str, metadata_url: &str) -> CompatRuntimeArgs {
+        // Point both `transport_metadata_url` and `metadata_url` at the same redis
+        // URL so in-process transports have a working metadata channel without
+        // per-test overrides.
         CompatRuntimeArgs {
             setup: CompatSetupArgs {
                 local_hostname: "127.0.0.1".to_string(),
+                transport_metadata_url: metadata_url.to_string(),
                 metadata_url: metadata_url.to_string(),
-                transport_metadata_url: None,
                 global_segment_size: 1024,
                 local_buffer_size: 1024,
                 eviction_high_watermark_percent: None,

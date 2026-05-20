@@ -273,7 +273,7 @@ Start a storage client:
 
 Useful flags:
 
-- `--transport-metadata-url` for transport Redis when the metadata backend uses etcd
+- `--transport-metadata-url` to override the Transfer Engine metadata input (default `P2PHANDSHAKE`; `tent` requires `redis://...`)
 - `--transport-backend tent|classic-te` to choose the real data-plane backend
 - `--transport-rpc-port <port>` to pin the real data-plane TCP port used by real clients
 - `--routed-writes` and `--replica-count` to enable routed writer mode
@@ -435,12 +435,12 @@ from mooncake.store import MooncakeDistributedStore
 store = MooncakeDistributedStore()
 store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6380/0",
+    "P2PHANDSHAKE",                      # arg2 transport_metadata_url: TE input (default for classic_te)
     128 * 1024 * 1024,
     16 * 1024 * 1024,
     "tcp",
     "",
-    "",
+    "redis://127.0.0.1:6380/0",          # arg7 metadata_url: Store-RS metadata backend (required)
     stable_id="py-store-a",
     tenant="default",
     domain="sglang-chat",
@@ -464,12 +464,12 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 store = MooncakeDistributedStore()
 store.setup(
     "127.0.0.1",
-    "redis://127.0.0.1:6380/0",
+    "P2PHANDSHAKE",                      # arg2 transport_metadata_url: TE input (default for classic_te)
     128 * 1024 * 1024,
     16 * 1024 * 1024,
     "tcp",
     "",
-    "",
+    "redis://127.0.0.1:6380/0",          # arg7 metadata_url: Store-RS metadata backend
     stable_id="router-a",
     labels={"pool": "pool-a", "storage": "false"},
     routed_writes=True,
@@ -751,14 +751,16 @@ export MC_REDIS_USERNAME='<redis-username>'
 
 Credentials embedded in `redis://username:password@host:port/db` are also accepted and take precedence over the environment variables. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
 
+### Setup positional layout
+
+`setup(local_hostname, transport_metadata_url, global_segment_size, local_buffer_size, protocol, rdma_devices, metadata_url)`.
+
+- `transport_metadata_url` is forwarded to the Transfer Engine only. Accepts `redis://...` or `P2PHANDSHAKE`. **Default value is `P2PHANDSHAKE`** everywhere it can be defaulted: the Python dict-form (resolution order: dict key → `MC_STORE_RS_TRANSPORT_METADATA_URL` env → `P2PHANDSHAKE`), the standalone CLI bins (`mooncake-store-client` / `mooncake-store-bench` without `--transport-metadata-url` or env), and other defaultable surfaces. The Python positional `setup(...)` requires it explicitly because Python disallows defaults on a positional that precedes required positionals; pass `"P2PHANDSHAKE"` to opt into the default. The dict-form also accepts the upstream Mooncake key `metadata_server` as an alias.
+- `metadata_url` is the Store-RS metadata URL. Accepts `redis://...` or `etcd://...` and is required. The dict-form `setup({...})` also accepts the upstream Mooncake keys `master_server`, `master_server_addr`, and `master_server_address` interchangeably as aliases, with `MC_STORE_RS_METADATA_URL` env honored as a final fallback. The standalone CLI bins use the same env for their `--metadata-url` flag.
+
 ### Important note for etcd
 
-When the store metadata backend is etcd, TENT transport metadata still uses Redis. Provide that Redis endpoint through:
-
-- `transport_metadata_url=...`, or
-- `MC_STORE_RS_TENT_REDIS_URL`
-
-For `classic_te`, `transport_metadata_url=P2PHANDSHAKE` uses the upstream transfer-engine peer handshake path while Store-RS metadata continues to use `metadata_url`.
+When `metadata_url` is an etcd URL, the Transfer Engine still needs its own metadata: pass either `redis://...` or `P2PHANDSHAKE` at `transport_metadata_url`. For `classic_te`, `P2PHANDSHAKE` (the transfer-engine peer-handshake mode) is the default; `tent` always needs an explicit `redis://...`.
 
 ## Transport Backend Selection
 
@@ -781,11 +783,12 @@ The standalone client follows the same rule, except the explicit override is `--
 
 Current upstream SGLang only forwards legacy Mooncake setup fields. When SGLang cannot pass Store-RS setup extensions, the Python wrapper reads these environment variables as fallbacks:
 
+- `MC_STORE_RS_METADATA_URL` (dict-form `metadata_url` fallback) and `MC_STORE_RS_TRANSPORT_METADATA_URL` (dict-form `transport_metadata_url` fallback; defaults to `P2PHANDSHAKE` when unset)
 - `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te`
 - `MC_STORE_RS_KEYSPACE`, `MC_STORE_RS_STABLE_ID`, `MC_STORE_RS_TENANT`, `MC_STORE_RS_LABELS`
 - `MC_STORE_RS_ROUTED_WRITES=1`, `MC_STORE_RS_REPLICA_COUNT=<n>`, `MC_STORE_RS_ROUTE_TOPK=<n>`
 - `MC_STORE_RS_ROUTE_CONTROL=embedded_wrh|metadata_only`
-- `MC_STORE_RS_TRANSPORT_METADATA_URL` (`redis://...` by default, or `P2PHANDSHAKE` with `classic_te`), `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
+- `MC_STORE_RS_TRANSPORT_RPC_PORT`, `MC_STORE_RS_LOCAL_SEGMENT_NAME`
 - `MC_STORE_RS_INITIAL_STATE`, `MC_STORE_RS_EXPIRES_AT_MS`
 - `MC_STORE_RS_METRICS_ADDR=host:port`
 - `MC_STORE_RS_CONTROL_PLANE_THREADS=<n>` to tune concurrent control-plane RPC client capacity; default `2`
@@ -965,8 +968,8 @@ python -m sglang.launch_server \
   --hicache-storage-prefetch-policy wait_complete \
   --hicache-storage-backend-extra-config '{
     "local_hostname": "10.0.0.21:17121",
-    "metadata_server": "redis://10.0.0.10:6379/0",
-    "master_server_address": "ignored-by-store-rs",
+    "metadata_server": "P2PHANDSHAKE",
+    "master_server_address": "redis://10.0.0.10:6379/0",
     "global_segment_size": 0,
     "protocol": "tcp",
     "device_name": "",
@@ -975,14 +978,14 @@ python -m sglang.launch_server \
 ```
 
   Use this when SGLang should build the real store runtime directly inside the serving process. The `global_segment_size: 0` setting keeps the process rw-only while still allowing remote storage placement through the current compatibility path.
-  SGLang's current Mooncake backend parser still requires `master_server_address` in real mode for upstream schema compatibility. Store-RS accepts the field but ignores it; the actual control plane comes from `metadata_server=redis://...` or `etcd://...`. If `metadata_server` is omitted, SGLang falls back to `P2PHANDSHAKE`, which Store-RS intentionally rejects.
+  The upstream sglang JSON keys `metadata_server` and `master_server_address` are accepted as aliases that map to `transport_metadata_url` and `metadata_url` respectively. `metadata_server` is forwarded to the Transfer Engine only (defaults to `P2PHANDSHAKE`; omitting the key from the JSON has the same effect). `master_server_address` carries the Store-RS metadata URL (`redis://...` or `etcd://...`, required); `master_server` and `master_server_addr` are equivalent aliases. `setup()` rejects the call if no metadata URL is provided.
 
   Current upstream SGLang only forwards the legacy Mooncake fields from `--hicache-storage-backend-extra-config`: `local_hostname`, `metadata_server`, `global_segment_size`, `protocol`, `device_name`, `master_server_address`, `check_server`, `standalone_storage`, and `client_server_address`.
 
   Store-RS compatibility extensions such as `transport_backend`, `keyspace`, `stable_id`, `tenant`, `labels`, `routed_writes`, `replica_count`, and `route_topk` are not forwarded by the current SGLang parser. For real-mode compatibility today:
 
 - use `MC_STORE_RS_TRANSPORT_BACKEND=tent|classic_te` to override the backend; the default is `classic_te`
-- use `MC_STORE_RS_TRANSPORT_METADATA_URL=P2PHANDSHAKE` only with `classic_te` when the transfer engine should use peer handshake instead of Redis-backed transport metadata
+- use `MC_STORE_RS_TRANSPORT_METADATA_URL=P2PHANDSHAKE` only with `classic_te` when the transfer engine should use peer handshake instead of Redis-backed transport metadata; or set `transport_metadata_url` / `metadata_server` in the JSON dict to `P2PHANDSHAKE` (default for `classic_te`) or `redis://...` (required for `tent`)
 - with `P2PHANDSHAKE`, Store-RS keeps the logical segment name in route metadata and publishes a separate `transport_endpoint` (`ip:rpc_port`) so peer opens do not depend on DNS resolution of that logical segment name
 - keep SGLang real clients and storage peers on the default metadata keyspace `mc/store-rs/v2`
 - treat `--hicache-storage-backend-extra-config` as a legacy field bridge, not a full Store-RS setup dictionary

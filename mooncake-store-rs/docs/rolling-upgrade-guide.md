@@ -121,12 +121,12 @@ from mooncake.store import MooncakeDistributedStore
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",                       # local_hostname
-    "redis://127.0.0.1:6380/0",        # metadata_url
+    "P2PHANDSHAKE",                    # transport_metadata_url (TE default; classic_te peer handshake)
     4 * 1024 * 1024,                    # storage_bytes
     1 * 1024 * 1024,                    # scratch_bytes
     "tcp",                              # protocol
     "",                                 # rdma_devices
-    "",                                 # transport_metadata_url
+    "redis://127.0.0.1:6380/0",        # metadata_url (Store-RS metadata backend, required)
     stable_id="verify-driver",
     keyspace="<your-keyspace>",         # replace with actual keyspace
     labels={"pool": "pool-a", "storage": "false", "route": "false"},

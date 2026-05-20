@@ -825,9 +825,33 @@ class MooncakeDistributedStore:
         )
         if "local_hostname" not in config:
             raise TypeError("setup config requires `local_hostname`")
-        metadata_url = config.get("metadata_server", config.get("metadata_url"))
-        if metadata_url is None:
-            raise TypeError("setup config requires `metadata_server`")
+        # Transfer Engine metadata. Defaults to P2PHANDSHAKE so callers that omit
+        # the field still get a working classic_te bootstrap. Pass a `redis://...`
+        # value explicitly when using the `tent` backend. Accepts the upstream
+        # Mooncake key `metadata_server` as an alias for compatibility with
+        # existing JSON configs.
+        transport_metadata_url = (
+            config.get("transport_metadata_url")
+            or config.get("metadata_server")
+            or os.environ.get("MC_STORE_RS_TRANSPORT_METADATA_URL")
+            or "P2PHANDSHAKE"
+        )
+        # Store-RS metadata URL. Accepts the upstream Mooncake keys
+        # `master_server` / `master_server_addr` / `master_server_address` as
+        # aliases for compatibility with existing JSON configs.
+        metadata_url = (
+            config.get("metadata_url")
+            or config.get("master_server")
+            or config.get("master_server_addr")
+            or config.get("master_server_address")
+            or os.environ.get("MC_STORE_RS_METADATA_URL")
+        )
+        if not _has_value(metadata_url):
+            raise TypeError(
+                "setup config requires `metadata_url` (Store-RS metadata URL, "
+                "e.g. redis://host:port/db or etcd://host:port). "
+                "MC_STORE_RS_METADATA_URL env is honored as a fallback."
+            )
         transport_rpc_port = _coerce_optional_int(
             config.get("transport_rpc_port", config.get("rpc_server_port"))
         )
@@ -855,12 +879,12 @@ class MooncakeDistributedStore:
         result = self._invoke(
             "setup",
             local_hostname,
-            str(metadata_url),
+            str(transport_metadata_url),
             _coerce_int(config.get("global_segment_size"), 16 * 1024 * 1024),
             _coerce_int(config.get("local_buffer_size"), 16 * 1024 * 1024),
             str(config.get("protocol", "tcp")),
             str(config.get("rdma_devices", "")),
-            str(config.get("master_server_addr", config.get("master_server", ""))),
+            str(metadata_url),
             stable_id=_coerce_optional_str(config.get("stable_id")),
             initial_state=initial_state,
             tenant=str(config.get("tenant", "default")),
@@ -872,9 +896,6 @@ class MooncakeDistributedStore:
             route_topk=_coerce_int(config.get("route_topk"), 2),
             keyspace=_coerce_optional_str(config.get("keyspace")),
             worker_scope=_coerce_optional_str(config.get("worker_scope")),
-            transport_metadata_url=_coerce_optional_str(
-                config.get("transport_metadata_url")
-            ),
             transport_rpc_port=transport_rpc_port,
             transport_backend=_coerce_optional_str(config.get("transport_backend")),
             local_segment_name=_coerce_optional_str(config.get("local_segment_name")),
@@ -1035,10 +1056,6 @@ _SETUP_ENV_DEFAULTS = {
     "replica_count": ("MC_STORE_RS_REPLICA_COUNT", lambda value: _coerce_int(value, 1)),
     "route_topk": ("MC_STORE_RS_ROUTE_TOPK", lambda value: _coerce_int(value, 2)),
     "keyspace": ("MC_STORE_RS_KEYSPACE", _coerce_optional_str),
-    "transport_metadata_url": (
-        "MC_STORE_RS_TRANSPORT_METADATA_URL",
-        _coerce_optional_str,
-    ),
     "transport_rpc_port": ("MC_STORE_RS_TRANSPORT_RPC_PORT", _coerce_optional_int),
     "transport_backend": ("MC_STORE_RS_TRANSPORT_BACKEND", _coerce_optional_str),
     "local_segment_name": ("MC_STORE_RS_LOCAL_SEGMENT_NAME", _coerce_optional_str),

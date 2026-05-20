@@ -330,7 +330,7 @@ mooncake-store-admin [global flags] <group> <subcommand> [flags]
 
 ### Global flags
 
-- `--metadata-url`
+- `--metadata-url` (alias `--metadata_url`)
 - `--keyspace`
 - `--trace-filter`
 - optional future `--control-address` or `--authority-runtime`
