@@ -150,6 +150,8 @@ class TransferEngineImpl {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
     Status waitTransferCompletion(BatchID batch_id);
 
     Status transferSync(const std::vector<Request>& request_list);
@@ -186,8 +188,15 @@ class TransferEngineImpl {
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
-    void updateTaskStatusFromPoll(Batch* batch, size_t task_id,
-                                  TransferStatus& task_status);
+    Status pollTaskStatus(Batch* batch, size_t task_id,
+                          TransferStatus& task_status);
+
+    void updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
+                                   TransferStatus& task_status,
+                                   bool allow_failover);
+
+    Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
+                          bool allow_failover);
 
     TransportType resolveTransport(const Request& req, int priority,
                                    bool invalidate_on_fail = true);

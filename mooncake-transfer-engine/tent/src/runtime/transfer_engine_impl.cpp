@@ -1306,11 +1306,35 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
-void TransferEngineImpl::updateTaskStatusFromPoll(Batch* batch, size_t task_id,
-                                                  TransferStatus& task_status) {
+Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
+                                          TransferStatus& task_status) {
+    auto& task = batch->task_list[task_id];
+    if (task.staging) {
+        return staging_proxy_->getStatus(&task, task_status);
+    }
+
+    if (task.type == UNSPEC) {
+        task_status.s = FAILED;
+        task_status.transferred_bytes = 0;
+        return Status::OK();
+    }
+
+    auto& transport = transport_list_[task.type];
+    auto& sub_batch = batch->sub_batch[task.type];
+    if (!transport || !sub_batch) {
+        return Status::InvalidArgument("Transport not available" LOC_MARK);
+    }
+    return transport->getTransferStatus(sub_batch, task.sub_task_id,
+                                        task_status);
+}
+
+void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
+                                                   TransferStatus& task_status,
+                                                   bool allow_failover) {
     auto& task = batch->task_list[task_id];
     task.status = task_status.s;
-    if (!enable_auto_failover_on_poll_ || task_status.s != FAILED) return;
+    if (!allow_failover || task_status.s != FAILED || task.type == UNSPEC)
+        return;
 
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
@@ -1365,24 +1389,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto& task = batch->task_list[task_id];
     auto prev_status = task.status;
-    if (task.staging) {
-        CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
-    } else {
-        if (task.type == UNSPEC) {
-            task_status.s = FAILED;
-            task_status.transferred_bytes = 0;
-            batch->task_list[task_id].status = task_status.s;
-            return Status::OK();
-        }
-        auto& transport = transport_list_[task.type];
-        auto& sub_batch = batch->sub_batch[task.type];
-        if (!transport || !sub_batch) {
-            return Status::InvalidArgument("Transport not available" LOC_MARK);
-        }
-        CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                                  task_status));
-    }
-    updateTaskStatusFromPoll(batch, task_id, task_status);
+    CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
+    updateTaskStatusAfterPoll(batch, task_id, task_status,
+                              enable_auto_failover_on_poll_);
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1405,8 +1414,9 @@ Status TransferEngineImpl::getTransferStatus(
     return Status::OK();
 }
 
-Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
-                                             TransferStatus& overall_status) {
+Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
+                                          TransferStatus& overall_status,
+                                          bool allow_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
@@ -1439,26 +1449,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             continue;
         }
         auto prev_status = task.status;
-        if (task.staging) {
-            CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
-        } else {
-            if (task.type == UNSPEC) {
-                task.status = FAILED;
-                failed_tasks++;
-                if (isWorse(FAILED, worst_failure)) worst_failure = FAILED;
-                continue;
-            }
-            auto& transport = transport_list_[task.type];
-            auto& sub_batch = batch->sub_batch[task.type];
-            if (!transport || !sub_batch) {
-                return Status::InvalidArgument(
-                    "Transport not available" LOC_MARK);
-            }
-            CHECK_STATUS(transport->getTransferStatus(
-                sub_batch, task.sub_task_id, task_status));
-        }
-        // Preserve legacy auto-failover-on-poll before aggregating status.
-        updateTaskStatusFromPoll(batch, task_id, task_status);
+        CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
+        updateTaskStatusAfterPoll(batch, task_id, task_status, allow_failover);
 
         if (task_status.s == COMPLETED) {
             success_tasks++;
@@ -1486,10 +1478,21 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
+Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
+                                             TransferStatus& overall_status) {
+    return getBatchStatus(batch_id, overall_status,
+                          enable_auto_failover_on_poll_);
+}
+
+Status TransferEngineImpl::progressBatch(BatchID batch_id,
+                                         TransferStatus& overall_status) {
+    return getBatchStatus(batch_id, overall_status, true);
+}
+
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
     TransferStatus xfer_status;
     while (true) {
-        CHECK_STATUS(getTransferStatus(batch_id, xfer_status));
+        CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s != PENDING) {
             freeBatch(batch_id);
             return xfer_status.s == COMPLETED
@@ -1507,7 +1510,7 @@ Status TransferEngineImpl::transferSync(
     CHECK_STATUS(submitTransfer(batch_id, request_list));
     while (true) {
         TransferStatus xfer_status;
-        CHECK_STATUS(getTransferStatus(batch_id, xfer_status));
+        CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s == COMPLETED) break;
         if (xfer_status.s != PENDING) {
             CHECK_STATUS(freeBatch(batch_id));
