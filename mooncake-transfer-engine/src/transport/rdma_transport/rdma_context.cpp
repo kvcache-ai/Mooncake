@@ -240,7 +240,11 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
     // Register memory depending on whether memory is on host or GPU.
-    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+    // MACA reports ordinary pageable host allocations as
+    // cudaMemoryTypeUnregistered. Those buffers are still CPU memory and must
+    // use the normal verbs registration path rather than the GPU dmabuf path.
+    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST ||
+        memType == cudaMemoryTypeUnregistered) {
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
@@ -330,7 +334,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
-    MemoryRegionMeta mrMeta;
+    MemoryRegionMeta mrMeta{nullptr, nullptr};
     int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
     if (ret != 0) {
         return ret;
@@ -355,7 +359,7 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
-    MemoryRegionMeta mrMeta;
+    MemoryRegionMeta mrMeta{nullptr, nullptr};
     int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
                                            mrMeta);
     if (ret != 0) {
