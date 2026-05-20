@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -75,8 +76,10 @@ class MasterMetricManager {
     int64_t get_allocated_file_size();
     int64_t get_total_file_capacity();
     double get_global_file_used_ratio(void);
+    // When true, get_total_file_capacity() returns INT64_MAX to indicate
+    // unlimited DFS capacity instead of relying on the gauge value.
     void set_dfs_capacity_unlimited(bool unlimited);
-    bool is_dfs_capacity_unlimited();
+    bool is_dfs_capacity_unlimited() const;
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -422,7 +425,7 @@ class MasterMetricManager {
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
-    bool dfs_capacity_unlimited_{false};
+    std::atomic<bool> dfs_capacity_unlimited_{false};
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;

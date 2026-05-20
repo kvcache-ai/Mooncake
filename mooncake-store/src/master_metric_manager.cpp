@@ -560,7 +560,7 @@ void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
     dfs_capacity_unlimited_ = unlimited;
 }
 
-bool MasterMetricManager::is_dfs_capacity_unlimited() {
+bool MasterMetricManager::is_dfs_capacity_unlimited() const {
     return dfs_capacity_unlimited_;
 }
 
