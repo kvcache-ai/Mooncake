@@ -4,9 +4,7 @@
 #include <boost/lockfree/queue.hpp>
 #include <csignal>
 #include <memory>
-#include <numa.h>
 #include <shared_mutex>
-#include <sys/mman.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -757,12 +755,12 @@ class RealClient : public PyClient {
         }
     };
 
-    struct NumaSegmentDeleter {
+    struct UbSegmentDeleter {
         size_t size = 0;
+        std::string protocol = "ub";
         void operator()(void *ptr) const {
             if (ptr && size > 0) {
-                munmap(ptr, size);
-                numa_free(ptr, size);
+                free_memory(protocol.c_str(), ptr);
             }
         }
     };
@@ -772,8 +770,8 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
-    std::vector<std::unique_ptr<void, NumaSegmentDeleter>>
-        numa_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>>
+        ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

@@ -14,8 +14,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <boost/algorithm/string.hpp>
-#include <numa.h>
-#include <numaif.h>
 
 #include <algorithm>
 #include <atomic>
@@ -104,8 +102,7 @@ AutoPortBinder::~AutoPortBinder() {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment,
-                                       int numa_node) {
+                                       size_t alignment) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -119,7 +116,7 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
-        return mooncake::ub_allocate_memory(total_size, numa_node);
+        return mooncake::ub_allocate_memory(alignment, total_size);
     }
 #endif
     // Allocate aligned memory
@@ -365,10 +362,6 @@ void *allocate_buffer_numa_segments(size_t total_size,
 }
 
 void free_memory(const std::string &protocol, void *ptr) {
-    free_memory(protocol, ptr, 0);
-}
-
-void free_memory(const std::string &protocol, void *ptr, size_t size) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
@@ -376,7 +369,7 @@ void free_memory(const std::string &protocol, void *ptr, size_t size) {
 #endif
 #if defined(USE_UB)
     if (protocol == "ub") {
-        mooncake::ub_free_memory(ptr, size);
+        mooncake::ub_free_memory(ptr);
         return;
     }
 #endif
