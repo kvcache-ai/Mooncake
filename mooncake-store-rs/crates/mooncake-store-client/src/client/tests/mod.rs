@@ -5531,16 +5531,17 @@ fn routed_put_retries_past_default_limit_for_soft_preferred_owners() {
         } else {
             Arc::new(root_transport.peer(&format!("put-many-retry-store-{index}-segment")))
         };
-        let store = StoreClientBuilder::new(metadata.clone(), format!("put-many-retry-store-{index}"))
-            .state(ClientLifecycleState::Active)
-            .label("pool", "pool-a")
-            .label("storage", "true")
-            .route_control(RouteControlMode::MetadataOnly)
-            .live_client_sync_interval(fast_live_client_sync_interval())
-            .transport(transport.clone())
-            .local_memory(storage_config())
-            .build(test_future_expiry_ms())
-            .expect("store build should succeed");
+        let store =
+            StoreClientBuilder::new(metadata.clone(), format!("put-many-retry-store-{index}"))
+                .state(ClientLifecycleState::Active)
+                .label("pool", "pool-a")
+                .label("storage", "true")
+                .route_control(RouteControlMode::MetadataOnly)
+                .live_client_sync_interval(fast_live_client_sync_interval())
+                .transport(transport.clone())
+                .local_memory(storage_config())
+                .build(test_future_expiry_ms())
+                .expect("store build should succeed");
         store_transports.push(transport);
         stores.push(store);
     }

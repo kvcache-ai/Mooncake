@@ -460,15 +460,13 @@ fn cleanup_keys(
         }
 
         // Log progress every 1000 keys to show activity
-        if (i + 1) % 1000 == 0 || i + 1 == total {
-            if deleted != last_logged {
-                debug!(
-                    "worker {worker_id} cleanup progress: {}/{} keys cleaned",
-                    i + 1,
-                    total
-                );
-                last_logged = deleted;
-            }
+        if ((i + 1) % 1000 == 0 || i + 1 == total) && deleted != last_logged {
+            debug!(
+                "worker {worker_id} cleanup progress: {}/{} keys cleaned",
+                i + 1,
+                total
+            );
+            last_logged = deleted;
         }
     }
 
@@ -921,8 +919,7 @@ pub fn run_bench(
 
         let cleanup_result = thread::scope(|scope| {
             let mut handles = Vec::new();
-            for worker_id in 0..concurrency {
-                let writer_ptr = writer_ptrs_cleanup[worker_id];
+            for (worker_id, writer_ptr) in writer_ptrs_cleanup.iter().copied().enumerate() {
                 let worker_tenant = tenant.clone();
 
                 let handle = scope.spawn(move || {
