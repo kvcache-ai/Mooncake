@@ -103,6 +103,18 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     bool isRoce() const { return is_roce_; }
     uint8_t portNum() const { return port_num_; }
 
+    // Allocate the GPU-visible control buffer used by IBGDA DevX queues and
+    // register it as a DevX umem.  The allocation currently uses CUDA, but the
+    // ownership boundary intentionally lives in TENT so this can later dispatch
+    // to other platform backends without changing mooncake-ep.
+    Status allocateControlBuffer(size_t size);
+
+    Status releaseControlBuffer();
+
+    void* controlBuffer() const { return ctrl_buf_; }
+    size_t controlBufferSize() const { return ctrl_buf_size_; }
+    mlx5dv_devx_umem* controlBufferUmem() const { return ctrl_buf_umem_; }
+
     // Stage-C bridge: lets an existing IBGDA host setup hand a GPU-visible
     // backend context to the TENT DeviceTransport interface. The full Stage-D
     // transport will allocate and populate this context internally.
@@ -134,6 +146,10 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     int gid_index_ = -1;
     bool is_roce_ = false;
     std::unordered_map<void*, ibv_mr*> registered_mrs_;
+
+    void* ctrl_buf_ = nullptr;
+    size_t ctrl_buf_size_ = 0;
+    mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
 };
 
 }  // namespace tent

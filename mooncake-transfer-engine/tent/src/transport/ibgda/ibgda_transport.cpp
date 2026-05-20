@@ -74,6 +74,7 @@ Status IbGdaTransport::install(std::string& local_segment_name,
 }
 
 Status IbGdaTransport::uninstall() {
+    (void)releaseControlBuffer();
     for (auto& entry : registered_mrs_) {
         if (entry.second) ibv_dereg_mr(entry.second);
     }
@@ -179,6 +180,69 @@ Status IbGdaTransport::unregisterMemory(void* ptr) {
     if (ibv_dereg_mr(mr)) {
         return Status::RdmaError("failed to unregister IBGDA memory" LOC_MARK);
     }
+    return Status::OK();
+}
+
+Status IbGdaTransport::allocateControlBuffer(size_t size) {
+    if (size == 0) {
+        return Status::InvalidArgument("control buffer size is zero" LOC_MARK);
+    }
+    if (!ctx_) {
+        return Status::InvalidArgument(
+            "IBGDA device has not been initialized" LOC_MARK);
+    }
+    if (ctrl_buf_) {
+        if (ctrl_buf_size_ == size && ctrl_buf_umem_) return Status::OK();
+        return Status::InvalidArgument(
+            "IBGDA control buffer already allocated with a different size"
+            LOC_MARK);
+    }
+
+    auto err = cudaMalloc(&ctrl_buf_, size);
+    if (err != cudaSuccess) {
+        ctrl_buf_ = nullptr;
+        return Status::CudaError(std::string("cudaMalloc control buffer failed: ") +
+                                 cudaGetErrorString(err) + LOC_MARK);
+    }
+    ctrl_buf_size_ = size;
+
+    ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, ctrl_buf_size_,
+                                          IBV_ACCESS_LOCAL_WRITE);
+    if (!ctrl_buf_umem_) {
+        err = cudaFree(ctrl_buf_);
+        ctrl_buf_ = nullptr;
+        ctrl_buf_size_ = 0;
+        if (err != cudaSuccess) {
+            return Status::CudaError(
+                std::string("failed to register control buffer as umem; ") +
+                "cudaFree cleanup also failed: " + cudaGetErrorString(err) +
+                LOC_MARK);
+        }
+        return Status::RdmaError(
+            "failed to register IBGDA control buffer as umem" LOC_MARK);
+    }
+
+    return Status::OK();
+}
+
+Status IbGdaTransport::releaseControlBuffer() {
+    if (ctrl_buf_umem_) {
+        if (mlx5dv_devx_umem_dereg(ctrl_buf_umem_)) {
+            return Status::RdmaError(
+                "failed to deregister IBGDA control buffer umem" LOC_MARK);
+        }
+        ctrl_buf_umem_ = nullptr;
+    }
+    if (ctrl_buf_) {
+        auto err = cudaFree(ctrl_buf_);
+        ctrl_buf_ = nullptr;
+        ctrl_buf_size_ = 0;
+        if (err != cudaSuccess) {
+            return Status::CudaError(std::string("cudaFree control buffer failed: ") +
+                                     cudaGetErrorString(err) + LOC_MARK);
+        }
+    }
+    ctrl_buf_size_ = 0;
     return Status::OK();
 }
 
