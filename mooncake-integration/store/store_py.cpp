@@ -1807,6 +1807,9 @@ PYBIND11_MODULE(store, m) {
     // Progressive get handle for per-chunk completion tracking
     py::class_<ProgressiveGetHandle>(m, "ProgressiveGetHandle")
         .def_property_readonly("num_chunks", &ProgressiveGetHandle::num_chunks)
+        .def_property_readonly(
+            "completed_count",
+            [](ProgressiveGetHandle &self) { return self.completed_count(); })
         .def(
             "is_chunk_ready",
             [](ProgressiveGetHandle &self, size_t idx) {
@@ -1814,11 +1817,6 @@ PYBIND11_MODULE(store, m) {
                 return self.is_chunk_ready(idx);
             },
             py::arg("chunk_index"))
-        .def("completed_count",
-             [](ProgressiveGetHandle &self) {
-                 py::gil_scoped_release release;
-                 return self.completed_count();
-             })
         .def(
             "wait_chunk",
             [](ProgressiveGetHandle &self, size_t idx) {
@@ -1834,6 +1832,9 @@ PYBIND11_MODULE(store, m) {
     // Scatter read handle for per-chunk completion tracking
     py::class_<ScatterReadHandle>(m, "ScatterReadHandle")
         .def_property_readonly("num_chunks", &ScatterReadHandle::num_chunks)
+        .def_property_readonly(
+            "completed_count",
+            [](ScatterReadHandle &self) { return self.completed_count(); })
         .def(
             "is_chunk_ready",
             [](ScatterReadHandle &self, size_t idx) {
@@ -1841,11 +1842,6 @@ PYBIND11_MODULE(store, m) {
                 return self.is_chunk_ready(idx);
             },
             py::arg("chunk_index"))
-        .def("completed_count",
-             [](ScatterReadHandle &self) {
-                 py::gil_scoped_release release;
-                 return self.completed_count();
-             })
         .def(
             "wait_chunk",
             [](ScatterReadHandle &self, size_t idx) {
@@ -1856,6 +1852,33 @@ PYBIND11_MODULE(store, m) {
         .def("wait_all", [](ScatterReadHandle &self) {
             py::gil_scoped_release release;
             return static_cast<int>(self.wait_all());
+        });
+
+    // Progressive put handle for per-chunk streaming writes
+    py::class_<ProgressivePutHandle>(m, "ProgressivePutHandle")
+        .def_property_readonly("num_chunks", &ProgressivePutHandle::num_chunks)
+        .def_property_readonly("completed_count",
+                               &ProgressivePutHandle::completed_count)
+        .def_property_readonly("is_sealed", &ProgressivePutHandle::is_sealed)
+        .def(
+            "write_chunk",
+            [](ProgressivePutHandle &self, uintptr_t data_ptr, size_t offset,
+               size_t size) {
+                py::gil_scoped_release release;
+                return static_cast<int>(self.write_chunk(
+                    reinterpret_cast<void *>(data_ptr), offset, size));
+            },
+            py::arg("data_ptr"), py::arg("offset"), py::arg("size"),
+            "Write a chunk at the specified byte offset within the "
+            "preallocated object.\n"
+            "Args:\n"
+            "    data_ptr: Source buffer pointer (must be registered memory)\n"
+            "    offset: Byte offset within the object\n"
+            "    size: Number of bytes to write\n"
+            "Returns: 0 on success, negative error code on failure")
+        .def("seal", [](ProgressivePutHandle &self) {
+            py::gil_scoped_release release;
+            return static_cast<int>(self.seal());
         });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
@@ -2052,6 +2075,31 @@ PYBIND11_MODULE(store, m) {
             "Start a streaming scatter read. Returns a "
             "ScatterReadHandle or None on failure.\n"
             "The buffer must be a registered memory address (uintptr_t).")
+        .def(
+            "progressive_put",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               size_t total_size, size_t num_chunks,
+               const ReplicateConfig &config) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return py::cast<py::object>(py::none());
+                }
+                std::optional<ProgressivePutHandle> handle;
+                {
+                    py::gil_scoped_release release;
+                    handle = self.store_->progressive_put(key, total_size,
+                                                          num_chunks, config);
+                }
+                if (!handle) {
+                    return py::cast<py::object>(py::none());
+                }
+                return py::cast(std::move(*handle));
+            },
+            py::arg("key"), py::arg("total_size"), py::arg("num_chunks"),
+            py::arg("config") = ReplicateConfig{},
+            "Start a progressive (chunked) put. Preallocates an object of\n"
+            "total_size bytes and returns a ProgressivePutHandle for writing\n"
+            "chunks at arbitrary offsets. Returns None on failure.")
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {

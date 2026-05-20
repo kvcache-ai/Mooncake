@@ -176,6 +176,13 @@ class DummyClient : public PyClient {
         return std::nullopt;
     }
 
+    std::optional<ProgressivePutHandle> progressive_put(
+        const std::string &key, size_t total_size, size_t num_chunks,
+        const ReplicateConfig &config = ReplicateConfig{}) override {
+        LOG(ERROR) << "progressive_put not supported for DummyClient";
+        return std::nullopt;
+    }
+
     std::optional<ScatterReadHandle> streaming_batch_get_buffer_ranges(
         const std::vector<std::string> &keys, void *dest_buffer,
         const std::vector<size_t> &dest_offsets,

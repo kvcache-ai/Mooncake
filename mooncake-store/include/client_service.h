@@ -225,6 +225,23 @@ class Client {
             key_ranges);
 
     /**
+     * @brief Start a progressive (chunked) put for streaming writes.
+     *
+     * Preallocates an object of `total_size` bytes and returns a handle that
+     * allows writing chunks at arbitrary offsets. The object becomes readable
+     * chunk-by-chunk as writes complete (tracked via a sideband progress key).
+     *
+     * @param key Object key
+     * @param total_size Total preallocated size in bytes
+     * @param num_chunks Expected number of chunks (for progress tracking)
+     * @param config Replication configuration
+     * @return ProgressivePutHandle for per-chunk writing, or nullopt on failure
+     */
+    std::optional<ProgressivePutHandle> ProgressivePut(
+        const std::string& key, size_t total_size, size_t num_chunks,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -743,7 +760,7 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
-    std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::shared_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

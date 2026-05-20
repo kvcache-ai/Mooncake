@@ -2035,6 +2035,16 @@ std::optional<ProgressiveGetHandle> RealClient::progressive_get(
     return client_->ProgressiveGet(key, buffer, size, chunk_size);
 }
 
+std::optional<ProgressivePutHandle> RealClient::progressive_put(
+    const std::string &key, size_t total_size, size_t num_chunks,
+    const ReplicateConfig &config) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::nullopt;
+    }
+    return client_->ProgressivePut(key, total_size, num_chunks, config);
+}
+
 std::optional<ScatterReadHandle> RealClient::streaming_batch_get_buffer_ranges(
     const std::vector<std::string> &keys, void *dest_buffer,
     const std::vector<size_t> &dest_offsets,

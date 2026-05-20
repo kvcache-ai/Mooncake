@@ -1731,4 +1731,128 @@ void TransferSubmitter::updateReadBytes(size_t total_bytes) {
     transfer_metric_->total_read_bytes.inc(total_bytes);
 }
 
+// ============================================================================
+// ProgressivePutSession + ProgressivePutHandle Implementation
+// ============================================================================
+
+ErrorCode ProgressivePutSession::write_chunk(void* data, size_t offset,
+                                             size_t size) {
+    if (data == nullptr || size == 0) {
+        LOG(ERROR) << "ProgressivePutSession: invalid params (data=" << data
+                   << ", size=" << size << ")";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (size > total_size_ || offset > total_size_ - size) {
+        LOG(ERROR) << "ProgressivePutSession: overflow offset=" << offset
+                   << " + size=" << size << " > total=" << total_size_;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    if (sealed_.load(std::memory_order_relaxed)) {
+        LOG(ERROR) << "ProgressivePutSession: cannot write after seal";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (completed_count_.load(std::memory_order_relaxed) >= num_chunks_) {
+        LOG(ERROR) << "ProgressivePutSession: all chunks already written";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    ErrorCode err = submitter_->submitChunkWrite(replica_, data, offset, size);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    uint64_t new_count =
+        completed_count_.fetch_add(1, std::memory_order_release) + 1;
+
+    // Progress callback inside the lock to guarantee monotonic counter
+    // updates. This is acceptable because the progress key is forced to
+    // the local segment (LOCAL_MEMCPY path — sub-microsecond).
+    if (progress_cb_) {
+        progress_cb_(new_count);
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ProgressivePutSession::seal() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    sealed_.store(true, std::memory_order_release);
+    if (seal_cb_) {
+        return seal_cb_();
+    }
+    return ErrorCode::OK;
+}
+
+ProgressivePutHandle::ProgressivePutHandle(
+    std::shared_ptr<ProgressivePutSession> session)
+    : session_(std::move(session)) {}
+
+ProgressivePutHandle::~ProgressivePutHandle() {
+    if (session_ && !session_->is_sealed() &&
+        session_->completed_count() < session_->num_chunks()) {
+        LOG(WARNING) << "ProgressivePutHandle destroyed without seal: "
+                     << session_->completed_count() << "/"
+                     << session_->num_chunks() << " chunks written";
+    }
+}
+
+ProgressivePutHandle::ProgressivePutHandle(
+    ProgressivePutHandle&& other) noexcept = default;
+
+ProgressivePutHandle& ProgressivePutHandle::operator=(
+    ProgressivePutHandle&& other) noexcept = default;
+
+size_t ProgressivePutHandle::num_chunks() const {
+    return session_->num_chunks();
+}
+
+size_t ProgressivePutHandle::completed_count() const {
+    return session_->completed_count();
+}
+
+ErrorCode ProgressivePutHandle::write_chunk(void* data, size_t offset,
+                                            size_t size) {
+    return session_->write_chunk(data, offset, size);
+}
+
+ErrorCode ProgressivePutHandle::seal() { return session_->seal(); }
+
+bool ProgressivePutHandle::is_sealed() const { return session_->is_sealed(); }
+
+ErrorCode TransferSubmitter::submitChunkWrite(
+    const Replica::Descriptor& replica, void* data, size_t offset,
+    size_t size) {
+    const auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+    if (size > handle.size_ || offset > handle.size_ - size) {
+        LOG(ERROR) << "submitChunkWrite: overflow offset=" << offset
+                   << " + size=" << size << " > buffer=" << handle.size_;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    Slice slice{data, size};
+    std::vector<Slice> slices{slice};
+
+    std::optional<TransferFuture> future;
+    TransferStrategy strategy = selectStrategy(handle, slices);
+    if (strategy == TransferStrategy::LOCAL_MEMCPY) {
+        future = submitMemcpyOperation(handle, slices, TransferRequest::WRITE,
+                                       offset);
+    } else {
+        future = submitTransferEngineOperation(handle, slices,
+                                               TransferRequest::WRITE, offset);
+    }
+
+    if (!future) {
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    ErrorCode result = future->get();
+    if (result == ErrorCode::OK && transfer_metric_) {
+        transfer_metric_->total_write_bytes.inc(size);
+    }
+    return result;
+}
+
 }  // namespace mooncake

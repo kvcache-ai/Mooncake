@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -429,6 +430,104 @@ class ScatterReadHandle {
 };
 
 /**
+ * @brief Handle for tracking per-chunk completion of a progressive put
+ *
+ * Allows the writer to append chunks at specified offsets to a preallocated
+ * object. Each write_chunk issues an RDMA WRITE at the given offset.
+ * After each chunk completes, an internal progress counter is incremented.
+ * Readers can observe chunk readiness via a sideband progress key.
+ */
+class TransferSubmitter;  // forward declare for ProgressivePutSession
+
+class ProgressivePutSession {
+   public:
+    using ProgressCallback = std::function<void(uint64_t completed_chunks)>;
+    using SealCallback = std::function<ErrorCode()>;
+
+    ProgressivePutSession(std::shared_ptr<TransferSubmitter> submitter,
+                          Replica::Descriptor replica, size_t total_size,
+                          size_t num_chunks,
+                          ProgressCallback progress_cb = nullptr,
+                          SealCallback seal_cb = nullptr)
+        : submitter_(std::move(submitter)),
+          replica_(std::move(replica)),
+          total_size_(total_size),
+          num_chunks_(num_chunks),
+          completed_count_(0),
+          sealed_(false),
+          progress_cb_(std::move(progress_cb)),
+          seal_cb_(std::move(seal_cb)) {}
+
+    size_t num_chunks() const { return num_chunks_; }
+
+    size_t completed_count() const {
+        return completed_count_.load(std::memory_order_acquire);
+    }
+
+    bool is_sealed() const { return sealed_.load(std::memory_order_acquire); }
+
+    ErrorCode write_chunk(void* data, size_t offset, size_t size);
+
+    ErrorCode seal();
+
+   private:
+    std::shared_ptr<TransferSubmitter> submitter_;
+    Replica::Descriptor replica_;
+    size_t total_size_;
+    size_t num_chunks_;
+    std::atomic<size_t> completed_count_;
+    std::atomic<bool> sealed_;
+    ProgressCallback progress_cb_;
+    SealCallback seal_cb_;
+    std::mutex write_mutex_;  // serialize write_chunk + progress updates
+};
+
+class ProgressivePutHandle {
+   public:
+    explicit ProgressivePutHandle(
+        std::shared_ptr<ProgressivePutSession> session);
+
+    ~ProgressivePutHandle();
+
+    // Non-copyable, movable
+    ProgressivePutHandle(const ProgressivePutHandle&) = delete;
+    ProgressivePutHandle& operator=(const ProgressivePutHandle&) = delete;
+    ProgressivePutHandle(ProgressivePutHandle&& other) noexcept;
+    ProgressivePutHandle& operator=(ProgressivePutHandle&& other) noexcept;
+
+    size_t num_chunks() const;
+
+    /**
+     * @brief Number of chunks that have been successfully written
+     */
+    size_t completed_count() const;
+
+    /**
+     * @brief Write a chunk at the specified byte offset within the object.
+     * @param data Source buffer pointer (must be registered memory)
+     * @param offset Byte offset within the preallocated object
+     * @param size Number of bytes to write
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode write_chunk(void* data, size_t offset, size_t size);
+
+    /**
+     * @brief Seal the progressive put: finalize the object metadata.
+     * After sealing, no more writes are allowed.
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode seal();
+
+    /**
+     * @brief Check if the session has been sealed
+     */
+    bool is_sealed() const;
+
+   private:
+    std::shared_ptr<ProgressivePutSession> session_;
+};
+
+/**
  * @brief Submitter class for asynchronous transfer operations
  *
  * This class analyzes transfer requirements, selects optimal strategies, and
@@ -536,6 +635,18 @@ class TransferSubmitter {
                       std::vector<std::tuple<size_t, size_t, size_t>>>>&
             key_ranges,
         bool enable_task_grouping = false);
+
+    /**
+     * @brief Submit a single chunk write at the specified offset within a
+     * preallocated object. Used internally by ProgressivePutSession.
+     * @param replica Replica descriptor of the preallocated object
+     * @param data Source buffer (must be registered)
+     * @param offset Byte offset within the object
+     * @param size Bytes to write
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode submitChunkWrite(const Replica::Descriptor& replica, void* data,
+                               size_t offset, size_t size);
 
    private:
     TransferEngine& engine_;

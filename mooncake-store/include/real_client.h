@@ -305,6 +305,10 @@ class RealClient : public PyClient {
         const std::string &key, void *buffer, size_t size,
         size_t chunk_size) override;
 
+    std::optional<ProgressivePutHandle> progressive_put(
+        const std::string &key, size_t total_size, size_t num_chunks,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+
     std::optional<ScatterReadHandle> streaming_batch_get_buffer_ranges(
         const std::vector<std::string> &keys, void *dest_buffer,
         const std::vector<size_t> &dest_offsets,
