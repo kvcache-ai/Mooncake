@@ -18,9 +18,16 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct GlobalArgs {
-    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
+    /// Store-RS metadata URL (`redis://...` or `etcd://...`).
+    #[arg(long, alias = "metadata_url", env = "MC_STORE_RS_METADATA_URL")]
     pub metadata_url: String,
-    #[arg(long, env = "MC_STORE_RS_TRANSPORT_METADATA_URL")]
+    /// Transfer Engine metadata input (`redis://...` or `P2PHANDSHAKE`).
+    /// Defaults to `P2PHANDSHAKE` (classic_te peer handshake) when unset.
+    #[arg(
+        long = "transport-metadata-url",
+        alias = "transport_metadata_url",
+        env = "MC_STORE_RS_TRANSPORT_METADATA_URL"
+    )]
     pub transport_metadata_url: Option<String>,
     #[arg(long, default_value = "", env = "MC_STORE_RS_KEYSPACE")]
     pub keyspace: String,
@@ -475,30 +482,52 @@ mod tests {
     }
 
     #[test]
-    fn global_cli_reads_metadata_url_from_mc_store_rs_metadata_url() {
+    fn global_cli_metadata_url_binds_to_metadata_url_env() {
         let command = Cli::command();
-        let metadata = command
+        let arg = command
             .get_arguments()
             .find(|arg| arg.get_long() == Some("metadata-url"))
             .expect("global args should expose --metadata-url");
+        assert_eq!(arg.get_env(), Some(OsStr::new("MC_STORE_RS_METADATA_URL")),);
+    }
 
+    #[test]
+    fn global_cli_transport_metadata_url_binds_to_transport_metadata_url_env() {
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("transport-metadata-url"))
+            .expect("global args should expose --transport-metadata-url");
         assert_eq!(
-            metadata.get_env(),
-            Some(OsStr::new("MC_STORE_RS_METADATA_URL"))
+            arg.get_env(),
+            Some(OsStr::new("MC_STORE_RS_TRANSPORT_METADATA_URL")),
         );
     }
 
     #[test]
-    fn global_cli_reads_transport_metadata_url_from_mc_store_rs_transport_metadata_url() {
-        let command = Cli::command();
-        let transport_metadata = command
-            .get_arguments()
-            .find(|arg| arg.get_long() == Some("transport-metadata-url"))
-            .expect("global args should expose --transport-metadata-url");
+    fn global_cli_metadata_url_accepts_underscore_alias() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata_url",
+            "redis://127.0.0.1:6379/0",
+            "bench",
+        ]);
+        assert_eq!(cli.global.metadata_url, "redis://127.0.0.1:6379/0");
+    }
 
+    #[test]
+    fn global_cli_transport_metadata_url_accepts_underscore_alias() {
+        let cli = Cli::parse_from([
+            "mooncake-store-bench",
+            "--metadata-url",
+            "redis://127.0.0.1:6379/0",
+            "--transport_metadata_url",
+            "P2PHANDSHAKE",
+            "bench",
+        ]);
         assert_eq!(
-            transport_metadata.get_env(),
-            Some(OsStr::new("MC_STORE_RS_TRANSPORT_METADATA_URL"))
+            cli.global.transport_metadata_url.as_deref(),
+            Some("P2PHANDSHAKE")
         );
     }
 

@@ -170,12 +170,18 @@ pub struct CompatBuildPlan {
 #[derive(Clone, Debug)]
 /// Compatibility setup inputs accepted by the Python wrapper and standalone client.
 ///
-/// Admin-managed tenant policy in metadata is the preferred authoring surface for tenant-scoped
-/// routing and resource policy. These inputs are kept as bootstrap/fallback knobs.
+/// `transport_metadata_url` carries the Transfer Engine metadata input and `metadata_url`
+/// carries the Store-RS metadata URL. Admin-managed tenant policy in metadata is the
+/// preferred authoring surface for tenant-scoped routing and resource policy; the
+/// remaining inputs are kept as bootstrap/fallback knobs.
 pub struct CompatSetupArgs {
     pub local_hostname: String,
+    /// Transfer Engine metadata input. Accepts `redis://...` or `P2PHANDSHAKE`.
+    /// Empty resolves to `P2PHANDSHAKE`.
+    pub transport_metadata_url: String,
+    /// Store-RS metadata URL. Must be `redis://...` or `etcd://...`. Empty is
+    /// rejected.
     pub metadata_url: String,
-    pub transport_metadata_url: Option<String>,
     pub global_segment_size: usize,
     pub local_buffer_size: usize,
     pub eviction_high_watermark_percent: Option<u8>,
@@ -203,8 +209,8 @@ impl CompatSetupArgs {
     pub fn build(self) -> Result<CompatBuildPlan> {
         let Self {
             local_hostname,
-            metadata_url,
             transport_metadata_url,
+            metadata_url,
             global_segment_size,
             local_buffer_size,
             eviction_high_watermark_percent,
@@ -232,9 +238,13 @@ impl CompatSetupArgs {
         let stable_id = stable_id.unwrap_or_else(|| format!("py-store-{}", now_ms()));
         let transport_backend = resolve_transport_backend(transport_backend.as_deref())?;
         let timeouts = timeouts.unwrap_or_else(CompatTimeoutConfig::from_env);
+        if metadata_url.trim().is_empty() {
+            return Err(StoreError::Metadata(
+                "metadata_url (setup arg7) is required: pass a redis:// or etcd:// URL for the Store-RS metadata backend".to_string(),
+            ));
+        }
         let metadata = build_store_metadata_backend(&metadata_url, keyspace)?;
-        let transport_metadata_uri =
-            resolve_transport_metadata_uri(&metadata_url, transport_metadata_url)?;
+        let transport_metadata_uri = resolve_transport_metadata_uri(&transport_metadata_url)?;
         let transport_config = build_transport_config(
             transport_backend,
             &local_hostname,
@@ -399,50 +409,22 @@ pub fn build_store_metadata_backend(
     )))
 }
 
-fn resolve_transport_metadata_uri(
-    metadata_url: &str,
-    transport_metadata_url: Option<String>,
-) -> Result<String> {
-    if metadata_url.starts_with("redis://") {
-        let transport_metadata_uri =
-            normalize_transport_metadata_uri(transport_metadata_url, metadata_url.to_string());
-        validate_transport_metadata_uri(&transport_metadata_uri)?;
-        return Ok(transport_metadata_uri);
-    }
-
-    if metadata_url.starts_with("etcd://") {
-        let transport_metadata_uri = normalize_transport_metadata_uri(
-            transport_metadata_url.or_else(|| std::env::var("MC_STORE_RS_TENT_REDIS_URL").ok()),
-            "redis://127.0.0.1:6380/0".to_string(),
-        );
-        validate_transport_metadata_uri(&transport_metadata_uri)?;
-        return Ok(transport_metadata_uri);
-    }
-
-    if metadata_url.starts_with("http://") || metadata_url.starts_with("https://") {
-        return Err(StoreError::Unsupported(
-            "http metadata endpoints are not supported in store-rs; use redis:// or etcd://"
-                .to_string(),
-        ));
-    }
-
-    Err(StoreError::Metadata(format!(
-        "unsupported metadata url scheme: {metadata_url}"
-    )))
-}
-
-fn normalize_transport_metadata_uri(explicit: Option<String>, fallback: String) -> String {
-    explicit
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            if is_p2p_handshake_metadata(&value) {
-                P2P_HANDSHAKE_METADATA.to_string()
-            } else {
-                value
-            }
-        })
-        .unwrap_or(fallback)
+/// Picks the Transfer Engine metadata URI from arg2 (`transport_metadata_url`).
+///
+/// Empty input resolves to `P2PHANDSHAKE` (classic_te peer handshake), which
+/// is the only TE metadata scheme that works without an external service.
+/// `tent` callers must supply a `redis://...` value explicitly.
+fn resolve_transport_metadata_uri(transport_metadata_url: &str) -> Result<String> {
+    let trimmed = transport_metadata_url.trim();
+    let uri = if trimmed.is_empty() {
+        P2P_HANDSHAKE_METADATA.to_string()
+    } else if is_p2p_handshake_metadata(trimmed) {
+        P2P_HANDSHAKE_METADATA.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    validate_transport_metadata_uri(&uri)?;
+    Ok(uri)
 }
 
 fn validate_transport_metadata_uri(value: &str) -> Result<()> {
@@ -750,21 +732,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_transport_metadata_uri_honors_explicit_value_for_redis_store() {
-        let transport_metadata_uri = resolve_transport_metadata_uri(
-            "redis://127.0.0.1:6379/0",
-            Some("P2PHANDSHAKE".to_string()),
-        )
-        .expect("transport metadata uri should resolve");
+    fn resolve_transport_metadata_uri_accepts_p2phandshake() {
+        let transport_metadata_uri =
+            resolve_transport_metadata_uri("P2PHANDSHAKE").expect("p2phandshake should resolve");
         assert_eq!(transport_metadata_uri, P2P_HANDSHAKE_METADATA);
     }
 
     #[test]
-    fn resolve_transport_metadata_uri_rejects_non_redis_explicit_value_for_redis_store() {
-        let error = match resolve_transport_metadata_uri(
-            "redis://127.0.0.1:6379/0",
-            Some("http://bad-transport".to_string()),
-        ) {
+    fn resolve_transport_metadata_uri_normalizes_p2phandshake_case() {
+        let transport_metadata_uri =
+            resolve_transport_metadata_uri("p2phandshake").expect("lowercase should resolve");
+        assert_eq!(transport_metadata_uri, P2P_HANDSHAKE_METADATA);
+    }
+
+    #[test]
+    fn resolve_transport_metadata_uri_accepts_redis() {
+        let transport_metadata_uri = resolve_transport_metadata_uri("redis://cache.local:6381/2")
+            .expect("redis should resolve");
+        assert_eq!(transport_metadata_uri, "redis://cache.local:6381/2");
+    }
+
+    #[test]
+    fn resolve_transport_metadata_uri_rejects_unknown_scheme() {
+        let error = match resolve_transport_metadata_uri("http://bad-transport") {
             Ok(_) => panic!("transport metadata requires redis or p2p metadata"),
             Err(error) => error,
         };
@@ -820,8 +810,8 @@ mod tests {
     fn compat_setup_rejects_p2p_handshake_metadata_for_tent() {
         let result = CompatSetupArgs {
             local_hostname: "node-a:17112".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: Some("P2PHANDSHAKE".to_string()),
             global_segment_size: 4096,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -921,8 +911,8 @@ mod tests {
     fn build_plan_defaults_storage_false_when_storage_bytes_is_zero() {
         let plan = CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 0,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -959,8 +949,8 @@ mod tests {
     fn build_plan_rejects_storage_true_without_storage_bytes() {
         let result = CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 0,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -995,8 +985,8 @@ mod tests {
     fn build_plan_rejects_route_topk_below_two() {
         let result = CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 4096,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -1031,8 +1021,8 @@ mod tests {
     fn compat_setup_build_supports_etcd_metadata_and_defaults() {
         let plan = CompatSetupArgs {
             local_hostname: "node-a".to_string(),
+            transport_metadata_url: "redis://cache.local:6381/4".to_string(),
             metadata_url: "etcd://127.0.0.1:2379,https://etcd.example:32379".to_string(),
-            transport_metadata_url: Some("redis://cache.local:6381/4".to_string()),
             global_segment_size: 4096,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -1088,8 +1078,8 @@ mod tests {
     fn compat_setup_can_build_classic_te_plan() {
         let plan = CompatSetupArgs {
             local_hostname: "node-a:17112".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 4096,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -1118,7 +1108,10 @@ mod tests {
         assert_eq!(plan.transport_backend, TransportBackend::ClassicTe);
         match plan.transport_config {
             CompatTransportConfig::ClassicTe(config) => {
+                // arg2 defaulted to P2PHANDSHAKE flows through to the TE.
+                assert_eq!(config.metadata_uri(), P2P_HANDSHAKE_METADATA);
                 assert_eq!(config.rpc_bind_host(), "node-a");
+                assert_eq!(config.rpc_port_value(), Some(17112));
                 assert_eq!(config.transport_protocol(), ClassicTransportProtocol::Tcp);
             }
             CompatTransportConfig::Tent(_) => panic!("classic backend should build classic config"),
@@ -1130,8 +1123,8 @@ mod tests {
     fn compat_setup_defaults_storage_label_to_false_for_rw_only_clients() {
         let plan = CompatSetupArgs {
             local_hostname: "node-a".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 0,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -1169,8 +1162,8 @@ mod tests {
     fn compat_setup_keeps_explicit_route_true_for_rw_only_clients() {
         let plan = CompatSetupArgs {
             local_hostname: "node-a".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
-            transport_metadata_url: None,
             global_segment_size: 0,
             local_buffer_size: 1024,
             eviction_high_watermark_percent: None,
@@ -1226,12 +1219,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_transport_metadata_uri_validates_etcd_transport_url() {
-        let error = match resolve_transport_metadata_uri(
-            "etcd://127.0.0.1:2379",
-            Some("http://bad-transport".to_string()),
-        ) {
-            Ok(_) => panic!("etcd metadata requires redis or p2p transport metadata"),
+    fn resolve_transport_metadata_uri_empty_falls_back_to_p2phandshake() {
+        let transport_metadata_uri =
+            resolve_transport_metadata_uri("").expect("empty should resolve to P2PHANDSHAKE");
+        assert_eq!(transport_metadata_uri, P2P_HANDSHAKE_METADATA);
+    }
+
+    #[test]
+    fn compat_setup_rejects_missing_metadata_url() {
+        let result = CompatSetupArgs {
+            local_hostname: "127.0.0.1".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
+            metadata_url: String::new(),
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            eviction_high_watermark_percent: None,
+            eviction_low_watermark_percent: None,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            transport_backend: None,
+            stable_id: Some("no-metadata-url".to_string()),
+            tenant: "default".to_string(),
+            domain: None,
+            object_set: None,
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            route_topk: 2,
+            keyspace: None,
+            expires_at_ms: Some(10_000),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+            timeouts: None,
+        }
+        .build();
+        let error = match result {
+            Ok(_) => panic!("missing metadata_url must fail"),
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::Metadata(_)));

@@ -31,7 +31,8 @@ use url::Url;
 #[command(name = "mooncake-store-admin")]
 #[command(about = "Run explicit Mooncake store metadata maintenance tasks")]
 struct Args {
-    #[arg(long, env = "MC_STORE_RS_METADATA_URL")]
+    /// Store-RS metadata URL (`redis://...` or `etcd://...`).
+    #[arg(long, alias = "metadata_url", env = "MC_STORE_RS_METADATA_URL")]
     metadata_url: String,
     #[arg(long, env = "MC_STORE_ADMIN_URL")]
     admin_url: Option<String>,

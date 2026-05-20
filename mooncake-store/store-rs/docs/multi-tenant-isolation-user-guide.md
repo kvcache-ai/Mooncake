@@ -156,20 +156,20 @@ Python real-mode example:
 from mooncake import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="127.0.0.1",
-    metadata_url="redis://127.0.0.1:6380/0",
-    global_segment_size=256 * 1024 * 1024,
-    local_buffer_size=16 * 1024 * 1024,
-    protocol="tcp",
-    device_name="",
-    master_server_address="",
-    tenant="tenant-a",
-    domain="sglang-chat",
-    object_set="deepseek-r1__2026-04-19-build-44",
-    keyspace="tenant-a-prod",
-    worker_scope="py-worker-a",
-)
+store.setup({
+    "local_hostname": "127.0.0.1",
+    # transport_metadata_url omitted: defaults to P2PHANDSHAKE in the dict-form path.
+    "global_segment_size": 256 * 1024 * 1024,
+    "local_buffer_size": 16 * 1024 * 1024,
+    "protocol": "tcp",
+    "rdma_devices": "",
+    "metadata_url": "redis://127.0.0.1:6380/0",            # arg7: Store-RS metadata backend
+    "tenant": "tenant-a",
+    "domain": "sglang-chat",
+    "object_set": "deepseek-r1__2026-04-19-build-44",
+    "keyspace": "tenant-a-prod",
+    "worker_scope": "py-worker-a",
+})
 ```
 
 Use real mode when Python should participate directly in the same distributed runtime as Rust clients. If the caller cannot pass `domain` / `object_set`, set `MC_STORE_RS_DOMAIN` and `MC_STORE_RS_OBJECT_SET` before startup so compatibility reads, writes, route queries, removes, size checks, and local hot-cache keys all use the same default namespace scope.

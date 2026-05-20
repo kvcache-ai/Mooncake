@@ -178,12 +178,12 @@ from mooncake.store import MooncakeDistributedStore
 store = MooncakeDistributedStore()
 store.setup({
     "local_hostname": "127.0.0.1:19999",
-    "metadata_url": "redis://127.0.0.1:6379/0",
+    # transport_metadata_url omitted: defaults to P2PHANDSHAKE in the dict-form path.
     "global_segment_size": 0,
     "local_buffer_size": 16 * 1024 * 1024,
     "protocol": "tcp",
     "rdma_devices": "",
-    "master_server": "",
+    "metadata_url": "redis://127.0.0.1:6379/0",
     "labels": {
         "storage": "false",
         "route": "false",

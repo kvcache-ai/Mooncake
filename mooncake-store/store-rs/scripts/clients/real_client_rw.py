@@ -77,8 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metadata_url",
         "--metadata-url",
-        "--metadata_server",
-        "--metadata-server",
         dest="metadata_url",
         required=True,
         help="Metadata endpoint, e.g. redis://host:6379/0 or etcd://host:2379",
@@ -463,21 +461,22 @@ def setup_store(
         "replica_count": replica_num,
         "route_topk": route_topk,
         "keyspace": keyspace,
-        "transport_metadata_url": transport_metadata_url,
         "transport_rpc_port": transport_rpc_port,
         "transport_backend": transport_backend,
         "route_control": route_control,
     }
+    # transport_metadata_url (arg2): for the Transfer Engine (default P2PHANDSHAKE).
+    # metadata_url (arg7): the Store-RS metadata backend (redis/etcd).
     try:
         return int(
             store.setup(
                 local_hostname,
-                metadata_url,
+                transport_metadata_url or "P2PHANDSHAKE",
                 storage_bytes,
                 scratch_bytes,
                 protocol,
                 device_names,
-                "",
+                metadata_url or master_addr,
                 **modern_kwargs,
             )
         )
@@ -654,7 +653,7 @@ def main() -> int:
     print(f"  local_hostname:      {local_hostname}")
     print(f"  transport_rpc_port:  {transport_rpc_port}")
     print(f"  metadata_url:        {args.metadata_url}")
-    print(f"  transport_meta_url:  {args.transport_metadata_url}")
+    print(f"  transport_metadata_url:     {args.transport_metadata_url}")
     print(f"  protocol:            {args.protocol}")
     print(f"  device_names:        {args.device_names}")
     print(f"  storage_bytes:       {args.storage_bytes}")

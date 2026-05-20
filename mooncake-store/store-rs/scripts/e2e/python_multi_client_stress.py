@@ -636,12 +636,12 @@ def build_store(
     status = int(
         store.setup(
             config.local_hostname,
-            config.redis_url,
+            "P2PHANDSHAKE",            # arg2 transport_metadata_url: Transfer Engine default
             storage_bytes,
             scratch_bytes,
             "tcp",
             "",
-            "",
+            config.redis_url,          # arg7 metadata_url: Store-RS metadata backend
             stable_id=stable_id,
             tenant=config.tenant,
             labels=labels,

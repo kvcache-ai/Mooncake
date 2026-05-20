@@ -12,8 +12,8 @@ mooncake-store-bench [global options] <COMMAND>
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metadata-url <URL>` | required | Redis URL used by the bench metadata backend; also read from `MC_STORE_RS_METADATA_URL` |
-| `--transport-metadata-url <URL>` | unset | Optional transfer-engine metadata endpoint; also read from `MC_STORE_RS_TRANSPORT_METADATA_URL`. Use `P2PHANDSHAKE` with `classic_te` when the transport should use peer handshake metadata instead of Redis-backed transport metadata. |
+| `--metadata-url <URL>` (alias `--metadata_url`; env `MC_STORE_RS_METADATA_URL`) | required | Store-RS metadata URL. Accepts `redis://...` or `etcd://...`. |
+| `--transport-metadata-url <URL>` (alias `--transport_metadata_url`; env `MC_STORE_RS_TRANSPORT_METADATA_URL`) | `P2PHANDSHAKE` | Transfer Engine metadata input. Accepts `redis://...` or `P2PHANDSHAKE`. Defaults to `P2PHANDSHAKE` (classic_te peer handshake); `tent` requires `redis://...`. |
 | `--keyspace <PREFIX>` | `mc/store-rs/v2` when `storage_bytes=0`; otherwise auto-generated | Metadata keyspace prefix |
 | `--transport-backend <classic-te\|tent>` | `classic-te` | Data-plane transport backend |
 | `--protocol <tcp\|rdma>` | `tcp` | Transport protocol |
