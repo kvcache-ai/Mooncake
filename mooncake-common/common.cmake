@@ -113,7 +113,6 @@ option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
-option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
@@ -401,10 +400,6 @@ endif()
 if(USE_3FS)
   add_compile_definitions(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
-endif()
-
-if(WITH_NVIDIA_PEERMEM)
-  add_compile_definitions(WITH_NVIDIA_PEERMEM)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")

@@ -49,6 +49,7 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
+    bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
 
    private:
     Environ();
@@ -99,6 +100,7 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    bool with_nvidia_peermem_;
 };
 
 }  // namespace mooncake
