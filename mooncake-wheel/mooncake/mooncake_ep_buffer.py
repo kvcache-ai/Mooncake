@@ -91,39 +91,24 @@ class Buffer:
         self.connect()
     
     def _sync_ibgda_from_metadata(self, peers: List[dict]) -> None:
-        from mooncake import ep
         from mooncake.ep import get_active_ranks
 
-        all_to_all_size = ep.MAX_QP_COUNT // self.group_size
         raddrs = [peer["raddr"] for peer in peers]
         rkeys = [peer["rkey"] for peer in peers]
-        remote_qpns: List[int] = []
-        for peer in peers:
-            start = self.rank * all_to_all_size
-            end = start + all_to_all_size
-            remote_qpns.extend(peer["qpns"][start:end])
-
+        peer_qpns = [[int(x) for x in peer["qpns"]] for peer in peers]
+        peer_lids = [[int(x) for x in peer["lids"]] for peer in peers]
         active_ranks_mask = get_active_ranks(self.backend).tolist()
-        if self.runtime.is_roce():
-            subnet_prefixes = [peer["subnet_prefix"] for peer in peers]
-            interface_ids = [peer["interface_id"] for peer in peers]
-            self.runtime.sync_roce(
-                raddrs,
-                rkeys,
-                remote_qpns,
-                subnet_prefixes,
-                interface_ids,
-                active_ranks_mask,
-            )
-        else:
-            remote_lids: List[int] = []
-            for peer in peers:
-                start = self.rank * all_to_all_size
-                end = start + all_to_all_size
-                remote_lids.extend(peer["lids"][start:end])
-            self.runtime.sync_ib(
-                raddrs, rkeys, remote_qpns, remote_lids, active_ranks_mask
-            )
+        subnet_prefixes = [peer["subnet_prefix"] for peer in peers]
+        interface_ids = [peer["interface_id"] for peer in peers]
+        self.runtime.sync_ibgda_peers(
+            raddrs,
+            rkeys,
+            peer_qpns,
+            peer_lids,
+            subnet_prefixes,
+            interface_ids,
+            active_ranks_mask,
+        )
 
     def _local_ibgda_metadata(self) -> dict:
         (raddr, rkey) = self.runtime.get_mr_info()

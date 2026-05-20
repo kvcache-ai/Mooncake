@@ -805,6 +805,51 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
     }
 }
 
+void MooncakeEpBuffer::sync_ibgda_peers(
+    const std::vector<int64_t>& remote_addrs,
+    const std::vector<int32_t>& remote_keys,
+    const std::vector<std::vector<int32_t>>& peer_qpns,
+    const std::vector<std::vector<int32_t>>& peer_lids,
+    const std::vector<int64_t>& subnet_prefixes,
+    const std::vector<int64_t>& interface_ids,
+    const std::vector<int>& active_ranks_mask) {
+#ifdef MOONCAKE_EP_USE_TENT
+    auto status = tent_ibgda_transport_->connectPeers(
+        remote_addrs, remote_keys, peer_qpns, peer_lids, subnet_prefixes,
+        interface_ids, active_ranks_mask, rank, num_ranks, raddrs, rkeys);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] TENT IBGDA peer sync failed: "
+                   << status.ToString();
+        exit(1);
+    }
+#else
+    int all_to_all_size = USE_QP_COUNT / num_ranks;
+    std::vector<int32_t> remote_qpns;
+    remote_qpns.reserve(USE_QP_COUNT);
+    for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        int start = rank * all_to_all_size;
+        for (int i = 0; i < all_to_all_size; ++i) {
+            remote_qpns.push_back(peer_qpns[peer_rank][start + i]);
+        }
+    }
+    if (is_roce_) {
+        sync_roce(remote_addrs, remote_keys, remote_qpns, subnet_prefixes,
+                  interface_ids, active_ranks_mask);
+    } else {
+        std::vector<int32_t> remote_lids;
+        remote_lids.reserve(USE_QP_COUNT);
+        for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+            int start = rank * all_to_all_size;
+            for (int i = 0; i < all_to_all_size; ++i) {
+                remote_lids.push_back(peer_lids[peer_rank][start + i]);
+            }
+        }
+        sync_ib(remote_addrs, remote_keys, remote_qpns, remote_lids,
+                active_ranks_mask);
+    }
+#endif
+}
+
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
     if (use_fabric_mem_) {
         // Fabric memory is globally accessible via cuMemSetAccess — no IPC

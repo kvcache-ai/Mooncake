@@ -365,6 +365,130 @@ Status IbGdaTransport::connectQueuePair(int qp_index,
     return Status::OK();
 }
 
+Status IbGdaTransport::connectPeers(
+    const std::vector<int64_t>& remote_addrs,
+    const std::vector<int32_t>& remote_keys,
+    const std::vector<std::vector<int32_t>>& peer_qpns,
+    const std::vector<std::vector<int32_t>>& peer_lids,
+    const std::vector<int64_t>& subnet_prefixes,
+    const std::vector<int64_t>& interface_ids,
+    const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
+    void* raddrs, void* rkeys) {
+    if (rank < 0 || num_ranks <= 0 || rank >= num_ranks) {
+        return Status::InvalidArgument("invalid IBGDA rank shape" LOC_MARK);
+    }
+    if (!mr_) {
+        return Status::InvalidArgument(
+            "IBGDA memory has not been registered" LOC_MARK);
+    }
+    if (!raddrs || !rkeys) {
+        return Status::InvalidArgument(
+            "IBGDA device metadata arrays are null" LOC_MARK);
+    }
+    if (qps_.empty() || static_cast<int>(qps_.size()) % num_ranks != 0) {
+        return Status::InvalidArgument(
+            "IBGDA QP count must be positive and divisible by num_ranks"
+            LOC_MARK);
+    }
+    if (static_cast<int>(remote_addrs.size()) != num_ranks ||
+        static_cast<int>(remote_keys.size()) != num_ranks ||
+        static_cast<int>(peer_qpns.size()) != num_ranks ||
+        static_cast<int>(active_ranks_mask.size()) != num_ranks) {
+        return Status::InvalidArgument(
+            "incomplete IBGDA peer metadata" LOC_MARK);
+    }
+    if (is_roce_) {
+        if (static_cast<int>(subnet_prefixes.size()) != num_ranks ||
+            static_cast<int>(interface_ids.size()) != num_ranks) {
+            return Status::InvalidArgument(
+                "incomplete RoCE GID metadata" LOC_MARK);
+        }
+    } else if (static_cast<int>(peer_lids.size()) != num_ranks) {
+        return Status::InvalidArgument("incomplete IB LID metadata" LOC_MARK);
+    }
+
+    const int qp_count = static_cast<int>(qps_.size());
+    const int qps_per_rank = qp_count / num_ranks;
+    const int local_qp_base = rank * qps_per_rank;
+
+    for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        if (static_cast<int>(peer_qpns[peer_rank].size()) <
+            local_qp_base + qps_per_rank) {
+            return Status::InvalidArgument(
+                "insufficient peer QPN metadata" LOC_MARK);
+        }
+        if (!is_roce_ &&
+            static_cast<int>(peer_lids[peer_rank].size()) <
+                local_qp_base + qps_per_rank) {
+            return Status::InvalidArgument(
+                "insufficient peer LID metadata" LOC_MARK);
+        }
+    }
+
+    // QP ordering mirrors EP's original flattened layout: each contiguous block
+    // of qps_per_rank local QPs targets one peer rank, while each remote peer's
+    // QPN array is indexed by this rank's QP block.
+    for (int qp_index = 0; qp_index < qp_count; ++qp_index) {
+        int peer_rank = qp_index * num_ranks / qp_count;
+        if (active_ranks_mask[peer_rank] == 0) continue;
+        int local_index = qp_index - peer_rank * qps_per_rank;
+        int remote_qp_index = local_qp_base + local_index;
+        auto remote_qpn = static_cast<uint32_t>(
+            peer_qpns[peer_rank][remote_qp_index]);
+
+        ibv_ah_attr ah_attr = {};
+        if (is_roce_) {
+            ibv_gid remote_gid{};
+            remote_gid.global.subnet_prefix = subnet_prefixes[peer_rank];
+            remote_gid.global.interface_id = interface_ids[peer_rank];
+            ah_attr.is_global = 1;
+            ah_attr.grh.dgid = remote_gid;
+            ah_attr.grh.sgid_index = gid_index_;
+            ah_attr.grh.hop_limit = 1;
+            ah_attr.port_num = port_num_;
+            ah_attr.dlid = queuePairLid(qp_index) | 0xC000;
+        } else {
+            ah_attr.dlid = static_cast<uint16_t>(
+                peer_lids[peer_rank][remote_qp_index]);
+            ah_attr.port_num = 0;
+        }
+
+        auto status = connectQueuePair(qp_index, ah_attr, remote_qpn,
+                                       IBV_MTU_4096);
+        if (!status.ok()) return status;
+    }
+
+    for (int peer_rank = 0; peer_rank < num_ranks; ++peer_rank) {
+        if (active_ranks_mask[peer_rank] == 0) continue;
+        uint64_t raddr = peer_rank == rank
+                             ? reinterpret_cast<uint64_t>(mr_->addr)
+                             : static_cast<uint64_t>(remote_addrs[peer_rank]);
+        uint32_t rkey = peer_rank == rank
+                            ? mr_->lkey
+                            : static_cast<uint32_t>(remote_keys[peer_rank]);
+
+        auto err = cudaMemcpy(static_cast<uint8_t*>(raddrs) +
+                                  peer_rank * sizeof(uint64_t),
+                              &raddr, sizeof(uint64_t),
+                              cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            return Status::CudaError(
+                std::string("cudaMemcpy IBGDA remote address failed: ") +
+                cudaGetErrorString(err) + LOC_MARK);
+        }
+        err = cudaMemcpy(static_cast<uint8_t*>(rkeys) +
+                             peer_rank * sizeof(uint32_t),
+                         &rkey, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            return Status::CudaError(
+                std::string("cudaMemcpy IBGDA remote key failed: ") +
+                cudaGetErrorString(err) + LOC_MARK);
+        }
+    }
+
+    return Status::OK();
+}
+
 uint32_t IbGdaTransport::queuePairQpn(int qp_index) const {
     if (qp_index < 0 || qp_index >= static_cast<int>(qps_.size()) ||
         !qps_[qp_index]) {

@@ -199,6 +199,15 @@ struct MooncakeEpBuffer {
                    const std::vector<int64_t>& interface_ids,
                    const std::vector<int>& active_ranks_mask);
 
+    void sync_ibgda_peers(
+        const std::vector<int64_t>& remote_addrs,
+        const std::vector<int32_t>& remote_keys,
+        const std::vector<std::vector<int32_t>>& peer_qpns,
+        const std::vector<std::vector<int32_t>>& peer_lids,
+        const std::vector<int64_t>& subnet_prefixes,
+        const std::vector<int64_t>& interface_ids,
+        const std::vector<int>& active_ranks_mask);
+
     std::tuple<int64_t, int32_t> get_mr_info() {
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
     }

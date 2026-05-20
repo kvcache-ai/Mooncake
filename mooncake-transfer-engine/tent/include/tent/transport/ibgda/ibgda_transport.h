@@ -133,6 +133,21 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     Status connectQueuePair(int qp_index, const ibv_ah_attr& ah_attr,
                             uint32_t remote_qpn, ibv_mtu mtu);
 
+    // Consume exchanged per-rank IBGDA metadata, connect QPs in deterministic
+    // QP-index order, and publish remote addresses/keys into the GPU-visible
+    // device context arrays.  The actual metadata exchange can still be driven
+    // by the caller during the migration window, but the interpretation of that
+    // metadata and the queue bring-up state machine lives in TENT.
+    Status connectPeers(const std::vector<int64_t>& remote_addrs,
+                        const std::vector<int32_t>& remote_keys,
+                        const std::vector<std::vector<int32_t>>& peer_qpns,
+                        const std::vector<std::vector<int32_t>>& peer_lids,
+                        const std::vector<int64_t>& subnet_prefixes,
+                        const std::vector<int64_t>& interface_ids,
+                        const std::vector<int>& active_ranks_mask,
+                        int rank, int num_ranks, void* raddrs,
+                        void* rkeys);
+
     int queuePairCount() const { return static_cast<int>(qps_.size()); }
     uint32_t queuePairQpn(int qp_index) const;
     uint16_t queuePairLid(int qp_index) const;
