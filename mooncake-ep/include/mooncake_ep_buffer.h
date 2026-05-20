@@ -209,38 +209,46 @@ struct MooncakeEpBuffer {
         const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
+#ifdef MOONCAKE_EP_USE_TENT
+        auto metadata = tent_ibgda_transport_->localMetadata();
+        return {metadata.raddr, metadata.rkey};
+#else
         return {(int64_t)mr->addr, (int32_t)mr->rkey};
+#endif
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
+#ifdef MOONCAKE_EP_USE_TENT
+        auto metadata = tent_ibgda_transport_->localMetadata();
+        return {metadata.subnet_prefix, metadata.interface_id};
+#else
         return {(int64_t)gid.global.subnet_prefix,
                 (int64_t)gid.global.interface_id};
+#endif
     }
 
     std::vector<int32_t> get_local_qpns() {
+#ifdef MOONCAKE_EP_USE_TENT
+        return tent_ibgda_transport_->localMetadata().qpns;
+#else
         std::vector<int32_t> local_qpns;
         for (int i = 0; i < USE_QP_COUNT; ++i) {
-#ifdef MOONCAKE_EP_USE_TENT
-            local_qpns.push_back(
-                (int32_t)tent_ibgda_transport_->queuePairQpn(i));
-#else
             local_qpns.push_back((int32_t)qps[i]->qpn);
-#endif
         }
         return local_qpns;
+#endif
     }
 
     std::vector<int32_t> get_local_lids() {
+#ifdef MOONCAKE_EP_USE_TENT
+        return tent_ibgda_transport_->localMetadata().lids;
+#else
         std::vector<int32_t> local_lids;
         for (int i = 0; i < USE_QP_COUNT; ++i) {
-#ifdef MOONCAKE_EP_USE_TENT
-            local_lids.push_back(
-                (int32_t)tent_ibgda_transport_->queuePairLid(i));
-#else
             local_lids.push_back((int32_t)qps[i]->port_attr.lid);
-#endif
         }
         return local_lids;
+#endif
     }
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>

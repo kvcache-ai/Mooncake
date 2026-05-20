@@ -38,6 +38,16 @@ class Config;
 class ControlService;
 class Topology;
 
+struct IbGdaLocalMetadata {
+    int64_t raddr = 0;
+    int32_t rkey = 0;
+    bool is_roce = false;
+    int64_t subnet_prefix = 0;
+    int64_t interface_id = 0;
+    std::vector<int32_t> qpns;
+    std::vector<int32_t> lids;
+};
+
 class IbGdaTransport : public Transport, public DeviceTransport {
    public:
     IbGdaTransport();
@@ -105,6 +115,11 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     int gidIndex() const { return gid_index_; }
     bool isRoce() const { return is_roce_; }
     uint8_t portNum() const { return port_num_; }
+
+    // Return the local metadata payload that must be exchanged before peer QP
+    // connection.  Keeping this projection in TENT avoids leaking the concrete
+    // mlx5/QP ownership details back into EP as resource ownership moves here.
+    IbGdaLocalMetadata localMetadata() const;
 
     // Allocate the GPU-visible control buffer used by IBGDA DevX queues and
     // register it as a DevX umem.  The allocation currently uses CUDA, but the

@@ -489,6 +489,24 @@ Status IbGdaTransport::connectPeers(
     return Status::OK();
 }
 
+IbGdaLocalMetadata IbGdaTransport::localMetadata() const {
+    IbGdaLocalMetadata metadata;
+    if (mr_) {
+        metadata.raddr = reinterpret_cast<int64_t>(mr_->addr);
+        metadata.rkey = static_cast<int32_t>(mr_->rkey);
+    }
+    metadata.is_roce = is_roce_;
+    metadata.subnet_prefix = static_cast<int64_t>(gid_.global.subnet_prefix);
+    metadata.interface_id = static_cast<int64_t>(gid_.global.interface_id);
+    metadata.qpns.reserve(qps_.size());
+    metadata.lids.reserve(qps_.size());
+    for (int i = 0; i < static_cast<int>(qps_.size()); ++i) {
+        metadata.qpns.push_back(static_cast<int32_t>(queuePairQpn(i)));
+        metadata.lids.push_back(static_cast<int32_t>(queuePairLid(i)));
+    }
+    return metadata;
+}
+
 uint32_t IbGdaTransport::queuePairQpn(int qp_index) const {
     if (qp_index < 0 || qp_index >= static_cast<int>(qps_.size()) ||
         !qps_[qp_index]) {
