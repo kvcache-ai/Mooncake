@@ -398,9 +398,9 @@ void UbWorkerPool::performPoll(int thread_id) {
                                  << context_.nicPath() << ", mark it inactive";
                     context_.set_active(false);
                 }
-                context_.deleteEndpoint(slice->peer_nic_path);
                 slice->ub.retry_cnt++;
                 if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                    context_.deleteEndpoint(slice->peer_nic_path);
                     slice->markFailed();
                     processed_slice_count_++;
                 } else {

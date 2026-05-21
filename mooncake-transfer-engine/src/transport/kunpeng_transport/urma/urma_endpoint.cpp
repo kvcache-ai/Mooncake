@@ -531,9 +531,9 @@ int UrmaContext::poll(int num_entries, Transport::Slice** slices,
         if (!slice) {
             continue;
         }
+        slices[i] = slice;
         if (cr[i].status == URMA_CR_SUCCESS) {
             slice->markSuccess();
-            slices[i] = slice;
             continue;
         }
         if (cr[i].status != URMA_CR_WR_FLUSH_ERR ||
