@@ -233,6 +233,26 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
+    static constexpr const char* value = "PromotionObjectHeartbeat";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionAllocStart> {
+    static constexpr const char* value = "PromotionAllocStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
+    static constexpr const char* value = "NotifyPromotionSuccess";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailure> {
+    static constexpr const char* value = "NotifyPromotionFailure";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CopyStart> {
     static constexpr const char* value = "CopyStart";
 };
@@ -949,6 +969,50 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, keys, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id);
+    return invoke_rpc<&WrappedMasterService::PromotionObjectHeartbeat,
+                      std::unordered_map<std::string, int64_t>>(client_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+MasterClient::PromotionAllocStart(
+    const UUID& client_id, const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionAllocStart");
+    timer.LogRequest("client_id=", client_id, ", key=", key, ", size=", size,
+                     ", preferred_count=", preferred_segments.size());
+    auto result = invoke_rpc<&WrappedMasterService::PromotionAllocStart,
+                             PromotionAllocStartResponse>(client_id, key, size,
+                                                          preferred_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccess(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionSuccess");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionSuccess, void>(
+            client_id, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
+    const UUID& client_id, const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionFailure");
+    timer.LogRequest("client_id=", client_id, ", key=", key);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
+            client_id, key);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -521,8 +521,158 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return offload_result;
     }
 
+    // Drive any pending L2->L1 promotion work for this client. Failures
+    // inside ProcessPromotionTasks are logged per-key and do not propagate;
+    // promotion is best-effort and must never break offload.
+    (void)ProcessPromotionTasks();
+
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::unordered_map<std::string, int64_t> promotion_objects;
+    auto heartbeat_result =
+        client_->PromotionObjectHeartbeat(promotion_objects);
+    if (!heartbeat_result) {
+        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
+        // first heartbeat tick if the master forgets us (e.g. across a master
+        // restart): benign no-op until next ReMount.
+        if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            return {};
+        }
+        LOG(WARNING) << "PromotionObjectHeartbeat failed: "
+                     << heartbeat_result.error();
+        return tl::make_unexpected(heartbeat_result.error());
+    }
+    if (promotion_objects.empty()) {
+        return {};
+    }
+
+    VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
+            << " promotion candidate(s) from master";
+
+    // No segment preference from the client: let master pick from any
+    // DRAM segment.
+    const std::vector<std::string> preferred_segments;
+
+    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
+    // returning at most one task per call so the heartbeat thread stays
+    // within the client-liveness window even for large objects. Leftover
+    // work stays queued in the master's promotion_objects map and is
+    // returned on subsequent heartbeats; we process whatever we received
+    // here without a second client-side cap.
+    for (const auto& [key, size] : promotion_objects) {
+        if (size <= 0) {
+            LOG(WARNING) << "Skipping promotion for key=" << key
+                         << " with non-positive size=" << size;
+            continue;
+        }
+
+        auto alloc_result = client_->PromotionAllocStart(
+            key, static_cast<uint64_t>(size), preferred_segments);
+        if (!alloc_result) {
+            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
+            // DRAM pressure). No staged buffer to release, but the
+            // task entry already claimed a promotion_in_flight_ slot
+            // at admission. Notify the master to release it
+            // immediately; otherwise the slot stays pinned for the
+            // reaper TTL (~10 min default), turning transient DRAM
+            // pressure into a sustained outage of promotion_queue_limit_.
+            // Notify is idempotent and handles alloc_id == 0 correctly.
+            VLOG(1) << "PromotionAllocStart failed for key=" << key
+                    << ", error=" << alloc_result.error()
+                    << " (likely no free DRAM); releasing master slot";
+            auto release = client_->NotifyPromotionFailure(key);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+            continue;
+        }
+
+        // Every failure path past this point has a master-side staged
+        // PROCESSING MEMORY buffer and an incremented in-flight slot.
+        // Eagerly notify the master on failure so the buffer is
+        // reclaimed and the slot is freed; otherwise transient SSD
+        // throttling or RDMA flakes saturate promotion_queue_limit_
+        // for the full reaper TTL. NotifyPromotionFailure is
+        // idempotent and best-effort — the reaper is the long-stop.
+        auto release_master_state = [this, &key]() {
+            auto release = client_->NotifyPromotionFailure(key);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+        };
+
+        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
+        // from the local SSD backend into it. AllocateBatch returns a
+        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
+        // staging space when the local goes out of scope.
+        std::vector<std::string> single_key{key};
+        std::vector<int64_t> single_size{size};
+        auto allocate_res = AllocateBatch(single_key, single_size);
+        if (!allocate_res) {
+            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
+                         << ", error=" << allocate_res.error();
+            release_master_state();
+            continue;
+        }
+        auto staging = allocate_res.value();
+        auto load_res = BatchLoad(staging->slices);
+        if (!load_res) {
+            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
+                         << ", error=" << load_res.error();
+            release_master_state();
+            continue;
+        }
+
+        // (b) TE-write from the staging slice into the freshly-allocated
+        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
+        // correction in BatchLoad, so re-read it from the slice map.
+        auto slice_it = staging->slices.find(key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
+            release_master_state();
+            continue;
+        }
+        std::vector<Slice> tx_slices{slice_it->second};
+        ErrorCode write_err = client_->PromotionWrite(
+            alloc_result.value().memory_descriptor, tx_slices);
+        if (write_err != ErrorCode::OK) {
+            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
+                         << ", error=" << write_err;
+            release_master_state();
+            continue;
+        }
+
+        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
+        // becomes visible to readers.
+        auto notify_res = client_->NotifyPromotionSuccess(key);
+        if (!notify_res) {
+            // The write landed but the commit failed. We can't retry the
+            // commit (the success path is one-shot via alloc_id), and we
+            // don't know whether the failure was transient or structural.
+            // Release the master-side state so the slot is reusable; the
+            // bytes we wrote become stranded under a soon-to-be-erased
+            // PROCESSING replica, which is harmless.
+            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
+                         << key << ", error=" << notify_res.error();
+            release_master_state();
+            continue;
+        }
+
+        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    }
+
     return {};
 }
 

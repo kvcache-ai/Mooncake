@@ -238,6 +238,37 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY. Only meaningful when offload is enabled
+    // (otherwise no LOCAL_DISK replicas exist in the first place).
+    promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
+    promotion_admission_threshold_ = config.promotion_admission_threshold;
+    promotion_queue_limit_ = config.promotion_queue_limit;
+    // Defense-in-depth clamp: master.cpp clamps threshold into [1, 255]
+    // at flag-parse time, but direct MasterServiceConfig construction
+    // (tests, embedded users) bypasses that. Without the clamp here,
+    // threshold=0 would silently bypass the frequency gate entirely
+    // (freq < 0 is never true for uint8_t).
+    if (promotion_admission_threshold_ == 0) {
+        promotion_admission_threshold_ = 1;
+    } else if (promotion_admission_threshold_ > 255) {
+        promotion_admission_threshold_ = 255;
+    }
+    if (config.promotion_on_hit && !enable_offload_) {
+        LOG(WARNING) << "promotion_on_hit=true was requested but "
+                     << "enable_offload=false; promotion is silently "
+                     << "disabled because it requires offload to produce "
+                     << "LOCAL_DISK replicas. Set enable_offload=true to "
+                     << "use this feature.";
+    }
+    if (promotion_on_hit_) {
+        promotion_sketch_ = std::make_unique<CountMinSketch>();
+        LOG(INFO) << "Promotion-on-hit mode enabled: LOCAL_DISK-only Gets "
+                     "will queue async promotion to MEMORY (threshold="
+                  << promotion_admission_threshold_
+                  << ", queue_limit=" << promotion_queue_limit_ << ")";
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -553,10 +584,22 @@ void MasterService::ClearInvalidHandles(
             if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
-                // replication_tasks, and offloading_tasks.
+                // replication_tasks, offloading_tasks, and promotion_tasks.
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                // Promotion task cleanup: if the holder client expired, the
+                // LOCAL_DISK source is gone and the metadata is being erased
+                // here. Without this erase the dangling promotion_tasks
+                // entry stays pinned for up to put_start_release_timeout_sec_
+                // (~10 min default), inflating the global in-flight counter
+                // and blocking new admissions on busy clusters where many
+                // holders expire together (e.g. inference-worker rolling
+                // restarts).
+                if (shard->promotion_tasks.erase(it->first) > 0) {
+                    promotion_in_flight_.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                }
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -1033,40 +1076,62 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
 
-    MasterMetricManager::instance().inc_total_get_nums();
+    GetReplicaListResponse resp({}, default_kv_lease_ttl_);
+    bool promotion_eligible = false;
+    {
+        MetadataAccessorRO accessor(this, key);
 
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        MasterMetricManager::instance().inc_total_get_nums();
+
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        const auto& metadata = accessor.Get();
+
+        std::vector<Replica::Descriptor> replica_list;
+        metadata.VisitReplicas(
+            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+                replica_list.emplace_back(replica.get_descriptor());
+            });
+
+        if (replica_list.empty()) {
+            LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        // TODO: NoF SSD support (ranhaojia)
+        if (replica_list[0].is_memory_replica()) {
+            MasterMetricManager::instance().inc_mem_cache_hit_nums();
+        } else if (replica_list[0].is_disk_replica()) {
+            MasterMetricManager::instance().inc_file_cache_hit_nums();
+        }
+        MasterMetricManager::instance().inc_valid_get_nums();
+        // Grant a lease to the object so it will not be removed
+        // when the client is reading it.
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+
+        // Promotion-on-hit eligibility: only when no MEMORY replica is
+        // present but at least one LOCAL_DISK replica is. Decided here while
+        // we hold the RO accessor; the actual enqueue happens after we
+        // release the accessor below to avoid lock-upgrade complexity.
+        if (promotion_on_hit_) {
+            const bool any_memory =
+                metadata.HasReplica(&Replica::fn_is_memory_replica);
+            const bool any_local_disk =
+                metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+            promotion_eligible = !any_memory && any_local_disk;
+        }
+
+        resp = GetReplicaListResponse(std::move(replica_list),
+                                      default_kv_lease_ttl_);
     }
-    const auto& metadata = accessor.Get();
-
-    std::vector<Replica::Descriptor> replica_list;
-    metadata.VisitReplicas(
-        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-            replica_list.emplace_back(replica.get_descriptor());
-        });
-
-    if (replica_list.empty()) {
-        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    // RO accessor released. Safe to take a fresh RW accessor now.
+    if (promotion_eligible) {
+        TryPushPromotionQueue(key);
     }
-
-    // TODO: NoF SSD support (ranhaojia)
-    if (replica_list[0].is_memory_replica()) {
-        MasterMetricManager::instance().inc_mem_cache_hit_nums();
-    } else if (replica_list[0].is_disk_replica()) {
-        MasterMetricManager::instance().inc_file_cache_hit_nums();
-    }
-    MasterMetricManager::instance().inc_valid_get_nums();
-    // Grant a lease to the object so it will not be removed
-    // when the client is reading it.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+    return resp;
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -1556,6 +1621,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (it != shard->metadata.end() &&
         CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
+        ErasePromotionTaskIfPresent(shard, key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
     }
@@ -1596,6 +1662,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                ErasePromotionTaskIfPresent(shard, key);
                 shard->metadata.erase(it);
                 it = shard->metadata.end();
             }
@@ -2263,6 +2330,7 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     accessor.Erase();
+    ErasePromotionTaskIfPresent(accessor.GetShard(), key);
     return {};
 }
 
@@ -2316,6 +2384,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                ErasePromotionTaskIfPresent(shard, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -2718,6 +2787,376 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     return {};
 }
 
+// Promotion-on-hit
+
+// Push a key onto the holder client's promotion_objects map. Resolves the
+// holder via the LOCAL_DISK replica's embedded client_id rather than via
+// the segment-name reverse lookup.
+tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
+    const std::string& key, Replica& source_replica) {
+    auto holder_id = source_replica.get_local_disk_client_id();
+    if (!holder_id.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it =
+        client_local_disk_segment.find(holder_id.value());
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        // Holder client expired or never had a LocalDiskSegment registered;
+        // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
+        // its own schedule.
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    auto res = local_disk_segment_it->second->promotion_objects.emplace(
+        key, static_cast<int64_t>(source_replica.get_descriptor()
+                                      .get_local_disk_descriptor()
+                                      .object_size));
+    if (!res.second) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    return {};
+}
+
+void MasterService::TryPushPromotionQueue(const std::string& key) {
+    if (!promotion_on_hit_ || !promotion_sketch_) {
+        return;
+    }
+
+    // Frequency gate: bump and compare against the threshold. The sketch
+    // returns uint8_t (saturating at 255); promotion_admission_threshold_
+    // is clamped into [1, 255] at config parse time (see master.cpp), so
+    // direct comparison is well-defined and threshold=0 (which would
+    // bypass the gate entirely since freq is uint8_t) cannot reach here.
+    const uint8_t freq = promotion_sketch_->increment(key);
+    if (freq < promotion_admission_threshold_) {
+        return;
+    }
+
+    // Watermark gate: don't promote if DRAM is already under eviction
+    // pressure. The check is best-effort (state can change between this
+    // sample and the actual allocation in PromotionAllocStart).
+    const double used_ratio =
+        MasterMetricManager::instance().get_global_mem_used_ratio();
+    if (used_ratio >= eviction_high_watermark_ratio_) {
+        return;
+    }
+
+    // Acquire a fresh RW shard accessor for dedup, refcnt-pin, and task
+    // record. Safe to call here because GetReplicaList has already released
+    // its RO accessor.
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return;
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    // Dedup: don't queue twice if a promotion is already in flight or if a
+    // MEMORY replica has appeared since GetReplicaList observed only-disk.
+    if (shard->promotion_tasks.count(key) > 0) {
+        return;
+    }
+    if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+        return;
+    }
+
+    // Cap gate: read the cluster-wide in-flight count. Soft cap — a
+    // benign TOCTOU race between this load and the emplace below can let
+    // a few extra tasks slip in, but the per-shard mutex already
+    // serializes inserts within a shard and the dedup gate above prevents
+    // duplicate work, so the worst case is N concurrent inserters across
+    // distinct shards each admitting one extra task. Atomic load is
+    // relaxed because the value is purely advisory.
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
+        return;
+    }
+
+    // Find the LOCAL_DISK source replica.
+    Replica* source = nullptr;
+    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
+                           [&source](Replica& r) {
+                               if (source == nullptr) source = &r;
+                           });
+    if (source == nullptr) {
+        return;
+    }
+
+    // Pin the source replica.
+    source->inc_refcnt();
+    const uint64_t object_size =
+        source->get_descriptor().get_local_disk_descriptor().object_size;
+
+    // Try to enqueue on the holder client. On failure, drop the refcnt back.
+    auto push_result = PushPromotionQueue(key, *source);
+    if (!push_result) {
+        source->dec_refcnt();
+        VLOG(1) << "promotion_push_failed key=" << key
+                << " error=" << push_result.error();
+        return;
+    }
+
+    // Capture the holder client_id so NotifyPromotionSuccess can reject
+    // calls from other clients. PushPromotionQueue already validated
+    // get_local_disk_client_id() returns a value, so .value() is safe.
+    const UUID holder_id = source->get_local_disk_client_id().value();
+
+    // Record the in-flight task. alloc_id is filled in by
+    // PromotionAllocStart once the new MEMORY replica is staged.
+    shard->promotion_tasks.emplace(
+        key, PromotionTask{.source_id = source->id(),
+                           .alloc_id = 0,
+                           .object_size = object_size,
+                           .start_time = std::chrono::system_clock::now(),
+                           .holder_id = holder_id});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
+}
+
+auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
+    -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    // Return at most kMaxPerHeartbeat tasks. Each task does a
+    // synchronous SSD read + RDMA write on the client side; allowing
+    // more than one per heartbeat risks blocking past the client-
+    // liveness window and the master marking the client dead. The rest
+    // stay queued in promotion_objects for subsequent heartbeats. The
+    // cap must live here (server side) rather than on the client so
+    // leftover work isn't silently dropped.
+    constexpr size_t kMaxPerHeartbeat = 1;
+    auto& src = local_disk_segment_it->second->promotion_objects;
+    std::unordered_map<std::string, int64_t> result;
+    while (result.size() < kMaxPerHeartbeat && !src.empty()) {
+        auto node = src.extract(src.begin());
+        result.insert(std::move(node));
+    }
+    return result;
+}
+
+auto MasterService::PromotionAllocStart(
+    const UUID& client_id, const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+
+    // Verify the in-flight task still exists before allocating. The
+    // reaper can sweep it between the holder's heartbeat and this
+    // AllocStart call (a hung client, GC pause, or HA failover can
+    // stall AllocStart past put_start_release_timeout_sec_). If we
+    // allocated and AddReplicas'd anyway, the staged PROCESSING MEMORY
+    // replica would have no PromotionTask pointing at it: the generic
+    // PROCESSING reaper iterates shard->processing_keys (never
+    // populated by promotion) and the promotion-task reaper would have
+    // nothing left to iterate, leaking the buffer until the object is
+    // removed or evicted. The shard mutex is held for the rest of this
+    // function, so the iterator stays valid across the allocation step.
+    auto& shard = accessor.GetShard();
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Defensive size check: must match the source LOCAL_DISK
+    // descriptor's object_size captured at admission. A mismatch would
+    // let a buggy caller request a wrong-sized allocation — smaller
+    // risks RDMA overflow, larger wastes DRAM pinned until reaper TTL.
+    if (task_it->second.object_size != size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Allocate a single MEMORY replica via the existing strategy, biased to
+    // the holder's mem segment when possible.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    if (!preferred_segments.empty()) {
+        config.preferred_segments = preferred_segments;
+    }
+
+    std::vector<Replica> staged_replicas;
+    {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocator_manager, size, config.replica_num, preferred_segments);
+        if (!allocation_result) {
+            return tl::make_unexpected(allocation_result.error());
+        }
+        staged_replicas = std::move(allocation_result.value());
+    }
+    if (staged_replicas.empty()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Append the new PROCESSING MEMORY replica to the existing object's
+    // metadata. Visible only after NotifyPromotionSuccess flips it COMPLETE.
+    Replica::Descriptor desc = staged_replicas[0].get_descriptor();
+    const ReplicaID new_id = staged_replicas[0].id();
+    std::vector<Replica> to_add;
+    to_add.push_back(std::move(staged_replicas[0]));
+    metadata.AddReplicas(std::move(to_add));
+
+    // Record the new replica's ID on the in-flight PromotionTask so
+    // NotifyPromotionSuccess knows exactly which replica to commit. A
+    // concurrent Put on this key may stage other PROCESSING MEMORY
+    // replicas; using alloc_id avoids the "first PROCESSING memory"
+    // ambiguity.
+    //
+    // Also reset start_time so the reaper TTL covers the active-
+    // transfer phase (AllocStart -> SSD read -> RDMA write -> Notify)
+    // measured from when a master-allocated buffer becomes vulnerable,
+    // rather than being consumed by queue-waiting. Without the reset,
+    // a backlogged task could enter active transfer with little TTL
+    // remaining and the reaper could free the staged replica via
+    // EraseReplicaByID mid-RDMA-write. The queue-waiting phase
+    // (alloc_id == 0) is bounded by its own original start_time window
+    // during which the reaper's EraseReplicaByID branch is a no-op.
+    task_it->second.alloc_id = new_id;
+    task_it->second.start_time = std::chrono::system_clock::now();
+    return PromotionAllocStartResponse{std::move(desc)};
+}
+
+auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
+                                           const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    // Look up the in-flight task to find the exact replica we staged. A
+    // concurrent Put on this key may have created other PROCESSING MEMORY
+    // replicas, so we must not just "mark first PROCESSING memory
+    // complete" — that would risk committing someone else's half-written
+    // replica.
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end() ||
+        task_it->second.alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    bool committed = false;
+    Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
+    if (staged != nullptr && staged->is_memory_replica() &&
+        staged->is_processing()) {
+        staged->mark_complete();
+        committed = true;
+    }
+
+    // Drop the source LOCAL_DISK replica's refcnt and erase the task.
+    auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+
+    // Erase the per-client promotion_objects entry (best-effort; the
+    // heartbeat may have already drained it).
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto it = client_local_disk_segment.find(client_id);
+        if (it != client_local_disk_segment.end()) {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            it->second->promotion_objects.erase(key);
+        }
+    }
+
+    if (!committed) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    return {};
+}
+
+auto MasterService::NotifyPromotionFailure(const UUID& client_id,
+                                           const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        // No task to release. Either the reaper already swept it, or the
+        // client never had a task here. Return OK to keep this RPC
+        // idempotent — repeated failure notifications on the same key
+        // should be safe.
+        return {};
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Mirror the reaper's expiry path; see DiscardExpiredProcessingReplicas
+    // Part 4 for the full rationale on each step.
+    auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    if (task_it->second.alloc_id != 0) {
+        metadata.EraseReplicaByID(task_it->second.alloc_id);
+    }
+    shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+
+    // Clear the holder's per-client promotion_objects entry. Same
+    // best-effort cleanup pattern as NotifyPromotionSuccess — the
+    // heartbeat may have already drained it.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto it = client_local_disk_segment.find(client_id);
+        if (it != client_local_disk_segment.end()) {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            it->second->promotion_objects.erase(key);
+        }
+    }
+
+    return {};
+}
+
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
@@ -2905,6 +3344,45 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         LOG(WARNING) << "Offloading task expired for key: " << task_it->first;
         task_it = shard->offloading_tasks.erase(task_it);
+    }
+
+    // Part 4: Discard expired promotion-on-hit tasks. For each:
+    //   - Drop the source LOCAL_DISK refcnt so the source can be
+    //     evicted normally.
+    //   - If a PROCESSING MEMORY replica was staged (alloc_id != 0),
+    //     pop it via EraseReplicaByID. The staged replica is not in
+    //     shard->processing_keys, so this is the only place (besides
+    //     NotifyPromotionFailure) that reaps it; without this the
+    //     buffer leaks until the object is removed or evicted.
+    //   - Erase the task entry and decrement the in-flight counter.
+    // task.start_time is set at admission and reset at AllocStart, so
+    // queue-wait (alloc_id == 0) and active-transfer (alloc_id != 0)
+    // phases each get a full put_start_release_timeout_sec_ window.
+    // The per-client promotion_objects map is GC'd on the next
+    // heartbeat (entries for vanished tasks are harmless — Notify will
+    // return REPLICA_IS_NOT_READY since the task entry is gone).
+    for (auto task_it = shard->promotion_tasks.begin();
+         task_it != shard->promotion_tasks.end();) {
+        const auto ttl =
+            task_it->second.start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            task_it++;
+            continue;
+        }
+        auto metadata_it = shard->metadata.find(task_it->first);
+        if (metadata_it != shard->metadata.end()) {
+            auto source =
+                metadata_it->second.GetReplicaByID(task_it->second.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
+            if (task_it->second.alloc_id != 0) {
+                metadata_it->second.EraseReplicaByID(task_it->second.alloc_id);
+            }
+        }
+        LOG(WARNING) << "Promotion task expired for key: " << task_it->first;
+        task_it = shard->promotion_tasks.erase(task_it);
+        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     if (!discarded_replicas.empty()) {
