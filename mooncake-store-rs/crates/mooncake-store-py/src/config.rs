@@ -416,9 +416,7 @@ pub fn build_store_metadata_backend(
 /// `tent` callers must supply a `redis://...` value explicitly.
 fn resolve_transport_metadata_uri(transport_metadata_url: &str) -> Result<String> {
     let trimmed = transport_metadata_url.trim();
-    let uri = if trimmed.is_empty() {
-        P2P_HANDSHAKE_METADATA.to_string()
-    } else if is_p2p_handshake_metadata(trimmed) {
+    let uri = if trimmed.is_empty() || is_p2p_handshake_metadata(trimmed) {
         P2P_HANDSHAKE_METADATA.to_string()
     } else {
         trimmed.to_string()
