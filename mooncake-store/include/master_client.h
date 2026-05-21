@@ -14,6 +14,7 @@
 
 #include "client_metric.h"
 #include "replica.h"
+#include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
@@ -315,12 +316,18 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
         const UUID& segment_id);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, uint64_t grace_period_ms);
+
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
      * name
      * @return GetClusterIdResponse containing the cluster ID
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
+
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
 
     [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
     GetStorageConfig();
@@ -348,6 +355,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
                                ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
+        const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     /**
      * @brief Adds multiple new objects to a specified client in batch.

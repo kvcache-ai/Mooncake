@@ -48,6 +48,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         mooncake_common
          ibverbs
          glog::glog
          gflags::gflags
@@ -80,6 +81,16 @@ endif()
 if(USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
+endif()
+
+if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
+if(USE_COREX)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
 if(USE_HIP)

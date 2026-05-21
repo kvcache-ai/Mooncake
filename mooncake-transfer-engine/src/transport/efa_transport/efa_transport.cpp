@@ -745,7 +745,7 @@ int EfaTransport::warmupSegment(const std::string& segment_name) {
                         // slot is freed and the next warmup retry starts
                         // clean.  Cheap under the shared-endpoint model —
                         // no fi_endpoint teardown required.
-                        ctx->deleteEndpoint(normalizeNicPath(path));
+                        ctx->deleteEndpoint(path);
                     }
                     return rc;
                 }));

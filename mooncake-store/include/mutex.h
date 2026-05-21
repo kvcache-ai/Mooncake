@@ -125,6 +125,10 @@ class CAPABILITY("mutex") SpinLock {
    public:
     // Acquire/lock the spinlock.
     void lock() ACQUIRE() {
+        // Fast path: try to acquire directly
+        if (!flag.test_and_set(std::memory_order_acquire)) return;
+
+        // Slow path: spin wait with relaxed loads, acquire on success
         do {
             while (flag.test(std::memory_order_relaxed)) {
                 PAUSE();

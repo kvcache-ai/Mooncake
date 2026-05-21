@@ -25,15 +25,14 @@ static constexpr size_t kMaxNumRanks = 64;
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
         warmup_buffer[2];
-    uint64_t p2p_send_buffer;
-    uint64_t p2p_recv_buffer;
-    uint64_t p2p_ctrl_send;
-    uint64_t p2p_ctrl_recv;
+    uint64_t p2p_credit_region;
+    uint64_t p2p_ack_region;
 };
 
 struct TransferGroupMeta {
     int rank;
-    int size;
+    int size;        // capacity: number of slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;

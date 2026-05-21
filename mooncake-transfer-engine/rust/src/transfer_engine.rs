@@ -150,6 +150,9 @@ impl TransferEngine {
         buffer_list: &[BufferEntry],
         location: &str,
     ) -> Result<()> {
+        if buffer_list.is_empty() {
+            return Ok(());
+        }
         let location_c = CString::new(location).map_err(|_| anyhow!("CString::new failed"))?;
         let mut buffer_list_c: Vec<bindings::buffer_entry_t> = vec![];
         let buffer_len_c = buffer_list.len();
@@ -175,6 +178,9 @@ impl TransferEngine {
     }
 
     pub fn unregister_local_memory_batch(&self, buffer_list: &[BufferEntry]) -> Result<()> {
+        if buffer_list.is_empty() {
+            return Ok(());
+        }
         let mut addr_list: Vec<*mut c_void> = buffer_list.iter().map(|entry| entry.addr).collect();
         let addr_len = buffer_list.len();
         let ret = unsafe {
@@ -201,6 +207,9 @@ impl TransferEngine {
         batch_id: BatchID,
         requests: &mut [TransferRequest],
     ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
         let mut requests_c: Vec<bindings::transfer_request_t> = vec![];
         for i in 0..requests.len() {
             requests_c.push(bindings::transfer_request_t {

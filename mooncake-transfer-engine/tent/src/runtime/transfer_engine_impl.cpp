@@ -304,6 +304,8 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
+    enable_auto_failover_on_poll_ =
+        conf_->get("enable_auto_failover_on_poll", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -770,10 +772,14 @@ Status TransferEngineImpl::lazyFreeBatch() {
     return Status::OK();
 }
 
+static bool isGpuType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM;
+}
+
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local) {
     if (local == MTYPE_CPU) return xport && xport->capabilities().dram_to_file;
-    if (local == MTYPE_CUDA) return xport && xport->capabilities().gpu_to_file;
+    if (isGpuType(local)) return xport && xport->capabilities().gpu_to_file;
     return false;
 }
 
@@ -781,11 +787,11 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local, MemoryType remote) {
     if (local == MTYPE_CPU && remote == MTYPE_CPU)
         return xport && xport->capabilities().dram_to_dram;
-    if (local == MTYPE_CUDA && remote == MTYPE_CUDA)
+    if (isGpuType(local) && isGpuType(remote))
         return xport && xport->capabilities().gpu_to_gpu;
-    if (local == MTYPE_CPU && remote == MTYPE_CUDA)
+    if (local == MTYPE_CPU && isGpuType(remote))
         return xport && xport->capabilities().dram_to_gpu;
-    if (local == MTYPE_CUDA && remote == MTYPE_CPU)
+    if (isGpuType(local) && remote == MTYPE_CPU)
         return xport && xport->capabilities().gpu_to_dram;
     return false;
 }
@@ -794,6 +800,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
+    if (type == "rocm") return MTYPE_ROCM;
     return MTYPE_UNKNOWN;
 }
 
@@ -1299,6 +1306,18 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
+void TransferEngineImpl::updateTaskStatusFromPoll(Batch* batch, size_t task_id,
+                                                  TransferStatus& task_status) {
+    auto& task = batch->task_list[task_id];
+    task.status = task_status.s;
+    if (!enable_auto_failover_on_poll_ || task_status.s != FAILED) return;
+
+    if (resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        task.status = PENDING;
+    }
+}
+
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
                                             const Notification& notifi) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
@@ -1363,12 +1382,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
     }
-    batch->task_list[task_id].status = task_status.s;
-
-    if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
-        task_status.s = PENDING;
-        batch->task_list[task_id].status = PENDING;
-    }
+    updateTaskStatusFromPoll(batch, task_id, task_status);
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1398,7 +1412,16 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
+    size_t failed_tasks = 0;
     size_t total_tasks = 0;
+    TransferStatusEnum worst_failure = PENDING;
+    auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
+        static const std::unordered_map<TransferStatusEnum, int> severity = {
+            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
+            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
+        };
+        return severity.at(cur) > severity.at(best);
+    };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
@@ -1409,7 +1432,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;
             } else {
-                overall_status.s = task.status;
+                failed_tasks++;
+                if (isWorse(task.status, worst_failure))
+                    worst_failure = task.status;
             }
             continue;
         }
@@ -1419,7 +1444,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         } else {
             if (task.type == UNSPEC) {
                 task.status = FAILED;
-                overall_status.s = FAILED;
+                failed_tasks++;
+                if (isWorse(FAILED, worst_failure)) worst_failure = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1431,30 +1457,31 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
-        // memorize task result
-        task.status = task_status.s;
-
-        // Attempt failover before status aggregation so that a
-        // successfully resubmitted task appears as PENDING and does not
-        // overwrite a permanent FAILED from another task in the batch.
-        if (task_status.s == FAILED &&
-            resubmitTransferTask(batch, task_id).ok()) {
-            task.status = PENDING;
-            task_status.s = PENDING;
-        }
+        // Preserve legacy auto-failover-on-poll before aggregating status.
+        updateTaskStatusFromPoll(batch, task_id, task_status);
 
         if (task_status.s == COMPLETED) {
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;
         } else if (task_status.s != PENDING) {
-            overall_status.s = task_status.s;
+            failed_tasks++;
+            if (isWorse(task_status.s, worst_failure))
+                worst_failure = task_status.s;
         }
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
                                     task_status.s);
     }
-    if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    // Determine overall status: COMPLETED only when all succeed; FAILED only
+    // when all tasks are terminal (no in-flight work) and at least one failed;
+    // otherwise PENDING (some tasks still running).
+    if (success_tasks == total_tasks) {
+        overall_status.s = COMPLETED;
+    } else if (success_tasks + failed_tasks == total_tasks) {
+        overall_status.s = worst_failure;
+    }
+    // else: some tasks still PENDING → overall_status.s stays PENDING
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }

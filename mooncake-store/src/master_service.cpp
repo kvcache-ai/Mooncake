@@ -84,7 +84,8 @@ int64_t CurrentTimeMs() {
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : default_kv_lease_ttl_(config.default_kv_lease_ttl),
+    : graceful_unmount_scheduler_(this),
+      default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
@@ -264,6 +265,7 @@ MasterService::~MasterService() {
     snapshot_running_ = false;
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
+    graceful_unmount_scheduler_.Stop();
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
@@ -460,6 +462,44 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     return {};
 }
 
+auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
+                                           const UUID& client_id,
+                                           uint64_t grace_period_ms)
+    -> tl::expected<void, ErrorCode> {
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    // Verify ownership: the segment must belong to the calling client
+    std::vector<Segment> client_segments;
+    auto err = segment_access.GetClientSegments(client_id, client_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    bool owned = false;
+    for (auto& seg : client_segments) {
+        if (seg.id == segment_id) {
+            owned = true;
+            break;
+        }
+    }
+    if (!owned) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    err = segment_access.PrepareGracefulUnmountSegment(segment_id);
+    if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+        return {};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto expire_time = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(grace_period_ms);
+    graceful_unmount_scheduler_.Schedule(segment_id, client_id, expire_time);
+    return {};
+}
+
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -529,6 +569,17 @@ auto MasterService::QuerySegmentStatus(const std::string& segment_name)
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
     auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return status;
+}
+
+auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
+    -> tl::expected<SegmentStatus, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusById(segment_id, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -822,6 +873,7 @@ auto MasterService::AllocateAndInsertMetadata(
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
             need_eviction_ = true;
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
@@ -845,7 +897,8 @@ auto MasterService::AllocateAndInsertMetadata(
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+                              config.with_soft_pin, config.with_hard_pin,
+                              config.data_type));
     shard->processing_keys.insert(key);
 
     return replica_list;
@@ -2168,6 +2221,41 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                 }
                 shard->offloading_tasks.erase(task_it);
             }
+        }
+    }
+    return {};
+}
+
+auto MasterService::ReportSsdCapacity(const UUID& client_id,
+                                      int64_t ssd_total_capacity_bytes)
+    -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not found with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    int64_t old_capacity =
+        local_disk_segment_it->second->ssd_total_capacity_bytes;
+    if (ssd_total_capacity_bytes != old_capacity) {
+        local_disk_segment_it->second->ssd_total_capacity_bytes =
+            ssd_total_capacity_bytes;
+        if (old_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                old_capacity);
+        }
+        if (ssd_total_capacity_bytes > 0) {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                ssd_total_capacity_bytes);
         }
     }
     return {};
@@ -3903,6 +3991,12 @@ void MasterService::ClientMonitorFunc() {
 
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
+            // Notify graceful unmount scheduler to drop pending records
+            // for expired clients. The actual unmount is handled below.
+            for (auto& cid : expired_clients) {
+                graceful_unmount_scheduler_.RemoveClientRecords(cid);
+            }
+
             // Record which segments are unmounted, will be used in the commit
             // phase.
             std::vector<UUID> unmount_segments;
@@ -4287,7 +4381,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -4302,12 +4396,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
+    // replicas..., hard_pinned]
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
                             // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
+                            // replicas_count, data_type, hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4347,6 +4441,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
+    // Serialize data_type
+    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
@@ -4373,7 +4470,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -4406,13 +4502,33 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
-    if (obj.via.array.size != 7 + replicas_count &&
-        obj.via.array.size != 8 + replicas_count) {
+    // Format detection:
+    //   v1: 7 + replicas_count, no data_type or hard_pinned
+    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    constexpr uint32_t kOldFieldCount = 7;
+    constexpr uint32_t kOneExtraFieldCount = 8;
+    constexpr uint32_t kCurrentFieldCount = 9;
+    const uint32_t total_elements = obj.via.array.size;
+    const bool is_old_format =
+        (total_elements == kOldFieldCount + replicas_count);
+    const bool is_one_extra_format =
+        (total_elements == kOneExtraFieldCount + replicas_count);
+    const bool is_current_format =
+        (total_elements == kCurrentFieldCount + replicas_count);
+
+    if (!is_current_format && !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
+    }
+
+    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+    if (is_current_format) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    } else if (is_one_extra_format &&
+               array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas
@@ -4440,7 +4556,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -5192,6 +5308,107 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// GracefulUnmountScheduler implementation
+// ---------------------------------------------------------------------------
+
+MasterService::GracefulUnmountScheduler::GracefulUnmountScheduler(
+    MasterService* service)
+    : service_(service) {}
+
+MasterService::GracefulUnmountScheduler::~GracefulUnmountScheduler() { Stop(); }
+
+void MasterService::GracefulUnmountScheduler::Schedule(
+    const UUID& segment_id, const UUID& client_id,
+    std::chrono::steady_clock::time_point expire_time) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            return;
+        }
+        queue_.push(Record{segment_id, client_id, expire_time});
+        if (!timer_running_.load()) {
+            timer_running_.store(true);
+            timer_thread_ = std::thread([this]() { this->TimerLoop(); });
+        }
+    }
+    timer_cv_.notify_one();
+}
+
+void MasterService::GracefulUnmountScheduler::RemoveClientRecords(
+    const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<Record> remaining;
+    remaining.reserve(queue_.size());
+    while (!queue_.empty()) {
+        auto rec = queue_.top();
+        queue_.pop();
+        if (rec.client_id != client_id) {
+            remaining.push_back(rec);
+        }
+    }
+    for (auto& rec : remaining) {
+        queue_.push(rec);
+    }
+    timer_cv_.notify_one();
+}
+
+void MasterService::GracefulUnmountScheduler::Stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        timer_running_.store(false);
+    }
+    timer_cv_.notify_all();
+    if (timer_thread_.joinable()) {
+        timer_thread_.join();
+    }
+}
+
+void MasterService::GracefulUnmountScheduler::TimerLoop() {
+    while (timer_running_.load()) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            timer_cv_.wait(lock, [this]() {
+                return !timer_running_.load() || !queue_.empty();
+            });
+            if (!timer_running_.load()) break;
+            continue;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto next_expire = queue_.top().expire_time;
+        if (next_expire > now) {
+            timer_cv_.wait_until(lock, next_expire, [this, next_expire]() {
+                return !timer_running_.load() || queue_.empty() ||
+                       queue_.top().expire_time < next_expire;
+            });
+            if (!timer_running_.load()) break;
+            continue;
+        }
+
+        // Collect all expired records
+        std::vector<Record> expired;
+        while (!queue_.empty() && queue_.top().expire_time <= now) {
+            expired.push_back(queue_.top());
+            queue_.pop();
+        }
+
+        for (auto& rec : expired) {
+            if (service_) {
+                auto result =
+                    service_->UnmountSegment(rec.segment_id, rec.client_id);
+                if (!result.has_value()) {
+                    LOG(WARNING)
+                        << "Failed to complete graceful unmount, segment_id="
+                        << rec.segment_id << ", client_id=" << rec.client_id
+                        << ", error=" << toString(result.error());
+                }
+            }
+        }
+    }
 }
 
 }  // namespace mooncake

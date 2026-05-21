@@ -99,6 +99,10 @@ class MasterService {
     auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
+    auto GracefulUnmountSegment(const UUID& segment_id, const UUID& client_id,
+                                uint64_t grace_period_ms)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
@@ -439,6 +443,10 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
 
+    auto ReportSsdCapacity(const UUID& client_id,
+                           int64_t ssd_total_capacity_bytes)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
@@ -489,6 +497,12 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+
+    /**
+     * @brief Query current segment lifecycle state by segment id.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
 
     /**
      * @brief Query the status of a task
@@ -594,10 +608,12 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin = false,
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              data_type(data_type_),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -620,6 +636,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        const ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -931,6 +948,36 @@ class MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       Replica& replica);
 
+    // Graceful unmount scheduler
+    class GracefulUnmountScheduler {
+       public:
+        explicit GracefulUnmountScheduler(MasterService* service);
+        ~GracefulUnmountScheduler();
+        void Schedule(const UUID& segment_id, const UUID& client_id,
+                      std::chrono::steady_clock::time_point expire_time);
+        void RemoveClientRecords(const UUID& client_id);
+        void Stop();
+
+       private:
+        void TimerLoop();
+        struct Record {
+            UUID segment_id;
+            UUID client_id;
+            std::chrono::steady_clock::time_point expire_time;
+            bool operator>(const Record& other) const {
+                return expire_time > other.expire_time;
+            }
+        };
+        MasterService* service_;
+        std::mutex mutex_;
+        std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
+            queue_;
+        std::thread timer_thread_;
+        std::atomic<bool> timer_running_{false};
+        bool stopping_{false};
+        std::condition_variable timer_cv_;
+    } graceful_unmount_scheduler_;
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -1036,7 +1083,8 @@ class MasterService {
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
-                    bool enable_hard_pin = false) {
+                    bool enable_hard_pin = false,
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1045,7 +1093,7 @@ class MasterService {
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin));
+                                      enable_hard_pin, data_type));
             it_ = result.first;
         }
 

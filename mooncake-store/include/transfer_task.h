@@ -370,6 +370,7 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
+                               const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr);
 
     /**
@@ -406,13 +407,31 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
+
+    /**
+     * @brief Pure comparison helper: returns true iff both endpoints are
+     * non-empty and identical. Exposed for unit testing of the locality
+     * decision without instantiating a full TransferEngine.
+     *
+     * Two endpoints identify the same process only when their ip:port (or
+     * full hostname) match exactly; same-host different-process pairs share
+     * an IP but not a port and must NOT be treated as locally addressable.
+     */
+    static bool isSameProcessEndpoint(const std::string& handle_endpoint,
+                                      const std::string& local_endpoint);
 
    private:
     TransferEngine& engine_;
+    // Cached at construction: the local transport endpoint never changes for
+    // the lifetime of the TransferSubmitter, so we avoid calling
+    // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
+    const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 
     /**

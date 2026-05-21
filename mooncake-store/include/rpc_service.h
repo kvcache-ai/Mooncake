@@ -124,6 +124,10 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
 
+    tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, const UUID& client_id,
+        uint64_t grace_period_ms);
+
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
@@ -145,6 +149,9 @@ class WrappedMasterService {
     tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        const UUID& client_id, int64_t ssd_total_capacity_bytes);
+
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
@@ -158,6 +165,8 @@ class WrappedMasterService {
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 

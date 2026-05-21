@@ -242,11 +242,27 @@ bool MasterAdminServer::Start() {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
                 const auto snapshot = SnapshotState();
-                LOG(INFO) << "Master Admin Metrics: role="
-                          << ha::MasterRuntimeRoleToString(snapshot.state)
-                          << ", state="
-                          << ha::MasterRuntimeStateToString(snapshot.state)
-                          << ", summary=" << BuildMetricsSummaryText();
+                std::ostringstream log_stream;
+                log_stream << "Master Admin Metrics: role="
+                           << ha::MasterRuntimeRoleToString(snapshot.state)
+                           << ", state="
+                           << ha::MasterRuntimeStateToString(snapshot.state)
+                           << ", service_ready="
+                           << (snapshot.service_available ? "true" : "false")
+                           << ", master={"
+                           << MasterMetricManager::instance()
+                                  .get_summary_string_and_update_snapshot()
+                           << "}"
+                           << ", ha={"
+                           << HAMetricManager::instance().get_summary_string()
+                           << "}";
+                if (snapshot.leader_view.has_value()) {
+                    log_stream
+                        << ", leader=" << snapshot.leader_view->leader_address
+                        << ", view_version="
+                        << snapshot.leader_view->view_version;
+                }
+                LOG(INFO) << log_stream.str();
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kMetricReportIntervalSeconds));
             }
@@ -1375,6 +1391,29 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
+    const UUID& segment_id, const UUID& client_id, uint64_t grace_period_ms) {
+    return execute_rpc(
+        "GracefulUnmountSegment",
+        [&] {
+            return master_service_.GracefulUnmountSegment(segment_id, client_id,
+                                                          grace_period_ms);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("segment_id=", segment_id,
+                             ", client_id=", client_id,
+                             ", grace_period_ms=", grace_period_ms);
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_unmount_segment_requests();  // reuse metric or add new
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_unmount_segment_failures();  // reuse metric or add new
+        });
+}
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
@@ -1651,6 +1690,15 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
+    const UUID& client_id, int64_t ssd_total_capacity_bytes) {
+    ScopedVLogTimer timer(1, "ReportSsdCapacity");
+    timer.LogRequest("client_id=", client_id,
+                     ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
+    return master_service_.ReportSsdCapacity(client_id,
+                                             ssd_total_capacity_bytes);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -1681,6 +1729,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::CancelDrainJob(
 tl::expected<SegmentStatus, ErrorCode> WrappedMasterService::QuerySegmentStatus(
     const std::string& segment_name) {
     return master_service_.QuerySegmentStatus(segment_name);
+}
+
+tl::expected<SegmentStatus, ErrorCode>
+WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
+    return master_service_.QuerySegmentStatusById(segment_id);
 }
 
 void RegisterRpcService(
@@ -1738,9 +1791,18 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GracefulUnmountSegment>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::QuerySegmentStatus>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QuerySegmentStatusById>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
@@ -1753,6 +1815,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(

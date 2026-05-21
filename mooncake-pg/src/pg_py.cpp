@@ -9,7 +9,7 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
+c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
@@ -17,7 +17,7 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
                                                 std::move(backendOptions));
 }
 
-c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
+c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
@@ -39,49 +39,65 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
                      /* extended_api */ true, **kwargsCuda);
 }
 
-std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
+std::string getPreferredHca(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                             std::string location) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     return mooncakeBackend->getPreferredHca(location);
 }
 
-at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
+at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     return mooncakeBackend->getActiveRanksTensor();
 }
 
-int getNumSyncedRanks(c10::intrusive_ptr<c10d::Backend> backend) {
+int getNumSyncedRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     return mooncakeBackend->getNumSyncedRanks();
 }
 
-void extendGroupSizeTo(c10::intrusive_ptr<c10d::Backend> backend, int size) {
+void extendGroupSizeTo(c10::intrusive_ptr<c10d::ProcessGroup> backend,
+                       int size) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->extendGroupSizeTo(size);
 }
 
-std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::Backend> backend,
+std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                                const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     return mooncakeBackend->getPeerState(ranks);
 }
 
-void recoverRanks(c10::intrusive_ptr<c10d::Backend> backend,
+void recoverRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend,
                   const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->recoverRanks(ranks);
 }
 
-void joinGroup(c10::intrusive_ptr<c10d::Backend> backend) {
+void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->joinGroup();
+}
+
+/// Python-facing wrapper that extracts the raw TransferEngine* from a
+/// mooncake.engine.TransferEngine Python object and passes it to
+/// MooncakeBackend::setExternalEngine().  The caller must ensure the
+/// TransferEnginePy object outlives all MooncakeBackend instances.
+void setTransferEnginePy(pybind11::object engine_obj) {
+    if (engine_obj.is_none()) {
+        MooncakeBackend::setExternalEngine(nullptr);
+        return;
+    }
+    auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
+    uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
+    auto* engine = reinterpret_cast<TransferEngine*>(ptr);
+    MooncakeBackend::setExternalEngine(engine);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -89,6 +105,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
+    m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
+          "Set an external TransferEngine to be used by MooncakeBackend. "
+          "Must be called before init_process_group(). The engine must already "
+          "be initialized. Pass None to reset to default behavior. "
+          "The caller must ensure the TransferEngine object outlives all "
+          "MooncakeBackend instances.");
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
@@ -102,7 +124,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"));
+             py::arg("is_extension"))
+        .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
+             py::arg("is_extension"), py::arg("max_world_size"));
 }
 
 }  // namespace mooncake

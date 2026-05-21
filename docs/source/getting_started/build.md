@@ -70,7 +70,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libnuma-dev \
                        libunwind-dev \
                        libpython3-dev \
-                       libboost-all-dev \
+                       libboost-dev \
                        libssl-dev \
                        pybind11-dev \
                        libcurl4-openssl-dev \
@@ -173,16 +173,49 @@ pip install mooncake-transfer-engine-non-cuda
    ```
 
 ## Use Mooncake in Docker Containers
-Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
+Mooncake supports Docker-based deployment. You can either build the image from
+this repository with `docker/mooncake.Dockerfile` or substitute a published
+tag that matches the release you want to run.
 For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host
-sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:v0.9.0 /bin/bash
+sudo docker build -f docker/mooncake.Dockerfile -t mooncake:from-source .
+sudo docker run --net=host --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/rdma_cm --ulimit memlock=-1 -t -i mooncake:from-source /bin/bash
 # Run transfer engine in container
 cd /Mooncake-main/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 --metadata_server=10.1.101.3:2379 --mode=target --local_server_name=10.1.100.3
 ```
+
+For SGLang HiCache deployments inside Docker, reserve HugeTLB pages on the host before starting the container and pass the allocator settings through the container environment:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+sudo docker run --gpus all \
+  --net=host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  --device=/dev/infiniband/uverbs0 \
+  --device=/dev/infiniband/rdma_cm \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -t -i mooncake:from-source /bin/bash
+```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it, and if you enable it via gflag without an env override the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. When you want the baseline direct-`mmap()` path instead of the arena, set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) and omit `MC_MMAP_ARENA_POOL_SIZE`. Set it before the first Mooncake mmap-buffer allocation in the process. If you build the image from source with `docker/mooncake.Dockerfile`, that source-built image also installs the helper as `mooncake-hicache-sizing`.
+Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is set, both the arena path and the direct-`mmap()` fallback path require HugeTLB pages. Mooncake will not silently degrade that explicit hugepage request to regular pages.
 
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
@@ -195,6 +228,14 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DMACA_LIB_DIR=/path/to/lib64`: Override MACA library directory when `-DUSE_MACA=ON`.
 - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: Override MACA runtime libraries linked by `transfer_engine`.
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
+- `-DUSE_HYGON=[ON|OFF]`: Enable Hygon DCU support via DTK SDK. **Default: OFF.** Uses CUDA-compatible runtime.
+- `-DDTK_ROOT=/path/to/dtk`: Override the default DTK SDK root used when `-DUSE_HYGON=ON`. If unset, Mooncake uses `DTK_HOME` or `/opt/dtk`.
+- `-DDTK_INCLUDE_DIR=/path/to/include`: Override the DTK include directory when `-DUSE_HYGON=ON`.
+- `-DDTK_LIB_DIR=/path/to/lib64`: Override the DTK library directory when `-DUSE_HYGON=ON`.
+- `-DUSE_COREX=[ON|OFF]`: Enable Iluvatar CoreX GPU support. **Default: OFF.** Uses CUDA-compatible runtime.
+- `-DCOREX_ROOT=/path/to/corex`: Override the default CoreX SDK root used when `-DUSE_COREX=ON`. If unset, Mooncake uses `COREX_HOME` or `/usr/local/corex`.
+- `-DCOREX_INCLUDE_DIR=/path/to/include`: Override the CoreX include directory when `-DUSE_COREX=ON`.
+- `-DCOREX_LIB_DIR=/path/to/lib`: Override the CoreX library directory when `-DUSE_COREX=ON`.
 - `-DUSE_MLU=[ON|OFF]`: Enable Cambricon MLU memory support via Neuware. **Default: OFF.** Supports MLU memory detection, topology discovery, and RDMA registration for Transfer Engine.
 - `-DNEUWARE_ROOT=/path/to/neuware`: Override the default Neuware SDK root used when `-DUSE_MLU=ON`. If unset, Mooncake uses `NEUWARE_HOME` or `/usr/local/neuware`.
 - `-DMLU_INCLUDE_DIR=/path/to/include`: Override the Neuware include directory when `-DUSE_MLU=ON`.
@@ -204,12 +245,14 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+
-- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: Enable Rust support
+- `-DWITH_RUST_EXAMPLE=[ON|OFF]`: Build the Transfer Engine Rust interface and sample code. **Default: OFF.**
+- `-DWITH_STORE_RUST=[ON|OFF]`: Build Mooncake Store Rust bindings and CMake Rust targets. **Default: ON.**
 - `-DWITH_EP=[ON|OFF]`: Build the EP (Expert Parallelism) and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.9.1"` (semicolon-separated) to build for specific PyTorch versions, or leave empty to use the currently-installed torch. The CUDA version is detected automatically. **Default: OFF.**
-- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service
+- `-DUSE_REDIS=[ON|OFF]`: Enable Redis-based metadata service for the Transfer Engine, require hiredis
 - `-DUSE_HTTP=[ON|OFF]`: Enable Http-based metadata service
 - `-DUSE_ETCD=[ON|OFF]`: Enable etcd-based metadata service, require go 1.23+
 - `-DSTORE_USE_ETCD=[ON|OFF]`: Enable etcd-based failover for Mooncake Store, require go 1.23+. **Note:** `-DUSE_ETCD` and `-DSTORE_USE_ETCD` are two independent options. Enabling `-DSTORE_USE_ETCD` does **not** depend on `-DUSE_ETCD`
+- `-DSTORE_USE_REDIS=[ON|OFF]`: Enable Redis-based failover for Mooncake Store, require hiredis. **Default: OFF.** **Note:** `-DUSE_REDIS` and `-DSTORE_USE_REDIS` are two independent options. Enabling `-DSTORE_USE_REDIS` does **not** depend on `-DUSE_REDIS`.
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON

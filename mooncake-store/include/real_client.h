@@ -681,7 +681,7 @@ class RealClient : public PyClient {
      */
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
-        std::unordered_map<std::string, Slice> &objects);
+        std::unordered_map<std::string, std::vector<Slice>> &objects);
 
     /**
      * @brief Mount a shared memory file region and return segment ids.
@@ -695,13 +695,40 @@ class RealClient : public PyClient {
 
     /**
      * @brief Unmount segments by their ids and clean up local mmap/fd.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
      */
-    int unmountSegment(const std::vector<std::string> &segment_ids);
+    int unmountSegment(const std::vector<std::string> &segment_ids,
+                       uint64_t grace_period_seconds = 0);
+
+    /**
+     * @brief Allocate memory internally and mount segments to master.
+     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Memory is allocated via allocate_buffer_allocator_memory.
+     *        The actual allocated size (aligned up to Slab::kSize) is written
+     *        to out_allocated_size if non-null.
+     */
+    int allocateAndMountSegment(size_t size, const std::string &protocol,
+                                const std::string &location,
+                                std::vector<std::string> &out_segment_ids,
+                                size_t *out_allocated_size = nullptr);
+
+    /**
+     * @brief Unmount segments by their ids and free locally allocated memory.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
+     */
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
+                              uint64_t grace_period_seconds = 0);
 
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
         size_t size = 0;
         std::string path;
+    };
+
+    struct AllocatedSegmentRecord {
+        void *base = nullptr;
+        size_t size = 0;
+        std::string protocol;
     };
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
@@ -806,6 +833,7 @@ class RealClient : public PyClient {
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
+    void stop_dummy_client_monitor();
     std::thread dummy_client_monitor_thread_;
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =
@@ -845,6 +873,15 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
+
+    std::unordered_map<std::string, AllocatedSegmentRecord>
+        allocated_segment_records_;
+    std::mutex allocated_segment_records_mutex_;
+
+    void ReleaseMountedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllMountedSegmentRecords();
+    void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllAllocatedSegmentRecords();
 };
 
 }  // namespace mooncake

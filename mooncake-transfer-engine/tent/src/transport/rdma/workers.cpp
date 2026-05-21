@@ -19,6 +19,7 @@
 #include <cassert>
 
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/rail_monitor.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
@@ -27,6 +28,21 @@
 namespace mooncake {
 namespace tent {
 thread_local int tl_wid = -1;
+
+namespace {
+// Look up (or create) the RailMonitor for `machine_id` on this worker's
+// map. Returning a stable reference is safe because the map stores values
+// via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
+RailMonitor& getOrCreateRail(
+    std::unordered_map<std::string, std::unique_ptr<RailMonitor>>& rails,
+    const std::string& machine_id) {
+    auto it = rails.find(machine_id);
+    if (it != rails.end()) return *it->second;
+    auto [ins, _] = rails.emplace(machine_id, std::make_unique<RailMonitor>());
+    return *ins->second;
+}
+}  // namespace
+
 Workers::Workers(RdmaTransport* transport)
     : transport_(transport), num_workers_(0), running_(false) {
     device_quota_ = std::make_unique<DeviceQuota>();
@@ -162,10 +178,6 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     std::shared_ptr<RdmaEndPoint> endpoint;
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(endpoint.get());
-        endpoint = context->endpointStore()->getOrInsert(peer_name);
-    }
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;
@@ -188,23 +200,12 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
 }
 
 void Workers::disableEndpoint(RdmaSlice* slice) {
-    SegmentDesc* desc = nullptr;
-    auto& segment_manager = transport_->metadata_->segmentManager();
-    auto target_id = slice->task->request.target_id;
-    if (target_id == LOCAL_SEGMENT_ID) {
-        desc = segment_manager.getLocal().get();
-    } else {
-        auto status = segment_manager.getRemoteCached(desc, target_id);
-        if (!status.ok()) return;
-    }
-    if (desc) {
-        auto& worker = worker_context_[tl_wid];
-        auto& rail = worker.rails[desc->machine_id];
-        rail.markFailed(slice->source_dev_id, slice->target_dev_id);
+    if (auto* rail = slice->rail_monitor) {
+        rail->markFailed(slice->source_dev_id, slice->target_dev_id);
     }
     if (auto ep = slice->ep_weak_ptr.lock()) {
         ep->acknowledge(slice, FAILED);
-        ep->reset();
+        ep->resetConnection("Endpoint failed");
     }
 }
 
@@ -361,6 +362,14 @@ void Workers::asyncPollCq() {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful transfer proves this rail is healthy; clear
+                // any accumulated error count so a previously-cooled-down
+                // rail can be used again without waiting for the full
+                // cooldown to expire. The monitor pointer is resolved once
+                // in generatePostPath, so no map lookup is needed here.
+                if (auto* rail = slice->rail_monitor; rail && rail->ready())
+                    rail->markRecovered(slice->source_dev_id,
+                                        slice->target_dev_id);
                 worker.perf.inflight_lat.add(inflight_lat);
                 worker.perf.enqueue_lat.add(enqueue_lat);
             }
@@ -449,7 +458,25 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
 }
 
 void Workers::monitorThread() {
+    // Track time for periodic endpoint reclaim (1 Hz heartbeat)
+    auto last_reclaim_time = std::chrono::steady_clock::now();
+
     while (running_) {
+        // Periodic endpoint reclaim: runs every 1 second to drain waiting_list_
+        // Under failure load, insertions stall but endpoints still need cleanup
+        auto current_time = std::chrono::steady_clock::now();
+        auto time_since_last_reclaim =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_time - last_reclaim_time)
+                .count();
+
+        if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
+            for (auto& context : transport_->context_set_) {
+                context->endpointStore()->reclaim();
+            }
+            last_reclaim_time = current_time;
+        }
+
         for (auto& context : transport_->context_set_) {
             struct epoll_event event;
             if (context->eventFd() < 0) continue;
@@ -532,9 +559,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    auto& rail = worker.rails[target.segment->machine_id];
+    auto& rail = getOrCreateRail(worker.rails, target.segment->machine_id);
     if (!rail.ready() || target.topo != rail.remote())
-        rail.load(source.topo, target.topo);
+        rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
+                  transport_->conf_.get());
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
@@ -630,7 +658,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             reachable = (sdev == tdev);  // loopback is safe
         } else {
             auto& worker = worker_context_[tl_wid];
-            auto& rail = worker.rails[target.segment->machine_id];
+            auto& rail =
+                getOrCreateRail(worker.rails, target.segment->machine_id);
             reachable = rail.available(sdev, tdev);
         }
 
@@ -663,6 +692,11 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
     slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
     slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
+    // update rail state without a segment lookup or string-keyed map
+    // lookup on the hot path.
+    slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
+                                           target.segment->machine_id);
     return Status::OK();
 }
 }  // namespace tent

@@ -163,8 +163,10 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     return Status::OK();
 }
 
-static bool isGpuDirectRdmaSupported() {
-    if (getenv("MC_DISABLE_GPU_DIRECT_RDMA")) {
+static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
+    auto disable_gpu_direct =
+        conf->get("transports/rdma/disable_gpu_direct_rdma", false);
+    if (disable_gpu_direct) {
         return false;
     }
     std::ifstream modules("/proc/modules");
@@ -252,7 +254,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
 
     installed_ = true;
     caps.dram_to_dram = true;
-    if (isGpuDirectRdmaSupported()) {
+    if (isGpuDirectRdmaSupported(conf_)) {
         caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
@@ -293,6 +295,10 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    for (auto* task : rdma_batch->task_list) {
+        task->deref();  // Release batch's reference to the task
+    }
+    rdma_batch->task_list.clear();
     for (auto slice : rdma_batch->slice_chain) {
         while (slice) {
             auto next = slice->next;
@@ -336,12 +342,13 @@ Status RdmaTransport::submitTransferTasks(
         size_t max_slice_count = 64;
         if (type == MTYPE_CUDA || opcode == Request::WRITE)
             max_slice_count = 32;
-        rdma_batch->task_list.push_back(RdmaTask{});
-        auto& task = rdma_batch->task_list.back();
-        task.request = request;
-        task.num_slices = 0;
-        task.status_word = PENDING;
-        task.transferred_bytes = 0;
+        auto* task = RdmaTaskStorage::Get().allocate();
+        rdma_batch->task_list.push_back(task);
+        task->request = request;
+        task->num_slices = 0;
+        task->status_word = PENDING;
+        task->transferred_bytes = 0;
+        task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
@@ -371,13 +378,14 @@ Status RdmaTransport::submitTransferTasks(
             slice->source_addr = (char*)request.source + offset;
             slice->target_addr = request.target_offset + offset;
             slice->length = length;
-            slice->task = &task;
+            slice->task = task;
             slice->retry_count = 0;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
             slice->enqueue_ts = enqueue_ts;
-            task.num_slices++;
+            task->num_slices++;
+            task->ref();  // Each slice holds a reference to the task
             offset += length;
             int part_id =
                 ((enable_spray ? submit_slices : static_cast<int>(slice_idx)) /
@@ -411,8 +419,8 @@ Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
-    auto& task = rdma_batch->task_list[task_id];
-    status = TransferStatus{task.status_word, task.transferred_bytes};
+    auto* task = rdma_batch->task_list[task_id];
+    status = TransferStatus{task->status_word, task->transferred_bytes};
     return Status::OK();
 }
 
@@ -552,10 +560,6 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     std::shared_ptr<RdmaEndPoint> endpoint;
     std::string peer_name = MakeNicPath(segment_desc->name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
-    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
-        context->endpointStore()->remove(endpoint.get());
-        endpoint = context->endpointStore()->getOrInsert(peer_name);
-    }
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
         return nullptr;

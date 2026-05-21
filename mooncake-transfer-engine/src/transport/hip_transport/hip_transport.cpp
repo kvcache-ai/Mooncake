@@ -251,6 +251,17 @@ static int setDeviceContext(void* source_ptr, int& device_id) {
 }
 
 static void setupP2PAccess(int num_devices) {
+    // Save the active device. The loop below calls hipSetDevice once per
+    // iteration; without restoring it before returning, the calling thread is
+    // left with its active device pinned to num_devices-1, causing downstream
+    // HIP calls on the same thread (e.g. PyTorch allocations in TP workers) to
+    // target the wrong GPU.
+    int original_device = -1;
+    if (!checkHip(hipGetDevice(&original_device),
+                  "HipTransport: failed to get current device")) {
+        return;
+    }
+
     auto clearStickyPeerAccessError = [](int src_device, int dst_device) {
         // hipDeviceEnablePeerAccess may leave hipErrorPeerAccessAlreadyEnabled
         // in the runtime's last-error slot. Clear it so subsequent PyTorch HIP
@@ -299,6 +310,12 @@ static void setupP2PAccess(int num_devices) {
                     << i << " and device " << j;
             }
         }
+    }
+
+    // Restore the active device so this function is transparent to the caller.
+    if (original_device >= 0) {
+        (void)checkHip(hipSetDevice(original_device),
+                       "HipTransport: failed to restore device");
     }
 }
 

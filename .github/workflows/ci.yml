@@ -75,6 +75,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y lcov gcovr ninja-build
 
+    - name: Test HugeTLB sizing helper
+      run: |
+        python3 scripts/test_hicache_hugepage_requirements.py
+      shell: bash
+
     - name: Set up coverage compilation flags
       run: |
         echo "Setting up coverage compilation flags..."
@@ -460,7 +465,7 @@ jobs:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
     - name: Test Safetensor Functions
@@ -589,6 +594,13 @@ jobs:
 
     - name: Check Mooncake Store Rust bindings, examples, and tests
       run: |
+        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
+        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd mooncake-store/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
         cargo test --lib
@@ -601,7 +613,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0"
       shell: bash
 
     - name: Build project
@@ -617,16 +629,20 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DUSE_CUDA=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
       shell: bash
 
     - name: Build project with TENT
       run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build-tent
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Test (TENT)
+      run: |
+        cd build-tent
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
       shell: bash
 
     - name: Build nvlink_allocator.so

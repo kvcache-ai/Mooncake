@@ -23,6 +23,19 @@ TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(15 * 1024 * 1024 + 44048), "15.04 MB");
 }
 
+TEST(UtilsTest, StringToBool) {
+    EXPECT_EQ(string_to_bool("1"), true);
+    EXPECT_EQ(string_to_bool("true"), true);
+    EXPECT_EQ(string_to_bool("YES"), true);
+    EXPECT_EQ(string_to_bool(" on "), true);
+    EXPECT_EQ(string_to_bool("0"), false);
+    EXPECT_EQ(string_to_bool("false"), false);
+    EXPECT_EQ(string_to_bool("No"), false);
+    EXPECT_EQ(string_to_bool(" off "), false);
+    EXPECT_EQ(string_to_bool("maybe"), std::nullopt);
+    EXPECT_EQ(string_to_bool(""), std::nullopt);
+}
+
 TEST(UtilsTest, IsPortAvailable) {
     // Find an available port
     int test_port = -1;

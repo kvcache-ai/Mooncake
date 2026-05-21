@@ -89,9 +89,29 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
         ;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
-    // Get fabric info
+    // Get fabric info.
+    //
+    // Request libfabric API 1.18+ so the EFA provider's
+    // efa_rdm_get_use_device_rdma() takes the "new API" branch and keys
+    // the default for FI_EFA_USE_DEVICE_RDMA on hardware capability
+    // (hw_support) instead of vendor_part_id.  Under the older 1.14
+    // request, the provider's legacy branch hardcoded
+    //   default_val = (vendor_part_id == 0xefa0 || 0xefa1) ? false : true
+    // which silently disabled device RDMA on Nitro v4 EFA (p5/p5e, part
+    // id 0xefa1) while leaving it enabled on Nitro v5+ (p5en and newer).
+    // With device RDMA disabled, fi_write falls back to libfabric's
+    // emulated RDMA data path, and libfabric 2.4.0 has a thread-safety
+    // regression there between fi_av_insert and concurrent fi_cq_read
+    // that segfaults Mooncake once the handshake wave finishes and the
+    // first real transfers start.  Bumping the requested API to 1.18
+    // restores the same default path we already got on newer hardware,
+    // and applications that still want emulated RDMA can opt out with
+    // FI_EFA_USE_DEVICE_RDMA=0.
+    //
+    // 1.18 is from March 2023 (EFA installer 1.26+ ships 1.18 or later);
+    // all Mooncake deployments today run libfabric >> 1.18.
     int ret =
-        fi_getinfo(FI_VERSION(1, 14), nullptr, nullptr, 0, hints_, &fi_info_);
+        fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0, hints_, &fi_info_);
     if (ret) {
         LOG(ERROR) << "fi_getinfo failed for device " << device_name_ << ": "
                    << fi_strerror(-ret);
@@ -458,16 +478,31 @@ void* EfaContext::mrDesc(void* addr) {
 
 std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     const std::string& peer_nic_path) {
-    // Use normalized key (strip port) so the same physical peer reuses its
-    // handle across reconnections.  Each P2PHANDSHAKE run picks a random
-    // port, producing a different peer_nic_path for the same peer host+NIC.
-    std::string key = normalizeNicPath(peer_nic_path);
+    // Key the peer map by the full "host:port@nic" path, not the
+    // port-stripped form.  Under sglang DP>1 every DP worker on a peer
+    // host is a distinct process with its own Mooncake TransferEngine
+    // and its own P2PHANDSHAKE RPC port.  They share the same host+NIC
+    // but map to different EFA QPNs / memory regions.  If we normalize
+    // the port away, every DP worker on that host collapses onto the
+    // same EfaEndPoint slot: each arriving handshake looks like a
+    // "peer reconnected with new address" to the previous holder,
+    // triggering fi_av_remove + fi_av_insert (and an AH warm-up) on
+    // every KV transfer.  At high DP this devolves into permanent
+    // thrashing and eventually "Remote MR invalid" when an in-flight
+    // fi_write runs against a stale AV slot.
+    //
+    // The port is stable for the lifetime of a sglang worker process
+    // (Mooncake only calls initialize() once), so keying by full path
+    // costs nothing in steady state.  A genuine peer restart (process
+    // re-launch → new RPC port) creates a new map entry and leaks the
+    // old EfaEndPoint — that's at most a few bytes per ex-worker and
+    // far cheaper than the churn the old normalization caused.
+    const std::string& key = peer_nic_path;
 
     {
         RWSpinlock::ReadGuard guard(peer_map_lock_);
         auto it = peer_map_.find(key);
         if (it != peer_map_.end()) {
-            it->second->setPeerNicPath(peer_nic_path);
             return it->second;
         }
     }
@@ -478,7 +513,6 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     RWSpinlock::WriteGuard guard(peer_map_lock_);
     auto it = peer_map_.find(key);
     if (it != peer_map_.end()) {
-        it->second->setPeerNicPath(peer_nic_path);
         return it->second;
     }
     peer_map_[key] = new_ep;
@@ -488,7 +522,7 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
 std::shared_ptr<EfaEndPoint> EfaContext::peekEndpoint(
     const std::string& peer_nic_path) {
     RWSpinlock::ReadGuard guard(peer_map_lock_);
-    auto it = peer_map_.find(normalizeNicPath(peer_nic_path));
+    auto it = peer_map_.find(peer_nic_path);
     if (it == peer_map_.end()) return nullptr;
     return it->second;
 }
@@ -497,7 +531,7 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
     std::shared_ptr<EfaEndPoint> ep;
     {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
-        auto it = peer_map_.find(normalizeNicPath(peer_nic_path));
+        auto it = peer_map_.find(peer_nic_path);
         if (it == peer_map_.end()) return 0;
         ep = it->second;
         peer_map_.erase(it);
@@ -656,7 +690,7 @@ int EfaContext::submitPostSend(
         // freeing its AV entry for reuse.  Under the shared-endpoint model
         // this is cheap (no fid_ep to destroy).
         if (rc != 0 && !ep->connected()) {
-            deleteEndpoint(normalizeNicPath(peer_nic_path));
+            deleteEndpoint(peer_nic_path);
         }
     }
 

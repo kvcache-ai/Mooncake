@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <csignal>
 #include <thread>
 #include <vector>
@@ -8,6 +9,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "utils.h"
+#include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -58,6 +60,7 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Operation Statistics
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -509,6 +512,174 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_batch_put_start_items(), 7);
     ASSERT_EQ(metrics.get_batch_put_start_failed_items(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Tests for local SSD metrics (Bug 1 fix)
+// ---------------------------------------------------------------------------
+
+// Helper: put a key into a mem segment and immediately notify offload success,
+// simulating the client-side SSD write completing.
+static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
+                                    const std::string& segment_name,
+                                    uint64_t value_size,
+                                    const std::string& key) {
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto put_start = svc.PutStart(client_id, key, value_size, cfg);
+    if (!put_start) return "";
+    svc.PutEnd(client_id, key, ReplicaType::MEMORY);
+
+    StorageObjectMetadata meta;
+    meta.data_size = static_cast<int64_t>(value_size);
+    meta.transport_endpoint = "127.0.0.1:9999";
+    svc.NotifyOffloadSuccess(client_id, {key}, {meta});
+    return key;
+}
+
+// Verify that creating a LocalDiskReplica (via NotifyOffloadSuccess) increments
+// file_allocated_size, and that removing the key decrements it back to zero.
+TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
+    auto& metrics = MasterMetricManager::instance();
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    constexpr size_t kBuf = 0x400000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 4096;
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "ssd_alloc_test_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    const int64_t baseline = metrics.get_allocated_file_size();
+
+    // After NotifyOffloadSuccess, a LocalDiskReplica is created.
+    std::string key = PutKeyAndOffload(svc, client_id, seg.name, kValueSize,
+                                       "ssd_alloc_test_key");
+    ASSERT_FALSE(key.empty());
+    EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
+
+    // After removing the key the LocalDiskReplica is destroyed; gauge resets.
+    ASSERT_TRUE(svc.Remove(key).has_value());
+    EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
+}
+
+// Verify that OffloadObjectHeartbeat updates total_file_capacity correctly,
+// including when a client reports a changed capacity on a subsequent heartbeat.
+TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
+    auto& metrics = MasterMetricManager::instance();
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    constexpr size_t kBuf = 0x500000000;
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    constexpr int64_t kCap1 = 800LL * 1024 * 1024 * 1024;  // 800 GB
+    constexpr int64_t kCap2 = 400LL * 1024 * 1024 * 1024;  // 400 GB
+
+    UUID client_id = generate_uuid();
+    Segment seg;
+    seg.id = generate_uuid();
+    seg.name = "ssd_capacity_test_segment";
+    seg.base = kBuf;
+    seg.size = kSegSize;
+    seg.te_endpoint = seg.name;
+
+    ASSERT_TRUE(svc.MountSegment(seg, client_id).has_value());
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    const int64_t baseline = metrics.get_total_file_capacity();
+
+    // ReportSsdCapacity: client reports 800 GB.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap1).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap1);
+
+    // Client reports 400 GB (e.g. config changed).
+    // Gauge must be updated to reflect the new value, not double-counted.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+
+    // Idempotent: same capacity reported again — gauge must not change.
+    ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
+    EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+}
+
+TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
+    const uint64_t default_kv_lease_ttl = 100;
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    WrappedMasterService service_(service_config);
+
+    const int64_t allocation_failures_before =
+        metrics.get_put_start_alloc_failures();
+    const int64_t put_start_failures_before = metrics.get_put_start_failures();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result = service_.PutStart(
+        generate_uuid(), "allocation_failure_key", 1024, config);
+
+    ASSERT_FALSE(put_start_result.has_value());
+    ASSERT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(),
+              allocation_failures_before + 1);
+    ASSERT_EQ(metrics.get_put_start_failures(), put_start_failures_before + 1);
+}
+
+TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string baseline_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(baseline_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(baseline_summary.find("PutStart=0.00/0.00"), std::string::npos);
+
+    metrics.inc_put_start_requests(4);
+    metrics.inc_put_start_failures(1);
+    metrics.inc_batch_put_start_requests(5);
+    metrics.inc_batch_put_start_partial_success(2);
+    metrics.inc_eviction_success(3, 4096);
+    metrics.inc_eviction_fail();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string window_summary = metrics.get_summary_string();
+    EXPECT_NE(window_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(window_summary.find("PutStart="), std::string::npos);
+    EXPECT_EQ(window_summary.find("/s"), std::string::npos);
+    EXPECT_EQ(window_summary.find("PutStart=3/4"), std::string::npos);
+    EXPECT_NE(window_summary.find("Batch Requests (per sec"),
+              std::string::npos);
+    EXPECT_NE(
+        window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                            "keys=3, size=4.00 KB"),
+        std::string::npos);
+
+    const std::string reported_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(
+        reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                              "keys=3, size=4.00 KB"),
+        std::string::npos);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string idle_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
+    EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=0/0, "
+                                "AllocFail=0, keys=0, size=0 B"),
+              std::string::npos);
 }
 
 }  // namespace mooncake::test
