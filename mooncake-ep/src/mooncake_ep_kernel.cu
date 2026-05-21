@@ -8,24 +8,35 @@
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
 #ifdef MOONCAKE_EP_USE_TENT
-#include <tent/transport/ibgda/detail/mlx5gda.h>
+#include <tent/device/ibgda.cuh>
+#include <tent/device/nvlink.cuh>
 #else
 #include <mooncake_ibgda/mlx5gda.h>
-#endif
-#include <mooncake_ep_utils.cuh>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>
+#endif
+#include <mooncake_ep_utils.cuh>
 
 namespace mooncake {
+
+#ifdef MOONCAKE_EP_USE_TENT
+inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
+#endif
 
 using mooncake::tent::device::cuda_platform::cudaDeviceOps;
 using mooncake::tent::device::ibgda::IbGdaCtx;
 using mooncake::tent::device::ibgda::IbGdaQpDevCtx;
 using mooncake::tent::device::ibgda::ibgda_put;
 using mooncake::tent::device::ibgda::ibgda_red_add;
+#ifdef MOONCAKE_EP_USE_TENT
+using mooncake::tent::device::nvlink::is_available;
+using mooncake::tent::device::nvlink::peer_ptr;
+#endif
 
+#ifndef MOONCAKE_EP_USE_TENT
 static_assert(sizeof(IbGdaQpDevCtx) == sizeof(mlx5gda_qp_devctx),
               "IbGdaQpDevCtx must stay ABI-compatible with mlx5gda_qp_devctx");
+#endif
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
@@ -85,6 +96,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
+#ifdef MOONCAKE_EP_USE_TENT
+    tent::NvLinkDeviceContext nvlink_ctx = {
+        tent::kNvLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+#endif
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -164,10 +183,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
                 if (dst_rank != rank) {
-                    bool use_nvlink = nvlink_available[dst_rank] != 0;
+                    bool use_nvlink =
+#ifdef MOONCAKE_EP_USE_TENT
+                        is_available(nvlink_ctx, dst_rank);
+#else
+                        nvlink_available[dst_rank] != 0;
+#endif
                     if (use_nvlink) {
+#ifdef MOONCAKE_EP_USE_TENT
+                        void* peer_dst_ptr = peer_ptr(
+                            nvlink_ctx, dst_rank, mxa_buffer,
+                            reinterpret_cast<const void*>(dst_ptr));
+#else
                         size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                         void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
+#endif
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
@@ -241,11 +271,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
-            bool use_nvlink = nvlink_available[dst_rank] != 0;
+            bool use_nvlink =
+#ifdef MOONCAKE_EP_USE_TENT
+                is_available(nvlink_ctx, dst_rank);
+#else
+                nvlink_available[dst_rank] != 0;
+#endif
             if (use_nvlink) {
                 int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
+#ifdef MOONCAKE_EP_USE_TENT
+                int* peer_signal_ptr = reinterpret_cast<int*>(
+                    peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#else
                 size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                 int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
+#endif
                 st_na_release(peer_signal_ptr, -num_tokens_sent - 1);
             } else {
                 ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
@@ -452,6 +492,14 @@ combine(void* combined_x, int32_t* active_ranks,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
+#ifdef MOONCAKE_EP_USE_TENT
+    tent::NvLinkDeviceContext nvlink_ctx = {
+        tent::kNvLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+#endif
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -499,10 +547,21 @@ combine(void* combined_x, int32_t* active_ranks,
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             } else {
-                bool use_nvlink = nvlink_available[dst_rank] != 0;
+                bool use_nvlink =
+#ifdef MOONCAKE_EP_USE_TENT
+                    is_available(nvlink_ctx, dst_rank);
+#else
+                    nvlink_available[dst_rank] != 0;
+#endif
                 if (use_nvlink) {
+#ifdef MOONCAKE_EP_USE_TENT
+                    void* peer_dst_ptr = peer_ptr(
+                        nvlink_ctx, dst_rank, mxa_buffer,
+                        reinterpret_cast<const void*>(dst_ptr));
+#else
                     size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                     void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
+#endif
                     const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 } else {
@@ -527,11 +586,21 @@ combine(void* combined_x, int32_t* active_ranks,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
-                bool use_nvlink = nvlink_available[dst_rank] != 0;
+                bool use_nvlink =
+#ifdef MOONCAKE_EP_USE_TENT
+                    is_available(nvlink_ctx, dst_rank);
+#else
+                    nvlink_available[dst_rank] != 0;
+#endif
                 if (use_nvlink) {
                     int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
+#ifdef MOONCAKE_EP_USE_TENT
+                    int* peer_signal_ptr = reinterpret_cast<int*>(
+                        peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#else
                     size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                     int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
+#endif
                     st_na_release(peer_signal_ptr, 1);
                 } else {
                     ibgda_red_add(&ibgda_ctx, local_expert_idx,

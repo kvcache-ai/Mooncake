@@ -9,6 +9,7 @@
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
+#   EP_USE_TENT         - whether the extension should expose TENT device APIs
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
 
@@ -35,6 +36,7 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+set(ENV{MOONCAKE_PG_USE_TENT_DEVICE_API} "${EP_USE_TENT}")
 
 # ---------------------------------------------------------------------------
 # 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.

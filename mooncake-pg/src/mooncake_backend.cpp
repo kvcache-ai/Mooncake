@@ -9,6 +9,10 @@
 #include <chrono>
 #include <atomic>
 #include <memory>
+#ifdef MOONCAKE_PG_HAS_TENT_DEVICE_API
+#include <tent/device/ibgda.h>
+#include <tent/device/nvlink.h>
+#endif
 #include "connection_poller.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
@@ -25,6 +29,13 @@ constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 constexpr int kBarrierDummyTensorSize = 1;
+
+#ifdef MOONCAKE_PG_HAS_TENT_DEVICE_API
+static_assert(sizeof(tent::IbGdaLocalMetadata) > 0,
+              "PG must be able to include the public TENT IBGDA device API");
+static_assert(sizeof(tent::NvLinkDeviceContext) > 0,
+              "PG must be able to include the public TENT NVLink device API");
+#endif
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 // leaky singleton to avoid destructor fiasco problem

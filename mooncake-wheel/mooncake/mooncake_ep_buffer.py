@@ -176,13 +176,19 @@ class Buffer:
             "lids": [int(x) for x in values[lid_base : lid_base + qp_count]],
         }
 
+    def _update_local_qpns_or_raise(self) -> None:
+        if not self.runtime.update_local_qpns():
+            raise RuntimeError(
+                "Failed to recreate local IBGDA QPs before metadata exchange"
+            )
+
     def _exchange_ibgda_metadata_store_ordered(self, is_update: bool = False) -> None:
         import json
         import os
         import time
 
         if is_update:
-            self.runtime.update_local_qpns()
+            self._update_local_qpns_or_raise()
 
         try:
             from torch.distributed import distributed_c10d
@@ -244,7 +250,7 @@ class Buffer:
         self, is_update: bool = False
     ) -> None:
         if is_update:
-            self.runtime.update_local_qpns()
+            self._update_local_qpns_or_raise()
 
         local_payload = self._encode_ibgda_metadata(self._local_ibgda_metadata())
         peers: List[dict] = []
@@ -290,7 +296,7 @@ class Buffer:
         all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
         if is_update:
-            self.runtime.update_local_qpns()
+            self._update_local_qpns_or_raise()
 
         local_qpns = self.runtime.get_local_qpns()
         local_qpns = list(

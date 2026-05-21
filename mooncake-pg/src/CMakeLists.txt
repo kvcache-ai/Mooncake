@@ -2,3 +2,7 @@ add_library(mooncake_pg connection_poller.cpp mooncake_backend.cpp mooncake_work
 
 set_target_properties(mooncake_pg PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(mooncake_pg PUBLIC ${TORCH_LIBRARIES} transfer_engine ibverbs mlx5)
+if(USE_TENT AND TARGET tent_link_group)
+  target_link_libraries(mooncake_pg PUBLIC tent_link_group)
+  target_compile_definitions(mooncake_pg PRIVATE MOONCAKE_PG_HAS_TENT_DEVICE_API)
+endif()

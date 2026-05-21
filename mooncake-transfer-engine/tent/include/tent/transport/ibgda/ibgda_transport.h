@@ -26,6 +26,7 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include "tent/device/ibgda.h"
 #include "tent/transport/ibgda/detail/memheap.h"
 #include "tent/transport/ibgda/detail/mlx5gda.h"
 #include "tent/runtime/device_transport.h"
@@ -37,16 +38,6 @@ namespace tent {
 class Config;
 class ControlService;
 class Topology;
-
-struct IbGdaLocalMetadata {
-    int64_t raddr = 0;
-    int32_t rkey = 0;
-    bool is_roce = false;
-    int64_t subnet_prefix = 0;
-    int64_t interface_id = 0;
-    std::vector<int32_t> qpns;
-    std::vector<int32_t> lids;
-};
 
 class IbGdaTransport : public Transport, public DeviceTransport {
    public:

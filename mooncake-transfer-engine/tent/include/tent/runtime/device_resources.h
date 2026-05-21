@@ -20,6 +20,8 @@
 namespace mooncake {
 namespace tent {
 
+inline constexpr int kIbGdaMaxQueuePairs = 256;
+
 struct DeviceCommCapabilities {
     bool gpu_initiated_rdma = false;
     bool symmetric_memory = false;
@@ -55,6 +57,21 @@ struct IbGdaDeviceContext {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
+};
+
+inline constexpr uint32_t kNvLinkDeviceContextAbiVersion = 1;
+
+// GPU-visible NVLink/P2P resources consumed by device kernels.  `available`
+// is a device array of length `num_ranks`; `peer_ptrs` is a device array of
+// peer base pointers indexed by rank.  Kernels can compute a peer address by
+// adding the local-buffer-relative offset to `peer_ptrs[dst_rank]` when
+// `available[dst_rank] != 0`.
+struct NvLinkDeviceContext {
+    uint32_t abi_version = kNvLinkDeviceContextAbiVersion;
+    int rank = 0;
+    int num_ranks = 0;
+    int32_t* available = nullptr;
+    void** peer_ptrs = nullptr;
 };
 
 }  // namespace tent

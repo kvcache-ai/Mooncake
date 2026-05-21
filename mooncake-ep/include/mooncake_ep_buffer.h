@@ -8,7 +8,8 @@
 #include <fstream>
 #include <memory>
 #ifdef MOONCAKE_EP_USE_TENT
-#include <tent/transport/ibgda/ibgda_transport.h>
+#include <tent/device/ibgda.h>
+#include <tent/device/nvlink.h>
 #else
 #include <mooncake_ibgda/memheap.h>
 #include <mooncake_ibgda/mlx5gda.h>
@@ -21,6 +22,10 @@
 #include <torch/torch.h>
 
 namespace mooncake {
+
+#ifdef MOONCAKE_EP_USE_TENT
+inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
+#endif
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
@@ -80,13 +85,13 @@ struct MooncakeEpBuffer {
     // IBGDA
     static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
+#ifndef MOONCAKE_EP_USE_TENT
     // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
     // fails.
     ibv_mr* mr = nullptr;
-#ifndef MOONCAKE_EP_USE_TENT
     std::vector<mlx5gda_qp*> qps;
-#endif
     ibv_gid gid;
+#endif
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
@@ -97,14 +102,14 @@ struct MooncakeEpBuffer {
     int gid_index_ = -1;  // Dynamically discovered GID index
     int USE_QP_COUNT = MAX_QP_COUNT;
 
+#ifndef MOONCAKE_EP_USE_TENT
     mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
     ibv_pd* pd = nullptr;
     mlx5dv_pd mpd = {};
-#ifndef MOONCAKE_EP_USE_TENT
     memheap* ctrl_buf_heap = nullptr;
 #endif
 #ifdef MOONCAKE_EP_USE_TENT
-    std::unique_ptr<tent::IbGdaTransport> tent_ibgda_transport_;
+    std::unique_ptr<tent::IbGdaDeviceTransport> tent_ibgda_transport_;
 #endif
 
     // Fabric memory (MNNVL)
@@ -114,9 +119,15 @@ struct MooncakeEpBuffer {
 
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
+#ifndef MOONCAKE_EP_USE_TENT
     void** ipc_peer_ptrs_host = nullptr;
+#endif
     void** ipc_peer_ptrs = nullptr;
     bool p2p_ipc_all_enabled_ = false;
+#ifdef MOONCAKE_EP_USE_TENT
+    tent::NvLinkDeviceContext tent_nvlink_ctx_;
+    std::unique_ptr<tent::NvLinkDeviceTransport> tent_nvlink_transport_;
+#endif
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -184,7 +195,7 @@ struct MooncakeEpBuffer {
         return p2p_ipc_all_enabled_;
     }
 
-    void update_local_qpns();
+    bool update_local_qpns();
 
     void sync_ib(const std::vector<int64_t>& remote_addrs,
                  const std::vector<int32_t>& remote_keys,

@@ -12,6 +12,12 @@ module_name = "mooncake.pg" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
+use_tent_device_api = os.getenv("MOONCAKE_PG_USE_TENT_DEVICE_API", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+}
 
 # Link against the CUDA driver stub library if available.
 # Same approach as mooncake-ep/setup.py.
@@ -34,6 +40,11 @@ setup(
             include_dirs=[
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+                *(
+                    [os.path.join(current_dir, "../mooncake-transfer-engine/tent/include")]
+                    if use_tent_device_api
+                    else []
+                ),
             ],
             sources=[
                 "src/pg_py.cpp",
@@ -46,12 +57,22 @@ setup(
             extra_compile_args={
                 "cxx": [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    *(
+                        ["-DMOONCAKE_PG_HAS_TENT_DEVICE_API=1"]
+                        if use_tent_device_api
+                        else []
+                    ),
                     "-std=c++20",
                     "-O3",
                     "-g0",
                 ],
                 "nvcc": [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+                    *(
+                        ["-DMOONCAKE_PG_HAS_TENT_DEVICE_API=1"]
+                        if use_tent_device_api
+                        else []
+                    ),
                     "-std=c++20",
                     "-Xcompiler",
                     "-O3",
