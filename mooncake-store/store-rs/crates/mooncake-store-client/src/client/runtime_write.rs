@@ -28,6 +28,18 @@ impl StoreClient {
             .ok_or_else(|| StoreError::InvalidState("segment_name is not configured".to_string()))
     }
 
+    fn batch_put_reserve_retry_delay(error: &StoreError, attempt: usize) -> Duration {
+        match error {
+            StoreError::InvalidState(message)
+                if message.contains("no placement candidates available")
+                    || message.contains("not enough writable owners")
+                    || message.contains("batch put exhausted all placement candidates") =>
+            {
+                Duration::from_millis(300_u64.saturating_mul(attempt as u64))
+            }
+            _ => Duration::from_millis(0),
+        }
+    }
     fn write_reserved_replicas(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -112,9 +124,8 @@ impl StoreClient {
             } else {
                 let remote_bytes = (remote_requests.len() * value.len()) as u64;
                 let request_deadline = self.request_deadline_for_transfer(remote_bytes, 1);
-                let tracker = OperationTracker::new("put_remote_batch_write")
-                    .attribute_u64("mooncake.remote_target_count", remote_requests.len() as u64)
-                    .input_bytes(remote_bytes);
+                let tracker =
+                    OperationTracker::new("put_remote_batch_write").input_bytes(remote_bytes);
                 let result = (|| {
                     let requests = if let Some(source) = registered_source {
                         let mut requests = Vec::new();
@@ -269,68 +280,6 @@ impl StoreClient {
         )
     }
 
-    fn batch_put_scoped_routed_accept_existing_statuses(
-        &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: &[*mut c_void],
-        policy: Option<&ReplicationPolicy>,
-    ) -> Vec<Result<ObjectRoute>> {
-        if requests.is_empty() {
-            return Vec::new();
-        }
-        self.batch_put_scoped_routed_accept_existing_statuses_inner(
-            requests,
-            registered_sources,
-            policy,
-        )
-    }
-
-    fn batch_put_scoped_routed_accept_existing_statuses_inner(
-        &self,
-        requests: &[PutRequest<'_>],
-        registered_sources: &[*mut c_void],
-        policy: Option<&ReplicationPolicy>,
-    ) -> Vec<Result<ObjectRoute>> {
-        match self.batch_put_scoped_routed_accept_existing(
-            requests,
-            Some(registered_sources),
-            policy,
-        ) {
-            Ok(routes) if routes.len() == requests.len() => routes.into_iter().map(Ok).collect(),
-            Ok(routes) => {
-                let error = StoreError::InvalidState(format!(
-                    "batch put status route count mismatch: got={} expected={}",
-                    routes.len(),
-                    requests.len()
-                ));
-                std::iter::repeat_with(|| Err(error.clone()))
-                    .take(requests.len())
-                    .collect()
-            }
-            Err(error) if requests.len() == 1 => vec![Err(error)],
-            Err(error) => {
-                debug!(
-                    runtime = %self.lease.runtime,
-                    items = requests.len(),
-                    error = %error,
-                    "splitting routed batch put failure into per-key status batches"
-                );
-                let mid = requests.len() / 2;
-                let mut statuses = self.batch_put_scoped_routed_accept_existing_statuses_inner(
-                    &requests[..mid],
-                    &registered_sources[..mid],
-                    policy,
-                );
-                statuses.extend(self.batch_put_scoped_routed_accept_existing_statuses_inner(
-                    &requests[mid..],
-                    &registered_sources[mid..],
-                    policy,
-                ));
-                statuses
-            }
-        }
-    }
-
     fn batch_put_scoped_routed_with_route_conflicts(
         &self,
         requests: &[PutRequest<'_>],
@@ -380,8 +329,7 @@ impl StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let rank_tracker = OperationTracker::new("batch_put_stage_rank")
-            .attribute_u64("mooncake.item_count", object_refs.len() as u64);
+        let rank_tracker = OperationTracker::new("batch_put_stage_rank");
         let rank_result = planner.rank_many(self, &object_refs);
         rank_tracker.finish(&rank_result, 0);
         let plans = rank_result?;
@@ -408,86 +356,92 @@ impl StoreClient {
             write_attempt = write_attempt.saturating_add(1);
             self.flush_due_reclaims()?;
 
-        struct PendingBatchReservation<'a> {
-            tenant: &'a str,
-            object_id: LogicalObjectId,
-            qos_tier: Option<&'a str>,
-            scoped_key: ObjectKey,
-            current: Option<ObjectRoute>,
-            value: &'a [u8],
-            quota_reservation: Option<TenantQuotaReservationRequest>,
-            candidates: Vec<ReplicaPlacementCandidate>,
-            next_candidate: usize,
-            targets: Vec<ReplicaWriteTarget>,
-            reservations: Vec<mooncake_store_core::SegmentReservation>,
-        }
+            let rank_tracker = OperationTracker::new("batch_put_stage_rank");
+            let rank_result = planner.rank_many(self, &object_refs);
+            rank_tracker.finish(&rank_result, 0);
+            let plans = rank_result?;
 
-        let release_pending = |entries: &[PendingBatchReservation<'_>], context: &str| {
-            for entry in entries {
-                let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
-                let _ = self.abort_tenant_quota_reservation(entry.quota_reservation.as_ref(), context);
+            struct PendingBatchReservation<'a> {
+                tenant: &'a str,
+                object_id: LogicalObjectId,
+                qos_tier: Option<&'a str>,
+                scoped_key: ObjectKey,
+                current: Option<ObjectRoute>,
+                value: &'a [u8],
+                quota_reservation: Option<TenantQuotaReservationRequest>,
+                candidates: Vec<ReplicaPlacementCandidate>,
+                next_candidate: usize,
+                targets: Vec<ReplicaWriteTarget>,
+                reservations: Vec<mooncake_store_core::SegmentReservation>,
             }
-        };
 
-        let reserve_tracker = OperationTracker::new("batch_put_stage_reserve").input_bytes(
-            requests
-                .iter()
-                .map(|request| request.value.len())
-                .sum::<usize>() as u64,
-        )
-        .attribute_u64("mooncake.item_count", requests.len() as u64)
-        .attribute_u64("mooncake.replica_count", resolved_policy.replica_count as u64);
-        let reserve_result = (|| {
-            let mut shared_candidates = Vec::new();
-            let mut shared_seen = BTreeSet::new();
-            let add_preferred_segments = |
-                this: &Self,
-                segments: &[SegmentName],
-                source: PreferredSegmentSource,
-                soft: bool,
-                shared_seen: &mut BTreeSet<ClientRuntimeId>,
-                shared_candidates: &mut Vec<ReplicaPlacementCandidate>,
-            | -> Result<()> {
-                for segment in segments {
-                    match this.lookup_preferred_segment(segment) {
-                        Ok(preferred) => {
-                            if this.runtime_is_suspect(&preferred.owner) {
+            let release_pending = |entries: &[PendingBatchReservation<'_>], context: &str| {
+                for entry in entries {
+                    let _ = self.release_reserved_allocations(&entry.targets, &entry.reservations);
+                    let _ = self.abort_tenant_quota_reservation(
+                        entry.quota_reservation.as_ref(),
+                        context,
+                    );
+                }
+            };
+
+            let reserve_tracker = OperationTracker::new("batch_put_stage_reserve").input_bytes(
+                requests
+                    .iter()
+                    .map(|request| request.value.len())
+                    .sum::<usize>() as u64,
+            );
+            let reserve_result = (|| {
+                let mut shared_candidates = Vec::new();
+                let mut shared_seen = BTreeSet::new();
+                let add_preferred_segments = |
+                    this: &Self,
+                    segments: &[SegmentName],
+                    source: PreferredSegmentSource,
+                    soft: bool,
+                    shared_seen: &mut BTreeSet<ClientRuntimeId>,
+                    shared_candidates: &mut Vec<ReplicaPlacementCandidate>,
+                | -> Result<()> {
+                    for segment in segments {
+                        match this.lookup_preferred_segment(segment) {
+                            Ok(preferred) => {
+                                if this.runtime_is_suspect(&preferred.owner) {
+                                    this.log_skipped_preferred_segment(
+                                        this.default_tenant(),
+                                        "*",
+                                        segment,
+                                        source,
+                                        "owner_suspect",
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                if !shared_seen.insert(preferred.owner.clone()) {
+                                    continue;
+                                }
+                                shared_candidates.push(ReplicaPlacementCandidate {
+                                    target: ReplicaPlacementTarget::Segment {
+                                        storage_runtime: preferred.owner,
+                                        segment_name: preferred.segment_name,
+                                    },
+                                    soft,
+                                });
+                            }
+                            Err(error) if this.should_skip_candidate(&error, soft) => {
                                 this.log_skipped_preferred_segment(
                                     this.default_tenant(),
                                     "*",
                                     segment,
                                     source,
-                                    "owner_suspect",
-                                    None,
+                                    Self::preferred_segment_skip_reason(&error),
+                                    Some(&error),
                                 );
-                                continue;
                             }
-                            if !shared_seen.insert(preferred.owner.clone()) {
-                                continue;
-                            }
-                            shared_candidates.push(ReplicaPlacementCandidate {
-                                target: ReplicaPlacementTarget::Segment {
-                                    storage_runtime: preferred.owner,
-                                    segment_name: preferred.segment_name,
-                                },
-                                soft,
-                            });
+                            Err(error) => return Err(error),
                         }
-                        Err(error) if this.should_skip_candidate(&error, soft) => {
-                            this.log_skipped_preferred_segment(
-                                this.default_tenant(),
-                                "*",
-                                segment,
-                                source,
-                                Self::preferred_segment_skip_reason(&error),
-                                Some(&error),
-                            );
-                        }
-                        Err(error) => return Err(error),
                     }
-                }
-                Ok(())
-            };
+                    Ok(())
+                };
             add_preferred_segments(
                 self,
                 &resolved_policy.required_preferred_segments,
@@ -530,8 +484,7 @@ impl StoreClient {
                 });
             }
 
-            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
-                .attribute_u64("mooncake.item_count", object_refs.len() as u64);
+            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
             let object_keys = object_refs
                 .iter()
                 .map(|object_ref| {
@@ -750,7 +703,40 @@ impl StoreClient {
             Ok(prepared)
         })();
         reserve_tracker.finish(&reserve_result, 0);
-        let prepared = reserve_result?;
+        let prepared = match reserve_result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if write_attempt < max_write_attempts
+                    && resolved_policy.required_preferred_segments.is_empty()
+                    && matches!(
+                        error,
+                        StoreError::Transport(_)
+                            | StoreError::NotFound(_)
+                            | StoreError::InvalidState(_)
+                    )
+                {
+                    let retry_delay = Self::batch_put_reserve_retry_delay(&error, write_attempt);
+                    if !retry_delay.is_zero() {
+                        sleep(retry_delay);
+                    }
+                    let _ = refresh_live_client_cache(
+                        self.metadata.as_ref(),
+                        &self.live_client_cache,
+                        "live_client_snapshot_batch_put_reserve_failure",
+                    );
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        items = requests.len(),
+                        attempt = write_attempt,
+                        max_write_attempts,
+                        error = %error,
+                        "retrying batch put after transient placement reservation failure"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
             .attribute_u64("mooncake.item_count", prepared.len() as u64);
         let current_routes_result = self.route_ops().load_routes(
@@ -1130,51 +1116,50 @@ impl StoreClient {
                     }
                     Err(error) => break Err(error),
                 }
-            }
-        };
-        write_tracker.finish(&write_result, 0);
-        if has_remote_targets {
-            registry::record_transport_operation(
-                "write",
-                "storage",
-                if write_result.is_ok() { "ok" } else { "error" },
-            );
-        }
-        match write_result {
-            Ok(routes) => break (routes, prepared),
-            Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
-                let failed_targets = prepared
-                    .iter()
-                    .flat_map(|entry| entry.targets.iter().cloned())
-                    .collect::<Vec<_>>();
-                self.note_remote_write_failure(
-                    &failed_targets,
-                    &error,
-                    "remote_batch_write_failed",
-                );
-                if write_attempt < max_write_attempts
-                    && resolved_policy.required_preferred_segments.is_empty()
-                    && matches!(
-                        error,
-                        StoreError::Transport(_)
-                            | StoreError::NotFound(_)
-                            | StoreError::InvalidState(_)
-                    )
-                {
-                    debug!(
-                        runtime = %self.lease.runtime,
-                        items = prepared.len(),
-                        attempt = write_attempt,
-                        max_write_attempts,
-                        error = %error,
-                        "retrying batch put after transient replica write failure"
-                    );
-                    continue;
                 }
-                return Err(error);
+            };
+            write_tracker.finish(&write_result, 0);
+            if has_remote_targets {
+                registry::record_transport_operation(
+                    "write",
+                    "storage",
+                    if write_result.is_ok() { "ok" } else { "error" },
+                );
             }
-        };
+            match write_result {
+                Ok(routes) => break (routes, prepared),
+                Err(error) => {
+                    let failed_targets = prepared
+                        .iter()
+                        .flat_map(|entry| entry.targets.iter().cloned())
+                        .collect::<Vec<_>>();
+                    self.note_remote_write_failure(
+                        &failed_targets,
+                        &error,
+                        "remote_batch_write_failed",
+                    );
+                    if write_attempt < max_write_attempts
+                        && resolved_policy.required_preferred_segments.is_empty()
+                        && matches!(
+                            error,
+                            StoreError::Transport(_)
+                                | StoreError::NotFound(_)
+                                | StoreError::InvalidState(_)
+                        )
+                    {
+                        debug!(
+                            runtime = %self.lease.runtime,
+                            items = prepared.len(),
+                            attempt = write_attempt,
+                            max_write_attempts,
+                            error = %error,
+                            "retrying batch put after transient replica write failure"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
         };
 
         let cas_requests = routes
