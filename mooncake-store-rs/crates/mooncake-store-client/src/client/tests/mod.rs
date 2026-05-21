@@ -23,11 +23,11 @@ use parking_lot::Mutex;
 use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
-    flatten_slices, now_ms, payload_checksum, record_success_metric, scatter_into_buffers,
-    shared_suspect_runtime_cache, stable_debug_log_sample, startup_prewarm_delay, AllocationSpan,
-    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
-    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
-    StoreState, SuspectRuntimeCache,
+    flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
+    scatter_into_buffers, shared_suspect_runtime_cache, stable_debug_log_sample,
+    startup_prewarm_delay, AllocationSpan, LiveClientCache, LocalAllocatorAdapter,
+    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
+    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -9710,57 +9710,23 @@ fn heartbeat_recovery_republishes_local_metadata_after_long_redis_outage() {
 }
 
 #[test]
-fn bootstrap_route_policy_uses_tenant_override_when_present() {
-    let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let writer = ClientLease {
-        runtime: ClientRuntimeId::new("writer", ClientEpoch(1)),
-        state: ClientLifecycleState::Active,
-        compatibility: CompatibilityDescriptor::default(),
-        endpoints: ClientEndpointSet::default(),
-        expires_at_ms: test_future_expiry_ms(),
+fn route_topk_from_tenant_spec_extracts_topk() {
+    let spec_with_topk = TenantPolicySpec {
+        routing: Some(TenantRoutePolicy {
+            route_topk: Some(4),
+        }),
+        ..TenantPolicySpec::default()
     };
-    let default_policy = RoutePolicy {
-        route_topk: 2,
-        route_control: RouteControlMode::EmbeddedWrh,
-        created_by: writer.runtime.clone(),
-        created_at_ms: 10,
+    assert_eq!(route_topk_from_tenant_spec(&spec_with_topk), Some(4));
+
+    let spec_without_topk = TenantPolicySpec {
+        routing: Some(TenantRoutePolicy { route_topk: None }),
+        ..TenantPolicySpec::default()
     };
-    metadata
-        .put_route_policy(&RoutePolicyDomain::Default, &default_policy)
-        .expect("default route policy should be stored");
-    metadata
-        .put_tenant_policy(
-            &TenantPolicy {
-                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
-                spec: TenantPolicySpec {
-                    routing: Some(TenantRoutePolicy {
-                        route_topk: Some(4),
-                        route_control: Some(RouteControlMode::MetadataOnly),
-                    }),
-                    ..TenantPolicySpec::default()
-                },
-                version: 1,
-                updated_at_ms: 20,
-                updated_by: "admin".to_string(),
-            },
-            None,
-        )
-        .expect("tenant policy should be stored");
+    assert_eq!(route_topk_from_tenant_spec(&spec_without_topk), None);
 
-    bootstrap_route_policy(
-        metadata.as_ref(),
-        &writer,
-        "tenant-a",
-        RouteControlMode::MetadataOnly,
-        4,
-    )
-    .expect("tenant override should satisfy bootstrap");
-
-    let effective = effective_route_policy(metadata.as_ref(), "tenant-a")
-        .expect("effective route policy should resolve")
-        .expect("effective policy should exist");
-    assert_eq!(effective.route_topk, 4);
-    assert_eq!(effective.route_control, RouteControlMode::MetadataOnly);
+    let spec_no_routing = TenantPolicySpec::default();
+    assert_eq!(route_topk_from_tenant_spec(&spec_no_routing), None);
 }
 
 #[test]
@@ -9798,10 +9764,7 @@ fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
             &TenantPolicy {
                 scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
                 spec: TenantPolicySpec {
-                    routing: Some(TenantRoutePolicy {
-                        route_topk: None,
-                        route_control: Some(RouteControlMode::MetadataOnly),
-                    }),
+                    routing: Some(TenantRoutePolicy { route_topk: None }),
                     ..TenantPolicySpec::default()
                 },
                 version: 1,
@@ -9818,7 +9781,6 @@ fn builder_resolves_scoped_tenant_policy_without_listing_all_policies() {
                 spec: TenantPolicySpec {
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(4),
-                        route_control: None,
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -9871,7 +9833,6 @@ fn namespace_quota_evicts_within_same_tenant_before_rejecting() {
                     }),
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10042,7 +10003,6 @@ fn routing_only_tenant_policy_still_inherits_namespace_quota() {
                     quota: None,
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10087,7 +10047,6 @@ fn namespace_quota_overwrite_uses_committed_delta() {
                     }),
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10154,7 +10113,6 @@ fn remove_refunds_quota_when_delete_becomes_authoritative() {
                     }),
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10214,7 +10172,6 @@ fn routed_batch_put_rejects_over_quota_all_or_nothing() {
                     }),
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10295,7 +10252,6 @@ fn tenant_local_quota_eviction_does_not_touch_other_tenants() {
                         }),
                         routing: Some(TenantRoutePolicy {
                             route_topk: Some(2),
-                            route_control: Some(RouteControlMode::MetadataOnly),
                         }),
                         ..TenantPolicySpec::default()
                     },
@@ -10417,7 +10373,6 @@ fn tenant_local_quota_eviction_preserves_other_tenant_same_logical_key() {
                         }),
                         routing: Some(TenantRoutePolicy {
                             route_topk: Some(2),
-                            route_control: Some(RouteControlMode::MetadataOnly),
                         }),
                         ..TenantPolicySpec::default()
                     },
@@ -10512,7 +10467,6 @@ fn routed_batch_put_preserves_cross_tenant_quota_isolation() {
                         }),
                         routing: Some(TenantRoutePolicy {
                             route_topk: Some(2),
-                            route_control: Some(RouteControlMode::MetadataOnly),
                         }),
                         ..TenantPolicySpec::default()
                     },
@@ -10587,7 +10541,6 @@ fn put_returns_error_when_route_publish_succeeds_but_quota_finalize_fails() {
                     }),
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     ..TenantPolicySpec::default()
                 },
@@ -10649,7 +10602,6 @@ fn runtime_uses_metadata_authored_fairness_shaping_and_placement_defaults() {
                 spec: TenantPolicySpec {
                     routing: Some(TenantRoutePolicy {
                         route_topk: Some(2),
-                        route_control: Some(RouteControlMode::MetadataOnly),
                     }),
                     fairness: Some(TenantExecutionFairnessPolicy {
                         max_remote_batch_items_per_tenant: Some(3),

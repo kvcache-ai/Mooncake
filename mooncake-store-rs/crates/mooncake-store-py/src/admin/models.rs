@@ -1,4 +1,3 @@
-use mooncake_store_client::RouteControlMode;
 use mooncake_store_core::{
     ClientRuntimeId, RoutePolicy, TenantObjectAccounting, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaReservation, TenantQuotaReservationState, TenantQuotaState,
@@ -47,7 +46,6 @@ pub struct TenantQuotaAbortResponse {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicyPatchInput {
     pub route_topk: Option<u32>,
-    pub route_control: Option<RouteControlMode>,
     pub max_bytes: Option<u64>,
     pub max_objects: Option<usize>,
     pub max_remote_batch_items_per_tenant: Option<usize>,

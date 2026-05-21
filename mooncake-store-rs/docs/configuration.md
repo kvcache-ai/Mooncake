@@ -174,7 +174,7 @@ Notes:
 | `transport(...)` / `with_tent(...)` | none | required for remote transfer paths; low-level Rust transport is wired explicitly |
 | `transport_factory(...)` | none | used to create transports for peers |
 | `routed_writes(...)` | disabled | enables routed placement |
-| `route_control(...)` | `EmbeddedWrh` | compatibility fallback route-control mode; metadata tenant policy wins when present |
+| `route_control(...)` | `EmbeddedWrh` | cluster-level route-control mode (EmbeddedWrh or MetadataOnly); fixed at startup, not overridable per-tenant |
 | `route_topk(...)` | `2` | compatibility fallback WRH route-authority fanout; metadata tenant policy wins when present; must be `>= 2` |
 | `live_client_sync_interval(...)` | `1s` | background refresh interval for the live-client membership snapshot; `0` disables the worker |
 
@@ -306,7 +306,8 @@ Embedded route authorities maintain in-memory indexes for scope and reuse-identi
 Startup bootstrap is metadata-authoritative:
 
 - admin-managed tenant policy is the preferred source for tenant-scoped routing
-- runtime-local `route_control + route_topk` values are bootstrap/compatibility fallbacks only
+- runtime-local `route_topk` is a bootstrap/compatibility fallback (tenant policy overrides it)
+- `route_control` is always determined by the CLI setting (cluster-level, not per-tenant)
 - if the metadata keyspace has no default route policy yet, the first successful client writes it with create-if-absent semantics
 - startup then resolves the effective policy for the client's default tenant: tenant override first, otherwise the default cluster policy
 - later clients must match that effective policy or startup fails immediately
@@ -487,7 +488,7 @@ same falsey-value parsing as the standalone runtime boolean flags.
 
 Important Python-only compatibility knobs:
 
-`tenant`, `domain`, and `object_set` form the default namespace scope used by Python compatibility read/write operations when a request does not provide a more specific scope. `route_topk` and `route_control` are kept for compatibility, but admin-managed tenant policy in metadata is the preferred place to author tenant-scoped routing policy.
+`tenant`, `domain`, and `object_set` form the default namespace scope used by Python compatibility read/write operations when a request does not provide a more specific scope. `route_topk` is kept for compatibility, but admin-managed tenant policy in metadata is the preferred place to author tenant-scoped routing policy. `route_control` is a cluster-level deployment setting fixed at startup.
 
 
 | Parameter | Meaning |

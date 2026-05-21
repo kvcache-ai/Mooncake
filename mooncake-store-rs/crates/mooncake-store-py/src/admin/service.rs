@@ -15,8 +15,8 @@ use mooncake_store_client::{
 };
 use mooncake_store_core::{
     route_logical_object_id, ClientEpoch, ClientLease, ClientRuntimeId, ClientStableId,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, RoutePolicy,
-    RoutePolicyDomain, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
+    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, RoutePolicyDomain,
+    StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
     TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationState,
     TenantRoutePolicy, DEFAULT_DOMAIN, DEFAULT_OBJECT_SET,
@@ -1209,7 +1209,6 @@ impl AdminService {
         let policy = merge_tenant_policy(current.as_ref(), scope.clone(), patch, updated_by);
         let expected = expected_version.or_else(|| current.as_ref().map(|policy| policy.version));
         let stored = self.backend.put_tenant_policy(&policy, expected)?;
-        sync_legacy_route_policy(self.backend.as_ref(), &stored)?;
         Ok(stored)
     }
 
@@ -1639,9 +1638,8 @@ pub fn tenant_policy_patch(values: &PolicyPatchInput) -> AdminResult<TenantPolic
     Ok(TenantPolicySpec {
         routing: Some(TenantRoutePolicy {
             route_topk: values.route_topk,
-            route_control: values.route_control,
         })
-        .filter(|policy| policy.route_topk.is_some() || policy.route_control.is_some()),
+        .filter(|policy| policy.route_topk.is_some()),
         quota: Some(TenantQuotaPolicy {
             max_bytes: values.max_bytes,
             max_objects: values.max_objects,
@@ -1704,36 +1702,6 @@ pub fn merge_tenant_policy(
         updated_at_ms: now_ms(),
         updated_by: updated_by.to_string(),
     }
-}
-
-pub fn sync_legacy_route_policy(
-    backend: &dyn MetadataBackend,
-    policy: &TenantPolicy,
-) -> AdminResult<()> {
-    if !is_root_tenant_scope(&policy.scope) {
-        return Ok(());
-    }
-    let domain = RoutePolicyDomain::Tenant(policy.scope.tenant.clone());
-    if let Some(routing) = policy.spec.routing.as_ref() {
-        if let Some(route_policy) = route_policy_from_tenant_policy(policy, routing) {
-            backend.put_route_policy(&domain, &route_policy)?;
-            return Ok(());
-        }
-    }
-    backend.delete_route_policy(&domain)?;
-    Ok(())
-}
-
-pub fn route_policy_from_tenant_policy(
-    policy: &TenantPolicy,
-    routing: &TenantRoutePolicy,
-) -> Option<RoutePolicy> {
-    Some(RoutePolicy {
-        route_topk: routing.route_topk?,
-        route_control: routing.route_control?,
-        created_by: ClientRuntimeId::new(policy.updated_by.clone(), ClientEpoch(0)),
-        created_at_ms: policy.updated_at_ms,
-    })
 }
 
 pub fn is_root_tenant_scope(scope: &TenantPolicyScope) -> bool {
@@ -2700,10 +2668,7 @@ mod tests {
                     scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
                     spec: TenantPolicySpec {
                         routing: Some(TenantRoutePolicy {
-                            route_topk: None,
-                            route_control: Some(
-                                mooncake_store_client::RouteControlMode::MetadataOnly,
-                            ),
+                            route_topk: Some(3),
                         }),
                         ..TenantPolicySpec::default()
                     },
@@ -2721,7 +2686,6 @@ mod tests {
                     spec: TenantPolicySpec {
                         routing: Some(TenantRoutePolicy {
                             route_topk: Some(4),
-                            route_control: None,
                         }),
                         ..TenantPolicySpec::default()
                     },
@@ -2747,7 +2711,6 @@ mod tests {
                 .routing,
             Some(TenantRoutePolicy {
                 route_topk: Some(4),
-                route_control: Some(mooncake_store_client::RouteControlMode::MetadataOnly),
             })
         );
     }

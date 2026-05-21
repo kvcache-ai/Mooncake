@@ -13,7 +13,7 @@ Runtime-local builder, Python, CLI, and environment knobs still exist as compati
 
 Store-RS multi-tenant isolation currently spans these areas:
 
-- tenant-scoped routing defaults such as `route_control` and `route_topk`
+- tenant-scoped routing defaults such as `route_topk`
 - tenant-scoped quota defaults such as `max_bytes` and `max_objects`
 - placement defaults such as replica count, preferred storage owners, and preferred segment hints
 - QoS-related defaults such as fairness and shaping knobs
@@ -71,7 +71,8 @@ Tenant-scoped policy resolution is ordered like this:
 Practical takeaway:
 
 - if a tenant policy exists in metadata, treat it as the source of truth
-- local `route_topk`, `route_control`, `namespace_quota`, `execution_fairness`, and `bandwidth_shaping` are fallback knobs, not the preferred authoring surface
+- local `route_topk`, `namespace_quota`, `execution_fairness`, and `bandwidth_shaping` are fallback knobs, not the preferred authoring surface
+- `route_control` is a cluster-level deployment setting (CLI only), not a per-tenant knob
 
 ## Basic Operator Workflow
 

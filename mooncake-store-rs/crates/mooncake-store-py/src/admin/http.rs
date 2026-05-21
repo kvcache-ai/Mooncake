@@ -727,7 +727,7 @@ mod tests {
     use std::time::Duration;
 
     use mooncake_metadata::{InMemoryMetadataBackend, MetadataKeyspace};
-    use mooncake_store_client::{control_plane_pb, RouteControlMode};
+    use mooncake_store_client::control_plane_pb;
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
         CompatibilityDescriptor, MetadataBackend, ObjectKey, ObjectRoute, ReplicaRoute,
@@ -914,7 +914,6 @@ mod tests {
 
         let put_body = serde_json::json!({
             "route_topk": 3,
-            "route_control": "EmbeddedWrh",
             "updated_by": "tester"
         })
         .to_string();
@@ -1067,7 +1066,6 @@ mod tests {
                 None,
                 PolicyPatchInput {
                     route_topk: Some(4),
-                    route_control: Some(RouteControlMode::MetadataOnly),
                     ..PolicyPatchInput::default()
                 },
                 None,
@@ -1078,7 +1076,6 @@ mod tests {
             stored.spec.routing,
             Some(TenantRoutePolicy {
                 route_topk: Some(4),
-                route_control: Some(RouteControlMode::MetadataOnly),
             })
         );
 
@@ -1090,7 +1087,6 @@ mod tests {
             Some(TenantPolicySpec {
                 routing: Some(TenantRoutePolicy {
                     route_topk: Some(4),
-                    route_control: Some(RouteControlMode::MetadataOnly),
                 }),
                 ..TenantPolicySpec::default()
             })

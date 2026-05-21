@@ -679,10 +679,10 @@ This is the default mode.
 
 Cluster policy is metadata-authoritative:
 
-- every client starts with a local `route_control + route_topk` policy
-- the first client in a metadata keyspace persists that policy
+- every client starts with a local `route_control` (cluster-level) and `route_topk` (fallback, overridable per-tenant)
+- the first client in a metadata keyspace persists the cluster route policy
 - later clients must match the stored policy or startup fails
-- request-level tenants share that policy inside one metadata keyspace
+- `route_control` is uniform across all tenants in a metadata keyspace
 
 ### `MetadataOnly`
 

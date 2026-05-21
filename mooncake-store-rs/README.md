@@ -95,7 +95,7 @@ The implementation is easier to understand when grouped by capability instead of
 - prewarmed membership snapshots with background lease refresh instead of request-path membership refresh
 - read fail-fast on suspect or offline owners while keeping draining owners readable during handoff
 - suspect owners stay quarantined until a fresh lease heartbeat or control-plane endpoint change proves recovery
-- cluster route policy bootstrap in metadata: the first client in a metadata keyspace publishes `route_control + route_topk`, later clients must match or fail startup
+- cluster route policy bootstrap in metadata: the first client in a metadata keyspace publishes `route_control + route_topk` as the cluster policy, later clients must match or fail startup
 
 ### Placement and Replication
 
@@ -181,7 +181,7 @@ The intended operator flow is:
 
 What tenant policy covers:
 
-- routing defaults such as `route_control` and `route_topk`
+- routing defaults such as `route_topk`
 - quota limits such as `max_bytes` and `max_objects`
 - placement defaults such as replica count and preferred storage owners
 - QoS-related defaults such as fairness and shaping knobs
