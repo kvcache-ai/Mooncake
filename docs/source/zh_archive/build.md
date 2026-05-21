@@ -95,12 +95,12 @@
     ```
 
 2. 如果你要编译Nvidia GPUDirect 支持模块，首先需按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的指引安装 CUDA (确保启用 `nvidia-fs` 以正确编译 `cuFile` 模块)。之后:
-    1) 按照 https://docs.nvidia.com/cuda/gpudirect-rdma/ 的第 3.7 节说明安装 `nvidia-peermem` 以启用 GPU-Direct RDMA
-    2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
+    1) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
+    > **注意：** 默认情况下，Mooncake 使用 DMA-BUF 路径进行 GPU-Direct RDMA，**无需** `nvidia-peermem` 内核模块。如需使用依赖 `nvidia-peermem` 的传统 `ibv_reg_mr` 路径，请在启动 Mooncake 前设置运行时环境变量 `WITH_NVIDIA_PEERMEM=1`。安装 `nvidia-peermem` 的说明见 https://docs.nvidia.com/cuda/gpudirect-rdma/ 第 3.7 节。
 
 3. 如果你要编译Moore Threads GPUDirect RDMA 支持模块，首先需按照 https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide 的指引安装 MUSA SDK。之后:
     1) 安装 `mthreads-peermem` 以启用 GPU-Direct RDMA
