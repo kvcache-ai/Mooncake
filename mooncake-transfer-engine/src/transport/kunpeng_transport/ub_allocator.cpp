@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cstddef>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 #include <glog/logging.h>
+#include <numa.h>
 
 #include "ub_allocator.h"
 
@@ -14,39 +16,41 @@ struct UbStoreMemRange {
 std::mutex g_ub_store_mem_mutex;
 std::vector<UbStoreMemRange> g_ub_store_mem_ranges;
 
-void remove_store_memory_range(void* ptr) {
+size_t remove_store_memory_range(void* ptr) {
     std::lock_guard<std::mutex> store_lock(g_ub_store_mem_mutex);
     auto it = std::remove_if(
         g_ub_store_mem_ranges.begin(), g_ub_store_mem_ranges.end(),
         [ptr](const UbStoreMemRange& range) { return range.base == ptr; });
     g_ub_store_mem_ranges.erase(it, g_ub_store_mem_ranges.end());
+    if (it != g_ub_store_mem_ranges.end()) {
+        return it->size;
+    }
+    LOG(ERROR) << "failed for UB protocol, addr at " << ptr;
+    return 0;
 }
 
 void* ub_allocate_memory(size_t alignment, size_t total_size) {
-    size_t page_size = getpagesize();
-    size_t ub_alignment = std::max(alignment / page_size * page_size, page_size);
-    void** ptr = nullptr;
-    auto ret = posix_memalign(ptr, ub_alignment, total_size);
-    if (!ret) {
+    void* ptr = numa_alloc_local(total_size);
+    if (!ptr) {
         LOG(ERROR) << "failed for UB protocol, size="
                    << total_size << ", alignment : " << alignment;
         return nullptr;
     }
     LOG(INFO) << "UB:  allocated total size : " << total_size
-                << ", alignment : " << alignment << " addr at " << *ptr;
+                << ", alignment : " << alignment << " addr at " << ptr;
 
     std::lock_guard<std::mutex> store_lock(g_ub_store_mem_mutex);
-    g_ub_store_mem_ranges.push_back({*ptr, total_size});
+    g_ub_store_mem_ranges.push_back({ptr, total_size});
 
-    return *ptr;
+    return ptr;
 }
 
 void ub_free_memory(void* ptr) {
     if (!ptr) {
         return;
     }
-    remove_store_memory_range(ptr);
-    free(ptr);
+    auto size = remove_store_memory_range(ptr);
+    numa_free(ptr, size);
     LOG(INFO) << "UB: freed  bytes at " << ptr;
 }
 
