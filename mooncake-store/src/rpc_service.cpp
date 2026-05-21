@@ -1072,7 +1072,8 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -1083,7 +1084,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 
     for (const auto& key : keys) {
         results.emplace_back(
-            master_service_.PutEnd(client_id, key, ReplicaType::MEMORY));
+            master_service_.PutEnd(client_id, key, replica_type));
     }
 
     size_t failure_count = 0;
@@ -1111,7 +1112,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -1122,7 +1124,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 
     for (const auto& key : keys) {
         results.emplace_back(
-            master_service_.PutRevoke(client_id, key, ReplicaType::MEMORY));
+            master_service_.PutRevoke(client_id, key, replica_type));
     }
 
     size_t failure_count = 0;
@@ -1365,6 +1367,25 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountSegment(
         [] { MasterMetricManager::instance().inc_mount_segment_failures(); });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
+    const NoFSegment& segment, const UUID& client_id) {
+    return execute_rpc(
+        "MountNoFSegment",
+        [&] { return master_service_.MountNoFSegment(segment, client_id); },
+        [&](auto& timer) {
+            timer.LogRequest("NoF segment mount: ", "base=", segment.base,
+                             ", size=", segment.size,
+                             ", segment_name=", segment.name,
+                             ", id=", segment.id);
+        },
+        [] {
+            MasterMetricManager::instance().inc_mount_nof_segment_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_mount_nof_segment_failures();
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -1376,6 +1397,23 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
         },
         [] { MasterMetricManager::instance().inc_remount_segment_requests(); },
         [] { MasterMetricManager::instance().inc_remount_segment_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::ReMountNoFSegment(
+    const std::vector<NoFSegment>& segments, const UUID& client_id) {
+    return execute_rpc(
+        "ReMountNoFSegment",
+        [&] { return master_service_.ReMountNoFSegment(segments, client_id); },
+        [&](auto& timer) {
+            timer.LogRequest("NoF segment remount: ", "segments_count=",
+                             segments.size(), ", client_id=", client_id);
+        },
+        [] {
+            MasterMetricManager::instance().inc_remount_nof_segment_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_remount_nof_segment_failures();
+        });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
@@ -1412,6 +1450,43 @@ tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
             MasterMetricManager::instance()
                 .inc_unmount_segment_failures();  // reuse metric or add new
         });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::UnmountNoFSegment(
+    const UUID& segment_id, const UUID& client_id) {
+    return execute_rpc(
+        "UnmountNoFSegment",
+        [&] {
+            return master_service_.UnmountNoFSegment(segment_id, client_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("NoF segment unmount: ", "segment_id=", segment_id,
+                             ", client_id=", client_id);
+        },
+        [] {
+            MasterMetricManager::instance().inc_unmount_nof_segment_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_unmount_nof_segment_failures();
+        });
+}
+
+tl::expected<std::vector<NoFSegment>, ErrorCode>
+WrappedMasterService::GetAllNoFSegments() {
+    return execute_rpc(
+        "GetAllNoFSegments",
+        [&] { return master_service_.GetAllNoFSegments(); },
+        [&](auto& timer) { timer.LogRequest("Get all NoF segments"); }, [] {},
+        [] {});
+}
+
+tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
+    return execute_rpc(
+        "GetNoFSegmentsByName",
+        [&] { return master_service_.GetNoFSegmentsByName(segment_name); },
+        [&](auto& timer) { timer.LogRequest("segment_name=", segment_name); },
+        [] {}, [] {});
 }
 
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
@@ -1787,12 +1862,23 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ReMountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UnmountSegment>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GracefulUnmountSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::UnmountNoFSegment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetAllNoFSegments>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);

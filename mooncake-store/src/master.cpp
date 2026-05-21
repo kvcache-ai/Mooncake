@@ -79,10 +79,15 @@ DEFINE_bool(allow_evict_soft_pinned_objects,
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
-              "Ratio of objects to evict when storage space is full");
+              "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-              "Ratio of high watermark trigger eviction");
+              "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
+              "Ratio of objects to evict when NoF SSD space is full");
+DEFINE_double(nof_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
+              "Ratio of high watermark trigger eviction in NoF SSD");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -102,7 +107,14 @@ DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
-        LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
+        LOG(FATAL) << "Mem eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
         return false;
     }
     return true;
@@ -122,10 +134,22 @@ DEFINE_string(ha_backend_connstring, "",
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "Seconds a client stays considered alive after the last heartbeat. "
-             "If this TTL elapses without a refresh, the master treats the "
-             "client as disconnected and may unmount its segments");
+DEFINE_int64(
+    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+    "Seconds a client stays considered alive after the last heartbeat. "
+    "If this TTL elapses without a refresh, the master treats the "
+    "client as disconnected and may unmount its segments");
+DEFINE_int64(nof_heartbeat_interval_sec,
+             mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
+             "How often master probes each mounted NoF segment");
+DEFINE_uint32(nof_heartbeat_probe_timeout_ms,
+              mooncake::DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS,
+              "Timeout in milliseconds for a single NoF heartbeat probe");
+DEFINE_uint32(
+    nof_heartbeat_failures_threshold,
+    mooncake::DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD,
+    "Consecutive NoF heartbeat failures required before unmounting a NoF "
+    "segment");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -290,9 +314,24 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("nof_eviction_ratio",
+                             &master_config.nof_eviction_ratio,
+                             FLAGS_nof_eviction_ratio);
+    default_config.GetDouble("nof_eviction_high_watermark_ratio",
+                             &master_config.nof_eviction_high_watermark_ratio,
+                             FLAGS_nof_eviction_high_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetInt64("nof_heartbeat_interval_sec",
+                            &master_config.nof_heartbeat_interval_sec,
+                            FLAGS_nof_heartbeat_interval_sec);
+    default_config.GetUInt32("nof_heartbeat_probe_timeout_ms",
+                             &master_config.nof_heartbeat_probe_timeout_ms,
+                             FLAGS_nof_heartbeat_probe_timeout_ms);
+    default_config.GetUInt32("nof_heartbeat_failures_threshold",
+                             &master_config.nof_heartbeat_failures_threshold,
+                             FLAGS_nof_heartbeat_failures_threshold);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -534,6 +573,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
     }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_ratio = FLAGS_nof_eviction_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_high_watermark_ratio =
+            FLAGS_nof_eviction_high_watermark_ratio;
+    }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -563,6 +614,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_interval_sec =
+            FLAGS_nof_heartbeat_interval_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_probe_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_probe_timeout_ms =
+            FLAGS_nof_heartbeat_probe_timeout_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_failures_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_failures_threshold =
+            FLAGS_nof_heartbeat_failures_threshold;
     }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||

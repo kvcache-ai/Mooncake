@@ -41,6 +41,15 @@ class MasterMetricManager {
     void inc_valid_get_nums(int64_t val = 1);
     void inc_total_get_nums(int64_t val = 1);
 
+    // NoF segment Metrics
+    void inc_allocated_nof_size(const std::string& segment, int64_t val = 1);
+    void dec_allocated_nof_size(const std::string& segment, int64_t val = 1);
+    void reset_allocated_nof_size();
+    void inc_total_nof_capacity(const std::string& segment, int64_t val = 1);
+    void dec_total_nof_capacity(const std::string& segment, int64_t val = 1);
+    void reset_total_nof_capacity();
+    double get_global_nof_used_ratio(void);
+
     enum class CacheHitStat {
         MEMORY_HITS,
         SSD_HITS,
@@ -67,6 +76,17 @@ class MasterMetricManager {
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
+
+    // NoF segment Metrics
+    void inc_allocated_nof_size(int64_t val = 1);
+    void dec_allocated_nof_size(int64_t val = 1);
+    void inc_total_nof_capacity(int64_t val = 1);
+    void dec_total_nof_capacity(int64_t val = 1);
+    int64_t get_allocated_nof_size();
+    int64_t get_total_nof_capacity();
+    double get_segment_nof_used_ratio(const std::string& segment);
+    int64_t get_segment_allocated_nof_size(const std::string& segment);
+    int64_t get_segment_total_nof_capacity(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -122,12 +142,23 @@ class MasterMetricManager {
     void inc_remove_all_failures(int64_t val = 1);
     void inc_mount_segment_requests(int64_t val = 1);
     void inc_mount_segment_failures(int64_t val = 1);
+    void inc_mount_nof_segment_requests(int64_t val = 1);
+    void inc_mount_nof_segment_failures(int64_t val = 1);
     void inc_unmount_segment_requests(int64_t val = 1);
     void inc_unmount_segment_failures(int64_t val = 1);
+    void inc_unmount_nof_segment_requests(int64_t val = 1);
+    void inc_unmount_nof_segment_failures(int64_t val = 1);
     void inc_remount_segment_requests(int64_t val = 1);
     void inc_remount_segment_failures(int64_t val = 1);
+    void inc_remount_nof_segment_requests(int64_t val = 1);
+    void inc_remount_nof_segment_failures(int64_t val = 1);
     void inc_ping_requests(int64_t val = 1);
     void inc_ping_failures(int64_t val = 1);
+    void inc_nof_heartbeat_success_total(int64_t val = 1);
+    void inc_nof_heartbeat_failure_total(int64_t val = 1);
+    void inc_nof_heartbeat_timeout_total(int64_t val = 1);
+    void inc_nof_segments_unmounted_by_heartbeat_total(int64_t val = 1);
+    void observe_nof_heartbeat_probe_latency_ms(int64_t latency_ms);
 
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
@@ -219,14 +250,32 @@ class MasterMetricManager {
     int64_t get_batch_put_revoke_failed_items();
 
     // Eviction Metrics
+    // total eviction metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
     void inc_eviction_fail();  // not a single object is evicted
+    // mem eviction metrics
+    void inc_mem_eviction_success(int64_t key_count, int64_t size);
+    void inc_mem_eviction_fail();  // not a single object is evicted
+    // nof eviction metrics
+    void inc_nof_eviction_success(int64_t key_count, int64_t size);
+    void inc_nof_eviction_fail();  // not a single object is evicted
 
     // Eviction Metrics Getters
+    // total eviction metrics
     int64_t get_eviction_success();
     int64_t get_eviction_attempts();
     int64_t get_evicted_key_count();
     int64_t get_evicted_size();
+    // mem eviction metrics
+    int64_t get_mem_eviction_success();
+    int64_t get_mem_eviction_attempts();
+    int64_t get_mem_evicted_key_count();
+    int64_t get_mem_evicted_size();
+    // nof eviction metrics
+    int64_t get_nof_eviction_success();
+    int64_t get_nof_eviction_attempts();
+    int64_t get_nof_evicted_key_count();
+    int64_t get_nof_evicted_size();
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -394,6 +443,14 @@ class MasterMetricManager {
         int64_t eviction_attempts = 0;
         int64_t evicted_key_count = 0;
         int64_t evicted_size = 0;
+        int64_t mem_eviction_success = 0;
+        int64_t mem_eviction_attempts = 0;
+        int64_t mem_evicted_key_count = 0;
+        int64_t mem_evicted_size = 0;
+        int64_t nof_eviction_success = 0;
+        int64_t nof_eviction_attempts = 0;
+        int64_t nof_evicted_key_count = 0;
+        int64_t nof_evicted_size = 0;
         int64_t ping = 0;
         int64_t ping_fails = 0;
         int64_t mark_task_to_complete_requests = 0;
@@ -420,6 +477,18 @@ class MasterMetricManager {
                                           // gauge
     ylt::metric::dynamic_gauge_1t
         mem_total_capacity_per_segment_;  // Segment memory capacity update for
+                                          // gauge
+
+    // NoF Segment Metrics
+    ylt::metric::gauge_t
+        nof_allocated_size_;  // Overall NoF SSD usage update for gauge
+    ylt::metric::gauge_t
+        nof_total_capacity_;  // Overall NoF SSD capacity update for gauge
+    ylt::metric::dynamic_gauge_1t
+        nof_allocated_size_per_segment_;  // NoF segment usage update for
+                                          // gauge
+    ylt::metric::dynamic_gauge_1t
+        nof_total_capacity_per_segment_;  // NoF segment capacity update for
                                           // gauge
 
     // File Storage Metrics
@@ -461,8 +530,19 @@ class MasterMetricManager {
     ylt::metric::counter_t unmount_segment_failures_;
     ylt::metric::counter_t remount_segment_requests_;
     ylt::metric::counter_t remount_segment_failures_;
+    ylt::metric::counter_t mount_nof_segment_requests_;
+    ylt::metric::counter_t mount_nof_segment_failures_;
+    ylt::metric::counter_t unmount_nof_segment_requests_;
+    ylt::metric::counter_t unmount_nof_segment_failures_;
+    ylt::metric::counter_t remount_nof_segment_requests_;
+    ylt::metric::counter_t remount_nof_segment_failures_;
     ylt::metric::counter_t ping_requests_;
     ylt::metric::counter_t ping_failures_;
+    ylt::metric::counter_t nof_heartbeat_success_total_;
+    ylt::metric::counter_t nof_heartbeat_failure_total_;
+    ylt::metric::counter_t nof_heartbeat_timeout_total_;
+    ylt::metric::counter_t nof_segments_unmounted_by_heartbeat_total_;
+    ylt::metric::histogram_t nof_heartbeat_probe_latency_ms_;
 
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
@@ -521,10 +601,21 @@ class MasterMetricManager {
                        {CacheHitStat::VALID_GET_RATE, "valid_get_rate"}};
 
     // Eviction Metrics
+    // total eviction metrics
     ylt::metric::counter_t eviction_success_;
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+    // mem eviction metrics
+    ylt::metric::counter_t mem_eviction_success_;
+    ylt::metric::counter_t mem_eviction_attempts_;
+    ylt::metric::counter_t mem_evicted_key_count_;
+    ylt::metric::counter_t mem_evicted_size_;
+    // nof eviction metrics
+    ylt::metric::counter_t nof_eviction_success_;
+    ylt::metric::counter_t nof_eviction_attempts_;
+    ylt::metric::counter_t nof_evicted_key_count_;
+    ylt::metric::counter_t nof_evicted_size_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
