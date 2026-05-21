@@ -18,15 +18,20 @@ std::vector<UbStoreMemRange> g_ub_store_mem_ranges;
 
 size_t remove_store_memory_range(void* ptr) {
     std::lock_guard<std::mutex> store_lock(g_ub_store_mem_mutex);
-    auto it = std::remove_if(
-        g_ub_store_mem_ranges.begin(), g_ub_store_mem_ranges.end(),
+    
+    auto it = std::find_if(
+        g_ub_store_mem_ranges.begin(),
+        g_ub_store_mem_ranges.end(),
         [ptr](const UbStoreMemRange& range) { return range.base == ptr; });
-    g_ub_store_mem_ranges.erase(it, g_ub_store_mem_ranges.end());
-    if (it != g_ub_store_mem_ranges.end()) {
-        return it->size;
+
+    if (it == g_ub_store_mem_ranges.end()) {
+        LOG(ERROR) << "failed for UB protocol, addr at " << ptr;
+        return 0;
     }
-    LOG(ERROR) << "failed for UB protocol, addr at " << ptr;
-    return 0;
+
+    size_t sz = it->size;           // 先保存 size
+    g_ub_store_mem_ranges.erase(it); // 再删除
+    return sz;
 }
 
 void* ub_allocate_memory(size_t alignment, size_t total_size) {
