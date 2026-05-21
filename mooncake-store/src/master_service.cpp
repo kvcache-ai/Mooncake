@@ -442,6 +442,7 @@ auto MasterService::RemoveByRegex(std::string_view regex_pattern)
 
 long MasterService::RemoveAll() {
     long removed_count = 0;
+    uint64_t total_freed_size = 0;
 
     for (size_t i = 0; i < GetShardCount(); ++i) {
         auto& shard = GetShard(i);
@@ -449,6 +450,9 @@ long MasterService::RemoveAll() {
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
             if (it->second->IsObjectRemovable()) {
+                auto mem_rep_count =
+                    it->second->CountReplicas(&Replica::fn_is_memory_replica);
+                total_freed_size += it->second->size_ * mem_rep_count;
                 OnObjectRemoved(*it->second);
                 RemoveReplicaFromSegmentIndex(shard, it->first,
                                               it->second->replicas_);
@@ -461,7 +465,8 @@ long MasterService::RemoveAll() {
     }
 
     VLOG(1) << "action=remove_all_objects"
-            << ", removed_count=" << removed_count;
+            << ", removed_count=" << removed_count
+            << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 

@@ -331,6 +331,92 @@ WrappedCentralizedMasterService::BatchReplicaClear(
     return result;
 }
 
+tl::expected<CopyStartResponse, ErrorCode>
+WrappedCentralizedMasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
+    return execute_rpc(
+        "CopyStart",
+        [&] {
+            return master_service_.CopyStart(client_id, key, src_segment,
+                                             tgt_segments);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segments_count=", tgt_segments.size());
+        },
+        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedCentralizedMasterService::CopyEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyEnd", [&] { return master_service_.CopyEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_end_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedCentralizedMasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyRevoke",
+        [&] { return master_service_.CopyRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
+}
+
+tl::expected<MoveStartResponse, ErrorCode>
+WrappedCentralizedMasterService::MoveStart(const UUID& client_id,
+                                           const std::string& key,
+                                           const std::string& src_segment,
+                                           const std::string& tgt_segment) {
+    return execute_rpc(
+        "MoveStart",
+        [&] {
+            return master_service_.MoveStart(client_id, key, src_segment,
+                                             tgt_segment);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segment=", tgt_segment);
+        },
+        [] { MasterMetricManager::instance().inc_move_start_requests(); },
+        [] { MasterMetricManager::instance().inc_move_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedCentralizedMasterService::MoveEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveEnd", [&] { return master_service_.MoveEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_end_requests(); },
+        [] { MasterMetricManager::instance().inc_move_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedCentralizedMasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveRevoke",
+        [&] { return master_service_.MoveRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
+}
+
 tl::expected<UUID, ErrorCode> WrappedCentralizedMasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return execute_rpc(
@@ -496,6 +582,25 @@ void RegisterCentralizedRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::CopyStart>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedCentralizedMasterService::CopyEnd>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::CopyRevoke>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::MoveStart>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedCentralizedMasterService::MoveEnd>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::MoveRevoke>(
         &wrapped_master_service);
 
     server.register_handler<

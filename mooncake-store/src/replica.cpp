@@ -14,6 +14,7 @@ std::optional<UUID> Replica::get_p2p_client_id() const {
 
 Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
+    desc.id = id_;
     desc.status = status_;
 
     if (is_memory_replica()) {
@@ -64,7 +65,8 @@ Replica::Descriptor Replica::get_descriptor() const {
 }
 
 std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
-    os << "Descriptor: { status: " << desc.status << ", ";
+    os << "Descriptor: { id: " << desc.id << ", status: " << desc.status
+       << ", ";
     std::visit(
         [&os](const auto& d) {
             using T = std::decay_t<decltype(d)>;
@@ -93,7 +95,8 @@ std::ostream& operator<<(std::ostream& os, const Replica::Descriptor& desc) {
 }
 
 std::ostream& operator<<(std::ostream& os, const Replica& replica) {
-    os << "Replica: { status: " << replica.status_ << ", ";
+    os << "Replica: { id: " << replica.id_ << ", status: " << replica.status_
+       << ", ";
 
     if (replica.is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
@@ -129,7 +132,7 @@ std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         os << ", object_size: " << proxy_data.object_size;
     }
 
-    os << " }";
+    os << ", refcnt: " << replica.refcnt_.load() << " }";
     return os;
 }
 

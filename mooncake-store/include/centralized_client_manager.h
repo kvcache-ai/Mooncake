@@ -33,6 +33,10 @@ class CentralizedClientManager final : public ClientManager {
                   const std::vector<std::string>& preferred_segments)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
+    auto AllocateFrom(const uint64_t slice_length,
+                      const std::string& segment_name)
+        -> tl::expected<Replica, ErrorCode>;
+
    protected:
     DeploymentMode GetDeploymentMode() const override {
         return DeploymentMode::CENTRALIZATION;

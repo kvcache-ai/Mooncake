@@ -62,6 +62,36 @@ struct RpcNameTraits<&WrappedCentralizedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::CopyStart> {
+    static constexpr const char* value = "CopyStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::CopyEnd> {
+    static constexpr const char* value = "CopyEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::CopyRevoke> {
+    static constexpr const char* value = "CopyRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::MoveStart> {
+    static constexpr const char* value = "MoveStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::MoveEnd> {
+    static constexpr const char* value = "MoveEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::MoveRevoke> {
+    static constexpr const char* value = "MoveRevoke";
+};
+
+template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::CreateCopyTask> {
     static constexpr const char* value = "CreateCopyTask";
 };
@@ -251,6 +281,80 @@ tl::expected<void, ErrorCode> CentralizedMasterClient::NotifyOffloadSuccess(
     auto result =
         invoke_rpc<&WrappedCentralizedMasterService::NotifyOffloadSuccess,
                    void>(client_id, keys, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<CopyStartResponse, ErrorCode> CentralizedMasterClient::CopyStart(
+    const std::string& key, const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::CopyStart");
+    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+                     ", tgt_segments_count=", tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedCentralizedMasterService::CopyStart,
+                             CopyStartResponse>(client_id_, key, src_segment,
+                                                tgt_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterClient::CopyEnd(
+    const std::string& key) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::CopyEnd");
+    timer.LogRequest("key=", key);
+
+    auto result = invoke_rpc<&WrappedCentralizedMasterService::CopyEnd, void>(
+        client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterClient::CopyRevoke(
+    const std::string& key) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::CopyRevoke");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedCentralizedMasterService::CopyRevoke, void>(
+            client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<MoveStartResponse, ErrorCode> CentralizedMasterClient::MoveStart(
+    const std::string& key, const std::string& src_segment,
+    const std::string& tgt_segment) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::MoveStart");
+    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+                     ", tgt_segment=", tgt_segment);
+
+    auto result = invoke_rpc<&WrappedCentralizedMasterService::MoveStart,
+                             MoveStartResponse>(client_id_, key, src_segment,
+                                                tgt_segment);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterClient::MoveEnd(
+    const std::string& key) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::MoveEnd");
+    timer.LogRequest("key=", key);
+
+    auto result = invoke_rpc<&WrappedCentralizedMasterService::MoveEnd, void>(
+        client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterClient::MoveRevoke(
+    const std::string& key) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::MoveRevoke");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedCentralizedMasterService::MoveRevoke, void>(
+            client_id_, key);
     timer.LogResponseExpected(result);
     return result;
 }
