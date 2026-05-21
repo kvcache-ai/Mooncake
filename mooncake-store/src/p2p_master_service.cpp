@@ -94,9 +94,9 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     // it might happen that concurrent write for same key.
     // for this case, we will finally check it when add route replica.
     if (!req.key.empty() && max_replicas_per_key_ > 0) {
-        auto accessor = GetMetadataAccessor(req.key);
-        if (accessor->Exists()) {
-            auto& metadata = accessor->Get();
+        MetadataAccessorRO accessor(this, req.key);
+        if (accessor.Exists()) {
+            auto& metadata = accessor.Get();
             if (metadata.replicas_.size() >= max_replicas_per_key_) {
                 LOG(WARNING)
                     << "replica num exceeded"
@@ -174,7 +174,7 @@ auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
 
 auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
-    auto accessor = GetMetadataAccessor(req.key);
+    MetadataAccessorRW accessor(this, req.key);
     auto client = std::static_pointer_cast<P2PClientMeta>(
         client_manager_->GetClient(req.client_id));
     if (!client) {
@@ -182,7 +182,7 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
                    << ", client_id: " << req.client_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
-    return InnerAddReplica(accessor->GetShard(), req.key, req.client_id,
+    return InnerAddReplica(accessor.GetShard().GetRef(), req.key, req.client_id,
                            req.segment_id, req.size, client);
 }
 
@@ -250,9 +250,9 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
 
 auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
-    auto accessor = GetMetadataAccessor(req.key);
-    return InnerRemoveReplica(accessor->GetShard(), req.key, req.client_id,
-                              req.segment_id);
+    MetadataAccessorRW accessor(this, req.key);
+    return InnerRemoveReplica(accessor.GetShard().GetRef(), req.key,
+                              req.client_id, req.segment_id);
 }
 
 tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
@@ -390,8 +390,8 @@ auto P2PMasterService::BatchSyncReplica(const BatchSyncReplicaRequest& req)
 
     // Process each shard group with one lock acquisition
     for (auto& [shard_idx, ops] : shard_groups) {
-        auto& shard = GetShard(shard_idx);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, shard_idx);
+        auto& shard = shard_rw.GetRef();
 
         for (auto& [idx, is_add] : ops) {
             if (is_add) {
@@ -436,7 +436,7 @@ auto P2PMasterService::SetSyncCompleted(UUID client_id)
     return {};
 }
 
-void P2PMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
+void P2PMasterService::OnObjectAccessed(const ObjectMetadata& metadata) {
     // do nothing
 }
 

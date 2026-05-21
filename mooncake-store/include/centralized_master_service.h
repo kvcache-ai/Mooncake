@@ -264,7 +264,7 @@ class CentralizedMasterService final : public MasterService {
         const ObjectMetadata& metadata) override;
 
     // Hooks implementation
-    void OnObjectAccessed(ObjectMetadata& metadata) override;
+    void OnObjectAccessed(const ObjectMetadata& metadata) override;
     void OnObjectHit(const ObjectMetadata& metadata) override;
     void OnReplicaRemoved(const Replica& replica) override;
     void OnReplicaAdded(const Replica& replica) override;
@@ -357,7 +357,7 @@ class CentralizedMasterService final : public MasterService {
 
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
-        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl);
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) const;
 
         // Check if the lease has expired
         bool IsLeaseExpired() const;
@@ -372,6 +372,14 @@ class CentralizedMasterService final : public MasterService {
         // Check if is in soft pin status
         bool IsSoftPinned(
             const std::chrono::steady_clock::time_point& now) const;
+
+        virtual bool IsValid() const override {
+            return ObjectMetadata::IsValid() &&
+                   HasReplica([](const Replica& replica) {
+                       return !replica.is_memory_replica() ||
+                              !replica.has_invalid_mem_handle();
+                   });
+        }
 
         // Return names of all segments referenced by replicas
         std::vector<std::string> GetReplicaSegmentNames() const {
@@ -395,8 +403,11 @@ class CentralizedMasterService final : public MasterService {
         // The client that created this object (via PutStart).
         const UUID owner_client_id_;
         const std::chrono::steady_clock::time_point put_start_time_;
-        std::chrono::steady_clock::time_point lease_timeout_;
-        std::optional<std::chrono::steady_clock::time_point> soft_pin_timeout_;
+        mutable SpinLock lock_;
+        mutable std::chrono::steady_clock::time_point lease_timeout_
+            GUARDED_BY(lock_);
+        mutable std::optional<std::chrono::steady_clock::time_point>
+            soft_pin_timeout_ GUARDED_BY(lock_);
         int32_t replication_task_cnt_;
     };
 
@@ -437,14 +448,18 @@ class CentralizedMasterService final : public MasterService {
 
    private:
     class CentralizedMetadataAccessor final
-        : public MasterService::MetadataAccessor {
+        : public MasterService::MetadataAccessorRW {
        public:
         CentralizedMetadataAccessor(CentralizedMasterService* service,
                                     std::string_view key)
-            : MasterService::MetadataAccessor(service, key),
-              c_shard_(static_cast<CentralizedMetadataShard&>(shard_)),
-              processing_it_(c_shard_.processing_keys.find(key)),
-              replication_task_it_(c_shard_.replication_tasks.find(key)) {}
+            : MasterService::MetadataAccessorRW(service, key),
+              c_shard_(static_cast<CentralizedMetadataShard&>(
+                  shard_guard_.GetRef())),
+              processing_it_(c_shard_.processing_keys.end()),
+              replication_task_it_(c_shard_.replication_tasks.end()) {
+            processing_it_ = c_shard_.processing_keys.find(key);
+            replication_task_it_ = c_shard_.replication_tasks.find(key);
+        }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
             return processing_it_ != c_shard_.processing_keys.end();
@@ -454,13 +469,14 @@ class CentralizedMasterService final : public MasterService {
             return replication_task_it_ != c_shard_.replication_tasks.end();
         }
 
-        CentralizedMetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+        CentralizedMetadataShard& GetCentralizedShard()
+            NO_THREAD_SAFETY_ANALYSIS {
             return c_shard_;
         }
 
         CentralizedObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
             return static_cast<CentralizedObjectMetadata&>(
-                MasterService::MetadataAccessor::Get());
+                MasterService::MetadataAccessorRW::Get());
         }
 
         const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
@@ -472,14 +488,12 @@ class CentralizedMasterService final : public MasterService {
             processing_it_ = c_shard_.processing_keys.end();
         }
 
-        // Access the extended shard directly (for inserting processing keys)
-        CentralizedMetadataShard& GetCentralizedShard() { return c_shard_; }
-
         void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
             c_shard_.replication_tasks.erase(replication_task_it_);
             replication_task_it_ = c_shard_.replication_tasks.end();
             Get().replication_task_cnt_--;
         }
+
         void AddReplicationTask(
             const UUID& client_id, ReplicationTask::Type type, ReplicaID id,
             std::vector<ReplicaID> replica_ids) NO_THREAD_SAFETY_ANALYSIS {
@@ -498,11 +512,6 @@ class CentralizedMasterService final : public MasterService {
         std::unordered_map<std::string, const ReplicationTask, StringHash,
                            std::equal_to<>>::iterator replication_task_it_;
     };
-
-    std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
-        std::string_view key) override {
-        return std::make_unique<CentralizedMetadataAccessor>(this, key);
-    }
 
    private:
     class DiscardedReplicas {

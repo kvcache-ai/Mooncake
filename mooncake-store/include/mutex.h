@@ -1,9 +1,19 @@
 #ifndef THREAD_SAFETY_ANALYSIS_MUTEX_H
 #define THREAD_SAFETY_ANALYSIS_MUTEX_H
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define PAUSE() __asm__ __volatile__("yield")
+#else
+#define PAUSE()
+#endif
 
 // Enable thread safety attributes only with clang.
 // The attributes can be safely erased when compiling with other compilers.
@@ -116,27 +126,33 @@ class CAPABILITY("shared_mutex") SharedMutex {
     const SharedMutex& operator!() const { return *this; }
 };
 
-// Simple spinlock implementation using std::atomic<bool>.
+// Simple spin lock implementation using std::atomic_flag for exclusive locking
+// only.
 class CAPABILITY("mutex") SpinLock {
    private:
-    std::atomic<bool> flag_{false};
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
 
    public:
+    // Acquire/lock the spinlock.
     void lock() ACQUIRE() {
-        while (flag_.exchange(true, std::memory_order_acquire)) {
-            while (flag_.load(std::memory_order_relaxed)) {
-                MOONCAKE_CPU_RELAX();
+        do {
+            while (flag.test(std::memory_order_relaxed)) {
+                PAUSE();
             }
-        }
+        } while (flag.test_and_set(std::memory_order_acquire));
     }
 
-    void unlock() RELEASE() { flag_.store(false, std::memory_order_release); }
-
+    // Try to acquire the spinlock. Returns true on success, and false on
+    // failure.
     bool try_lock() TRY_ACQUIRE(true) {
-        return !flag_.exchange(true, std::memory_order_acquire);
+        return !flag.test_and_set(std::memory_order_acquire);
     }
 
-    const SpinLock& operator!() const { return *this; }
+    // Release the spinlock.
+    void unlock() RELEASE() { flag.clear(std::memory_order_release); }
+
+    // Check whether the spinlock is locked.
+    bool is_locked() const { return flag.test(std::memory_order_relaxed); }
 };
 
 // Simple spin-read-write lock implementation.
@@ -324,29 +340,22 @@ class SCOPED_CAPABILITY SharedMutexLocker {
     }
 };
 
-// RAII class for SpinLock
-class SCOPED_CAPABILITY SpinLockLocker {
+class SCOPED_CAPABILITY SpinLocker {
    private:
-    SpinLock* mut;
-    bool locked;
+    SpinLock* lock_;
 
    public:
-    explicit SpinLockLocker(SpinLock* mu) ACQUIRE(mu) : mut(mu), locked(true) {
-        mu->lock();
-    }
-    ~SpinLockLocker() RELEASE() {
-        if (locked) mut->unlock();
+    // Acquire lock.
+    explicit SpinLocker(SpinLock* lock) ACQUIRE(lock) : lock_(lock) {
+        lock->lock();
     }
 
     // Prevent copying and assignment
-    SpinLockLocker(const SpinLockLocker&) = delete;
-    SpinLockLocker& operator=(const SpinLockLocker&) = delete;
+    SpinLocker(const SpinLocker&) = delete;
+    SpinLocker& operator=(const SpinLocker&) = delete;
 
-    void unlock() RELEASE() {
-        if (!locked) return;
-        mut->unlock();
-        locked = false;
-    }
+    // Release lock.
+    ~SpinLocker() RELEASE() { lock_->unlock(); }
 };
 
 // RAII class for SpinRWLock
