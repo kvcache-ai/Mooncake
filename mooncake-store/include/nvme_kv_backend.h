@@ -72,8 +72,6 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
         std::shared_ptr<NvmeKvConnector> connector;
         DeviceState state;
         uint32_t consecutive_failures = 0;
-        int64_t total_size = 0;
-        int64_t total_keys = 0;
     };
 
     std::filesystem::path CatalogPath() const;
@@ -86,8 +84,6 @@ class NvmeKvStorageBackend : public StorageBackendInterface {
     bool ShouldStoreInline(size_t payload_size) const;
     void MarkCorrupted(const std::string& key);
     std::vector<std::string> EnabledDeviceIds() const;
-    tl::expected<std::string, ErrorCode> SelectDeviceIdForKey(
-        const std::string& key, size_t retry_count = 0) const;
     std::shared_ptr<NvmeKvConnector> GetConnectorForDeviceId(
         const std::string& device_id) const;
     void RecordDeviceFailure(const std::string& device_id);
