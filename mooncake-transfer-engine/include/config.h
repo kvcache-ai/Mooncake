@@ -51,7 +51,8 @@ struct GlobalConfig {
     int retry_cnt = 9;
     int handshake_listen_backlog = 128;
     bool metacache = true;
-    int64_t rpc_meta_cache_ttl_us = 60000000;  // RPC metadata cache TTL in microseconds (default: 60s)
+    int64_t rpc_meta_cache_ttl_us =
+        60000000;  // RPC metadata cache TTL in microseconds (default: 60s)
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;

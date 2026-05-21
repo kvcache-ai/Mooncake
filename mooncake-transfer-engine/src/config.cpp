@@ -228,16 +228,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.metacache = false;
     }
 
-    const char* rpc_meta_cache_ttl_env = std::getenv("MC_RPC_META_CACHE_TTL_SEC");
+    const char* rpc_meta_cache_ttl_env =
+        std::getenv("MC_RPC_META_CACHE_TTL_SEC");
     if (rpc_meta_cache_ttl_env) {
         int val = atoi(rpc_meta_cache_ttl_env);
         if (val >= 0 && val < 3600) {
-            config.rpc_meta_cache_ttl_us = val * 1000000LL;  // Convert sec to us
+            config.rpc_meta_cache_ttl_us =
+                val * 1000000LL;  // Convert sec to us
             LOG(INFO) << "RPC metadata cache TTL set to " << val << " seconds";
         } else {
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_RPC_META_CACHE_TTL_SEC"
-                << ", it should be between 0 and 3600 seconds";
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RPC_META_CACHE_TTL_SEC"
+                         << ", it should be between 0 and 3600 seconds";
         }
     }
 
@@ -433,8 +435,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "metacache = " << (config.metacache ? "enabled" : "disabled");
-    LOG(INFO) << "rpc_meta_cache_ttl = " << (config.rpc_meta_cache_ttl_us / 1000000.0)
-              << " seconds";
+    LOG(INFO) << "rpc_meta_cache_ttl = "
+              << (config.rpc_meta_cache_ttl_us / 1000000.0) << " seconds";
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
 }
