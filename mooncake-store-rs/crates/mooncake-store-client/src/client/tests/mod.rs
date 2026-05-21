@@ -5741,6 +5741,335 @@ fn routed_batch_put_from_retries_after_mid_transfer_failure_and_uses_surviving_p
 }
 
 #[test]
+fn routed_batch_put_from_replans_after_membership_refresh_and_uses_new_runtime() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("batch-put-replan-a-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("batch-put-replan-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("batch-put-replan-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "batch-put-replan-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-put-replan-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "batch-put-replan-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &writer, &reader]);
+
+    let source = b"batch-put-replan-payload".to_vec();
+    writer
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    // Simulate a rollout successor appearing after the writer already cached membership.
+    let store_b_transport = Arc::new(store_a_transport.peer("batch-put-replan-b-segment"));
+    let store_b = StoreClientBuilder::new(metadata.clone(), "batch-put-replan-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+
+    // Simulate a stale shared membership view that predates the successor rollout.
+    writer
+        .live_client_cache
+        .lock()
+        .store(vec![store_a.lease(), writer.lease(), reader.lease()]);
+
+    let store_a_segment = store_a
+        .segment_name()
+        .expect("store-a segment should exist");
+    store_a_transport.fail_next_submit_for_segment(&store_a_segment.0);
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owners([store_a.runtime_id().storage_key()]);
+
+    let routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "batch-put-replan-key",
+            source.as_ptr().cast(),
+            source.len(),
+        )
+        .replication(policy)])
+        .expect("batch_put_from should replan after membership refresh");
+
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].replicas.len(), 1);
+    assert_eq!(routes[0].replicas[0].owner, *store_b.runtime_id());
+    assert!(
+        writer
+            .suspect_runtime_cache
+            .lock()
+            .contains(store_a.runtime_id()),
+        "failed stale target should be quarantined before replanning"
+    );
+    assert_eq!(
+        reader
+            .get("batch-put-replan-key")
+            .expect("reader should see replanned write"),
+        source
+    );
+}
+
+#[test]
+fn routed_batch_put_from_retries_after_reserve_phase_membership_refresh_and_uses_new_runtime() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("batch-put-reserve-retry-a-segment"));
+    let writer_transport =
+        Arc::new(store_a_transport.peer("batch-put-reserve-retry-writer-segment"));
+    let reader_transport =
+        Arc::new(store_a_transport.peer("batch-put-reserve-retry-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "batch-put-reserve-retry-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-put-reserve-retry-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "batch-put-reserve-retry-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &writer, &reader]);
+
+    let source = b"batch-put-reserve-retry-payload".to_vec();
+    writer
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    // Simulate a rollout successor appearing after the writer already cached membership.
+    let store_b_transport = Arc::new(store_a_transport.peer("batch-put-reserve-retry-b-segment"));
+    let store_b = StoreClientBuilder::new(metadata.clone(), "batch-put-reserve-retry-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+
+    // Simulate a stale shared membership view that predates the successor rollout.
+    writer
+        .live_client_cache
+        .lock()
+        .store(vec![store_a.lease(), writer.lease(), reader.lease()]);
+
+    // The predecessor stops accepting new reservations before the writer refreshes membership.
+    store_a
+        .enter_draining()
+        .expect("store-a should enter draining before reserve retry");
+
+    let routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "batch-put-reserve-retry-key",
+            source.as_ptr().cast(),
+            source.len(),
+        )])
+        .expect("batch_put_from should retry after reserve-stage membership refresh");
+
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].replicas.len(), 1);
+    assert_eq!(routes[0].replicas[0].owner, *store_b.runtime_id());
+    assert_eq!(
+        reader
+            .get("batch-put-reserve-retry-key")
+            .expect("reader should see reserve-stage retried write"),
+        source
+    );
+}
+
+#[test]
+fn routed_batch_put_from_waits_through_handoff_gap_until_successor_becomes_active() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("batch-put-handoff-gap-a-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("batch-put-handoff-gap-writer-segment"));
+    let reader_transport = Arc::new(store_a_transport.peer("batch-put-handoff-gap-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let mut store_a = StoreClientBuilder::new(metadata.clone(), "batch-put-handoff-gap-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_a_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let mut store_b = StoreClientBuilder::new(metadata.clone(), "batch-put-handoff-gap-store-b")
+        .state(ClientLifecycleState::Standby)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(Arc::new(
+            store_a_transport.peer("batch-put-handoff-gap-b-segment"),
+        ))
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-put-handoff-gap-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "batch-put-handoff-gap-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer, &reader]);
+
+    let source = b"batch-put-handoff-gap-payload".to_vec();
+    writer
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    // The writer starts from a stale view that still ranks the predecessor.
+    writer
+        .live_client_cache
+        .lock()
+        .store(vec![store_a.lease(), writer.lease(), reader.lease()]);
+    store_a
+        .enter_draining()
+        .expect("store-a should stop accepting new writes");
+
+    std::thread::scope(|scope| {
+        let writer_result = scope.spawn(|| {
+            writer.batch_put_from(&[PutFromRequest::new(
+                "batch-put-handoff-gap-key",
+                source.as_ptr().cast(),
+                source.len(),
+            )])
+        });
+
+        sleep(Duration::from_millis(150));
+        store_b
+            .activate()
+            .expect("store-b should become active after the handoff gap");
+
+        let routes = writer_result
+            .join()
+            .expect("writer thread should join")
+            .expect("batch_put_from should survive the handoff gap");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].replicas.len(), 1);
+        assert_eq!(routes[0].replicas[0].owner, *store_b.runtime_id());
+    });
+
+    assert_eq!(
+        reader
+            .get("batch-put-handoff-gap-key")
+            .expect("reader should see the write after successor activation"),
+        source
+    );
+}
+
+#[test]
 fn embedded_wrh_query_route_repairs_from_old_authority_after_churn() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_a_transport = Arc::new(TestTransport::new("repair-old-a-segment"));

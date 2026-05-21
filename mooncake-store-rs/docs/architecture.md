@@ -151,6 +151,17 @@ membership snapshot, and retries placement when the request is not pinned to a h
 segment. This keeps transient storage-owner transport failures from escaping into Python backup
 threads as fatal exceptions.
 
+For routed batch writes, retry placement re-ranks candidates after each membership refresh instead
+of reusing only the pre-failure ranking. When a rollout removes one runtime and introduces a
+successor between attempts, the retried batch can move onto the newly visible live runtime instead
+of exhausting only the stale pre-refresh owner list. The reserve stage now uses the same retry
+envelope: transient `no placement candidates` / `not enough writable owners` windows back off
+briefly, refresh membership again, and wait for a standby successor to become active before the
+batch gives up.
+
+Segment-announcement metadata faults such as missing or non-contiguous published storage target
+chunks are treated as stale segment state first. The client invalidates cached segment state and
+may retry the write, but it does not quarantine the touched storage runtimes on that signal alone.
 Remote transfer planning splits each request at both local registration limits and the storage
 target chunks published in the target segment announcement. The route still records one logical
 replica, but the transport only receives slices that fit inside one registered storage target
