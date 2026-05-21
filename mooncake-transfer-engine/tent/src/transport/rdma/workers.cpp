@@ -77,7 +77,7 @@ Workers::Workers(RdmaTransport* transport)
     // Bandwidth Estimation (EWMA)
     // ============================================================
 
-    // Learning rate: 0.0 = no adaptation, 1.0 = full adaptation
+    // Learning rate: 0.0 = full adaptation, 1.0 = no adaptation
     params.bandwidth_learning_rate =
         conf->get("transports/rdma/bandwidth_learning_rate", 0.01);
 

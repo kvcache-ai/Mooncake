@@ -98,6 +98,8 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
         selectSinglePath(tl_candidates, num_slices, total_length,
                          slice_dev_ids);
     } else {
+        // Probe mode: every 100th call uses round-robin distribution
+        // to ensure all devices are sampled for EWMA updates
         thread_local uint64_t tl_call_count = 0;
         bool probe_mode = ((++tl_call_count % 100) == 0);
         selectMultiPath(tl_candidates, num_slices, total_length, slice_dev_ids,
@@ -124,6 +126,8 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
                                        std::vector<Candidate>& candidates,
                                        int request_priority) {
     // Helper lambda to add candidate device
+    // Score formula: predicted_time × numa_penalty + random_jitter
+    // Lower score = better candidate
     auto add_candidate = [&](int dev_id, size_t rank) {
         auto& dev = devices_[dev_id];
         uint64_t inflight = dev.getInflightBytes();
@@ -208,6 +212,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
     if (candidates.empty()) return;
     uint64_t slice_bytes = (total_length + num_slices - 1) / num_slices;
     if (probe_mode) {
+        // Probe mode: round-robin distribution to ensure all devices are
+        // sampled Activates every 100th call to prevent EWMA starvation
         for (uint32_t i = 0; i < num_slices; ++i) {
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
@@ -216,6 +222,8 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
                                                      std::memory_order_relaxed);
         }
     } else {
+        // Normal mode: weighted distribution based on inverse score
+        // Lower score → higher weight → more slices
         double total_weight = 0.0;
         double max_weight = -1.0;
         int best_dev_idx = -1;
@@ -288,12 +296,16 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
         return Status::OK();
     }
 
+    // Update EWMA bandwidth: new = α × old + (1-α) × observed
+    // α = 0: always use observed (full adaptation)
+    // α = 1: never update (no learning)
     double observed_bw = static_cast<double>(length) / latency;
     double current_ewma = dev.getEwmaBandwidth();
 
     double alpha = sched_params_.bandwidth_learning_rate;
     double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
 
+    // Clamp to [min_multiplier, max_multiplier] of theoretical bandwidth
     double theoretical_bw = dev.getTheoreticalBandwidth();
     new_ewma = std::max(
         sched_params_.ewma_min_multiplier * theoretical_bw,

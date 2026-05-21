@@ -47,7 +47,7 @@ When `enable_smart_scheduling = true`, the selector uses an EWMA-based algorithm
 ```
 For each request:
   1. Calculate predicted completion time for each device:
-     predicted_time = (inflight_bytes + request_length) / ewma_bandwidth
+     predicted_time = (inflight_bytes + slice_bytes) / ewma_bandwidth
 
   2. Apply NUMA penalty based on tier:
      score = predicted_time × numa_tier_weights[tier]
@@ -96,9 +96,14 @@ on_transfer_complete:
 
 where `α = bandwidth_learning_rate`.
 
-Note: This formula places higher weight on new observations when α is small.
-- α = 0: ewma_bandwidth = observed_bandwidth (full adaptation)
-- α = 1: ewma_bandwidth = ewma_bandwidth (no adaptation)
+**Note on terminology**: The EWMA formula uses α as the coefficient for the old value. Therefore:
+- **Lower α** (closer to 0) → more weight on new observations → **faster adaptation**
+- **Higher α** (closer to 1) → more weight on old value → **slower adaptation**
+
+Examples:
+- α = 0: `ewma_bandwidth = observed_bandwidth` (full adaptation, always use new value)
+- α = 1: `ewma_bandwidth = ewma_bandwidth` (no learning, never update)
+- α = 0.01: `ewma_bandwidth = 0.01 × old + 0.99 × new` (default, gradual adaptation)
 
 The EWMA provides:
 - **Memory**: Recent observations have more influence than old ones
@@ -114,9 +119,12 @@ For large transfers, TENT distributes slices across multiple devices:
 - Minimizes coordination overhead
 
 **Multi Path** (large requests):
-- Slices distributed proportionally to device capacity
-- Each device gets: `(device_weight / total_weight) × num_slices`
-- Remaining slices assigned to best device
+- **Normal mode** (99% of calls): Slices distributed proportionally to device capacity
+  - Each device gets: `(device_weight / total_weight) × num_slices`
+  - Remaining slices assigned to best device
+- **Probe mode** (1% of calls, every 100th call): Slices distributed round-robin
+  - Purpose: Ensure all devices are continuously sampled for EWMA updates
+  - Prevents EWMA starvation for less-used devices
 
 ### Request Flow
 
@@ -130,6 +138,7 @@ For large transfers, TENT distributes slices across multiple devices:
 │  RdmaTransport::submitTransferTasks  │
 │  - Split large requests into slices   │
 │  - Call DeviceSelector for allocation │
+│  - Only if num_slices >= max_slice_count/2 │
 └──────┬───────────────────────────────┘
        │
        ▼
@@ -215,9 +224,10 @@ All slice spraying parameters are configurable via the configuration file:
 | `ewma_max_bandwidth_multiplier` | float | `10.0` | Maximum bandwidth as fraction of theoretical |
 
 **Guidelines**:
-- Lower learning rate = faster adaptation, more volatile (α = 0 means always use new value)
-- Higher learning rate = slower adaptation, more stable (α = 1 means never update)
-- Multipliers constrain EWMA to reasonable range
+- Lower α (e.g., 0.001) → faster adaptation, more volatile → responds quickly to changes
+- Higher α (e.g., 0.1) → slower adaptation, more stable → smooths out transient fluctuations
+- Default α = 0.01 provides balanced adaptation
+- Multipliers constrain EWMA to reasonable range [0.1×, 10.0×] of theoretical bandwidth
 
 ### Device Selection Scoring
 
@@ -236,6 +246,31 @@ All slice spraying parameters are configurable via the configuration file:
 |-----------|------|---------|-------------|
 | `score_jitter_range` | float | `1e-9` | Random jitter range to avoid deterministic selection |
 | `score_epsilon` | float | `1e-12` | Small value to prevent division by zero |
+
+### Bandwidth Constants
+
+```json
+{
+  "transports": {
+    "rdma": {
+      "default_bandwidth_gbps": 400.0,
+      "min_bandwidth_gbps": 10.0,
+      "max_bandwidth_gbps": 800.0
+    }
+  }
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `default_bandwidth_gbps` | float | `400.0` | Default NIC bandwidth when topology info unavailable |
+| `min_bandwidth_gbps` | float | `10.0` | Minimum valid NIC bandwidth (Gbps) |
+| `max_bandwidth_gbps` | float | `800.0` | Maximum valid NIC bandwidth (Gbps) |
+
+**Notes**:
+- These constants define the valid range and default for device bandwidth
+- Used in EWMA calculations and theoretical bandwidth estimation
+- If a device's reported bandwidth is outside [min, max], default_bandwidth is used
 
 ## Usage Examples
 
@@ -322,8 +357,8 @@ For deterministic performance matching original TE:
    - `bandwidth_learning_rate = 0.01`
 3. **Monitor performance** and adjust based on observations:
    - If cross-NUMA transfers are too frequent: increase remote penalties
-   - If adaptation is too slow: increase learning rate
-   - If performance is unstable: decrease learning rate
+   - If adaptation is too slow (EWMA not keeping up with load changes): decrease α
+   - If performance is unstable (too much fluctuation): increase α
 
 ## Troubleshooting
 

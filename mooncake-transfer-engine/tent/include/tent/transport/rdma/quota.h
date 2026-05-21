@@ -51,7 +51,7 @@ class SharedSlotManager;
  *    - Supports multi-path for large requests
  *
  * Selection formula:
- *     predicted_time = (inflight + length) / ewma_bandwidth
+ *     predicted_time = (inflight + slice_bytes) / ewma_bandwidth
  *
  * EWMA update:
  *     ewma_bandwidth <- alpha * ewma_bandwidth + (1 - alpha) *
@@ -157,8 +157,8 @@ class DeviceSelector {
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
 
-        // EWMA bandwidth learning rate (0.0 = no learning, 1.0 = full
-        // adaptation)
+        // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
+        // learning)
         double bandwidth_learning_rate = 0.01;
 
         // Enable priority-based filtering
@@ -178,9 +178,9 @@ class DeviceSelector {
         double ewma_max_multiplier = 10.0;  // 1000% of theoretical
 
         // Default bandwidth (Gbps) when topology info unavailable
-        double default_bandwidth_gbps = 400.0;
-        double min_bandwidth_gbps = 10.0;
-        double max_bandwidth_gbps = 800.0;
+        double default_bandwidth_gbps = 400.0;  // Default NIC bandwidth
+        double min_bandwidth_gbps = 10.0;       // Minimum valid NIC bandwidth
+        double max_bandwidth_gbps = 800.0;      // Maximum valid NIC bandwidth
 
         // Shared slot rotation interval (milliseconds)
         int slot_rotation_interval_ms = 2;
