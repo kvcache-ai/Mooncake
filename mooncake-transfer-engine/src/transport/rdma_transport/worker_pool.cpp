@@ -260,10 +260,9 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
                        << entry.first << ", deleting endpoint";
-            // Mark rail as failed
-            markRailFailed(entry.first);
+            // Unified path failure handling
+            handlePathFailure(entry.first, endpoint.get());
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            context_.deleteEndpointByPtr(endpoint.get());
             entry.second.clear();
             continue;
         }
@@ -276,8 +275,18 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 
     if (!failed_slice_list.empty()) {
-        for (auto &slice : failed_slice_list) slice->rdma.retry_cnt++;
-        redispatch(failed_slice_list, thread_id);
+        SliceList retry_list;
+        for (auto &slice : failed_slice_list) {
+            if (shouldRetrySlice(slice)) {
+                retry_list.push_back(slice);
+            } else {
+                slice->markFailed();
+                processed_slice_count_++;
+            }
+        }
+        if (!retry_list.empty()) {
+            redispatch(retry_list, thread_id);
+        }
     }
 }
 
@@ -285,6 +294,7 @@ void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int *, int> qp_depth_set;
+    SliceList failed_slice_list;  // Unified: collect all slices for redispatch
     for (int cq_index = thread_id; cq_index < context_.cqCount();
          cq_index += kTransferWorkerCount) {
         ibv_wc wc[kPollCount];
@@ -319,17 +329,13 @@ void WorkerPool::performPollCq(int thread_id) {
                         << ", retry_cnt: " << slice->rdma.retry_cnt
                         << "): " << ibv_wc_status_str(wc[i].status);
                 }
-                markRailFailed(slice->peer_nic_path);
-                if (slice->rdma.endpoint)
-                    context_.deleteEndpointByPtr(slice->rdma.endpoint);
-                slice->rdma.retry_cnt++;
-                if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
+                // Unified path failure handling
+                handlePathFailure(slice->peer_nic_path, slice->rdma.endpoint);
+                if (shouldRetrySlice(slice)) {
+                    failed_slice_list.push_back(slice);
+                } else {
                     slice->markFailed();
                     processed_slice_count_++;
-                } else {
-                    collective_slice_queue_[thread_id][slice->peer_nic_path]
-                        .push_back(slice);
-                    redispatch_counter_++;
                 }
             } else {
                 slice->markSuccess();
@@ -346,6 +352,10 @@ void WorkerPool::performPollCq(int thread_id) {
 
     if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
+
+    if (!failed_slice_list.empty()) {
+        redispatch(failed_slice_list, thread_id);
+    }
 }
 
 void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
@@ -548,4 +558,22 @@ bool WorkerPool::isRailAvailable(const std::string &peer_nic_path) {
     }
     return false;
 }
+
+// Unified retry logic: increment retry count and return whether retry is
+// allowed
+bool WorkerPool::shouldRetrySlice(Transport::Slice *slice) {
+    slice->rdma.retry_cnt++;
+    return slice->rdma.retry_cnt < slice->rdma.max_retry_cnt;
+}
+
+// Unified path failure handler
+void WorkerPool::handlePathFailure(const std::string &peer_nic_path,
+                                   RdmaEndPoint *endpoint) {
+    markRailFailed(peer_nic_path);
+    redispatch_counter_++;  // Notify all workers to redispatch their queues
+    if (endpoint) {
+        context_.deleteEndpointByPtr(endpoint);
+    }
+}
+
 }  // namespace mooncake
