@@ -91,6 +91,7 @@ struct ReplicateConfig {
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    std::optional<std::vector<std::string>> group_ids{};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -116,7 +117,16 @@ struct ReplicateConfig {
         os << "]";
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
-           << ", data_type: " << config.data_type << " }";
+           << ", data_type: " << config.data_type;
+        if (config.group_ids.has_value()) {
+            os << ", group_ids: [";
+            for (size_t i = 0; i < config.group_ids->size(); ++i) {
+                os << config.group_ids->at(i);
+                if (i + 1 < config.group_ids->size()) os << ", ";
+            }
+            os << "]";
+        }
+        os << " }";
         return os;
     }
 };

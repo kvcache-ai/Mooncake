@@ -9,6 +9,7 @@
 #include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -741,11 +742,13 @@ class MasterService {
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
-            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
+            std::string group_id_ = "")
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               data_type(data_type_),
+              group_id(std::move(group_id_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -769,6 +772,7 @@ class MasterService {
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+        const std::string group_id;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -975,6 +979,8 @@ class MasterService {
 
         bool IsHardPinned() const { return hard_pinned; }
 
+        bool IsGrouped() const { return !group_id.empty(); }
+
         // Check if the metadata is valid
         // Valid means it has at least one valid replica and size is greater
         // than 0
@@ -1063,8 +1069,14 @@ class MasterService {
             GUARDED_BY(mutex);
         std::unordered_map<std::string, PromotionTask> promotion_tasks
             GUARDED_BY(mutex);
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+            group_members GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    std::unordered_map<std::string, std::string> object_group_ids_
+        GUARDED_BY(group_routing_mutex_);
+    mutable std::shared_mutex group_routing_mutex_;
 
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
@@ -1077,6 +1089,10 @@ class MasterService {
         MetadataShard* operator->() { return &shard_; }
 
         const MetadataShard* operator->() const { return &shard_; }
+
+        MetadataShard& get() { return shard_; }
+
+        const MetadataShard& get() const { return shard_; }
 
        private:
         MetadataShard& shard_;
@@ -1093,6 +1109,8 @@ class MasterService {
 
         const MetadataShard* operator->() const { return &shard_; }
 
+        const MetadataShard& get() const { return shard_; }
+
        private:
         const MetadataShard& shard_;
         SharedMutexLocker lock_;
@@ -1102,6 +1120,19 @@ class MasterService {
     size_t getShardIndex(const std::string& key) const {
         return std::hash<std::string>{}(key) % kNumShards;
     }
+
+    size_t getMetadataShardIndex(const std::string& key) const;
+    void RegisterGroupMember(MetadataShard& shard, const std::string& key,
+                             const std::string& group_id);
+    void UnregisterGroupMember(MetadataShard& shard, const std::string& key,
+                               const std::string& group_id);
+    std::unordered_map<std::string, ObjectMetadata>::iterator
+    EraseMetadataEntry(
+        MetadataShard& shard,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it);
+    void RebuildGroupRoutingIndex();
+    void GrantLeaseForGroup(const MetadataShard& shard, const std::string& key,
+                            const ObjectMetadata& metadata) const;
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
@@ -1114,7 +1145,7 @@ class MasterService {
     auto AllocateAndInsertMetadata(
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
-        const ReplicateConfig& config,
+        const ReplicateConfig& config, const std::string& group_id,
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -1193,19 +1224,6 @@ class MasterService {
      */
     void TryPushPromotionQueue(const std::string& key);
 
-    // Erase any in-flight PromotionTask for `key` and decrement the
-    // cluster-wide in-flight counter. Safe no-op if no task exists.
-    // Call from any path that erases an ObjectMetadata entry, so the
-    // task doesn't pin a promotion_in_flight_ slot for the full
-    // put_start_release_timeout_sec_ until the reaper sweeps.
-    void ErasePromotionTaskIfPresent(MetadataShardAccessorRW& shard,
-                                     const std::string& key)
-        NO_THREAD_SAFETY_ANALYSIS {
-        if (shard->promotion_tasks.erase(key) > 0) {
-            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-        }
-    }
-
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -1245,7 +1263,7 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, const std::string& key)
             : service_(service),
               key_(key),
-              shard_idx_(service_->getShardIndex(key)),
+              shard_idx_(service_->getMetadataShardIndex(key)),
               shard_guard_(service_, shard_idx_),
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
@@ -1268,7 +1286,6 @@ class MasterService {
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
-                    service_->ErasePromotionTaskIfPresent(shard_guard_, key_);
                 }
             }
         }
@@ -1300,8 +1317,7 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            shard_guard_->metadata.erase(it_);
-            it_ = shard_guard_->metadata.end();
+            it_ = service_->EraseMetadataEntry(shard_guard_.get(), it_);
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
@@ -1388,7 +1404,7 @@ class MasterService {
         MetadataAccessorRO(const MasterService* service, const std::string& key)
             : service_(service),
               key_(key),
-              shard_idx_(service_->getShardIndex(key)),
+              shard_idx_(service_->getMetadataShardIndex(key)),
               shard_guard_(service_, shard_idx_),
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)) {}
