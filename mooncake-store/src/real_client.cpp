@@ -620,7 +620,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -658,7 +658,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
-            master_server_addr, transfer_engine, {{"client_mode", "real"}});
+            master_server_addr, transfer_engine, {{"client_mode", "real"}},
+            tenant_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -693,7 +694,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 hostname + ":" + std::to_string(local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine, {{"client_mode", "real"}});
+                master_server_addr, transfer_engine, {{"client_mode", "real"}},
+                tenant_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -917,11 +919,12 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        tenant_id));
 }
 
 namespace {
@@ -988,6 +991,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
+    std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
 
     // Validate size parameters are within acceptable ranges
     if (global_segment_size < MIN_SEGMENT_SIZE ||
@@ -1022,10 +1026,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload =
         (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -5458,11 +5462,14 @@ RealClient::batch_get_into_offload_object_internal(
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::vector<Slice>> storage_objects;
     for (const auto &object_it : objects) {
-        keys.emplace_back(object_it.first);
+        std::string storage_key = client_->BuildStorageKey(object_it.first);
+        keys.emplace_back(storage_key);
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
+        storage_objects.emplace(std::move(storage_key), object_it.second);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
         target_rpc_service_addr, keys, sizes);
@@ -5478,7 +5485,7 @@ RealClient::batch_get_into_offload_object_internal(
     }
     auto result =
         client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
-                                       batchGetResp->pointers, objects);
+                                       batchGetResp->pointers, storage_objects);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -

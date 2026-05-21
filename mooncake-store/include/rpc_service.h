@@ -46,77 +46,145 @@ class WrappedMasterService {
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClearInTenant(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name, const std::string& tenant_id);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegexInTenant(const std::string& str,
+                                  const std::string& tenant_id);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaListInTenant(
+        const std::string& key, const std::string& tenant_id);
 
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListInTenant(const std::vector<std::string>& keys,
+                                const std::string& tenant_id);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStartInTenant(
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL);
+    tl::expected<void, ErrorCode> PutEndInTenant(const UUID& client_id,
+                                                 const std::string& key,
+                                                 ReplicaType replica_type,
+                                                 const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL);
+    tl::expected<void, ErrorCode> PutRevokeInTenant(
+        const UUID& client_id, const std::string& key, ReplicaType replica_type,
+        const std::string& tenant_id);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStartInTenant(const UUID& client_id,
+                          const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& slice_lengths,
+                          const ReplicateConfig& config,
+                          const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEndInTenant(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type, const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeInTenant(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type, const std::string& tenant_id);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    UpsertStartInTenant(const UUID& client_id, const std::string& key,
+                        const uint64_t slice_length,
+                        const ReplicateConfig& config,
+                        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> UpsertEnd(const UUID& client_id,
                                             const std::string& key,
                                             ReplicaType replica_type);
+    tl::expected<void, ErrorCode> UpsertEndInTenant(
+        const UUID& client_id, const std::string& key, ReplicaType replica_type,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> UpsertRevoke(const UUID& client_id,
                                                const std::string& key,
                                                ReplicaType replica_type);
+    tl::expected<void, ErrorCode> UpsertRevokeInTenant(
+        const UUID& client_id, const std::string& key, ReplicaType replica_type,
+        const std::string& tenant_id);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStartInTenant(const UUID& client_id,
+                             const std::vector<std::string>& keys,
+                             const std::vector<uint64_t>& slice_lengths,
+                             const ReplicateConfig& config,
+                             const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEndInTenant(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevokeInTenant(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> Remove(const std::string& key,
                                          bool force = false);
+    tl::expected<void, ErrorCode> RemoveInTenant(const std::string& key,
+                                                 const std::string& tenant_id,
+                                                 bool force = false);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
                                                 bool force = false);
+    tl::expected<long, ErrorCode> RemoveByRegexInTenant(
+        const std::string& str, const std::string& tenant_id,
+        bool force = false);
 
     long RemoveAll(bool force = false);
 
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false);
+    std::vector<tl::expected<void, ErrorCode>> BatchRemoveInTenant(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        bool force = false);
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
@@ -201,10 +269,16 @@ class WrappedMasterService {
         const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTaskInTenant(
+        const std::string& key, const std::vector<std::string>& targets,
+        const std::string& tenant_id);
 
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& source,
                                                  const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTaskInTenant(
+        const std::string& key, const std::string& source,
+        const std::string& target, const std::string& tenant_id);
 
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
@@ -218,30 +292,57 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    tl::expected<CopyStartResponse, ErrorCode> CopyStartInTenant(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key);
+    tl::expected<void, ErrorCode> CopyEndInTenant(const UUID& client_id,
+                                                  const std::string& key,
+                                                  const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key);
+    tl::expected<void, ErrorCode> CopyRevokeInTenant(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);
+    tl::expected<MoveStartResponse, ErrorCode> MoveStartInTenant(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key);
+    tl::expected<void, ErrorCode> MoveEndInTenant(const UUID& client_id,
+                                                  const std::string& key,
+                                                  const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key);
+    tl::expected<void, ErrorCode> MoveRevokeInTenant(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,
                                                    ReplicaType replica_type);
+    tl::expected<void, ErrorCode> EvictDiskReplicaInTenant(
+        const UUID& client_id, const std::string& key, ReplicaType replica_type,
+        const std::string& tenant_id);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type);
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplicaInTenant(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type, const std::string& tenant_id);
 
    private:
     MasterService master_service_;

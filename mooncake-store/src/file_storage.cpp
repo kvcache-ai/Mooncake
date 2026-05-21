@@ -343,11 +343,26 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty()) {
         return {};
     }
+    std::unordered_map<std::string, int64_t> storage_offloading_objects;
+    std::unordered_map<std::string, std::string> storage_to_user_key;
+    std::unordered_map<std::string, std::string> user_to_storage_key;
+    storage_offloading_objects.reserve(offloading_objects.size());
+    storage_to_user_key.reserve(offloading_objects.size());
+    user_to_storage_key.reserve(offloading_objects.size());
+    for (const auto& [key, size] : offloading_objects) {
+        auto parsed = ParseTenantScopedKey(key);
+        std::string storage_key = parsed ? key : client_->BuildStorageKey(key);
+        std::string user_key = parsed ? parsed->user_key : key;
+        user_to_storage_key.emplace(user_key, storage_key);
+        storage_to_user_key.emplace(storage_key, std::move(user_key));
+        storage_offloading_objects.emplace(std::move(storage_key), size);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            offloading_objects, buckets_keys);
+            storage_offloading_objects, buckets_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -355,8 +370,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     } else {
         std::vector<std::string> keys;
-        keys.reserve(offloading_objects.size());
-        for (const auto& it : offloading_objects) {
+        keys.reserve(storage_offloading_objects.size());
+        for (const auto& it : storage_offloading_objects) {
             keys.emplace_back(it.first);
         }
         buckets_keys.emplace_back(std::move(keys));
@@ -378,9 +393,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    for (const auto& keys : buckets_keys) {
+    for (const auto& storage_keys : buckets_keys) {
+        std::vector<std::string> user_keys;
+        user_keys.reserve(storage_keys.size());
+        for (const auto& storage_key : storage_keys) {
+            auto it = storage_to_user_key.find(storage_key);
+            if (it == storage_to_user_key.end()) {
+                LOG(ERROR) << "Missing user key for storage key: "
+                           << storage_key;
+                continue;
+            }
+            user_keys.emplace_back(it->second);
+        }
+
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        auto query_result = BatchQuerySegmentSlices(keys, batch_object);
+        auto query_result = BatchQuerySegmentSlices(user_keys, batch_object);
         if (!query_result) {
             LOG(ERROR) << "BatchQuerySlices failed with error: "
                        << query_result.error();
@@ -390,8 +417,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
+            std::vector<std::string> evicted_object_keys;
+            evicted_object_keys.reserve(evicted_keys.size());
+            for (const auto& evicted_key : evicted_keys) {
+                if (auto parsed = ParseTenantScopedKey(evicted_key)) {
+                    evicted_object_keys.emplace_back(
+                        std::move(parsed->user_key));
+                } else {
+                    evicted_object_keys.emplace_back(evicted_key);
+                }
+            }
             auto results = client_->BatchEvictDiskReplica(
-                evicted_keys, ReplicaType::LOCAL_DISK);
+                evicted_object_keys, ReplicaType::LOCAL_DISK);
             for (size_t i = 0; i < results.size(); ++i) {
                 if (!results[i]) {
                     LOG(WARNING)
@@ -411,6 +448,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
+            auto storage_key_it = user_to_storage_key.find(obj_key);
+            if (storage_key_it == user_to_storage_key.end()) {
+                LOG(ERROR) << "Missing storage key for user key: " << obj_key;
+                continue;
+            }
+            const std::string& storage_key = storage_key_it->second;
             for (const auto& slice : slices) {
                 int device_id = -1;
                 if (IsDevicePointer(slice.ptr, &device_id)) {
@@ -429,7 +472,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 }
             }
             if (obj_success) {
-                host_batch_object[obj_key] = std::move(host_slices);
+                host_batch_object[storage_key] = std::move(host_slices);
             }
         }
 

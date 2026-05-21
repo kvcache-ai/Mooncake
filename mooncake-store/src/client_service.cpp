@@ -16,6 +16,7 @@
 #include <ranges>
 #include <thread>
 #include <set>
+#include <utility>
 #include <ylt/struct_json/json_reader.h>
 
 #include "transfer_engine.h"
@@ -56,11 +57,14 @@ using gpu_staging::SetDevice;
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
-               const std::map<std::string, std::string>& labels)
+               const std::map<std::string, std::string>& labels,
+               std::string tenant_id)
     : client_id_(generate_uuid()),
+      tenant_id_(tenant_id.empty() ? "default" : std::move(tenant_id)),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr),
+                     metrics_ ? &metrics_->master_client_metric : nullptr,
+                     tenant_id_),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
@@ -591,9 +595,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels) {
+    std::map<std::string, std::string> labels, std::string tenant_id) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, protocol, labels));
+        new Client(local_hostname, metadata_connstring, protocol, labels,
+                   std::move(tenant_id)));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -2592,29 +2597,31 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
-    LOG(INFO) << "action=replica_copy_start" << ", key=" << key
-              << ", targets_count=" << targets.size();
+    LOG(INFO) << "action=replica_copy_start"
+              << ", key=" << key << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result = master_client_.CopyStart(key, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
-        LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                   << ", source=" << source << ", error=copy_start_failed"
+        LOG(ERROR) << "action=replica_copy_failed"
+                   << ", key=" << key << ", source=" << source
+                   << ", error=copy_start_failed"
                    << ", error_code=" << error;
         return tl::unexpected(error);
     }
 
     const auto& response = start_result.value();
     if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
+        LOG(INFO) << "action=replica_copy_skipped"
+                  << ", key=" << key << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
         auto copy_end_result = master_client_.CopyEnd(key);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                       << ", error=copy_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_copy_failed"
+                       << ", key=" << key << ", error=copy_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -2626,7 +2633,8 @@ tl::expected<void, ErrorCode> Client::Copy(
         response.targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_copy_success" << ", key=" << key
+        LOG(INFO) << "action=replica_copy_success"
+                  << ", key=" << key
                   << ", target_count=" << response.targets.size();
     }
 
@@ -2636,30 +2644,33 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
-    LOG(INFO) << "action=replica_move_start" << ", key=" << key
-              << ", source_segment=" << source << ", target_segment=" << target;
+    LOG(INFO) << "action=replica_move_start"
+              << ", key=" << key << ", source_segment=" << source
+              << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
     auto move_start_result = master_client_.MoveStart(key, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
-        LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                   << ", error=move_start_failed" << ", error_code=" << error;
+        LOG(ERROR) << "action=replica_move_failed"
+                   << ", key=" << key << ", error=move_start_failed"
+                   << ", error_code=" << error;
         // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
     const auto& response = move_start_result.value();
     if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
-                  << ", info=target_replica_already_exists";
+        LOG(INFO) << "action=replica_move_skipped"
+                  << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                       << ", error=move_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_move_failed"
+                       << ", key=" << key << ", error=move_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -2673,8 +2684,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_move_success" << ", key=" << key
-                  << ", source_segment=" << source
+        LOG(INFO) << "action=replica_move_success"
+                  << ", key=" << key << ", source_segment=" << source
                   << ", target_segment=" << target;
     }
 
@@ -2752,9 +2763,10 @@ void Client::PutToLocalFile(const std::string& key,
 
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
+                                storage_key = BuildStorageKey(key),
                                 value = std::move(value), path] {
         // Store the object
-        auto store_result = backend->StoreObject(path, value, key);
+        auto store_result = backend->StoreObject(path, value, storage_key);
         ReplicaType replica_type = ReplicaType::DISK;
 
         if (!store_result) {
@@ -2770,8 +2782,18 @@ void Client::PutToLocalFile(const std::string& key,
         // Notify master about any evicted disk replicas (batch)
         if (!store_result.value().empty()) {
             const auto& evicted_keys = store_result.value();
+            std::vector<std::string> evicted_object_keys;
+            evicted_object_keys.reserve(evicted_keys.size());
+            for (const auto& evicted_key : evicted_keys) {
+                if (auto parsed = ParseTenantScopedKey(evicted_key)) {
+                    evicted_object_keys.emplace_back(
+                        std::move(parsed->user_key));
+                } else {
+                    evicted_object_keys.emplace_back(evicted_key);
+                }
+            }
             auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_keys, replica_type);
+                evicted_object_keys, replica_type);
             for (size_t i = 0; i < evict_results.size(); ++i) {
                 if (!evict_results[i]) {
                     LOG(WARNING)
@@ -2879,8 +2901,8 @@ void Client::PollAndDispatchTasks() {
             // Only log if it's not an RPC failure (which is expected
             // during connection failures)
             if (error != ErrorCode::RPC_FAIL) {
-                LOG(WARNING)
-                    << "action=task_poll_failed" << ", error_code=" << error;
+                LOG(WARNING) << "action=task_poll_failed"
+                             << ", error_code=" << error;
             }
         }
     }
@@ -2897,7 +2919,8 @@ void Client::TaskPollThreadMain() {
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
     if (!task_running_.load()) {
-        LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
+        LOG(WARNING) << "action=task_rejected"
+                     << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
         return;
     }

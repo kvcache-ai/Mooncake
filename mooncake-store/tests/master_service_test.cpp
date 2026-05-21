@@ -169,6 +169,97 @@ class MasterServiceTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST_F(MasterServiceTest, TenantScopedKeysAllowSameUserKeyIsolation) {
+    auto service = std::make_unique<MasterService>();
+    PrepareSimpleSegment(*service);
+
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const std::string key = "shared_user_key";
+    const uint64_t value_length = 1024;
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service->PutStart(client_a, key, value_length, config, "tenant_a")
+            .has_value());
+    ASSERT_TRUE(service->PutEnd(client_a, key, ReplicaType::MEMORY, "tenant_a")
+                    .has_value());
+
+    ASSERT_FALSE(
+        service->PutStart(client_a, key, value_length, config, "tenant_a")
+            .has_value());
+    ASSERT_TRUE(
+        service->PutStart(client_b, key, value_length, config, "tenant_b")
+            .has_value());
+    ASSERT_TRUE(service->PutEnd(client_b, key, ReplicaType::MEMORY, "tenant_b")
+                    .has_value());
+
+    EXPECT_TRUE(service->GetReplicaList(key, "tenant_a").has_value());
+    EXPECT_TRUE(service->GetReplicaList(key, "tenant_b").has_value());
+    EXPECT_EQ(service->GetReplicaList(key).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+
+    auto regex_a = service->GetReplicaListByRegex("shared_.*", "tenant_a");
+    ASSERT_TRUE(regex_a.has_value());
+    ASSERT_EQ(regex_a->size(), 1);
+    EXPECT_TRUE(regex_a->contains(key));
+
+    ASSERT_TRUE(service->Remove(key, "tenant_a", true).has_value());
+    EXPECT_EQ(service->GetReplicaList(key, "tenant_a").error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(service->GetReplicaList(key, "tenant_b").has_value());
+}
+
+TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
+    auto service = std::make_unique<MasterService>();
+    PrepareSimpleSegment(*service, "segment_1");
+    PrepareSimpleSegment(*service, "segment_2");
+    PrepareSimpleSegment(*service, "segment_3");
+
+    const UUID client_id = generate_uuid();
+    const std::string tenant_id = "tenant_a";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, "copy_key", 1024, config, tenant_id)
+            .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, "copy_key", ReplicaType::MEMORY, tenant_id)
+            .has_value());
+    EXPECT_EQ(
+        service->CopyStart(client_id, "copy_key", "segment_1", {"segment_2"})
+            .error(),
+        ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(service
+                    ->CopyStart(client_id, "copy_key", "segment_1",
+                                {"segment_2"}, tenant_id)
+                    .has_value());
+    ASSERT_TRUE(service->CopyEnd(client_id, "copy_key", tenant_id).has_value());
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, "move_key", 1024, config, tenant_id)
+            .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, "move_key", ReplicaType::MEMORY, tenant_id)
+            .has_value());
+    EXPECT_EQ(
+        service->CreateMoveTask("move_key", "segment_1", "segment_3").error(),
+        ErrorCode::OBJECT_NOT_FOUND);
+    ASSERT_TRUE(
+        service->CreateMoveTask("move_key", "segment_1", "segment_3", tenant_id)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->MoveStart(client_id, "move_key", "segment_1", "segment_3",
+                                tenant_id)
+                    .has_value());
+    ASSERT_TRUE(service->MoveEnd(client_id, "move_key", tenant_id).has_value());
+}
+
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
                                   const std::string& segment_name) {
@@ -3544,8 +3635,14 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        const auto storage_key = BuildTenantScopedKey("default", key);
+        auto it = res.value().find(storage_key);
+        ASSERT_TRUE(it != res.value().end());
+        ASSERT_EQ(it->second, 1024);
+        auto parsed = ParseTenantScopedKey(storage_key);
+        ASSERT_TRUE(parsed.has_value());
+        ASSERT_EQ(parsed->tenant_id, "default");
+        ASSERT_EQ(parsed->user_key, key);
     }
 
     keys.clear();
@@ -3561,8 +3658,10 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        const auto storage_key = BuildTenantScopedKey("default", key);
+        auto it = res.value().find(storage_key);
+        ASSERT_TRUE(it != res.value().end());
+        ASSERT_EQ(it->second, 1024);
     }
 }
 

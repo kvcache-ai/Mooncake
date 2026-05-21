@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 #include <variant>
 #include <cstdlib>
@@ -52,8 +53,11 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
  */
 class MasterClient {
    public:
-    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)
-        : client_id_(client_id), metrics_(metrics) {
+    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
+                 std::string tenant_id = "default")
+        : client_id_(client_id),
+          tenant_id_(tenant_id.empty() ? "default" : std::move(tenant_id)),
+          metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
 
@@ -632,6 +636,7 @@ class MasterClient {
 
     // The client identification.
     const UUID client_id_;
+    const std::string tenant_id_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

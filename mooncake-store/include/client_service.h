@@ -65,6 +65,10 @@ class Client {
     virtual ~Client();
 
     const UUID& getClientId() const { return client_id_; }
+    const std::string& GetTenantId() const { return tenant_id_; }
+    std::string BuildStorageKey(const std::string& object_key) const {
+        return BuildTenantScopedKey(tenant_id_, object_key);
+    }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -86,7 +90,8 @@ class Client {
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
-        std::map<std::string, std::string> labels = {});
+        std::map<std::string, std::string> labels = {},
+        std::string tenant_id = "default");
 
     /**
      * @brief Retrieves data for a given key
@@ -627,7 +632,8 @@ class Client {
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring, const std::string& protocol,
-           const std::map<std::string, std::string>& labels = {});
+           const std::map<std::string, std::string>& labels = {},
+           std::string tenant_id = "default");
 
    private:
     /**
@@ -744,6 +750,7 @@ class Client {
 
     // Client identification
     const UUID client_id_;
+    const std::string tenant_id_;
 
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;

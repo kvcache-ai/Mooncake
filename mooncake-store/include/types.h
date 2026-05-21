@@ -215,6 +215,50 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+
+inline std::string NormalizeTenantId(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
+inline std::string BuildTenantScopedKey(const std::string& tenant_id,
+                                        const std::string& user_key) {
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    return std::to_string(normalized_tenant.size()) + ":" + normalized_tenant +
+           ":" + user_key;
+}
+
+struct TenantScopedKey {
+    std::string tenant_id;
+    std::string user_key;
+};
+
+inline std::optional<TenantScopedKey> ParseTenantScopedKey(
+    std::string_view scoped_key) {
+    const auto first_sep = scoped_key.find(':');
+    if (first_sep == std::string_view::npos || first_sep == 0) {
+        return std::nullopt;
+    }
+
+    size_t tenant_len = 0;
+    for (size_t i = 0; i < first_sep; ++i) {
+        const char ch = scoped_key[i];
+        if (ch < '0' || ch > '9') {
+            return std::nullopt;
+        }
+        tenant_len = tenant_len * 10 + static_cast<size_t>(ch - '0');
+    }
+
+    const size_t tenant_begin = first_sep + 1;
+    const size_t second_sep = tenant_begin + tenant_len;
+    if (second_sep >= scoped_key.size() || scoped_key[second_sep] != ':') {
+        return std::nullopt;
+    }
+
+    return TenantScopedKey{
+        std::string(scoped_key.substr(tenant_begin, tenant_len)),
+        std::string(scoped_key.substr(second_sep + 1))};
+}
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB

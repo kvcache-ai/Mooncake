@@ -755,8 +755,15 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
+    return ExistKey(key, "default");
+}
+
+auto MasterService::ExistKey(const std::string& key,
+                             const std::string& tenant_id)
+    -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRO accessor(this, internal_key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
@@ -775,10 +782,15 @@ auto MasterService::ExistKey(const std::string& key)
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
+    return BatchExistKey(keys, "default");
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
     std::vector<tl::expected<bool, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(ExistKey(key));
+        results.emplace_back(ExistKey(key, tenant_id));
     }
     return results;
 }
@@ -789,7 +801,7 @@ auto MasterService::GetAllKeys()
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
         for (const auto& item : shard->metadata) {
-            all_keys.push_back(item.first);
+            all_keys.push_back(item.second.UserKeyOr(item.first));
         }
     }
     return all_keys;
@@ -918,6 +930,13 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    return BatchReplicaClear(object_keys, client_id, segment_name, "default");
+}
+
+auto MasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name, const std::string& tenant_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
@@ -928,7 +947,8 @@ auto MasterService::BatchReplicaClear(
             LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
             continue;
         }
-        MetadataAccessorRW accessor(this, key);
+        const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+        MetadataAccessorRW accessor(this, internal_key);
         if (!accessor.Exists()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " not found, skipping";
@@ -1036,6 +1056,14 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     -> tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode> {
+    return GetReplicaListByRegex(regex_pattern, "default");
+}
+
+auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
+                                          const std::string& tenant_id)
+    -> tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode> {
     std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
     std::regex pattern;
 
@@ -1048,11 +1076,14 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
 
         for (const auto& [key, metadata] : shard->metadata) {
-            if (std::regex_search(key, pattern)) {
+            const auto& user_key = metadata.UserKeyOr(key);
+            if (metadata.tenant_id == normalized_tenant &&
+                std::regex_search(user_key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     &Replica::fn_is_completed,
@@ -1067,7 +1098,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                     continue;
                 }
 
-                results.emplace(key, std::move(replica_list));
+                results.emplace(user_key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
             }
@@ -1079,12 +1110,19 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    return GetReplicaList(key, "default");
+}
+
+auto MasterService::GetReplicaList(const std::string& key,
+                                   const std::string& tenant_id)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
     {
-        MetadataAccessorRO accessor(this, key);
+        MetadataAccessorRO accessor(this, internal_key);
 
         MasterMetricManager::instance().inc_total_get_nums();
 
@@ -1141,9 +1179,12 @@ auto MasterService::GetReplicaList(const std::string& key)
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
-    const ReplicateConfig& config,
+    const ReplicateConfig& config, const std::string& tenant_id_param,
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    const std::string tenant_id = NormalizeTenantId(tenant_id_param);
+    const std::string user_key = key;
+    const std::string internal_key = BuildTenantScopedKey(tenant_id, user_key);
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
@@ -1241,7 +1282,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (use_disk_replica_) {
         std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+            ResolvePathFromKey(internal_key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, value_length,
                               ReplicaStatus::PROCESSING);
     }
@@ -1271,11 +1312,11 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     shard->metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
+        std::piecewise_construct, std::forward_as_tuple(internal_key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin, config.with_hard_pin,
-                              config.data_type));
-    shard->processing_keys.insert(key);
+                              config.data_type, tenant_id, user_key));
+    shard->processing_keys.insert(internal_key);
 
     return replica_list;
 }
@@ -1283,6 +1324,14 @@ auto MasterService::AllocateAndInsertMetadata(
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    return PutStart(client_id, key, slice_length, config, "default");
+}
+
+auto MasterService::PutStart(const UUID& client_id, const std::string& key,
+                             const uint64_t slice_length,
+                             const ReplicateConfig& config,
+                             const std::string& tenant_id)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -1323,10 +1372,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
-    MetadataShardAccessorRW shard(this, getShardIndex(key));
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataShardAccessorRW shard(this, getShardIndex(internal_key));
 
     const auto now = std::chrono::system_clock::now();
-    auto it = shard->metadata.find(key);
+    auto it = shard->metadata.find(internal_key);
     if (it != shard->metadata.end() &&
         !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
@@ -1342,7 +1392,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
-            shard->processing_keys.erase(key);
+            shard->processing_keys.erase(internal_key);
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -1351,14 +1401,22 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
 
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     config, now);
+                                     config, tenant_id, now);
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, key, replica_type, "default");
+}
+
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           ReplicaType replica_type,
+                           const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1397,13 +1455,14 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &key, &shard](Replica& replica) {
-                auto result = PushOffloadingQueue(key, replica);
+            [this, &key, &tenant_id, &internal_key, &shard](Replica& replica) {
+                auto result = PushOffloadingQueue(tenant_id, key, replica);
                 if (result) {
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(),
-                                            std::chrono::system_clock::now()});
+                        internal_key,
+                        OffloadingTask{replica.id(),
+                                       std::chrono::system_clock::now()});
                 }
             });
     }
@@ -1430,13 +1489,22 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                Replica& replica)
     -> tl::expected<void, ErrorCode> {
+    return AddReplica(client_id, key, replica, "default");
+}
+
+auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
+                               Replica& replica, const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    const auto internal_key = BuildTenantScopedKey(normalized_tenant, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
+            std::vector<Replica>{}, false, false, ObjectDataType::UNKNOWN,
+            normalized_tenant, key);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -1475,8 +1543,16 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    return PutRevoke(client_id, key, replica_type, "default");
+}
+
+auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
+                              ReplicaType replica_type,
+                              const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1532,10 +1608,16 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
+    return BatchPutEnd(client_id, keys, replica_type, "default");
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type, const std::string& tenant_id) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, replica_type));
+        results.emplace_back(PutEnd(client_id, key, replica_type, tenant_id));
     }
     return results;
 }
@@ -1543,10 +1625,17 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
+    return BatchPutRevoke(client_id, keys, replica_type, "default");
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type, const std::string& tenant_id) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(client_id, key, replica_type));
+        results.emplace_back(
+            PutRevoke(client_id, key, replica_type, tenant_id));
     }
     return results;
 }
@@ -1568,6 +1657,14 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const uint64_t slice_length,
                                 const ReplicateConfig& config)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    return UpsertStart(client_id, key, slice_length, config, "default");
+}
+
+auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
+                                const uint64_t slice_length,
+                                const ReplicateConfig& config,
+                                const std::string& tenant_id)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     // --- Parameter validation (same as PutStart) ---
     if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
@@ -1613,10 +1710,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   operations on keys that hash to the same shard.
     auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataShardAccessorRW shard(this, getShardIndex(key));
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataShardAccessorRW shard(this, getShardIndex(internal_key));
 
     const auto now = std::chrono::system_clock::now();
-    auto it = shard->metadata.find(key);
+    auto it = shard->metadata.find(internal_key);
 
     // --- Step 0: stale handle cleanup ---
     // If all memory replicas point to unmounted segments (node crashed and
@@ -1624,8 +1722,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // Also clean up local_disk replicas whose owner client has expired.
     if (it != shard->metadata.end() &&
         CleanupStaleHandles(it->second, alive_clients)) {
-        shard->processing_keys.erase(key);
-        ErasePromotionTaskIfPresent(shard, key);
+        shard->processing_keys.erase(internal_key);
+        ErasePromotionTaskIfPresent(shard, internal_key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
     }
@@ -1636,13 +1734,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
         // Reject if a Copy/Move task is actively reading this key's replicas.
         // Writing during replication would corrupt the copy.
-        if (shard->replication_tasks.count(key) > 0) {
+        if (shard->replication_tasks.count(internal_key) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
 
         // Reject if an offload-to-disk task is in progress (same reason).
-        if (shard->offloading_tasks.count(key) > 0) {
+        if (shard->offloading_tasks.count(internal_key) > 0) {
             LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
             return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
         }
@@ -1652,7 +1750,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         // TTL so they are not freed while the old writer may still be doing
         // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
         // UpsertStart preempts immediately.
-        if (shard->processing_keys.count(key) > 0) {
+        if (shard->processing_keys.count(internal_key) > 0) {
             auto processing_replicas =
                 metadata.PopReplicas(&Replica::fn_is_processing);
             if (!processing_replicas.empty()) {
@@ -1661,7 +1759,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     std::move(processing_replicas),
                     now + put_start_release_timeout_sec_);
             }
-            shard->processing_keys.erase(key);
+            shard->processing_keys.erase(internal_key);
 
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
@@ -1678,7 +1776,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (it == shard->metadata.end()) {
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         config, now);
+                                         config, tenant_id, now);
     }
 
     // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
@@ -1720,7 +1818,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             replica.mark_processing();
         });
 
-        shard->processing_keys.insert(key);
+        shard->processing_keys.insert(internal_key);
 
         // Return the existing descriptors — same buffer addresses as before.
         std::vector<Replica::Descriptor> replica_list;
@@ -1757,19 +1855,33 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     merged_config, now);
+                                     merged_config, tenant_id, now);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, replica_type);
+    return UpsertEnd(client_id, key, replica_type, "default");
+}
+
+auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
+                              ReplicaType replica_type,
+                              const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, key, replica_type, tenant_id);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutRevoke(client_id, key, replica_type);
+    return UpsertRevoke(client_id, key, replica_type, "default");
+}
+
+auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
+                                 ReplicaType replica_type,
+                                 const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    return PutRevoke(client_id, key, replica_type, tenant_id);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -1777,6 +1889,15 @@ MasterService::BatchUpsertStart(const UUID& client_id,
                                 const std::vector<std::string>& keys,
                                 const std::vector<uint64_t>& slice_lengths,
                                 const ReplicateConfig& config) {
+    return BatchUpsertStart(client_id, keys, slice_lengths, config, "default");
+}
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchUpsertStart(const UUID& client_id,
+                                const std::vector<std::string>& keys,
+                                const std::vector<uint64_t>& slice_lengths,
+                                const ReplicateConfig& config,
+                                const std::string& tenant_id) {
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
@@ -1788,27 +1909,52 @@ MasterService::BatchUpsertStart(const UUID& client_id,
         results;
     results.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results.emplace_back(
-            UpsertStart(client_id, keys[i], slice_lengths[i], config));
+        results.emplace_back(UpsertStart(client_id, keys[i], slice_lengths[i],
+                                         config, tenant_id));
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys) {
-    return BatchPutEnd(client_id, keys);
+    return BatchPutEnd(client_id, keys, ReplicaType::ALL);
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    return BatchPutEnd(client_id, keys, ReplicaType::ALL, tenant_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     const UUID& client_id, const std::vector<std::string>& keys) {
-    return BatchPutRevoke(client_id, keys);
+    return BatchPutRevoke(client_id, keys, ReplicaType::ALL);
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::string& tenant_id) {
+    return BatchPutRevoke(client_id, keys, ReplicaType::ALL, tenant_id);
 }
 
 auto MasterService::EvictDiskReplica(const UUID& client_id,
                                      const std::string& key,
                                      ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessorRW accessor(this, key);
+    if (auto parsed = ParseTenantScopedKey(key)) {
+        return EvictDiskReplica(client_id, parsed->user_key, replica_type,
+                                parsed->tenant_id);
+    }
+    return EvictDiskReplica(client_id, key, replica_type, "default");
+}
+
+auto MasterService::EvictDiskReplica(const UUID& client_id,
+                                     const std::string& key,
+                                     ReplicaType replica_type,
+                                     const std::string& tenant_id)
+    -> tl::expected<void, ErrorCode> {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found_for_eviction";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1850,10 +1996,31 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type, const std::string& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto& key : keys) {
+        results.push_back(
+            EvictDiskReplica(client_id, key, replica_type, tenant_id));
+    }
+    return results;
+}
+
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
+    return CopyStart(client_id, key, src_segment, tgt_segments, "default");
+}
+
+tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         ScopedSegmentAccess segment_access =
@@ -1872,7 +2039,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
             }
         }
     }
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1931,7 +2098,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
     shard->replication_tasks.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
+        std::piecewise_construct, std::forward_as_tuple(internal_key),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::COPY, source->id(),
                               std::move(replica_ids)));
@@ -1948,8 +2115,15 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
+    return CopyEnd(client_id, key, "default");
+}
+
+tl::expected<void, ErrorCode> MasterService::CopyEnd(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2019,8 +2193,15 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
+    return CopyRevoke(client_id, key, "default");
+}
+
+tl::expected<void, ErrorCode> MasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2073,6 +2254,14 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
+    return MoveStart(client_id, key, src_segment, tgt_segment, "default");
+}
+
+tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment, const std::string& tgt_segment,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
@@ -2095,7 +2284,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         }
     }
 
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2146,7 +2335,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
     shard->replication_tasks.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
+        std::piecewise_construct, std::forward_as_tuple(internal_key),
         std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::MOVE, source->id(),
                               std::move(replica_ids)));
@@ -2163,8 +2352,15 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
+    return MoveEnd(client_id, key, "default");
+}
+
+tl::expected<void, ErrorCode> MasterService::MoveEnd(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2249,8 +2445,15 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
+    return MoveRevoke(client_id, key, "default");
+}
+
+tl::expected<void, ErrorCode> MasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2302,8 +2505,14 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
+    return Remove(key, "default", force);
+}
+
+auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
+                           bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRW accessor(this, key);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRW accessor(this, internal_key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2340,6 +2549,12 @@ auto MasterService::Remove(const std::string& key, bool force)
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
+    return RemoveByRegex(regex_pattern, "default", force);
+}
+
+auto MasterService::RemoveByRegex(const std::string& regex_pattern,
+                                  const std::string& tenant_id, bool force)
+    -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 
@@ -2352,11 +2567,14 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
-            if (std::regex_search(it->first, pattern)) {
+            const auto& user_key = it->second.UserKeyOr(it->first);
+            if (it->second.tenant_id == normalized_tenant &&
+                std::regex_search(user_key, pattern)) {
                 if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
@@ -2448,6 +2666,12 @@ long MasterService::RemoveAll(bool force) {
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                                 bool force)
     -> std::vector<tl::expected<void, ErrorCode>> {
+    return BatchRemove(keys, "default", force);
+}
+
+auto MasterService::BatchRemove(const std::vector<std::string>& keys,
+                                const std::string& tenant_id, bool force)
+    -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
 
     // Group keys by shard to reduce lock contention
@@ -2458,7 +2682,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        size_t shard_idx = getShardIndex(keys[i]);
+        size_t shard_idx =
+            getShardIndex(BuildTenantScopedKey(tenant_id, keys[i]));
         keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
@@ -2473,7 +2698,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
-            auto it = shard->metadata.find(key);
+            const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+            auto it = shard->metadata.find(internal_key);
 
             if (it == shard->metadata.end()) {
                 VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -2484,9 +2710,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Clean up stale replica handles (consistent with single Remove)
             if (CleanupStaleHandles(it->second, alive_clients)) {
-                shard->processing_keys.erase(key);
-                shard->replication_tasks.erase(key);
-                shard->offloading_tasks.erase(key);
+                shard->processing_keys.erase(internal_key);
+                shard->replication_tasks.erase(internal_key);
+                shard->offloading_tasks.erase(internal_key);
                 shard->metadata.erase(it);
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2514,7 +2740,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
-            if (shard->replication_tasks.contains(key)) {
+            if (shard->replication_tasks.contains(internal_key)) {
                 LOG(ERROR) << "key=" << key
                            << ", error=object_has_replication_task";
                 results[original_idx] =
@@ -2669,10 +2895,14 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
 
     for (auto& [key, size] : offloading_objects_copy) {
-        MetadataAccessorRW accessor(this, key);
+        auto parsed = ParseTenantScopedKey(key);
+        const auto internal_key =
+            parsed ? BuildTenantScopedKey(parsed->tenant_id, parsed->user_key)
+                   : BuildTenantScopedKey("default", key);
+        MetadataAccessorRW accessor(this, internal_key);
         if (accessor.Exists()) {
             auto& shard = accessor.GetShard();
-            auto task_it = shard->offloading_tasks.find(key);
+            auto task_it = shard->offloading_tasks.find(internal_key);
             if (task_it != shard->offloading_tasks.end()) {
                 auto source =
                     accessor.Get().GetReplicaByID(task_it->second.source_id);
@@ -2726,16 +2956,20 @@ auto MasterService::NotifyOffloadSuccess(
     const std::vector<StorageObjectMetadata>& metadatas)
     -> tl::expected<void, ErrorCode> {
     for (size_t i = 0; i < keys.size(); ++i) {
-        const auto& key = keys[i];
+        const auto& storage_key = keys[i];
+        auto parsed = ParseTenantScopedKey(storage_key);
+        const std::string tenant_id = parsed ? parsed->tenant_id : "default";
+        const std::string user_key = parsed ? parsed->user_key : storage_key;
+        const auto internal_key = BuildTenantScopedKey(tenant_id, user_key);
         const auto& metadata = metadatas[i];
 
         // Release refcnt and clear offloading task.
         {
-            MetadataAccessorRW accessor(this, key);
+            MetadataAccessorRW accessor(this, internal_key);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& shard = accessor.GetShard();
-                auto task_it = shard->offloading_tasks.find(key);
+                auto task_it = shard->offloading_tasks.find(internal_key);
                 if (task_it != shard->offloading_tasks.end()) {
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
@@ -2750,10 +2984,11 @@ auto MasterService::NotifyOffloadSuccess(
         // Add LOCAL_DISK replica.
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        auto res = AddReplica(client_id, key, replica);
+        auto res = AddReplica(client_id, user_key, replica, tenant_id);
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                       << ", client_id=" << client_id << ", key=" << key;
+                       << ", client_id=" << client_id << ", key=" << user_key
+                       << ", tenant_id=" << tenant_id;
             return tl::make_unexpected(res.error());
         }
     }
@@ -2761,7 +2996,8 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const std::string& key, Replica& replica) {
+    const std::string& tenant_id, const std::string& key, Replica& replica) {
+    const auto storage_key = BuildTenantScopedKey(tenant_id, key);
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -2795,9 +3031,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
         auto res = local_disk_segment_it->second->offloading_objects.emplace(
-            key, replica.get_descriptor()
-                     .get_memory_descriptor()
-                     .buffer_descriptor.size_);
+            storage_key, replica.get_descriptor()
+                             .get_memory_descriptor()
+                             .buffer_descriptor.size_);
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
@@ -4553,14 +4789,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
+        const std::string& user_key = metadata.UserKeyOr(key);
         metadata.VisitReplicas(
             [](const Replica& r) {
                 return r.is_memory_replica() && r.is_completed() &&
                        r.get_refcnt() == 0;
             },
-            [this, &key, &shard, &queued, &now](Replica& replica) {
+            [this, &key, &metadata, &user_key, &shard, &queued,
+             &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(key, replica);
+                auto result =
+                    PushOffloadingQueue(metadata.tenant_id, user_key, replica);
                 if (result) {
                     replica.inc_refcnt();
                     shard->offloading_tasks.emplace(
@@ -4827,7 +5066,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced
@@ -5580,13 +5820,20 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
+        std::string restored_user_key = metadata_ptr->UserKeyOr(key);
+        if (metadata_ptr->user_key.empty()) {
+            if (auto parsed = ParseTenantScopedKey(key)) {
+                restored_user_key = std::move(parsed->user_key);
+            }
+        }
         auto [it, inserted] = shard.metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(std::move(key)),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
+                metadata_ptr->tenant_id, std::move(restored_user_key)));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -5602,11 +5849,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned]
+    // tenant_id, user_key, replicas..., hard_pinned]
 
-    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
-                            // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count, data_type, hard_pinned
+    size_t array_size = 11;  // client_id, put_start_time, size, lease_timeout,
+                             // has_soft_pin_timeout, soft_pin_timeout,
+                             // replicas_count, data_type, tenant_id, user_key,
+                             // hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -5648,6 +5896,10 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     // Serialize data_type
     packer.pack(static_cast<uint8_t>(metadata.data_type));
+
+    // Serialize tenant scope
+    packer.pack(metadata.tenant_id);
+    packer.pack(metadata.user_key);
 
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
@@ -5711,9 +5963,11 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v1: 7 + replicas_count, no data_type or hard_pinned
     //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
     //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    //   v4: 11 + replicas_count, data_type, tenant_id, user_key, hard_pinned
     constexpr uint32_t kOldFieldCount = 7;
     constexpr uint32_t kOneExtraFieldCount = 8;
     constexpr uint32_t kCurrentFieldCount = 9;
+    constexpr uint32_t kTenantFieldCount = 11;
     const uint32_t total_elements = obj.via.array.size;
     const bool is_old_format =
         (total_elements == kOldFieldCount + replicas_count);
@@ -5721,19 +5975,29 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         (total_elements == kOneExtraFieldCount + replicas_count);
     const bool is_current_format =
         (total_elements == kCurrentFieldCount + replicas_count);
+    const bool is_tenant_format =
+        (total_elements == kTenantFieldCount + replicas_count);
 
-    if (!is_current_format && !is_one_extra_format && !is_old_format) {
+    if (!is_tenant_format && !is_current_format && !is_one_extra_format &&
+        !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
     }
 
     ObjectDataType data_type = ObjectDataType::UNKNOWN;
-    if (is_current_format) {
+    if (is_current_format || is_tenant_format) {
         data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     } else if (is_one_extra_format &&
                array[index].type == msgpack::type::POSITIVE_INTEGER) {
         data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    }
+
+    std::string tenant_id = "default";
+    std::string user_key;
+    if (is_tenant_format) {
+        tenant_id = array[index++].as<std::string>();
+        user_key = array[index++].as<std::string>();
     }
 
     // Deserialize replicas
@@ -5761,7 +6025,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
+        tenant_id, user_key);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -5794,12 +6059,19 @@ std::string MasterService::FormatTimestamp(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
+    return CreateCopyTask(key, targets, "default");
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets,
+    const std::string& tenant_id) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    MetadataAccessorRO accessor(this, key);
+    MetadataAccessorRO accessor(this, internal_key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -5850,8 +6122,15 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
+    return CreateMoveTask(key, source, target, "default");
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target, const std::string& tenant_id) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
+    const auto internal_key = BuildTenantScopedKey(tenant_id, key);
+    MetadataAccessorRO accessor(this, internal_key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -6221,8 +6500,10 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [key, metadata] : shard->metadata) {
+                const std::string& user_key = metadata.UserKeyOr(key);
                 for (const auto& source_segment : job.request.segments) {
-                    const auto unit_key = MakeDrainUnitKey(key, source_segment);
+                    const auto unit_key =
+                        MakeDrainUnitKey(user_key, source_segment);
                     if (job.completed_unit_keys.contains(unit_key) ||
                         active_unit_keys.contains(unit_key) ||
                         job.terminal_failed_unit_keys.contains(unit_key)) {
@@ -6252,7 +6533,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     }
 
                     if (plans.size() < slots) {
-                        plans.push_back({key, source_segment, *target,
+                        plans.push_back({user_key, source_segment, *target,
                                          metadata.size, unit_key});
                     }
                 }
@@ -6306,6 +6587,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [key, metadata] : shard->metadata) {
+                const std::string& user_key = metadata.UserKeyOr(key);
                 const auto replica_segments = metadata.GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
                     if (std::find(replica_segments.begin(),
@@ -6313,7 +6595,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                                   source_segment) != replica_segments.end()) {
                         remaining_segments.insert(source_segment);
                         remaining_unit_keys.insert(
-                            MakeDrainUnitKey(key, source_segment));
+                            MakeDrainUnitKey(user_key, source_segment));
                     }
                 }
             }
