@@ -28,7 +28,7 @@ sources = [
     "src/mooncake_ep_kernel.cu",
 ]
 if not use_tent:
-    sources.append("src/mooncake_ibgda/mlx5gda.cpp")
+    sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp")
 
 if CUDA_HOME is not None:
     cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")

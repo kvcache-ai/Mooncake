@@ -1,6 +1,7 @@
 set(MOONCAKE_EP_SOURCES ep_py.cpp mooncake_ep_buffer.cpp mooncake_ep_kernel.cu)
 if(NOT USE_TENT)
-  list(APPEND MOONCAKE_EP_SOURCES mooncake_ibgda/mlx5gda.cpp)
+  list(APPEND MOONCAKE_EP_SOURCES
+       ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp)
 endif()
 
 add_library(mooncake_ep ${MOONCAKE_EP_SOURCES})

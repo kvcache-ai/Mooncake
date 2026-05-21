@@ -11,7 +11,7 @@
 #include <tent/device/ibgda.cuh>
 #include <tent/device/nvlink.cuh>
 #else
-#include <mooncake_ibgda/mlx5gda.h>
+#include <tent/transport/ibgda/detail/mlx5gda.h>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>
 #endif

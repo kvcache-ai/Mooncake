@@ -11,8 +11,8 @@
 #include <tent/device/ibgda.h>
 #include <tent/device/nvlink.h>
 #else
-#include <mooncake_ibgda/memheap.h>
-#include <mooncake_ibgda/mlx5gda.h>
+#include <tent/transport/ibgda/detail/memheap.h>
+#include <tent/transport/ibgda/detail/mlx5gda.h>
 #endif
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
