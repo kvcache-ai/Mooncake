@@ -306,6 +306,9 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t expired_pre = mm.get_promotion_expired();
+
     // Trigger #1: enqueue, then drain the per-segment queue. Drain leaves
     // the per-shard PromotionTask intact (the heartbeat is best-effort GC,
     // not the authoritative state).
@@ -344,6 +347,9 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
             << "After reap, a fresh read must re-enqueue the same key";
     }
 
+    EXPECT_EQ(mm.get_promotion_expired() - expired_pre, 1)
+        << "Reaper expiry must bump promotion_expired";
+
     service->RemoveAll();
 }
 
@@ -368,6 +374,9 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
     // Queue a promotion task.
     {
         auto r = service->GetReplicaList("k_cold");
@@ -381,6 +390,9 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     ASSERT_TRUE(rm.has_value())
         << "Remove on a LOCAL_DISK-only key with a queued promotion should "
         << "succeed (all replicas COMPLETE); error=" << rm.error();
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
+        << "Remove of a key with an in-flight promotion task must bump "
+        << "promotion_cancelled";
 
     // NotifyPromotionSuccess on the now-removed key must surface the missing
     // metadata cleanly, not crash.
@@ -547,6 +559,9 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
                                        seg.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cap_rej_pre = mm.get_promotion_rejected_cap();
+
     // First read on k1 enqueues a task in shard S.
     auto r1 = service->GetReplicaList(k1);
     ASSERT_TRUE(r1.has_value());
@@ -568,6 +583,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
         << "k1 was read first and should be the surviving task";
     EXPECT_EQ(heartbeat->count(k2), 0u)
         << "k2 was rejected by the cap gate; should not appear";
+    EXPECT_EQ(mm.get_promotion_rejected_cap() - cap_rej_pre, 1)
+        << "k2's rejection must increment promotion_rejected_cap";
 
     service->RemoveAll();
 }
@@ -1133,6 +1150,9 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     ASSERT_TRUE(seg_baseline.has_value());
     const size_t used_baseline = seg_baseline->first;
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t failed_pre = mm.get_promotion_failed();
+
     // Admit + stage k_a. promotion_in_flight_ goes 0 -> 1.
     {
         auto r = service->GetReplicaList("k_a");
@@ -1154,6 +1174,8 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     ASSERT_TRUE(failure.has_value())
         << "NotifyPromotionFailure on a valid in-flight task from the "
         << "legitimate holder must succeed; error=" << failure.error();
+    EXPECT_EQ(mm.get_promotion_failed() - failed_pre, 1)
+        << "holder-reported failure must bump promotion_failed";
 
     // The staged buffer must be freed back to the DRAM allocator. If
     // this fires, NotifyPromotionFailure did not pop the staged replica
@@ -1387,6 +1409,9 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_cold",
                                        1024, holder.segment_name));
 
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
     // Admit the promotion. promotion_in_flight_ goes 0 -> 1.
     {
         auto r = service->GetReplicaList("k_cold");
@@ -1464,6 +1489,9 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
         << "saturated by the dead holder's task for "
         << "put_start_release_timeout_sec_ seconds, and this admission "
         << "is dropped.";
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
+        << "Holder-client expiry mid-promotion must bump "
+        << "promotion_cancelled";
 
     service->RemoveAll();
 }
@@ -1608,6 +1636,218 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
         << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
         << "— RemoveByRegex must erase the in-flight promotion_tasks "
         << "entry. Otherwise queue_limit=1 stays saturated.";
+
+    service->RemoveAll();
+}
+
+// The funnel metrics (admitted, completed, completed_bytes, in_flight)
+// track a successful promotion lifecycle end-to-end: a single
+// admission bumps admitted+1 and in_flight+1; NotifyPromotionSuccess
+// bumps completed+1 and completed_bytes+object_size and brings
+// in_flight back to 0.
+TEST_F(PromotionOnHitTest, MetricsFunnelTracksSuccessfulPromotion) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr int64_t kObjBytes = 4096;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_hot",
+                                       kObjBytes, seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t completed_pre = mm.get_promotion_completed();
+    const int64_t bytes_pre = mm.get_promotion_completed_bytes();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    // Admit.
+    {
+        auto r = service->GetReplicaList("k_hot");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_admitted() - admitted_pre, 1);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 1);
+
+    // Drive AllocStart + NotifyPromotionSuccess.
+    auto alloc =
+        service->PromotionAllocStart(seg.client_id, "k_hot", kObjBytes, {});
+    ASSERT_TRUE(alloc.has_value());
+    auto notify = service->NotifyPromotionSuccess(seg.client_id, "k_hot");
+    ASSERT_TRUE(notify.has_value());
+
+    EXPECT_EQ(mm.get_promotion_completed() - completed_pre, 1);
+    EXPECT_EQ(mm.get_promotion_completed_bytes() - bytes_pre, kObjBytes);
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+
+    service->RemoveAll();
+}
+
+// Each rejection gate (frequency / watermark / cap) increments its
+// own counter when its branch fires.
+TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    // Threshold > 1 so the first Get is rejected on frequency.
+    config.promotion_admission_threshold = 2;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_a", 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_b", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t freq_pre = mm.get_promotion_rejected_frequency();
+    const int64_t cap_pre = mm.get_promotion_rejected_cap();
+
+    // 1st Get on k_a: freq=1, threshold=2 → rejected on frequency.
+    {
+        auto r = service->GetReplicaList("k_a");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_rejected_frequency() - freq_pre, 1);
+
+    // 2nd Get on k_a: freq=2, admits. Now in-flight = 1 == limit.
+    {
+        auto r = service->GetReplicaList("k_a");
+        ASSERT_TRUE(r.has_value());
+    }
+    // Get on k_b: freq=1, threshold=2 → rejected on frequency.
+    {
+        auto r = service->GetReplicaList("k_b");
+        ASSERT_TRUE(r.has_value());
+    }
+    // Get on k_b again: freq=2, gets past frequency, but cap=1
+    // saturated → rejected on cap.
+    {
+        auto r = service->GetReplicaList("k_b");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_rejected_cap() - cap_pre, 1);
+
+    service->RemoveAll();
+}
+
+// promotion_max_per_heartbeat controls how many tasks
+// PromotionObjectHeartbeat returns per call. Set the knob to 3 and
+// verify the master returns up to 3 tasks per heartbeat.
+TEST_F(PromotionOnHitTest, MaxPerHeartbeatKnobControlsBatchSize) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 3;  // raise from default 1
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+
+    // Admit 5 tasks on the same holder.
+    for (int i = 0; i < 5; ++i) {
+        const auto key = "k_" + std::to_string(i);
+        ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
+                                           seg.segment_name));
+        auto r = service->GetReplicaList(key);
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // First heartbeat: cap=3.
+    auto first = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->size(), 3u)
+        << "expected promotion_max_per_heartbeat=3 keys, got " << first->size();
+
+    // Second heartbeat: 2 leftover.
+    auto second = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->size(), 2u);
+
+    // Third heartbeat: empty.
+    auto third = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(third.has_value());
+    EXPECT_EQ(third->size(), 0u);
+
+    service->RemoveAll();
+}
+
+// promotion_max_per_heartbeat = 0 must be clamped to 1 by the
+// MasterService constructor; otherwise PromotionObjectHeartbeat would
+// return an empty batch every call and silently disable promotion
+// delivery.
+TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_max_per_heartbeat = 0;  // pathological
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k1", 1024,
+                                       seg.segment_name));
+    {
+        auto r = service->GetReplicaList("k1");
+        ASSERT_TRUE(r.has_value());
+    }
+
+    // If max_per_heartbeat=0 weren't clamped, this would return empty.
+    auto hb = service->PromotionObjectHeartbeat(seg.client_id);
+    ASSERT_TRUE(hb.has_value());
+    EXPECT_EQ(hb->size(), 1u)
+        << "max_per_heartbeat=0 must clamp to 1 so promotion delivery "
+        << "isn't silently disabled";
+
+    service->RemoveAll();
+}
+
+// Remove on a key mid-promotion must bump promotion_cancelled so the
+// funnel invariant
+// admitted = completed + failed + expired + cancelled + in_flight
+// holds. Exercises the ErasePromotionTaskIfPresent path.
+TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k_drop", 1024,
+                                       seg.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t admitted_pre = mm.get_promotion_admitted();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+    const int64_t in_flight_pre = mm.get_promotion_in_flight();
+
+    // Admit a promotion. in_flight goes from 0 to 1.
+    {
+        auto r = service->GetReplicaList("k_drop");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_EQ(mm.get_promotion_admitted() - admitted_pre, 1);
+    ASSERT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 1);
+
+    auto rm = service->Remove("k_drop", /*force=*/true);
+    ASSERT_TRUE(rm.has_value()) << "error=" << rm.error();
+
+    EXPECT_EQ(mm.get_promotion_in_flight() - in_flight_pre, 0);
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1);
 
     service->RemoveAll();
 }
