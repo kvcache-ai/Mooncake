@@ -95,8 +95,7 @@ Status TcpTransport::install(std::string &local_segment_name,
         return 0;
     });
     caps.dram_to_dram = true;
-    if (Platform::getLoader().type() == "cuda" ||
-        Platform::getLoader().type() == "cann") {
+    if (Platform::getLoader().type() != "cpu") {
         caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;

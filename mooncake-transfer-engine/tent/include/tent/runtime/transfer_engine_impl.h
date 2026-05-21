@@ -186,6 +186,9 @@ class TransferEngineImpl {
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
+    void updateTaskStatusFromPoll(Batch* batch, size_t task_id,
+                                  TransferStatus& task_status);
+
     TransportType resolveTransport(const Request& req, int priority,
                                    bool invalidate_on_fail = true);
 
@@ -236,6 +239,7 @@ class TransferEngineImpl {
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
     int max_failover_attempts_{3};
+    bool enable_auto_failover_on_poll_{true};
 };
 }  // namespace tent
 }  // namespace mooncake

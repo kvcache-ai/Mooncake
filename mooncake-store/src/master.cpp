@@ -17,6 +17,7 @@
 #include "utils.h"
 
 #include "master_config.h"
+#include "version.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
@@ -78,10 +79,15 @@ DEFINE_bool(allow_evict_soft_pinned_objects,
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
-              "Ratio of objects to evict when storage space is full");
+              "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-              "Ratio of high watermark trigger eviction");
+              "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
+              "Ratio of objects to evict when NoF SSD space is full");
+DEFINE_double(nof_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
+              "Ratio of high watermark trigger eviction in NoF SSD");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -101,13 +107,20 @@ DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
-        LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
+        LOG(FATAL) << "Mem eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
         return false;
     }
     return true;
 });
 DEFINE_bool(enable_ha, false,
-            "Enable high availability, which depends on etcd");
+            "Enable high availability using the configured HA backend");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
@@ -116,14 +129,27 @@ DEFINE_bool(offload_force_evict, false,
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
-              "HA backend connection string. If unset, fallback to "
-              "etcd_endpoints for backward compatibility");
+              "HA backend connection string. If unset, only backend_type=etcd "
+              "falls back to etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "How long a client is considered alive after the last ping, only "
-             "used in HA mode");
+DEFINE_int64(
+    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+    "Seconds a client stays considered alive after the last heartbeat. "
+    "If this TTL elapses without a refresh, the master treats the "
+    "client as disconnected and may unmount its segments");
+DEFINE_int64(nof_heartbeat_interval_sec,
+             mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
+             "How often master probes each mounted NoF segment");
+DEFINE_uint32(nof_heartbeat_probe_timeout_ms,
+              mooncake::DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS,
+              "Timeout in milliseconds for a single NoF heartbeat probe");
+DEFINE_uint32(
+    nof_heartbeat_failures_threshold,
+    mooncake::DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD,
+    "Consecutive NoF heartbeat failures required before unmounting a NoF "
+    "segment");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -214,10 +240,9 @@ namespace {
 
 std::string ResolveHABackendConnstring(
     const mooncake::MasterConfig& master_config) {
-    if (!master_config.ha_backend_connstring.empty()) {
-        return master_config.ha_backend_connstring;
-    }
-    return master_config.etcd_endpoints;
+    return mooncake::ResolveConfiguredHABackendConnstring(
+        master_config.ha_backend_type, master_config.ha_backend_connstring,
+        master_config.etcd_endpoints);
 }
 
 void ResolveRpcAddressFromInterfaceOrDie(
@@ -289,9 +314,24 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("nof_eviction_ratio",
+                             &master_config.nof_eviction_ratio,
+                             FLAGS_nof_eviction_ratio);
+    default_config.GetDouble("nof_eviction_high_watermark_ratio",
+                             &master_config.nof_eviction_high_watermark_ratio,
+                             FLAGS_nof_eviction_high_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetInt64("nof_heartbeat_interval_sec",
+                            &master_config.nof_heartbeat_interval_sec,
+                            FLAGS_nof_heartbeat_interval_sec);
+    default_config.GetUInt32("nof_heartbeat_probe_timeout_ms",
+                             &master_config.nof_heartbeat_probe_timeout_ms,
+                             FLAGS_nof_heartbeat_probe_timeout_ms);
+    default_config.GetUInt32("nof_heartbeat_failures_threshold",
+                             &master_config.nof_heartbeat_failures_threshold,
+                             FLAGS_nof_heartbeat_failures_threshold);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -533,6 +573,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
     }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_ratio = FLAGS_nof_eviction_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_high_watermark_ratio =
+            FLAGS_nof_eviction_high_watermark_ratio;
+    }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -562,6 +614,26 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_interval_sec =
+            FLAGS_nof_heartbeat_interval_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_probe_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_probe_timeout_ms =
+            FLAGS_nof_heartbeat_probe_timeout_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_failures_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_failures_threshold =
+            FLAGS_nof_heartbeat_failures_threshold;
     }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||
@@ -805,6 +877,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
@@ -832,7 +905,10 @@ int main(int argc, char* argv[]) {
         ResolveHABackendConnstring(master_config);
     if (master_config.enable_ha && ha_backend_connstring.empty()) {
         LOG(FATAL) << "HA backend connection string must be set when "
-                   << "enable_ha is true";
+                   << "enable_ha is true, backend_type="
+                   << master_config.ha_backend_type
+                   << ". Only backend_type=etcd may fall back to "
+                   << "etcd_endpoints";
         return 1;
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||

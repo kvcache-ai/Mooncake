@@ -14,6 +14,7 @@
 
 #include "client_metric.h"
 #include "replica.h"
+#include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
@@ -204,7 +205,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revokes a put operation
@@ -221,7 +223,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -296,6 +299,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const Segment& segment);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
+        const Segment& segment);
+
+    /**
+     * @brief Registers a NoF ssd segment to master for allocation
+     * @param segment Segment to register
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
+        const NoFSegment& segment);
+
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
@@ -308,6 +322,17 @@ class MasterClient {
         const std::vector<Segment>& segments);
 
     /**
+     * @brief Re-mount NoF ssd segments, invoked when the client is the first
+     * time to connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountNoFSegment(
+        const std::vector<NoFSegment>& segments);
+
+    /**
      * @brief Unregisters a memory segment from master
      * @param segment_id ID of the segment to unmount
      * @return tl::expected<void, ErrorCode> indicating success/failure
@@ -315,12 +340,43 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
         const UUID& segment_id);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, uint64_t grace_period_ms);
+
+    /**
+     * @brief Unregisters a NoF ssd segment from master
+     * @param segment_id ID of the segment to unmount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountNoFSegment(
+        const UUID& segment_id);
+
+    /**
+     * @brief Gets all mounted NoF ssd segments from master
+     * @return tl::expected<std::vector<MountedNoFSegmentSnapshot>, ErrorCode>
+     * containing all mounted segments
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    GetAllNoFSegments();
+
+    /**
+     * @brief Gets all mounted NoF segments that match a segment name together
+     * with their owner client ids.
+     * @param segment_name Mounted NoF segment name
+     * @return Matching segment owner info list
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+    GetNoFSegmentsByName(const std::string& segment_name);
+
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
      * name
      * @return GetClusterIdResponse containing the cluster ID
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
+
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
 
     [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
     GetStorageConfig();
