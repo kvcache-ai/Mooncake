@@ -1,11 +1,13 @@
 #include "nvme_kv_backend.h"
 
 #include "utils.h"
+#include "utils/file_util.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -13,6 +15,7 @@
 #include <sstream>
 #include <string_view>
 #include <tuple>
+#include <unistd.h>
 #include <vector>
 
 namespace mooncake {
@@ -76,14 +79,12 @@ std::vector<std::string> ParseConfiguredDeviceIds() {
         return {kDefaultDeviceId};
     }
 
-    std::vector<std::string> device_ids;
-    std::stringstream ss(configured);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        if (item.empty() || !IsSafeDeviceId(item)) {
-            return {};
-        }
-        device_ids.push_back(item);
+    const auto device_ids = splitString(configured, ',', true, false);
+    if (device_ids.empty()) {
+        return {};
+    }
+    if (!std::ranges::all_of(device_ids, IsSafeDeviceId)) {
+        return {};
     }
     return device_ids;
 }
@@ -153,8 +154,6 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::LoadCatalog() {
     }
 
     std::unordered_map<std::string, CatalogEntry> loaded_catalog;
-    std::unordered_map<std::string, int64_t> per_device_sizes;
-    std::unordered_map<std::string, int64_t> per_device_keys;
     int64_t total_size = 0;
     int64_t total_keys = 0;
     std::string line;
@@ -211,17 +210,11 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::LoadCatalog() {
         if (state == ObjectState::COMMITTED) {
             total_size += payload_size;
             total_keys += 1;
-            per_device_sizes[device_id] += payload_size;
-            per_device_keys[device_id] += 1;
         }
     }
 
     SharedMutexLocker lock(&mutex_);
     catalog_ = std::move(loaded_catalog);
-    for (auto& [device_id, runtime] : devices_) {
-        runtime.total_size = per_device_sizes[device_id];
-        runtime.total_keys = per_device_keys[device_id];
-    }
     total_size_.store(total_size, std::memory_order_relaxed);
     total_keys_.store(total_keys, std::memory_order_relaxed);
     return {};
@@ -240,36 +233,67 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::PersistCatalog() const {
         }
     }
 
-    std::error_code ec;
     const auto catalog_path = CatalogPath();
-    std::filesystem::create_directories(catalog_path.parent_path(), ec);
-    if (ec) {
+    const auto ensure_dir_res =
+        FileUtil::EnsureDirExists(catalog_path.parent_path().string());
+    if (!ensure_dir_res) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    std::ostringstream content;
+    for (const auto& [key, device_id, physical_key, payload_size, state] :
+         entries) {
+        content << kCatalogFormatPrefix << '\t' << EncodeCatalogField(key)
+                << '\t' << EncodeCatalogField(device_id) << '\t'
+                << NvmeKvPhysicalKeyToHex(physical_key) << '\t' << payload_size
+                << ' ' << static_cast<int>(state) << '\n';
     }
 
     const auto tmp_path = catalog_path.string() + ".tmp";
-    std::ofstream out(tmp_path, std::ios::trunc);
-    if (!out) {
+    int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    for (const auto& [key, device_id, physical_key, payload_size, state] :
-         entries) {
-        out << kCatalogFormatPrefix << '\t' << EncodeCatalogField(key) << '\t'
-            << EncodeCatalogField(device_id) << '\t'
-            << NvmeKvPhysicalKeyToHex(physical_key) << '\t' << payload_size
-            << ' ' << static_cast<int>(state) << '\n';
+    const std::string serialized = content.str();
+    const char* ptr = serialized.data();
+    size_t remaining = serialized.size();
+    while (remaining > 0) {
+        const ssize_t written = ::write(fd, ptr, remaining);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ::close(fd);
+            ::unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        ptr += written;
+        remaining -= static_cast<size_t>(written);
     }
-    if (!out.good()) {
+
+    if (::fsync(fd) != 0) {
+        ::close(fd);
+        ::unlink(tmp_path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    out.close();
-    if (!out) {
+    if (::close(fd) != 0) {
+        ::unlink(tmp_path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+
+    std::error_code ec;
     std::filesystem::rename(tmp_path, catalog_path, ec);
     if (ec) {
+        ::unlink(tmp_path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    const std::string parent_dir = catalog_path.parent_path().string();
+    const int dir_fd = ::open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
     }
     return {};
 }
@@ -316,6 +340,12 @@ void NvmeKvStorageBackend::MarkCorrupted(const std::string& key) {
     }
 }
 
+StorageObjectMetadata BuildStorageObjectMetadata(std::string_view key,
+                                                 uint32_t payload_size) {
+    return StorageObjectMetadata{0, 0, static_cast<int64_t>(key.size()),
+                                 static_cast<int64_t>(payload_size), ""};
+}
+
 std::vector<std::string> NvmeKvStorageBackend::EnabledDeviceIds() const {
     SharedMutexLocker lock(&mutex_, shared_lock);
     std::vector<std::string> device_ids;
@@ -327,17 +357,6 @@ std::vector<std::string> NvmeKvStorageBackend::EnabledDeviceIds() const {
     }
     std::sort(device_ids.begin(), device_ids.end());
     return device_ids;
-}
-
-tl::expected<std::string, ErrorCode> NvmeKvStorageBackend::SelectDeviceIdForKey(
-    const std::string& key, size_t retry_count) const {
-    auto device_ids = EnabledDeviceIds();
-    if (device_ids.empty()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    const size_t index =
-        (std::hash<std::string>{}(key) + retry_count) % device_ids.size();
-    return device_ids[index];
 }
 
 std::shared_ptr<NvmeKvConnector> NvmeKvStorageBackend::GetConnectorForDeviceId(
@@ -366,6 +385,8 @@ void NvmeKvStorageBackend::RecordDeviceFailure(const std::string& device_id) {
 void NvmeKvStorageBackend::RecordDeviceSuccess(const std::string& device_id,
                                                int64_t payload_size,
                                                bool new_key_committed) {
+    (void)payload_size;
+    (void)new_key_committed;
     SharedMutexLocker lock(&mutex_);
     auto it = devices_.find(device_id);
     if (it == devices_.end()) {
@@ -374,10 +395,6 @@ void NvmeKvStorageBackend::RecordDeviceSuccess(const std::string& device_id,
     auto& runtime = it->second;
     if (runtime.state == DeviceState::ENABLED) {
         runtime.consecutive_failures = 0;
-    }
-    runtime.total_size += payload_size;
-    if (new_key_committed) {
-        runtime.total_keys += 1;
     }
 }
 
@@ -615,11 +632,9 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         bool key_committed = false;
         for (size_t retry_count = 0; retry_count < enabled_device_ids.size();
              ++retry_count) {
-            auto device_id_res = SelectDeviceIdForKey(key, retry_count);
-            if (!device_id_res) {
-                return tl::make_unexpected(device_id_res.error());
-            }
-            const std::string& device_id = device_id_res.value();
+            const size_t index = (std::hash<std::string>{}(key) + retry_count) %
+                                 enabled_device_ids.size();
+            const std::string& device_id = enabled_device_ids[index];
             auto connector = GetConnectorForDeviceId(device_id);
             if (connector == nullptr) {
                 continue;
@@ -662,9 +677,8 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                         return tl::make_unexpected(persist_res.error());
                     }
                     keys.push_back(key);
-                    metadatas.emplace_back(StorageObjectMetadata{
-                        0, 0, static_cast<int64_t>(key.size()),
-                        static_cast<int64_t>(payload_size), ""});
+                    metadatas.emplace_back(BuildStorageObjectMetadata(
+                        key, static_cast<uint32_t>(payload_size)));
                     key_committed = true;
                     break;
                 }
@@ -785,9 +799,8 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             }
 
             keys.push_back(key);
-            metadatas.emplace_back(
-                StorageObjectMetadata{0, 0, static_cast<int64_t>(key.size()),
-                                      static_cast<int64_t>(payload_size), ""});
+            metadatas.emplace_back(BuildStorageObjectMetadata(
+                key, static_cast<uint32_t>(payload_size)));
             key_committed = true;
             break;
         }
@@ -974,9 +987,8 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::ScanMeta(
                 continue;
             }
             keys.push_back(key);
-            metadatas.emplace_back(StorageObjectMetadata{
-                0, 0, static_cast<int64_t>(key.size()),
-                static_cast<int64_t>(entry.payload_size), ""});
+            metadatas.emplace_back(
+                BuildStorageObjectMetadata(key, entry.payload_size));
         }
     }
 
