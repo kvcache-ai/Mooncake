@@ -3,7 +3,6 @@
 #include <cuda/atomic>
 
 #include <tent/device/ir/device_ops.cuh>
-#include <tent/device/ir/ep_comm_ops.cuh>
 #include <tent/device/network/ibgda/mlx5_wqe.cuh>
 
 namespace mooncake::tent::device::ibgda {
@@ -226,15 +225,5 @@ static __device__ __forceinline__ void ibgda_put_value(void* opaque, int ch,
                                                        int dst) {
     ibgda_red_add(opaque, ch, sym, val, dst);
 }
-
-struct IbGdaBackend {
-    static __device__ __forceinline__ EpCommOps buildOps(void* ctx,
-                                                         DeviceOps* dops) {
-        reinterpret_cast<IbGdaCtx*>(ctx)->dops = dops;
-        return {ibgda_put,       ibgda_get,   ibgda_signal, ibgda_wait_signal,
-                ibgda_red_add,   ibgda_flush, ibgda_wait,   ibgda_barrier,
-                ibgda_put_value, ctx};
-    }
-};
 
 }  // namespace mooncake::tent::device::ibgda

@@ -18,7 +18,5 @@
 // include this header instead of transport implementation/detail headers.
 #include <tent/runtime/device_resources.h>
 #include <tent/device/ir/device_ops.cuh>
-#include <tent/device/ir/ep_comm_ops.cuh>
-#include <tent/device/ir/ep_comm_ops_factory.cuh>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>
