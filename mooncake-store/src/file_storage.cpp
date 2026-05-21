@@ -58,7 +58,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
+                           config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
