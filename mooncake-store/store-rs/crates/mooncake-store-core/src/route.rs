@@ -308,8 +308,6 @@ impl TenantPolicyScope {
 pub struct TenantRoutePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_topk: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_control: Option<RouteControlMode>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -528,7 +526,7 @@ impl TenantPolicySpec {
                 self.routing.as_ref(),
                 overlay.routing.as_ref(),
             ))
-            .filter(|policy| policy.route_topk.is_some() || policy.route_control.is_some()),
+            .filter(|policy| policy.route_topk.is_some()),
             quota: Some(merge_quota_policy(
                 self.quota.as_ref(),
                 overlay.quota.as_ref(),
@@ -602,9 +600,6 @@ fn merge_routing_policy(
         route_topk: overlay
             .and_then(|policy| policy.route_topk)
             .or(base.and_then(|policy| policy.route_topk)),
-        route_control: overlay
-            .and_then(|policy| policy.route_control)
-            .or(base.and_then(|policy| policy.route_control)),
     }
 }
 
@@ -1082,7 +1077,6 @@ mod tests {
             }),
             routing: Some(TenantRoutePolicy {
                 route_topk: Some(3),
-                route_control: None,
             }),
             ..Default::default()
         };
@@ -1092,8 +1086,7 @@ mod tests {
                 max_objects: None,
             }),
             routing: Some(TenantRoutePolicy {
-                route_topk: None,
-                route_control: Some(RouteControlMode::MetadataOnly),
+                route_topk: Some(5),
             }),
             ..Default::default()
         };
@@ -1102,8 +1095,7 @@ mod tests {
         assert_eq!(q.max_bytes, Some(200));
         assert_eq!(q.max_objects, Some(10));
         let r = merged.routing.as_ref().unwrap();
-        assert_eq!(r.route_topk, Some(3));
-        assert_eq!(r.route_control, Some(RouteControlMode::MetadataOnly));
+        assert_eq!(r.route_topk, Some(5));
     }
 
     #[test]

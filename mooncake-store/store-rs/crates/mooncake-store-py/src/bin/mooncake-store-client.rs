@@ -190,7 +190,7 @@ struct RunArgs {
     hugepage_size: Option<usize>,
     #[arg(long, env = "MC_STORE_RS_TRACE_FILTER")]
     trace_filter: Option<String>,
-    #[arg(long, value_parser = parse_route_control_arg, default_value = "embedded-wrh", env = "MC_STORE_RS_ROUTE_CONTROL", help = "Compatibility fallback route-control mode; prefer admin-managed tenant policy in metadata")]
+    #[arg(long, value_parser = parse_route_control_arg, default_value = "embedded-wrh", env = "MC_STORE_RS_ROUTE_CONTROL", help = "Cluster-level route storage mode: embedded-wrh (WRH authority mesh) or metadata-only (Redis-only)")]
     route_control: RouteControlArg,
     #[arg(long, default_value_t = false, value_parser = FalseyValueParser::new(), env = "MC_STORE_RS_DRAIN_ON_EXIT")]
     drain_on_exit: bool,
@@ -516,7 +516,7 @@ fn compat_warnings(args: &RunArgs) -> Vec<&'static str> {
     }
     if args.route_control != RouteControlArg::EmbeddedWrh {
         warnings.push(
-            "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata",
+            "[WARN] --route-control=metadata-only uses Redis-only route storage; this is a cluster-level deployment setting",
         );
     }
     warnings
@@ -1437,7 +1437,7 @@ mod tests {
         assert_eq!(
             compat_warnings(&args),
             vec![
-                "[WARN] --route-control is accepted as a compatibility fallback; prefer admin-managed tenant policy in metadata"
+                "[WARN] --route-control=metadata-only uses Redis-only route storage; this is a cluster-level deployment setting"
             ]
         );
 

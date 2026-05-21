@@ -228,11 +228,10 @@ impl StoreClientBuilder {
         self
     }
 
-    /// Sets a compatibility fallback route-control mode for startup.
+    /// Sets the cluster-level route-control mode (EmbeddedWrh or MetadataOnly).
     ///
-    /// Admin-managed tenant policy in metadata is the preferred authoring surface for
-    /// tenant-scoped routing. When a tenant policy provides routing settings, those values
-    /// take precedence over this builder-local fallback.
+    /// This is a deployment-level decision that determines the route storage architecture
+    /// and is fixed for the lifetime of the client. It is not overridable per-tenant.
     pub fn route_control(mut self, route_control: RouteControlMode) -> Self {
         self.route_control = route_control;
         self
@@ -345,14 +344,8 @@ impl StoreClientBuilder {
             resolve_effective_tenant_policy(runtime_metadata.as_ref(), &default_scope)?;
         let effective_namespace_quota =
             resolved_namespace_quota(&effective_tenant_policy).or(self.namespace_quota.clone());
-        let effective_route_policy = route_policy_from_tenant_spec(&effective_tenant_policy);
-        let effective_route_control = effective_route_policy
-            .as_ref()
-            .map(|policy| policy.route_control)
-            .unwrap_or(self.route_control);
-        let effective_route_topk = effective_route_policy
-            .as_ref()
-            .map(|policy| policy.route_topk as usize)
+        let effective_route_control = self.route_control;
+        let effective_route_topk = route_topk_from_tenant_spec(&effective_tenant_policy)
             .unwrap_or(self.route_topk);
         let state = Mutex::new(StoreState::default());
         let allocator = Arc::new(Mutex::new(LocalAllocatorState::default()));
@@ -575,25 +568,14 @@ fn resolve_effective_tenant_policy(
     Ok(resolved)
 }
 
-fn route_policy_from_tenant_spec(spec: &TenantPolicySpec) -> Option<RoutePolicy> {
-    let routing = spec.routing.as_ref()?;
-    Some(RoutePolicy {
-        route_topk: routing.route_topk?,
-        route_control: routing.route_control?,
-        created_by: ClientRuntimeId::new("tenant-policy", ClientEpoch(0)),
-        created_at_ms: 0,
-    })
+fn route_topk_from_tenant_spec(spec: &TenantPolicySpec) -> Option<usize> {
+    spec.routing.as_ref()?.route_topk.map(|v| v as usize)
 }
 
 fn effective_route_policy(
     metadata: &dyn MetadataBackend,
     default_tenant: &str,
 ) -> Result<Option<RoutePolicy>> {
-    let scope = NamespaceScope::with_defaults(Some(default_tenant), None, None);
-    let tenant_spec = resolve_effective_tenant_policy(metadata, &scope)?;
-    if let Some(policy) = route_policy_from_tenant_spec(&tenant_spec) {
-        return Ok(Some(policy));
-    }
     if let Some(tenant_policy) =
         metadata.get_route_policy(&RoutePolicyDomain::Tenant(default_tenant.to_string()))?
     {

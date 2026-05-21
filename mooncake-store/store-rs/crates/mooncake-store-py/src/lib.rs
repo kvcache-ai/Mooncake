@@ -130,9 +130,9 @@ impl PyMooncakeDistributedStore {
     ///   `etcd://...` and is required.
     ///
     /// Tenant-scoped routing and resource policy should be authored through
-    /// `mooncake-store-admin policy ...` and durable metadata. `route_topk` and
-    /// `route_control` are accepted here as compatibility/bootstrap fallbacks so
-    /// existing Python integrations continue to work.
+    /// `mooncake-store-admin policy ...` and durable metadata. `route_topk` is
+    /// accepted here as a compatibility/bootstrap fallback (tenant policy overrides it).
+    /// `route_control` is a cluster-level deployment setting (not per-tenant).
     #[pyo3(signature = (
         local_hostname,
         transport_metadata_url,

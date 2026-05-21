@@ -324,7 +324,7 @@ The client supports tenant-scoped keys and tenant-aware request builders.
 
 This keeps API usage explicit while still allowing a default tenant for simpler applications.
 
-Route-authority policy has a default cluster policy per metadata keyspace and optional tenant-scoped overrides. Runtime bootstrap resolves the effective policy as: tenant override for the client's default tenant first, otherwise the default cluster `route_control + route_topk` policy.
+Route-authority policy has a default cluster policy per metadata keyspace. `route_control` is a cluster-level deployment decision fixed at startup (determines whether WRH authority mesh or Redis-only route storage is used). `route_topk` can be overridden per-tenant via admin policy. Runtime bootstrap resolves the effective `route_topk` from the tenant policy if present, otherwise uses the CLI default.
 
 ## Dynamic Membership and Lifecycle
 

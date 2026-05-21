@@ -73,9 +73,9 @@ This keeps object route lookups on the authority mesh and off the metadata hot p
 
 Route authority policy is bootstrap-validated through metadata:
 
-- every client starts with a local `route_control + route_topk` policy
-- the first client in a metadata keyspace writes the default cluster policy with create-if-absent semantics
-- runtimes then resolve the effective route policy for their default tenant through exact scoped metadata lookups: tenant root, then domain, then object-set, otherwise the default cluster policy
+- every client starts with a local `route_control` (cluster-level, fixed at startup) and `route_topk` (fallback, overridable via tenant policy)
+- the first client in a metadata keyspace writes the default cluster route policy with create-if-absent semantics
+- runtimes then resolve the effective route policy from the stored metadata key for their default tenant, otherwise the default cluster policy
 - later clients must match that effective policy or startup fails
 
 This keeps route-authority fanout deterministic across the cluster instead of letting each client silently pick a different authority set size.

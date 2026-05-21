@@ -18,7 +18,7 @@ use _store_rs::admin::{
 };
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
-use mooncake_store_client::{init_tracing, RouteControlMode};
+use mooncake_store_client::init_tracing;
 use mooncake_store_core::{
     RoutePolicy, TenantPolicy, TenantPolicySpec, TenantQuotaReservationState,
 };
@@ -231,8 +231,6 @@ struct PolicyScopeArgs {
 struct PolicyValueArgs {
     #[arg(long, env = "MC_STORE_ADMIN_ROUTE_TOPK")]
     route_topk: Option<u32>,
-    #[arg(long, value_enum, env = "MC_STORE_ADMIN_ROUTE_CONTROL")]
-    route_control: Option<RouteControlArg>,
     #[arg(long, env = "MC_STORE_ADMIN_MAX_BYTES")]
     max_bytes: Option<u64>,
     #[arg(long, env = "MC_STORE_ADMIN_MAX_OBJECTS")]
@@ -262,32 +260,16 @@ struct PolicyValueArgs {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum RouteControlArg {
-    EmbeddedWrh,
-    MetadataOnly,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ReservationStateArg {
     Pending,
     Finalized,
     Aborted,
 }
 
-impl From<RouteControlArg> for RouteControlMode {
-    fn from(value: RouteControlArg) -> Self {
-        match value {
-            RouteControlArg::EmbeddedWrh => RouteControlMode::EmbeddedWrh,
-            RouteControlArg::MetadataOnly => RouteControlMode::MetadataOnly,
-        }
-    }
-}
-
 impl From<&PolicyValueArgs> for PolicyPatchInput {
     fn from(values: &PolicyValueArgs) -> Self {
         Self {
             route_topk: values.route_topk,
-            route_control: values.route_control.map(Into::into),
             max_bytes: values.max_bytes,
             max_objects: values.max_objects,
             max_remote_batch_items_per_tenant: values.max_remote_batch_items_per_tenant,
@@ -1127,9 +1109,6 @@ fn print_policy_spec(spec: &TenantPolicySpec, indent: usize) {
     let pad = " ".repeat(indent);
     if let Some(routing) = spec.routing.as_ref() {
         println!("{pad}routing:");
-        if let Some(route_control) = routing.route_control {
-            println!("{pad}  route_control: {:?}", route_control);
-        }
         if let Some(route_topk) = routing.route_topk {
             println!("{pad}  route_topk: {}", route_topk);
         }
@@ -1269,18 +1248,6 @@ mod tests {
     }
 
     #[test]
-    fn route_control_arg_maps_to_runtime_mode() {
-        assert_eq!(
-            RouteControlMode::from(RouteControlArg::EmbeddedWrh),
-            RouteControlMode::EmbeddedWrh
-        );
-        assert_eq!(
-            RouteControlMode::from(RouteControlArg::MetadataOnly),
-            RouteControlMode::MetadataOnly
-        );
-    }
-
-    #[test]
     fn server_subcommand_parses_bind_addr() {
         let args = Args::parse_from([
             "mooncake-store-admin",
@@ -1373,7 +1340,6 @@ mod tests {
                 ("MC_STORE_ADMIN_DOMAIN", Some("domain-env")),
                 ("MC_STORE_ADMIN_OBJECT_SET", Some("set-env")),
                 ("MC_STORE_ADMIN_ROUTE_TOPK", Some("5")),
-                ("MC_STORE_ADMIN_ROUTE_CONTROL", Some("metadata-only")),
                 ("MC_STORE_ADMIN_MAX_BYTES", Some("1024")),
                 ("MC_STORE_ADMIN_MAX_OBJECTS", Some("7")),
                 (
@@ -1413,7 +1379,6 @@ mod tests {
                         assert_eq!(scope.domain.as_deref(), Some("domain-env"));
                         assert_eq!(scope.object_set.as_deref(), Some("set-env"));
                         assert_eq!(values.route_topk, Some(5));
-                        assert_eq!(values.route_control, Some(RouteControlArg::MetadataOnly));
                         assert_eq!(values.max_bytes, Some(1024));
                         assert_eq!(values.max_objects, Some(7));
                         assert_eq!(values.max_remote_batch_items_per_tenant, Some(8));
@@ -1603,8 +1568,6 @@ mod tests {
             "domain-a",
             "--route-topk",
             "3",
-            "--route-control",
-            "embedded-wrh",
             "--max-bytes",
             "1024",
             "--prefer-local",
@@ -1623,7 +1586,6 @@ mod tests {
                 assert_eq!(scope.tenant, "tenant-a");
                 assert_eq!(scope.domain.as_deref(), Some("domain-a"));
                 assert_eq!(values.route_topk, Some(3));
-                assert_eq!(values.route_control, Some(RouteControlArg::EmbeddedWrh));
                 assert_eq!(values.max_bytes, Some(1024));
                 assert_eq!(values.prefer_local, Some(true));
                 assert_eq!(updated_by, "admin");
@@ -1636,13 +1598,11 @@ mod tests {
     fn policy_value_args_convert_to_patch_input() {
         let values = PolicyValueArgs {
             route_topk: Some(3),
-            route_control: Some(RouteControlArg::MetadataOnly),
             max_bytes: Some(9),
             ..PolicyValueArgs::default()
         };
         let patch: PolicyPatchInput = (&values).into();
         assert_eq!(patch.route_topk, Some(3));
-        assert_eq!(patch.route_control, Some(RouteControlMode::MetadataOnly));
         assert_eq!(patch.max_bytes, Some(9));
     }
 
@@ -2042,7 +2002,6 @@ mod tests {
                 None,
                 PolicyPatchInput {
                     route_topk: Some(5),
-                    route_control: Some(RouteControlMode::MetadataOnly),
                     max_bytes: Some(64),
                     ..PolicyPatchInput::default()
                 },
@@ -2058,13 +2017,6 @@ mod tests {
                 max_objects: None,
             })
         );
-        let mirrored = service
-            .get_route_policy(Some("tenant-a"))
-            .expect("route policy read should succeed");
-        assert_eq!(
-            mirrored.policy.expect("mirrored route policy").route_topk,
-            5
-        );
         let effective = service
             .get_tenant_policy("tenant-a", None, None, true)
             .expect("effective policy read should succeed");
@@ -2073,7 +2025,6 @@ mod tests {
             effective.effective_spec.expect("effective spec").routing,
             Some(TenantRoutePolicy {
                 route_topk: Some(5),
-                route_control: Some(RouteControlMode::MetadataOnly),
             })
         );
     }
