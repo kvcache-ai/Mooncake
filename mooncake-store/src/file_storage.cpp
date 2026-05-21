@@ -614,8 +614,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
-        assert(sizes[i] <= kMaxSliceSize);
-
         // Allocate oversized buffer for O_DIRECT alignment:
         //   +4096 for aligning the ptr to 4096 boundary
         //   +4096 for aligned read tail padding (actual_offset may not be
