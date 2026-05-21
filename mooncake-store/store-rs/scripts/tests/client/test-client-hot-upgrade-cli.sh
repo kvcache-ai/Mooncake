@@ -187,12 +187,12 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
-    os.environ["REDIS_URL"],
+    "P2PHANDSHAKE",
     4 * 1024 * 1024,
     1 * 1024 * 1024,
     "tcp",
     "",
-    "",
+    os.environ["REDIS_URL"],
     stable_id=os.environ["DRIVER_ID"],
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
@@ -239,12 +239,12 @@ from mooncake.store import MooncakeDistributedStore
 store = MooncakeDistributedStore()
 assert store.setup(
     "127.0.0.1",
-    os.environ["REDIS_URL"],
+    "P2PHANDSHAKE",
     4 * 1024 * 1024,
     1 * 1024 * 1024,
     "tcp",
     "",
-    "",
+    os.environ["REDIS_URL"],
     stable_id=os.environ["DRIVER_ID"],
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},

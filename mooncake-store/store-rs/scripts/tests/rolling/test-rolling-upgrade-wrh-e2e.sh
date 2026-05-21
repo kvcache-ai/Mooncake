@@ -206,8 +206,8 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
-    "127.0.0.1", os.environ["REDIS_URL"],
-    4*1024*1024, 1*1024*1024, "tcp", "", "",
+    "127.0.0.1", "P2PHANDSHAKE",
+    4*1024*1024, 1*1024*1024, "tcp", "", os.environ["REDIS_URL"],
     stable_id="driver-write-1",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
@@ -263,8 +263,8 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
-    "127.0.0.1", os.environ["REDIS_URL"],
-    4*1024*1024, 1*1024*1024, "tcp", "", "",
+    "127.0.0.1", "P2PHANDSHAKE",
+    4*1024*1024, 1*1024*1024, "tcp", "", os.environ["REDIS_URL"],
     stable_id="driver-verify-2",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
@@ -329,8 +329,8 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
-    "127.0.0.1", os.environ["REDIS_URL"],
-    4*1024*1024, 1*1024*1024, "tcp", "", "",
+    "127.0.0.1", "P2PHANDSHAKE",
+    4*1024*1024, 1*1024*1024, "tcp", "", os.environ["REDIS_URL"],
     stable_id="driver-verify-3",
     keyspace=os.environ["KEYSPACE"],
     labels={"pool": "pool-a", "storage": "false", "route": "false"},
