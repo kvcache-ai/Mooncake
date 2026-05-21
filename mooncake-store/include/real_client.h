@@ -484,6 +484,9 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
         const UUID &client_id);
 
+    tl::expected<bool, ErrorCode> is_shm_mapped_internal(
+        uint64_t dummy_base_addr, const UUID &client_id);
+
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
