@@ -34,10 +34,10 @@ namespace {
 
 // Helper to pick an RDMA device
 std::string pickRdmaDevice() {
-    const char *override_name = std::getenv("MC_TEST_DEVICE_NAME");
+    const char* override_name = std::getenv("MC_TEST_DEVICE_NAME");
     if (override_name && *override_name) return override_name;
     int num_devices = 0;
-    ibv_device **list = ibv_get_device_list(&num_devices);
+    ibv_device** list = ibv_get_device_list(&num_devices);
     if (!list || num_devices == 0) return "";
     std::string name = ibv_get_device_name(list[0]);
     ibv_free_device_list(list);
@@ -54,19 +54,21 @@ class E2EFaultToleranceTest : public ::testing::Test {
     void SetUp() override {
         const std::string device = pickRdmaDevice();
         if (device.empty()) {
-            GTEST_SKIP() << "no RDMA device available — set MC_TEST_DEVICE_NAME to override.";
+            GTEST_SKIP() << "no RDMA device available — set "
+                            "MC_TEST_DEVICE_NAME to override.";
         }
 
         // Create RdmaTransport
-        auto *transport = new RdmaTransport();
+        auto* transport = new RdmaTransport();
         context_ = std::make_shared<RdmaContext>(*transport, device);
 
-        auto &config = globalConfig();
-        int rc = context_->construct(config.num_cq_per_ctx,
-                                    config.num_comp_channels_per_ctx, config.port,
-                                    config.gid_index, config.max_cqe);
+        auto& config = globalConfig();
+        int rc = context_->construct(
+            config.num_cq_per_ctx, config.num_comp_channels_per_ctx,
+            config.port, config.gid_index, config.max_cqe);
         if (rc != 0) {
-            GTEST_SKIP() << "failed to construct RDMA context for device " << device;
+            GTEST_SKIP() << "failed to construct RDMA context for device "
+                         << device;
         }
 
         // Create WorkerPool
@@ -92,7 +94,9 @@ class E2EFaultToleranceTest : public ::testing::Test {
 
         // Register memory region
         int rc = context_->registerMemoryRegion(buf, size,
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+                                                IBV_ACCESS_LOCAL_WRITE |
+                                                    IBV_ACCESS_REMOTE_WRITE |
+                                                    IBV_ACCESS_REMOTE_READ);
         if (rc != 0) {
             free(buf);
             allocated_buffers_.pop_back();
@@ -127,7 +131,8 @@ class E2EFaultToleranceTest : public ::testing::Test {
 // Test 1: Basic retry logic
 // =============================================================================
 
-TEST_F(E2EFaultToleranceTest, RetrySlice_IncreasesRetryCountAndReturnsCorrectly) {
+TEST_F(E2EFaultToleranceTest,
+       RetrySlice_IncreasesRetryCountAndReturnsCorrectly) {
     auto* slice = createTestSlice();
     ASSERT_NE(slice, nullptr) << "Failed to create test slice";
 
@@ -182,7 +187,8 @@ TEST_F(E2EFaultToleranceTest, RailPause_AutoRecoversAfterTimeout) {
     EXPECT_FALSE(worker_pool_->testOnlyIsRailAvailable(test_path));
 
     // Wait for pause to expire
-    std::this_thread::sleep_for(std::chrono::nanoseconds(kPauseNs + 100000000ull));
+    std::this_thread::sleep_for(
+        std::chrono::nanoseconds(kPauseNs + 100000000ull));
 
     // Verify rail recovered
     EXPECT_TRUE(worker_pool_->testOnlyIsRailAvailable(test_path));
@@ -300,7 +306,8 @@ TEST_F(E2EFaultToleranceTest, RailFailureAndRecovery_CompleteCycle) {
     EXPECT_GT(paused_state.pause_until_ns, 0);
 
     // Step 4: Wait for recovery
-    std::this_thread::sleep_for(std::chrono::nanoseconds(kPauseNs + 100000000ull));
+    std::this_thread::sleep_for(
+        std::chrono::nanoseconds(kPauseNs + 100000000ull));
 
     // Step 5: Verify rail recovered
     EXPECT_TRUE(worker_pool_->testOnlyIsRailAvailable(test_path))
@@ -308,7 +315,8 @@ TEST_F(E2EFaultToleranceTest, RailFailureAndRecovery_CompleteCycle) {
 
     auto recovered_state = worker_pool_->testOnlyGetRailState(test_path);
     EXPECT_EQ(recovered_state.error_count, 0) << "Error count should be reset";
-    EXPECT_EQ(recovered_state.pause_until_ns, 0) << "Pause timestamp should be reset";
+    EXPECT_EQ(recovered_state.pause_until_ns, 0)
+        << "Pause timestamp should be reset";
 
     // Step 6: Verify rail can fail again
     for (int i = 0; i < kThreshold; ++i) {
@@ -323,18 +331,16 @@ TEST_F(E2EFaultToleranceTest, RailFailureAndRecovery_CompleteCycle) {
 // =============================================================================
 
 TEST_F(E2EFaultToleranceTest, ConcurrentRailFailures_AllHandledCorrectly) {
-    // This test verifies that multiple concurrent rail failures are handled correctly:
+    // This test verifies that multiple concurrent rail failures are handled
+    // correctly:
     // 1. Create multiple rails
     // 2. Cause failures on different rails
     // 3. Verify each rail's state is managed independently
     // 4. Verify rails recover independently
 
     const int kThreshold = WorkerPool::testOnlyGetRailErrorThreshold();
-    std::vector<std::string> rails = {
-        "peer_a/device_a",
-        "peer_b/device_b",
-        "peer_c/device_c"
-    };
+    std::vector<std::string> rails = {"peer_a/device_a", "peer_b/device_b",
+                                      "peer_c/device_c"};
 
     // Pause rail-a (kThreshold errors)
     for (int i = 0; i < kThreshold; ++i) {
@@ -381,7 +387,8 @@ TEST_F(E2EFaultToleranceTest, RetryExhaustion_AfterMaxRetries) {
         if (i < max_retries - 1) {
             EXPECT_TRUE(should_retry) << "Should retry on attempt " << (i + 1);
         } else {
-            EXPECT_FALSE(should_retry) << "Should not retry on attempt " << (i + 1);
+            EXPECT_FALSE(should_retry)
+                << "Should not retry on attempt " << (i + 1);
         }
     }
 
@@ -455,11 +462,14 @@ TEST_F(E2EFaultToleranceTest, NoAvalanche_SingleFailureDoesNotRedistributeAll) {
     EXPECT_EQ(state_c.pause_until_ns, 0);
 
     // Verify redispatch counter increased
-    auto redispatch_counter = worker_pool_->testOnlyGetRedispatchCounter().load();
-    EXPECT_GT(redispatch_counter, 0) << "Redispatch counter should increase after failure";
+    auto redispatch_counter =
+        worker_pool_->testOnlyGetRedispatchCounter().load();
+    EXPECT_GT(redispatch_counter, 0)
+        << "Redispatch counter should increase after failure";
 
-    // Additional failures on rail-a should not increase error_count beyond threshold
-    // (pause_until_ns is updated but error_count saturates at kThreshold)
+    // Additional failures on rail-a should not increase error_count beyond
+    // threshold (pause_until_ns is updated but error_count saturates at
+    // kThreshold)
     auto error_count_before = state_a.error_count;
     worker_pool_->testOnlySimulatePathFailure(rail_a, nullptr);
     auto state_a_after = worker_pool_->testOnlyGetRailState(rail_a);
@@ -494,7 +504,8 @@ TEST_F(E2EFaultToleranceTest, ConcurrentFailures_NoDeadlockOrDataLoss) {
     std::atomic<bool> start_flag{false};
 
     // Thread 1: Fail rail-a
-    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_a, kThreshold, kIterationsPerThread]() {
+    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_a,
+                          kThreshold, kIterationsPerThread]() {
         thread_ready_count++;
         while (!start_flag) std::this_thread::yield();
 
@@ -505,7 +516,8 @@ TEST_F(E2EFaultToleranceTest, ConcurrentFailures_NoDeadlockOrDataLoss) {
     });
 
     // Thread 2: Fail rail-b
-    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_b, kThreshold, kIterationsPerThread]() {
+    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_b,
+                          kThreshold, kIterationsPerThread]() {
         thread_ready_count++;
         while (!start_flag) std::this_thread::yield();
 
@@ -516,7 +528,8 @@ TEST_F(E2EFaultToleranceTest, ConcurrentFailures_NoDeadlockOrDataLoss) {
     });
 
     // Thread 3: Fail rail-c
-    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_c, kThreshold, kIterationsPerThread]() {
+    threads.emplace_back([this, &thread_ready_count, &start_flag, &rail_c,
+                          kThreshold, kIterationsPerThread]() {
         thread_ready_count++;
         while (!start_flag) std::this_thread::yield();
 
@@ -539,7 +552,8 @@ TEST_F(E2EFaultToleranceTest, ConcurrentFailures_NoDeadlockOrDataLoss) {
         t.join();
     }
 
-    // Verify all rails are paused (each got kIterationsPerThread errors, >= kThreshold)
+    // Verify all rails are paused (each got kIterationsPerThread errors, >=
+    // kThreshold)
     EXPECT_FALSE(worker_pool_->testOnlyIsRailAvailable(rail_a));
     EXPECT_FALSE(worker_pool_->testOnlyIsRailAvailable(rail_b));
     EXPECT_FALSE(worker_pool_->testOnlyIsRailAvailable(rail_c));
@@ -559,7 +573,8 @@ TEST_F(E2EFaultToleranceTest, ConcurrentFailures_NoDeadlockOrDataLoss) {
 
     // Verify redispatch counter increased (total failures across all rails)
     auto final_counter = worker_pool_->testOnlyGetRedispatchCounter().load();
-    EXPECT_GT(final_counter, initial_counter) << "Redispatch counter should increase";
+    EXPECT_GT(final_counter, initial_counter)
+        << "Redispatch counter should increase";
 }
 
 // =============================================================================
@@ -606,13 +621,15 @@ TEST_F(E2EFaultToleranceTest, SliceStateTransitions_DuringRetryFlow) {
 
         // Verify rail error count increased
         auto state = worker_pool_->testOnlyGetRailState(test_path);
-        EXPECT_GT(state.error_count, 0) << "Rail error count should be positive";
+        EXPECT_GT(state.error_count, 0)
+            << "Rail error count should be positive";
     }
 
     // After max_retries-1 calls, retry_cnt should be max_retries-1
     EXPECT_EQ(slice->rdma.retry_cnt, max_retries - 1);
 
-    // One more call to shouldRetrySlice should increment to max_retries and return false (exhausted)
+    // One more call to shouldRetrySlice should increment to max_retries and
+    // return false (exhausted)
     EXPECT_FALSE(WorkerPool::testOnlyShouldRetrySlice(slice));
     EXPECT_EQ(slice->rdma.retry_cnt, max_retries);
 
@@ -637,7 +654,8 @@ TEST_F(E2EFaultToleranceTest, SliceStateTransitions_DuringRetryFlow) {
 // =============================================================================
 
 TEST_F(E2EFaultToleranceTest, EndpointReset_WithInFlightRequests) {
-    // This test simulates an endpoint RESET while RDMA operations are in-flight:
+    // This test simulates an endpoint RESET while RDMA operations are
+    // in-flight:
     // 1. Get a real RDMA endpoint (using loopback mode)
     // 2. Submit slices to the worker pool
     // 3. Simulate endpoint RESET by deleting the endpoint
@@ -673,14 +691,17 @@ TEST_F(E2EFaultToleranceTest, EndpointReset_WithInFlightRequests) {
 
     // Verify the failure was recorded
     auto state = worker_pool_->testOnlyGetRailState(loopback_path);
-    EXPECT_GT(state.error_count, 0) << "Rail error count should increase after RESET simulation";
+    EXPECT_GT(state.error_count, 0)
+        << "Rail error count should increase after RESET simulation";
 
     // Verify redispatch counter increased
     auto initial_counter = worker_pool_->testOnlyGetRedispatchCounter().load();
-    EXPECT_GT(initial_counter, 0) << "Redispatch counter should increase after failure";
+    EXPECT_GT(initial_counter, 0)
+        << "Redispatch counter should increase after failure";
 
-    // The slice should have been processed (either succeeded, failed, or redispatched)
-    // We don't check the exact state since it depends on timing and endpoint availability
+    // The slice should have been processed (either succeeded, failed, or
+    // redispatched) We don't check the exact state since it depends on timing
+    // and endpoint availability
 
     // Clean up
     if (slice->status == Transport::Slice::PENDING) {
