@@ -1152,8 +1152,26 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
-            desc = rpc_meta_map_[server_name];
-            return 0;
+            const auto &cached = rpc_meta_map_[server_name];
+            // Check if cache entry has expired
+            int64_t ttl_us = globalConfig().rpc_meta_cache_ttl_us;
+            if (ttl_us > 0) {
+                int64_t current_us = getCurrentTimeInNano() / 1000;
+                int64_t age_us = current_us - cached.cached_timestamp_us;
+                if (age_us < ttl_us) {
+                    // Cache entry is still valid
+                    desc = cached;
+                    return 0;
+                }
+                // Cache entry expired, fall through to refresh below
+            } else if (ttl_us == 0) {
+                // TTL disabled, always use cache
+                desc = cached;
+                return 0;
+            } else {
+                // Negative TTL means cache disabled, but this shouldn't happen
+                // Fall through to refresh
+            }
         }
     }
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
@@ -1171,6 +1189,8 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
         desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
     }
+    // Set timestamp when caching
+    desc.cached_timestamp_us = getCurrentTimeInNano() / 1000;
     rpc_meta_map_[server_name] = desc;
     return 0;
 }
