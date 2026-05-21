@@ -317,7 +317,7 @@ The following are additional dependencies for building Mooncake:
 - Hygon DTK SDK, if you want to build with `-DUSE_HYGON`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `DTK_HOME` or `/opt/dtk` by default, and also supports overriding `DTK_INCLUDE_DIR` / `DTK_LIB_DIR` during CMake configure.
 - Iluvatar CoreX SDK, if you want to build with `-DUSE_COREX`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `COREX_HOME` or `/usr/local/corex` by default, and also supports overriding `COREX_INCLUDE_DIR` / `COREX_LIB_DIR` during CMake configure.
 - [Optional] Rust Toolchain and libclang, if you want to build Transfer Engine Rust examples with `-DWITH_RUST_EXAMPLE=ON` or Mooncake Store Rust bindings with `-DWITH_STORE_RUST=ON`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers, or with `-DSTORE_USE_REDIS` to use Redis for Mooncake Store failover.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
 The build and installation steps are as follows:

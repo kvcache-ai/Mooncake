@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <csignal>
 #include <thread>
 #include <vector>
@@ -62,6 +63,7 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Operation Statistics
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -629,6 +631,75 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+}
+
+TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
+    const uint64_t default_kv_lease_ttl = 100;
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    WrappedMasterService service_(service_config);
+
+    const int64_t allocation_failures_before =
+        metrics.get_put_start_alloc_failures();
+    const int64_t put_start_failures_before = metrics.get_put_start_failures();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result = service_.PutStart(
+        generate_uuid(), "allocation_failure_key", 1024, config);
+
+    ASSERT_FALSE(put_start_result.has_value());
+    ASSERT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(),
+              allocation_failures_before + 1);
+    ASSERT_EQ(metrics.get_put_start_failures(), put_start_failures_before + 1);
+}
+
+TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string baseline_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(baseline_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(baseline_summary.find("PutStart=0.00/0.00"), std::string::npos);
+
+    metrics.inc_put_start_requests(4);
+    metrics.inc_put_start_failures(1);
+    metrics.inc_batch_put_start_requests(5);
+    metrics.inc_batch_put_start_partial_success(2);
+    metrics.inc_eviction_success(3, 4096);
+    metrics.inc_eviction_fail();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string window_summary = metrics.get_summary_string();
+    EXPECT_NE(window_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(window_summary.find("PutStart="), std::string::npos);
+    EXPECT_EQ(window_summary.find("/s"), std::string::npos);
+    EXPECT_EQ(window_summary.find("PutStart=3/4"), std::string::npos);
+    EXPECT_NE(window_summary.find("Batch Requests (per sec"),
+              std::string::npos);
+    EXPECT_NE(
+        window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                            "keys=3, size=4.00 KB"),
+        std::string::npos);
+
+    const std::string reported_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(
+        reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                              "keys=3, size=4.00 KB"),
+        std::string::npos);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string idle_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
+    EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=0/0, "
+                                "AllocFail=0, keys=0, size=0 B"),
+              std::string::npos);
 }
 
 }  // namespace mooncake::test

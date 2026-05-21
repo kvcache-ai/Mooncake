@@ -231,7 +231,7 @@ endif()
 #
 # Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags,
 # because USE_CUDA may be OFF even when GPU pointers are present
-# (e.g. WITH_NVIDIA_PEERMEM=ON uses nvidia-peermem for RDMA without cudart).
+# (e.g. WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart).
 # Each detected toolkit gets both link libraries AND compile definitions,
 # so that gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
 #

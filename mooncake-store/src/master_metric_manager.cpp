@@ -77,6 +77,10 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
+      put_start_alloc_failures_(
+          "master_put_start_alloc_failures_total",
+          "Total number of PutStart failures caused by replica allocation "
+          "failure"),
       put_end_requests_("master_put_end_requests_total",
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
@@ -369,6 +373,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Counters (use inc(0) to mark as changed)
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
+    put_start_alloc_failures_.inc(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
@@ -780,6 +785,9 @@ void MasterMetricManager::inc_put_start_requests(int64_t val) {
 void MasterMetricManager::inc_put_start_failures(int64_t val) {
     put_start_failures_.inc(val);
 }
+void MasterMetricManager::inc_put_start_alloc_failures(int64_t val) {
+    put_start_alloc_failures_.inc(val);
+}
 void MasterMetricManager::inc_put_end_requests(int64_t val) {
     put_end_requests_.inc(val);
 }
@@ -969,6 +977,10 @@ int64_t MasterMetricManager::get_put_start_requests() {
 
 int64_t MasterMetricManager::get_put_start_failures() {
     return put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_alloc_failures() {
+    return put_start_alloc_failures_.value();
 }
 
 int64_t MasterMetricManager::get_put_end_requests() {
@@ -1441,6 +1453,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);
@@ -1594,6 +1607,15 @@ void MasterMetricManager::add_stat_to_dict(
 
 // --- Human-Readable Summary ---
 std::string MasterMetricManager::get_summary_string() {
+    return get_summary_string(false);
+}
+
+std::string MasterMetricManager::get_summary_string_and_update_snapshot() {
+    return get_summary_string(true);
+}
+
+std::string MasterMetricManager::get_summary_string(
+    bool update_summary_snapshot) {
     std::stringstream ss;
 
     // --- Get current values ---
@@ -1614,6 +1636,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t exist_key_fails = exist_key_failures_.value();
     int64_t put_starts = put_start_requests_.value();
     int64_t put_start_fails = put_start_failures_.value();
+    int64_t put_start_alloc_fails = put_start_alloc_failures_.value();
     int64_t put_ends = put_end_requests_.value();
     int64_t put_end_fails = put_end_failures_.value();
     int64_t put_revoke_requests = put_revoke_requests_.value();
@@ -1718,6 +1741,154 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t put_start_discarded_staging_size =
         put_start_discarded_staging_size_.value();
 
+    SummaryCounters current_counters;
+    current_counters.exist_keys = exist_keys;
+    current_counters.exist_key_fails = exist_key_fails;
+    current_counters.put_starts = put_starts;
+    current_counters.put_start_fails = put_start_fails;
+    current_counters.put_start_alloc_fails = put_start_alloc_fails;
+    current_counters.put_ends = put_ends;
+    current_counters.put_end_fails = put_end_fails;
+    current_counters.put_revoke_requests = put_revoke_requests;
+    current_counters.put_revoke_fails = put_revoke_fails;
+    current_counters.get_replicas = get_replicas;
+    current_counters.get_replica_fails = get_replica_fails;
+    current_counters.removes = removes;
+    current_counters.remove_fails = remove_fails;
+    current_counters.remove_all = remove_all;
+    current_counters.remove_all_fails = remove_all_fails;
+    current_counters.create_move_tasks = create_move_tasks;
+    current_counters.create_move_task_fails = create_move_task_fails;
+    current_counters.create_copy_tasks = create_copy_tasks;
+    current_counters.create_copy_task_fails = create_copy_task_fails;
+    current_counters.query_tasks = query_tasks;
+    current_counters.query_task_fails = query_task_fails;
+    current_counters.fetch_tasks = fetch_tasks;
+    current_counters.fetch_task_fails = fetch_task_fails;
+    current_counters.copy_starts = copy_starts;
+    current_counters.copy_start_fails = copy_start_fails;
+    current_counters.copy_ends = copy_ends;
+    current_counters.copy_end_fails = copy_end_fails;
+    current_counters.copy_revokes = copy_revokes;
+    current_counters.copy_revoke_fails = copy_revoke_fails;
+    current_counters.move_starts = move_starts;
+    current_counters.move_start_fails = move_start_fails;
+    current_counters.move_ends = move_ends;
+    current_counters.move_end_fails = move_end_fails;
+    current_counters.move_revokes = move_revokes;
+    current_counters.move_revoke_fails = move_revoke_fails;
+    current_counters.evict_disk_replicas = evict_disk_replicas;
+    current_counters.evict_disk_replica_fails = evict_disk_replica_fails;
+    current_counters.batch_put_start_requests = batch_put_start_requests;
+    current_counters.batch_put_start_fails = batch_put_start_fails;
+    current_counters.batch_put_start_partial_successes =
+        batch_put_start_partial_successes;
+    current_counters.batch_put_start_items = batch_put_start_items;
+    current_counters.batch_put_start_failed_items =
+        batch_put_start_failed_items;
+    current_counters.batch_put_end_requests = batch_put_end_requests;
+    current_counters.batch_put_end_fails = batch_put_end_fails;
+    current_counters.batch_put_end_partial_successes =
+        batch_put_end_partial_successes;
+    current_counters.batch_put_end_items = batch_put_end_items;
+    current_counters.batch_put_end_failed_items = batch_put_end_failed_items;
+    current_counters.batch_put_revoke_requests = batch_put_revoke_requests;
+    current_counters.batch_put_revoke_fails = batch_put_revoke_fails;
+    current_counters.batch_put_revoke_partial_successes =
+        batch_put_revoke_partial_successes;
+    current_counters.batch_put_revoke_items = batch_put_revoke_items;
+    current_counters.batch_put_revoke_failed_items =
+        batch_put_revoke_failed_items;
+    current_counters.batch_get_replica_list_requests =
+        batch_get_replica_list_requests;
+    current_counters.batch_get_replica_list_fails =
+        batch_get_replica_list_fails;
+    current_counters.batch_get_replica_list_partial_successes =
+        batch_get_replica_list_partial_successes;
+    current_counters.batch_get_replica_list_items =
+        batch_get_replica_list_items;
+    current_counters.batch_get_replica_list_failed_items =
+        batch_get_replica_list_failed_items;
+    current_counters.batch_exist_key_requests = batch_exist_key_requests;
+    current_counters.batch_exist_key_fails = batch_exist_key_fails;
+    current_counters.batch_exist_key_partial_successes =
+        batch_exist_key_partial_successes;
+    current_counters.batch_exist_key_items = batch_exist_key_items;
+    current_counters.batch_exist_key_failed_items =
+        batch_exist_key_failed_items;
+    current_counters.batch_query_ip_requests = batch_query_ip_requests;
+    current_counters.batch_query_ip_fails = batch_query_ip_fails;
+    current_counters.batch_query_ip_partial_successes =
+        batch_query_ip_partial_successes;
+    current_counters.batch_query_ip_items = batch_query_ip_items;
+    current_counters.batch_query_ip_failed_items = batch_query_ip_failed_items;
+    current_counters.batch_replica_clear_requests =
+        batch_replica_clear_requests;
+    current_counters.batch_replica_clear_fails = batch_replica_clear_fails;
+    current_counters.batch_replica_clear_partial_successes =
+        batch_replica_clear_partial_successes;
+    current_counters.batch_replica_clear_items = batch_replica_clear_items;
+    current_counters.batch_replica_clear_failed_items =
+        batch_replica_clear_failed_items;
+    current_counters.eviction_success = eviction_success;
+    current_counters.eviction_attempts = eviction_attempts;
+    current_counters.evicted_key_count = evicted_key_count;
+    current_counters.evicted_size = evicted_size;
+    current_counters.ping = ping;
+    current_counters.ping_fails = ping_fails;
+    current_counters.mark_task_to_complete_requests =
+        mark_task_to_complete_requests_.value();
+    current_counters.mark_task_to_complete_fails =
+        mark_task_to_complete_failures_.value();
+
+    SummaryCounters previous_counters = current_counters;
+    bool has_previous_summary = false;
+    double elapsed_seconds = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(summary_snapshot_mutex_);
+        has_previous_summary = summary_snapshot_.initialized;
+        if (has_previous_summary) {
+            previous_counters = summary_snapshot_.counters;
+            elapsed_seconds =
+                std::chrono::duration<double>(now - summary_snapshot_.timestamp)
+                    .count();
+        }
+        if (update_summary_snapshot) {
+            summary_snapshot_.initialized = true;
+            summary_snapshot_.timestamp = now;
+            summary_snapshot_.counters = current_counters;
+        }
+    }
+
+    auto delta = [&](int64_t SummaryCounters::* field) {
+        if (!has_previous_summary) {
+            return int64_t{0};
+        }
+        int64_t value = current_counters.*field - previous_counters.*field;
+        return value > 0 ? value : int64_t{0};
+    };
+    auto rate = [&](int64_t value) {
+        if (elapsed_seconds <= 0.0) {
+            return 0.0;
+        }
+        return static_cast<double>(value) / elapsed_seconds;
+    };
+    auto format_rate_value = [&](int64_t value) {
+        std::ostringstream rate_stream;
+        rate_stream << std::fixed << std::setprecision(2) << rate(value);
+        return rate_stream.str();
+    };
+    auto format_rate_pair = [&](int64_t success, int64_t total) {
+        return format_rate_value(success) + "/" + format_rate_value(total);
+    };
+    auto format_rate_triple = [&](int64_t success, int64_t partial_success,
+                                  int64_t total) {
+        return format_rate_value(success) + "/" +
+               format_rate_value(partial_success) + "/" +
+               format_rate_value(total);
+    };
+
     // --- Format the summary string ---
     ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
        << byte_size_to_string(mem_capacity);
@@ -1742,102 +1913,215 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
-    // Request summary - focus on the most important metrics
-    ss << " | Requests (Success/Total): ";
-    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts
+    // Request summary - rate per second of the last window
+    ss << " | Requests (Success/Total per sec): ";
+    ss << "PutStart="
+       << format_rate_pair(delta(&SummaryCounters::put_starts) -
+                               delta(&SummaryCounters::put_start_fails),
+                           delta(&SummaryCounters::put_starts))
        << ", ";
-    ss << "PutEnd=" << put_ends - put_end_fails << "/" << put_ends << ", ";
-    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/"
-       << put_revoke_requests << ", ";
-    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
+    ss << "PutEnd="
+       << format_rate_pair(delta(&SummaryCounters::put_ends) -
+                               delta(&SummaryCounters::put_end_fails),
+                           delta(&SummaryCounters::put_ends))
        << ", ";
-    ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
-    ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
-    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
+    ss << "PutRevoke="
+       << format_rate_pair(delta(&SummaryCounters::put_revoke_requests) -
+                               delta(&SummaryCounters::put_revoke_fails),
+                           delta(&SummaryCounters::put_revoke_requests))
        << ", ";
-    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
-    ss << "CopyStart=" << copy_starts - copy_start_fails << "/" << copy_starts
+    ss << "Get="
+       << format_rate_pair(delta(&SummaryCounters::get_replicas) -
+                               delta(&SummaryCounters::get_replica_fails),
+                           delta(&SummaryCounters::get_replicas))
        << ", ";
-    ss << "CopyEnd=" << copy_ends - copy_end_fails << "/" << copy_ends << ", ";
-    ss << "CopyRevoke=" << copy_revokes - copy_revoke_fails << "/"
-       << copy_revokes << ", ";
-    ss << "MoveStart=" << move_starts - move_start_fails << "/" << move_starts
+    ss << "Exist="
+       << format_rate_pair(delta(&SummaryCounters::exist_keys) -
+                               delta(&SummaryCounters::exist_key_fails),
+                           delta(&SummaryCounters::exist_keys))
        << ", ";
-    ss << "MoveEnd=" << move_ends - move_end_fails << "/" << move_ends << ", ";
-    ss << "MoveRevoke=" << move_revokes - move_revoke_fails << "/"
-       << move_revokes << ", ";
-    ss << "EvictDiskReplica=" << evict_disk_replicas - evict_disk_replica_fails
-       << "/" << evict_disk_replicas;
+    ss << "Del="
+       << format_rate_pair(delta(&SummaryCounters::removes) -
+                               delta(&SummaryCounters::remove_fails),
+                           delta(&SummaryCounters::removes))
+       << ", ";
+    ss << "DelAll="
+       << format_rate_pair(delta(&SummaryCounters::remove_all) -
+                               delta(&SummaryCounters::remove_all_fails),
+                           delta(&SummaryCounters::remove_all))
+       << ", ";
+    ss << "Ping="
+       << format_rate_pair(delta(&SummaryCounters::ping) -
+                               delta(&SummaryCounters::ping_fails),
+                           delta(&SummaryCounters::ping))
+       << ", ";
+    ss << "CopyStart="
+       << format_rate_pair(delta(&SummaryCounters::copy_starts) -
+                               delta(&SummaryCounters::copy_start_fails),
+                           delta(&SummaryCounters::copy_starts))
+       << ", ";
+    ss << "CopyEnd="
+       << format_rate_pair(delta(&SummaryCounters::copy_ends) -
+                               delta(&SummaryCounters::copy_end_fails),
+                           delta(&SummaryCounters::copy_ends))
+       << ", ";
+    ss << "CopyRevoke="
+       << format_rate_pair(delta(&SummaryCounters::copy_revokes) -
+                               delta(&SummaryCounters::copy_revoke_fails),
+                           delta(&SummaryCounters::copy_revokes))
+       << ", ";
+    ss << "MoveStart="
+       << format_rate_pair(delta(&SummaryCounters::move_starts) -
+                               delta(&SummaryCounters::move_start_fails),
+                           delta(&SummaryCounters::move_starts))
+       << ", ";
+    ss << "MoveEnd="
+       << format_rate_pair(delta(&SummaryCounters::move_ends) -
+                               delta(&SummaryCounters::move_end_fails),
+                           delta(&SummaryCounters::move_ends))
+       << ", ";
+    ss << "MoveRevoke="
+       << format_rate_pair(delta(&SummaryCounters::move_revokes) -
+                               delta(&SummaryCounters::move_revoke_fails),
+                           delta(&SummaryCounters::move_revokes))
+       << ", ";
+    ss << "EvictDiskReplica="
+       << format_rate_pair(
+              delta(&SummaryCounters::evict_disk_replicas) -
+                  delta(&SummaryCounters::evict_disk_replica_fails),
+              delta(&SummaryCounters::evict_disk_replicas));
 
     // Batch request summary
     ss << " | Batch Requests "
-          "(Req=Success/PartialSuccess/Total, Item=Success/Total): ";
+          "(per sec, Req=Success/PartialSuccess/Total, "
+          "Item=Success/Total): ";
     ss << "PutStart:(Req="
-       << batch_put_start_requests - batch_put_start_fails -
-              batch_put_start_partial_successes
-       << "/" << batch_put_start_partial_successes << "/"
-       << batch_put_start_requests
-       << ", Item=" << batch_put_start_items - batch_put_start_failed_items
-       << "/" << batch_put_start_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_start_requests) -
+                  delta(&SummaryCounters::batch_put_start_fails) -
+                  delta(&SummaryCounters::batch_put_start_partial_successes),
+              delta(&SummaryCounters::batch_put_start_partial_successes),
+              delta(&SummaryCounters::batch_put_start_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_start_items) -
+                  delta(&SummaryCounters::batch_put_start_failed_items),
+              delta(&SummaryCounters::batch_put_start_items))
+       << "), ";
     ss << "PutEnd:(Req="
-       << batch_put_end_requests - batch_put_end_fails -
-              batch_put_end_partial_successes
-       << "/" << batch_put_end_partial_successes << "/"
-       << batch_put_end_requests
-       << ", Item=" << batch_put_end_items - batch_put_end_failed_items << "/"
-       << batch_put_end_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_end_requests) -
+                  delta(&SummaryCounters::batch_put_end_fails) -
+                  delta(&SummaryCounters::batch_put_end_partial_successes),
+              delta(&SummaryCounters::batch_put_end_partial_successes),
+              delta(&SummaryCounters::batch_put_end_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_end_items) -
+                  delta(&SummaryCounters::batch_put_end_failed_items),
+              delta(&SummaryCounters::batch_put_end_items))
+       << "), ";
     ss << "PutRevoke:(Req="
-       << batch_put_revoke_requests - batch_put_revoke_fails -
-              batch_put_revoke_partial_successes
-       << "/" << batch_put_revoke_partial_successes << "/"
-       << batch_put_revoke_requests
-       << ", Item=" << batch_put_revoke_items - batch_put_revoke_failed_items
-       << "/" << batch_put_revoke_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_revoke_requests) -
+                  delta(&SummaryCounters::batch_put_revoke_fails) -
+                  delta(&SummaryCounters::batch_put_revoke_partial_successes),
+              delta(&SummaryCounters::batch_put_revoke_partial_successes),
+              delta(&SummaryCounters::batch_put_revoke_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_revoke_items) -
+                  delta(&SummaryCounters::batch_put_revoke_failed_items),
+              delta(&SummaryCounters::batch_put_revoke_items))
+       << "), ";
     ss << "Get:(Req="
-       << batch_get_replica_list_requests - batch_get_replica_list_fails -
-              batch_get_replica_list_partial_successes
-       << "/" << batch_get_replica_list_partial_successes << "/"
-       << batch_get_replica_list_requests << ", Item="
-       << batch_get_replica_list_items - batch_get_replica_list_failed_items
-       << "/" << batch_get_replica_list_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_get_replica_list_requests) -
+                  delta(&SummaryCounters::batch_get_replica_list_fails) -
+                  delta(&SummaryCounters::
+                            batch_get_replica_list_partial_successes),
+              delta(&SummaryCounters::batch_get_replica_list_partial_successes),
+              delta(&SummaryCounters::batch_get_replica_list_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_get_replica_list_items) -
+                  delta(&SummaryCounters::batch_get_replica_list_failed_items),
+              delta(&SummaryCounters::batch_get_replica_list_items))
+       << "), ";
     ss << "ExistKey:(Req="
-       << batch_exist_key_requests - batch_exist_key_fails -
-              batch_exist_key_partial_successes
-       << "/" << batch_exist_key_partial_successes << "/"
-       << batch_exist_key_requests
-       << ", Item=" << batch_exist_key_items - batch_exist_key_failed_items
-       << "/" << batch_exist_key_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_exist_key_requests) -
+                  delta(&SummaryCounters::batch_exist_key_fails) -
+                  delta(&SummaryCounters::batch_exist_key_partial_successes),
+              delta(&SummaryCounters::batch_exist_key_partial_successes),
+              delta(&SummaryCounters::batch_exist_key_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_exist_key_items) -
+                  delta(&SummaryCounters::batch_exist_key_failed_items),
+              delta(&SummaryCounters::batch_exist_key_items))
+       << "), ";
     ss << "QueryIp:(Req="
-       << batch_query_ip_requests - batch_query_ip_fails -
-              batch_query_ip_partial_successes
-       << "/" << batch_query_ip_partial_successes << "/"
-       << batch_query_ip_requests
-       << ", Item=" << batch_query_ip_items - batch_query_ip_failed_items << "/"
-       << batch_query_ip_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_query_ip_requests) -
+                  delta(&SummaryCounters::batch_query_ip_fails) -
+                  delta(&SummaryCounters::batch_query_ip_partial_successes),
+              delta(&SummaryCounters::batch_query_ip_partial_successes),
+              delta(&SummaryCounters::batch_query_ip_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_query_ip_items) -
+                  delta(&SummaryCounters::batch_query_ip_failed_items),
+              delta(&SummaryCounters::batch_query_ip_items))
+       << "), ";
     ss << "Clear:(Req="
-       << batch_replica_clear_requests - batch_replica_clear_fails -
-              batch_replica_clear_partial_successes
-       << "/" << batch_replica_clear_partial_successes << "/"
-       << batch_replica_clear_requests << ", Item="
-       << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
-       << batch_replica_clear_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_replica_clear_requests) -
+                  delta(&SummaryCounters::batch_replica_clear_fails) -
+                  delta(
+                      &SummaryCounters::batch_replica_clear_partial_successes),
+              delta(&SummaryCounters::batch_replica_clear_partial_successes),
+              delta(&SummaryCounters::batch_replica_clear_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_replica_clear_items) -
+                  delta(&SummaryCounters::batch_replica_clear_failed_items),
+              delta(&SummaryCounters::batch_replica_clear_items))
+       << "), ";
 
-    ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
-       << "/" << create_move_tasks << "), ";
-    ss << "CreateCopyTask:(Req=" << create_copy_tasks - create_copy_task_fails
-       << "/" << create_copy_tasks << "), ";
-    ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
-       << query_tasks << "), ";
-    ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
-       << fetch_tasks << "), ";
-    ss << "MarkTaskToComplete= (Req="
-       << mark_task_to_complete_requests_.value() -
-              mark_task_to_complete_failures_.value()
-       << "/" << mark_task_to_complete_requests_.value() << "), ";
+    ss << "CreateMoveTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::create_move_tasks) -
+                               delta(&SummaryCounters::create_move_task_fails),
+                           delta(&SummaryCounters::create_move_tasks))
+       << "), ";
+    ss << "CreateCopyTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::create_copy_tasks) -
+                               delta(&SummaryCounters::create_copy_task_fails),
+                           delta(&SummaryCounters::create_copy_tasks))
+       << "), ";
+    ss << "QueryTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::query_tasks) -
+                               delta(&SummaryCounters::query_task_fails),
+                           delta(&SummaryCounters::query_tasks))
+       << "), ";
+    ss << "FetchTasks:(Req="
+       << format_rate_pair(delta(&SummaryCounters::fetch_tasks) -
+                               delta(&SummaryCounters::fetch_task_fails),
+                           delta(&SummaryCounters::fetch_tasks))
+       << "), ";
+    ss << "MarkTaskToComplete:(Req="
+       << format_rate_pair(
+              delta(&SummaryCounters::mark_task_to_complete_requests) -
+                  delta(&SummaryCounters::mark_task_to_complete_fails),
+              delta(&SummaryCounters::mark_task_to_complete_requests))
+       << ")";
     // Eviction summary
-    ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
-       << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
-       << "size=" << byte_size_to_string(evicted_size);
+    ss << " | Eviction: "
+       << "Success/Attempts=" << delta(&SummaryCounters::eviction_success)
+       << "/" << delta(&SummaryCounters::eviction_attempts) << ", "
+       << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
+       << "keys=" << delta(&SummaryCounters::evicted_key_count) << ", "
+       << "size=" << byte_size_to_string(delta(&SummaryCounters::evicted_size));
 
     // Discard summary
     ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"

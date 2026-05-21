@@ -847,6 +847,7 @@ class RealClient : public PyClient {
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
+    void stop_dummy_client_monitor();
     std::thread dummy_client_monitor_thread_;
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =
