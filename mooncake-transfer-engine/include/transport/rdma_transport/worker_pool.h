@@ -96,5 +96,4 @@ class WorkerPool {
 };
 }  // namespace mooncake
 
-
 #endif  // WORKER_H
