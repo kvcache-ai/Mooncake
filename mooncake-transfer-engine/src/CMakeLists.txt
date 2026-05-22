@@ -133,6 +133,11 @@ if(USE_INTRA_NVLINK)
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
 endif()
 
+if(USE_MLX5DV)
+  message(STATUS "Enabled USE_MLX5DV support (mlx5 direct verbs)")
+  target_link_libraries(transfer_engine PUBLIC mlx5)
+endif()
+
 if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
   target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
