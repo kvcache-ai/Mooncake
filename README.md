@@ -377,7 +377,7 @@ The above presents two samples from our trace dataset. The trace includes the ti
 **_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
 
 <h2 id="citation">📑 Citation</h2>
-Please kindly cite our paper if you find the paper or the traces are useful:
+Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
 @article{sun2026survivingpartialrankfailures,
