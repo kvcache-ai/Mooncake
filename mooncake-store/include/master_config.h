@@ -39,7 +39,12 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double nof_eviction_ratio;
+    double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
+    int64_t nof_heartbeat_interval_sec;
+    uint32_t nof_heartbeat_probe_timeout_ms;
+    uint32_t nof_heartbeat_failures_threshold;
 
     bool enable_ha;
     bool enable_offload;
@@ -98,6 +103,12 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY so the next Get is fast.
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
 };
 
 class MasterServiceSupervisorConfig {
@@ -112,7 +123,16 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
+    RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
+    RequiredParam<double> nof_eviction_high_watermark_ratio{
+        "nof_eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<int64_t> nof_heartbeat_interval_sec{
+        "nof_heartbeat_interval_sec"};
+    RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
+        "nof_heartbeat_probe_timeout_ms"};
+    RequiredParam<uint32_t> nof_heartbeat_failures_threshold{
+        "nof_heartbeat_failures_threshold"};
     RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
@@ -159,6 +179,9 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -172,10 +195,20 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -256,8 +289,26 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error(
                 "eviction_high_watermark_ratio is not set");
         }
+        if (!nof_eviction_ratio.IsSet()) {
+            throw std::runtime_error("nof_eviction_ratio is not set");
+        }
+        if (!nof_eviction_high_watermark_ratio.IsSet()) {
+            throw std::runtime_error(
+                "nof_eviction_high_watermark_ratio is not set");
+        }
         if (!client_live_ttl_sec.IsSet()) {
             throw std::runtime_error("client_live_ttl_sec is not set");
+        }
+        if (!nof_heartbeat_interval_sec.IsSet()) {
+            throw std::runtime_error("nof_heartbeat_interval_sec is not set");
+        }
+        if (!nof_heartbeat_probe_timeout_ms.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_probe_timeout_ms is not set");
+        }
+        if (!nof_heartbeat_failures_threshold.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_failures_threshold is not set");
         }
         if (!rpc_port.IsSet()) {
             throw std::runtime_error("rpc_port is not set");
@@ -282,12 +333,23 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -339,12 +401,22 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -417,6 +489,9 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
@@ -424,6 +499,9 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -473,8 +551,16 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio_ =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms_ =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold_ =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
@@ -540,6 +626,17 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_nof_eviction_ratio(double ratio) {
+        nof_eviction_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_eviction_high_watermark_ratio(
+        double ratio) {
+        nof_eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_view_version(ViewVersionId version) {
         view_version_ = version;
         return *this;
@@ -547,6 +644,23 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
         client_live_ttl_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_interval_sec(int64_t ttl) {
+        nof_heartbeat_interval_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_probe_timeout_ms(
+        uint32_t timeout_ms) {
+        nof_heartbeat_probe_timeout_ms_ = timeout_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_failures_threshold(
+        uint32_t threshold) {
+        nof_heartbeat_failures_threshold_ = threshold;
         return *this;
     }
 
@@ -755,12 +869,23 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -808,12 +933,22 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
@@ -866,8 +1001,14 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.nof_eviction_ratio = nof_eviction_ratio_;
+    config.nof_eviction_high_watermark_ratio =
+        nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
+    config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
+    config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;

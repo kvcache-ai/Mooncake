@@ -36,7 +36,7 @@
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -77,7 +77,7 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
@@ -88,7 +88,7 @@ using namespace mooncake;
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -111,7 +111,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -304,7 +304,7 @@ int initiator() {
     int buffer_num = NR_SOCKETS;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {

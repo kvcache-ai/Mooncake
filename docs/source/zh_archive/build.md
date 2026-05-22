@@ -95,12 +95,12 @@
     ```
 
 2. 如果你要编译Nvidia GPUDirect 支持模块，首先需按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的指引安装 CUDA (确保启用 `nvidia-fs` 以正确编译 `cuFile` 模块)。之后:
-    1) 按照 https://docs.nvidia.com/cuda/gpudirect-rdma/ 的第 3.7 节说明安装 `nvidia-peermem` 以启用 GPU-Direct RDMA
-    2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
+    1) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
+    > **注意：** 默认情况下，Mooncake 使用 DMA-BUF 路径进行 GPU-Direct RDMA，**无需** `nvidia-peermem` 内核模块。如需使用依赖 `nvidia-peermem` 的传统 `ibv_reg_mr` 路径，请在启动 Mooncake 前设置运行时环境变量 `WITH_NVIDIA_PEERMEM=1`。安装 `nvidia-peermem` 的说明见 https://docs.nvidia.com/cuda/gpudirect-rdma/ 第 3.7 节。
 
 3. 如果你要编译Moore Threads GPUDirect RDMA 支持模块，首先需按照 https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide 的指引安装 MUSA SDK。之后:
     1) 安装 `mthreads-peermem` 以启用 GPU-Direct RDMA
@@ -180,6 +180,12 @@
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
+- `-DUSE_HYGON=[ON|OFF]`: 通过 DTK SDK 启用对海光 DCU 的支持。默认 OFF；使用 CUDA 兼容运行时。
+- `-DDTK_ROOT=/path/to/dtk`: 在 `-DUSE_HYGON=ON` 时覆盖默认 DTK SDK 根路径；未设置时使用 `DTK_HOME` 或 `/opt/dtk`。
+- `-DDTK_INCLUDE_DIR=/path/to/include` / `-DDTK_LIB_DIR=/path/to/lib64`: 在 `-DUSE_HYGON=ON` 时覆盖 DTK 头文件与库目录。
+- `-DUSE_COREX=[ON|OFF]`: 启用对天数智芯 CoreX GPU 的支持。默认 OFF；使用 CUDA 兼容运行时。
+- `-DCOREX_ROOT=/path/to/corex`: 在 `-DUSE_COREX=ON` 时覆盖默认 CoreX SDK 根路径；未设置时使用 `COREX_HOME` 或 `/usr/local/corex`。
+- `-DCOREX_INCLUDE_DIR=/path/to/include` / `-DCOREX_LIB_DIR=/path/to/lib`: 在 `-DUSE_COREX=ON` 时覆盖 CoreX 头文件与库目录。
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
 - `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+

@@ -111,6 +111,17 @@ TEST(FailoverConfigTest, ZeroDisablesFailover) {
     EXPECT_GT(task.failover_count, max_attempts);
 }
 
+TEST(FailoverConfigTest, AutoFailoverOnPollDefaultEnabled) {
+    auto conf = std::make_shared<Config>();
+    EXPECT_TRUE(conf->get("enable_auto_failover_on_poll", true));
+}
+
+TEST(FailoverConfigTest, AutoFailoverOnPollCanBeDisabled) {
+    auto conf = std::make_shared<Config>();
+    conf->set("enable_auto_failover_on_poll", false);
+    EXPECT_FALSE(conf->get("enable_auto_failover_on_poll", true));
+}
+
 // ---------------------------------------------------------------------------
 // TransportType name coverage (tests the static helper indirectly via
 // the enum values — the function itself is file-local in the .cpp, so we

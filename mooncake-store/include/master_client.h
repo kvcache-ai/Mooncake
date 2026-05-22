@@ -205,7 +205,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revokes a put operation
@@ -222,7 +223,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -297,6 +299,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const Segment& segment);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
+        const Segment& segment);
+
+    /**
+     * @brief Registers a NoF ssd segment to master for allocation
+     * @param segment Segment to register
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
+        const NoFSegment& segment);
+
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
@@ -309,6 +322,17 @@ class MasterClient {
         const std::vector<Segment>& segments);
 
     /**
+     * @brief Re-mount NoF ssd segments, invoked when the client is the first
+     * time to connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountNoFSegment(
+        const std::vector<NoFSegment>& segments);
+
+    /**
      * @brief Unregisters a memory segment from master
      * @param segment_id ID of the segment to unmount
      * @return tl::expected<void, ErrorCode> indicating success/failure
@@ -318,6 +342,31 @@ class MasterClient {
 
     [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegment(
         const UUID& segment_id, uint64_t grace_period_ms);
+
+    /**
+     * @brief Unregisters a NoF ssd segment from master
+     * @param segment_id ID of the segment to unmount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountNoFSegment(
+        const UUID& segment_id);
+
+    /**
+     * @brief Gets all mounted NoF ssd segments from master
+     * @return tl::expected<std::vector<MountedNoFSegmentSnapshot>, ErrorCode>
+     * containing all mounted segments
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    GetAllNoFSegments();
+
+    /**
+     * @brief Gets all mounted NoF segments that match a segment name together
+     * with their owner client ids.
+     * @param segment_name Mounted NoF segment name
+     * @return Matching segment owner info list
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+    GetNoFSegmentsByName(const std::string& segment_name);
 
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
@@ -369,6 +418,41 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
+     * client. Returns key->size pairs the caller should read from local
+     * SSD and stage as MEMORY replicas via PromotionAllocStart +
+     * NotifyPromotionSuccess.
+     */
+    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
+                               ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * promotion. Returns the new replica's descriptor that the caller writes
+     * via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const UUID& client_id, const std::string& key,
+                        uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Release master-side promotion task state after a client-side
+     * failure that prevents the holder from calling NotifyPromotionSuccess.
+     * Idempotent; returns OK if the task was already swept by the reaper.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
 
     /**
      * @brief Start a copy operation

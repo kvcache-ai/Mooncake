@@ -98,6 +98,7 @@ class Environ {
     bool GetUseTent() const { return use_tent_; }
     bool GetUseTev1() const { return use_tev1_; }
     std::string GetYltLogLevel() const { return ylt_log_level_; }
+    bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
 
    private:
     Environ();
@@ -183,6 +184,7 @@ class Environ {
     bool use_tent_;
     bool use_tev1_;
     std::string ylt_log_level_;
+    bool with_nvidia_peermem_;
 };
 
 }  // namespace mooncake

@@ -126,6 +126,8 @@ Mooncake supports heterogeneous accelerators, NICs, and specialized transport pa
 | T-Head | PPU / Barex | Supported | T-Head PPU deployments are represented here through Barex-based transport support |
 | NVIDIA | CUDA GPUs / NVLink | Supported | `-DUSE_CUDA=ON`, `-DUSE_INTRA_NVLINK=ON`, `-DUSE_MNNVL=ON`; covers CUDA memory, GPUDirect RDMA, GPUDirect Storage, intra-node NVLink, and multi-node NVLink |
 | AMD | ROCm / HIP GPUs | Supported | `-DUSE_HIP=ON`; HIP transport for AMD GPU communication |
+| Hygon | DCU / DTK | Supported | `-DUSE_HYGON=ON`; CUDA-compatible runtime via Hygon DTK SDK |
+| Iluvatar | CoreX | Supported | `-DUSE_COREX=ON`; CUDA-compatible runtime via Iluvatar CoreX SDK |
 
 #### Network and fabric support
 
@@ -236,6 +238,8 @@ The following need to be installed before running any component of Mooncake:
 - Python 3.10, virtual environment is recommended.
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
+- Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
+- Iluvatar CoreX SDK, if the package is built with `-DUSE_COREX`. By default Mooncake looks for CoreX under `COREX_HOME` or `/usr/local/corex`.
 
 ### Use Python package
 The simplest way to use Mooncake Transfer Engine is using `pip`:
@@ -310,8 +314,10 @@ The following are additional dependencies for building Mooncake:
 - Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if you want to build with `-DUSE_MLU`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `NEUWARE_HOME` or `/usr/local/neuware` by default, and also supports overriding `MLU_INCLUDE_DIR` / `MLU_LIB_DIR` during CMake configure.
+- Hygon DTK SDK, if you want to build with `-DUSE_HYGON`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `DTK_HOME` or `/opt/dtk` by default, and also supports overriding `DTK_INCLUDE_DIR` / `DTK_LIB_DIR` during CMake configure.
+- Iluvatar CoreX SDK, if you want to build with `-DUSE_COREX`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `COREX_HOME` or `/usr/local/corex` by default, and also supports overriding `COREX_INCLUDE_DIR` / `COREX_LIB_DIR` during CMake configure.
 - [Optional] Rust Toolchain and libclang, if you want to build Transfer Engine Rust examples with `-DWITH_RUST_EXAMPLE=ON` or Mooncake Store Rust bindings with `-DWITH_STORE_RUST=ON`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers, or with `-DSTORE_USE_REDIS` to use Redis for Mooncake Store failover.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
 The build and installation steps are as follows:

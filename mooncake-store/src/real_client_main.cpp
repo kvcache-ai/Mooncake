@@ -66,6 +66,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_unmap_shm_internal>(
         &real_client);
+    server.register_handler<&RealClient::is_shm_mapped_internal>(&real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(
         &real_client);
