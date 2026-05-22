@@ -6285,7 +6285,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
-            select_client, {.key = key,
+            select_client, {.key = internal_key,
                             .source = selected_source_segment,
                             .targets = targets});
 }
@@ -6349,7 +6349,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
 
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_MOVE>(
-            select_client, {.key = key, .source = source, .target = target});
+            select_client,
+            {.key = internal_key, .source = source, .target = target});
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
@@ -6673,10 +6674,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [key, metadata] : shard->metadata) {
-                const std::string& user_key = metadata.UserKeyOr(key);
                 for (const auto& source_segment : job.request.segments) {
-                    const auto unit_key =
-                        MakeDrainUnitKey(user_key, source_segment);
+                    const auto unit_key = MakeDrainUnitKey(key, source_segment);
                     if (job.completed_unit_keys.contains(unit_key) ||
                         active_unit_keys.contains(unit_key) ||
                         job.terminal_failed_unit_keys.contains(unit_key)) {
@@ -6706,7 +6705,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                     }
 
                     if (plans.size() < slots) {
-                        plans.push_back({user_key, source_segment, *target,
+                        plans.push_back({key, source_segment, *target,
                                          metadata.size, unit_key});
                     }
                 }
@@ -6760,7 +6759,6 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         for (size_t i = 0; i < kNumShards; ++i) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [key, metadata] : shard->metadata) {
-                const std::string& user_key = metadata.UserKeyOr(key);
                 const auto replica_segments = metadata.GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
                     if (std::find(replica_segments.begin(),
@@ -6768,7 +6766,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                                   source_segment) != replica_segments.end()) {
                         remaining_segments.insert(source_segment);
                         remaining_unit_keys.insert(
-                            MakeDrainUnitKey(user_key, source_segment));
+                            MakeDrainUnitKey(key, source_segment));
                     }
                 }
             }

@@ -417,18 +417,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
-            std::vector<std::string> evicted_object_keys;
-            evicted_object_keys.reserve(evicted_keys.size());
-            for (const auto& evicted_key : evicted_keys) {
-                if (auto parsed = ParseTenantScopedKey(evicted_key)) {
-                    evicted_object_keys.emplace_back(
-                        std::move(parsed->user_key));
-                } else {
-                    evicted_object_keys.emplace_back(evicted_key);
-                }
-            }
             auto results = client_->BatchEvictDiskReplica(
-                evicted_object_keys, ReplicaType::LOCAL_DISK);
+                evicted_keys, ReplicaType::LOCAL_DISK);
             for (size_t i = 0; i < results.size(); ++i) {
                 if (!results[i]) {
                     LOG(WARNING)

@@ -417,6 +417,9 @@ std::string EscapeRegexLiteral(const std::string& value) {
 MasterClient::~MasterClient() = default;
 
 std::string MasterClient::BuildStorageKey(const std::string& object_key) const {
+    if (ParseTenantScopedKey(object_key)) {
+        return object_key;
+    }
     return BuildTenantScopedKey(tenant_id_, object_key);
 }
 

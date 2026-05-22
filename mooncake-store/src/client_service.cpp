@@ -2782,18 +2782,8 @@ void Client::PutToLocalFile(const std::string& key,
         // Notify master about any evicted disk replicas (batch)
         if (!store_result.value().empty()) {
             const auto& evicted_keys = store_result.value();
-            std::vector<std::string> evicted_object_keys;
-            evicted_object_keys.reserve(evicted_keys.size());
-            for (const auto& evicted_key : evicted_keys) {
-                if (auto parsed = ParseTenantScopedKey(evicted_key)) {
-                    evicted_object_keys.emplace_back(
-                        std::move(parsed->user_key));
-                } else {
-                    evicted_object_keys.emplace_back(evicted_key);
-                }
-            }
             auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_object_keys, replica_type);
+                evicted_keys, replica_type);
             for (size_t i = 0; i < evict_results.size(); ++i) {
                 if (!evict_results[i]) {
                     LOG(WARNING)

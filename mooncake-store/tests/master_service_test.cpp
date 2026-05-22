@@ -260,6 +260,71 @@ TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
     ASSERT_TRUE(service->MoveEnd(client_id, "move_key", tenant_id).has_value());
 }
 
+TEST_F(MasterServiceTest, TenantScopedReplicaTasksCarryStorageKey) {
+    auto service = std::make_unique<MasterService>();
+    const auto ctx1 = PrepareSimpleSegment(*service, "segment_1");
+    PrepareSimpleSegment(*service, "segment_2");
+    PrepareSimpleSegment(*service, "segment_3");
+
+    const UUID client_id = generate_uuid();
+    const std::string tenant_id = "tenant_a";
+    const std::string expected_copy_key =
+        BuildTenantScopedKey(tenant_id, "copy_task_key");
+    const std::string expected_move_key =
+        BuildTenantScopedKey(tenant_id, "move_task_key");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, "copy_task_key", 1024, config, tenant_id)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id, "copy_task_key", ReplicaType::MEMORY, tenant_id)
+            .has_value());
+    ASSERT_TRUE(
+        service->CreateCopyTask("copy_task_key", {"segment_2"}, tenant_id)
+            .has_value());
+
+    auto copy_tasks = service->FetchTasks(ctx1.client_id, 1);
+    ASSERT_TRUE(copy_tasks.has_value());
+    ASSERT_EQ(copy_tasks->size(), 1u);
+    ReplicaCopyPayload copy_payload;
+    struct_json::from_json(copy_payload, copy_tasks->front().payload);
+    EXPECT_EQ(copy_payload.key, expected_copy_key);
+    EXPECT_TRUE(service
+                    ->CopyStart(ctx1.client_id, copy_payload.key,
+                                copy_payload.source, copy_payload.targets)
+                    .has_value());
+    EXPECT_TRUE(service->CopyEnd(ctx1.client_id, copy_payload.key).has_value());
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, "move_task_key", 1024, config, tenant_id)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutEnd(client_id, "move_task_key", ReplicaType::MEMORY, tenant_id)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->CreateMoveTask("move_task_key", "segment_1", "segment_3",
+                                     tenant_id)
+                    .has_value());
+
+    auto move_tasks = service->FetchTasks(ctx1.client_id, 1);
+    ASSERT_TRUE(move_tasks.has_value());
+    ASSERT_EQ(move_tasks->size(), 1u);
+    ReplicaMovePayload move_payload;
+    struct_json::from_json(move_payload, move_tasks->front().payload);
+    EXPECT_EQ(move_payload.key, expected_move_key);
+    EXPECT_TRUE(service
+                    ->MoveStart(ctx1.client_id, move_payload.key,
+                                move_payload.source, move_payload.target)
+                    .has_value());
+    EXPECT_TRUE(service->MoveEnd(ctx1.client_id, move_payload.key).has_value());
+}
+
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
                                   const std::string& segment_name) {
@@ -4517,6 +4582,81 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
 
     auto replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(replicas.has_value());
+    std::unordered_set<std::string> segment_names;
+    for (const auto& replica : replicas->replicas) {
+        segment_names.insert(replica.get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
+    }
+    EXPECT_TRUE(segment_names.contains("segment_1"));
+    EXPECT_FALSE(segment_names.contains("segment_0"));
+}
+
+TEST_F(MasterServiceTest, TenantScopedDrainJobSchedulesScopedMoveTask) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    auto service_ = std::make_unique<MasterService>(service_config);
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    PrepareSimpleSegment(*service_, "segment_1", 0x400000000,
+                         kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "tenant_drain_key";
+    const std::string tenant_id = "tenant_drain";
+    const std::string storage_key = BuildTenantScopedKey(tenant_id, key);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    ASSERT_TRUE(service_->PutStart(put_client_id, key, 1024, config, tenant_id)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY, tenant_id)
+            .has_value());
+
+    CreateDrainJobRequest request;
+    request.segments = {"segment_0"};
+    request.target_segments = {"segment_1"};
+    request.max_concurrency = 1;
+
+    auto job_id = service_->CreateDrainJob(request);
+    ASSERT_TRUE(job_id.has_value());
+
+    std::vector<TaskAssignment> fetched_tasks;
+    WaitUntil([&] {
+        auto fetched = service_->FetchTasks(ctx0.client_id, 1);
+        if (!fetched.has_value() || fetched->empty()) {
+            return false;
+        }
+        fetched_tasks = std::move(fetched.value());
+        return true;
+    });
+    ASSERT_EQ(fetched_tasks.size(), 1u);
+
+    ReplicaMovePayload payload;
+    struct_json::from_json(payload, fetched_tasks.front().payload);
+    EXPECT_EQ(payload.key, storage_key);
+    ASSERT_TRUE(service_
+                    ->MoveStart(ctx0.client_id, payload.key, payload.source,
+                                payload.target)
+                    .has_value());
+    ASSERT_TRUE(service_->MoveEnd(ctx0.client_id, payload.key).has_value());
+
+    TaskCompleteRequest complete_request;
+    complete_request.id = fetched_tasks.front().id;
+    complete_request.status = TaskStatus::SUCCESS;
+    complete_request.message = "move_done";
+    ASSERT_TRUE(service_->MarkTaskToComplete(ctx0.client_id, complete_request)
+                    .has_value());
+
+    WaitUntil([&] {
+        auto query = service_->QueryDrainJob(job_id.value());
+        return query.has_value() && query->status == JobStatus::SUCCEEDED;
+    });
+
+    auto replicas = service_->GetReplicaList(key, tenant_id);
     ASSERT_TRUE(replicas.has_value());
     std::unordered_set<std::string> segment_names;
     for (const auto& replica : replicas->replicas) {

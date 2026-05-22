@@ -67,6 +67,9 @@ class Client {
     const UUID& getClientId() const { return client_id_; }
     const std::string& GetTenantId() const { return tenant_id_; }
     std::string BuildStorageKey(const std::string& object_key) const {
+        if (ParseTenantScopedKey(object_key)) {
+            return object_key;
+        }
         return BuildTenantScopedKey(tenant_id_, object_key);
     }
 
