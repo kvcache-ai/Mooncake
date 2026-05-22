@@ -1088,27 +1088,34 @@ impl PyMooncakeDistributedStore {
 
     #[pyo3(signature = (key, force = false, *, tenant = None))]
     fn remove(&self, key: &str, force: bool, tenant: Option<&str>) -> PyResult<i32> {
-        let dispatcher = self.real_dispatcher()?;
-        let key = key.to_string();
-        let tenant = tenant.map(str::to_string);
-        let cache_key = key.clone();
-        let cache_tenant = tenant.clone();
-        let scope = dispatcher.object_scope(tenant);
-        run_without_gil(move || {
-            dispatcher.run(move |client| {
-                let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
-                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
-                    object = object.domain(scope.domain.as_str());
-                }
-                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
-                    object = object.object_set(scope.object_set.as_str());
-                }
-                client.batch_remove(&[object], force).map(|_| ())
-            })
-        })
-        .map_err(store_error_to_py)?;
-        dispatcher.invalidate_key(cache_key, cache_tenant);
-        Ok(0)
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.remove(key, tenant, force)).map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let key = key.to_string();
+                let tenant = tenant.map(str::to_string);
+                let cache_key = key.clone();
+                let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
+                        let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                            object = object.domain(scope.domain.as_str());
+                        }
+                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                            object = object.object_set(scope.object_set.as_str());
+                        }
+                        client.batch_remove(&[object], force).map(|_| ())
+                    })
+                })
+                .map_err(store_error_to_py)?;
+                dispatcher.untrack_key(&cache_key, cache_tenant.as_deref());
+                dispatcher.invalidate_key(cache_key, cache_tenant);
+                Ok(0)
+            }
+        }
     }
 
     #[pyo3(signature = (keys, force = false, *, tenant = None))]
@@ -1118,33 +1125,42 @@ impl PyMooncakeDistributedStore {
         force: bool,
         tenant: Option<&str>,
     ) -> PyResult<Vec<i32>> {
-        let dispatcher = self.real_dispatcher()?;
-        let key_count = keys.len();
-        let tenant = tenant.map(str::to_string);
-        let cache_keys = keys.clone();
-        let cache_tenant = tenant.clone();
-        let scope = dispatcher.object_scope(tenant);
-        run_without_gil(move || {
-            dispatcher.run(move |client| {
-                let objects = keys
-                    .iter()
-                    .map(|key| {
-                        let mut object = ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
-                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
-                            object = object.domain(scope.domain.as_str());
-                        }
-                        if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
-                            object = object.object_set(scope.object_set.as_str());
-                        }
-                        object
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                run_without_gil(move || dummy.batch_remove(&keys, tenant, force))
+                    .map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let key_count = keys.len();
+                let tenant = tenant.map(str::to_string);
+                let cache_keys = keys.clone();
+                let cache_tenant = tenant.clone();
+                let scope = dispatcher.object_scope(tenant);
+                run_without_gil(move || {
+                    dispatcher.run(move |client| {
+                        let objects = keys
+                            .iter()
+                            .map(|key| {
+                                let mut object =
+                                    ObjectRef::new(key.as_str()).tenant(scope.tenant.as_str());
+                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
+                                    object = object.domain(scope.domain.as_str());
+                                }
+                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
+                                    object = object.object_set(scope.object_set.as_str());
+                                }
+                                object
+                            })
+                            .collect::<Vec<_>>();
+                        client.batch_remove(&objects, force).map(|_| ())
                     })
-                    .collect::<Vec<_>>();
-                client.batch_remove(&objects, force).map(|_| ())
-            })
-        })
-        .map_err(store_error_to_py)?;
-        dispatcher.invalidate_keys(cache_keys, cache_tenant);
-        Ok(vec![0; key_count])
+                })
+                .map_err(store_error_to_py)?;
+                dispatcher.untrack_keys(&cache_keys, cache_tenant.as_deref());
+                dispatcher.invalidate_keys(cache_keys, cache_tenant);
+                Ok(vec![0; key_count])
+            }
+        }
     }
 
     #[pyo3(signature = (keys, *, tenant = None))]
@@ -3485,6 +3501,24 @@ mod tests {
             }))
         }
 
+        async fn remove(
+            &self,
+            _request: tonic::Request<pb::RemoveRequest>,
+        ) -> std::result::Result<tonic::Response<pb::StatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
+        }
+
+        async fn batch_remove(
+            &self,
+            _request: tonic::Request<pb::BatchRemoveRequest>,
+        ) -> std::result::Result<tonic::Response<pb::BatchStatusReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::BatchStatusReply {
+                statuses: vec![],
+            }))
+        }
+
         async fn remove_all(
             &self,
             _request: tonic::Request<pb::RemoveAllRequest>,
@@ -4929,7 +4963,11 @@ mod tests {
             .remove_all(false)
             .expect("dummy remove_all should succeed");
         assert!(removed >= 1);
-        assert!(store.remove("alpha", false, None).is_err());
+        // After remove_all, the key is gone. force=false returns -1 status.
+        let status = store
+            .remove("alpha", false, None)
+            .expect("dummy remove should succeed");
+        assert_eq!(status, -1);
         Python::with_gil(|py| {
             assert!(store.list_segments(py).is_err());
         });

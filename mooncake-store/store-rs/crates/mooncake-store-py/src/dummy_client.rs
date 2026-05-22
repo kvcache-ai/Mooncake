@@ -152,6 +152,41 @@ impl DummySession {
         Ok((reply.status, reply.value))
     }
 
+    pub fn remove(&self, key: &str, tenant: Option<&str>, force: bool) -> Result<i32> {
+        let request = pb::RemoveRequest {
+            key: key.to_string(),
+            tenant: tenant.unwrap_or_default().to_string(),
+            force,
+        };
+        Ok(self
+            .rpc(|mut client| async move { client.remove(request).await })?
+            .into_inner()
+            .status)
+    }
+
+    pub fn batch_remove(
+        &self,
+        keys: &[String],
+        tenant: Option<&str>,
+        force: bool,
+    ) -> Result<Vec<i32>> {
+        let tenant_str = tenant.unwrap_or_default().to_string();
+        let request = pb::BatchRemoveRequest {
+            objects: keys
+                .iter()
+                .map(|key| pb::ObjectRef {
+                    key: key.clone(),
+                    tenant: tenant_str.clone(),
+                })
+                .collect(),
+            force,
+        };
+        Ok(self
+            .rpc(|mut client| async move { client.batch_remove(request).await })?
+            .into_inner()
+            .statuses)
+    }
+
     pub fn batch_is_exist(&self, keys: &[String], tenant: Option<&str>) -> Result<Vec<i32>> {
         let request = pb::BatchIsExistRequest {
             objects: keys

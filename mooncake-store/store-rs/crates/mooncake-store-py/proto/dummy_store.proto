@@ -15,6 +15,8 @@ service DummyStoreService {
   rpc BatchPutFromMultiBuffers(BatchPutFromMultiBuffersRequest) returns (BatchStatusReply);
   rpc BatchGetInto(BatchGetIntoRequest) returns (BatchGetIntoReply);
   rpc BatchGetIntoMultiBuffers(BatchGetIntoMultiBuffersRequest) returns (BatchGetIntoReply);
+  rpc Remove(RemoveRequest) returns (StatusReply);
+  rpc BatchRemove(BatchRemoveRequest) returns (BatchStatusReply);
   rpc RemoveAll(RemoveAllRequest) returns (RemoveAllReply);
   rpc UnregisterRegion(UnregisterRegionRequest) returns (StatusReply);
 }
@@ -27,6 +29,17 @@ message HealthReply {
 
 message StatusReply {
   int32 status = 1;
+}
+
+message RemoveRequest {
+  string key = 1;
+  string tenant = 2;
+  bool force = 3;
+}
+
+message BatchRemoveRequest {
+  repeated ObjectRef objects = 1;
+  bool force = 2;
 }
 
 message RemoveAllRequest {
