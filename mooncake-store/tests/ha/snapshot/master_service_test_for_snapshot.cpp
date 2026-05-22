@@ -2369,8 +2369,14 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        const auto storage_key = BuildTenantScopedKey("default", key);
+        auto it = res.value().find(storage_key);
+        ASSERT_TRUE(it != res.value().end());
+        ASSERT_EQ(it->second, 1024);
+        auto parsed = ParseTenantScopedKey(storage_key);
+        ASSERT_TRUE(parsed.has_value());
+        ASSERT_EQ(parsed->tenant_id, "default");
+        ASSERT_EQ(parsed->user_key, key);
     }
 
     keys.clear();
@@ -2386,8 +2392,10 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        const auto storage_key = BuildTenantScopedKey("default", key);
+        auto it = res.value().find(storage_key);
+        ASSERT_TRUE(it != res.value().end());
+        ASSERT_EQ(it->second, 1024);
     }
 }
 

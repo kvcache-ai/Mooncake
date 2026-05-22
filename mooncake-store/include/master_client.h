@@ -582,6 +582,15 @@ class MasterClient {
                           ReplicaType replica_type);
 
    private:
+    [[nodiscard]] std::string BuildStorageKey(
+        const std::string& object_key) const;
+
+    [[nodiscard]] std::vector<std::string> BuildStorageKeys(
+        const std::vector<std::string>& object_keys) const;
+
+    [[nodiscard]] std::string BuildStorageRegex(
+        const std::string& object_regex) const;
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
