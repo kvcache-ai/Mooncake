@@ -13,7 +13,9 @@ import numpy as np
 DEFAULT_BUNDLE_CHUNK_BYTES = 512 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
 AUTO_PARALLEL_MIN_CHUNKS = 8
-MISSING_OBJECT_ERROR = -704  # Mooncake remove returns -704 for an already-missing object.
+MISSING_OBJECT_ERROR = (
+    -704
+)  # Mooncake remove returns -704 for an already-missing object.
 STRUCTURED_FIELD_SPECS_KEY = "__mooncake_structured_fields__"
 
 
@@ -41,12 +43,22 @@ class RemoteBundleRef:
     manifest: dict[str, Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class StructuredObjectPayload:
     """Structured object encoded as metadata plus named buffers."""
 
     metadata: Mapping[str, Any]
     buffers: Mapping[str, Any]
+
+    def __init__(
+        self,
+        metadata: Optional[Mapping[str, Any]] = None,
+        buffers: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if buffers is None:
+            raise TypeError("StructuredObjectPayload requires buffers")
+        object.__setattr__(self, "metadata", {} if metadata is None else metadata)
+        object.__setattr__(self, "buffers", buffers)
 
 
 @dataclass
@@ -75,7 +87,9 @@ class StructuredObjectReadSpec:
     member_names: tuple[str, ...] | None = None
     member_slices: tuple[tuple[str, StructuredMemberSlice], ...] = ()
 
-    def select_members(self, names: Optional[Sequence[str]]) -> "StructuredObjectReadSpec":
+    def select_members(
+        self, names: Optional[Sequence[str]]
+    ) -> "StructuredObjectReadSpec":
         """Return a new spec that materializes only the selected members."""
         return StructuredObjectReadSpec(
             ref=self.ref,
@@ -181,7 +195,9 @@ class MooncakeBundleTransfer:
             max_inflight_put=max_inflight_put,
         )
 
-    def read_spec(self, ref: RemoteBundleRef | Mapping[str, Any]) -> StructuredObjectReadSpec:
+    def read_spec(
+        self, ref: RemoteBundleRef | Mapping[str, Any]
+    ) -> StructuredObjectReadSpec:
         """Create a lazy read spec for a structured object reference."""
         return self._structured_store.read_spec(ref)
 
@@ -220,7 +236,9 @@ class _StructuredObjectLayer:
             max_inflight_put=max_inflight_put,
         )
 
-    def read_spec(self, ref: RemoteBundleRef | Mapping[str, Any]) -> StructuredObjectReadSpec:
+    def read_spec(
+        self, ref: RemoteBundleRef | Mapping[str, Any]
+    ) -> StructuredObjectReadSpec:
         return StructuredObjectReadSpec(ref=ref)
 
     def materialize(self, spec: StructuredObjectReadSpec) -> StructuredObjectResult:
@@ -254,9 +272,13 @@ class _StructuredObjectLayer:
         if spec.member_names is not None and not spec.member_names:
             raise ValueError("structured read spec selected no members")
         manifest = self._bundle_store.resolve_manifest(spec.ref)
-        metadata = _decode_structured_metadata(self._bundle_store.read_payload(manifest["meta"]))
+        metadata = _decode_structured_metadata(
+            self._bundle_store.read_payload(manifest["meta"])
+        )
         buffers = manifest["buffers"]
-        selected = list(buffers) if spec.member_names is None else list(spec.member_names)
+        selected = (
+            list(buffers) if spec.member_names is None else list(spec.member_names)
+        )
         missing = [name for name in selected if name not in buffers]
         if missing:
             raise KeyError(f"unknown bundle buffers: {missing}")
@@ -272,10 +294,14 @@ class _StructuredObjectLayer:
     ) -> Any:
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "bytes":
-            return self._read_bytes_member(name, payload_spec, member_slice, destination)
+            return self._read_bytes_member(
+                name, payload_spec, member_slice, destination
+            )
         if encoding != "ndarray":
             raise ValueError(f"unsupported structured field encoding: {encoding}")
-        return self._read_ndarray_member(name, payload_spec, field_spec, member_slice, destination)
+        return self._read_ndarray_member(
+            name, payload_spec, field_spec, member_slice, destination
+        )
 
     def _read_bytes_member(
         self,
@@ -287,7 +313,9 @@ class _StructuredObjectLayer:
         if member_slice is not None:
             raise ValueError(f"structured bytes member {name} does not support slicing")
         if destination is not None:
-            raise ValueError(f"structured bytes member {name} does not support materialize_into")
+            raise ValueError(
+                f"structured bytes member {name} does not support materialize_into"
+            )
         return self._bundle_store.read_payload(payload_spec)
 
     def _read_ndarray_member(
@@ -301,9 +329,15 @@ class _StructuredObjectLayer:
         dtype = field_spec.get("dtype")
         shape = field_spec.get("shape")
         if not isinstance(dtype, str) or not isinstance(shape, list):
-            raise ValueError(f"structured ndarray field {name} is missing dtype or shape")
-        read_plan = _resolve_ndarray_read_plan(tuple(int(dim) for dim in shape), np.dtype(dtype), member_slice)
-        target = _resolve_ndarray_destination(name, destination, read_plan.dtype, read_plan.output_shape)
+            raise ValueError(
+                f"structured ndarray field {name} is missing dtype or shape"
+            )
+        read_plan = _resolve_ndarray_read_plan(
+            tuple(int(dim) for dim in shape), np.dtype(dtype), member_slice
+        )
+        target = _resolve_ndarray_destination(
+            name, destination, read_plan.dtype, read_plan.output_shape
+        )
         destination_view = target.view(np.uint8).reshape(-1)
         if read_plan.byte_length == 0:
             return target
@@ -317,9 +351,12 @@ class _StructuredObjectLayer:
         temp_shape = (read_plan.cover_row_count, *read_plan.full_shape[1:])
         temp = np.empty(temp_shape, dtype=read_plan.dtype)
         temp_view = temp.view(np.uint8).reshape(-1)
-        self._bundle_store.read_payload_range_into_destination(payload_spec, temp_view, read_plan.byte_offset)
+        self._bundle_store.read_payload_range_into_destination(
+            payload_spec, temp_view, read_plan.byte_offset
+        )
         target[...] = temp[:: read_plan.step]
         return target
+
 
 class _BundleManifestStore:
     def __init__(
@@ -385,7 +422,9 @@ class _BundleManifestStore:
                 "buffers": buffer_specs,
             }
             manifest_blob = _encode_manifest(manifest)
-            _check_status(self._store.put(manifest_key, manifest_blob), "put", manifest_key)
+            _check_status(
+                self._store.put(manifest_key, manifest_blob), "put", manifest_key
+            )
             written_keys.append(manifest_key)
         except Exception:
             _cleanup_keys(self._store, written_keys, strict=False)
@@ -398,7 +437,9 @@ class _BundleManifestStore:
         keys.append(self._manifest_key(ref, manifest))
         _cleanup_keys(self._store, keys, strict=True)
 
-    def resolve_manifest(self, ref: RemoteBundleRef | Mapping[str, Any]) -> dict[str, Any]:
+    def resolve_manifest(
+        self, ref: RemoteBundleRef | Mapping[str, Any]
+    ) -> dict[str, Any]:
         if isinstance(ref, RemoteBundleRef):
             manifest = ref.manifest
         else:
@@ -437,7 +478,10 @@ class _BundleManifestStore:
         pre_registered: bool,
     ) -> tuple[dict[str, Any], list[str]]:
         chunks = _split_view(value, chunk_bytes)
-        chunk_keys = [key if len(chunks) == 1 else f"{key}/chunk/{index}" for index in range(len(chunks))]
+        chunk_keys = [
+            key if len(chunks) == 1 else f"{key}/chunk/{index}"
+            for index in range(len(chunks))
+        ]
         written_keys = self._transport.put_payload_chunks(
             chunk_keys,
             chunks,
@@ -461,7 +505,9 @@ class _BundleManifestStore:
     ) -> BundleTransferPolicy:
         result = policy or BundleTransferPolicy()
         if max_inflight_put is not None:
-            result = BundleTransferPolicy(max_inflight_put=max_inflight_put, put_mode=result.put_mode)
+            result = BundleTransferPolicy(
+                max_inflight_put=max_inflight_put, put_mode=result.put_mode
+            )
         if result.max_inflight_put < 1:
             raise ValueError("max_inflight_put must be positive")
         if result.put_mode not in {"auto", "batch", "parallel"}:
@@ -487,7 +533,9 @@ class _BundleManifestStore:
         if not isinstance(payload_spec, dict):
             raise ValueError("bundle payload spec must be a dict")
         payload_key = payload_spec.get("key")
-        if not isinstance(payload_key, str) or not payload_key.startswith(f"{base_key}/"):
+        if not isinstance(payload_key, str) or not payload_key.startswith(
+            f"{base_key}/"
+        ):
             raise ValueError("bundle payload key is outside the bundle namespace")
         expected_bytes = int(payload_spec.get("bytes", -1))
         if expected_bytes < 0:
@@ -502,7 +550,9 @@ class _BundleManifestStore:
                 raise ValueError("bundle chunk must be a dict")
             key = chunk.get("key")
             chunk_bytes = int(chunk.get("bytes", -1))
-            if not isinstance(key, str) or (key != payload_key and not key.startswith(f"{payload_key}/")):
+            if not isinstance(key, str) or (
+                key != payload_key and not key.startswith(f"{payload_key}/")
+            ):
                 raise ValueError("bundle chunk key is outside the payload namespace")
             if key in seen_keys:
                 raise ValueError("bundle chunk keys must be unique")
@@ -511,11 +561,19 @@ class _BundleManifestStore:
             seen_keys.add(key)
             total_bytes += chunk_bytes
         if total_bytes != expected_bytes:
-            raise ValueError(f"bundle payload chunks total {total_bytes} bytes, expected {expected_bytes}")
+            raise ValueError(
+                f"bundle payload chunks total {total_bytes} bytes, expected {expected_bytes}"
+            )
 
-    def _manifest_key(self, ref: RemoteBundleRef | Mapping[str, Any], manifest: Mapping[str, Any]) -> str:
+    def _manifest_key(
+        self, ref: RemoteBundleRef | Mapping[str, Any], manifest: Mapping[str, Any]
+    ) -> str:
         expected = f"{self._key_prefix}/{manifest['object_id']}/manifest"
-        manifest_key = ref.manifest_key if isinstance(ref, RemoteBundleRef) else ref.get("manifest_key")
+        manifest_key = (
+            ref.manifest_key
+            if isinstance(ref, RemoteBundleRef)
+            else ref.get("manifest_key")
+        )
         if manifest_key is None:
             return expected
         if manifest_key != expected:
@@ -532,6 +590,7 @@ class _BundleManifestStore:
 
 class _MooncakePayloadTransport:
     """Move payload bytes through Mooncake, preferring fast-path APIs and falling back to generic store calls."""
+
     def __init__(self, store: BundleStore) -> None:
         self._store = store
         self._batch_put_from = getattr(store, "batch_put_from", None)
@@ -552,7 +611,9 @@ class _MooncakePayloadTransport:
             return self._put_chunks_direct(chunk_keys, chunks)
         put_mode = self._resolve_put_mode(chunks, transfer_policy)
         if put_mode == "batch":
-            self.batch_put_chunks_from(chunk_keys, chunks, pre_registered=pre_registered)
+            self.batch_put_chunks_from(
+                chunk_keys, chunks, pre_registered=pre_registered
+            )
             return list(chunk_keys)
         return self._put_chunks_parallel(
             list(chunk_keys),
@@ -569,7 +630,9 @@ class _MooncakePayloadTransport:
         self.read_payload_into(payload_spec, data)
         return bytes(data)
 
-    def read_payload_into(self, payload_spec: Mapping[str, Any], destination: bytearray | np.ndarray) -> None:
+    def read_payload_into(
+        self, payload_spec: Mapping[str, Any], destination: bytearray | np.ndarray
+    ) -> None:
         chunks = payload_spec["chunks"]
         offsets = _chunk_offsets(chunks)
         if self._read_chunks_with_batch_get_into(chunks, offsets, destination):
@@ -585,7 +648,7 @@ class _MooncakePayloadTransport:
         destination_pre_registered: bool,
     ) -> None:
         chunks = payload_spec["chunks"]
-        byte_length = int(destination.size)
+        byte_length = _buffer_nbytes(destination)
         if not self._read_payload_range_into_registered_destination(
             chunks,
             destination,
@@ -593,7 +656,9 @@ class _MooncakePayloadTransport:
             byte_length,
             destination_pre_registered=destination_pre_registered,
         ):
-            self._copy_payload_range_into_destination(chunks, destination, byte_offset, byte_length)
+            self._copy_payload_range_into_destination(
+                chunks, destination, byte_offset, byte_length
+            )
 
     def batch_put_chunks_from(
         self,
@@ -609,7 +674,9 @@ class _MooncakePayloadTransport:
         prepared_chunks = [_prepare_chunk_source_buffer(chunk) for chunk in chunks]
         buffer_ptrs = [ptr for _owner, ptr, _size in prepared_chunks]
         sizes = [size for _owner, _ptr, size in prepared_chunks]
-        registered_ptrs = self._register_buffers(buffer_ptrs, sizes, pre_registered, "bundle source payload")
+        registered_ptrs = self._register_buffers(
+            buffer_ptrs, sizes, pre_registered, "bundle source payload"
+        )
         try:
             results = batch_put_from(list(chunk_keys), buffer_ptrs, sizes)
             if len(results) != len(chunk_keys):
@@ -647,11 +714,18 @@ class _MooncakePayloadTransport:
         pre_registered: bool,
     ) -> list[str]:
         groups = self._group_chunk_ranges(chunk_keys, chunks, max_inflight_put)
-        futures: list[Future[bool]] = []
+        futures: list[Future[None]] = []
         try:
-            with ThreadPoolExecutor(max_workers=min(max_inflight_put, len(groups))) as executor:
+            with ThreadPoolExecutor(
+                max_workers=min(max_inflight_put, len(groups))
+            ) as executor:
                 futures = [
-                    executor.submit(self.batch_put_chunks_from, group_keys, group_chunks, pre_registered)
+                    executor.submit(
+                        self.batch_put_chunks_from,
+                        group_keys,
+                        group_chunks,
+                        pre_registered,
+                    )
                     for group_keys, group_chunks in groups
                 ]
                 for future in as_completed(futures):
@@ -680,7 +754,10 @@ class _MooncakePayloadTransport:
         group_count = max(1, min(max_inflight_put, len(chunks)))
         group_size = (len(chunks) + group_count - 1) // group_count
         return [
-            (list(chunk_keys[start : start + group_size]), list(chunks[start : start + group_size]))
+            (
+                list(chunk_keys[start : start + group_size]),
+                list(chunks[start : start + group_size]),
+            )
             for start in range(0, len(chunks), group_size)
         ]
 
@@ -699,7 +776,9 @@ class _MooncakePayloadTransport:
             sizes = [int(chunk["bytes"]) for chunk in chunks]
             read_sizes = batch_get_into(keys, ptrs, sizes)
             if len(read_sizes) != len(keys):
-                raise RuntimeError(f"batch_get_into returned {len(read_sizes)} results for {len(keys)} chunks")
+                raise RuntimeError(
+                    f"batch_get_into returned {len(read_sizes)} results for {len(keys)} chunks"
+                )
             for key, expected_size, actual_size in zip(keys, sizes, read_sizes):
                 if actual_size != expected_size:
                     raise RuntimeError(
@@ -757,18 +836,34 @@ class _MooncakePayloadTransport:
             fragments = _payload_range_fragments(chunks, byte_offset, byte_length)
             if not fragments:
                 return True
-            keys = [key for key, _chunk_size, _destination_offset, _source_offset, _size in fragments]
-            dst_offsets = [
-                [destination_offset] for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
+            keys = [
+                key
+                for key, _chunk_size, _destination_offset, _source_offset, _size in fragments
             ]
-            src_offsets = [[source_offset] for _key, _chunk_size, _destination_offset, source_offset, _size in fragments]
-            sizes = [[size] for _key, _chunk_size, _destination_offset, _source_offset, size in fragments]
-            results = get_into_ranges([base_ptr], [keys], [dst_offsets], [src_offsets], [sizes])
+            dst_offsets = [
+                [destination_offset]
+                for _key, _chunk_size, destination_offset, _source_offset, _size in fragments
+            ]
+            src_offsets = [
+                [source_offset]
+                for _key, _chunk_size, _destination_offset, source_offset, _size in fragments
+            ]
+            sizes = [
+                [size]
+                for _key, _chunk_size, _destination_offset, _source_offset, size in fragments
+            ]
+            results = get_into_ranges(
+                [base_ptr], [keys], [dst_offsets], [src_offsets], [sizes]
+            )
             if len(results) != 1 or len(results[0]) != len(keys):
-                raise RuntimeError(f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks")
+                raise RuntimeError(
+                    f"get_into_ranges returned invalid ranged result shape for {len(keys)} chunks"
+                )
             for key, expected_sizes, actual_sizes in zip(keys, sizes, results[0]):
                 if len(actual_sizes) != len(expected_sizes):
-                    raise RuntimeError(f"get_into_ranges returned invalid ranged fragment count for {key}")
+                    raise RuntimeError(
+                        f"get_into_ranges returned invalid ranged fragment count for {key}"
+                    )
                 for expected_size, actual_size in zip(expected_sizes, actual_sizes):
                     if actual_size != expected_size:
                         raise RuntimeError(
@@ -783,17 +878,27 @@ class _MooncakePayloadTransport:
         byte_offset: int,
         byte_length: int,
     ) -> None:
-        for key, chunk_size, destination_offset, source_offset, size in _payload_range_fragments(
+        for (
+            key,
+            chunk_size,
+            destination_offset,
+            source_offset,
+            size,
+        ) in _payload_range_fragments(
             chunks,
             byte_offset,
             byte_length,
         ):
             data = self._store.get(key)
             if len(data) != chunk_size:
-                raise RuntimeError(f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}")
+                raise RuntimeError(
+                    f"get failed for {key}: expected {chunk_size} bytes, got {len(data)}"
+                )
             fragment = memoryview(data)[source_offset : source_offset + size]
             target_end = destination_offset + size
-            destination[destination_offset:target_end] = np.frombuffer(fragment, dtype=np.uint8)
+            destination[destination_offset:target_end] = np.frombuffer(
+                fragment, dtype=np.uint8
+            )
 
     def _register_buffers(
         self,
@@ -840,7 +945,9 @@ class _MooncakePayloadTransport:
         if pre_registered:
             yield base_ptr
             return
-        registered_ptrs = self._register_buffers([base_ptr], [_buffer_nbytes(destination)], False, label)
+        registered_ptrs = self._register_buffers(
+            [base_ptr], [_buffer_nbytes(destination)], False, label
+        )
         if not registered_ptrs:
             yield base_ptr
             return
@@ -875,7 +982,9 @@ class _MooncakePayloadTransport:
         return "parallel"
 
     def _has_batch_put_support(self) -> bool:
-        return callable(self._batch_put_from) and self._has_buffer_registration_support()
+        return (
+            callable(self._batch_put_from) and self._has_buffer_registration_support()
+        )
 
     def _has_buffer_registration_support(self) -> bool:
         return callable(self._register_buffer) and callable(self._unregister_buffer)
@@ -890,7 +999,9 @@ def _resolve_ndarray_destination(
     if destination is None:
         return np.empty(shape, dtype=dtype)
     if not isinstance(destination, np.ndarray):
-        raise TypeError(f"structured ndarray field {name} destination must be a numpy.ndarray")
+        raise TypeError(
+            f"structured ndarray field {name} destination must be a numpy.ndarray"
+        )
     if destination.dtype != dtype:
         raise ValueError(
             f"structured ndarray field {name} destination dtype mismatch: expected {dtype.str}, got {destination.dtype.str}"
@@ -900,7 +1011,13 @@ def _resolve_ndarray_destination(
             f"structured ndarray field {name} destination shape mismatch: expected {shape}, got {tuple(destination.shape)}"
         )
     if not destination.flags["C_CONTIGUOUS"]:
-        raise ValueError(f"structured ndarray field {name} destination must be C-contiguous")
+        raise ValueError(
+            f"structured ndarray field {name} destination must be C-contiguous"
+        )
+    if not destination.flags["WRITEABLE"]:
+        raise ValueError(
+            f"structured ndarray field {name} destination must be writeable"
+        )
     return destination
 
 
@@ -915,7 +1032,9 @@ def _resolve_ndarray_read_plan(
             full_shape=shape,
             output_shape=shape,
             byte_offset=0,
-            byte_length=int(np.prod(shape, dtype=np.int64)) * dtype.itemsize if shape else dtype.itemsize,
+            byte_length=int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+            if shape
+            else dtype.itemsize,
             step=1,
             cover_row_count=shape[0] if shape else 1,
         )
@@ -949,17 +1068,24 @@ def _resolve_ndarray_read_plan(
         cover_row_count=cover_end - cover_start,
     )
 
-def _normalized_member_slice(member_slice: StructuredMemberSlice, total_rows: int) -> tuple[int, int, int]:
+
+def _normalized_member_slice(
+    member_slice: StructuredMemberSlice, total_rows: int
+) -> tuple[int, int, int]:
     if member_slice.step <= 0:
         raise ValueError("structured ndarray slicing step must be positive")
-    return slice(member_slice.start, member_slice.end, member_slice.step).indices(total_rows)
+    return slice(member_slice.start, member_slice.end, member_slice.step).indices(
+        total_rows
+    )
 
 
 def _bytes_view(value: Any, name: str) -> memoryview:
     try:
         view = memoryview(value)
     except TypeError as error:
-        raise TypeError(f"{name} must be bytes-like, got {type(value).__name__}") from error
+        raise TypeError(
+            f"{name} must be bytes-like, got {type(value).__name__}"
+        ) from error
     if not view.contiguous:
         view = memoryview(bytes(view))
     return view.cast("B")
@@ -985,7 +1111,9 @@ def _buffer_nbytes(value: bytearray | np.ndarray) -> int:
 def _split_view(view: memoryview, chunk_bytes: int) -> list[memoryview]:
     if len(view) == 0:
         return [view]
-    return [view[start : start + chunk_bytes] for start in range(0, len(view), chunk_bytes)]
+    return [
+        view[start : start + chunk_bytes] for start in range(0, len(view), chunk_bytes)
+    ]
 
 
 def _chunk_offsets(chunks: Sequence[Mapping[str, Any]]) -> list[int]:
@@ -1036,7 +1164,12 @@ def _normalize_key_prefix(key_prefix: str) -> str:
 
 
 def _validate_key_segment(value: str, name: str) -> None:
-    if not isinstance(value, str) or not value or "/" in value or any(ord(char) < 32 for char in value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or "/" in value
+        or any(ord(char) < 32 for char in value)
+    ):
         raise ValueError(f"invalid bundle {name}: {value!r}")
 
 
@@ -1053,7 +1186,9 @@ def _normalize_structured_metadata(metadata: Mapping[str, Any]) -> dict[str, Any
         raise TypeError("structured metadata must be a mapping")
     normalized = dict(metadata)
     if STRUCTURED_FIELD_SPECS_KEY in normalized:
-        raise ValueError(f"structured metadata key {STRUCTURED_FIELD_SPECS_KEY!r} is reserved")
+        raise ValueError(
+            f"structured metadata key {STRUCTURED_FIELD_SPECS_KEY!r} is reserved"
+        )
     if not isinstance(normalized.get("layout", "structured"), str):
         raise ValueError("structured metadata layout must be a string")
     normalized.setdefault("layout", "structured")
@@ -1169,4 +1304,6 @@ def _cleanup_keys(store: BundleStore, keys: Sequence[str], strict: bool) -> None
     if retry_errors:
         errors = retry_errors
     if errors and strict:
-        raise RuntimeError(f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}")
+        raise RuntimeError(
+            f"failed to remove {len(errors)} Mooncake keys: {errors[:3]}"
+        )

@@ -79,7 +79,9 @@ class InMemoryStore:
             self.remove(key, force)
         return [0 for _key in keys]
 
-    def batch_put_from(self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]) -> list[int]:
+    def batch_put_from(
+        self, keys: list[str], buffer_ptrs: list[int], sizes: list[int]
+    ) -> list[int]:
         results: list[int] = []
         for key, ptr, size in zip(keys, buffer_ptrs, sizes):
             data = ctypes.string_at(ptr, size)
@@ -126,16 +128,22 @@ class InMemoryStore:
                 buffer_ptrs, all_keys, all_dst_offsets, all_src_offsets, all_sizes
             ):
                 buffer_results: list[list[int]] = []
-                for key, dst_offsets, src_offsets, sizes in zip(keys, dst_groups, src_groups, size_groups):
+                for key, dst_offsets, src_offsets, sizes in zip(
+                    keys, dst_groups, src_groups, size_groups
+                ):
                     with self.lock:
                         data = self.objects[key]
                     key_results: list[int] = []
-                    for dst_offset, src_offset, size in zip(dst_offsets, src_offsets, sizes):
+                    for dst_offset, src_offset, size in zip(
+                        dst_offsets, src_offsets, sizes
+                    ):
                         end = src_offset + size
                         if end > len(data):
                             key_results.append(-1)
                             continue
-                        ctypes.memmove(base_ptr + dst_offset, data[src_offset:end], size)
+                        ctypes.memmove(
+                            base_ptr + dst_offset, data[src_offset:end], size
+                        )
                         key_results.append(size)
                     buffer_results.append(key_results)
                 results.append(buffer_results)
@@ -261,18 +269,24 @@ def make_transfer(
     return current_store, MooncakeBundleTransfer(current_store, **kwargs)
 
 
-def structured_payload(metadata: dict[str, object] | None = None, **buffers: object) -> StructuredObjectPayload:
-    return StructuredObjectPayload(metadata=metadata or {"type": "example"}, buffers=buffers)
+def structured_payload(
+    metadata: dict[str, object] | None = None, **buffers: object
+) -> StructuredObjectPayload:
+    return StructuredObjectPayload(metadata=metadata, buffers=buffers)
 
 
-def write_manifest(store: InMemoryStore, manifest_key: str, manifest: dict[str, object]) -> None:
-    store.objects[manifest_key] = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+def write_manifest(
+    store: InMemoryStore, manifest_key: str, manifest: dict[str, object]
+) -> None:
+    store.objects[manifest_key] = json.dumps(manifest, separators=(",", ":")).encode(
+        "utf-8"
+    )
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
     store, transfer = make_transfer()
     array = np.arange(16, dtype=np.int32).reshape(4, 4)
-    payload = structured_payload(array=array, raw=b"abc")
+    payload = structured_payload({"type": "example"}, array=array, raw=b"abc")
 
     ref = transfer.put_structured_object(payload)
     result = transfer.materialize(transfer.read_spec(ref))
@@ -281,6 +295,18 @@ def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
     assert result.objects["raw"] == b"abc"
     assert store.batch_get_into_calls > 0
     assert store.registered == set()
+
+
+def test_structured_object_payload_metadata_defaults_empty() -> None:
+    store, transfer = make_transfer()
+    array = np.arange(8, dtype=np.int32).reshape(2, 4)
+
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"array": array})
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert np.array_equal(result.objects["array"], array)
 
 
 def test_bundle_chunked_full_read_via_read_spec() -> None:
@@ -301,7 +327,9 @@ def test_bundle_put_falls_back_to_store_put_without_batch_put_support() -> None:
     store, transfer = make_transfer(MinimalStore())
     payload = bytes(range(128))
 
-    ref = transfer.put_structured_object(structured_payload(payload=payload), chunk_bytes=17)
+    ref = transfer.put_structured_object(
+        structured_payload(payload=payload), chunk_bytes=17
+    )
     result = transfer.materialize(transfer.read_spec(ref))
 
     assert result.objects["payload"] == payload
@@ -387,7 +415,11 @@ def test_structured_object_slice_member_uses_partial_range_reads() -> None:
     payload = structured_payload(weights=array, raw=b"payload")
 
     ref = transfer.put_structured_object(payload, chunk_bytes=20)
-    spec = transfer.read_spec(ref).select_members(["weights"]).slice_member("weights", axis=0, start=3, end=9)
+    spec = (
+        transfer.read_spec(ref)
+        .select_members(["weights"])
+        .slice_member("weights", axis=0, start=3, end=9)
+    )
     before_range_reads = store.get_into_ranges_calls
     result = transfer.materialize(spec)
 
@@ -402,7 +434,11 @@ def test_structured_object_slice_member_falls_back_to_plain_get_reads() -> None:
     payload = structured_payload(weights=array, raw=b"payload")
 
     ref = transfer.put_structured_object(payload, chunk_bytes=20)
-    spec = transfer.read_spec(ref).select_members(["weights"]).slice_member("weights", axis=0, start=3, end=9)
+    spec = (
+        transfer.read_spec(ref)
+        .select_members(["weights"])
+        .slice_member("weights", axis=0, start=3, end=9)
+    )
     result = transfer.materialize(spec)
 
     assert np.array_equal(result.objects["weights"], array[3:9])
@@ -433,7 +469,11 @@ def test_structured_object_duplicate_destination_registration_is_tolerated() -> 
     payload = structured_payload(weights=array)
 
     ref = transfer.put_structured_object(payload, chunk_bytes=40)
-    spec = transfer.read_spec(ref).select_members(["weights"]).slice_member("weights", axis=0, start=2, end=10)
+    spec = (
+        transfer.read_spec(ref)
+        .select_members(["weights"])
+        .slice_member("weights", axis=0, start=2, end=10)
+    )
     destination = np.empty((8, 8), dtype=np.float32)
     destination_ptr = ctypes.addressof(ctypes.c_char.from_buffer(destination))
     assert store.register_buffer(destination_ptr, int(destination.nbytes)) == 0
@@ -453,7 +493,9 @@ def test_structured_object_slice_member_step_copy() -> None:
     payload = structured_payload(weights=array)
 
     ref = transfer.put_structured_object(payload, chunk_bytes=24)
-    spec = transfer.read_spec(ref).slice_member("weights", axis=0, start=1, end=12, step=3)
+    spec = transfer.read_spec(ref).slice_member(
+        "weights", axis=0, start=1, end=12, step=3
+    )
     result = transfer.materialize(spec)
 
     assert np.array_equal(result.objects["weights"], array[1:12:3])
@@ -470,15 +512,30 @@ def test_structured_object_invalid_slice_and_destination_raise() -> None:
     )
 
     with pytest.raises(ValueError, match="axis=0"):
-        transfer.materialize(transfer.read_spec(ref).slice_member("weights", axis=1, start=0, end=2))
+        transfer.materialize(
+            transfer.read_spec(ref).slice_member("weights", axis=1, start=0, end=2)
+        )
     with pytest.raises(ValueError, match="step must be positive"):
-        transfer.materialize(transfer.read_spec(ref).slice_member("weights", axis=0, start=0, end=2, step=0))
+        transfer.materialize(
+            transfer.read_spec(ref).slice_member(
+                "weights", axis=0, start=0, end=2, step=0
+            )
+        )
     with pytest.raises(ValueError, match="does not support slicing"):
-        transfer.materialize(transfer.read_spec(ref).slice_member("raw", axis=0, start=0, end=1))
+        transfer.materialize(
+            transfer.read_spec(ref).slice_member("raw", axis=0, start=0, end=1)
+        )
     with pytest.raises(ValueError, match="shape mismatch"):
         transfer.materialize_into(
             transfer.read_spec(ref).slice_member("weights", axis=0, start=1, end=3),
             destinations={"weights": np.empty((3, 4), dtype=np.int16)},
+        )
+    readonly_destination = np.empty((2, 4), dtype=np.int16)
+    readonly_destination.flags.writeable = False
+    with pytest.raises(ValueError, match="writeable"):
+        transfer.materialize_into(
+            transfer.read_spec(ref).slice_member("weights", axis=0, start=1, end=3),
+            destinations={"weights": readonly_destination},
         )
 
 
@@ -557,7 +614,9 @@ def test_bundle_partial_register_failure_unwinds_registered_buffers() -> None:
     payload = bytes(range(64))
 
     with pytest.raises(RuntimeError, match="register_buffer"):
-        transfer.put_structured_object(structured_payload(payload=payload), chunk_bytes=32)
+        transfer.put_structured_object(
+            structured_payload(payload=payload), chunk_bytes=32
+        )
 
     assert store.registered == set()
     assert store.objects == {}
@@ -611,7 +670,11 @@ def test_bundle_invalid_policy_and_chunk_size_raise() -> None:
     with pytest.raises(ValueError, match="max_inflight_put"):
         transfer.put_bundle(b"meta", {"payload": b"data"}, max_inflight_put=0)
     with pytest.raises(ValueError, match="selected no members"):
-        transfer.materialize(transfer.read_spec({"manifest_key": "test/default/example/manifest"}).select_members([]))
+        transfer.materialize(
+            transfer.read_spec(
+                {"manifest_key": "test/default/example/manifest"}
+            ).select_members([])
+        )
     with pytest.raises(ValueError, match="chunk_bytes"):
         transfer.put_bundle(b"meta", {"payload": b"data"}, chunk_bytes=0)
 
@@ -633,12 +696,19 @@ def test_structured_object_invalid_metadata_raises() -> None:
     store, transfer = make_transfer()
 
     with pytest.raises(TypeError, match="mapping"):
-        transfer.put_structured_object(StructuredObjectPayload(metadata=["not", "a", "mapping"], buffers={}))
+        transfer.put_structured_object(
+            StructuredObjectPayload(metadata=["not", "a", "mapping"], buffers={})
+        )
     with pytest.raises(TypeError, match="JSON-serializable"):
-        transfer.put_structured_object(StructuredObjectPayload(metadata={"bad": object()}, buffers={}))
+        transfer.put_structured_object(
+            StructuredObjectPayload(metadata={"bad": object()}, buffers={})
+        )
     with pytest.raises(ValueError, match="reserved"):
         transfer.put_structured_object(
-            StructuredObjectPayload(metadata={"__mooncake_structured_fields__": {}}, buffers={"payload": b"abc"})
+            StructuredObjectPayload(
+                metadata={"__mooncake_structured_fields__": {}},
+                buffers={"payload": b"abc"},
+            )
         )
 
 
@@ -697,4 +767,3 @@ def test_bundle_rejects_tampered_manifest() -> None:
         transfer.remove_bundle(
             RemoteBundleRef(manifest_key="test/other/manifest", manifest=ref.manifest)
         )
-
