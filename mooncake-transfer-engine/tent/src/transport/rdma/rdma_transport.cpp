@@ -328,7 +328,11 @@ Status RdmaTransport::submitTransferTasks(
     std::vector<RdmaSliceList> slice_lists(num_workers);
     std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
-    int submit_slices = 0;
+
+    // Distribute starting worker across threads to avoid contention
+    static std::atomic<int> g_caller_threads(0);
+    thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
+    int next_worker_idx = tl_caller_id;
     for (auto& request : request_list) {
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
@@ -401,11 +405,11 @@ Status RdmaTransport::submitTransferTasks(
             if (slice_idx < slice_dev_ids.size())
                 slice->source_dev_id = slice_dev_ids[slice_idx];
             offset += length;
-            int part_id = submit_slices % num_workers;
+            int part_id = next_worker_idx % num_workers;
             auto& list = slice_lists[part_id];
             auto& tail = slice_tails[part_id];
             list.num_slices++;
-            submit_slices++;
+            next_worker_idx++;
             if (list.first) {
                 tail->next = slice;
                 tail = slice;
