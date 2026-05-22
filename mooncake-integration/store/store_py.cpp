@@ -50,7 +50,7 @@ struct PyTensorInfo {
         // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
         // excluding UNKNOWN=-1)
         if (validated.header.dtype >=
-            static_cast<uint32_t>(TensorDtype::NR_DTYPES)) {
+            static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
             return false;
         }
 

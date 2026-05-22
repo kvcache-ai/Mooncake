@@ -151,10 +151,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      task_manager_(config.task_manager_config) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =

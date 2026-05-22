@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include "allocator.h"
 #include "segment.h"
 
 #include <csignal>
@@ -2735,7 +2736,12 @@ void Client::PutToLocalFile(const std::string& key,
                            << ", triggering PutRevoke for disk replica";
                 pinned_buffer_pool_->Release(buf);
                 // Must revoke to avoid phantom replica in master
-                master_client_.PutRevoke(key, ReplicaType::DISK);
+                auto revoke_result =
+                    master_client_.PutRevoke(key, ReplicaType::DISK);
+                if (!revoke_result) {
+                    LOG(ERROR)
+                        << "Failed to revoke put operation for key: " << key;
+                }
                 return;
             }
             value.append(buf.data, slice.size);

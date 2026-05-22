@@ -27,7 +27,7 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol,
                                              bool use_hugepage)
-    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    : buffer_size_(size), use_hugepage_(use_hugepage), protocol(protocol) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;
@@ -50,7 +50,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 
 ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
                                              const std::string& protocol)
-    : protocol(protocol), buffer_size_(size) {
+    : buffer_size_(size), protocol(protocol) {
     buffer_ = addr;
     is_external_memory_ = true;
     allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
