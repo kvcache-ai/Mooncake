@@ -259,6 +259,11 @@ PYBIND11_MODULE(tent, m) {
     m.attr("LOCAL_SEGMENT_ID") = py::int_(LOCAL_SEGMENT_ID);
     m.attr("kWildcardLocation") = py::str(kWildcardLocation);
 
+    // Priority constants
+    m.attr("PRIO_HIGH") = py::int_(PRIO_HIGH);
+    m.attr("PRIO_MEDIUM") = py::int_(PRIO_MEDIUM);
+    m.attr("PRIO_LOW") = py::int_(PRIO_LOW);
+
     // -------------------------------------------------------------------------
     // Enums
     // -------------------------------------------------------------------------
@@ -314,17 +319,19 @@ PYBIND11_MODULE(tent, m) {
         .def(py::init<>())
         .def(py::init([](Request::OpCode opcode, uint64_t source,
                          uint64_t target_id, uint64_t target_offset,
-                         size_t length) {
+                         size_t length, int priority) {
                  Request r;
                  r.opcode = opcode;
                  r.source = U64ToPtr(source);
                  r.target_id = target_id;
                  r.target_offset = target_offset;
                  r.length = length;
+                 r.priority = priority;
                  return r;
              }),
              py::arg("opcode"), py::arg("source"), py::arg("target_id"),
-             py::arg("target_offset"), py::arg("length"))
+             py::arg("target_offset"), py::arg("length"),
+             py::arg("priority") = PRIO_HIGH)
         .def_property(
             "opcode", [](const Request& r) { return r.opcode; },
             [](Request& r, Request::OpCode op) { r.opcode = op; })
@@ -333,7 +340,8 @@ PYBIND11_MODULE(tent, m) {
             [](Request& r, uint64_t addr) { r.source = U64ToPtr(addr); })
         .def_readwrite("target_id", &Request::target_id)
         .def_readwrite("target_offset", &Request::target_offset)
-        .def_readwrite("length", &Request::length);
+        .def_readwrite("length", &Request::length)
+        .def_readwrite("priority", &Request::priority);
 
     py::class_<TransferStatus>(m, "TransferStatus")
         .def(py::init<>())
