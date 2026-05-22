@@ -4,7 +4,7 @@
 
 namespace mooncake {
 
-// Version information for the Mooncake system
+// Version information for the Mooncake system (used for RPC handshake)
 constexpr const char* MOONCAKE_STORE_VERSION = "@MOONCAKE_STORE_VERSION@";
 
 // Function to get the version string
@@ -12,5 +12,10 @@ inline const std::string& GetMooncakeStoreVersion() {
     static const std::string version(MOONCAKE_STORE_VERSION);
     return version;
 }
+
+// Human-readable display version: sourced from pyproject.toml + short git hash
+// e.g. "0.3.10.post2 (git: abc1234)"
+// Used for the --version flag only; does not affect RPC compatibility.
+constexpr const char* MOONCAKE_DISPLAY_VERSION = "@MOONCAKE_DISPLAY_VERSION@";
 
 }  // namespace mooncake

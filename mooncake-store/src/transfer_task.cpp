@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
+#include <string>
 #include <vector>
 #include "gpu_staging_utils.h"
 #include "transfer_engine.h"
@@ -447,10 +448,13 @@ TransferStrategy TransferFuture::strategy() const {
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      std::shared_ptr<StorageBackend>& backend,
+                                     const std::string& local_hostname,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
+      local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
+      local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
     // Read MC_STORE_MEMCPY environment variable.
     // When not set, auto-detect based on transport type:
@@ -574,25 +578,38 @@ std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
     std::optional<TransferFuture> future;
     std::vector<TransferRequest> requests;
+    // Open the segment once — all keys share the same transfer_engine_addr.
+    SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+        // nullopt = failure (caller checks !future).  The function returns
+        // std::optional so tl::unexpected is not available here.
+        return std::nullopt;
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto pointer = pointers[i];
-        SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+        const auto& key = keys[i];
+        const uint64_t pointer = pointers[i];
+        auto it = batched_slices.find(key);
+        if (it == batched_slices.end()) {
+            LOG(ERROR) << "Key not found in batched_slices: " << key;
+            return std::nullopt;  // fail closed
         }
-        const auto& slice = batched_slices.find(key)->second;
-        TransferRequest request;
-        request.opcode = TransferRequest::READ;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = pointer;
-        request.length = slice.size;
-        requests.emplace_back(request);
+        // Emit one TransferRequest per slice: the on-disk blob is read
+        // sequentially while slices may point to non-contiguous GPU memory.
+        uint64_t offset = 0;
+        for (const auto& slice : it->second) {
+            TransferRequest request;
+            request.opcode = TransferRequest::READ;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = seg;
+            request.target_offset = pointer + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
     }
     return submitTransfer(requests);
 }
@@ -800,17 +817,65 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
-bool TransferSubmitter::isLocalTransfer(
-    const AllocatedBuffer::Descriptor& handle) const {
-    std::string local_ep = engine_.getLocalIpAndPort();
-
-    if (!local_ep.empty()) {
-        return !handle.transport_endpoint_.empty() &&
-               handle.transport_endpoint_ == local_ep;
+namespace {
+// Helper function to extract IP address from endpoint string (ip:port format).
+// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats.
+std::string extractIpAddress(const std::string& endpoint) {
+    if (endpoint.empty()) {
+        return "";
     }
 
-    // Without a local endpoint we cannot prove locality; disable memcpy.
+    // Handle IPv6 format: [ipv6]:port
+    if (endpoint[0] == '[') {
+        size_t closing_bracket = endpoint.find(']');
+        if (closing_bracket == std::string::npos) {
+            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
+            return "";
+        }
+        return endpoint.substr(1, closing_bracket - 1);
+    }
+
+    // Handle IPv4 or hostname:port format.
+    size_t colon_pos = endpoint.rfind(':');
+    if (colon_pos != std::string::npos) {
+        return endpoint.substr(0, colon_pos);
+    }
+
+    // No colon found, return the whole string (might be just IP or hostname).
+    return endpoint;
+}
+}  // namespace
+
+bool TransferSubmitter::isSameProcessEndpoint(
+    const std::string& handle_endpoint, const std::string& local_endpoint) {
+    // Local memcpy requires that handle.buffer_address_ is a virtual address
+    // valid in THIS process. Same host is not enough: two processes on the
+    // same host share an IP but have distinct virtual address spaces, so a
+    // memcpy on a peer process's address would segfault. Require the full
+    // transport endpoint to match, which uniquely identifies the owning
+    // process.
+    if (handle_endpoint.empty() || local_endpoint.empty()) {
+        return false;
+    }
+    if (handle_endpoint == local_endpoint) {
+        return true;
+    }
+
+    const std::string handle_ip = extractIpAddress(handle_endpoint);
+    const std::string local_ip = extractIpAddress(local_endpoint);
+    if (!handle_ip.empty() && handle_ip == local_ip) {
+        VLOG(2) << "Disabling local memcpy for same-host endpoints with "
+                   "different process endpoints: handle="
+                << handle_endpoint << ", local=" << local_endpoint;
+    }
+
     return false;
+}
+
+bool TransferSubmitter::isLocalTransfer(
+    const AllocatedBuffer::Descriptor& handle) const {
+    return isSameProcessEndpoint(handle.transport_endpoint_, local_hostname_) ||
+           isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
 }
 
 bool TransferSubmitter::validateTransferParams(

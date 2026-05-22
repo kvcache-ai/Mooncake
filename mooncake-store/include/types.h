@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -88,8 +89,13 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
@@ -122,6 +128,46 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
+
+/**
+ * @brief Data type classification for objects stored in Mooncake Store.
+ *
+ * This allows the store to track what kind of data each object holds,
+ * enabling future type-aware policies (eviction priority, replication
+ * strategies, etc.). Defaults to UNKNOWN for backward compatibility.
+ */
+enum class ObjectDataType : uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+    GENERAL = 9,
+    // 10-255 reserved for future types
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const ObjectDataType& type) noexcept {
+    static const std::unordered_map<ObjectDataType, std::string_view>
+        type_strings{{ObjectDataType::UNKNOWN, "UNKNOWN"},
+                     {ObjectDataType::KVCACHE, "KVCACHE"},
+                     {ObjectDataType::TENSOR, "TENSOR"},
+                     {ObjectDataType::WEIGHT, "WEIGHT"},
+                     {ObjectDataType::SAMPLE, "SAMPLE"},
+                     {ObjectDataType::ACTIVATION, "ACTIVATION"},
+                     {ObjectDataType::GRADIENT, "GRADIENT"},
+                     {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
+                     {ObjectDataType::METADATA, "METADATA"},
+                     {ObjectDataType::GENERAL, "GENERAL"}};
+
+    auto it = type_strings.find(type);
+    os << (it != type_strings.end() ? it->second : "UNKNOWN");
+    return os;
+}
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -270,6 +316,8 @@ enum class ErrorCode : int32_t {
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
+    K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
@@ -358,6 +406,20 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
 };
+
+/**
+ * @brief Represents a contiguous NoF ssd region
+ */
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
+    size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    NoFSegment() = default;
+};
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective

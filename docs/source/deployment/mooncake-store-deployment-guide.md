@@ -32,11 +32,11 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--allow_evict_soft_pinned_objects` (bool, default `true`): Allow evicting soft-pinned objects.
   - `--eviction_ratio` (double, default `0.05`): Fraction evicted when hitting high watermark.
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
+  - `--client_ttl` (int64, default `10` s): Seconds a client stays considered alive after the last heartbeat. If this TTL elapses without a refresh, the master treats the client as disconnected and may unmount its segments.
 
 - High Availability (optional)
   - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
-  - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
 - Task Manager (optional)

@@ -1484,18 +1484,26 @@ named shared memory object name instead of an arbitrary path.
 Unmount one or more file or shared-memory segments by segment id.
 
 ```python
-def unmount_segment(self, segment_ids: List[str]) -> int
+def unmount_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
 ```
 
 **Parameters:**
 - `segment_ids` (List[str]): Segment ids returned by `mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted. Defaults to `0`, which keeps the existing immediate unmount
+  behavior. During a positive grace period, the segment remains readable but no
+  longer accepts new allocations.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
 **Example:**
 ```python
-ret = store.unmount_segment(segment_ids)
+ret = store.unmount_segment(segment_ids, grace_period_seconds=30)
 if ret != 0:
     print("Unmount failed:", ret)
 ```
@@ -1550,19 +1558,28 @@ Unmount one or more internally allocated segments by segment id and free their
 local memory.
 
 ```python
-def unmount_and_free_segment(self, segment_ids: List[str]) -> int
+def unmount_and_free_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
 ```
 
 **Parameters:**
 - `segment_ids` (List[str]): Segment ids returned by
   `allocate_and_mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted and its local allocated memory is released. Defaults to `0`,
+  which keeps the existing immediate unmount-and-free behavior. During a
+  positive grace period, the segment remains readable but no longer accepts new
+  allocations.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
 **Example:**
 ```python
-ret = store.unmount_and_free_segment(segment_ids)
+ret = store.unmount_and_free_segment(segment_ids, grace_period_seconds=30)
 if ret != 0:
     print("Unmount and free failed:", ret)
 ```

@@ -820,7 +820,12 @@ After enabling the persistence feature:
 - For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
 - For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
 
-#### 3FS USRBIO Plugin
+#### 3FS USRBIO Plugin (Experimental)
+
+```{note}
+This integration is **experimental** and incomplete; see the plugin page for details before relying on it.
+```
+
 If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
 
 ### Builtin Metadata Server

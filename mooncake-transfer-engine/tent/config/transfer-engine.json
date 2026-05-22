@@ -11,6 +11,7 @@
     },
     "log_level": "warning",
     "max_failover_attempts": 3,
+    "enable_auto_failover_on_poll": true,
     "metrics": {
         "enabled": true,
         "http_port": 9100,

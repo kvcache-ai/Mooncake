@@ -58,6 +58,17 @@ struct GetStorageConfigResponse {
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
 
+struct NoFSegmentOwnerInfo {
+    UUID segment_id;
+    UUID client_id;
+
+    NoFSegmentOwnerInfo() = default;
+    NoFSegmentOwnerInfo(const UUID& segment_id_param,
+                        const UUID& client_id_param)
+        : segment_id(segment_id_param), client_id(client_id_param) {}
+};
+YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
+
 /**
  * @brief Response structure for CopyStart operation
  */
@@ -66,6 +77,15 @@ struct CopyStartResponse {
     std::vector<Replica::Descriptor> targets;
 };
 YLT_REFL(CopyStartResponse, source, targets);
+
+/**
+ * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
+ * Carries the staged PROCESSING MEMORY replica descriptor.
+ */
+struct PromotionAllocStartResponse {
+    Replica::Descriptor memory_descriptor;
+};
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 
 /**
  * @brief Response structure for MoveStart operation
