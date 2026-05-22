@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <mooncake_worker.cuh>
@@ -34,8 +35,6 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    bool supportsCoalescing() const override { return false; }
-
     c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
                                         int dstRank, int tag) override;
 
@@ -66,6 +65,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
               maxWorldSize_{maxWorldSize} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxWorldSize, bool lazyInit)
+            : activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxWorldSize_{maxWorldSize},
+              lazyInit_{lazyInit} {}
 
         ~MooncakeBackendOptions() override = default;
 
@@ -75,6 +80,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // When > 0, the backend may pre-size internal rank metadata to this
         // value (while PyTorch's group_size() remains unchanged).
         int maxWorldSize_ = -1;
+        bool lazyInit_ = false;
     };
 
     /**
@@ -96,7 +102,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
+    int getSize() const { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -149,7 +155,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ScatterOptions& opts) override;
 
-    void shutdown() override;
+    void shutdown();
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
@@ -164,39 +170,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     /// outlives all MooncakeBackend instances. Pass nullptr to reset.
     static void setExternalEngine(TransferEngine* engine);
 
-    std::string getPreferredHca(std::string location) {
-        static std::once_flag topo_once;
-        static std::shared_ptr<Topology> topology;
-        static TopologyMatrix matrix;
-        std::call_once(topo_once, [this] {
-            // FIXME: getLocalTopology is deprecated in TENT
-            topology = engine_->getLocalTopology();
-            if (topology) {
-                matrix = topology->getMatrix();
-            }
-            if (!topology || matrix.empty()) {
-                topology = std::make_shared<Topology>();
-                topology->discover();
-                matrix = topology->getMatrix();
-            }
-        });
+    std::string getPreferredHca(std::string location);
 
-        auto it = matrix.find(location);
-        if (it == matrix.end()) {
-            LOG(INFO) << "Topology is " << topology->toJson();
-            LOG(ERROR) << "Topology entry not found for location: " << location;
-            return "";
-        }
-        if (it->second.preferred_hca.empty()) {
-            LOG(INFO) << "Topology is " << topology->toJson();
-            LOG(ERROR) << "Preferred HCA list is empty for location: "
-                       << location;
-            return "";
-        }
-        return it->second.preferred_hca[0];
-    }
+    at::Tensor getActiveRanksTensor();
 
-    at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
+    void setActiveRanks(at::Tensor activeRanks);
 
     int getNumSyncedRanks();
 
@@ -209,6 +187,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     void joinGroup();
 
    private:
+    void ensureInitialized();
+    void initializeResources();
+    void applyActiveRanksTensor(const at::Tensor& activeRanks);
     void waitForExtensionState();
     void publishLocalPeerMetadata();
     void setLocalOnlyActiveRanks();
@@ -226,14 +207,26 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
-    void* send_buffer_[2];
-    void* recv_buffer_[2];
-    int32_t* cpu_sync_send_region_[2];
-    int32_t* cpu_sync_recv_region_[2];
-    SegmentInfo rank_info;
+    c10::intrusive_ptr<::c10d::Store> store_;
+    int maxSize_{0};
+    std::vector<uint64_t> globalRanksInGroup_;
+    int instanceBackendIndex_{0};
+    bool resourcesStarted_{false};
+    bool resourcesInitialized_{false};
+    bool initializationFailed_{false};
+    std::mutex initMutex_;
+    void* send_buffer_[2]{};
+    void* recv_buffer_[2]{};
+    bool send_buffer_registered_[2]{};
+    bool recv_buffer_registered_[2]{};
+    int32_t* cpu_sync_send_region_[2]{};
+    int32_t* cpu_sync_recv_region_[2]{};
+    bool cpu_sync_send_registered_[2]{};
+    bool cpu_sync_recv_registered_[2]{};
+    SegmentInfo rank_info{};
     std::shared_ptr<TransferGroupMeta> meta_;
     bool isShutdown_{false};
-    uint64_t local2global_rank_map_[kMaxNumRanks];
+    uint64_t local2global_rank_map_[kMaxNumRanks]{};
     std::string localServerName_;
 
     // P2P async infrastructure
