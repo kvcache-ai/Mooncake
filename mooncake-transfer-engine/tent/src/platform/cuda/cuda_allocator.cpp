@@ -73,12 +73,12 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     }
     CHECK_CU(cuMemcpyAsync((CUdeviceptr)dst, (CUdeviceptr)src, length,
                            (CUstream)stream.get()));
+    CHECK_CU(cuStreamSynchronize((CUstream)stream.get()));
 #else  // Original implementation using cudaMemcpyAsync
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
-#endif
-
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+#endif
     return Status::OK();
 }
 }  // namespace tent
