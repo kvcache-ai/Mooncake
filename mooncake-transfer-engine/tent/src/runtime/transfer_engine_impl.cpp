@@ -817,7 +817,7 @@ static MemoryType getTypeEnum(const std::string& type) {
 }
 
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
-                                                     int priority) {
+                                                     int transport_index) {
     SegmentDesc* desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
         desc = metadata_->segmentManager().getLocal().get();
@@ -833,10 +833,10 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         SelectionResult result;
         if (desc->type == SegmentType::File) {
             if (checkAvailability(transport_list_[GDS], local_mtype)) {
-                if (priority-- == 0) result.transport = GDS;
+                if (transport_index-- == 0) result.transport = GDS;
             } else if (checkAvailability(transport_list_[IOURING],
                                          local_mtype)) {
-                if (priority-- == 0) result.transport = IOURING;
+                if (transport_index-- == 0) result.transport = IOURING;
             }
         } else {
             auto entry =
@@ -856,7 +856,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
-                        if (priority-- == 0) {
+                        if (transport_index-- == 0) {
                             result.transport = type;
                             break;
                         }
@@ -871,7 +871,8 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     // Build selection context
     SelectionContext ctx;
     ctx.transfer_size = request.length;
-    ctx.priority_level = 0;  // Default priority (not using Request.priority)
+    ctx.priority_level =
+        request.priority;  // Use request priority for selection
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports
@@ -881,7 +882,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
 
-        return transport_selector_->select(ctx, transport_list_, priority);
+        return transport_selector_->select(ctx, transport_list_, transport_index);
     } else {
         // Memory segment
         auto entry = desc->findBuffer(request.target_offset, request.length);
@@ -897,7 +898,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports = &entry->transports;
 
-        return transport_selector_->select(ctx, transport_list_, priority);
+        return transport_selector_->select(ctx, transport_list_, transport_index);
     }
 }
 
@@ -1163,12 +1164,12 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
 }
 
 SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
-                                                     int priority,
+                                                     int transport_index,
                                                      bool invalidate_on_fail) {
-    auto result = getTransportType(req, priority);
+    auto result = getTransportType(req, transport_index);
     if (result.transport == UNSPEC && invalidate_on_fail) {
         metadata_->segmentManager().invalidateRemote(req.target_id);
-        result = getTransportType(req, priority);
+        result = getTransportType(req, transport_index);
     }
     return result;
 }
@@ -1263,6 +1264,15 @@ Status TransferEngineImpl::submitTransfer(
         if (classified_request_list[type].empty()) continue;
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
+
+        // Set device_mask on SubBatch for RDMA transport
+        if (type == RDMA && !task_id_list[type].empty()) {
+            // Use the device_mask from the first task (we assume all tasks in
+            // this batch should have the same policy)
+            sub_batch->device_mask =
+                batch->task_list[task_id_list[type][0]].device_mask;
+        }
+
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {

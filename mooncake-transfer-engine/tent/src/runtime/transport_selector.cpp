@@ -149,7 +149,27 @@ void TransportSelector::loadPolicies() {
 
         // Parse priority filter (optional)
         if (policy_json.contains("priority")) {
-            policy.priority = policy_json["priority"].get<int>();
+            if (policy_json["priority"].is_string()) {
+                // Parse string: "high", "medium", "low"
+                std::string prio_str = policy_json["priority"].get<std::string>();
+                // Convert to lowercase for case-insensitive matching
+                std::transform(prio_str.begin(), prio_str.end(),
+                               prio_str.begin(), ::tolower);
+                if (prio_str == "high" || prio_str == "0") {
+                    policy.priority = PRIO_HIGH;
+                } else if (prio_str == "medium" || prio_str == "1") {
+                    policy.priority = PRIO_MEDIUM;
+                } else if (prio_str == "low" || prio_str == "2") {
+                    policy.priority = PRIO_LOW;
+                } else {
+                    LOG(WARNING) << "Invalid priority string: " << prio_str
+                                 << ", using PRIO_LOW";
+                    policy.priority = PRIO_LOW;
+                }
+            } else {
+                // Parse integer for backward compatibility
+                policy.priority = policy_json["priority"].get<int>();
+            }
         } else {
             policy.priority = std::nullopt;
         }
@@ -326,7 +346,7 @@ SelectionResult TransportSelector::select(
     const SelectionContext& context,
     const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
         available_transports,
-    int priority_offset) {
+    int transport_index) {
     SelectionResult result;
 
     // Find the first matching policy (JSON order wins)
@@ -366,7 +386,7 @@ SelectionResult TransportSelector::select(
 
     // If policy has transports list, use it
     if (!matching_policy->transports.empty()) {
-        int priority_index = priority_offset;
+        int priority_index = transport_index;
         for (size_t i = 0; i < matching_policy->transports.size(); ++i) {
             TransportType type = matching_policy->transports[i];
             if (isTransportAvailable(type, context, available_transports)) {
@@ -387,7 +407,7 @@ SelectionResult TransportSelector::select(
     if (context.buffer_transports) {
         for (auto type : *context.buffer_transports) {
             if (isTransportAvailable(type, context, available_transports)) {
-                if (priority_offset-- <= 0) {
+                if (transport_index-- <= 0) {
                     result.transport = type;
                     VLOG(1) << "Selected transport " << transportTypeName(type)
                             << " from buffer_transports"

@@ -181,7 +181,7 @@ class TransferEngineImpl {
 
     Status lazyFreeBatch();
 
-    SelectionResult getTransportType(const Request& request, int priority = 0);
+    SelectionResult getTransportType(const Request& request, int transport_index = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
@@ -190,8 +190,8 @@ class TransferEngineImpl {
 
     void updateTaskStatusFromPoll(Batch* batch, size_t task_id,
                                   TransferStatus& task_status);
- 
-    SelectionResult resolveTransport(const Request& req, int priority,
+
+    SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
 
     Status loadTransports();

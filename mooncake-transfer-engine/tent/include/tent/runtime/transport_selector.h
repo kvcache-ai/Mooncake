@@ -143,14 +143,14 @@ class TransportSelector {
      * @brief Select the best transport for a given context
      * @param context Selection context
      * @param available_transports Array of available transports
-     * @param priority_offset Priority offset for fallback (0 = first choice)
+     * @param transport_index Transport selection index (0 = first choice, 1 = second, ...)
      * @return Selection result with transport type and device mask
      */
     SelectionResult select(
         const SelectionContext& context,
         const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
             available_transports,
-        int priority_offset = 0);
+        int transport_index = 0);
 
     /**
      * @brief Enable legacy mode (skip TransportSelector, use original logic)
