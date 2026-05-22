@@ -415,12 +415,10 @@ Status RdmaTransport::submitTransferTasks(
         }
     }
 
-    static std::atomic<int> g_caller_threads(0);
-    thread_local int tl_caller_id = g_caller_threads.fetch_add(1);
     for (int i = 0; i < num_workers; ++i) {
         if (slice_lists[i].first) {
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
-            workers_->submit(slice_lists[i], (tl_caller_id + i) % num_workers);
+            workers_->submit(slice_lists[i], i);
         }
     }
     return Status::OK();
