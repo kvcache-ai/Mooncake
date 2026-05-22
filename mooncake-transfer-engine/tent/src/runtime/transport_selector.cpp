@@ -151,7 +151,8 @@ void TransportSelector::loadPolicies() {
         if (policy_json.contains("priority")) {
             if (policy_json["priority"].is_string()) {
                 // Parse string: "high", "medium", "low"
-                std::string prio_str = policy_json["priority"].get<std::string>();
+                std::string prio_str =
+                    policy_json["priority"].get<std::string>();
                 // Convert to lowercase for case-insensitive matching
                 std::transform(prio_str.begin(), prio_str.end(),
                                prio_str.begin(), ::tolower);

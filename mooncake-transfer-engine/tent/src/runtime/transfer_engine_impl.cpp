@@ -882,7 +882,8 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
 
-        return transport_selector_->select(ctx, transport_list_, transport_index);
+        return transport_selector_->select(ctx, transport_list_,
+                                           transport_index);
     } else {
         // Memory segment
         auto entry = desc->findBuffer(request.target_offset, request.length);
@@ -898,7 +899,8 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports = &entry->transports;
 
-        return transport_selector_->select(ctx, transport_list_, transport_index);
+        return transport_selector_->select(ctx, transport_list_,
+                                           transport_index);
     }
 }
 
