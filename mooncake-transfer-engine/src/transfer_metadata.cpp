@@ -1151,27 +1151,26 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
-        if (rpc_meta_map_.count(server_name)) {
-            const auto &cached = rpc_meta_map_[server_name];
-            // Check if cache entry has expired
+        auto it = rpc_meta_map_.find(server_name);
+        if (it != rpc_meta_map_.end()) {
             int64_t ttl_us = globalConfig().rpc_meta_cache_ttl_us;
             if (ttl_us > 0) {
+                // Positive TTL: use cache with expiration
                 int64_t current_us = getCurrentTimeInNano() / 1000;
-                int64_t age_us = current_us - cached.cached_timestamp_us;
+                int64_t age_us = current_us - it->second.cached_timestamp_us;
                 if (age_us < ttl_us) {
                     // Cache entry is still valid
-                    desc = cached;
+                    desc = it->second;
                     return 0;
                 }
                 // Cache entry expired, fall through to refresh below
-            } else if (ttl_us == 0) {
-                // TTL disabled, always use cache
-                desc = cached;
+            } else if (ttl_us < 0) {
+                // Negative TTL: permanent cache (no expiration)
+                desc = it->second;
                 return 0;
-            } else {
-                // Negative TTL means cache disabled, but this shouldn't happen
-                // Fall through to refresh
             }
+            // If ttl_us == 0, caching is disabled per documentation,
+            // so we fall through to refresh without using cached value.
         }
     }
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
