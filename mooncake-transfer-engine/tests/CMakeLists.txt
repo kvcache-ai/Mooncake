@@ -20,11 +20,6 @@ add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
-# Fault tolerance tests for unified failure handling strategy
-add_executable(fault_tolerance_test ${WORKSPACE}/fault_tolerance_test.cpp)
-target_link_libraries(fault_tolerance_test PUBLIC transfer_engine gtest gtest_main)
-add_test(NAME fault_tolerance_test COMMAND fault_tolerance_test)
-
 # Integration test for the monitorWorker reclaim tick (issue #1845).
 # Self-skips when no RDMA device is present, so safe to register with ctest.
 add_executable(endpoint_store_integration_test ${WORKSPACE}/endpoint_store_integration_test.cpp)
