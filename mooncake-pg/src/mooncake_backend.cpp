@@ -389,9 +389,10 @@ void MooncakeBackend::initializeResources() {
     connection_ctx_ = std::make_shared<ConnectionContext>(
         instanceBackendIndex_, rank, size, options_ && options_->isExtension_,
         local2global_rank_map_, store_, meta_, p2p_proxy_, engine_);
-    connection_ctx_->setLivenessProbeGuard([worker = worker_, meta = meta_.get()] {
-        return !worker->hasActiveTasks(meta);
-    });
+    connection_ctx_->setLivenessProbeGuard(
+        [worker = worker_, meta = meta_.get()] {
+            return !worker->hasActiveTasks(meta);
+        });
 
     if (max_size != size) {
         connection_ctx_->setPollingLimitTo(max_size);
@@ -1151,7 +1152,8 @@ void MooncakeBackend::applyActiveRanksTensor(const at::Tensor& activeRanks) {
     TORCH_CHECK(activeRanks.defined(), "activeRanks must be defined.");
     TORCH_CHECK(activeRanks.dtype() == at::kInt, "activeRanks must be int.");
     if (isCpu_) {
-        TORCH_CHECK(activeRanks.device().is_cpu(), "activeRanks must be on CPU.");
+        TORCH_CHECK(activeRanks.device().is_cpu(),
+                    "activeRanks must be on CPU.");
     } else {
         TORCH_CHECK(activeRanks.device().is_cuda(),
                     "activeRanks must be on CUDA.");

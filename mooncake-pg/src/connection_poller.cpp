@@ -255,7 +255,8 @@ void ConnectionContext::markPeerDisconnected(int pollingRank,
     try {
         store_->deleteKey(getServerNameStoreKey(backendIndex_, pollingRank));
         store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
-        store_->deleteKey(getExtensionStateStoreKey(backendIndex_, pollingRank));
+        store_->deleteKey(
+            getExtensionStateStoreKey(backendIndex_, pollingRank));
     } catch (const std::exception& e) {
         LOG(WARNING) << "Rank " << rank_
                      << " got an exception when deleteKey for peer "
@@ -472,7 +473,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 global_peerConnected_[globalPollingRank]) {
                 const int currentGroupSize =
                     groupSize_.load(std::memory_order_acquire);
-                if (!peerState.countedInGroup && pollingRank < currentGroupSize) {
+                if (!peerState.countedInGroup &&
+                    pollingRank < currentGroupSize) {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
                     totalConnectedPeers_.fetch_add(1,
                                                    std::memory_order_release);

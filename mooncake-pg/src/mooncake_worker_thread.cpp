@@ -231,14 +231,16 @@ void MooncakeWorker::startWorker() {
                                     isPeerUnreachable(group, j)) {
                                     markPeerBroken(group, j, "transferring",
                                                    task.opType);
-                                } else if (status.s == TransferStatusEnum::FAILED) {
+                                } else if (status.s ==
+                                           TransferStatusEnum::FAILED) {
                                     LOG(WARNING)
                                         << "Rank " << group->rank
                                         << " retrying transfer to alive peer "
-                                        << j << " during op " << (int)task.opType;
+                                        << j << " during op "
+                                        << (int)task.opType;
                                     freeBatchID(group, task.batchID);
-                                    task_status[i].store(IDLE,
-                                                         std::memory_order_release);
+                                    task_status[i].store(
+                                        IDLE, std::memory_order_release);
                                     batch_done = false;
                                     break;
                                 } else {
@@ -311,7 +313,8 @@ void MooncakeWorker::startWorker() {
                             if ((status.s == TransferStatusEnum::FAILED ||
                                  diff.count() > kPingTimeoutMicroseconds_) &&
                                 isPeerUnreachable(group, j)) {
-                                markPeerBroken(group, j, "syncing", task.opType);
+                                markPeerBroken(group, j, "syncing",
+                                               task.opType);
                             } else if (status.s == TransferStatusEnum::FAILED) {
                                 LOG(WARNING)
                                     << "Rank " << group->rank
