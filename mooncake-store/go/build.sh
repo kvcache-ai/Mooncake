@@ -40,8 +40,7 @@ CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/cachelib_memory_allocator"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -lmooncake_common"
+CGO_LDFLAGS+=" -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl"
 
 if [ -d "/usr/local/cuda/lib64" ]; then

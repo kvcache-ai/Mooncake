@@ -5,15 +5,12 @@ if(USE_HIP)
   list(APPEND _extra_build_opts --use-hipcc)
 elseif(USE_MUSA)
   list(APPEND _extra_build_opts --use-mcc)
-elseif(USE_MACA)
-  list(APPEND _extra_build_opts --use-maca)
 endif()
 
 set(_enable_nvlink_allocator_build FALSE)
 if(USE_CUDA
    OR USE_HIP
-   OR USE_MUSA
-   OR USE_MACA)
+   OR USE_MUSA)
   set(_enable_nvlink_allocator_build TRUE)
 endif()
 
