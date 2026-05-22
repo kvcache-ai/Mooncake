@@ -1332,6 +1332,21 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             },
         )
     }
+
+    fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
+        let candidates = self.authority_candidates(observer).ok()?;
+        let ranked = self.ranked_authorities_from_candidates(&candidates, key);
+        for authority in ranked {
+            if self.authority_is_local(&authority) {
+                return authority_get_version_floor(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    key,
+                );
+            }
+        }
+        None
+    }
 }
 
 pub(crate) fn authority_get(
@@ -1592,6 +1607,16 @@ pub(crate) fn authority_replace_many(
     Ok(())
 }
 
+pub(crate) fn authority_get_version_floor(
+    namespace: &str,
+    authority: &ClientStableId,
+    _key: &ObjectKey,
+) -> Option<RouteVersion> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    guard.version_hwm.get(&authority.0).copied()
+}
+
 fn apply_route_update(
     mesh: &mut ClusterRouteMesh,
     authority: &ClientStableId,
@@ -1616,6 +1641,16 @@ fn apply_route_update(
                 routes.insert(key.0.clone(), route.clone());
             }
             None => {
+                // Advance the per-authority high-water mark so that a future
+                // put of *any* key on this authority starts above every
+                // version ever observed.  O(1) per authority, zero per-key
+                // residual.
+                if let Some(old) = old.as_ref() {
+                    let hwm = mesh.version_hwm.entry(authority.0.clone()).or_default();
+                    if old.version > *hwm {
+                        *hwm = old.version;
+                    }
+                }
                 routes.remove(&key.0);
             }
         }
@@ -1632,6 +1667,11 @@ struct ClusterRouteMesh {
     scope_index: BTreeMap<String, BTreeMap<NamespaceScope, BTreeSet<String>>>,
     reuse_index: BTreeMap<String, BTreeMap<ReuseIdentity, BTreeSet<String>>>,
     authority_services: BTreeMap<String, Arc<dyn AuthorityService>>,
+    /// Per-authority version high-water mark.  When a route is removed
+    /// (CAS to `None`), we record `max(hwm, old.version)` so that any
+    /// subsequent put on this authority starts above every version ever
+    /// observed.  One `RouteVersion` per authority — zero per-key residual.
+    version_hwm: BTreeMap<String, RouteVersion>,
 }
 
 impl ClusterRouteMesh {
@@ -1667,6 +1707,7 @@ impl ClusterRouteMesh {
                 self.scope_index.remove(&key);
                 self.reuse_index.remove(&key);
                 self.authority_services.remove(&key);
+                self.version_hwm.remove(&key);
             }
             None => {}
         }
