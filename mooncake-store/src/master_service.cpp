@@ -15,6 +15,7 @@
 #include <boost/algorithm/string.hpp>
 
 #include "master_metric_manager.h"
+#include "common.h"
 #include "segment.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
@@ -486,7 +487,8 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
     ScopedNoFSegmentAccess nof_segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
 
-    LOG(INFO) << "NoF segment mount: " << "client_id=" << client_id
+    LOG(INFO) << "NoF segment mount: "
+              << "client_id=" << client_id
               << ", action=mount_segment, segment_name=" << segment.name;
 
     auto err = nof_segment_access.MountSegment(segment, client_id);
@@ -875,13 +877,7 @@ auto MasterService::QueryIp(const UUID& client_id)
     unique_ips.reserve(segments.size());
     for (const auto& segment : segments) {
         if (!segment.te_endpoint.empty()) {
-            size_t colon_pos = segment.te_endpoint.find(':');
-            if (colon_pos != std::string::npos) {
-                std::string ip = segment.te_endpoint.substr(0, colon_pos);
-                unique_ips.emplace(ip);
-            } else {
-                unique_ips.emplace(segment.te_endpoint);
-            }
+            unique_ips.emplace(getHostNameWithoutPort(segment.te_endpoint));
         }
     }
 
@@ -4809,7 +4805,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         MasterMetricManager::instance().inc_eviction_fail();
         MasterMetricManager::instance().inc_mem_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced

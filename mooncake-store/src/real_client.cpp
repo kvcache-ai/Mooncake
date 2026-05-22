@@ -22,6 +22,7 @@
 
 #include "real_client.h"
 #include "client_buffer.hpp"
+#include "common.h"
 #include "config.h"
 #include "mutex.h"
 #include "types.h"
@@ -648,14 +649,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // Check if hostname already contains a port
     const std::string &hostname = local_hostname;
-    size_t colon_pos = hostname.find(':');
-    bool user_specified_port = (colon_pos != std::string::npos);
+    bool user_specified_port = hasExplicitPort(hostname);
 
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        this->local_rpc_addr =
-            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine, {{"client_mode", "real"}});
@@ -688,9 +688,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 continue;
             }
 
-            this->local_hostname = hostname + ":" + std::to_string(port);
+            this->local_hostname = buildHostNameWithPort(hostname, port);
             this->local_rpc_addr =
-                hostname + ":" + std::to_string(local_rpc_port);
+                buildHostNameWithPort(hostname, local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine, {{"client_mode", "real"}});
@@ -876,13 +876,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
 
         // Build local_rpc_addr from hostname + auto-allocated port
-        std::string rpc_host = this->local_hostname;
-        auto pos = rpc_host.find(':');
-        if (pos != std::string::npos) {
-            rpc_host = rpc_host.substr(0, pos);
-        }
-        this->local_rpc_addr =
-            rpc_host + ":" + std::to_string(offload_rpc_port_);
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
     if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
