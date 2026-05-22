@@ -227,7 +227,8 @@ void MooncakeWorker::startWorker() {
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 if ((status.s == TransferStatusEnum::FAILED ||
-                                     diff.count() > kPingTimeoutMicroseconds_) &&
+                                     diff.count() >
+                                         kPingTimeoutMicroseconds_) &&
                                     isPeerUnreachable(group, j)) {
                                     markPeerBroken(group, j, "transferring",
                                                    task.opType);

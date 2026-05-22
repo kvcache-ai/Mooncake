@@ -494,8 +494,7 @@ std::string MooncakeBackend::getPreferredHca(std::string location) {
     }
     if (it->second.preferred_hca.empty()) {
         LOG(INFO) << "Topology is " << topology->toJson();
-        LOG(ERROR) << "Preferred HCA list is empty for location: "
-                   << location;
+        LOG(ERROR) << "Preferred HCA list is empty for location: " << location;
         return "";
     }
     return it->second.preferred_hca[0];
