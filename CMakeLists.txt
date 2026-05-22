@@ -24,7 +24,7 @@ option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
+    COMMAND ${PYTHON_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('platlib'))"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
 )
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)

@@ -2,7 +2,7 @@ file(GLOB SOURCES "*.cpp")
 include(${CMAKE_CURRENT_LIST_DIR}/../mooncake-common/SetupPython.cmake)
 execute_process(
   COMMAND ${PYTHON_EXECUTABLE} -c
-          "import sys; print([s for s in sys.path if 'packages' in s][0])"
+          "import sysconfig; print(sysconfig.get_path('platlib'))"
   OUTPUT_VARIABLE PYTHON_SYS_PATH)
 string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
 
