@@ -553,6 +553,32 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         Ok(Response::new(pb::BatchGetIntoReply { lengths }))
     }
 
+    async fn remove(
+        &self,
+        request: Request<pb::RemoveRequest>,
+    ) -> Result<Response<pb::StatusReply>, Status> {
+        let status = self
+            .context
+            .client
+            .remove(request.into_inner())
+            .await
+            .map_err(executor_status)?;
+        Ok(Response::new(pb::StatusReply { status }))
+    }
+
+    async fn batch_remove(
+        &self,
+        request: Request<pb::BatchRemoveRequest>,
+    ) -> Result<Response<pb::BatchStatusReply>, Status> {
+        let statuses = self
+            .context
+            .client
+            .batch_remove(request.into_inner())
+            .await
+            .map_err(executor_status)?;
+        Ok(Response::new(pb::BatchStatusReply { statuses }))
+    }
+
     async fn remove_all(
         &self,
         request: Request<pb::RemoveAllRequest>,

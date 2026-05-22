@@ -1062,6 +1062,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
                             "route delete reclaim scheduling failed after authoritative delete"
                         );
                     }
+                    // Best-effort tombstone cleanup to prevent unbounded route
+                    // entry accumulation. The CAS version guard ensures this
+                    // is safe against concurrent puts.
+                    let _ = self.route_directory.compare_and_swap_object_route(
+                        &self.lease,
+                        &object_key,
+                        Some(tombstone.version),
+                        None,
+                    );
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -1134,6 +1143,13 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         "batch route delete reclaim scheduling failed after authoritative delete"
                     );
                 }
+                // Best-effort tombstone cleanup (see remove_in_tenant).
+                let _ = self.route_directory.compare_and_swap_object_route(
+                    &self.lease,
+                    &object_key,
+                    Some(tombstone.version),
+                    None,
+                );
             } else {
                 let _ = self.abort_tenant_quota_reservation(
                     quota_reservation.as_ref(),

@@ -687,6 +687,19 @@ impl StoreDispatcher {
         );
     }
 
+    pub fn untrack_key(&self, key: &str, tenant: Option<&str>) {
+        let scope = self.object_scope(tenant.map(str::to_string));
+        untrack_key(&self.state, &scope.tenant, key);
+    }
+
+    pub fn untrack_keys(&self, keys: &[String], tenant: Option<&str>) {
+        let tenant = self.object_scope(tenant.map(str::to_string)).tenant;
+        let mut state = self.state.lock();
+        for key in keys {
+            state.tracked_keys.remove(&(tenant.clone(), key.clone()));
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn hot_cache_contains(&self, tenant: &str, key: &str) -> bool {
         let scope = self.object_scope(Some(tenant.to_string()));
@@ -787,6 +800,32 @@ impl StoreDispatcher {
                 client,
                 hot_cache.as_ref(),
                 &regions,
+                request,
+            ))
+        })
+        .await
+    }
+
+    pub async fn remove(&self, request: pb::RemoveRequest) -> Result<i32, StoreError> {
+        let state = self.state.clone();
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| {
+            Ok(execute_remove(client, hot_cache.as_ref(), &state, request))
+        })
+        .await
+    }
+
+    pub async fn batch_remove(
+        &self,
+        request: pb::BatchRemoveRequest,
+    ) -> Result<Vec<i32>, StoreError> {
+        let state = self.state.clone();
+        let hot_cache = self.hot_cache.clone();
+        self.run_async(move |client| {
+            Ok(execute_batch_remove(
+                client,
+                hot_cache.as_ref(),
+                &state,
                 request,
             ))
         })
@@ -1550,6 +1589,49 @@ fn soft_get_status(error: &StoreError) -> i64 {
         StoreError::Unsupported(_) => -7,
         StoreError::Allocator(_) => -8,
     }
+}
+
+fn execute_remove(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    state: &Arc<Mutex<DispatcherState>>,
+    request: pb::RemoveRequest,
+) -> i32 {
+    let tenant = normalized_tenant(client, &request.tenant);
+    if client
+        .remove_in_tenant(&tenant, &request.key, request.force)
+        .is_ok()
+    {
+        invalidate_hot_cache(hot_cache, &tenant, &request.key);
+        untrack_key(state, &tenant, &request.key);
+        0
+    } else {
+        -1
+    }
+}
+
+fn execute_batch_remove(
+    client: &StoreClient,
+    hot_cache: Option<&Arc<LocalHotCache>>,
+    state: &Arc<Mutex<DispatcherState>>,
+    request: pb::BatchRemoveRequest,
+) -> Vec<i32> {
+    request
+        .objects
+        .into_iter()
+        .map(|obj| {
+            execute_remove(
+                client,
+                hot_cache,
+                state,
+                pb::RemoveRequest {
+                    key: obj.key,
+                    tenant: obj.tenant,
+                    force: request.force,
+                },
+            )
+        })
+        .collect()
 }
 
 fn execute_remove_all(
