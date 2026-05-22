@@ -31,12 +31,23 @@ bool isPeerUnreachable(TransferGroupMeta* group, int peerRank) {
 
 void markPeerBroken(TransferGroupMeta* group, int peerRank, const char* phase,
                     c10d::OpType opType) {
-    LOG(ERROR) << "Rank " << group->rank << " marking peer " << peerRank
-               << " as broken during " << phase << " op " << (int)opType;
+    LOG(WARNING) << "Rank " << group->rank << " marking peer " << peerRank
+                 << " as broken during " << phase << " op " << (int)opType
+                 << " segmentID=" << group->segmentIDs[peerRank];
 
     group->peerConnected[peerRank] = false;
     group->activeRanks[peerRank] = false;
     group->activeRanksTensor[peerRank] = 0;
+
+    // Invalidate the cached segment ID so that any subsequent submitTransfer
+    // (including P2P proxy or sync-phase writes) will fail at selectTransport
+    // instead of submitting RDMA operations to a dead peer.  closeSegment only
+    // clears the metadata cache and is safe to call even when there are still
+    // in-flight transfers.
+    if (group->segmentIDs[peerRank] != 0) {
+        group->engine->closeSegment(group->segmentIDs[peerRank]);
+    }
+    group->segmentIDs[peerRank] = static_cast<TransferMetadata::SegmentID>(-1);
 }
 
 void freeBatchID(TransferGroupMeta* group, BatchID batchID) {
@@ -148,6 +159,18 @@ void MooncakeWorker::startWorker() {
                             j != task.broadcastRoot) {
                             continue;
                         }
+                        if (!group->peerConnected[j]) {
+                            markPeerBroken(group, j, "preparing", task.opType);
+                            continue;
+                        }
+                        if (j != group->rank &&
+                            group->engine->probePeerAliveByID(
+                                group->segmentIDs[j]) !=
+                                PeerLiveness::Alive) {
+                            markPeerBroken(group, j, "preparing",
+                                           task.opType);
+                            continue;
+                        }
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
@@ -201,7 +224,21 @@ void MooncakeWorker::startWorker() {
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
-                    group->engine->submitTransfer(task.batchID, entries);
+                    auto submit_status =
+                        group->engine->submitTransfer(task.batchID, entries);
+                    if (!submit_status.ok()) {
+                        LOG(ERROR) << "Worker submitTransfer failed: "
+                                   << submit_status.message();
+                        for (int j = 0; j < group->size; ++j) {
+                            if (rankToTaskId[i][j] != kInvalidTaskId) {
+                                markPeerBroken(group, j, "submitting",
+                                               task.opType);
+                            }
+                        }
+                        freeBatchID(group, task.batchID);
+                        task.batchID = 0;
+                        continue;
+                    }
                     submitted_task_sequence_[i].store(
                         submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();
@@ -226,24 +263,11 @@ void MooncakeWorker::startWorker() {
                             group->engine->getTransferStatus(
                                 task.batchID, rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
-                                if ((status.s == TransferStatusEnum::FAILED ||
-                                     diff.count() >
-                                         kPingTimeoutMicroseconds_) &&
-                                    isPeerUnreachable(group, j)) {
+                                if (status.s == TransferStatusEnum::FAILED ||
+                                    (diff.count() > kPingTimeoutMicroseconds_ &&
+                                     isPeerUnreachable(group, j))) {
                                     markPeerBroken(group, j, "transferring",
                                                    task.opType);
-                                } else if (status.s ==
-                                           TransferStatusEnum::FAILED) {
-                                    LOG(WARNING)
-                                        << "Rank " << group->rank
-                                        << " retrying transfer to alive peer "
-                                        << j << " during op "
-                                        << (int)task.opType;
-                                    freeBatchID(group, task.batchID);
-                                    task_status[i].store(
-                                        IDLE, std::memory_order_release);
-                                    batch_done = false;
-                                    break;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -269,6 +293,10 @@ void MooncakeWorker::startWorker() {
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
+                            continue;
+                        }
+                        if (!group->peerConnected[j]) {
+                            markPeerBroken(group, j, "signaling", task.opType);
                             continue;
                         }
                         *source_ptr = 1;
@@ -311,52 +339,11 @@ void MooncakeWorker::startWorker() {
                             task.batchID, rankToTaskId[i][j], status);
                         if (signal_ptr[j] != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
-                            if ((status.s == TransferStatusEnum::FAILED ||
-                                 diff.count() > kPingTimeoutMicroseconds_) &&
-                                isPeerUnreachable(group, j)) {
+                            if (status.s == TransferStatusEnum::FAILED ||
+                                (diff.count() > kPingTimeoutMicroseconds_ &&
+                                 isPeerUnreachable(group, j))) {
                                 markPeerBroken(group, j, "syncing",
                                                task.opType);
-                            } else if (status.s == TransferStatusEnum::FAILED) {
-                                LOG(WARNING)
-                                    << "Rank " << group->rank
-                                    << " retrying sync to alive peer " << j
-                                    << " during op " << (int)task.opType;
-                                freeBatchID(group, task.batchID);
-
-                                for (size_t peer = 0; peer < kMaxNumRanks;
-                                     ++peer) {
-                                    rankToTaskId[i][peer] = kInvalidTaskId;
-                                }
-                                auto retry_source_ptr =
-                                    (int32_t*)group->segmentInfos[group->rank]
-                                        .send_sync[task.bufferOffset];
-                                std::vector<TransferRequest> entries;
-                                for (int peer = 0; peer < group->size; ++peer) {
-                                    if (!group->activeRanks[peer]) {
-                                        continue;
-                                    }
-                                    *retry_source_ptr = 1;
-                                    rankToTaskId[i][peer] = entries.size();
-                                    entries.push_back(TransferRequest{
-                                        .opcode = TransferRequest::WRITE,
-                                        .source = (void*)retry_source_ptr,
-                                        .target_id = group->segmentIDs[peer],
-                                        .target_offset =
-                                            group->segmentInfos[peer]
-                                                .recv_sync[task.bufferOffset] +
-                                            group->rank * sizeof(int32_t),
-                                        .length = sizeof(int32_t),
-                                    });
-                                }
-                                task.batchID = group->engine->allocateBatchID(
-                                    entries.size());
-                                group->engine->submitTransfer(task.batchID,
-                                                              entries);
-                                activeTime[i] = clock::now();
-                                task_status[i].store(SIGNALED_1,
-                                                     std::memory_order_release);
-                                task_done = false;
-                                break;
                             } else {
                                 task_done = false;
                                 break;

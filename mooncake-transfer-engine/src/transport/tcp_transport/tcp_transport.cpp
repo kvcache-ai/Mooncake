@@ -54,6 +54,38 @@ static bool isCudaMemory(void* addr) {
     if (attributes.type == cudaMemoryTypeDevice) return true;
     return false;
 }
+
+static cudaError_t cudaMemcpyOnNonBlockingStream(void* dst, const void* src,
+                                                size_t size,
+                                                const void* cuda_addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, cuda_addr);
+    if (status != cudaSuccess || attributes.type != cudaMemoryTypeDevice) {
+        return cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+    }
+
+    int previous_device = -1;
+    status = cudaGetDevice(&previous_device);
+    if (status != cudaSuccess) return status;
+
+    status = cudaSetDevice(attributes.device);
+    if (status != cudaSuccess) return status;
+
+    cudaStream_t stream = nullptr;
+    status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    if (status == cudaSuccess) {
+        status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, stream);
+        if (status == cudaSuccess) {
+            status = cudaStreamSynchronize(stream);
+        }
+        auto destroy_status = cudaStreamDestroy(stream);
+        if (status == cudaSuccess) status = destroy_status;
+    }
+
+    auto restore_status = cudaSetDevice(previous_device);
+    if (status == cudaSuccess) status = restore_status;
+    return status;
+}
 #endif
 
 // Forward declaration
@@ -125,9 +157,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+            cudaError_t cuda_status = cudaMemcpyOnNonBlockingStream(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                addr);
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
@@ -221,9 +253,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
                 if (is_cuda_memory) {
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                    cudaError_t cuda_status = cudaMemcpyOnNonBlockingStream(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, addr);
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ServerSession::readBody failed to copy to CUDA "
@@ -343,9 +375,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
                 if (is_cuda_memory) {
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                    cudaError_t cuda_status = cudaMemcpyOnNonBlockingStream(
+                        addr + total_transferred_bytes_, dram_buffer,
+                        transferred_bytes, addr);
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ClientSession::readBody failed to copy to CUDA "
@@ -387,9 +419,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+            cudaError_t cuda_status = cudaMemcpyOnNonBlockingStream(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size,
+                addr);
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "

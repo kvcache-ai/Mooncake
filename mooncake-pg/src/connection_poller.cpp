@@ -245,23 +245,14 @@ void ConnectionContext::markPeerDisconnected(int pollingRank,
     auto& peerState = peerStates_[pollingRank];
 
     LOG(WARNING) << "Rank " << rank_ << " marking peer " << pollingRank
-                 << " disconnected: " << reason;
+                 << " disconnected: " << reason
+                 << " oldSegmentId="
+                 << (peerState.segmentId.has_value()
+                         ? std::to_string(peerState.segmentId.value())
+                         : "null");
 
     global_peerConnected_[globalPollingRank] = false;
     meta_->peerConnected[pollingRank] = false;
-    meta_->activeRanks[pollingRank] = false;
-    meta_->activeRanksTensor[pollingRank] = 0;
-
-    try {
-        store_->deleteKey(getServerNameStoreKey(backendIndex_, pollingRank));
-        store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
-        store_->deleteKey(
-            getExtensionStateStoreKey(backendIndex_, pollingRank));
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "Rank " << rank_
-                     << " got an exception when deleteKey for peer "
-                     << pollingRank << ": " << e.what();
-    }
 
     if (warmup_recv_region_) {
         *reinterpret_cast<volatile int32_t*>(
@@ -270,14 +261,19 @@ void ConnectionContext::markPeerDisconnected(int pollingRank,
 
     p2p_proxy_->resetPeerState(pollingRank);
 
-    if (peerState.warmupBatchId.has_value()) {
-        engine_->freeBatchID(peerState.warmupBatchId.value());
-        peerState.warmupBatchId = std::nullopt;
-    }
+    // closeSegment now only clears the metadata cache, so it is safe to
+    // call even when the worker thread may still have inflight transfers.
+    // Clearing the cache prevents the connection poller from reusing a
+    // stale segment descriptor and submitting RDMA writes to a dead peer,
+    // which is what actually triggers fatal async events.
+    //
+    // Do NOT call freeBatchID here: the worker thread may still be
+    // polling the batch status.
     if (peerState.segmentId.has_value()) {
         engine_->closeSegment(peerState.segmentId.value());
-        peerState.segmentId = std::nullopt;
     }
+    peerState.warmupBatchId = std::nullopt;
+    peerState.segmentId = std::nullopt;
     if (peerState.countedInGroup) {
         totalConnectedPeers_.fetch_sub(1, std::memory_order_release);
         peerState.countedInGroup = false;
@@ -334,7 +330,16 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 return false;
             }
 
+            peerState.serverName = peerServerName;
+
             auto segment_id = engine_->openSegment(peerServerName);
+            if (segment_id == static_cast<TransferMetadata::SegmentID>(-1)) {
+                LOG(WARNING) << "ConnectionContext rank=" << rank_ << " peer="
+                             << pollingRank
+                             << " openSegment failed, server may not be ready";
+                peerState.increaseCheckStoreBackoff();
+                return false;
+            }
             meta_->segmentIDs[pollingRank] = segment_id;
             peerState.segmentId = segment_id;
             peerState.consecutive_liveness_failures = 0;
@@ -410,7 +415,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             } else if (status.s == TransferStatusEnum::FAILED) {
                 LOG(WARNING) << "Warmup request " << rank_ << " -> "
                              << pollingRank << " failed.";
-                // Free resources and retry
+                // Free resources and retry. Keep serverName so the next
+                // store poll can tell whether metadata still points to the
+                // same dead process or a replacement has overwritten it.
                 engine_->freeBatchID(peerState.warmupBatchId.value());
                 engine_->closeSegment(peerState.segmentId.value());
                 peerState.warmupBatchId = std::nullopt;
@@ -424,6 +431,10 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         case PeerConnectionState::WAITING_PEER_WARMUP: {
             if (*reinterpret_cast<volatile int32_t*>(
                     &warmup_recv_region_[pollingRank])) {
+                peerState.consecutive_liveness_failures = 0;
+                peerState.last_liveness_probe =
+                    std::chrono::steady_clock::now();
+
                 meta_->peerConnected[pollingRank] = true;
                 global_peerConnected_[globalPollingRank] = true;
                 peerState.state = PeerConnectionState::CONNECTED;
@@ -497,12 +508,13 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                                 peerState.segmentId.value()) ==
                             PeerLiveness::Alive) {
                             peerState.consecutive_liveness_failures = 0;
+                            peerState.peerAliveByHealthCheck = true;
                         } else if (++peerState.consecutive_liveness_failures >=
                                    kHealthCheckFailureThreshold) {
-                            markPeerDisconnected(pollingRank,
-                                                 "health check failed");
-                            state_changed = true;
-                            break;
+                            peerState.peerAliveByHealthCheck = false;
+                            LOG(WARNING) << "Rank " << rank_
+                                         << " health check failed for peer "
+                                         << pollingRank;
                         }
                     }
                 }

@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct PeerConnection {
     PeerConnectionState state{PeerConnectionState::WAITING_STORE};
     std::optional<BatchID> warmupBatchId{std::nullopt};
     std::optional<TransferMetadata::SegmentID> segmentId{std::nullopt};
+    std::string serverName;
 
     // Whether this peer has been counted in `totalConnectedPeers_`.
     // Note that ConnectionPoller may establish connections for ranks beyond
@@ -47,8 +49,12 @@ struct PeerConnection {
     // Out-of-band liveness probe state. The connection poller probes connected
     // active peers periodically and only marks them disconnected after multiple
     // consecutive failures to avoid transient false positives.
+    // NOTE: health-check failures are intentionally isolated from
+    // peerConnected/activeRanks so that idle PG does not observe membership
+    // changes.  Only collective/P2P transfer failures may mutate activeRanks.
     std::chrono::steady_clock::time_point last_liveness_probe;
     int consecutive_liveness_failures{0};
+    bool peerAliveByHealthCheck{true};
 
     void increaseCheckStoreBackoff() {
         check_store_backoff_ms =

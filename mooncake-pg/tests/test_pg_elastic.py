@@ -43,26 +43,6 @@ def _mark_ready_and_wait(
     )
 
 
-def _wait_for_inactive_rank(
-    backend,
-    rank: int,
-    *,
-    timeout_s: float = 30.0,
-) -> list[int]:
-    def get_inactive_mask():
-        mask = pg.get_active_ranks(backend).cpu().tolist()
-        if mask[rank] == 0:
-            return mask
-        return None
-
-    return wait_until(
-        get_inactive_mask,
-        timeout_s=timeout_s,
-        poll_interval_s=0.05,
-        description=f"rank {rank} to become inactive",
-    )
-
-
 def _dynamic_world_size_worker(
     ctx: MooncakePGWorkerContext,
 ) -> None:
@@ -79,8 +59,8 @@ def _dynamic_world_size_worker(
     pg.extend_group_size_to(backend, initial_world_size + 1)
 
     new_ws = dist.get_world_size()
-    assert new_ws == initial_world_size, (
-        f"rank {ctx.rank}: after extend world_size={new_ws}, expected {initial_world_size}"
+    assert new_ws == initial_world_size + 1, (
+        f"rank {ctx.rank}: after extend world_size={new_ws}, expected {initial_world_size + 1}"
     )
     active_ranks = pg.get_active_ranks(backend).cpu().tolist()
     expected_active = [1] * initial_world_size + [0]
@@ -143,8 +123,12 @@ def _extension_worker(
         )
         pg.recover_ranks(backend, join_ranks)
 
-        # PyTorch's ProcessGroup world_size is fixed at construction time; the
-        # backend uses activeRanks to include the joiner in subsequent collectives.
+        actual_ws_after = dist.get_world_size()
+        assert actual_ws_after == ctx.world_size, (
+            f"rank {ctx.proc_rank}: world_size after recover={actual_ws_after}, "
+            f"expected max_world_size={ctx.world_size}"
+        )
+
         active_after = pg.get_active_ranks(backend).cpu().tolist()
         expected_active_after = [1] * ctx.world_size
         assert active_after == expected_active_after, (
@@ -627,70 +611,15 @@ def _allgather_reduce_scatter_recovery_worker(
         ctx.record_result({"role": "replacement"})
 
 
-def _manual_degraded_allreduce_worker(ctx: MooncakePGWorkerContext) -> None:
-    """Test explicit active-rank masking excludes inactive ranks from collectives."""
-    device = ctx.init_group()
-    backend = ctx.get_backend()
-
-    baseline = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(baseline, op=dist.ReduceOp.SUM)
-    expected_baseline = _rank_sum(ctx.world_size)
-    if int(baseline.cpu().item()) != expected_baseline:
-        raise AssertionError(
-            f"baseline expected {expected_baseline}, got {int(baseline.cpu().item())}"
-        )
-
-    mask = torch.ones(ctx.world_size, dtype=torch.int32, device=device)
-    mask[BROKEN_RANK] = 0
-    pg.set_active_ranks(backend, mask)
-    observed = pg.get_active_ranks(backend).cpu().tolist()
-
-    active_ranks = [rank for rank in range(ctx.world_size) if rank != BROKEN_RANK]
-    if ctx.rank == BROKEN_RANK:
-        wait_until(
-            lambda: all(
-                f"manual_degraded_done_{rank}" in ctx.result_map
-                for rank in active_ranks
-            ),
-            timeout_s=30.0,
-            poll_interval_s=0.05,
-            description="manual degraded active ranks to finish",
-        )
-        ctx.record_result({
-            "role": "inactive",
-            "active_ranks": observed,
-            "baseline": int(baseline.cpu().item()),
-        })
-        return
-
-    _mark_ready_and_wait(ctx, "manual_degraded", ctx.rank, active_ranks)
-
-    degraded = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(degraded, op=dist.ReduceOp.SUM)
-    degraded_value = int(degraded.cpu().item())
-    expected_degraded = _rank_sum(ctx.world_size, {BROKEN_RANK})
-    if degraded_value != expected_degraded:
-        raise AssertionError(
-            f"degraded expected {expected_degraded}, got {degraded_value}"
-        )
-
-    ctx.result_map[f"manual_degraded_done_{ctx.rank}"] = True
-    ctx.record_result({
-        "role": "active",
-        "active_ranks": observed,
-        "baseline": int(baseline.cpu().item()),
-        "degraded": degraded_value,
-    })
-
-
 def _fault_detection_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
+    hard_kill: bool = False,
 ) -> None:
     """Worker for testing fault detection - survivors can continue without broken rank."""
     device = ctx.init_group()
-    backend = ctx.get_backend()
 
+    # Step 1: All ranks participate in first collective.
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     baseline = int(tensor.cpu().item())
@@ -698,53 +627,19 @@ def _fault_detection_worker(
     if baseline != expected_baseline:
         raise AssertionError(f"baseline expected {expected_baseline}, got {baseline}")
 
+    # Step 2: One rank exits; survivors only observe membership change when the
+    # next collective detects the failed participant.
     if ctx.rank == BROKEN_RANK:
         ctx.record_result({"role": "broken", "baseline": baseline})
         broken_exited.set()
+        if hard_kill:
+            os.kill(os.getpid(), signal.SIGKILL)
         os._exit(0)
 
     broken_exited.wait()
-    active_ranks = [rank for rank in range(ctx.world_size) if rank != BROKEN_RANK]
-    _wait_for_inactive_rank(backend, BROKEN_RANK)
-    _mark_ready_and_wait(ctx, "fault_degraded", ctx.rank, active_ranks)
 
-    tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    degraded = int(tensor.cpu().item())
-    expected_degraded = _rank_sum(ctx.world_size, {BROKEN_RANK})
-    if degraded != expected_degraded:
-        raise AssertionError(f"degraded expected {expected_degraded}, got {degraded}")
-
-    ctx.record_result({
-        "role": "survivor",
-        "baseline": baseline,
-        "degraded": degraded,
-    })
-
-
-def _kill9_fault_detection_worker(
-    ctx: MooncakePGWorkerContext,
-    broken_exited: mp.Event,
-) -> None:
-    """Gated hard-kill repro using the same degraded continuation checks."""
-    device = ctx.init_group()
-    backend = ctx.get_backend()
-
-    tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    baseline = int(tensor.cpu().item())
-
-    if ctx.rank == BROKEN_RANK:
-        broken_exited.set()
-        os.kill(os.getpid(), signal.SIGKILL)
-
-    broken_exited.wait()
-    active_ranks = [rank for rank in range(ctx.world_size) if rank != BROKEN_RANK]
-    _wait_for_inactive_rank(backend, BROKEN_RANK, timeout_s=60.0)
-    _mark_ready_and_wait(
-        ctx, "kill9_degraded", ctx.rank, active_ranks, timeout_s=60.0
-    )
-
+    # Step 3: The collective itself deactivates the failed rank and completes
+    # among surviving active ranks.
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     degraded = int(tensor.cpu().item())
@@ -791,11 +686,9 @@ def _replacement_recovery_worker(
         # Survivor ranks
         broken_exited.wait()
         backend = ctx.get_backend()
-        active_ranks = [rank for rank in range(ctx.world_size) if rank != BROKEN_RANK]
-        _wait_for_inactive_rank(backend, BROKEN_RANK)
-        _mark_ready_and_wait(ctx, "recovery_degraded", logical_rank, active_ranks)
 
-        # Run collective without broken rank
+        # The collective itself deactivates the failed rank and completes among
+        # the surviving active ranks.
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         degraded = int(tensor.cpu().item())
@@ -880,31 +773,8 @@ class _ElasticMixin:
 
         self.assert_all_ok(rows)
         for row in rows:
-            self.assertEqual(row["new_ws"], self.world_size)
+            self.assertEqual(row["new_ws"], self.world_size + 1)
             self.assertEqual(row["active_ranks"], [1] * self.world_size + [0])
-
-    def test_manual_degraded_allreduce(self) -> None:
-        """Test explicit activeRanks masking excludes inactive ranks."""
-        rows = self.spawn_backend_and_collect(
-            _manual_degraded_allreduce_worker,
-            timeout_s=30.0,
-        )
-        self.assert_all_ok(rows)
-
-        active_rows = [r for r in rows if r.get("role") == "active"]
-        inactive_rows = [r for r in rows if r.get("role") == "inactive"]
-        self.assertEqual(len(active_rows), self.world_size - 1)
-        self.assertEqual(len(inactive_rows), 1)
-
-        expected_mask = [1] * self.world_size
-        expected_mask[BROKEN_RANK] = 0
-        expected_baseline = _rank_sum(self.world_size)
-        expected_degraded = _rank_sum(self.world_size, {BROKEN_RANK})
-        for row in rows:
-            self.assertEqual(row["active_ranks"], expected_mask)
-            self.assertEqual(row["baseline"], expected_baseline)
-        for row in active_rows:
-            self.assertEqual(row["degraded"], expected_degraded)
 
     def test_failed_rank(self) -> None:
         """Test that survivors can continue collective after a rank fails."""
@@ -939,8 +809,9 @@ class _ElasticMixin:
         spawn_ctx = mp.get_context("spawn")
         broken_exited = spawn_ctx.Event()
         rows = self.spawn_backend_and_collect(
-            _kill9_fault_detection_worker,
+            _fault_detection_worker,
             broken_exited,
+            True,
             timeout_s=60.0,
         )
 

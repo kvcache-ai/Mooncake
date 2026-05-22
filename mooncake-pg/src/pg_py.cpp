@@ -52,13 +52,6 @@ at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     return mooncakeBackend->getActiveRanksTensor();
 }
 
-void setActiveRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                    at::Tensor activeRanks) {
-    auto mooncakeBackend =
-        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    mooncakeBackend->setActiveRanks(activeRanks);
-}
-
 int getNumSyncedRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
@@ -120,7 +113,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MooncakeBackend instances.");
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
-    m.def("set_active_ranks", &setActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
     m.def("extend_group_size_to", &extendGroupSizeTo);
     m.def("get_peer_state", &getPeerState);

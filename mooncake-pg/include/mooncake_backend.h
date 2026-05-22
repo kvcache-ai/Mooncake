@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_BACKEND_H
 #define MOONCAKE_BACKEND_H
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -102,7 +103,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const { return meta_ ? meta_->activeSize : size_; }
+    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -155,7 +156,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ScatterOptions& opts) override;
 
-    void shutdown();
+    void shutdown() override;
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
@@ -173,8 +174,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     std::string getPreferredHca(std::string location);
 
     at::Tensor getActiveRanksTensor();
-
-    void setActiveRanks(at::Tensor activeRanks);
 
     int getNumSyncedRanks();
 
@@ -211,9 +210,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     int maxSize_{0};
     std::vector<uint64_t> globalRanksInGroup_;
     int instanceBackendIndex_{0};
-    bool resourcesStarted_{false};
-    bool resourcesInitialized_{false};
-    bool initializationFailed_{false};
+    std::atomic<bool> resourcesStarted_{false};
+    std::atomic<bool> resourcesInitialized_{false};
+    std::atomic<bool> initializationFailed_{false};
     std::mutex initMutex_;
     void* send_buffer_[2]{};
     void* recv_buffer_[2]{};

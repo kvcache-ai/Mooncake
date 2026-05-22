@@ -182,8 +182,7 @@ MooncakeBackend::MooncakeBackend(
     c10d::DistributedBackendOptions distBackendOpts,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : ProcessGroup(distBackendOpts.store, distBackendOpts.group_rank,
-                   distBackendOpts.group_size,
-                   c10::make_intrusive<Options>("mooncake")),
+                   distBackendOpts.group_size),
       options_(std::move(options)),
       isCpu_(isCpu),
       store_(distBackendOpts.store) {
@@ -206,6 +205,7 @@ MooncakeBackend::MooncakeBackend(
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
     auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
     setBackend(deviceType, BackendType::CUSTOM, shim);
+    setDefaultBackend(BackendType::CUSTOM);
 
     if (!(options_ && options_->lazyInit_)) {
         try {
@@ -218,25 +218,25 @@ MooncakeBackend::MooncakeBackend(
 }
 
 void MooncakeBackend::ensureInitialized() {
-    if (resourcesInitialized_) {
+    if (resourcesInitialized_.load(std::memory_order_acquire)) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(initMutex_);
-    if (resourcesInitialized_) {
+    if (resourcesInitialized_.load(std::memory_order_acquire)) {
         return;
     }
 
     TORCH_CHECK(!isShutdown_, "MooncakeBackend has been shut down.");
-    TORCH_CHECK(!initializationFailed_,
+    TORCH_CHECK(!initializationFailed_.load(std::memory_order_acquire),
                 "MooncakeBackend initialization failed previously.");
 
-    resourcesStarted_ = true;
+    resourcesStarted_.store(true, std::memory_order_release);
     try {
         initializeResources();
-        resourcesInitialized_ = true;
+        resourcesInitialized_.store(true, std::memory_order_release);
     } catch (...) {
-        initializationFailed_ = true;
+        initializationFailed_.store(true, std::memory_order_release);
         throw;
     }
 }
@@ -419,12 +419,6 @@ void MooncakeBackend::initializeResources() {
     // without calling extendGroupSizeTo(). Inactive slots are masked by
     // meta_->activeRanks / meta_->activeRanksTensor.
     meta_->size = max_size;
-    // activeSize tracks the visible group size (returned by getSize() /
-    // dist.get_world_size()). It starts at the actual member count and grows
-    // when extendGroupSizeTo() or recoverRanks() expands the group.
-    // For extension ranks, activeSize equals world_size (= max_world_size);
-    // the local-only behavior before joinGroup() is ensured by activeRanks
-    // masking, not by a smaller activeSize.
     meta_->activeSize = size;
     meta_->taskCount = 0;
     if (isCpu_) {
@@ -503,14 +497,6 @@ std::string MooncakeBackend::getPreferredHca(std::string location) {
 at::Tensor MooncakeBackend::getActiveRanksTensor() {
     ensureInitialized();
     return meta_->activeRanksTensor;
-}
-
-void MooncakeBackend::setActiveRanks(at::Tensor activeRanks) {
-    ensureInitialized();
-    TORCH_CHECK(worker_->drainTasks(meta_.get()),
-                "Failed to drain Mooncake collective tasks before updating "
-                "activeRanks.");
-    applyActiveRanksTensor(activeRanks);
 }
 
 // ---- MooncakeP2PShim implementation ----
@@ -1058,7 +1044,7 @@ void MooncakeBackend::shutdown() {
         isShutdown_ = true;
     }
 
-    if (!resourcesStarted_) {
+    if (!resourcesStarted_.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -1255,14 +1241,8 @@ void MooncakeBackend::waitForExtensionState() {
     }
     syncActiveRanksTensor();
 
-    // activeSize: count the number of active ranks (contiguous from 0)
-    int newActiveSize = 0;
-    for (int i = 0; i < meta_->size; ++i) {
-        if (meta_->activeRanks[i]) {
-            newActiveSize = i + 1;
-        }
-    }
-    meta_->activeSize = newActiveSize;
+    meta_->activeSize = static_cast<int>(
+        std::count(state.activeRanks.begin(), state.activeRanks.end(), true));
 }
 
 int MooncakeBackend::getNumSyncedRanks() {
@@ -1382,13 +1362,8 @@ void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
         meta_->activeRanks[rank] = true;
     }
 
-    // Expand activeSize if any recovered rank is beyond the current boundary.
-    if (!ranks.empty()) {
-        const int max_rank = *std::max_element(ranks.begin(), ranks.end());
-        if (max_rank >= meta_->activeSize) {
-            meta_->activeSize = max_rank + 1;
-        }
-    }
+    meta_->activeSize = static_cast<int>(
+        std::count(meta_->activeRanks, meta_->activeRanks + meta_->size, true));
 
     syncActiveRanksTensor();
     std::vector<uint32_t> epochs(meta_->size);

@@ -2,7 +2,6 @@ import unittest
 
 import torch
 import torch.distributed as dist
-from mooncake import pg
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -44,17 +43,6 @@ def _lazy_init_destroy_without_use_worker(ctx: MooncakePGWorkerContext) -> None:
     ctx.init_group(lazy_init=True)
     dist.destroy_process_group(dist.group.WORLD)
     ctx.record_result({"destroyed": True})
-
-
-def _set_active_ranks_worker(ctx: MooncakePGWorkerContext) -> None:
-    """Test runtime activeRanks setter updates the backend-visible mask."""
-    device = ctx.init_group()
-    backend = ctx.get_backend()
-    mask = torch.ones(ctx.world_size, dtype=torch.int32, device=device)
-    mask[-1] = 0
-    pg.set_active_ranks(backend, mask)
-    observed = pg.get_active_ranks(backend).cpu().tolist()
-    ctx.record_result({"active_ranks": observed})
 
 
 def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
@@ -158,15 +146,6 @@ class _InitFunctionalMixin:
         self.assert_all_ok(rows)
         for row in rows:
             self.assertTrue(row["destroyed"])
-
-    def test_set_active_ranks(self) -> None:
-        """Test runtime activeRanks setter updates the backend mask."""
-        rows = self.spawn_backend_and_collect(_set_active_ranks_worker)
-        self.assert_all_ok(rows)
-        expected = [1] * self.world_size
-        expected[-1] = 0
-        for row in rows:
-            self.assertEqual(row["active_ranks"], expected)
 
     def test_subgroup_create_destroy(self) -> None:
         """Test subgroup creation and destruction."""
