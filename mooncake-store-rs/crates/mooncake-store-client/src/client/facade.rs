@@ -1062,6 +1062,23 @@ impl MooncakeCompatibilityFacade for StoreClient {
                             "route delete reclaim scheduling failed after authoritative delete"
                         );
                     }
+                    // Best-effort tombstone cleanup: remove the route entry
+                    // now that mirroring has propagated the tombstone.  The
+                    // per-authority version high-water mark ensures that
+                    // subsequent puts maintain monotonic versioning.
+                    //
+                    // Only safe for EmbeddedWrh where the in-memory mesh is
+                    // separate from the metadata backend.  In MetadataOnly
+                    // mode the backend IS the authoritative store; deleting
+                    // the tombstone would erase the route for readers.
+                    if self.route_control == RouteControlMode::EmbeddedWrh {
+                        let _ = self.route_directory.compare_and_swap_object_route(
+                            &self.lease,
+                            &object_key,
+                            Some(tombstone.version),
+                            None,
+                        );
+                    }
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -1132,6 +1149,15 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         key = object.key,
                         error = %error,
                         "batch route delete reclaim scheduling failed after authoritative delete"
+                    );
+                }
+                // Best-effort tombstone cleanup (see remove_in_tenant).
+                if self.route_control == RouteControlMode::EmbeddedWrh {
+                    let _ = self.route_directory.compare_and_swap_object_route(
+                        &self.lease,
+                        &object_key,
+                        Some(tombstone.version),
+                        None,
                     );
                 }
             } else {
