@@ -183,6 +183,8 @@ class TransferEnginePy {
 
     std::vector<TransferNotify> getNotifies();
 
+    int sendProbe(const std::string &peer_server_name);
+
     std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
 
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }

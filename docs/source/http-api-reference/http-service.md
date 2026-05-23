@@ -241,11 +241,16 @@ Unmount one or more segment ids previously returned by `/api/mount_shm`.
 **Request Body**:
 ```json
 {
-  "segment_ids": ["00000000-0000-0000-0000-000000000001"]
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"],
+  "grace_period_seconds": 0
 }
 ```
 
 `segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount behavior. When set to a positive value, the master
+keeps the segment readable for that grace period while preventing new
+allocations, then completes the unmount.
 
 **Success Response**:
 ```json
@@ -258,7 +263,8 @@ Unmount one or more segment ids previously returned by `/api/mount_shm`.
 ```bash
 curl -X POST http://localhost:8080/api/unmount_shm \
   -H "Content-Type: application/json" \
-  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"]}'
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"],
+       "grace_period_seconds": 30}'
 ```
 
 ### `/api/mount`
@@ -312,11 +318,16 @@ the memory allocated by the store process.
 **Request Body**:
 ```json
 {
-  "segment_ids": ["00000000-0000-0000-0000-000000000002"]
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"],
+  "grace_period_seconds": 0
 }
 ```
 
 `segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount-and-free behavior. When set to a positive value, the
+master keeps the segment readable for that grace period while preventing new
+allocations, then the store releases the local allocated memory after cleanup.
 
 **Success Response**:
 ```json
@@ -329,5 +340,6 @@ the memory allocated by the store process.
 ```bash
 curl -X POST http://localhost:8080/api/unmount \
   -H "Content-Type: application/json" \
-  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"]}'
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"],
+       "grace_period_seconds": 30}'
 ```

@@ -211,6 +211,47 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::PrepareGracefulUnmountSegment(
+    const UUID& segment_id) {
+    auto it = segment_manager_->mounted_segments_.find(segment_id);
+    if (it == segment_manager_->mounted_segments_.end()) {
+        LOG(WARNING) << "segment_id=" << segment_id
+                     << ", warn=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    auto status = it->second.status;
+    if (status == SegmentStatus::UNMOUNTING) {
+        LOG(ERROR) << "segment_id=" << segment_id
+                   << ", error=segment_is_unmounting";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+    if (status == SegmentStatus::GRACEFULLY_UNMOUNTING) {
+        // Idempotent: already in graceful unmount state
+        return ErrorCode::OK;
+    }
+    if (status != SegmentStatus::OK && status != SegmentStatus::DRAINING) {
+        LOG(ERROR) << "segment_id=" << segment_id
+                   << ", error=unavailable_in_current_status, status="
+                   << status;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    auto& mounted_segment = it->second;
+    auto& segment = mounted_segment.segment;
+
+    // Remove the allocator from the segment manager
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        mounted_segment.buf_allocator;
+    if (HasAllocator(segment_manager_->allocator_manager_, segment.name,
+                     allocator)) {
+        segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                             allocator);
+    }
+    // Set the segment status to GRACEFULLY_UNMOUNTING
+    mounted_segment.status = SegmentStatus::GRACEFULLY_UNMOUNTING;
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     const size_t& metrics_dec_capacity) {
@@ -240,9 +281,14 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
-        // Also remove from segment_name_client_id_map_
-        segment_manager_->client_by_name_.erase(segment_name);
-        segment_manager_->segment_id_by_name_.erase(segment_name);
+        auto segment_id_by_name_it =
+            segment_manager_->segment_id_by_name_.find(segment_name);
+        if (segment_id_by_name_it !=
+                segment_manager_->segment_id_by_name_.end() &&
+            segment_id_by_name_it->second == segment_id) {
+            segment_manager_->segment_id_by_name_.erase(segment_id_by_name_it);
+            segment_manager_->client_by_name_.erase(segment_name);
+        }
         is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_
@@ -954,6 +1000,17 @@ ErrorCode ScopedSegmentAccess::GetSegmentStatusByName(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::GetSegmentStatusById(
+    const UUID& segment_id, SegmentStatus& status) const {
+    auto mounted_segment_it =
+        segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted_segment_it == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted_segment_it->second.status;
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
     const std::string& segment_name, SegmentStatus status) {
     auto segment_id_it =
@@ -989,6 +1046,272 @@ ErrorCode ScopedSegmentAccess::SetSegmentStatusByName(
 
     mounted_segment.status = status;
     return ErrorCode::OK;
+}
+
+/* ScopedNoFSegmentAccess Implementation */
+ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
+                                               const UUID& client_id) {
+    const uintptr_t buffer = segment.base;
+    const size_t size = segment.size;
+
+    // NoF segment base is an NVMe namespace offset, so 0 is valid.
+    if (size == 0) {
+        LOG(ERROR) << "NoF segment mount: buffer=" << buffer
+                   << " or size=" << size << " is invalid";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (nof_segment_manager_->memory_allocator_ ==
+            BufferAllocatorType::CACHELIB &&
+        (buffer % facebook::cachelib::Slab::kSize ||
+         size % facebook::cachelib::Slab::kSize)) {
+        LOG(ERROR) << "NoF segment mount: buffer=" << buffer
+                   << " or size=" << size << " is not aligned to "
+                   << facebook::cachelib::Slab::kSize
+                   << " as required by Cachelib";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto exist_segment_it =
+        nof_segment_manager_->mounted_segments_.find(segment.id);
+    if (exist_segment_it != nof_segment_manager_->mounted_segments_.end()) {
+        auto& exist_segment = exist_segment_it->second;
+        if (exist_segment.status == SegmentStatus::OK) {
+            LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
+                         << ", warn=segment_already_exists_by_id";
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
+        LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
+                   << ", error=segment_already_exists_but_not_ok"
+                   << ", status=" << exist_segment.status;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    // Treat the same transport endpoint as the same remote SSD namespace even
+    // if a retry arrives with a different generated UUID.
+    for (const auto& [existing_id, existing_segment] :
+         nof_segment_manager_->mounted_segments_) {
+        if (existing_segment.status == SegmentStatus::OK &&
+            existing_segment.segment.te_endpoint == segment.te_endpoint) {
+            LOG(WARNING) << "NoF segment mount: segment_name=" << segment.name
+                         << ", endpoint=" << segment.te_endpoint
+                         << ", warn=segment_already_exists_with_different_id";
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
+    }
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    try {
+        switch (nof_segment_manager_->memory_allocator_) {
+            case BufferAllocatorType::CACHELIB:
+                allocator = std::make_shared<CachelibBufferAllocator>(
+                    segment.name, buffer, size, segment.te_endpoint,
+                    ReplicaType::NOF_SSD);
+                break;
+            case BufferAllocatorType::OFFSET:
+                allocator = std::make_shared<OffsetBufferAllocator>(
+                    segment.name, buffer, size, segment.te_endpoint,
+                    ReplicaType::NOF_SSD);
+                break;
+            default:
+                LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
+                           << ", error=unknown_memory_allocator="
+                           << static_cast<int>(
+                                  nof_segment_manager_->memory_allocator_);
+                return ErrorCode::INVALID_PARAMS;
+        }
+
+        if (!allocator) {
+            LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
+                       << ", error=failed_to_create_allocator";
+            return ErrorCode::INVALID_PARAMS;
+        }
+    } catch (...) {
+        LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
+                   << ", error=exception_during_allocator_creation";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
+                                                          allocator);
+    nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
+    nof_segment_manager_->mounted_segments_[segment.id] = {
+        segment, client_id, SegmentStatus::OK, std::move(allocator)};
+    nof_segment_manager_->client_by_name_[segment.name] = client_id;
+    MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
+
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
+    const std::vector<NoFSegment>& segments, const UUID& client_id) {
+    for (const auto& segment : segments) {
+        ErrorCode err = MountSegment(segment, client_id);
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+            err == ErrorCode::INTERNAL_ERROR) {
+            LOG(ERROR) << "NoF segment remount: segment_name=" << segment.name
+                       << ", error=fail_to_remount_segment";
+            return err;
+        }
+        if (err == ErrorCode::INVALID_PARAMS) {
+            LOG(WARNING) << "NoF segment remount: segment_name=" << segment.name
+                         << ", warn=invalid_params";
+        } else if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            LOG(WARNING) << "NoF segment remount: segment_name=" << segment.name
+                         << ", warn=segment_already_exists";
+        } else if (err != ErrorCode::OK) {
+            LOG(ERROR) << "NoF segment remount: segment_name=" << segment.name
+                       << ", error=unexpected_error (" << err << ")";
+        }
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
+    const UUID& segment_id, size_t& metrics_dec_capacity) {
+    auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (it == nof_segment_manager_->mounted_segments_.end()) {
+        LOG(WARNING) << "NoF segment unmount: segment_id=" << segment_id
+                     << ", warn=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    if (it->second.status == SegmentStatus::UNMOUNTING) {
+        LOG(ERROR) << "NoF segment unmount: segment_id=" << segment_id
+                   << ", error=segment_is_unmounting";
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    auto& mounted_segment = it->second;
+    auto& segment = mounted_segment.segment;
+    metrics_dec_capacity = segment.size;
+
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        mounted_segment.buf_allocator;
+    if (HasAllocator(nof_segment_manager_->allocator_manager_, segment.name,
+                     allocator)) {
+        nof_segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                                 allocator);
+    }
+
+    mounted_segment.buf_allocator.reset();
+    mounted_segment.status = SegmentStatus::UNMOUNTING;
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
+    const UUID& segment_id, const UUID& client_id,
+    const size_t& metrics_dec_capacity) {
+    bool found_in_client_segments = false;
+    auto client_it = nof_segment_manager_->client_segments_.find(client_id);
+    if (client_it != nof_segment_manager_->client_segments_.end()) {
+        auto& segments = client_it->second;
+        auto segment_it =
+            std::find(segments.begin(), segments.end(), segment_id);
+        if (segment_it != segments.end()) {
+            segments.erase(segment_it);
+            found_in_client_segments = true;
+        }
+        if (segments.empty()) {
+            nof_segment_manager_->client_segments_.erase(client_it);
+        }
+    }
+    if (!found_in_client_segments) {
+        LOG(ERROR) << "NoF segment unmount: segment_id=" << segment_id
+                   << ", error=segment_not_found_in_client_segments";
+    }
+
+    std::string segment_name;
+    auto segment_it = nof_segment_manager_->mounted_segments_.find(segment_id);
+    if (segment_it != nof_segment_manager_->mounted_segments_.end()) {
+        segment_name = segment_it->second.segment.name;
+        nof_segment_manager_->client_by_name_.erase(segment_name);
+    }
+
+    nof_segment_manager_->mounted_segments_.erase(segment_id);
+    MasterMetricManager::instance().dec_total_nof_capacity(
+        segment_name, metrics_dec_capacity);
+
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::GetClientSegments(
+    const UUID& client_id, std::vector<NoFSegment>& segments) const {
+    auto it = nof_segment_manager_->client_segments_.find(client_id);
+    if (it == nof_segment_manager_->client_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    segments.clear();
+    for (auto& segment_id : it->second) {
+        auto segment_it =
+            nof_segment_manager_->mounted_segments_.find(segment_id);
+        if (segment_it != nof_segment_manager_->mounted_segments_.end()) {
+            segments.emplace_back(segment_it->second.segment);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::GetMountedSegments(
+    std::vector<MountedNoFSegmentSnapshot>& segments) const {
+    segments.clear();
+    segments.reserve(nof_segment_manager_->mounted_segments_.size());
+    for (const auto& it : nof_segment_manager_->mounted_segments_) {
+        segments.push_back(MountedNoFSegmentSnapshot{
+            .segment_id = it.first,
+            .client_id = it.second.client_id,
+            .segment = it.second.segment,
+            .status = it.second.status,
+        });
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::GetAllSegments(
+    std::vector<std::string>& all_segments) {
+    all_segments.clear();
+    for (auto& segment : nof_segment_manager_->mounted_segments_) {
+        if (segment.second.status == SegmentStatus::OK) {
+            all_segments.push_back(segment.second.segment.name);
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedNoFSegmentAccess::QuerySegments(const std::string& segment,
+                                                size_t& used,
+                                                size_t& capacity) {
+    size_t total_used = 0, total_capacity = 0;
+    const auto& allocator_manager = nof_segment_manager_->allocator_manager_;
+    const auto& allocators = allocator_manager.getAllocators(segment);
+    if (allocators != nullptr) {
+        for (const auto& allocator : *allocators) {
+            total_used += allocator->size();
+            total_capacity += allocator->capacity();
+        }
+    }
+
+    if (total_capacity == 0) {
+        VLOG(1) << "NoF segment query: segment=" << segment
+                << ", error=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+
+    used = total_used;
+    capacity = total_capacity;
+    return ErrorCode::OK;
+}
+
+void NoFSegmentManager::GetMountedSegmentsSnapshot(
+    std::vector<MountedNoFSegmentSnapshot>& segments) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    segments.clear();
+    segments.reserve(mounted_segments_.size());
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        segments.push_back(MountedNoFSegmentSnapshot{
+            segment_id, mounted_segment.client_id, mounted_segment.segment,
+            mounted_segment.status});
+    }
 }
 
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,

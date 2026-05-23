@@ -15,6 +15,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -1059,6 +1060,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     stop_ipc_server();
+    stop_dummy_client_monitor();
     stop_http_server();
 
     if (!client_) {
@@ -1076,19 +1078,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
     }
 
-    std::unordered_map<std::string, AllocatedSegmentRecord> records_to_free;
-    {
-        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
-        records_to_free.swap(allocated_segment_records_);
-    }
-    for (const auto &entry : records_to_free) {
-        if (entry.second.base) {
-            free_memory(entry.second.protocol, entry.second.base);
-        }
-    }
-
     // Reset all resources
     client_.reset();
+    ReleaseAllMountedSegmentRecords();
+    ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
@@ -1234,13 +1227,84 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
     return 0;
 }
 
-int RealClient::unmountSegment(const std::vector<std::string> &segment_ids) {
+void RealClient::ReleaseMountedSegmentRecord(const std::string &segment_id) {
+    MountedSegmentRecord record;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+        auto it = mounted_segment_records_.find(segment_id);
+        if (it != mounted_segment_records_.end()) {
+            record = it->second;
+            mounted_segment_records_.erase(it);
+            found = true;
+        }
+    }
+    if (found && record.mmap_base) {
+        munmap(record.mmap_base, record.size);
+    }
+}
+
+void RealClient::ReleaseAllMountedSegmentRecords() {
+    std::vector<MountedSegmentRecord> records;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+        records.reserve(mounted_segment_records_.size());
+        for (auto &entry : mounted_segment_records_) {
+            records.push_back(entry.second);
+        }
+        mounted_segment_records_.clear();
+    }
+    for (auto &record : records) {
+        if (record.mmap_base) {
+            munmap(record.mmap_base, record.size);
+        }
+    }
+}
+
+void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
+    AllocatedSegmentRecord record;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        auto it = allocated_segment_records_.find(segment_id);
+        if (it != allocated_segment_records_.end()) {
+            record = it->second;
+            allocated_segment_records_.erase(it);
+            found = true;
+        }
+    }
+    if (found && record.base) {
+        free_memory(record.protocol, record.base);
+    }
+}
+
+void RealClient::ReleaseAllAllocatedSegmentRecords() {
+    std::unordered_map<std::string, AllocatedSegmentRecord> records;
+    {
+        std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+        records.swap(allocated_segment_records_);
+    }
+    for (auto &entry : records) {
+        if (entry.second.base) {
+            free_memory(entry.second.protocol, entry.second.base);
+        }
+    }
+}
+
+int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
+                               uint64_t grace_period_seconds) {
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
     }
 
+    uint64_t grace_period_ms = grace_period_seconds * 1000;
     int first_error = 0;
+    struct SegmentToUnmount {
+        std::string segment_id;
+        UUID id;
+    };
+    std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, MountedSegmentRecord>> to_cleanup;
     {
         std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
@@ -1260,17 +1324,37 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids) {
                 continue;
             }
 
-            auto result = client_->UnmountSegmentById(id);
-            if (!result.has_value()) {
-                LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
-                if (first_error == 0) {
-                    first_error = static_cast<int>(result.error());
-                }
-                continue;  // Don't release local resources on failure
-            }
+            to_unmount.push_back({segment_id, id});
+        }
+    }
 
-            to_cleanup.emplace_back(segment_id, it->second);
-            mounted_segment_records_.erase(it);
+    for (auto &entry : to_unmount) {
+        std::function<void(const UUID &)> cleanup_callback;
+        if (grace_period_ms != 0) {
+            cleanup_callback = [this](const UUID &cleanup_id) {
+                ReleaseMountedSegmentRecord(UuidToString(cleanup_id));
+            };
+        }
+        auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
+                                                  std::move(cleanup_callback));
+        if (!result.has_value()) {
+            LOG(ERROR) << "UnmountSegmentById failed for " << entry.segment_id;
+            if (first_error == 0) {
+                first_error = static_cast<int>(result.error());
+            }
+            continue;  // Don't release local resources on failure
+        }
+
+        // For immediate unmount, clean up local mmap/fd right away.
+        // For graceful unmount, local mmap/fd is kept until the segment
+        // is actually removed or the client destructor runs.
+        if (grace_period_ms == 0) {
+            std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+            auto it = mounted_segment_records_.find(entry.segment_id);
+            if (it != mounted_segment_records_.end()) {
+                to_cleanup.emplace_back(entry.segment_id, it->second);
+                mounted_segment_records_.erase(it);
+            }
         }
     }
 
@@ -1387,13 +1471,20 @@ int RealClient::allocateAndMountSegment(
 }
 
 int RealClient::unmountAndFreeSegment(
-    const std::vector<std::string> &segment_ids) {
+    const std::vector<std::string> &segment_ids,
+    uint64_t grace_period_seconds) {
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
     }
 
+    uint64_t grace_period_ms = grace_period_seconds * 1000;
     int first_error = 0;
+    struct SegmentToUnmount {
+        std::string segment_id;
+        UUID id;
+    };
+    std::vector<SegmentToUnmount> to_unmount;
     std::vector<std::pair<std::string, AllocatedSegmentRecord>> to_cleanup;
     {
         std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
@@ -1413,17 +1504,34 @@ int RealClient::unmountAndFreeSegment(
                 continue;
             }
 
-            auto result = client_->UnmountSegmentById(id);
-            if (!result.has_value()) {
-                LOG(ERROR) << "UnmountSegmentById failed for " << segment_id;
-                if (first_error == 0) {
-                    first_error = static_cast<int>(result.error());
-                }
-                continue;  // Don't release local resources on failure
-            }
+            to_unmount.push_back({segment_id, id});
+        }
+    }
 
-            to_cleanup.emplace_back(segment_id, it->second);
-            allocated_segment_records_.erase(it);
+    for (auto &entry : to_unmount) {
+        std::function<void(const UUID &)> cleanup_callback;
+        if (grace_period_ms != 0) {
+            cleanup_callback = [this](const UUID &cleanup_id) {
+                ReleaseAllocatedSegmentRecord(UuidToString(cleanup_id));
+            };
+        }
+        auto result = client_->UnmountSegmentById(entry.id, grace_period_ms,
+                                                  std::move(cleanup_callback));
+        if (!result.has_value()) {
+            LOG(ERROR) << "UnmountSegmentById failed for " << entry.segment_id;
+            if (first_error == 0) {
+                first_error = static_cast<int>(result.error());
+            }
+            continue;  // Don't release local resources on failure
+        }
+
+        if (grace_period_ms == 0) {
+            std::lock_guard<std::mutex> lock(allocated_segment_records_mutex_);
+            auto it = allocated_segment_records_.find(entry.segment_id);
+            if (it != allocated_segment_records_.end()) {
+                to_cleanup.emplace_back(entry.segment_id, it->second);
+                allocated_segment_records_.erase(it);
+            }
         }
     }
 
@@ -2302,6 +2410,22 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     }
     shm_contexts_.erase(it);
     return {};
+}
+
+tl::expected<bool, ErrorCode> RealClient::is_shm_mapped_internal(
+    uint64_t dummy_base_addr, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto context_it = shm_contexts_.find(client_id);
+    if (context_it == shm_contexts_.end()) {
+        return false;
+    }
+
+    const auto target_addr = static_cast<uintptr_t>(dummy_base_addr);
+    const auto &mapped_shms = context_it->second.mapped_shms;
+    return std::any_of(mapped_shms.begin(), mapped_shms.end(),
+                       [target_addr](const MappedShm &shm) {
+                           return shm.dummy_base_addr == target_addr;
+                       });
 }
 
 tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
@@ -5042,6 +5166,13 @@ int RealClient::start_dummy_client_monitor() {
     return 0;
 }
 
+void RealClient::stop_dummy_client_monitor() {
+    dummy_client_monitor_running_ = false;
+    if (dummy_client_monitor_thread_.joinable()) {
+        dummy_client_monitor_thread_.join();
+        LOG(INFO) << "dummy_client_monitor_thread stopped";
+    }
+}
 int RealClient::start_ipc_server() {
     ipc_running_ = true;
     ipc_thread_ = std::jthread(&RealClient::ipc_server_func, this);
@@ -5327,6 +5458,7 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
+    offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;

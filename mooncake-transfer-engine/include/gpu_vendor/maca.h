@@ -14,7 +14,6 @@ const static std::string GPU_PREFIX = "maca:";
 #define CUresult mcError_t
 #define cuDeviceGet mcDeviceGet
 #define cuDeviceGetAttribute mcDeviceGetAttribute
-#define cuGetErrorString mcGetErrorString
 #define cuMemAddressFree mcMemAddressFree
 #define cuMemAddressReserve mcMemAddressReserve
 #define cuMemCreate mcMemCreate
@@ -57,6 +56,7 @@ const static std::string GPU_PREFIX = "maca:";
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor
 #define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
     mcDeviceAttributeHandleTypePosixFileDescriptorSupported
+
 static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
     if (err_str) {
         *err_str = mcGetErrorString(error);

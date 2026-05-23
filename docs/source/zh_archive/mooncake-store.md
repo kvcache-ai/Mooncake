@@ -699,7 +699,10 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
-#### 3FS USRBIO 插件
+#### 3FS USRBIO 插件（实验性 / 未完成）
+
+> **实验性功能：** HF3FS（3FS USRBIO）相关集成仍在开发中，尚未达到可视为生产就绪的程度；接口与行为可能变更，建议仅用于评估与测试。
+
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
 ### 内置元数据服务器

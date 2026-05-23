@@ -51,6 +51,7 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class FileStoragePromotionTest;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -82,9 +83,23 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
+     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
+     *    master (mirror of step 1+2 in the reverse direction).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
+
+    /**
+     * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
+     * Pulls promotion work from the master, stages a MEMORY replica for each
+     * key, copies the bytes from local SSD into that replica, and notifies the
+     * master on success. A failure on any single key is logged and skipped;
+     * the master-side reaper decrements the source replica's refcnt and
+     * erases the task entry on TTL expiry, and any orphaned PROCESSING
+     * MEMORY replica is reaped via the standard discarded-replicas path.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 

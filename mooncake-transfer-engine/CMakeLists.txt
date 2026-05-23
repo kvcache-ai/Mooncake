@@ -61,8 +61,9 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-# Non-peermem requires cuMem allocated memory pointers
-if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
+# is now a runtime environment variable, always build when GPU support is present.
+if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA)
   add_subdirectory(nvlink-allocator)
 endif()
 

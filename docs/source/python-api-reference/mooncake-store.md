@@ -130,6 +130,111 @@ store.close()
 
 </details>
 
+## Structured Object Store Helper
+
+`mooncake.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
+It is designed for cases such as rollout / batch transfer where callers want to keep their own object semantics locally while using Mooncake for fast payload movement.
+
+The helper separates two concepts:
+
+- **structured object path**: named members with metadata-aware materialization;
+- **generic bundle path**: manifest + named payloads when the caller only needs raw grouped objects.
+
+### Main types
+
+```python
+from mooncake.structured_object_store import (
+    MooncakeBundleTransfer,
+    StructuredMemberSlice,
+    StructuredObjectPayload,
+)
+```
+
+- `MooncakeBundleTransfer`: public helper facade built on a `MooncakeDistributedStore`.
+- `StructuredObjectPayload`: structured object to write. Members are passed in `buffers`, and optional object metadata is passed in `metadata`.
+- `StructuredMemberSlice`: slice selection for one structured member during reads.
+
+### Structured object write and full read
+
+Use `put_structured_object()` to write one structured object. The default read path is `read_spec(ref)`, and full-object materialization is just the default case of the partial-read API.
+
+```python
+import numpy as np
+from mooncake.store import MooncakeDistributedStore
+from mooncake.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
+
+store = MooncakeDistributedStore()
+transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
+
+payload = StructuredObjectPayload(
+    metadata={"step": 7, "layout": "rollout"},
+    buffers={
+        "tokens": np.array(range(24), dtype=np.int32).reshape(6, 4),
+        "mask": np.ones((6, 4), dtype=np.int8),
+        "prompt_ids": b"sample-ids",
+    },
+)
+
+ref = transfer.put_structured_object(payload)
+result = transfer.materialize(transfer.read_spec(ref))
+
+tokens = result.objects["tokens"]
+prompt_ids = result.objects["prompt_ids"]
+metadata = result.metadata
+```
+
+### Partial reads
+
+Read narrowing happens on top of `read_spec(ref)`:
+
+- `select_members([...])` keeps only selected members;
+- `slice_member(name, axis=0, start=..., end=...)` slices one ndarray member;
+- `materialize(spec)` returns newly materialized objects.
+
+```python
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize(spec)
+
+selected_tokens = result.objects["tokens"]
+```
+
+Current scope:
+
+- byte members support full-member reads;
+- ndarray members support full reads and sliced reads;
+- full read is the default `read_spec(ref)` case.
+
+### Reusing caller-owned destinations
+
+Use `materialize_into()` when the caller already owns the destination ndarray buffers and wants Mooncake to fill them directly.
+
+```python
+destination = np.empty((3, 4), dtype=np.int32)
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize_into(spec, {"tokens": destination})
+
+assert result.objects["tokens"] is destination
+```
+
+`materialize_into()` is only for members whose destination layout is already known to the caller. For byte members or default object reconstruction, use `materialize()`.
+
+### Generic bundle fallback
+
+If the caller does not need structured member semantics, the same helper also supports raw named bundles:
+
+- `put_bundle(...)`
+- `remove_bundle(...)`
+
+Use the bundle path when the object is just a manifest plus named payloads, and use the structured object path when callers want member selection, slicing, and ndarray-aware materialization.
+
 ## Zero-Copy API (Advanced Performance)
 
 For maximum performance, especially with RDMA networks, use the zero-copy API. This allows direct memory access without intermediate copies.
@@ -1484,18 +1589,26 @@ named shared memory object name instead of an arbitrary path.
 Unmount one or more file or shared-memory segments by segment id.
 
 ```python
-def unmount_segment(self, segment_ids: List[str]) -> int
+def unmount_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
 ```
 
 **Parameters:**
 - `segment_ids` (List[str]): Segment ids returned by `mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted. Defaults to `0`, which keeps the existing immediate unmount
+  behavior. During a positive grace period, the segment remains readable but no
+  longer accepts new allocations.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
 **Example:**
 ```python
-ret = store.unmount_segment(segment_ids)
+ret = store.unmount_segment(segment_ids, grace_period_seconds=30)
 if ret != 0:
     print("Unmount failed:", ret)
 ```
@@ -1550,19 +1663,28 @@ Unmount one or more internally allocated segments by segment id and free their
 local memory.
 
 ```python
-def unmount_and_free_segment(self, segment_ids: List[str]) -> int
+def unmount_and_free_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
 ```
 
 **Parameters:**
 - `segment_ids` (List[str]): Segment ids returned by
   `allocate_and_mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted and its local allocated memory is released. Defaults to `0`,
+  which keeps the existing immediate unmount-and-free behavior. During a
+  positive grace period, the segment remains readable but no longer accepts new
+  allocations.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
 **Example:**
 ```python
-ret = store.unmount_and_free_segment(segment_ids)
+ret = store.unmount_and_free_segment(segment_ids, grace_period_seconds=30)
 if ret != 0:
     print("Unmount and free failed:", ret)
 ```

@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <boost/functional/hash.hpp>
+#include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,7 +62,7 @@ class QueryResult {
  */
 class Client {
    public:
-    ~Client();
+    virtual ~Client();
 
     const UUID& getClientId() const { return client_id_; }
 
@@ -306,8 +308,11 @@ class Client {
     /**
      * @brief Unmounts a segment by its UUID.
      *        Logic is identical to UnmountSegment, but looks up by id.
+     * @param grace_period_ms 0 = immediate unmount (legacy behavior).
      */
-    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+    tl::expected<void, ErrorCode> UnmountSegmentById(
+        const UUID& segment_id, uint64_t grace_period_ms = 0,
+        std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -406,6 +411,49 @@ class Client {
         int64_t ssd_total_capacity_bytes);
 
     /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
+     * client. Mirror of OffloadObjectHeartbeat. Returns key->size pairs the
+     * caller (FileStorage) must read from local SSD and stage as MEMORY
+     * replicas via PromotionAllocStart + NotifyPromotionSuccess.
+     */
+    // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
+        std::unordered_map<std::string, int64_t>& promotion_objects);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * L2->L1 promotion. Returns the new replica's descriptor that the caller
+     * writes via Transfer Engine before calling NotifyPromotionSuccess.
+     */
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key);
+
+    /**
+     * @brief Release master-side promotion task after a client-side failure
+     * between PromotionAllocStart and the transfer's completion. Idempotent.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key);
+
+    /**
+     * @brief Write `slices` into the memory replica described by
+     * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
+     * PROCESSING memory replica staged by PromotionAllocStart before calling
+     * NotifyPromotionSuccess.
+     */
+    virtual ErrorCode PromotionWrite(
+        const Replica::Descriptor& memory_descriptor,
+        std::vector<Slice>& slices);
+
+    /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
      * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
@@ -492,6 +540,8 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
@@ -570,14 +620,16 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
-   private:
+   protected:
     /**
-     * @brief Private constructor to enforce creation through Create() method
+     * @brief Constructor exposed to subclasses for testing only; production
+     * code must go through Create().
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring, const std::string& protocol,
            const std::map<std::string, std::string>& labels = {});
 
+   private:
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -705,12 +757,28 @@ class Client {
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
+    // Segments in graceful unmount: readable by remote peers, not allocatable
+    // locally. TE MR remains registered until master confirms removal.
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>
+        gracefully_unmounting_segments_;
+    std::unordered_map<UUID, std::function<void(const UUID&)>,
+                       boost::hash<UUID>>
+        graceful_unmount_cleanup_callbacks_;
+
     /**
      * @brief Internal helper to unmount a segment by iterator.
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
         std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
+    void StartGracefulUnmountTimer(const UUID& segment_id,
+                                   uint64_t grace_period_ms);
+    void OnGracefulUnmountTimer(const UUID& segment_id, int retry_left);
+    bool WaitForGracefulUnmountDelay(std::chrono::milliseconds delay);
+    std::mutex graceful_unmount_timer_mutex_;
+    std::condition_variable graceful_unmount_timer_cv_;
+    bool graceful_unmount_timer_stopping_{false};
 
     // Configuration
     const std::string local_hostname_;
