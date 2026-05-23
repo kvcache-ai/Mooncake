@@ -1779,6 +1779,13 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_replica_clear_requests << ", Item="
        << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
        << batch_replica_clear_items << "), ";
+    ss << "RemoveReplica:(Req="
+       << batch_remove_replica_requests - batch_remove_replica_fails -
+              batch_remove_replica_partial_successes
+       << "/" << batch_remove_replica_partial_successes << "/"
+       << batch_remove_replica_requests << ", Item="
+       << batch_remove_replica_items - batch_remove_replica_failed_items << "/"
+       << batch_remove_replica_items << "), ";
 
     ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
        << "/" << create_move_tasks << "), ";

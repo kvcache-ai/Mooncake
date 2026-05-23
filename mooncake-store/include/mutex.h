@@ -1,7 +1,6 @@
 #ifndef THREAD_SAFETY_ANALYSIS_MUTEX_H
 #define THREAD_SAFETY_ANALYSIS_MUTEX_H
 
-#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
