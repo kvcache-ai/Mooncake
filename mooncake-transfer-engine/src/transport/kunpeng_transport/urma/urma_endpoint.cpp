@@ -427,9 +427,9 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
                 break;
             }
         }
-        if (dev_attr_.port_cnt != 0 && (
-            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE ||
-            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER)) {
+        if (dev_attr_.port_cnt != 0 &&
+            (dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE ||
+             dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER)) {
             LOG(WARNING) << "Device " << device_name
                          << " not found active port";
             if (urma_delete_context(context)) {
@@ -890,8 +890,8 @@ int UrmaEndpoint::submitPostSend(
         // Check if the jetty is in the imported_jetty_map_
         auto it = imported_jetty_map_.find(jetty_list_[jetty_index]);
         if (it == imported_jetty_map_.end()) {
-            LOG(ERROR) << "Jetty not imported for endpoint, tjetty is nullptr" <<  jetty_index
-            << ", local_nic=";
+            LOG(ERROR) << "Jetty not imported for endpoint, tjetty is nullptr"
+                       << jetty_index << ", local_nic=";
         }
         if (it != imported_jetty_map_.end()) {
             wr.tjetty = it->second;

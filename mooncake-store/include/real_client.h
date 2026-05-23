@@ -781,8 +781,7 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
-    std::vector<std::unique_ptr<void, UbSegmentDeleter>>
-        ub_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

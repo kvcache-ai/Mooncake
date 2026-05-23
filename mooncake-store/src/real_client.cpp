@@ -827,8 +827,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
             } else if (this->protocol == "ub") {
-                ub_segment_ptrs_.emplace_back(
-                    ptr, UbSegmentDeleter{mapped_size});
+                ub_segment_ptrs_.emplace_back(ptr,
+                                              UbSegmentDeleter{mapped_size});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
