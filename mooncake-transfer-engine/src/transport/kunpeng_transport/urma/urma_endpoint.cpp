@@ -428,8 +428,8 @@ int UrmaContext::openDevice(const std::string& device_name, uint8_t port,
             }
         }
         if (dev_attr_.port_cnt != 0 &&
-            (dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE ||
-             dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER)) {
+            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE &&
+            dev_attr_.port_attr[port_].state != URMA_PORT_ACTIVE_DEFER) {
             LOG(WARNING) << "Device " << device_name
                          << " not found active port";
             if (urma_delete_context(context)) {
