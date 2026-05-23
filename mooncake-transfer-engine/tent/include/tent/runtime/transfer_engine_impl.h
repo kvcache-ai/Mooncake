@@ -45,6 +45,7 @@ class ControlService;
 class SegmentTracker;
 class Platform;
 class ProxyManager;
+class ProgressWorker;
 
 struct TaskInfo {
     TransportType type{UNSPEC};
@@ -172,6 +173,11 @@ class TransferEngineImpl {
         }
     }
 
+    // Wake the optional event-driven progress worker for `batch_id`. No-op if
+    // enable_progress_worker is false. Currently used by test/integration
+    // hooks; transports will be migrated to call this in a follow-up PR.
+    void notifyBatchMaybeReady(BatchID batch_id);
+
    private:
     Status construct();
 
@@ -249,6 +255,15 @@ class TransferEngineImpl {
     bool merge_requests_;
     int max_failover_attempts_{3};
     bool enable_auto_failover_on_poll_{true};
+    bool enable_progress_worker_{false};
+
+    // Guards alive_batches_ and serializes pollTaskStatus /
+    // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
+    // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
+    // getTransferStatus can re-enter on the same thread. See issue #2116.
+    std::recursive_mutex progress_mutex_;
+    std::unordered_set<BatchID> alive_batches_;
+    std::unique_ptr<ProgressWorker> progress_worker_;
 };
 }  // namespace tent
 }  // namespace mooncake

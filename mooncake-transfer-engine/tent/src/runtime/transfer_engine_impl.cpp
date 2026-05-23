@@ -30,6 +30,7 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
+#include "tent/runtime/progress_worker.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
@@ -306,6 +307,7 @@ Status TransferEngineImpl::construct() {
     max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
+    enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -358,6 +360,11 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    if (enable_progress_worker_) {
+        progress_worker_ = std::make_unique<ProgressWorker>(this);
+        progress_worker_->start();
+    }
+
     // Initialize and start Metrics system
     auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf_.get());
     if (metrics_config.enabled) {
@@ -399,6 +406,13 @@ Status TransferEngineImpl::construct() {
 
 Status TransferEngineImpl::deconstruct() {
     // Metrics cleanup is handled automatically by TentMetrics destructor
+
+    // Stop the progress worker first so it cannot race with batch teardown
+    // below (it dereferences BatchID into Batch* via progressBatch).
+    if (progress_worker_) {
+        progress_worker_->stop();
+        progress_worker_.reset();
+    }
 
     // Destroy staging_proxy_ first: its destructor calls back into
     // unregisterLocalMemory/freeLocalMemory, which require
@@ -738,18 +752,25 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
     batch_set_.get().active.insert(batch);
-    return (BatchID)batch;
+    BatchID batch_id = (BatchID)batch;
+    {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        alive_batches_.insert(batch_id);
+    }
+    return batch_id;
 }
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
 }
 
 Status TransferEngineImpl::lazyFreeBatch() {
+    // Caller must hold progress_mutex_.
     auto& batch_set = batch_set_.get();
     for (auto it = batch_set.freelist.begin();
          it != batch_set.freelist.end();) {
@@ -766,6 +787,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
             if (transport && sub_batch) transport->freeSubBatch(sub_batch);
         }
         batch_set.active.erase(batch);
+        alive_batches_.erase((BatchID)batch);
         Slab<Batch>::Get().deallocate(batch);
         it = batch_set.freelist.erase(it);
     }
@@ -1384,6 +1406,9 @@ Status TransferEngineImpl::receiveNotification(
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                                              TransferStatus& task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
@@ -1404,6 +1429,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
 Status TransferEngineImpl::getTransferStatus(
     BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     status_list.clear();
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
@@ -1418,6 +1446,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
                                           bool allow_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    if (!alive_batches_.count(batch_id))
+        return Status::InvalidArgument("Batch is not alive" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
@@ -1487,6 +1518,10 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
 Status TransferEngineImpl::progressBatch(BatchID batch_id,
                                          TransferStatus& overall_status) {
     return getBatchStatus(batch_id, overall_status, true);
+}
+
+void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
+    if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }
 
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
