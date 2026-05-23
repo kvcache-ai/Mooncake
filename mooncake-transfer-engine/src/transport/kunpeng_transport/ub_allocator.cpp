@@ -66,7 +66,7 @@ bool ub_is_store_memory(void* addr, size_t length) {
     for (const auto& range : g_ub_store_mem_ranges) {
         auto range_start = reinterpret_cast<uintptr_t>(range.base);
         uintptr_t range_end = range_start + range.size;
-        if (addr_start < range_end && addr_end > range_start) {
+        if (addr_start >= range_start && addr_end <= range_end) {
             return true;
         }
     }
