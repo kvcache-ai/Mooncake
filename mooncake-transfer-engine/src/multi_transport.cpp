@@ -238,11 +238,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
-    if (!task.slice_count) {
-        status.s = Transport::TransferStatusEnum::FAILED;
-        task.is_finished = true;
-        return Status::OK();
-    }
+    assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = Transport::TransferStatusEnum::FAILED;

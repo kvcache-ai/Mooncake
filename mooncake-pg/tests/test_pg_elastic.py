@@ -642,7 +642,7 @@ def _fault_detection_worker(
     # among surviving active ranks.
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    degraded = int(tensor.cpu().item())
+    degraded = int(tensor.item())
     expected_degraded = _rank_sum(ctx.world_size, {BROKEN_RANK})
     if degraded != expected_degraded:
         raise AssertionError(f"degraded expected {expected_degraded}, got {degraded}")

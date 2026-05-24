@@ -447,8 +447,7 @@ int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
     if (!desc) {
         return ERR_METADATA;
     }
-    int ret = metadata_->sendProbe(desc->name);
-    return ret;
+    return metadata_->sendProbe(desc->name);
 }
 
 Transport::SegmentHandle TransferEngineImpl::openSegment(
@@ -492,7 +491,6 @@ Status TransferEngineImpl::CheckSegmentStatus(SegmentID sid) {
 }
 
 int TransferEngineImpl::closeSegment(Transport::SegmentHandle handle) {
-    if (handle > 0) metadata_->removeSegmentDescByID(handle);
     return 0;
 }
 

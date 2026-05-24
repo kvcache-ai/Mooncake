@@ -499,24 +499,6 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     return 0;
 }
 
-int TransferMetadata::removeSegmentDescByID(SegmentID segment_id) {
-    if (p2p_handshake_mode_) {
-        RWSpinlock::WriteGuard guard(segment_lock_);
-        auto iter = segment_id_to_desc_map_.find(segment_id);
-        if (iter != segment_id_to_desc_map_.end()) {
-            auto segment_name = iter->second->name;
-            LOG(INFO) << "removeSegmentDescByID " << segment_id << " ("
-                      << segment_name << ") finish";
-            segment_id_to_desc_map_.erase(iter);
-            segment_name_to_id_map_.erase(segment_name);
-        }
-        return 0;
-    }
-    // Non-P2P mode: segment_id alone is insufficient to determine the key;
-    // callers should use removeSegmentDesc(segment_name) instead.
-    return ERR_INVALID_ARGUMENT;
-}
-
 #ifdef ENABLE_MULTI_PROTOCOL
 static std::shared_ptr<TransferMetadata::SegmentDesc>
 decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,

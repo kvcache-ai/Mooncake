@@ -164,8 +164,6 @@ class TransferMetadata {
 
     int removeSegmentDesc(const std::string &segment_name);
 
-    int removeSegmentDescByID(SegmentID segment_id);
-
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
 
