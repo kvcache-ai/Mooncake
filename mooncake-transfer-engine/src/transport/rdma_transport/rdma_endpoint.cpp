@@ -748,7 +748,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
                                     std::string *reply_msg) {
-    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
+    if (qp_index < 0 || qp_index > (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
