@@ -1,3 +1,5 @@
+import re
+import os
 import sys
 import platform
 from setuptools import setup, Distribution
@@ -12,6 +14,27 @@ if sys.platform in unsupported_platforms:
         f"Error: mooncake does not support {platform.system()} at this time. "
         "Please use a supported Linux distribution."
     )
+
+
+def get_version():
+    """Read version from mooncake/__init__.py."""
+    init_path = os.path.join("mooncake", "__init__.py")
+    try:
+        with open(init_path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Unable to read package version: failed to open '{init_path}': {exc}"
+        ) from exc
+    
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', content)
+    if not match:
+        raise RuntimeError(
+            f"Unable to determine package version: '__version__' not found in '{init_path}'.\n"
+            "Expected a line like: __version__ = \"x.y.z\""
+        )
+    
+    return match.group(1)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -166,6 +189,11 @@ class CustomBdistWheel(bdist_wheel):
 # setup()
 # ---------------------------------------------------------------------------
 setup(
+    name="mooncake-transfer-engine",  
+    version=get_version(),  
     distclass=BinaryDistribution,
     cmdclass={"bdist_wheel": CustomBdistWheel},
+    install_requires=[
+        'packaging>=21.0',  
+    ],
 )
