@@ -121,7 +121,7 @@ Environ::Environ() {
     use_tent_ = GetBool("MC_USE_TENT", false);
     use_tev1_ = GetBool("MC_USE_TEV1", false);
     ylt_log_level_ = GetString("MC_YLT_LOG_LEVEL", "");
-    with_nvidia_peermem_ = GetBool("WITH_NVIDIA_PEERMEM", false);
+    with_nvidia_peermem_ = GetBool("WITH_NVIDIA_PEERMEM", true);
 }
 
 }  // namespace mooncake
