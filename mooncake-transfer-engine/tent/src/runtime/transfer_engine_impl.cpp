@@ -1332,13 +1332,33 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
                                                    TransferStatus& task_status,
                                                    bool allow_failover) {
     auto& task = batch->task_list[task_id];
-    task.status = task_status.s;
-    if (!allow_failover || task_status.s != FAILED || task.type == UNSPEC)
-        return;
 
+    if (task_status.s != FAILED) {
+        task.status = task_status.s;
+        task.failover_pending = false;
+        return;
+    }
+
+    if (task.type == UNSPEC) {
+        task.status = FAILED;
+        task.failover_pending = false;
+        return;
+    }
+
+    // Observation-only polling records that this task has seen a failure, but
+    // leaves the failover decision to the progress-driving path.
+    if (!allow_failover) {
+        task.status = FAILED;
+        task.failover_pending = true;
+        return;
+    }
+
+    task.status = FAILED;
+    task.failover_pending = false;
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
+        task.failover_pending = false;
     }
 }
 
@@ -1388,14 +1408,15 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto& task = batch->task_list[task_id];
-    auto prev_status = task.status;
+    auto prev_status = task.failover_pending ? PENDING : task.status;
     CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
     updateTaskStatusAfterPoll(batch, task_id, task_status,
                               enable_auto_failover_on_poll_);
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
-                                task_status.s);
+                                task.failover_pending ? PENDING
+                                                      : task.status);
 
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
@@ -1437,7 +1458,10 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
         TransferStatus task_status;
-        if (task.status != PENDING) {
+        if (allow_failover && task.status == FAILED && task.failover_pending) {
+            task_status.s = FAILED;
+            task_status.transferred_bytes = 0;
+        } else if (task.status != PENDING) {
             if (task.status == COMPLETED) {
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;
@@ -1447,9 +1471,10 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                     worst_failure = task.status;
             }
             continue;
+        } else {
+            CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
         }
-        auto prev_status = task.status;
-        CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
+        auto prev_status = task.failover_pending ? PENDING : task.status;
         updateTaskStatusAfterPoll(batch, task_id, task_status, allow_failover);
 
         if (task_status.s == COMPLETED) {
@@ -1463,7 +1488,8 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
-                                    task_status.s);
+                                    task.failover_pending ? PENDING
+                                                          : task.status);
     }
     // Determine overall status: COMPLETED only when all succeed; FAILED only
     // when all tasks are terminal (no in-flight work) and at least one failed;

@@ -312,7 +312,8 @@ class TransferEngine {
     // regardless of enable_auto_failover_on_poll. The call is non-blocking and
     // performs at most one state-machine step per task; callers that want to
     // wait for completion must invoke it in a loop. PENDING means "make
-    // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
+    // progress later"; internally latched terminal states (COMPLETED/FAILED)
+    // will not be revived.
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
    private:

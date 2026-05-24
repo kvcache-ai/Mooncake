@@ -54,6 +54,7 @@ struct TaskInfo {
     Request request;
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
+    bool failover_pending{false};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};  // For latency tracking
     int failover_count{0};  // Number of cross-transport failover attempts
