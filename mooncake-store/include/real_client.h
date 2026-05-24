@@ -449,12 +449,8 @@ class RealClient : public PyClient {
 
     tl::expected<HeartbeatResponse, ErrorCode> ping(const UUID& client_id);
 
-    std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
-
     std::string protocol;
     std::string device_name;
-    std::string local_ip;
-    uint16_t te_port = 0;
 
     struct MappedShm {
         std::string shm_name;

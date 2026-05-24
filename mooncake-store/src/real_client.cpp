@@ -185,19 +185,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
         (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr) &&
         this->protocol != "ascend";
 
-    if (config.te_port == 0) {
-        // Create port binder to hold a port
-        port_binder_ = std::make_unique<AutoPortBinder>();
-        int port = port_binder_->getPort();
-        if (port < 0) {
-            LOG(ERROR) << "Failed to bind available port";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        config.te_port = static_cast<uint16_t>(port);
-    }
-    this->local_ip = config.local_ip;
-    this->te_port = config.te_port;
-
     auto client_opt = mooncake::ClientService::Create(config);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
@@ -288,9 +275,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     // Reset all resources
     client_service_.reset();
     client_buffer_allocator_.reset();
-    port_binder_.reset();
-    local_ip = "";
-    te_port = 0;
     device_name = "";
     protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -1007,7 +991,7 @@ int64_t RealClient::get_into(const std::string& key, void* buffer, size_t size,
 }
 
 std::string RealClient::get_hostname() const {
-    return local_ip + ":" + std::to_string(te_port);
+    return client_service_ ? client_service_->local_endpoint() : "";
 }
 
 std::vector<int> RealClient::batch_put_from(

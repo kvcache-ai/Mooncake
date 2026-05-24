@@ -22,11 +22,10 @@ namespace mooncake {
 // ============================================================================
 
 P2PClientService::P2PClientService(
-    const std::string& local_ip, uint16_t te_port,
     const std::string& metadata_connstring, uint16_t metrics_port,
     bool enable_metrics_http, const std::map<std::string, std::string>& labels)
-    : ClientService(local_ip, te_port, metadata_connstring, metrics_port,
-                    enable_metrics_http, labels),
+    : ClientService(metadata_connstring, metrics_port, enable_metrics_http,
+                    labels),
       metrics_(P2PClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr) {}
@@ -139,9 +138,9 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     // 5. Initialize transfer engine (local operation, no master dependency)
     if (config.transfer_engine == nullptr) {
-        transfer_engine_ = std::make_shared<TransferEngine>();
-        err = InitTransferEngine(local_endpoint(), metadata_connstring_,
-                                 config.protocol, config.rdma_devices);
+        err = InitTransferEngine(config.local_ip, config.te_port,
+                                 metadata_connstring_, config.protocol,
+                                 config.rdma_devices);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return err;

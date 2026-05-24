@@ -62,8 +62,8 @@ class HAIntegrationTest : public ::testing::Test {
             /*labels=*/{}, async_sender_thread_count);
 
         auto client = std::make_shared<P2PClientService>(
-            config.local_ip, config.te_port, config.metadata_connstring,
-            config.metrics_port, config.enable_metrics_http, config.labels);
+            config.metadata_connstring, config.metrics_port,
+            config.enable_metrics_http, config.labels);
 
         auto err = client->Init(config);
         EXPECT_EQ(err, ErrorCode::OK)
