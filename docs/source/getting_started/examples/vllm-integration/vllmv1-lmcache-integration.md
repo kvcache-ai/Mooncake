@@ -65,8 +65,8 @@ lmcache server \
     "metadata_server": "P2PHANDSHAKE",
     "protocol": "rdma",
     "rdma_devices": "{RDMA device}",
-    "global_segment_size": "3221225472",
-    "local_buffer_size": "3221225472",
+    "global_segment_size": "32212254720",
+    "local_buffer_size": "1073741824",
     "master_server_addr": "127.0.0.1:50051"
   }'
 ```
