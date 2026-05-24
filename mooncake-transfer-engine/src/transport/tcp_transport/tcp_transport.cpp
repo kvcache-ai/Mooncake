@@ -56,8 +56,8 @@ static bool isCudaMemory(void* addr) {
 }
 
 static cudaError_t cudaMemcpyOnNonBlockingStream(void* dst, const void* src,
-                                                size_t size,
-                                                const void* cuda_addr) {
+                                                 size_t size,
+                                                 const void* cuda_addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, cuda_addr);
     if (status != cudaSuccess || attributes.type != cudaMemoryTypeDevice) {

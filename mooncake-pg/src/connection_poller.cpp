@@ -245,8 +245,7 @@ void ConnectionContext::markPeerDisconnected(int pollingRank,
     auto& peerState = peerStates_[pollingRank];
 
     LOG(WARNING) << "Rank " << rank_ << " marking peer " << pollingRank
-                 << " disconnected: " << reason
-                 << " oldSegmentId="
+                 << " disconnected: " << reason << " oldSegmentId="
                  << (peerState.segmentId.has_value()
                          ? std::to_string(peerState.segmentId.value())
                          : "null");
@@ -334,8 +333,8 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             auto segment_id = engine_->openSegment(peerServerName);
             if (segment_id == static_cast<TransferMetadata::SegmentID>(-1)) {
-                LOG(WARNING) << "ConnectionContext rank=" << rank_ << " peer="
-                             << pollingRank
+                LOG(WARNING) << "ConnectionContext rank=" << rank_
+                             << " peer=" << pollingRank
                              << " openSegment failed, server may not be ready";
                 peerState.increaseCheckStoreBackoff();
                 return false;

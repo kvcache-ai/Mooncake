@@ -165,10 +165,8 @@ void MooncakeWorker::startWorker() {
                         }
                         if (j != group->rank &&
                             group->engine->probePeerAliveByID(
-                                group->segmentIDs[j]) !=
-                                PeerLiveness::Alive) {
-                            markPeerBroken(group, j, "preparing",
-                                           task.opType);
+                                group->segmentIDs[j]) != PeerLiveness::Alive) {
+                            markPeerBroken(group, j, "preparing", task.opType);
                             continue;
                         }
                         uint64_t source = group->segmentInfos[group->rank]
