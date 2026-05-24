@@ -1414,9 +1414,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                               enable_auto_failover_on_poll_);
 
     // Record metrics when task transitions to terminal state
-    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
-                                task.failover_pending ? PENDING
-                                                      : task.status);
+    recordTaskCompletionMetrics(
+        batch->task_list[task_id], prev_status,
+        task.failover_pending ? PENDING : task.status);
 
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
@@ -1487,9 +1487,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         }
 
         // Record metrics when task transitions to terminal state
-        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
-                                    task.failover_pending ? PENDING
-                                                          : task.status);
+        recordTaskCompletionMetrics(
+            batch->task_list[task_id], prev_status,
+            task.failover_pending ? PENDING : task.status);
     }
     // Determine overall status: COMPLETED only when all succeed; FAILED only
     // when all tasks are terminal (no in-flight work) and at least one failed;
