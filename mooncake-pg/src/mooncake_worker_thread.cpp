@@ -38,16 +38,6 @@ void markPeerBroken(TransferGroupMeta* group, int peerRank, const char* phase,
     group->peerConnected[peerRank] = false;
     group->activeRanks[peerRank] = false;
     group->activeRanksTensor[peerRank] = 0;
-
-    // Invalidate the cached segment ID so that any subsequent submitTransfer
-    // (including P2P proxy or sync-phase writes) will fail at selectTransport
-    // instead of submitting RDMA operations to a dead peer.  closeSegment only
-    // clears the metadata cache and is safe to call even when there are still
-    // in-flight transfers.
-    if (group->segmentIDs[peerRank] != 0) {
-        group->engine->closeSegment(group->segmentIDs[peerRank]);
-    }
-    group->segmentIDs[peerRank] = static_cast<TransferMetadata::SegmentID>(-1);
 }
 
 void freeBatchID(TransferGroupMeta* group, BatchID batchID) {
@@ -163,12 +153,6 @@ void MooncakeWorker::startWorker() {
                             markPeerBroken(group, j, "preparing", task.opType);
                             continue;
                         }
-                        if (j != group->rank &&
-                            group->engine->probePeerAliveByID(
-                                group->segmentIDs[j]) != PeerLiveness::Alive) {
-                            markPeerBroken(group, j, "preparing", task.opType);
-                            continue;
-                        }
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
@@ -222,21 +206,7 @@ void MooncakeWorker::startWorker() {
                     }
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
-                    auto submit_status =
-                        group->engine->submitTransfer(task.batchID, entries);
-                    if (!submit_status.ok()) {
-                        LOG(ERROR) << "Worker submitTransfer failed: "
-                                   << submit_status.message();
-                        for (int j = 0; j < group->size; ++j) {
-                            if (rankToTaskId[i][j] != kInvalidTaskId) {
-                                markPeerBroken(group, j, "submitting",
-                                               task.opType);
-                            }
-                        }
-                        freeBatchID(group, task.batchID);
-                        task.batchID = 0;
-                        continue;
-                    }
+                    group->engine->submitTransfer(task.batchID, entries);
                     submitted_task_sequence_[i].store(
                         submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();

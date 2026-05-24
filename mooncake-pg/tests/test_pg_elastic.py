@@ -26,23 +26,6 @@ def _rank_sum(world_size: int, excluded: set[int] | None = None) -> int:
     return sum(rank for rank in range(world_size) if rank not in excluded)
 
 
-def _mark_ready_and_wait(
-    ctx: MooncakePGWorkerContext,
-    prefix: str,
-    rank: int,
-    ranks: list[int],
-    *,
-    timeout_s: float = 30.0,
-) -> None:
-    ctx.result_map[f"{prefix}_{rank}"] = True
-    wait_until(
-        lambda: all(f"{prefix}_{item}" in ctx.result_map for item in ranks),
-        timeout_s=timeout_s,
-        poll_interval_s=0.05,
-        description=f"{prefix} ready ranks {ranks}",
-    )
-
-
 def _dynamic_world_size_worker(
     ctx: MooncakePGWorkerContext,
 ) -> None:

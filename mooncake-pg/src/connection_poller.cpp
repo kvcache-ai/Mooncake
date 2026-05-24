@@ -260,14 +260,26 @@ void ConnectionContext::markPeerDisconnected(int pollingRank,
 
     p2p_proxy_->resetPeerState(pollingRank);
 
+    // Reset store
+    try {
+        store_->deleteKey(getServerNameStoreKey(backendIndex_, pollingRank));
+        store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
+        store_->deleteKey(
+            getExtensionStateStoreKey(backendIndex_, pollingRank));
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "Rank " << rank_
+                     << " got an exception when deleteKey for peer "
+                     << pollingRank << ": " << e.what();
+    }
+
     // closeSegment now only clears the metadata cache, so it is safe to
     // call even when the worker thread may still have inflight transfers.
     // Clearing the cache prevents the connection poller from reusing a
     // stale segment descriptor and submitting RDMA writes to a dead peer,
     // which is what actually triggers fatal async events.
-    //
-    // Do NOT call freeBatchID here: the worker thread may still be
-    // polling the batch status.
+    if (peerState.warmupBatchId.has_value()) {
+        engine_->freeBatchID(peerState.warmupBatchId.value());
+    }
     if (peerState.segmentId.has_value()) {
         engine_->closeSegment(peerState.segmentId.value());
     }
@@ -328,8 +340,6 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.increaseCheckStoreBackoff();
                 return false;
             }
-
-            peerState.serverName = peerServerName;
 
             auto segment_id = engine_->openSegment(peerServerName);
             if (segment_id == static_cast<TransferMetadata::SegmentID>(-1)) {
@@ -414,9 +424,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             } else if (status.s == TransferStatusEnum::FAILED) {
                 LOG(WARNING) << "Warmup request " << rank_ << " -> "
                              << pollingRank << " failed.";
-                // Free resources and retry. Keep serverName so the next
-                // store poll can tell whether metadata still points to the
-                // same dead process or a replacement has overwritten it.
+                // Free resources and retry.
                 engine_->freeBatchID(peerState.warmupBatchId.value());
                 engine_->closeSegment(peerState.segmentId.value());
                 peerState.warmupBatchId = std::nullopt;

@@ -34,7 +34,6 @@ struct PeerConnection {
     PeerConnectionState state{PeerConnectionState::WAITING_STORE};
     std::optional<BatchID> warmupBatchId{std::nullopt};
     std::optional<TransferMetadata::SegmentID> segmentId{std::nullopt};
-    std::string serverName;
 
     // Whether this peer has been counted in `totalConnectedPeers_`.
     // Note that ConnectionPoller may establish connections for ranks beyond
