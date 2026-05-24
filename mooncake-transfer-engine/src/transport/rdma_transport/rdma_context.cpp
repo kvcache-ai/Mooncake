@@ -150,20 +150,8 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
-#ifdef USE_MLX5DV
-    {
-        mlx5dv_context dv_ctx = {};
-        dv_ctx.comp_mask = MLX5DV_CONTEXT_MASK_NUM_LAG_PORTS;
-        if (mlx5dv_query_device(context_, &dv_ctx) == 0)
-            num_lag_ports_ = dv_ctx.num_lag_ports;
-    }
-    LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
-              << ", GID: (GID_Index " << gid_index_ << ") " << gid()
-              << ", num_lag_ports: " << (int)num_lag_ports_;
-#else
     LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
-#endif
 
     return 0;
 }

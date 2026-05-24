@@ -123,7 +123,6 @@ if (ENABLE_MULTI_PROTOCOL)
 endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
-option(USE_MLX5DV "enable mlx5 direct verbs (libmlx5) for QP UDP source port override" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
 if (USE_LRU_MASTER)
