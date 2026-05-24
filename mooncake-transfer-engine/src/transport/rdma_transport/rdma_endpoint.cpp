@@ -33,6 +33,28 @@ namespace mooncake {
 const static uint8_t MAX_HOP_LIMIT = 16;
 const static uint8_t TIMEOUT = 14;
 const static uint8_t RETRY_CNT = 7;
+using RdmaEceDesc = TransferMetadata::RdmaEceDesc;
+
+namespace {
+RdmaEceDesc toEceDesc(const ibv_ece &ece, int supported) {
+    RdmaEceDesc desc;
+    desc.supported = supported != 0;
+    if (desc.supported) {
+        desc.vendor_id = ece.vendor_id;
+        desc.options = ece.options;
+        desc.comp_mask = ece.comp_mask;
+    }
+    return desc;
+}
+
+ibv_ece toIbvEce(const RdmaEceDesc &desc) {
+    ibv_ece ece = {};
+    ece.vendor_id = desc.vendor_id;
+    ece.options = desc.options;
+    ece.comp_mask = desc.comp_mask;
+    return ece;
+}
+}  // namespace
 
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
@@ -59,6 +81,8 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
+    ece_list_.assign(num_qp_list, ibv_ece{});
+    ece_supported_list_.assign(num_qp_list, 0);
     cq_outstanding_ = (volatile int *)cq->cq_context;
 
     max_wr_depth_ = (int)max_wr_depth;
@@ -158,6 +182,8 @@ int RdmaEndPoint::deconstructLocked() {
     if (result) return result;
 
     qp_list_.clear();
+    ece_list_.clear();
+    ece_supported_list_.clear();
     peer_qp_num_list_.clear();
     delete[] wr_depth_list_;
     wr_depth_list_ = nullptr;
@@ -272,7 +298,11 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            return doSetupConnection(context_.gid(), context_.lid(), qpNum());
+            int ret = prepareQpsForHandshake();
+            if (ret) return ret;
+            auto local_qp_ece = qpEce();
+            return doSetupConnection(context_.gid(), context_.lid(), qpNum(),
+                                     local_qp_ece, &local_qp_ece);
         }
 
         // Only proceed with RPC if we are the first to transition from
@@ -291,11 +321,18 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 return ERR_INVALID_ARGUMENT;
             }
 
+            int ret = prepareQpsForHandshake();
+            if (ret) {
+                disconnectUnlocked();
+                return ret;
+            }
+
             local_desc.local_nic_path = context_.nicPath();
             local_desc.local_lid = context_.lid();
             local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
+            local_desc.qp_ece = qpEce();
         }
     }
 
@@ -397,7 +434,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
     if (!peer_desc.local_gid.empty()) {
         int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
-                                    peer_desc.qp_num);
+                                    peer_desc.qp_num, peer_desc.qp_ece);
         if (ret != 0) {
             resetConnection("failed connection setup (active)");
         }
@@ -408,8 +445,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
         if (segment_desc) {
             for (auto &nic : segment_desc->devices) {
                 if (nic.name == peer_nic_name) {
-                    int ret =
-                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
+                    int ret = doSetupConnection(nic.gid, nic.lid,
+                                                peer_desc.qp_num,
+                                                peer_desc.qp_ece);
                     if (ret != 0) {
                         resetConnection("failed connection setup (active)");
                     }
@@ -435,6 +473,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
             local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
+            local_desc.qp_ece = qpEce();
             LOG(INFO) << "Received same peer QP numbers, reusing connection.";
             return 0;
         }
@@ -478,10 +517,13 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     local_desc.local_gid = context_.gid();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = qpNum();
+    local_desc.qp_ece = qpEce();
 
     if (!peer_desc.local_gid.empty()) {
         int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
-                                    peer_desc.qp_num, &local_desc.reply_msg);
+                                    peer_desc.qp_num, peer_desc.qp_ece,
+                                    &local_desc.qp_ece,
+                                    &local_desc.reply_msg);
         if (ret != 0) {
             resetConnection("failed connection setup (passive)");
         }
@@ -492,9 +534,11 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         if (segment_desc) {
             for (auto &nic : segment_desc->devices) {
                 if (nic.name == peer_nic_name) {
-                    int ret =
-                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
-                                          &local_desc.reply_msg);
+                    int ret = doSetupConnection(nic.gid, nic.lid,
+                                                peer_desc.qp_num,
+                                                peer_desc.qp_ece,
+                                                &local_desc.qp_ece,
+                                                &local_desc.reply_msg);
                     if (ret != 0) {
                         resetConnection("failed connection setup (passive)");
                     }
@@ -673,6 +717,89 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     return ret;
 }
 
+std::vector<RdmaEceDesc> RdmaEndPoint::qpEce() const {
+    std::vector<RdmaEceDesc> ret;
+    if (!globalConfig().ib_enable_ece) return ret;
+    ret.reserve(ece_list_.size());
+    for (size_t qp_index = 0; qp_index < ece_list_.size(); ++qp_index) {
+        int supported = 0;
+        if (qp_index < ece_supported_list_.size())
+            supported = ece_supported_list_[qp_index];
+        ret.push_back(toEceDesc(ece_list_[qp_index], supported));
+    }
+    return ret;
+}
+
+int RdmaEndPoint::prepareQpsForHandshake(std::string *reply_msg) {
+    for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
+        int ret = resetQpToInit(qp_index, reply_msg);
+        if (ret) return ret;
+        queryQpEce(qp_index, "handshake");
+    }
+    return 0;
+}
+
+int RdmaEndPoint::resetQpToInit(int qp_index, std::string *reply_msg) {
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
+        return ERR_INVALID_ARGUMENT;
+    auto &qp = qp_list_[qp_index];
+
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RESET;
+    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    if (ret) {
+        std::string message = "Failed to modify QP to RESET";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        return ERR_ENDPOINT;
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_INIT;
+    attr.port_num = context_.portNum();
+    attr.pkey_index = globalConfig().pkey_index;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
+    ret = ibv_modify_qp(
+        qp, &attr,
+        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    if (ret) {
+        std::string message =
+            "Failed to modify QP to INIT, check local context port num";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        return ERR_ENDPOINT;
+    }
+    return 0;
+}
+
+void RdmaEndPoint::queryQpEce(int qp_index, const char *stage) {
+    if (!globalConfig().ib_enable_ece) return;
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size() ||
+        qp_index >= (int)ece_list_.size() ||
+        qp_index >= (int)ece_supported_list_.size())
+        return;
+
+    int ece_ret = ibv_query_ece(qp_list_[qp_index], &ece_list_[qp_index]);
+    if (ece_ret == 0) {
+        ece_supported_list_[qp_index] = 1;
+        VLOG(1) << "[RDMA] QP[" << qp_index
+                << "] qpn=" << qp_list_[qp_index]->qp_num
+                << " ECE query at " << stage << " supported vendor_id=0x"
+                << std::hex << ece_list_[qp_index].vendor_id << " options=0x"
+                << ece_list_[qp_index].options << " comp_mask=0x"
+                << ece_list_[qp_index].comp_mask << std::dec;
+    } else {
+        ece_supported_list_[qp_index] = 0;
+        ece_list_[qp_index] = {};
+        LOG_FIRST_N(WARNING, 4)
+            << "[RDMA] ibv_query_ece failed on QP[" << qp_index
+            << "] qpn=" << qp_list_[qp_index]->qp_num << " at " << stage
+            << ": " << strerror(ece_ret) << "; ECE disabled for this QP";
+    }
+}
+
 static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
     if (gid_str.empty()) {
         LOG(ERROR) << "GID string is empty";
@@ -714,6 +841,9 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
+                                    const std::vector<RdmaEceDesc>
+                                        &peer_qp_ece_list,
+                                    std::vector<RdmaEceDesc> *local_qp_ece_list,
                                     std::string *reply_msg) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
@@ -734,9 +864,21 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         return ret;
     }
 
+    if (local_qp_ece_list && globalConfig().ib_enable_ece &&
+        local_qp_ece_list->size() < qp_list_.size()) {
+        local_qp_ece_list->resize(qp_list_.size());
+    }
+
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
+        const RdmaEceDesc *peer_ece = nullptr;
+        if (qp_index < (int)peer_qp_ece_list.size())
+            peer_ece = &peer_qp_ece_list[qp_index];
+        RdmaEceDesc *local_ece = nullptr;
+        if (local_qp_ece_list && qp_index < (int)local_qp_ece_list->size())
+            local_ece = &(*local_qp_ece_list)[qp_index];
         int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
-                                    peer_qp_num_list[qp_index], reply_msg);
+                                    peer_qp_num_list[qp_index], peer_ece,
+                                    local_ece, reply_msg);
         if (ret) return ret;
     }
 
@@ -747,42 +889,43 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
+                                    const RdmaEceDesc *peer_ece,
+                                    RdmaEceDesc *local_ece,
                                     std::string *reply_msg) {
-    if (qp_index < 0 || qp_index > (int)qp_list_.size())
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
-    // Any state -> RESET
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+    int ret = resetQpToInit(qp_index, reply_msg);
     if (ret) {
-        std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+        return ret;
     }
+    queryQpEce(qp_index, "setup");
 
-    // RESET -> INIT
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_INIT;
-    attr.port_num = context_.portNum();
-    attr.pkey_index = globalConfig().pkey_index;
-    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
-    ret = ibv_modify_qp(
-        qp, &attr,
-        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-    if (ret) {
-        std::string message =
-            "Failed to modify QP to INIT, check local context port num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
+    if (globalConfig().ib_enable_ece && peer_ece && peer_ece->supported &&
+        qp_index < (int)ece_supported_list_.size() &&
+        ece_supported_list_[qp_index]) {
+        ibv_ece remote_ece = toIbvEce(*peer_ece);
+        int ece_ret = ibv_set_ece(qp, &remote_ece);
+        if (ece_ret == 0) {
+            ece_list_[qp_index] = remote_ece;
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " ECE set vendor_id=0x" << std::hex
+                    << remote_ece.vendor_id << " options=0x"
+                    << remote_ece.options << " comp_mask=0x"
+                    << remote_ece.comp_mask << std::dec;
+        } else {
+            ece_list_[qp_index] = {};
+            ece_supported_list_[qp_index] = 0;
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] ibv_set_ece failed on QP[" << qp_index
+                << "] qpn=" << qp->qp_num << ": " << strerror(ece_ret)
+                << "; continuing without ECE on this QP";
+        }
     }
 
     // INIT -> RTR
+    ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
     attr.path_mtu = context_.activeMTU();
@@ -836,6 +979,36 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
+    }
+
+    if (local_ece) {
+        *local_ece = toEceDesc(ece_list_[qp_index],
+                               qp_index < (int)ece_supported_list_.size()
+                                   ? ece_supported_list_[qp_index]
+                                   : 0);
+    }
+    if (globalConfig().ib_enable_ece && local_ece &&
+        qp_index < (int)ece_supported_list_.size() &&
+        ece_supported_list_[qp_index]) {
+        ibv_ece reduced_ece = {};
+        int ece_ret = ibv_query_ece(qp, &reduced_ece);
+        if (ece_ret == 0) {
+            ece_list_[qp_index] = reduced_ece;
+            *local_ece = toEceDesc(reduced_ece, 1);
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " reduced ECE vendor_id=0x" << std::hex
+                    << reduced_ece.vendor_id << " options=0x"
+                    << reduced_ece.options << " comp_mask=0x"
+                    << reduced_ece.comp_mask << std::dec;
+        } else {
+            ece_list_[qp_index] = {};
+            ece_supported_list_[qp_index] = 0;
+            *local_ece = RdmaEceDesc{};
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] ibv_query_ece after RTS failed on QP[" << qp_index
+                << "] qpn=" << qp->qp_num << ": " << strerror(ece_ret)
+                << "; reporting ECE unsupported for this QP";
+        }
     }
 
     // Optional: pin QP to a specific LAG port for even traffic distribution

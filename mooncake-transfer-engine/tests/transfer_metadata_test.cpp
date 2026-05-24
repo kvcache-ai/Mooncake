@@ -123,6 +123,25 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     ASSERT_EQ(re, 0);
 }
 
+TEST(TransferMetadataHandshakeDescTest, CarriesPerQpEceMetadata) {
+    TransferMetadata::HandShakeDesc desc;
+    TransferMetadata::RdmaEceDesc ece;
+    ece.supported = true;
+    ece.vendor_id = 0x1234;
+    ece.options = 0x5678;
+    ece.comp_mask = 0x9abc;
+
+    desc.qp_num = {11, 22};
+    desc.qp_ece = {ece, TransferMetadata::RdmaEceDesc{}};
+
+    ASSERT_EQ(desc.qp_ece.size(), desc.qp_num.size());
+    EXPECT_TRUE(desc.qp_ece[0].supported);
+    EXPECT_EQ(desc.qp_ece[0].vendor_id, 0x1234u);
+    EXPECT_EQ(desc.qp_ece[0].options, 0x5678u);
+    EXPECT_EQ(desc.qp_ece[0].comp_mask, 0x9abcu);
+    EXPECT_FALSE(desc.qp_ece[1].supported);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

@@ -64,6 +64,7 @@ struct GlobalConfig {
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
+    bool ib_enable_ece = true;
     // mlx5 QP UDP source ports for ECMP path diversification.
     // Empty = no modification. QP at index i uses
     // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,

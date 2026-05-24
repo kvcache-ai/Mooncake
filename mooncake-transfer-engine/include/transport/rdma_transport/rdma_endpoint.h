@@ -148,14 +148,24 @@ class RdmaEndPoint {
     size_t getQPNumber() const;
 
    private:
+    using RdmaEceDesc = TransferMetadata::RdmaEceDesc;
+
     std::vector<uint32_t> qpNum() const;
+    std::vector<RdmaEceDesc> qpEce() const;
+    int prepareQpsForHandshake(std::string *reply_msg = nullptr);
+    int resetQpToInit(int qp_index, std::string *reply_msg = nullptr);
+    void queryQpEce(int qp_index, const char *stage);
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
+                          const std::vector<RdmaEceDesc> &peer_qp_ece_list = {},
+                          std::vector<RdmaEceDesc> *local_qp_ece_list = nullptr,
                           std::string *reply_msg = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
+                          const RdmaEceDesc *peer_ece,
+                          RdmaEceDesc *local_ece,
                           std::string *reply_msg = nullptr);
 
    private:
@@ -180,6 +190,8 @@ class RdmaEndPoint {
 
     RWSpinlock lock_;
     std::vector<ibv_qp *> qp_list_;
+    std::vector<ibv_ece> ece_list_;
+    std::vector<int> ece_supported_list_;
 
     std::string peer_nic_path_;
     std::vector<uint32_t> peer_qp_num_list_;

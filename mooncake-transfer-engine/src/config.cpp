@@ -22,6 +22,25 @@
 #include <unistd.h>
 
 namespace mooncake {
+namespace {
+bool parseBooleanEnv(const char* value, bool& out) {
+    if (!value) return false;
+    if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+        strcmp(value, "TRUE") == 0 || strcmp(value, "on") == 0 ||
+        strcmp(value, "ON") == 0) {
+        out = true;
+        return true;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "FALSE") == 0 || strcmp(value, "off") == 0 ||
+        strcmp(value, "OFF") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
 void loadGlobalConfig(GlobalConfig& config) {
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
@@ -358,6 +377,18 @@ void loadGlobalConfig(GlobalConfig& config) {
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_IB_TC environment value: "
                          << traffic_class_env << ". Error: " << e.what();
+        }
+    }
+
+    const char* ib_enable_ece_env = std::getenv("MC_IB_ENABLE_ECE");
+    if (ib_enable_ece_env && *ib_enable_ece_env) {
+        bool val = false;
+        if (parseBooleanEnv(ib_enable_ece_env, val)) {
+            config.ib_enable_ece = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_IB_ENABLE_ECE, it should be "
+                            "0|1|true|false|on|off";
         }
     }
 

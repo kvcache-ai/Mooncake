@@ -76,6 +76,16 @@ struct TransferHandshakeUtil {
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
+        Json::Value qpEces(Json::arrayValue);
+        for (const auto &ece : desc.qp_ece) {
+            Json::Value eceJson;
+            eceJson["supported"] = ece.supported;
+            eceJson["vendor_id"] = ece.vendor_id;
+            eceJson["options"] = ece.options;
+            eceJson["comp_mask"] = ece.comp_mask;
+            qpEces.append(eceJson);
+        }
+        root["qp_ece"] = qpEces;
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -110,6 +120,20 @@ struct TransferHandshakeUtil {
 #endif
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
+        if (root.isMember("qp_ece") && root["qp_ece"].isArray()) {
+            for (const auto &eceJson : root["qp_ece"]) {
+                TransferMetadata::RdmaEceDesc ece;
+                if (eceJson.isMember("supported"))
+                    ece.supported = eceJson["supported"].asBool();
+                if (eceJson.isMember("vendor_id"))
+                    ece.vendor_id = eceJson["vendor_id"].asUInt();
+                if (eceJson.isMember("options"))
+                    ece.options = eceJson["options"].asUInt();
+                if (eceJson.isMember("comp_mask"))
+                    ece.comp_mask = eceJson["comp_mask"].asUInt();
+                desc.qp_ece.push_back(ece);
+            }
+        }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
         desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address

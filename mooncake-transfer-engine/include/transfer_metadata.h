@@ -116,6 +116,13 @@ class TransferMetadata {
         int sockfd;  // local cache
     };
 
+    struct RdmaEceDesc {
+        bool supported = false;
+        uint32_t vendor_id = 0;
+        uint32_t options = 0;
+        uint32_t comp_mask = 0;
+    };
+
     struct HandShakeDesc {
         std::string local_nic_path;
         uint16_t local_lid = 0;
@@ -128,6 +135,7 @@ class TransferMetadata {
         uint16_t barex_port;
 #endif
         std::vector<uint32_t> qp_num;
+        std::vector<RdmaEceDesc> qp_ece;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
