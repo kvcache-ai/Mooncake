@@ -932,30 +932,44 @@ inline std::string get_config(const ConfigDict &config, const std::string &key,
     return (it != config.end()) ? it->second : default_value;
 }
 
-inline size_t get_config_size(const ConfigDict &config, const std::string &key,
-                              size_t default_value) {
+inline std::string trim_config_value(std::string value) {
+    value.erase(0, value.find_first_not_of(" \t\r\n"));
+    auto last = value.find_last_not_of(" \t\r\n");
+    if (last == std::string::npos) {
+        value.clear();
+    } else {
+        value.erase(last + 1);
+    }
+    return value;
+}
+
+inline std::optional<size_t> get_config_size(const ConfigDict &config,
+                                             const std::string &key,
+                                             size_t default_value) {
     auto it = config.find(key);
     if (it == config.end()) {
         return default_value;
     }
-    const std::string &value = it->second;
-    // Check for negative numbers (stoull incorrectly parses "-1" as large val)
-    if (!value.empty() && value[0] == '-') {
-        LOG(WARNING) << "Invalid negative value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
+    const std::string value = trim_config_value(it->second);
+    if (value.empty() || value[0] == '-') {
+        LOG(ERROR) << "Invalid value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
     }
-    try {
-        return std::stoull(value);
-    } catch (const std::invalid_argument &e) {
-        LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    } catch (const std::out_of_range &e) {
-        LOG(WARNING) << "Value out of range for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
+
+    auto parsed_size_opt = try_string_to_byte_size(value);
+    if (!parsed_size_opt.has_value()) {
+        LOG(ERROR) << "Invalid size value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
     }
+    uint64_t parsed_size = parsed_size_opt.value();
+    if (parsed_size > std::numeric_limits<size_t>::max()) {
+        LOG(ERROR) << "Value out of range for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
+    }
+    return static_cast<size_t>(parsed_size);
 }
 }  // namespace
 
@@ -977,10 +991,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Extract optional parameters with defaults
-    size_t global_segment_size = get_config_size(
+    auto global_segment_size_opt = get_config_size(
         config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
-    size_t local_buffer_size = get_config_size(
+    if (!global_segment_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto local_buffer_size_opt = get_config_size(
         config, CONFIG_KEY_LOCAL_BUFFER_SIZE, DEFAULT_LOCAL_BUFFER_SIZE);
+    if (!local_buffer_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t global_segment_size = global_segment_size_opt.value();
+    size_t local_buffer_size = local_buffer_size_opt.value();
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
@@ -990,17 +1012,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // Validate size parameters are within acceptable ranges
-    if (global_segment_size < MIN_SEGMENT_SIZE ||
+    if ((global_segment_size != 0 && global_segment_size < MIN_SEGMENT_SIZE) ||
         global_segment_size > MAX_SEGMENT_SIZE) {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_GLOBAL_SEGMENT_SIZE << ": "
-                   << global_segment_size << ", must be between "
+                   << global_segment_size << ", must be 0 or between "
                    << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (local_buffer_size < MIN_SEGMENT_SIZE ||
+    if ((local_buffer_size != 0 && local_buffer_size < MIN_SEGMENT_SIZE) ||
         local_buffer_size > MAX_SEGMENT_SIZE) {
         LOG(ERROR) << "Invalid " << CONFIG_KEY_LOCAL_BUFFER_SIZE << ": "
-                   << local_buffer_size << ", must be between "
+                   << local_buffer_size << ", must be 0 or between "
                    << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
