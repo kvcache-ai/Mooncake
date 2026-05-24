@@ -376,6 +376,9 @@ class ClientService {
     virtual std::string GetHealthStatus() const { return "OK"; }
 
    public:
+    std::string local_endpoint() const {
+        return local_ip_ + ":" + std::to_string(te_port_);
+    }
     /**
      * @brief Gets the local transport endpoint (IP and port).
      * @return The transport endpoint string.
@@ -416,8 +419,7 @@ class ClientService {
     /**
      * @brief Private constructor to enforce creation through Create() method
      */
-    ClientService(const std::string& local_ip, uint16_t te_port,
-                  const std::string& metadata_connstring,
+    ClientService(const std::string& metadata_connstring,
                   uint16_t metrics_port = 9003, bool enable_metrics_http = true,
                   const std::map<std::string, std::string>& labels = {});
 
@@ -449,11 +451,14 @@ class ClientService {
      * @return ErrorCode indicating success or failure.
      */
     ErrorCode InitTransferEngine(
-        const std::string& endpoint, const std::string& metadata_connstring,
-        const std::string& protocol,
+        const std::string& local_ip, uint16_t te_port,
+        const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
 
    protected:
+    ErrorCode InnerInitTransferEngine(
+        bool auto_discover, const std::string& protocol,
+        const std::optional<std::string>& device_names);
     // Heartbeat-related function
 
     /**
@@ -587,15 +592,13 @@ class ClientService {
     std::shared_ptr<TransferEngine> transfer_engine_;
 
     // Configuration
-    const std::string local_ip_;
-    const uint16_t te_port_;
-    std::string local_endpoint() const {
-        return local_ip_ + ":" + std::to_string(te_port_);
-    }
+    std::string local_ip_;
+    uint16_t te_port_ = 0;
 
     // The segment endpoint that the transfer engine registered with the
     // metadata backend.
     std::string te_endpoint_;
+    std::unique_ptr<AutoPortBinder> port_binder_;
     void initTeEndpoint();
     const std::string& get_te_endpoint() const { return te_endpoint_; }
 

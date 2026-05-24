@@ -141,6 +141,13 @@ BatchSyncReplicaResponse WrappedP2PMasterService::BatchSyncReplica(
         if (ec != ErrorCode::OK) remove_failures++;
     }
 
+    MasterMetricManager::instance().inc_add_replica_requests(
+        req.add_keys.size());
+    MasterMetricManager::instance().inc_add_replica_failures(add_failures);
+    MasterMetricManager::instance().inc_remove_replica_requests(
+        req.remove_keys.size());
+    MasterMetricManager::instance().inc_remove_replica_failures(
+        remove_failures);
     timer.LogResponse("add_failures=", add_failures,
                       ", remove_failures=", remove_failures);
     return response;

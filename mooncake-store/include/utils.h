@@ -378,9 +378,15 @@ class AutoPortBinder {
 
     int getPort() const { return port_; }
 
+    int rebind();
+
    private:
+    int tryBindPort();
+
     int socket_fd_;
     int port_;
+    int min_port_;
+    int max_port_;
 };
 
 // HTTP utility: simple GET, returns body on 200, otherwise error code

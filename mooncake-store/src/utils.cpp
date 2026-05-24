@@ -41,10 +41,14 @@ bool isPortAvailable(int port) {
 
 // AutoPortBinder implementation
 AutoPortBinder::AutoPortBinder(int min_port, int max_port)
-    : socket_fd_(-1), port_(-1) {
+    : socket_fd_(-1), port_(-1), min_port_(min_port), max_port_(max_port) {
+    tryBindPort();
+}
+
+int AutoPortBinder::tryBindPort() {
     static std::random_device rand_gen;
     std::mt19937 gen(rand_gen());
-    std::uniform_int_distribution<> rand_dist(min_port, max_port);
+    std::uniform_int_distribution<> rand_dist(min_port_, max_port_);
 
     for (int attempt = 0; attempt < 20; ++attempt) {
         int port = rand_dist(gen);
@@ -59,12 +63,22 @@ AutoPortBinder::AutoPortBinder(int min_port, int max_port)
 
         if (bind(socket_fd_, (sockaddr *)&addr, sizeof(addr)) == 0) {
             port_ = port;
-            break;
+            return port;
         } else {
             close(socket_fd_);
             socket_fd_ = -1;
         }
     }
+    return -1;
+}
+
+int AutoPortBinder::rebind() {
+    if (socket_fd_ >= 0) {
+        close(socket_fd_);
+        socket_fd_ = -1;
+    }
+    port_ = -1;
+    return tryBindPort();
 }
 
 AutoPortBinder::~AutoPortBinder() {

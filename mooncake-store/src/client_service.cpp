@@ -46,13 +46,10 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
     return slice_size;
 }
 
-ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
-                             const std::string& metadata_connstring,
+ClientService::ClientService(const std::string& metadata_connstring,
                              uint16_t metrics_port, bool enable_metrics_http,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      local_ip_(local_ip),
-      te_port_(te_port),
       metadata_connstring_(metadata_connstring),
       metrics_port_(metrics_port),
       enable_metrics_http_(enable_metrics_http) {
@@ -63,8 +60,8 @@ ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
-        config.local_ip, config.te_port, config.metadata_connstring,
-        config.metrics_port, config.enable_metrics_http, config.labels);
+        config.metadata_connstring, config.metrics_port,
+        config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -79,8 +76,8 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
-        config.local_ip, config.te_port, config.metadata_connstring,
-        config.metrics_port, config.enable_metrics_http, config.labels);
+        config.metadata_connstring, config.metrics_port,
+        config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -265,14 +262,9 @@ tl::expected<void, ErrorCode> ClientService::CheckRegisterMemoryParams(
 }
 
 ErrorCode ClientService::InitTransferEngine(
-    const std::string& endpoint, const std::string& metadata_connstring,
-    const std::string& protocol,
+    const std::string& local_ip, uint16_t te_port,
+    const std::string& metadata_connstring, const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    if (!transfer_engine_) {
-        LOG(ERROR) << "Transfer engine pointer is null";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
     // get auto_discover and filters from env
     std::optional<bool> env_auto_discover = get_auto_discover();
     bool auto_discover = false;
@@ -288,15 +280,7 @@ ErrorCode ClientService::InitTransferEngine(
             auto_discover = true;
         }
     }
-    transfer_engine_->setAutoDiscover(auto_discover);
-
-    // Honor filters when auto-discovery is enabled; otherwise warn once
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters();
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
+    if (!auto_discover) {
         const char* env_filters = std::getenv("MC_MS_FILTERS");
         if (env_filters && *env_filters != '\0') {
             LOG(WARNING)
@@ -312,9 +296,72 @@ ErrorCode ClientService::InitTransferEngine(
             globalConfig().ascend_use_fabric_mem = true;
         }
     }
-    auto [hostname, port] = parseHostNameWithPort(endpoint);
-    int rc =
-        transfer_engine_->init(metadata_connstring, endpoint, hostname, port);
+
+    local_ip_ = local_ip;
+    te_port_ = te_port;
+    const bool is_auto_port = (te_port_ == 0);
+    ErrorCode err = ErrorCode::OK;
+
+    const int kMaxRetries =
+        is_auto_port ? GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20) : 1;
+
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        if (attempt > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            int new_port = port_binder_->rebind();
+            if (new_port < 0) {
+                LOG(WARNING)
+                    << "Failed to rebind port"
+                    << ", port=" << std::to_string(new_port)
+                    << ", retry=" << (attempt + 1) << "/" << kMaxRetries;
+                continue;
+            }
+            te_port_ = static_cast<uint16_t>(new_port);
+        } else if (is_auto_port) {
+            port_binder_ = std::make_unique<AutoPortBinder>();
+            int new_port = port_binder_->getPort();
+            if (new_port < 0) {
+                LOG(ERROR) << "Failed to bind available port"
+                           << ", port=" << std::to_string(new_port);
+                continue;
+            }
+            te_port_ = static_cast<uint16_t>(new_port);
+        }
+
+        err = InnerInitTransferEngine(auto_discover, protocol, device_names);
+        if (err == ErrorCode::OK) {
+            if (attempt > 0) {
+                LOG(INFO) << "TE init succeeded on port " << te_port_
+                          << " after " << (attempt + 1) << " attempt(s)";
+            }
+            return ErrorCode::OK;
+        }
+
+        if (is_auto_port) {
+            LOG(WARNING) << "TE init failed on port " << te_port_ << ", retry "
+                         << (attempt + 1) << "/" << kMaxRetries;
+        }
+    }
+
+    LOG(ERROR) << "Failed to initialize transfer engine"
+               << (is_auto_port ? " after all retries" : "") << ", err=" << err;
+    return err;
+}
+
+ErrorCode ClientService::InnerInitTransferEngine(
+    bool auto_discover, const std::string& protocol,
+    const std::optional<std::string>& device_names) {
+    transfer_engine_ = std::make_shared<TransferEngine>();
+    transfer_engine_->setAutoDiscover(auto_discover);
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters();
+        transfer_engine_->setWhitelistFilters(std::move(filters));
+    }
+
+    int rc = transfer_engine_->init(metadata_connstring_, local_endpoint(),
+                                    local_ip_, te_port_);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
