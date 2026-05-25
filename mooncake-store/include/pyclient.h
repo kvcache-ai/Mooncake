@@ -207,6 +207,13 @@ class ClientRequester {
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
+    // Request-scoped cache of fresh batch_query() results that can be reused by
+    // subsequent ranged reads in the same operation. Callers should not retain
+    // entries across independent requests.
+    using QueryResultCache =
+        std::unordered_map<std::string,
+                           tl::expected<QueryResult, ErrorCode>>;
+
     virtual ~PyClient() = 0;
     virtual int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
@@ -238,12 +245,53 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    // query_result_cache is optional and is only used to reuse fresh
+    // batch_query() results for this read; callers still do not provide any
+    // replica-selection or ranged-read metadata directly.
     virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) = 0;
+
+    std::vector<int64_t> batch_get_metadata_prefixes(
+        const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+        size_t prefix_size, const QueryResultCache *query_result_cache = nullptr) {
+        std::vector<std::vector<std::string>> all_keys;
+        std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+        std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+        std::vector<std::vector<std::vector<size_t>>> all_sizes;
+        all_keys.reserve(keys.size());
+        all_dst_offsets.reserve(keys.size());
+        all_src_offsets.reserve(keys.size());
+        all_sizes.reserve(keys.size());
+        for (const auto &key : keys) {
+            all_keys.push_back({key});
+            all_dst_offsets.push_back({{0}});
+            all_src_offsets.push_back({{0}});
+            all_sizes.push_back({{prefix_size}});
+        }
+        auto results = get_into_ranges(buffers, all_keys, all_dst_offsets,
+                                       all_src_offsets, all_sizes,
+                                       query_result_cache);
+        std::vector<int64_t> flattened;
+        flattened.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i >= results.size() || results[i].size() != 1 ||
+                results[i][0].size() != 1) {
+                flattened.push_back(static_cast<int64_t>(
+                    toInt(ErrorCode::INVALID_PARAMS)));
+                continue;
+            }
+            flattened.push_back(results[i][0][0]);
+        }
+        return flattened;
+    }
+
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,

@@ -85,12 +85,15 @@ struct TensorIntoFragment {
     size_t size{0};
 };
 
+using QueryResultCache = mooncake::PyClient::QueryResultCache;
+
 struct TensorIntoPlan {
     uintptr_t user_buffer_ptr{0};
     uintptr_t registered_buffer_ptr{0};
     size_t registered_buffer_size{0};
     size_t total_length{0};
     std::vector<TensorIntoFragment> fragments;
+    QueryResultCache query_result_cache;
     std::optional<TensorMetadata> materialized_metadata;
 };
 
@@ -108,6 +111,7 @@ enum class ParallelismShardReadStorageRoute {
 struct ReconstructedShardSource {
     std::string read_key;
     ParsedTensorMetadata metadata;
+    tl::expected<QueryResult, ErrorCode> query_result;
 };
 
 struct FullTensorReconstructionSources {

@@ -80,6 +80,50 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
 }
 #endif
 
+CachedQueryResultResponse to_cached_query_result_response(
+    const tl::expected<QueryResult, ErrorCode> &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!query_result) {
+        return CachedQueryResultResponse(query_result.error());
+    }
+    const auto remaining_ttl_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result->lease_timeout - now)
+            .count());
+    return CachedQueryResultResponse(GetReplicaListResponse(
+        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                         query_result->replicas.end()),
+        remaining_ttl_ms));
+}
+
+tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
+    const CachedQueryResultResponse &cached_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!cached_result.success) {
+        return tl::make_unexpected(cached_result.error);
+    }
+    return QueryResult(
+        std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
+                                         cached_result.value.replicas.end()),
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
+}
+
+PyClient::QueryResultCache build_query_result_cache_from_cached_results(
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results) {
+    PyClient::QueryResultCache query_result_cache;
+    query_result_cache.reserve(cached_query_results.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, cached_result] : cached_query_results) {
+        auto query_result = from_cached_query_result_response(cached_result, now);
+        if (!query_result || query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        query_result_cache.emplace(key, std::move(query_result));
+    }
+    return query_result_cache;
+}
+
 struct PreparedRangedReadRequest {
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
         results;
@@ -3107,13 +3151,9 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto query_result = client_->Query(key);
+RealClient::build_ranged_read_metadata_from_query_result(
+    const std::string &key,
+    const tl::expected<QueryResult, ErrorCode> &query_result) {
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -3124,7 +3164,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(query_result.error());
     }
 
-    const auto &replica_list = query_result.value().replicas;
+    const auto &replica_list = query_result->replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Internal error: replica_list is empty";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3139,13 +3179,119 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
-    auto query_value = std::move(query_result.value());
+    QueryResult query_value(
+        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                         query_result->replicas.end()),
+        query_result->lease_timeout);
     auto replica = *best_replica;
     return RangedReadMetadata{.query_result = std::move(query_value),
                               .replica = std::move(replica),
                               .total_size = calculate_total_size(replica)};
 }
 
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::resolve_ranged_read_metadata(const std::string &key) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return build_ranged_read_metadata_from_query_result(key,
+                                                        client_->Query(key));
+}
+
+RealClient::RangedReadMetadataCache RealClient::batch_resolve_ranged_read_metadata(
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<bool>>> &valid_fragments,
+    const std::vector<size_t> &buffer_capacities,
+    bool skip_zero_capacity_buffers,
+    const QueryResultCache *initial_query_result_cache) {
+    RangedReadMetadataCache metadata_cache;
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return metadata_cache;
+    }
+
+    if (all_keys.size() != valid_fragments.size() ||
+        all_keys.size() != buffer_capacities.size()) {
+        LOG(ERROR) << "get_into_ranges: metadata input size mismatch";
+        return metadata_cache;
+    }
+
+    size_t key_count_hint = 0;
+    for (const auto &keys : all_keys) {
+        key_count_hint += keys.size();
+    }
+    metadata_cache.reserve(key_count_hint);
+    if (initial_query_result_cache != nullptr) {
+        auto now = std::chrono::steady_clock::now();
+        for (const auto &[key, query_result] : *initial_query_result_cache) {
+            if (!query_result || query_result->IsLeaseExpired(now)) {
+                continue;
+            }
+            auto metadata =
+                build_ranged_read_metadata_from_query_result(key, query_result);
+            if (!metadata) {
+                continue;
+            }
+            metadata_cache.emplace(key, std::move(metadata));
+        }
+    }
+
+    std::vector<std::string> unique_keys;
+    unique_keys.reserve(key_count_hint);
+    for (size_t i = 0; i < valid_fragments.size(); ++i) {
+        if (skip_zero_capacity_buffers && buffer_capacities[i] == 0 &&
+            !all_keys[i].empty()) {
+            continue;
+        }
+        if (all_keys[i].size() != valid_fragments[i].size()) {
+            LOG(ERROR) << "get_into_ranges: metadata key-group size mismatch";
+            continue;
+        }
+        for (size_t j = 0; j < valid_fragments[i].size(); ++j) {
+            bool has_valid_fragment = false;
+            for (bool valid_fragment : valid_fragments[i][j]) {
+                if (valid_fragment) {
+                    has_valid_fragment = true;
+                    break;
+                }
+            }
+            if (!has_valid_fragment) {
+                continue;
+            }
+            if (metadata_cache.find(all_keys[i][j]) != metadata_cache.end()) {
+                continue;
+            }
+            auto [_, inserted] = metadata_cache.emplace(
+                all_keys[i][j], tl::unexpected(ErrorCode::INVALID_PARAMS));
+            if (inserted) {
+                unique_keys.push_back(all_keys[i][j]);
+            }
+        }
+    }
+    if (unique_keys.empty()) {
+        return metadata_cache;
+    }
+
+    auto query_results = client_->BatchQuery(unique_keys);
+    if (query_results.size() != unique_keys.size()) {
+        LOG(ERROR) << "BatchQuery result size mismatch in get_into_ranges";
+        for (const auto &key : unique_keys) {
+            metadata_cache.erase(key);
+            metadata_cache.emplace(key, tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return metadata_cache;
+    }
+
+    for (size_t i = 0; i < unique_keys.size(); ++i) {
+        metadata_cache.erase(unique_keys[i]);
+        metadata_cache.emplace(
+            unique_keys[i], build_ranged_read_metadata_from_query_result(
+                                unique_keys[i], std::move(query_results[i])));
+    }
+    return metadata_cache;
+}
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
@@ -3342,6 +3488,16 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
     return to_py_ret(result);
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchQuery(keys);
+}
+
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
 RealClient::get_into_ranges_internal(
     const std::vector<void *> &buffers,
@@ -3352,7 +3508,8 @@ RealClient::get_into_ranges_internal(
     const std::vector<size_t> *buffer_capacities,
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
         *prepared_results,
-    const std::vector<std::vector<std::vector<bool>>> *valid_fragments) {
+    const std::vector<std::vector<std::vector<bool>>> *valid_fragments,
+    const QueryResultCache *query_result_cache) {
     const size_t buffer_count = buffers.size();
     PreparedRangedReadRequest prepared;
     if (prepared_results != nullptr && valid_fragments != nullptr) {
@@ -3393,8 +3550,9 @@ RealClient::get_into_ranges_internal(
         }
     }
 
-    std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
-        metadata_cache;
+    auto resolved_metadata_cache = batch_resolve_ranged_read_metadata(
+        all_keys, prepared.valid_fragments, resolved_buffer_capacities,
+        buffer_capacities == nullptr, query_result_cache);
 
     for (size_t i = 0; i < buffer_count; ++i) {
         const size_t key_count = prepared.results[i].size();
@@ -3404,9 +3562,13 @@ RealClient::get_into_ranges_internal(
         }
 
         for (size_t j = 0; j < key_count; ++j) {
-            auto [metadata_it, inserted] = metadata_cache.try_emplace(
-                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
-            (void)inserted;
+            auto metadata_it = resolved_metadata_cache.find(all_keys[i][j]);
+            if (metadata_it == resolved_metadata_cache.end()) {
+                prepared.results[i][j].assign(
+                    prepared.results[i][j].size(),
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+                continue;
+            }
             auto &metadata_result = metadata_it->second;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
@@ -3458,13 +3620,16 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     const std::vector<std::vector<std::string>> &all_keys,
     const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const QueryResultCache *query_result_cache) {
     auto results =
         execute_timed_operation<std::vector<std::vector<std::vector<int64_t>>>>(
             [&]() {
                 return convert_ranged_read_results(
                     get_into_ranges_internal(buffers, all_keys, all_dst_offsets,
-                                             all_src_offsets, all_sizes));
+                                             all_src_offsets, all_sizes,
+                                             nullptr, nullptr, nullptr,
+                                             query_result_cache));
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -4258,6 +4423,8 @@ RealClient::get_into_ranges_shm_helper(
     const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
     int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
@@ -4301,10 +4468,13 @@ RealClient::get_into_ranges_shm_helper(
         return prepared.results;
     }
 
+    auto query_result_cache =
+        build_query_result_cache_from_cached_results(cached_query_results);
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
         all_sizes, &prepared.required_buffer_sizes, &prepared.results,
-        &prepared.valid_fragments);
+        &prepared.valid_fragments,
+        query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -5427,6 +5597,31 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "batch_get_query_results: client not initialized";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::INVALID_PARAMS));
+    }
+    auto query_results = client_->BatchQuery(keys);
+    std::vector<CachedQueryResultResponse> cached_results;
+    cached_results.reserve(keys.size());
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Batch query response size mismatch in batch_get_query_results: expected "
+                   << keys.size() << ", got " << query_results.size() << ".";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::RPC_FAIL));
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto &query_result : query_results) {
+        cached_results.push_back(
+            to_cached_query_result_response(query_result, now));
+    }
+    return cached_results;
 }
 
 std::vector<std::string> RealClient::batch_replica_clear(
