@@ -834,8 +834,8 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         if (desc->type == SegmentType::File) {
             if (checkAvailability(transport_list_[GDS], local_mtype)) {
                 if (transport_index-- == 0) result.transport = GDS;
-            } else if (checkAvailability(transport_list_[IOURING],
-                                         local_mtype)) {
+            }
+            if (checkAvailability(transport_list_[IOURING], local_mtype)) {
                 if (transport_index-- == 0) result.transport = IOURING;
             }
         } else {
@@ -1343,7 +1343,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
 
-    if (task.failover_count >= max_failover_attempts_) {
+    if (++task.failover_count > max_failover_attempts_) {
         LOG(WARNING) << "Task failover limit reached ("
                      << max_failover_attempts_
                      << "), last transport=" << transportTypeName(prev_type);
@@ -1353,10 +1353,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
 
     if (task.staging)
         task.staging = false;
-    else {
-        task.failover_count++;
+    else
         task.xport_priority = task.failover_count;
-    }
 
     auto result = resolveTransport(task.request, task.xport_priority);
     auto type = result.transport;

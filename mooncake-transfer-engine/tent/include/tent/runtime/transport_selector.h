@@ -79,7 +79,7 @@ struct SelectionContext {
     const std::vector<TransportType>*
         buffer_transports;  // Pointer to transports in buffer
     size_t transfer_size;   // Transfer size in bytes
-    int priority_level;     // Request priority level (higher = more urgent)
+    int priority_level;     // Request priority level (lower = more urgent)
 };
 
 /**
