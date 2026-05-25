@@ -233,6 +233,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
 ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     auto tiered_backend = std::make_unique<TieredBackend>();
+    tiered_backend->SetMetadataShardCount(config.lock_shard_count);
 
     auto add_replica_callback = BuildAddReplicaCallback();
     auto remove_replica_callback = BuildRemoveReplicaCallback();

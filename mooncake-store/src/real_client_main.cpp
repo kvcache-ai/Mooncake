@@ -26,7 +26,8 @@ DEFINE_string(deployment_mode, "Centralization",
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
 DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
 DEFINE_uint64(lock_shard_count, 1024,
-              "Number of key lock shards for DataManager");
+              "Number of metadata shards in TieredBackend (and matching "
+              "pending-write/pinned-key lease shards in DataManager)");
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");

@@ -144,8 +144,8 @@ struct P2PClientConfig : RealClientConfigBase {
     // Parsed custom tiered backend configuration
     Json::Value tiered_backend_config;
 
-    // Number of key lock shards for DataManager.
-    // Higher values reduce contention of key.
+    // Number of TieredBackend metadata index shards (and matching DataManager
+    // pending-write/pinned-key lease shards). Higher values reduce contention.
     size_t lock_shard_count = 1024;
 
     // RouteCache configuration

@@ -64,6 +64,9 @@ class DataManagerTest : public ::testing::Test {
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
         tiered_backend_ = std::make_unique<TieredBackend>();
+        const size_t metadata_shard_count =
+            GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024);
+        tiered_backend_->SetMetadataShardCount(metadata_shard_count);
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
         auto init_result = InitTieredBackendForTest(*tiered_backend_, config);
@@ -85,7 +88,7 @@ class DataManagerTest : public ::testing::Test {
         // access
         TieredBackend* backend_raw_ptr = tiered_backend_.get();
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_, 1024,
+            std::move(tiered_backend_), transfer_engine_, metadata_shard_count,
             transfer_config);
         // Keep the raw pointer accessible for tests that need direct backend
         // access Note: The backend is now owned by DataManager, but tests can

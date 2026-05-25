@@ -31,6 +31,53 @@ AllocationEntry::~AllocationEntry() {
 
 TieredBackend::TieredBackend() = default;
 
+void TieredBackend::SetMetadataShardCount(size_t count) {
+    if (!tiers_.empty()) {
+        LOG(FATAL) << "SetMetadataShardCount must be called before Init()";
+    }
+    metadata_shard_count_ =
+        count > 0 ? count : kDefaultMetadataShardCount;
+    metadata_shards_.assign(metadata_shard_count_, MetadataShard{});
+}
+
+bool TieredBackend::KeyExistsInShard(const MetadataShard& shard,
+                                     std::string_view key,
+                                     std::optional<UUID> tier_id) {
+    auto it = shard.index.find(key);
+    if (it == shard.index.end()) {
+        return false;
+    }
+    if (!tier_id.has_value()) {
+        return true;
+    }
+    auto entry = it->second;
+    std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+    for (const auto& replica : entry->replicas) {
+        if (replica.first == *tier_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+ConditionalExecuteResult<void> TieredBackend::conditionalExecute(
+    std::string_view key, std::optional<UUID> tier_id,
+    std::function<void()> on_exists, std::function<void()> on_not_exists)
+    const {
+    auto& shard = GetMetadataShard(key);
+    std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
+    const bool exists = KeyExistsInShard(shard, key, tier_id);
+
+    ConditionalExecuteResult<void> result;
+    result.key_exists = exists;
+    if (exists) {
+        on_exists();
+    } else {
+        on_not_exists();
+    }
+    return result;
+}
+
 TieredBackend::~TieredBackend() {
     Stop();
     Destroy();
@@ -638,22 +685,7 @@ bool TieredBackend::Exist(std::string_view key,
                           std::optional<UUID> tier_id) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
-    auto it = shard.index.find(key);
-    if (it == shard.index.end()) {
-        return false;  // Key not found
-    }
-    if (!tier_id.has_value()) {
-        return true;  // Key exists in backend
-    }
-    // Check specific tier
-    auto entry = it->second;
-    std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-    for (const auto& replica : entry->replicas) {
-        if (replica.first == *tier_id) {
-            return true;  // Key exists in target tier
-        }
-    }
-    return false;  // Key does not exist in target tier
+    return KeyExistsInShard(shard, key, tier_id);
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
@@ -912,7 +944,7 @@ const DataCopier& TieredBackend::GetDataCopier() const {
 void TieredBackend::ForEachKeyBatch(
     const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
     // Iterate per-shard. Each shard is locked independently.
-    for (size_t s = 0; s < kMetadataShardCount; ++s) {
+    for (size_t s = 0; s < metadata_shard_count_; ++s) {
         auto& shard = metadata_shards_[s];
 
         // Copy entry pointers under shard shared lock

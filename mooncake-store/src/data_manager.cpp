@@ -133,7 +133,6 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
     : tiered_backend_(std::move(tiered_backend)),
       transfer_engine_(transfer_engine),
       lock_shard_count_(lock_shard_count > 0 ? lock_shard_count : 1024),
-      lock_shards_(lock_shard_count_),
       pending_write_shards_(lock_shard_count_),
       pinned_key_shards_(lock_shard_count_),
       local_transfer_config_(local_transfer_config) {
@@ -1014,15 +1013,11 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     }
     AllocationHandle handle = std::move(handle_result.value());
 
-    // key_lock: serialize tiered_backend_->Commit vs Delete on this key.
     // PendingWriteRecord is erased only after Commit (see Erase below); while
     // it remains in existed_operation_key_map, another PreWrite on this key
-    // gets REPLICA_IS_PROCESSING at Reserve.
-    tl::expected<void, ErrorCode> commit_result;
-    {
-        std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
-        commit_result = tiered_backend_->Commit(ctx.key, handle);
-    }
+    // gets REPLICA_IS_PROCESSING at Reserve. TieredBackend::Commit serializes
+    // metadata updates on this key via its internal shard lock.
+    auto commit_result = tiered_backend_->Commit(ctx.key, handle);
 
     const auto erased = ErasePendingWriteRecord(
         pending_write_shard, ctx.key, write_operation_id);
@@ -1727,8 +1722,6 @@ tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
     //   lease cleanup.
     // - PinnedKeyRecord holds a strong handle reference until UnPinKey reaches
     //   ref_count==0 or lease cleanup.
-    std::unique_lock lock(GetKeyLock(key));
-
     auto result = tiered_backend_->Delete(key, tier_id, notify_master);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to delete key: " << key;
@@ -1772,19 +1765,19 @@ void DataManager::RectifyReadRoute(std::string_view key,
                                    std::optional<UUID> tier_id) {
     if (!rectify_wrong_route_fn_) return;
 
-    std::shared_lock lock(GetKeyLock(key));
-
-    if (!tiered_backend_->Exist(key, tier_id)) {
-        LOG(WARNING) << "RectifyReadRoute: key not found locally"
-                     << (tier_id.has_value()
-                             ? " on tier " +
-                                   std::to_string(tier_id.value().first) + "_" +
-                                   std::to_string(tier_id.value().second)
-                             : "")
-                     << ", removing replica from master for key: " << key;
-        // Callback signature pins const std::string&; copy at the boundary.
-        rectify_wrong_route_fn_(key, tier_id);
-    }
+    tiered_backend_->conditionalExecute(
+        key, tier_id, []() {},
+        [this, key, tier_id]() {
+            LOG(WARNING) << "RectifyReadRoute: key not found locally"
+                         << (tier_id.has_value()
+                                 ? " on tier " +
+                                       std::to_string(tier_id.value().first) +
+                                       "_" +
+                                       std::to_string(tier_id.value().second)
+                                 : "")
+                         << ", removing replica from master for key: " << key;
+            rectify_wrong_route_fn_(key, tier_id);
+        });
 }
 
 void DataManager::SetRectifyCallback(

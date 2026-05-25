@@ -237,8 +237,8 @@ class DataManager {
     // ================================================================
 
     /**
-     * @brief Rectify stale read route by checking local key existence
-     * and removing replica from master if key is not found locally.
+     * @brief Rectify stale read route via TieredBackend::conditionalExecute:
+     *        if the key is not found locally, remove the replica from master.
      *
      * @param key Object key to rectify
      * @param tier_id Optional tier ID. If specified, only checks the given
@@ -335,10 +335,6 @@ class DataManager {
     tl::expected<AllocationHandle, ErrorCode> ValidatePendingWriteForCommit(
         PendingWriteShard& shard, std::string_view key, TimePoint now,
         const UUID& write_operation_id);
-
-    std::shared_mutex& GetKeyLock(std::string_view key) {
-        return lock_shards_[StringHash{}(key) % lock_shard_count_];
-    }
 
     /**
      * @brief Transfer data from local source to remote destination buffers
@@ -497,11 +493,9 @@ class DataManager {
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 
-    // Sharded locks for concurrent access
-    // Configurable via MOONCAKE_DM_LOCK_SHARD_COUNT environment variable
-    // (default: 1024)
+    // Shard count for pending-write and pinned-key lease tables (same value as
+    // TieredBackend metadata shard count when set via lock_shard_count).
     size_t lock_shard_count_;
-    std::vector<std::shared_mutex> lock_shards_;
     std::vector<PendingWriteShard> pending_write_shards_;
     std::vector<PinnedKeyShard> pinned_key_shards_;
 
