@@ -343,6 +343,23 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 
 > **Peak: ~64 GB/s** on both write and read — far below the GPU-to-GPU number despite identical NIC count. The bottleneck is DDR4-3200 DRAM bandwidth on the EPYC 7R13 (Milan): `batch=16` consistently wins because larger in-flight queues only deepen DRAM contention without unlocking new NIC capacity. p5.48xlarge CPU-to-CPU runs around **3× slower than p5en** (DDR5 Xeon 8488C, ~213 GB/s) at the same NIC aggregate. For PD KV transfer, the GPU-to-GPU path is the relevant one.
 
+### Single-host loopback
+
+EFA NICs have no hardware loopback short-circuit: even when both endpoints resolve to the same host, `fi_write`/`fi_read` drive a real DMA round-trip through the EFA device. For deployments where the producer and consumer run as **separate processes on the same host** (single-machine development, benchmarks, co-located workers), this is strictly slower than libfabric's emulated RDMA path, which resolves the same-host case to a memcpy and skips the NIC entirely.
+
+Set `MC_EFA_LOOPBACK_PREFER_EMULATED=1` to opt into the emulated path. It is opt-in, not auto-detect, because a single `EfaTransport` instance may serve a mix of loopback and cross-host peers, and `FI_EFA_USE_DEVICE_RDMA` is a provider-level flag resolved at `fi_getinfo` time — flipping it disables device RDMA for **every** transfer in the process, including cross-host ones. Use this for single-host workloads; leave it unset for production cross-host fan-out.
+
+Measured on p5.48xlarge (1 NIC, 80 MB write, same-host producer/consumer, Mooncake Store `put_from`):
+
+| `MC_EFA_LOOPBACK_PREFER_EMULATED` | per-write latency |
+|---|---:|
+| unset (device RDMA, default after #2041) | ~830 ms |
+| `1` (emulated, same-host memcpy fast path) | ~390 ms |
+
+Cross-host benchmarks are unaffected (device RDMA stays on unless the env is also set on the cross-host process).
+
+An explicit `FI_EFA_USE_DEVICE_RDMA` set by the user takes precedence; the opt-in only fills in the default when `FI_EFA_USE_DEVICE_RDMA` is unset.
+
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
