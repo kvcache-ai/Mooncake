@@ -1963,23 +1963,6 @@ impl StoreClient {
         result
     }
 
-    fn local_readable_segments_for_route(&self, route: &ObjectRoute) -> BTreeSet<SegmentName> {
-        let state = self.state.lock();
-        state
-            .memory_ref()
-            .ok()
-            .map(|memory| {
-                route
-                    .replicas
-                    .iter()
-                    .filter(|replica| replica.owner == self.lease.runtime)
-                    .filter(|replica| memory.has_storage_segment(&replica.segment_name))
-                    .map(|replica| replica.segment_name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     fn local_storage_segments(&self) -> BTreeSet<SegmentName> {
         self.state
             .lock()
@@ -3169,6 +3152,7 @@ impl StoreClient {
         true
     }
 
+    #[cfg(test)]
     fn segment_relative_target_offset(
         info: &SegmentInfo,
         segment_name: &SegmentName,
@@ -3376,6 +3360,7 @@ impl StoreClient {
         Ok(target_chunks)
     }
 
+    #[cfg(test)]
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
         if let Some(offset) = replica.offset {
             if Self::segment_info_covers_target(info, offset, replica.length) {

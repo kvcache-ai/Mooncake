@@ -772,7 +772,6 @@ impl PyMooncakeDistributedStore {
                 for (_, buffer_ptr, _) in &items {
                     let _ = pointer_from_usize(*buffer_ptr)?;
                 }
-                let item_count = items.len();
                 let tenant = tenant.map(str::to_string);
                 let cache_keys = items
                     .iter()
@@ -781,73 +780,7 @@ impl PyMooncakeDistributedStore {
                 let cache_tenant = tenant.clone();
                 let scope = dispatcher.object_scope(tenant);
                 let statuses = run_without_gil(move || {
-                    dispatcher.run(move |client| {
-                        let requests = items
-                            .iter()
-                            .map(|(key, buffer_ptr, size)| {
-                                let mut request = PutFromRequest::new(
-                                    key,
-                                    (*buffer_ptr as *mut c_void).cast_const(),
-                                    *size,
-                                )
-                                .tenant(scope.tenant.as_str());
-                                if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
-                                    request = request.domain(scope.domain.as_str());
-                                }
-                                if scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
-                                    request = request.object_set(scope.object_set.as_str());
-                                }
-                                if let Some(policy) = policy.clone() {
-                                    request = request.replication(policy);
-                                }
-                                request
-                            })
-                            .collect::<Vec<_>>();
-                        match client.batch_put_from(&requests) {
-                            Ok(_) => Ok(vec![0; item_count]),
-                            Err(batch_error) => {
-                                tracing::debug!(
-                                    error = %batch_error,
-                                    "batch_put_from falling back to per-key best-effort status"
-                                );
-                                let statuses = items
-                                    .iter()
-                                    .map(|(key, buffer_ptr, size)| {
-                                        let mut request = PutFromRequest::new(
-                                            key,
-                                            (*buffer_ptr as *mut c_void).cast_const(),
-                                            *size,
-                                        )
-                                        .tenant(scope.tenant.as_str());
-                                        if scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
-                                            request = request.domain(scope.domain.as_str());
-                                        }
-                                        if scope.object_set
-                                            != mooncake_store_core::DEFAULT_OBJECT_SET
-                                        {
-                                            request = request.object_set(scope.object_set.as_str());
-                                        }
-                                        if let Some(policy) = policy.clone() {
-                                            request = request.replication(policy);
-                                        }
-                                        let result = client.batch_put_from(&[request]);
-                                        match result {
-                                            Ok(_) | Err(StoreError::Conflict(_)) => 0,
-                                            Err(error) => {
-                                                tracing::debug!(
-                                                    key = %key,
-                                                    error = %error,
-                                                    "batch_put_from per-key write failed"
-                                                );
-                                                -1
-                                            }
-                                        }
-                                    })
-                                    .collect::<Vec<_>>();
-                                Ok(statuses)
-                            }
-                        }
-                    })
+                    execute_real_batch_put_from(dispatcher, items, scope, policy)
                 })
                 .map_err(store_error_to_py)?;
                 let successful_keys = cache_keys
