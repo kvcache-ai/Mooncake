@@ -2821,6 +2821,44 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     return {};
 }
 
+void MasterService::ClearPromotionQueueEntry(const UUID& client_id,
+                                             const std::string& key) {
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto it = client_local_disk_segment.find(client_id);
+    if (it == client_local_disk_segment.end()) {
+        return;
+    }
+    MutexLocker locker(&it->second->offloading_mutex_);
+    it->second->promotion_objects.erase(key);
+}
+
+bool MasterService::IsPromotionTaskExpired(
+    const PromotionTask& task,
+    const std::chrono::system_clock::time_point& now) const {
+    return task.start_time + put_start_release_timeout_sec_ <= now;
+}
+
+void MasterService::CleanupPromotionTask(ObjectMetadata* metadata,
+                                         MetadataShardAccessorRW& shard,
+                                         const std::string& key,
+                                         const PromotionTask& task) {
+    if (metadata != nullptr) {
+        auto* source = metadata->GetReplicaByID(task.source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+        if (task.alloc_id != 0) {
+            metadata->EraseReplicaByID(task.alloc_id);
+        }
+    }
+    shard->promotion_tasks.erase(key);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    ClearPromotionQueueEntry(task.holder_id, key);
+}
+
 void MasterService::TryPushPromotionQueue(const std::string& key) {
     if (!promotion_on_hit_ || !promotion_sketch_) {
         return;
@@ -2974,6 +3012,13 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    const auto now = std::chrono::system_clock::now();
+    if (IsPromotionTaskExpired(task_it->second, now)) {
+        const PromotionTask expired_task = task_it->second;
+        CleanupPromotionTask(&metadata, shard, key, expired_task);
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
     // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3061,6 +3106,13 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    const auto now = std::chrono::system_clock::now();
+    if (IsPromotionTaskExpired(task_it->second, now)) {
+        const PromotionTask expired_task = task_it->second;
+        CleanupPromotionTask(&metadata, shard, key, expired_task);
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
     // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3084,17 +3136,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
 
     // Erase the per-client promotion_objects entry (best-effort; the
     // heartbeat may have already drained it).
-    {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto it = client_local_disk_segment.find(client_id);
-        if (it != client_local_disk_segment.end()) {
-            MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(key);
-        }
-    }
+    ClearPromotionQueueEntry(client_id, key);
 
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -3122,6 +3164,13 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         return {};
     }
 
+    const auto now = std::chrono::system_clock::now();
+    if (IsPromotionTaskExpired(task_it->second, now)) {
+        const PromotionTask expired_task = task_it->second;
+        CleanupPromotionTask(&metadata, shard, key, expired_task);
+        return {};
+    }
+
     // Holder-only gate (see PromotionTask::holder_id doc).
     if (task_it->second.holder_id != client_id) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3142,17 +3191,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     // Clear the holder's per-client promotion_objects entry. Same
     // best-effort cleanup pattern as NotifyPromotionSuccess — the
     // heartbeat may have already drained it.
-    {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto it = client_local_disk_segment.find(client_id);
-        if (it != client_local_disk_segment.end()) {
-            MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(key);
-        }
-    }
+    ClearPromotionQueueEntry(client_id, key);
 
     return {};
 }
@@ -3363,26 +3402,19 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // return REPLICA_IS_NOT_READY since the task entry is gone).
     for (auto task_it = shard->promotion_tasks.begin();
          task_it != shard->promotion_tasks.end();) {
-        const auto ttl =
-            task_it->second.start_time + put_start_release_timeout_sec_;
-        if (ttl > now) {
-            task_it++;
+        if (!IsPromotionTaskExpired(task_it->second, now)) {
+            ++task_it;
             continue;
         }
-        auto metadata_it = shard->metadata.find(task_it->first);
-        if (metadata_it != shard->metadata.end()) {
-            auto source =
-                metadata_it->second.GetReplicaByID(task_it->second.source_id);
-            if (source != nullptr) {
-                source->dec_refcnt();
-            }
-            if (task_it->second.alloc_id != 0) {
-                metadata_it->second.EraseReplicaByID(task_it->second.alloc_id);
-            }
-        }
-        LOG(WARNING) << "Promotion task expired for key: " << task_it->first;
-        task_it = shard->promotion_tasks.erase(task_it);
-        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+        const std::string expired_key = task_it->first;
+        const PromotionTask expired_task = task_it->second;
+        auto metadata_it = shard->metadata.find(expired_key);
+        ObjectMetadata* metadata = metadata_it != shard->metadata.end()
+                                       ? &metadata_it->second
+                                       : nullptr;
+        ++task_it;
+        LOG(WARNING) << "Promotion task expired for key: " << expired_key;
+        CleanupPromotionTask(metadata, shard, expired_key, expired_task);
     }
 
     if (!discarded_replicas.empty()) {
