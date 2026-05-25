@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use mooncake_store_client::MooncakeCompatibilityFacade;
 use mooncake_store_core::StoreError;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -328,6 +329,16 @@ pub fn start_dummy_store_server(
     let address: SocketAddr = bind_addr
         .parse()
         .map_err(|error| StoreError::Transport(format!("invalid dummy server address: {error}")))?;
+    let listener = TcpListener::bind(address).map_err(|error| {
+        StoreError::Transport(format!(
+            "dummy gRPC server failed to bind {bind_addr}: {error}"
+        ))
+    })?;
+    listener.set_nonblocking(true).map_err(|error| {
+        StoreError::Transport(format!(
+            "dummy gRPC server failed to set nonblocking {bind_addr}: {error}"
+        ))
+    })?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let grpc_thread = thread::Builder::new()
         .name("mooncake-store-dummy-grpc".to_string())
@@ -337,11 +348,18 @@ pub fn start_dummy_store_server(
                 context: grpc_context.clone(),
             };
             runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "dummy gRPC server failed to adopt listener");
+                        return;
+                    }
+                };
                 let result = Server::builder()
                     .add_service(
                         pb::dummy_store_service_server::DummyStoreServiceServer::new(service),
                     )
-                    .serve_with_shutdown(address, async move {
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                         let _ = shutdown_rx.await;
                     })
                     .await;
