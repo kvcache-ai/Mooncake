@@ -16,6 +16,17 @@ add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest gtest_main )
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
+target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
+
+# Integration test for the monitorWorker reclaim tick (issue #1845).
+# Self-skips when no RDMA device is present, so safe to register with ctest.
+add_executable(endpoint_store_integration_test ${WORKSPACE}/endpoint_store_integration_test.cpp)
+target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_integration_test COMMAND endpoint_store_integration_test)
+set_tests_properties(endpoint_store_integration_test PROPERTIES LABELS "rdma")
+
 add_executable(rdma_transport_test2 ${WORKSPACE}/rdma_transport_test2.cpp)
 target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_transport_test2 COMMAND rdma_transport_test2)
@@ -63,11 +74,23 @@ if (USE_EFA)
     add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
     target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+    add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
+    target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+    add_executable(efa_single_nic_large_mr_test ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
+    target_link_libraries(efa_single_nic_large_mr_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
+    target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
 endif()
 
+# UB transport test with URMA endpoint and mock support
 if (USE_UB)
     add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
-    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main)
+    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main glog::glog pthread)
+    target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
     add_test(NAME ub_transport_test COMMAND ub_transport_test)
 endif()
 

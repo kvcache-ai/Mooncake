@@ -44,8 +44,8 @@ class ProxyManager {
 
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
-                          size_t chunk_size = 8 * 1024 * 1024,
-                          size_t chunk_count = 32);
+                          size_t chunk_size = 4 * 1024 * 1024,
+                          size_t chunk_count = 64);
 
     ~ProxyManager();
 

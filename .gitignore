@@ -5,6 +5,7 @@ build_ofed4
 old
 local_test
 go.sum
+!mooncake-common/etcd/go.sum
 *.so
 bin
 mod

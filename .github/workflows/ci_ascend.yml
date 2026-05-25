@@ -1,7 +1,12 @@
 name: 'CI Test on ASCEND Platform'
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git ref to checkout (PR head SHA)'
+        required: false
+        type: string
 
 jobs:
   build-and-test:
@@ -10,8 +15,8 @@ jobs:
 
     container:
       image: localhost:5000/mooncake-hixl-ci:v5
-      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3 
-                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7 
+      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
                     --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
       env:
         GITHUB_ACTIONS: "true"
@@ -23,30 +28,132 @@ jobs:
         - /etc/hccn.conf:/etc/hccn.conf
 
     steps:
+    - name: Configure GitHub fetch defaults
+      shell: bash
+      run: |
+        git config --global protocol.version 2
+        git config --global http.version HTTP/1.1
+        git config --global http.lowSpeedLimit 1024
+        git config --global http.lowSpeedTime 30
+
     - name: Checkout code
+      id: checkout_code
+      continue-on-error: true
       uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
         fetch-depth: 1
         persist-credentials: false
 
+    - name: Retry checkout via GitHub mirror
+      if: steps.checkout_code.outcome == 'failure'
+      shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
+        CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          echo "Checkout from GitHub failed and ASCEND_GITHUB_MIRROR_URLS is not set"
+          exit 1
+        fi
+
+        normalize_base() {
+          local base="$1"
+          base="${base#${base%%[![:space:]]*}}"
+          base="${base%${base##*[![:space:]]}}"
+          [ -n "$base" ] || return 1
+          [ "$base" != "https://github.com/" ] && base="${base%/}/"
+          printf '%s\n' "$base"
+        }
+
+        candidates=()
+        while IFS= read -r raw; do
+          base="$(normalize_base "$raw" || true)"
+          [ -n "$base" ] || continue
+          [ "$base" = "https://github.com/" ] && continue
+          candidates+=("$base")
+        done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
+
+        if [ ${#candidates[@]} -eq 0 ]; then
+          echo "Checkout from GitHub failed and no valid mirror candidates were configured"
+          exit 1
+        fi
+
+        workdir="${GITHUB_WORKSPACE}"
+        git config --global --add safe.directory "$workdir"
+
+        for base in "${candidates[@]}"; do
+          mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
+          echo "Retrying checkout with ${mirror_url}"
+
+          find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          git init "$workdir"
+          git -C "$workdir" remote add origin "$mirror_url"
+
+          if git -C "$workdir" fetch --depth=1 origin "$CHECKOUT_REF" && \
+             git -C "$workdir" checkout --force --detach FETCH_HEAD; then
+            echo "Mirror checkout succeeded via ${base}"
+            exit 0
+          fi
+
+          echo "Mirror checkout failed via ${base}"
+          rm -rf "$workdir/.git"
+        done
+
+        echo "Direct GitHub checkout failed and all mirror retries failed"
+        exit 1
+
     - name: Configure CMake
       shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
       run: |
         source /usr/local/Ascend/cann-9.0.0/set_env.sh
         pwd
-        if ! git submodule update --init --recursive; then
-            if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
-                echo "git submodule update failed, try to cp pybind11..."
-                if [ -d "../pybind11" ]; then
-                    cp -r ../pybind11 extern/
-                else
-                    echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
-                    exit 1
-                fi
-            else
-                echo "Detected that extern/pybind11 already exists, continuing execution...."
+
+        submodule_updated=false
+        if git submodule update --init --recursive; then
+          submodule_updated=true
+        elif [ -n "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          normalize_base() {
+            local base="$1"
+            base="${base#${base%%[![:space:]]*}}"
+            base="${base%${base##*[![:space:]]}}"
+            [ -n "$base" ] || return 1
+            [ "$base" != "https://github.com/" ] && base="${base%/}/"
+            printf '%s\n' "$base"
+          }
+
+          while IFS= read -r raw; do
+            base="$(normalize_base "$raw" || true)"
+            [ -n "$base" ] || continue
+            [ "$base" = "https://github.com/" ] && continue
+
+            echo "Retrying submodule update with ${base}"
+            if git -c url."${base}https://github.com/".insteadOf=https://github.com/ \
+              submodule update --init --recursive; then
+              submodule_updated=true
+              break
             fi
+          done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
         fi
+
+        if [ "$submodule_updated" != true ]; then
+          if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
+            echo "git submodule update failed (mirrors also exhausted), trying to cp pybind11..."
+            if [ -d "../pybind11" ]; then
+              cp -r ../pybind11 extern/
+            else
+              echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
+              exit 1
+            fi
+          else
+            echo "Detected that extern/pybind11 already exists, continuing execution...."
+          fi
+        fi
+
         bash scripts/ascend/dependencies_ascend_installation.sh
         echo "Configuring CMake..."
         rm -rf build
@@ -114,7 +221,7 @@ jobs:
           # Check if master is running
           if ! kill -0 $MASTER_PID 2>/dev/null; then
               echo "Error: Mooncake Master failed to start"
-              cat /tmp/mooncake_master.log 
+              cat /tmp/mooncake_master.log
               exit 1
           fi
 
@@ -238,7 +345,7 @@ jobs:
 
           echo ""
           echo "All Hixl Mooncake Store tests completed successfully!"
-          
+
 
     - name: Test Summary
       if: always()

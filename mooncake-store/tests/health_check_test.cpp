@@ -80,6 +80,20 @@ class HealthCheckTest : public ::testing::Test {
                                       16 * 1024 * 1024, FLAGS_protocol,
                                       rdma_devices, master_address_);
     }
+
+    bool WaitForHealthCode(
+        int expected_code,
+        std::chrono::milliseconds timeout = std::chrono::seconds(10),
+        std::chrono::milliseconds interval = std::chrono::milliseconds(100)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (py_client_->health_check() == expected_code) {
+                return true;
+            }
+            std::this_thread::sleep_for(interval);
+        }
+        return py_client_->health_check() == expected_code;
+    }
 };
 
 // Test 1: health_check returns HC_NOT_INITIALIZED before setup
@@ -120,9 +134,8 @@ TEST_F(HealthCheckTest, ReturnsTwoWhenMasterDown) {
 
     // Stop master, wait for ping to fail
     master_.Stop();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-
-    EXPECT_EQ(py_client_->health_check(), HC_MASTER_UNREACHABLE);
+    EXPECT_TRUE(WaitForHealthCode(HC_MASTER_UNREACHABLE))
+        << "Timed out waiting for HC_MASTER_UNREACHABLE";
 
     py_client_->tearDownAll();
 }
@@ -154,7 +167,8 @@ TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
     EXPECT_EQ(py_client_->health_check(), HC_HEALTHY);
 
     master_.Stop();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    ASSERT_TRUE(WaitForHealthCode(HC_MASTER_UNREACHABLE))
+        << "Timed out waiting for HC_MASTER_UNREACHABLE";
 
     auto resp = fetch_health(http_port);
     EXPECT_EQ(resp.http_status, 503);

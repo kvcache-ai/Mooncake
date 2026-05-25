@@ -118,6 +118,8 @@ class TransferMetadata {
 
     struct HandShakeDesc {
         std::string local_nic_path;
+        uint16_t local_lid = 0;
+        std::string local_gid;
         std::string peer_nic_path;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
@@ -175,6 +177,9 @@ class TransferMetadata {
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
+
+    // Re-publish the local RPC meta entry to the HTTP metadata server.
+    int rePublishRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);

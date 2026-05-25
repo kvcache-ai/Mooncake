@@ -34,6 +34,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_HIP
+#include <hip/hip_runtime.h>
+#endif
+
 #define CHECK_FAIL(call)                                        \
     do {                                                        \
         auto status_ = call;                                    \
@@ -154,13 +158,37 @@ static inline bool isCudaMemory(void* ptr) {
 }
 #endif
 
+#ifdef USE_HIP
+static inline bool isHipMemory(void* ptr) {
+    hipPointerAttribute_t attr;
+    auto ret = hipPointerGetAttributes(&attr, ptr);
+    return ret == hipSuccess && attr.type == hipMemoryTypeDevice;
+}
+#endif
+
+static inline bool isGpuMemory(void* ptr) {
+#ifdef USE_CUDA
+    if (isCudaMemory(ptr)) return true;
+#endif
+#ifdef USE_HIP
+    if (isHipMemory(ptr)) return true;
+#endif
+    return false;
+}
+
 static inline uint8_t fillData(void* addr, size_t length) {
     uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
 #ifdef USE_CUDA
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> ref_data;
-        ref_data.resize(length, seed);
+        std::vector<uint8_t> ref_data(length, seed);
         cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
+        return seed;
+    }
+#endif
+#ifdef USE_HIP
+    if (isHipMemory(addr)) {
+        std::vector<uint8_t> ref_data(length, seed);
+        hipMemcpy(addr, ref_data.data(), length, hipMemcpyDefault);
         return seed;
     }
 #endif
@@ -169,13 +197,21 @@ static inline uint8_t fillData(void* addr, size_t length) {
 }
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
-    std::vector<uint8_t> ref_data;
-    ref_data.resize(length, seed);
+    std::vector<uint8_t> ref_data(length, seed);
 #ifdef USE_CUDA
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> act_data;
-        act_data.resize(length);
+        std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#endif
+#ifdef USE_HIP
+    if (isHipMemory(addr)) {
+        std::vector<uint8_t> act_data(length);
+        hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

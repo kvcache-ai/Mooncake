@@ -4,7 +4,12 @@
 
 Mooncake Store supports offloading KV cache objects from distributed memory to local SSD. When memory pressure is high, the master instructs clients to persist selected objects to disk. On a cache miss, the client automatically falls back to reading from SSD.
 
-SSD offload is currently **only available in Real Client mode**. The real client is a standalone process that communicates with the application (e.g., SGLang) via RPC. All SSD reads and writes happen within this process.
+SSD offload requires the **Real Client** and supports two deployment modes:
+
+- **Mode A: Embedded Real Client** — the Python process embeds the Real Client, and SSD offload runs inside the Python process.
+- **Mode B: Standalone Real Client + DummyClient** — a standalone `mooncake_client` process runs SSD offload, and the Python process connects via a DummyClient.
+
+In both modes, all SSD reads and writes happen within the Real Client (embedded or standalone).
 
 ## Startup Steps
 
@@ -19,12 +24,33 @@ mkdir -p /nvme/mooncake_offload
 ```bash
 mooncake_master \
     --rpc_port=50051 \
-    --enable-offload true
+    --enable_offload=true
 ```
 
-### Step 3: Start the real client with SSD offload enabled
+### Step 3A (Mode A): Start the application with embedded Real Client
 
-Use the `--enable_offload` flag to enable SSD offload, and set environment variables to specify the storage path and backend:
+Use the `--enable_ssd_offload` flag to enable SSD offload, and set environment variables to specify the storage path and backend:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    local_hostname="<machine IP>",
+    metadata_server="P2PHANDSHAKE",
+    global_segment_size=4 * 1024 * 1024 * 1024,  # 4 GB
+    local_buffer_size=512 * 1024 * 1024,  # 512 MB
+    protocol="rdma",
+    rdma_devices="eth0",
+    master_server_addr="127.0.0.1:50051",
+    enable_ssd_offload=True,
+    ssd_offload_path="/nvme/mooncake_offload"
+)
+```
+
+### Step 3B (Mode B): Start the standalone real client with SSD offload enabled and connect it with the dummy client
+
+Set the same SSD offload environment variables as in Mode A.
 
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
@@ -41,26 +67,20 @@ mooncake_client \
     --metadata_server="P2PHANDSHAKE"
 ```
 
-> **Note:** On startup, the real client automatically scans existing SSD data and reports it to the master. No manual recovery is needed.
-
-### Step 4: Connect the application to the real client
-
-The application (e.g., SGLang) connects to the real client via the `MooncakeDistributedStore` Python SDK. SSD offload and fallback loading are handled transparently.
+The application (e.g., SGLang) connects to the standalone real client via the `MooncakeDistributedStore` Python SDK. The Python process acts as a DummyClient; SSD offload and fallback loading are handled by the standalone real client process.
 
 ```python
 from mooncake.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
-store.setup(
-    local_hostname="<machine IP>",
-    metadata_server="P2PHANDSHAKE",
-    global_segment_size=4 * 1024 * 1024 * 1024,   # 4 GB
-    local_buffer_size=512 * 1024 * 1024, #512MB
-    protocol="rdma",
-    device_name="eth0",
-    master_server_address="127.0.0.1:50051",
+store.setup_dummy(
+    mem_pool_size=4 * 1024 * 1024 * 1024,  # 4 GB
+    local_buffer_size=512 * 1024 * 1024,  # 512 MB
+    server_address="<machine IP>:50052"   # mooncake_client RPC address from Step 3
 )
 ```
+
+> **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
 
 ---
 
@@ -68,6 +88,7 @@ store.setup(
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--metadata_server` | `http://127.0.0.1:8080/metadata` | Metadata server connection string |
 | `--master_server_address` | `127.0.0.1:50051` | Master address |
 | `--host` | `0.0.0.0` | This machine's externally reachable IP |
 | `--port` | `50052` | Real client RPC listening port |
@@ -88,10 +109,13 @@ store.setup(
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
+| `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
 | `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval for offload heartbeat to master (seconds) |
-| `MOONCAKE_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
+| `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
+| `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
 
 ### Bucket backend settings
 
@@ -101,8 +125,17 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 |---|---|---|
 | `MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES` | `268435456` (256 MB) | Max size per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
-| `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
-| `MOONCAKE_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
+| `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `none` | Eviction policy: `none` / `fifo` / `lru` |
+
+### File-per-key backend settings
+
+Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_backend`.
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name created under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` |
+| `ENABLE_EVICTION` | `true` | Enables local-storage eviction logic for this backend |
 
 ---
 
@@ -127,6 +160,11 @@ Best for: general-purpose use, large-scale deployments.
 
 Stores each object in an individual file. Simple and easy to inspect, but generates many small files at scale.
 
+| Environment Variable | Default | Description |
+|---|---|---|
+| `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction when the total size exceeds the quota |
+
 Best for: debugging or small-scale deployments.
 
 ### `offset_allocator_storage_backend`
@@ -143,7 +181,7 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ## Eviction (Bucket Backend Only)
 
-When `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
+When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
 
 | Policy | Behavior |
 |--------|----------|
@@ -170,7 +208,8 @@ The following example starts a master and a real client on a single machine.
 
 ```bash
 mooncake_master \
-    --rpc_port=50051
+    --rpc_port=50051 \
+    --enable_offload=true
 ```
 
 ### Start the real client (new terminal)
@@ -178,8 +217,8 @@ mooncake_master \
 ```bash
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
-export MOONCAKE_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
-export MOONCAKE_BUCKET_EVICTION_POLICY=lru
+export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
+export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 
 mooncake_client \
     --master_server_address="192.168.1.10:50051" \
@@ -196,7 +235,7 @@ mooncake_client \
 ## Notes
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
-- On real client restart, the backend automatically scans existing SSD files and reports them to the master, so previously offloaded objects remain accessible.
+- On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
 
@@ -204,7 +243,7 @@ mooncake_client \
 
 ```bash
 # Node A — runs the master and its own real client
-mooncake_master --rpc_port=50051 --enable-offload true &
+mooncake_master --rpc_port=50051 --enable_offload=true &
 
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 mooncake_client \
@@ -238,8 +277,8 @@ mooncake_client \
 
 ### SSD offload is not triggering
 
-- Confirm `--enable_offload=true` is passed to `mooncake_client` and `--enable-offload true` is passed to `mooncake_master`.
-- Check that `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` points to an existing, writable directory. The client will fail silently if the path is invalid.
+- Confirm `--enable_offload=true` is passed to both `mooncake_client` and `mooncake_master`. Both binaries define the same gflags boolean; hyphenated aliases may work, but the underscored spelling matches the source.
+- Check that `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` points to an existing, writable directory. If the path is invalid, real client setup fails during `FileStorageConfig::Validate()`.
 - Verify memory pressure is actually high enough for the master to trigger offload. If the memory pool (`--global_segment_size`) is large relative to the data written, offload may never activate.
 
 ### "Permission denied" or "No such file or directory" on the storage path
@@ -247,10 +286,11 @@ mooncake_client \
 - Ensure the directory exists before starting the client: `mkdir -p <path>`.
 - Confirm the process user has read/write access to the directory.
 - Symbolic links and paths containing `..` are rejected — use an absolute, canonical path.
+- The path must already exist and must be a directory. Passing a regular file path also causes setup to fail.
 
 ### "Failed to register buffer with UringFile" warning in logs
 
-This warning appears when `MOONCAKE_USE_URING=true` and the io_uring fixed-buffer registration fails. The most common cause is that `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` exceeds the process's locked-memory limit (`RLIMIT_MEMLOCK`). io_uring requires the registered buffer to be pinned in physical memory, which counts against this limit.
+This warning appears when `MOONCAKE_OFFLOAD_USE_URING=true` and the io_uring fixed-buffer registration fails. The most common cause is that `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` exceeds the process's locked-memory limit (`RLIMIT_MEMLOCK`). io_uring requires the registered buffer to be pinned in physical memory, which counts against this limit.
 
 Check the current limit:
 

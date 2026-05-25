@@ -46,11 +46,13 @@ extensions = [
     "sphinxarg.ext",
     "sphinx_design",
     "sphinx_togglebutton",
+    "sphinxcontrib.mermaid",
 ]
 myst_enable_extensions = [
     "colon_fence",
     "fieldlist",
 ]
+myst_fence_as_directive = ["mermaid"]
 autodoc2_packages = [
     {
         "path": "../../Mooncake",

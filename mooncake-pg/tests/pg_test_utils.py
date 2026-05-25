@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import pg
 
-
 DEVICE_FILTER_ENV_VAR = "MOONCAKE_PGTEST_DEVICE_FILTERS"
 MASTER_ADDR_ENV_VAR = "MOONCAKE_PGTEST_MASTER_ADDR"
 MASTER_PORT_ENV_VAR = "MOONCAKE_PGTEST_MASTER_PORT"
@@ -104,17 +103,21 @@ def mooncake_backend_options(
     *,
     active_value: int = 0,
     is_extension: bool = False,
+    max_world_size: int | None = None,
 ) -> pg.MooncakeBackendOptions:
     device = torch.device(device_type)
+    tensor_size = world_size if max_world_size is None else int(max_world_size)
     active_ranks = torch.full(
-        (world_size,),
+        (tensor_size,),
         int(active_value),
         dtype=torch.int32,
         device=device,
     )
-    if is_extension:
-        return pg.MooncakeBackendOptions(active_ranks, True)
-    return pg.MooncakeBackendOptions(active_ranks)
+    if max_world_size is None:
+        if is_extension:
+            return pg.MooncakeBackendOptions(active_ranks, True)
+        return pg.MooncakeBackendOptions(active_ranks)
+    return pg.MooncakeBackendOptions(active_ranks, bool(is_extension), tensor_size)
 
 
 def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
@@ -140,6 +143,7 @@ def init_mooncake_group(
     use_pg_options: bool = True,
     is_extension: bool = False,
     active_value: int | None = None,
+    max_world_size: int | None = None,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -148,8 +152,6 @@ def init_mooncake_group(
         "rank": rank,
         "world_size": world_size,
     }
-    if device_type == "cuda":
-        kwargs["device_id"] = device
     if use_pg_options:
         resolved_active_value = (
             1 if is_extension else 0 if active_value is None else active_value
@@ -159,6 +161,7 @@ def init_mooncake_group(
             device_type,
             active_value=resolved_active_value,
             is_extension=is_extension,
+            max_world_size=max_world_size,
         )
     dist.init_process_group(**kwargs)
     return device
@@ -184,7 +187,7 @@ def init_mooncake_cpu_group(
 def get_mooncake_backend(group=None, device_type: str = "cpu"):
     if group is None:
         group = dist.group.WORLD
-    return group._get_backend(torch.device(device_type))
+    return group
 
 
 @dataclass(slots=True)
@@ -216,6 +219,7 @@ class MooncakePGWorkerContext:
         use_pg_options: bool = True,
         is_extension: bool = False,
         active_value: int | None = None,
+        max_world_size: int | None = None,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -228,6 +232,7 @@ class MooncakePGWorkerContext:
             use_pg_options=use_pg_options,
             is_extension=is_extension,
             active_value=active_value,
+            max_world_size=max_world_size,
         )
         return self._device
 

@@ -3,6 +3,9 @@
 #include <memory>
 #include <thread>
 #include <mooncake_worker.cuh>
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -30,18 +33,100 @@ class MooncakeWorkCpu : public ::c10d::Work {
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
     MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
-                     std::shared_ptr<TransferGroupMeta> meta)
-        : Work(-1, opType), event_(std::move(event)), meta_(std::move(meta)) {}
+                     std::shared_ptr<TransferGroupMeta> meta,
+                     const MooncakeWorker* worker,
+                     std::vector<CudaTaskSubmissionToken> submitted_tasks)
+        : Work(-1, opType),
+          event_(std::move(event)),
+          meta_(std::move(meta)),
+          worker_(worker),
+          submitted_tasks_(std::move(submitted_tasks)) {}
 
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        return true;  // This should be a no-op
+        // Wait until the task has been submitted to TransferEngine:
+        // This tries to ensure that the CUDA kernels required for the transfer
+        // have been launched by the time `waitUntilTasksSubmitted` returns.
+        //
+        // Why is this needed? PyTorch documentation implies that collective
+        // operations should be enqueued when `wait()` returns. In practice, we
+        // found that violating this causes hangs.
+        //
+        // Our current hypothesis for the hang is: PyTorch assumes the kernels
+        // needed for the transfer are already launched when `wait` returns
+        // true. It may then launch subsequent operations after the collective
+        // (e.g., `.cpu()`). Such operations may acquire a process-wide lock in
+        // the CUDA runtime. Also, they may rely on the data produced by the
+        // collective, thus causing a synchronization on enq_stream. However,
+        // holding that runtime lock prevents cudaMemcpy(Async) in TE/TENT from
+        // launching. This means the transfer can't finish, and enq_stream won't
+        // complete. Thus, a deadlock occurs.
+        // (In practice, we found that replacing all cudaMemcpyAsync in TENT
+        // with cuMemcpyAsync actually alleviates this, which further suggests a
+        // deadlock in the CUDA runtime. However, that change is too invasive
+        // for TE/TENT, so we do not adopt it here.)
+        //
+        // Strictly speaking, the wait is needed for another reason: The current
+        // stream will be blocked on the event below. Any subsequent work on
+        // `current_stream` will wait on that event, which effectively waits for
+        // the task to be done. Therefore, we must ensure all kernels needed for
+        // the transfer task are launched BEFORE blocking the current stream, in
+        // case TE/TENT use `current_stream` to launch those kernels (though it
+        // is rare).
+        //
+        // Please note that this logic relies on the assumption that TE/TENT
+        // will launch all CUDA operations in `submitTransfer`.
+        // Unfortunately, TcpTransport in TE and TENT currently violates this
+        // assumption (cudaMemcpy(Async) may be called later from a callback),
+        // which can cause hangs in PG when a CUDA operation such as
+        // `x.cpu().item()` follows the collective. For TE's TcpTransport, the
+        // use of cudaMemcpy on the default stream may also contribute to the
+        // hang.
+        //
+        // Besides, for CPU-only transports (like RdmaTransport),
+        // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
+        // uniform behavior to avoid invasive changes to TE/TENT.
+        bool submitted = true;
+        if (at::cuda::currentStreamCaptureStatus() ==
+            c10::cuda::CaptureStatus::None) {
+            // Normal execution: block until tasks are submitted.
+            submitted =
+                worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        } else {
+            // During CUDA graph capture, kernels are recorded but not actually
+            // executed. The enqueueTaskKernel would never run, so
+            // waitUntilTasksSubmitted would hang because the CPU worker thread
+            // never sees task.active == true.
+            //
+            // Note that this also means NvlinkTransport (and TcpTransport too,
+            // of course) won't work with CUDA Graphs: Kernels launched inside
+            // TE/TENT can't be captured by the graph, and during replay they
+            // are not ordered with the graph execution. This may trigger the
+            // same deadlock described above.
+        }
+        if (!submitted) return false;
+
+        // Once all tasks have been submitted, use the event to synchronize
+        // the current stream and the enqueue stream, but do not wait on this
+        // event.
+        //
+        // See PyTorch docs for more details:
+        // https://docs.pytorch.org/docs/stable/distributed.html#synchronous-and-asynchronous-collective-operations
+        //   "wait() - in the case of CPU collectives, will block the process
+        //    until the operation is completed. In the case of CUDA collectives,
+        //    will block the currently active CUDA stream until the operation
+        //    is completed (but will not block the CPU)."
+        auto current_stream = at::cuda::getCurrentCUDAStream();
+        event_->block(current_stream);
+        return true;
     }
 
    protected:
     std::shared_ptr<torch::Event> event_;
     std::shared_ptr<TransferGroupMeta> meta_;
+    const MooncakeWorker* worker_;
+    std::vector<CudaTaskSubmissionToken> submitted_tasks_;
 };
 
 class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
@@ -49,29 +134,33 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
+        // Skip host-side synchronization during CUDA graph capture.
+        // cudaEventSynchronize is not permitted while a stream is capturing.
+        if (at::cuda::currentStreamCaptureStatus() !=
+            c10::cuda::CaptureStatus::None) {
+            // We still need stream-level synchronization so that subsequent
+            // operations on the capture stream are ordered after the barrier
+            // task on the enqueue stream.
+            auto current_stream = at::cuda::getCurrentCUDAStream();
+            event_->block(current_stream);
+            return true;
+        }
+
         if (timeout == kNoTimeout) {
             event_->synchronize();
             return true;
         }
 
-        auto start = std::chrono::steady_clock::now();
-        while (!event_->query()) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                      start);
-            if (elapsed >= timeout) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
-        return true;
+        BackoffWaiter waiter(
+            BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
+        return waiter.wait_for(timeout, [this] { return event_->query(); });
     }
 };
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  void* meta, Task* tasks, int numRanks,
+                                  uint64_t submitSequence, void* meta,
+                                  Task* tasks, int numRanks,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
     // Copy task into slot
@@ -79,15 +168,16 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
+    tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
-    // Mark active
-    __threadfence();  // Ensure writes visible to host
+    // Publish task metadata before notifying the host worker thread.
+    __threadfence_system();
     tasks[taskId].active = true;
 
     // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
-        __threadfence();
+        __threadfence_system();
     }
     for (int i = 0; i < numRanks; ++i) {
         activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
@@ -311,6 +401,8 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
+        tasks_[i].submitSequence = 0;
+        submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
     }
 }
 
@@ -400,45 +492,65 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& stream,
-    const std::function<void(void* dst, size_t pos, size_t realSize)>&
-        tensorToBuffer,
-    const std::function<void(void* src, size_t pos, size_t realSize)>&
-        bufferToTensor) {
+    const at::cuda::CUDAStream& issue_stream,
+    const std::function<void(void* dst, size_t pos, size_t realSize,
+                             const at::cuda::CUDAStream&)>& tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize,
+                             const at::cuda::CUDAStream&)>& bufferToTensor) {
     connection_ctx->waitUntilNewRanksConnected();
 
     // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
     //  Alternately use even-odd items to maintain tasks
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
+    // Get a non-blocking stream for enqueue:
+    //   The incoming `issue_stream` may be the Null Stream, which enforces
+    //   implicit synchronization semantics. Launching a spin-wait kernel
+    //   (enqueueTaskKernel) on such a stream can introduce potential deadlock.
+    at::cuda::CUDAStream enq_stream =
+        at::cuda::getStreamFromPool(false, issue_stream.device_index());
+
+    // Synchronize: enq_stream waits for issue_stream
+    auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
+    event_start->record(issue_stream);
+    event_start->block(enq_stream);
+
+    std::vector<CudaTaskSubmissionToken> submitted_tasks;
+    submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
         int bufferOffset = meta->taskCount % 2;
+        const uint64_t taskSequence =
+            next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
+        submitted_tasks.push_back(
+            {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize);
+            pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
-        enqueueTaskKernel<<<1, 1, 0, stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, meta.get(),
-            tasks_device_, meta->size, meta->activeRanksDevice,
+        enqueueTaskKernel<<<1, 1, 0, enq_stream>>>(
+            opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+            meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize);
+            pos, realSize, enq_stream);
 
         ++cudaTaskCount;
         ++meta->taskCount;
     }
 
-    auto event = std::make_shared<torch::Event>(torch::kCUDA);
-    event->record(stream);
+    auto event_end = std::make_shared<torch::Event>(torch::kCUDA);
+    event_end->record(enq_stream);
+
     if (opType == c10d::OpType::BARRIER) {
-        return c10::make_intrusive<MooncakeBarrierWorkCuda>(opType, event,
-                                                            meta);
+        return c10::make_intrusive<MooncakeBarrierWorkCuda>(
+            opType, event_end, meta, this, std::move(submitted_tasks));
     }
-    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event_end, meta, this,
+                                                 std::move(submitted_tasks));
 }
 
 }  // namespace mooncake

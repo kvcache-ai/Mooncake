@@ -1,10 +1,11 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs"]
 
 [default.extend-words]
 CANN = "CANN"
 ASO = "ASO"
 fre = "fre"
+wqs = "wqs"
 
 [files]
 extend-exclude = [

@@ -50,23 +50,7 @@ std::string Config::dump(int indent) const {
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
-    if (val) {
-        std::string str_val(val);
-        // Try to parse as integer first
-        try {
-            size_t pos;
-            int int_val = std::stoi(str_val, &pos);
-            if (pos == str_val.length()) {
-                // Fully numeric, store as int
-                config.set(config_key, int_val);
-                return;
-            }
-        } catch (const std::exception& e) {
-            // Not an integer, continue to store as string
-        }
-        // Store as string
-        config.set(config_key, str_val);
-    }
+    if (val) config.setFromString(config_key, std::string(val));
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
@@ -100,9 +84,35 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         }
     }
 
-    // Legacy keys for backward compatibility
+    // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MC_NUM_CQ_PER_CTX",
+              "transports/rdma/device/num_cq_list");
+    setConfig(config, "MC_NUM_COMP_CHANNELS_PER_CTX",
+              "transports/rdma/device/num_comp_channels");
     setConfig(config, "MC_IB_PORT", "transports/rdma/device/port");
     setConfig(config, "MC_GID_INDEX", "transports/rdma/device/gid_index");
+    setConfig(config, "NCCL_IB_GID_INDEX", "transports/rdma/device/gid_index");
+    setConfig(config, "MC_MAX_CQE_PER_CTX", "transports/rdma/device/max_cqe");
+    setConfig(config, "MC_MAX_EP_PER_CTX",
+              "transports/rdma/endpoint/endpoint_store_cap");
+    setConfig(config, "MC_NUM_QP_PER_EP",
+              "transports/rdma/endpoint/qp_mul_factor");
+    setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
+    setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_MAX_INLINE",
+              "transports/rdma/endpoint/max_inline_bytes");
+    setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
+    setConfig(config, "MC_MTU", "transports/rdma/endpoint/path_mtu");
+    setConfig(config, "MC_IB_TC", "transports/rdma/endpoint/traffic_class");
+    setConfig(config, "MC_IB_PCI_RELAXED_ORDERING",
+              "transports/rdma/pci_relaxed_ordering");
+    setConfig(config, "MC_WORKERS_PER_CTX",
+              "transports/rdma/workers/num_workers");
+    setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
+    setConfig(config, "MC_RETRY_CNT",
+              "transports/rdma/workers/max_retry_count");
+    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+              "transports/rdma/disable_gpu_direct_rdma");
     return status;
 }
 

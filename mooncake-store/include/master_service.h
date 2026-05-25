@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
@@ -19,6 +20,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "count_min_sketch.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
@@ -45,6 +47,12 @@ class EvictionStrategy;
 namespace test {
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
+// Friended so the promotion-on-hit tests can drive a serialize/reset/
+// deserialize cycle directly via the otherwise-private
+// MetadataSerializer, and inspect private clamp fields. This avoids
+// standing up a full snapshot catalog + child-process harness, and
+// exposing test-only accessors on MasterService itself.
+class PromotionOnHitTest;
 }  // namespace test
 
 /*
@@ -58,11 +66,21 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
+    friend class test::PromotionOnHitTest;
 
    public:
+    using NoFProbeFn =
+        std::function<bool(const std::string&, uint32_t, std::string*)>;
+
     MasterService();
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
+
+    void SetNoFProbeFnForTesting(NoFProbeFn fn);
+    size_t GetMountedNoFSegmentCountForTesting();
+    bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
+    std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
+        const UUID& segment_id);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -74,6 +92,18 @@ class MasterService {
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Mount a NoF SSD segment for buffer allocation. This function is
+     * idempotent.
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::INVALID_PARAMS on invalid parameters,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily,
+     *         ErrorCode::INTERNAL_ERROR on internal errors.
+     */
+    auto MountNoFSegment(const NoFSegment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -91,12 +121,40 @@ class MasterService {
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Re-mount NoF SSD segments, invoked when the client is the first
+     * time to connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @return ErrorCode::OK means either all segments are remounted
+     * successfully or the fail is not solvable by a new remount request.
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment cannot
+     *         be mounted temporarily.
+     *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
+     */
+    auto ReMountNoFSegment(const std::vector<NoFSegment>& segments,
+                           const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Unmount a memory segment. This function is idempotent.
      * @return ErrorCode::OK on success,
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
      */
     auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    auto GracefulUnmountSegment(const UUID& segment_id, const UUID& client_id,
+                                uint64_t grace_period_ms)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Unmount a NoF ssd segment. This function is idempotent.
+     * @return ErrorCode::OK on success,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
+     *         currently unmounting.
+     */
+    auto UnmountNoFSegment(const UUID& segment_id, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -121,6 +179,24 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
+     * @brief Fetch all mounted NoF segments.
+     * @return std::vector<MountedNoFSegmentSnapshot> on success, error code
+     * otherwise.
+     */
+    auto GetAllNoFSegments()
+        -> tl::expected<std::vector<NoFSegment>, ErrorCode>;
+
+    /**
+     * @brief Query mounted NoF segments by segment name and return their
+     * segment ids together with owner client ids.
+     * @param segment_name Mounted NoF segment name.
+     * @return Matching segment owner info list on success, error code
+     * otherwise.
+     */
+    auto GetNoFSegmentsByName(const std::string& segment_name)
+        -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
 
     /**
      * @brief Query a segment's capacity and used size in bytes.
@@ -231,7 +307,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revoke a batch of put operations
@@ -239,7 +316,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
@@ -439,6 +517,10 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
 
+    auto ReportSsdCapacity(const UUID& client_id,
+                           int64_t ssd_total_capacity_bytes)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
@@ -450,6 +532,62 @@ class MasterService {
     auto NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Heartbeat-driven pull of pending promotion work for a client.
+     * Returns the per-client promotion_objects map (key -> object size) and
+     * clears it. The per-shard promotion_tasks map remains populated as the
+     * source of truth until NotifyPromotionSuccess commits the new MEMORY
+     * replica.
+     */
+    auto PromotionObjectHeartbeat(const UUID& client_id)
+        -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
+     * DRAM via the existing AllocationStrategy, optionally biased toward the
+     * caller's local memory segment via preferred_segments. The new replica is
+     * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
+     *
+     * Only the holder client (the one owning the source LOCAL_DISK replica)
+     * is authorized to call this. Other clients receive INVALID_PARAMS.
+     * `size` must match the source replica's object_size captured at task
+     * admission; mismatch returns INVALID_PARAMS to avoid allocating an
+     * arbitrary buffer size from a buggy or malicious caller.
+     */
+    auto PromotionAllocStart(const UUID& client_id, const std::string& key,
+                             uint64_t size,
+                             const std::vector<std::string>& preferred_segments)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; decrement source
+     * refcnt; erase per-shard and per-client task entries. Mirror of
+     * NotifyOffloadSuccess.
+     */
+    auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Holder-side failure notification: the client got past
+     * PromotionAllocStart but a downstream step (local SSD read, RDMA
+     * write, etc.) failed and it will not be calling
+     * NotifyPromotionSuccess. Releases the master-side task state
+     * immediately rather than waiting put_start_release_timeout_sec_
+     * for the reaper to do it. Without this call every transient
+     * client-side error (SSD throttling, RDMA flake, etc.) pins a
+     * task slot and a staged DRAM buffer for the full reaper TTL,
+     * which can saturate promotion_queue_limit_ on busy clusters.
+     *
+     * Authorization is the same as NotifyPromotionSuccess: only the
+     * holder client may release a task. Effects mirror the reaper's
+     * expiry path: drop source LOCAL_DISK refcnt, pop the staged
+     * PROCESSING MEMORY replica if alloc_id was recorded, erase the
+     * task, decrement the global in-flight counter, and clear the
+     * holder's promotion_objects entry.
+     */
+    auto NotifyPromotionFailure(const UUID& client_id, const std::string& key)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -489,6 +627,12 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+
+    /**
+     * @brief Query current segment lifecycle state by segment id.
+     */
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
 
     /**
      * @brief Query the status of a task
@@ -561,9 +705,17 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    void NoFBatchEvict(double evict_ratio_target,
+                       double evict_ratio_lowerbound);
+
+    // Helper to get a snapshot of alive clients (under client_mutex_ shared
+    // lock)
+    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    void ClearInvalidHandles(
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -588,10 +740,12 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin, bool enable_hard_pin = false)
+            bool enable_soft_pin, bool enable_hard_pin = false,
+            ObjectDataType data_type_ = ObjectDataType::UNKNOWN)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              data_type(data_type_),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -614,6 +768,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        const ObjectDataType data_type{ObjectDataType::UNKNOWN};
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -740,6 +895,32 @@ class MasterService {
             return num_erased > 0;
         }
 
+        size_t EraseReplica(ReplicaType replica_type) {
+            return EraseReplicas([replica_type](const Replica& replica) {
+                if (replica_type == ReplicaType::ALL) {
+                    return replica.is_memory_replica() ||
+                           replica.is_nof_replica();
+                }
+                return replica.type() == replica_type;
+            });
+        }
+
+        bool HasMemReplica() const {
+            return HasReplica(&Replica::fn_is_memory_replica);
+        }
+
+        bool HasNoFReplica() const {
+            return HasReplica(&Replica::fn_is_nof_replica);
+        }
+
+        size_t GetMemReplicaCount() const {
+            return CountReplicas(&Replica::fn_is_memory_replica);
+        }
+
+        size_t GetNoFReplicaCount() const {
+            return CountReplicas(&Replica::fn_is_nof_replica);
+        }
+
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
                 auto names = replica.get_segment_names();
@@ -838,6 +1019,36 @@ class MasterService {
         std::chrono::system_clock::time_point start_time;
     };
 
+    // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
+    // LOCAL_DISK replica is refcnt-pinned for the duration of the task
+    // so it cannot be evicted.
+    //
+    // alloc_id pins down which staged PROCESSING MEMORY replica
+    // NotifyPromotionSuccess should commit, so a concurrent Put on the
+    // same key cannot be confused with ours. 0 until
+    // PromotionAllocStart records the new replica.
+    //
+    // start_time is the reaper deadline anchor. Set at task admission
+    // and reset at PromotionAllocStart so each phase (queue-wait and
+    // active-transfer) gets its own full put_start_release_timeout_sec_
+    // window. Without the reset a backlogged task could enter active
+    // transfer with little TTL left, and the reaper could free the
+    // staged replica via EraseReplicaByID mid-RDMA-write.
+    //
+    // holder_id is the client owning the source LOCAL_DISK segment and
+    // the only one authorized to commit (NotifyPromotionSuccess) or
+    // abort (NotifyPromotionFailure) the task. Without it, any client
+    // knowing the key could flip the staged PROCESSING replica to
+    // COMPLETE before the holder's RDMA write landed, exposing torn
+    // data to readers.
+    struct PromotionTask {
+        ReplicaID source_id;    // the LOCAL_DISK replica being promoted
+        ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
+        uint64_t object_size;
+        std::chrono::system_clock::time_point start_time;
+        UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -849,6 +1060,8 @@ class MasterService {
         std::unordered_map<std::string, const ReplicationTask> replication_tasks
             GUARDED_BY(mutex);
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks
+            GUARDED_BY(mutex);
+        std::unordered_map<std::string, PromotionTask> promotion_tasks
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
@@ -891,7 +1104,10 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    // or local_disk replicas whose owner client is no longer alive.
+    bool CleanupStaleHandles(
+        ObjectMetadata& metadata,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -918,9 +1134,77 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    void NofHeartbeatThreadFunc();
+    bool TryUnmountNoFSegmentByHeartbeat(
+        const MountedNoFSegmentSnapshot& snapshot,
+        const std::string& error_reason);
+    bool ProbeNoFSegment(const std::string& te_endpoint,
+                         std::string* error_reason);
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       Replica& replica);
+
+    // Graceful unmount scheduler
+    class GracefulUnmountScheduler {
+       public:
+        explicit GracefulUnmountScheduler(MasterService* service);
+        ~GracefulUnmountScheduler();
+        void Schedule(const UUID& segment_id, const UUID& client_id,
+                      std::chrono::steady_clock::time_point expire_time);
+        void RemoveClientRecords(const UUID& client_id);
+        void Stop();
+
+       private:
+        void TimerLoop();
+        struct Record {
+            UUID segment_id;
+            UUID client_id;
+            std::chrono::steady_clock::time_point expire_time;
+            bool operator>(const Record& other) const {
+                return expire_time > other.expire_time;
+            }
+        };
+        MasterService* service_;
+        std::mutex mutex_;
+        std::priority_queue<Record, std::vector<Record>, std::greater<Record>>
+            queue_;
+        std::thread timer_thread_;
+        std::atomic<bool> timer_running_{false};
+        bool stopping_{false};
+        std::condition_variable timer_cv_;
+    } graceful_unmount_scheduler_;
+
+    /**
+     * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
+     * entry into the holder client's LocalDiskSegment::promotion_objects map.
+     * Caller is responsible for refcnt-pinning the source replica and
+     * recording the task in the shard's promotion_tasks map.
+     */
+    tl::expected<void, ErrorCode> PushPromotionQueue(const std::string& key,
+                                                     Replica& source_replica);
+
+    /**
+     * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
+     * observed. Applies the gating chain (frequency / watermark / dedup /
+     * cap), refcnt-pins the source LOCAL_DISK replica, records a
+     * PromotionTask, and pushes onto the holder client's promotion_objects
+     * map. Acquires its own RW shard accessor; safe to call after
+     * GetReplicaList's RO accessor has been released.
+     */
+    void TryPushPromotionQueue(const std::string& key);
+
+    // Erase any in-flight PromotionTask for `key` and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists.
+    // Call from any path that erases an ObjectMetadata entry, so the
+    // task doesn't pin a promotion_in_flight_ slot for the full
+    // put_start_release_timeout_sec_ until the reaper sweeps.
+    void ErasePromotionTaskIfPresent(MetadataShardAccessorRW& shard,
+                                     const std::string& key)
+        NO_THREAD_SAFETY_ANALYSIS {
+        if (shard->promotion_tasks.erase(key) > 0) {
+            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -928,10 +1212,14 @@ class MasterService {
     const bool allow_evict_soft_pinned_objects_;
 
     // Eviction related members
-    std::atomic<bool> need_eviction_{
-        false};  // Set to trigger eviction when not enough space left
-    const double eviction_ratio_;                 // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    std::atomic<bool> need_mem_eviction_{
+        false};  // Set to trigger memory eviction when allocation fails
+    std::atomic<bool> need_nof_eviction_{
+        false};  // Set to trigger NoF eviction when allocation fails
+    const double eviction_ratio_;                     // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -962,14 +1250,25 @@ class MasterService {
               it_(shard_guard_->metadata.find(key)),
               processing_it_(shard_guard_->processing_keys.find(key)),
               replication_task_it_(shard_guard_->replication_tasks.find(key)) {
-            // Automatically clean up invalid handles
+            // Automatically clean up invalid handles (memory replicas only).
+            // Note: We only check memory replicas here to avoid lock order
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (it_ != shard_guard_->metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
+                // Erase invalid memory replicas (those with unmounted
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
+                it_->second.EraseReplicas([](const Replica& replica) {
+                    return replica.has_invalid_mem_handle();
+                });
+                // If no valid replicas remain, delete the whole object.
+                if (!it_->second.IsValid()) {
                     this->Erase();
-
                     if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
+                    service_->ErasePromotionTaskIfPresent(shard_guard_, key_);
                 }
             }
         }
@@ -1017,7 +1316,8 @@ class MasterService {
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
-                    bool enable_hard_pin = false) {
+                    bool enable_hard_pin = false,
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -1026,7 +1326,7 @@ class MasterService {
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
                                       std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin));
+                                      enable_hard_pin, data_type));
             it_ = result.first;
         }
 
@@ -1143,11 +1443,58 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
+    const std::chrono::seconds nof_heartbeat_interval_sec_;
+    const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
+    const uint32_t nof_heartbeat_failures_threshold_;
+
+    struct NoFHeartbeatState {
+        UUID owner_client_id{0, 0};
+        std::string segment_name;
+        std::string te_endpoint;
+        std::chrono::steady_clock::time_point next_probe_at{};
+        std::chrono::steady_clock::time_point last_success_at{};
+        uint32_t consecutive_failures{0};
+        std::string last_error_reason;
+    };
+    std::mutex nof_heartbeat_mutex_;
+    std::unordered_map<UUID, NoFHeartbeatState, boost::hash<UUID>>
+        nof_heartbeat_states_;
+    std::thread nof_heartbeat_thread_;
+    std::atomic<bool> nof_heartbeat_running_{false};
+    static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
+    mutable std::mutex nof_probe_fn_mutex_;
+    NoFProbeFn nof_probe_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;
 
     const bool enable_offload_;
+
+    // Offload-on-evict: defer disk offload to eviction time
+    // (config: offload_on_evict)
+    bool offload_on_evict_{false};
+    // Force-evict: allow evicting MEMORY replicas without disk offload when cap
+    // exceeded (config: offload_force_evict, only effective when
+    // offload_on_evict_=true)
+    bool offload_force_evict_{false};
+
+    // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
+    // when a Get observes a key with only LOCAL_DISK replicas.
+    bool promotion_on_hit_{false};
+    uint32_t promotion_admission_threshold_{2};
+    uint32_t promotion_queue_limit_{50000};
+    // Global in-flight task counter, checked against promotion_queue_limit_
+    // as the gate cap. Promotion specifically targets skewed
+    // access (hot keys re-accessed after eviction), so the global counter
+    // is the correct primitive. Incremented in TryPushPromotionQueue after
+    // successful enqueue; decremented in NotifyPromotionSuccess and in the
+    // promotion task reaper after the task entry is erased. Relaxed memory
+    // order is safe — the value is an advisory soft cap, not a barrier.
+    std::atomic<uint64_t> promotion_in_flight_{0};
+    // Master-side frequency sketch. Constructed only when promotion_on_hit_ is
+    // true. CountMinSketch is mutex-protected internally so we can call into it
+    // from any GetReplicaList caller without additional locking.
+    std::unique_ptr<CountMinSketch> promotion_sketch_;
 
     const std::string ha_backend_type_;
 
@@ -1167,6 +1514,7 @@ class MasterService {
 
     // Segment management
     SegmentManager segment_manager_;
+    NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 

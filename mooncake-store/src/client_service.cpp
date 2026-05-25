@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include "segment.h"
+
 #include <csignal>
 #include <algorithm>
 #include <cassert>
@@ -27,8 +29,13 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "gpu_staging_utils.h"
 
 namespace mooncake {
+
+using gpu_staging::CopyDeviceToHost;
+using gpu_staging::IsDevicePointer;
+using gpu_staging::SetDevice;
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
@@ -57,6 +64,7 @@ Client::Client(const std::string& local_hostname,
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
@@ -92,22 +100,56 @@ Client::~Client() {
         leader_monitor_thread_.join();
     }
 
-    // Make a copy of mounted_segments_ to avoid modifying while iterating
-    std::vector<Segment> segments_to_unmount;
+    {
+        std::lock_guard<std::mutex> lock(graceful_unmount_timer_mutex_);
+        graceful_unmount_timer_stopping_ = true;
+    }
+    graceful_unmount_timer_cv_.notify_all();
+
+    // Stop queued timer/task callbacks before tearing down segment state.
+    task_running_ = false;
+    task_thread_pool_.stop();
+
+    // Make copies to avoid modifying while iterating
+    std::vector<Segment> mounted_segments_copy;
+    std::vector<Segment> gracefully_unmounting_segments_copy;
+    std::vector<std::pair<UUID, std::function<void(const UUID&)>>>
+        graceful_cleanup_callbacks;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        segments_to_unmount.reserve(mounted_segments_.size());
+        mounted_segments_copy.reserve(mounted_segments_.size());
         for (auto& entry : mounted_segments_) {
-            segments_to_unmount.emplace_back(entry.second);
+            mounted_segments_copy.emplace_back(entry.second);
         }
+        for (auto& entry : gracefully_unmounting_segments_) {
+            gracefully_unmounting_segments_copy.emplace_back(entry.second);
+        }
+        graceful_cleanup_callbacks.reserve(
+            graceful_unmount_cleanup_callbacks_.size());
+        for (auto& entry : graceful_unmount_cleanup_callbacks_) {
+            graceful_cleanup_callbacks.emplace_back(entry.first,
+                                                    std::move(entry.second));
+        }
+        graceful_unmount_cleanup_callbacks_.clear();
     }
 
-    for (auto& segment : segments_to_unmount) {
+    // Unmount mounted segments: notify master + local cleanup
+    for (auto& segment : mounted_segments_copy) {
         auto result =
             UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
         if (!result) {
-            LOG(ERROR) << "Failed to unmount segment: "
+            LOG(ERROR) << "Failed to unmount segment in destructor: "
                        << toString(result.error());
+        }
+    }
+
+    // Unregister gracefully unmounting segments: master already has timer
+    for (auto& segment : gracefully_unmounting_segments_copy) {
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(segment.base));
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "Failed to unregister transfer buffer in destructor: "
+                       << rc;
         }
     }
 
@@ -115,15 +157,18 @@ Client::~Client() {
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
+        gracefully_unmounting_segments_.clear();
+    }
+
+    for (auto& entry : graceful_cleanup_callbacks) {
+        if (entry.second) {
+            entry.second(entry.first);
+        }
     }
 
     // Stop hot cache handler and hot cache
     hot_cache_handler_.reset();
     hot_cache_.reset();
-
-    // Stop task thread pool after task polling has stopped.
-    task_running_ = false;
-    task_thread_pool_.stop();
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -194,6 +239,11 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
         ha::ParseHABackendType(master_server_entry.substr(0, delimiter_pos));
     if (!backend_type.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto availability = ha::ValidateHABackendAvailability(backend_type.value());
+    if (availability != ErrorCode::OK) {
+        return tl::make_unexpected(availability);
     }
 
     return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
@@ -532,7 +582,7 @@ void Client::InitTransferSubmitter() {
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_,
+        *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 }
 
@@ -817,6 +867,45 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices,
+                                          uint64_t src_offset) {
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::INVALID_REPLICA) {
+            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+        }
+        return tl::unexpected(err);
+    }
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "Range read only supported for memory replicas, key="
+                   << object_key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto t0_get = std::chrono::steady_clock::now();
+    err = TransferReadRange(replica, slices, src_offset);
+    auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0_get)
+                      .count();
+    if (metrics_) {
+        metrics_->transfer_metric.get_latency_us.observe(us_get);
+    }
+
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
+        return tl::unexpected(err);
+    }
+    if (query_result.IsLeaseExpired()) {
+        LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                     << object_key;
+        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
     return {};
 }
 
@@ -2039,11 +2128,70 @@ std::vector<int> Client::GetNicNumaNodes() const {
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    auto result = MountSegmentAndGetId(buffer, size, protocol, location);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
+    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    if (!unmount_result) {
+        ErrorCode err = unmount_result.error();
+        LOG(ERROR) << "Failed to unmount segment from master: "
+                   << toString(err);
+        return tl::unexpected(err);
+    }
+
+    int rc = transfer_engine_->unregisterLocalMemory(
+        reinterpret_cast<void*>(it->second.base));
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                      "engine ret is "
+                   << rc;
+        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        // Otherwise, the segment is already unregistered from transfer
+        // engine, we can continue
+    }
+
+    mounted_segments_.erase(it);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
+                                                     size_t size) {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    auto segment = mounted_segments_.end();
+
+    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
+         ++it) {
+        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+            it->second.size == size) {
+            segment = it;
+            break;
+        }
+    }
+    if (segment == mounted_segments_.end()) {
+        LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    return UnmountSegmentImpl(segment);
+}
+
+tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
+    const void* buffer, size_t size, const std::string& protocol,
+    const std::string& location) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
 
+    UUID segment_id;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
@@ -2070,17 +2218,12 @@ tl::expected<void, ErrorCode> Client::MountSegment(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Build segment with logical name; attach TE endpoint for transport
         Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
-        // For P2P handshake mode, publish the actual transport endpoint that
-        // was negotiated by the transfer engine. Otherwise, keep the logical
-        // hostname so metadata backends (HTTP/etcd/redis) can resolve the
-        // segment by name.
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {
@@ -2095,54 +2238,133 @@ tl::expected<void, ErrorCode> Client::MountSegment(
             return tl::unexpected(err);
         }
 
-        mounted_segments_[segment.id] = segment;
+        segment_id = segment.id;
+        mounted_segments_[segment_id] = segment;
     }
 
     EnsureStorageControlPlaneStarted();
-    return {};
+    return segment_id;
 }
 
-tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
-                                                     size_t size) {
+tl::expected<void, ErrorCode> Client::UnmountSegmentById(
+    const UUID& segment_id, uint64_t grace_period_ms,
+    std::function<void(const UUID&)> cleanup_callback) {
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-    auto segment = mounted_segments_.end();
-
-    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
-         ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
-            it->second.size == size) {
-            segment = it;
-            break;
-        }
-    }
+    auto segment = mounted_segments_.find(segment_id);
     if (segment == mounted_segments_.end()) {
-        LOG(ERROR) << "segment_not_found base=" << buffer << " size=" << size;
+        LOG(ERROR) << "segment_not_found id=" << UuidToString(segment_id);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto unmount_result = master_client_.UnmountSegment(segment->second.id);
-    if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
-        LOG(ERROR) << "Failed to unmount segment from master: "
+    if (grace_period_ms == 0) {
+        return UnmountSegmentImpl(segment);
+    }
+
+    auto result =
+        master_client_.GracefulUnmountSegment(segment_id, grace_period_ms);
+    if (!result) {
+        ErrorCode err = result.error();
+        LOG(ERROR) << "Failed to graceful unmount segment from master: "
                    << toString(err);
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(segment->second.base));
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
-                      "engine ret is "
-                   << rc;
-        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    gracefully_unmounting_segments_.emplace(segment->first, segment->second);
+    if (cleanup_callback) {
+        graceful_unmount_cleanup_callbacks_[segment->first] =
+            std::move(cleanup_callback);
+    }
+    mounted_segments_.erase(segment);
+    StartGracefulUnmountTimer(segment_id, grace_period_ms);
+    return {};
+}
+
+bool Client::WaitForGracefulUnmountDelay(std::chrono::milliseconds delay) {
+    std::unique_lock<std::mutex> lock(graceful_unmount_timer_mutex_);
+    return graceful_unmount_timer_cv_.wait_for(
+        lock, delay, [this]() { return graceful_unmount_timer_stopping_; });
+}
+
+void Client::StartGracefulUnmountTimer(const UUID& segment_id,
+                                       uint64_t grace_period_ms) {
+    auto delay =
+        std::chrono::milliseconds(grace_period_ms) + std::chrono::seconds(10);
+    task_thread_pool_.enqueue([this, segment_id, delay]() {
+        if (this->WaitForGracefulUnmountDelay(delay)) {
+            return;
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
+        this->OnGracefulUnmountTimer(segment_id, /*retry_left=*/3);
+    });
+}
+
+void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
+    // Query master to confirm the segment has been removed
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        auto it = gracefully_unmounting_segments_.find(segment_id);
+        if (it == gracefully_unmounting_segments_.end()) {
+            // Already cleaned up (e.g. by destructor)
+            return;
+        }
     }
 
-    mounted_segments_.erase(segment);
-    return {};
+    auto status = master_client_.QuerySegmentStatusById(segment_id);
+    bool removed = false;
+    if (!status) {
+        if (status.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            removed = true;
+        } else {
+            LOG(WARNING) << "Failed to query graceful unmount segment status: "
+                         << toString(status.error());
+        }
+    } else if (status.value() == SegmentStatus::UNDEFINED) {
+        removed = true;
+    }
+
+    if (removed) {
+        std::function<void(const UUID&)> cleanup_callback;
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            auto it = gracefully_unmounting_segments_.find(segment_id);
+            if (it != gracefully_unmounting_segments_.end()) {
+                int rc = transfer_engine_->unregisterLocalMemory(
+                    reinterpret_cast<void*>(it->second.base));
+                if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+                    LOG(ERROR)
+                        << "Failed to unregister TE MR for graceful unmount: "
+                        << rc;
+                }
+                gracefully_unmounting_segments_.erase(it);
+            }
+            auto callback_it =
+                graceful_unmount_cleanup_callbacks_.find(segment_id);
+            if (callback_it != graceful_unmount_cleanup_callbacks_.end()) {
+                cleanup_callback = std::move(callback_it->second);
+                graceful_unmount_cleanup_callbacks_.erase(callback_it);
+            }
+        }
+        if (cleanup_callback) {
+            cleanup_callback(segment_id);
+        }
+        return;
+    }
+
+    if (retry_left > 0) {
+        try {
+            task_thread_pool_.enqueue([this, segment_id, retry_left]() {
+                if (this->WaitForGracefulUnmountDelay(
+                        std::chrono::seconds(10))) {
+                    return;
+                }
+                this->OnGracefulUnmountTimer(segment_id, retry_left - 1);
+            });
+        } catch (const std::runtime_error& e) {
+            VLOG(1) << "Skip graceful unmount retry enqueue: " << e.what();
+        }
+    } else {
+        LOG(WARNING) << "Graceful unmount cleanup timeout for segment "
+                     << UuidToString(segment_id);
+    }
 }
 
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
@@ -2226,11 +2448,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
+    int64_t ssd_total_capacity_bytes) {
+    auto response =
+        master_client_.ReportSsdCapacity(client_id_, ssd_total_capacity_bytes);
+    if (!response) {
+        LOG(ERROR) << "ReportSsdCapacity failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batch_slices) {
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices);
     if (!future) {
@@ -2252,6 +2486,39 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     auto response =
         master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
     return response;
+}
+
+tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
+    std::unordered_map<std::string, int64_t>& promotion_objects) {
+    auto response = master_client_.PromotionObjectHeartbeat(client_id_);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    promotion_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStart(
+    const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStart(client_id_, key, size,
+                                              preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key) {
+    return master_client_.NotifyPromotionSuccess(client_id_, key);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key) {
+    return master_client_.NotifyPromotionFailure(client_id_, key);
+}
+
+ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
+                                 std::vector<Slice>& slices) {
+    return TransferWrite(memory_descriptor, slices);
 }
 
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
@@ -2456,19 +2723,34 @@ void Client::PutToLocalFile(const std::string& key,
     }
 
     std::string path = disk_descriptor.file_path;
-    // Currently, persistence is achieved through asynchronous writes, but
-    // before asynchronous writing in 3FS, significant performance degradation
-    // may occur due to data copying. Profiling reveals that the number of page
-    // faults triggered in this scenario is nearly double the normal count.
-    // Future plans include introducing a reuse buffer list to address this
-    // performance degradation issue.
 
+    // Synchronous D2H staging + copy into std::string.
+    // Done on the calling thread to guarantee GPU buffers are still valid
+    // (BatchPut has not yet returned to Python, so blocks are not reused).
     std::string value;
     value.reserve(total_size);
+
     for (const auto& slice : slices) {
-        value.append(static_cast<char*>(slice.ptr), slice.size);
+        int device_id = -1;
+        if (IsDevicePointer(slice.ptr, &device_id)) {
+            SetDevice(device_id);
+            auto buf = pinned_buffer_pool_->Acquire(slice.size);
+            if (!CopyDeviceToHost(buf.data, slice.ptr, slice.size)) {
+                LOG(ERROR) << "D2H copy failed for key: " << key
+                           << ", triggering PutRevoke for disk replica";
+                pinned_buffer_pool_->Release(buf);
+                // Must revoke to avoid phantom replica in master
+                master_client_.PutRevoke(key, ReplicaType::DISK);
+                return;
+            }
+            value.append(buf.data, slice.size);
+            pinned_buffer_pool_->Release(buf);
+        } else {
+            value.append(static_cast<char*>(slice.ptr), slice.size);
+        }
     }
 
+    // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
         // Store the object
@@ -2528,6 +2810,26 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     return future->get();
 }
 
+ErrorCode Client::TransferReadInternal(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+
+    return future->get();
+}
+
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
@@ -2552,6 +2854,12 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     }
 
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
+}
+
+ErrorCode Client::TransferReadRange(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    return TransferReadInternal(replica_descriptor, slices, src_offset);
 }
 
 void Client::PollAndDispatchTasks() {
@@ -2736,6 +3044,43 @@ void Client::StorageHeartbeatThreadMain() {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
         }
+        // Re-publish Transfer Engine segment descriptors to the HTTP
+        // metadata server.  When Master (which hosts the HTTP metadata
+        // server in the same process) is killed and restarted, all
+        // in-memory KV entries are lost.  ReMountSegment above only
+        // restores Master-side allocation state; it does NOT write back
+        // the transport-level segment descriptors.  Without this, remote
+        // peers get HTTP 404 when querying our segment descriptor and
+        // data transfers fail.
+        auto metadata = transfer_engine_->getMetadata();
+        if (metadata) {
+            int rc = metadata->updateLocalSegmentDesc();
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to re-publish segment descriptor "
+                           << "to metadata server, rc=" << rc
+                           << ", will retry in next heartbeat cycle";
+                segment_desc_publish_pending_.store(true);
+            } else {
+                segment_desc_publish_pending_.store(false);
+            }
+            // Also re-publish RPC meta entry (mooncake/rpc_meta/<hostname>).
+            // Remote peers need this to locate our RDMA RPC port for
+            // handshake.  Like segment descriptors, this entry is lost
+            // when the HTTP metadata server is cleared on Master restart.
+            rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to re-publish RPC meta entry "
+                           << "to metadata server, rc=" << rc
+                           << ", will retry in next heartbeat cycle";
+                rpc_meta_publish_pending_.store(true);
+            } else {
+                rpc_meta_publish_pending_.store(false);
+            }
+        }
+        // Note: LOCAL_DISK segment remount is NOT done here.
+        // It is handled by FileStorage::Heartbeat() when it detects
+        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
+        // re-register offloaded object metadata.
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
@@ -2761,6 +3106,41 @@ void Client::StorageHeartbeatThreadMain() {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
+            } else if (segment_desc_publish_pending_.load() &&
+                       !remount_segment_future.valid()) {
+                // Previous remount succeeded but updateLocalSegmentDesc()
+                // failed (e.g. transient HTTP error).  Retry it directly
+                // without re-running ReMountSegment.
+                auto metadata = transfer_engine_->getMetadata();
+                if (metadata) {
+                    int rc = metadata->updateLocalSegmentDesc();
+                    if (rc != 0) {
+                        LOG(ERROR)
+                            << "Retry: failed to re-publish segment "
+                            << "descriptor to metadata server, rc=" << rc;
+                    } else {
+                        LOG(INFO) << "Retry: successfully re-published "
+                                  << "segment descriptor to metadata server";
+                        segment_desc_publish_pending_.store(false);
+                    }
+                }
+            } else if (rpc_meta_publish_pending_.load() &&
+                       !remount_segment_future.valid()) {
+                // Previous remount succeeded but rePublishRpcMetaEntry()
+                // failed.  Retry it directly.
+                auto metadata = transfer_engine_->getMetadata();
+                if (metadata) {
+                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+                    if (rc != 0) {
+                        LOG(ERROR)
+                            << "Retry: failed to re-publish RPC "
+                            << "meta entry to metadata server, rc=" << rc;
+                    } else {
+                        LOG(INFO) << "Retry: successfully re-published "
+                                  << "RPC meta entry to metadata server";
+                        rpc_meta_publish_pending_.store(false);
+                    }
+                }
             }
 
             std::this_thread::sleep_for(

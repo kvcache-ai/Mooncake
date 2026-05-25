@@ -1,7 +1,16 @@
 name: 'Integration test (Linux)'
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      pr_sha:
+        description: 'PR head SHA (passed from parent workflow for workflow_dispatch)'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number (passed from parent workflow for workflow_dispatch)'
+        required: false
+        type: string
 
 jobs:
   test-sglang-integration:
@@ -12,8 +21,9 @@ jobs:
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
-          SHA="${{ github.event.pull_request.head.sha }}"
-          PR_ID="${{ github.event.pull_request.number }}"
+          # Priority: explicit inputs > PR event context > push SHA
+          SHA="${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}"
+          PR_ID="${{ inputs.pr_number || github.event.pull_request.number }}"
 
           if [ "${{ github.event_name }}" = "push" ]; then
             SHA="${{ github.sha }}"

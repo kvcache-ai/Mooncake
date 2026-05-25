@@ -28,6 +28,8 @@ enum ShmSegmentType : uint32_t {
     SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
 };
 
+constexpr int32_t kInvalidPhysicalDeviceId = -1;
+
 // Return codes for health_check()
 enum HealthCheckStatus : int {
     HC_HEALTHY = 0,          // Fully connected, all links up
@@ -36,12 +38,87 @@ enum HealthCheckStatus : int {
         2  // Master (or RealClient for DummyClient) unreachable
 };
 
+template <typename ResultValue, typename ErrorFactory>
+inline std::vector<std::vector<std::vector<ResultValue>>>
+build_ranged_read_results_like(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorFactory &&make_error) {
+    std::vector<std::vector<std::vector<ResultValue>>> results;
+    results.reserve(buffer_count);
+    for (size_t i = 0; i < buffer_count; ++i) {
+        std::vector<std::vector<ResultValue>> key_rows;
+        const size_t key_count = i < all_keys.size() ? all_keys[i].size() : 1;
+        key_rows.reserve(key_count);
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count =
+                (i < all_dst_offsets.size() && j < all_dst_offsets[i].size())
+                    ? all_dst_offsets[i][j].size()
+                    : 1;
+            std::vector<ResultValue> fragments;
+            fragments.reserve(std::max<size_t>(fragment_count, 1));
+            for (size_t k = 0; k < std::max<size_t>(fragment_count, 1); ++k) {
+                fragments.push_back(make_error());
+            }
+            key_rows.emplace_back(std::move(fragments));
+        }
+        results.emplace_back(std::move(key_rows));
+    }
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+convert_ranged_read_results(
+    const std::vector<
+        std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        &internal_results) {
+    std::vector<std::vector<std::vector<int64_t>>> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &key_rows : internal_results) {
+        std::vector<std::vector<int64_t>> converted_rows;
+        converted_rows.reserve(key_rows.size());
+        for (const auto &row : key_rows) {
+            std::vector<int64_t> converted;
+            converted.reserve(row.size());
+            for (const auto &result : row) {
+                converted.push_back(to_py_ret(result));
+            }
+            converted_rows.emplace_back(std::move(converted));
+        }
+        results.emplace_back(std::move(converted_rows));
+    }
+
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+build_ranged_read_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<int64_t>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return static_cast<int64_t>(toInt(error)); });
+}
+
+inline std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+build_ranged_read_internal_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<tl::expected<int64_t, ErrorCode>>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return tl::unexpected(error); });
+}
+
 // Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)
 struct ShmRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
+    int32_t device_id = kInvalidPhysicalDeviceId;
     bool is_local_buffer;
 };
 
@@ -137,7 +214,8 @@ class PyClient {
         const std::string &protocol, const std::string &rdma_devices,
         const std::string &master_server_addr,
         const std::shared_ptr<TransferEngine> &transfer_engine,
-        const std::string &ipc_socket_path) = 0;
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "") = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -158,6 +236,13 @@ class PyClient {
 
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
+
+    virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
@@ -247,6 +332,10 @@ class PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys) = 0;
     virtual std::vector<Replica::Descriptor> get_replica_desc(
         const std::string &key) = 0;
+
+    virtual std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") = 0;
 
     virtual int tearDownAll() = 0;
 

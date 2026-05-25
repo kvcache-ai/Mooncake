@@ -71,9 +71,9 @@ class Buffer:
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         # Get the index of the closest NIC
-        self.backend = self.group._get_backend(torch.device("cuda"))
+        self.backend = self.group
         preferred_hca = pg.get_preferred_hca(
-            self.backend, f"cuda:{torch.cuda.current_device()}"
+            self.group, f"cuda:{torch.cuda.current_device()}"
         )
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca

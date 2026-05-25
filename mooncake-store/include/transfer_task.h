@@ -174,7 +174,10 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
+        : engine_(engine),
+          batch_id_(batch_id),
+          batch_size_(batch_size),
+          start_ts_(getCurrentTimeInMilli()) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -199,6 +202,7 @@ class TransferEngineOperationState : public OperationState {
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
+    const int64_t start_ts_;
 };
 
 /**
@@ -366,6 +370,7 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
+                               const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr);
 
     /**
@@ -385,6 +390,14 @@ class TransferSubmitter {
                                          std::vector<Slice>& slices,
                                          TransferRequest::OpCode op_code);
 
+    /**
+     * @brief Submit a range read: read [src_offset, src_offset+size) from
+     * object into slice.ptr. Slices must total exactly `size` bytes.
+     */
+    std::optional<TransferFuture> submitRangeRead(
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        uint64_t src_offset);
+
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
@@ -394,13 +407,31 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
+
+    /**
+     * @brief Pure comparison helper: returns true iff both endpoints are
+     * non-empty and identical. Exposed for unit testing of the locality
+     * decision without instantiating a full TransferEngine.
+     *
+     * Two endpoints identify the same process only when their ip:port (or
+     * full hostname) match exactly; same-host different-process pairs share
+     * an IP but not a port and must NOT be treated as locally addressable.
+     */
+    static bool isSameProcessEndpoint(const std::string& handle_endpoint,
+                                      const std::string& local_endpoint);
 
    private:
     TransferEngine& engine_;
+    // Cached at construction: the local transport endpoint never changes for
+    // the lifetime of the TransferSubmitter, so we avoid calling
+    // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
+    const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 
     /**
@@ -425,16 +456,21 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
+     * @param src_offset Optional offset in source buffer (default 0)
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        uint64_t src_offset = 0);
+
+    std::optional<TransferFuture> submitMemoryReadOperation(
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices, uint64_t src_offset);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

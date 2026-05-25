@@ -126,13 +126,14 @@ fn main() {
     let config = ReplicateConfig {
         replica_num: 2,
         with_soft_pin: true,
+        with_hard_pin: false,
         preferred_segments: vec!["seg-0".to_string()],
     };
 
     if let Err(e) = store.put("replicated-key", b"replicated value", Some(&config)) {
         eprintln!("[FAIL] put() with ReplicateConfig failed: {e}");
     } else {
-        println!("[OK] put(\"replicated-key\") with replica_num=2, soft_pin=true");
+        println!("[OK] put(\"replicated-key\") with replica_num=2, soft_pin=true, hard_pin=false");
     }
 
     // Step 8: Remove the keys.

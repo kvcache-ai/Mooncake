@@ -31,9 +31,11 @@ import os
 import sys
 import time
 import unittest
+from dataclasses import dataclass
 
 import torch
 import numpy as np
+import mooncake.store as mooncake_store
 
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
@@ -41,12 +43,13 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 #  Constants
 # ==========================================
 
-# Must match C++ TensorMetadata layout
-TENSOR_METADATA_SIZE = 4 + 4 + 8 * 4  # 40 bytes
+# Must match current C++ TensorMetadata layout.
+# TensorObjectHeader (40) + TensorLayoutMetadata (264) = 304 bytes.
+TENSOR_METADATA_SIZE = 304
 
 
 def serialized_tensor_size(tensor):
-    """Size of [TensorMetadata][tensor data] as stored by get_tensor_into."""
+    """Size of [TensorObjectHeader+layout metadata][tensor data]."""
     return TENSOR_METADATA_SIZE + tensor.numel() * tensor.element_size()
 
 
@@ -92,6 +95,51 @@ def tearDownModule():
     if GLOBAL_STORE:
         GLOBAL_STORE.close()
         GLOBAL_STORE = None
+
+
+def require_unified_parallelism_api(test_case):
+    missing = [
+        name for name in ["ParallelAxis", "TensorParallelism", "ReadTarget"]
+        if not hasattr(mooncake_store, name)
+    ]
+    if missing:
+        test_case.skipTest(
+            "Unified parallelism Python bindings are not available in the installed extension: "
+            + ", ".join(missing)
+        )
+
+
+def make_parallel_axis(kind, rank, size, split_dim=None):
+    axis = mooncake_store.ParallelAxis()
+    axis.kind = kind
+    axis.rank = rank
+    axis.size = size
+    axis.split_dim = split_dim
+    return axis
+
+
+def make_tensor_parallelism(axes):
+    parallelism = mooncake_store.TensorParallelism()
+    parallelism.axes = axes
+    return parallelism
+
+
+def make_read_target(mode, parallelism=None):
+    target = mooncake_store.ReadTarget()
+    target.mode = mode
+    target.parallelism = parallelism
+    return target
+
+
+@dataclass
+class WriterPartition:
+    rank: int
+    size: int
+    split_dim: int
+
+
+def make_writer_partition(rank, size, split_dim):
+    return WriterPartition(rank=rank, size=size, split_dim=split_dim)
 
 
 class UpsertTestBase(unittest.TestCase):
@@ -466,6 +514,555 @@ class TestUpsertPubTensor(UpsertTestBase):
         self.assertTrue(torch.equal(t2, got))
 
 
+class TestUnifiedParallelismUpsert(UpsertTestBase):
+    def test_put_tensor_with_parallelism_rejects_nonuniform_multi_axis(self):
+        require_unified_parallelism_api(self)
+        key = "unified_nonuniform_multi_axis_reject"
+        tensor = torch.arange(6, dtype=torch.float32).view(2, 3).contiguous()
+        parallelism = make_tensor_parallelism([
+            make_parallel_axis("dp", rank=0, size=2),
+            make_parallel_axis("tp", rank=0, size=2, split_dim=1),
+        ])
+
+        rc = self.store.put_tensor_with_parallelism(key, tensor, parallelism)
+        self.assertNotEqual(rc, 0)
+        self.assertIsNone(
+            self.store.get_tensor_with_parallelism(key, make_read_target("shard", parallelism))
+        )
+
+    def test_put_tensor_with_parallelism_from_rejects_nonuniform_multi_axis(self):
+        require_unified_parallelism_api(self)
+        seed_key = "unified_nonuniform_multi_axis_from_seed"
+        key = "unified_nonuniform_multi_axis_from_reject"
+        tensor = torch.arange(6, dtype=torch.float32).view(2, 3).contiguous()
+        self.assertEqual(self.store.put_tensor(seed_key, tensor), 0)
+
+        buffer_size = serialized_tensor_size(tensor)
+        buf = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buf)
+        self.assertEqual(self.store.register_buffer(ptr, buffer_size), 0)
+        try:
+            got = self.store.get_tensor_into(seed_key, ptr, buffer_size)
+            self.assertIsNotNone(got)
+            parallelism = make_tensor_parallelism([
+                make_parallel_axis("dp", rank=1, size=2),
+                make_parallel_axis("tp", rank=1, size=2, split_dim=1),
+            ])
+            rc = self.store.put_tensor_with_parallelism_from(
+                key, ptr, buffer_size, parallelism
+            )
+            self.assertNotEqual(rc, 0)
+            self.assertIsNone(
+                self.store.get_tensor_with_parallelism(
+                    key, make_read_target("shard", parallelism)
+                )
+            )
+        finally:
+            self.store.unregister_buffer(ptr)
+
+    def test_put_tensor_with_writer_partition_rejects_nonuniform(self):
+        require_unified_parallelism_api(self)
+        key = "writer_partition_nonuniform_reject"
+        tensor = torch.arange(6, dtype=torch.float32).view(2, 3).contiguous()
+
+        rc = self.store.put_tensor_with_parallelism(
+            key,
+            tensor,
+            writer_partition=make_writer_partition(rank=0, size=2, split_dim=1),
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIsNone(self.store.get_tensor_with_parallelism(key, make_read_target("full")))
+
+    def test_batch_put_tensor_with_parallelism_rejects_nonuniform_and_preserves_uniform_data(self):
+        require_unified_parallelism_api(self)
+        keys = ["uniform_batch_ok", "nonuniform_batch_reject"]
+        tensors = [
+            torch.arange(8, dtype=torch.float32).view(2, 4).contiguous(),
+            torch.arange(6, dtype=torch.float32).view(2, 3).contiguous(),
+        ]
+        parallelisms = [
+            make_tensor_parallelism([
+                make_parallel_axis("dp", rank=0, size=2),
+                make_parallel_axis("tp", rank=1, size=2, split_dim=1),
+            ]),
+            make_tensor_parallelism([
+                make_parallel_axis("dp", rank=1, size=2),
+                make_parallel_axis("tp", rank=0, size=4, split_dim=1),
+            ]),
+        ]
+
+        results = list(
+            self.store.batch_put_tensor_with_parallelism(keys, tensors, parallelisms)
+        )
+        self.assertEqual(results[0], 0)
+        self.assertNotEqual(results[1], 0)
+
+        got_uniform = self.store.get_tensor_with_parallelism(
+            keys[0], make_read_target("shard", parallelisms[0])
+        )
+        self.assertIsNotNone(got_uniform)
+        self.assertTrue(torch.equal(got_uniform, tensors[0].chunk(2, 1)[1]))
+        self.assertIsNone(
+            self.store.get_tensor_with_parallelism(
+                keys[1], make_read_target("shard", parallelisms[1])
+            )
+        )
+
+    def test_upsert_tensor_with_parallelism_multi_axis(self):
+        require_unified_parallelism_api(self)
+        key = "unified_multi_axis_upsert"
+        original = torch.arange(8, dtype=torch.float32).view(2, 4).contiguous()
+        updated = (original + 50).contiguous()
+
+        dp_axis = make_parallel_axis("dp", rank=1, size=2)
+        tp_axis = make_parallel_axis("tp", rank=0, size=2, split_dim=1)
+        parallelism = make_tensor_parallelism([dp_axis, tp_axis])
+
+        for rank in range(2):
+            rank_parallelism = clone_parallelism(parallelism)
+            rank_parallelism.axes[1].rank = rank
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(key, original, rank_parallelism),
+                0,
+            )
+            self.assertEqual(
+                self.store.upsert_tensor_with_parallelism(key, updated, rank_parallelism),
+                0,
+            )
+
+        target = make_read_target("shard", parallelism)
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertIsNotNone(got)
+        self.assertTrue(torch.equal(got, updated.chunk(2, 1)[0]))
+
+    def test_batch_upsert_tensor_with_parallelism_multi_axis(self):
+        require_unified_parallelism_api(self)
+        keys = ["unified_multi_axis_batch_upsert_0", "unified_multi_axis_batch_upsert_1"]
+        originals = [
+            torch.arange(8, dtype=torch.float32).view(2, 4).contiguous(),
+            torch.arange(8, 16, dtype=torch.float32).view(4, 2).contiguous(),
+        ]
+        updates = [(tensor + 100).contiguous() for tensor in originals]
+
+        base_parallelisms = []
+        dp_tp = make_tensor_parallelism([
+            make_parallel_axis("dp", rank=1, size=2),
+            make_parallel_axis("tp", rank=1, size=2, split_dim=1),
+        ])
+        pp_tp = make_tensor_parallelism([
+            make_parallel_axis("pp", rank=0, size=2),
+            make_parallel_axis("tp", rank=1, size=2, split_dim=0),
+        ])
+        pp_tp.axes[0].stage_id = 3
+        base_parallelisms.extend([dp_tp, pp_tp])
+
+        rank_parallelisms = []
+        for base_parallelism in base_parallelisms:
+            tp_axis = next(axis for axis in base_parallelism.axes if axis.kind == "tp")
+            for rank in range(tp_axis.size):
+                parallelism = clone_parallelism(base_parallelism)
+                for axis in parallelism.axes:
+                    if axis.kind == "tp":
+                        axis.rank = rank
+                        break
+                rank_parallelisms.append(parallelism)
+        batch_keys = [keys[0]] * 2 + [keys[1]] * 2
+        batch_originals = [originals[0]] * 2 + [originals[1]] * 2
+        batch_updates = [updates[0]] * 2 + [updates[1]] * 2
+
+        self.assertEqual(
+            list(self.store.batch_put_tensor_with_parallelism(batch_keys, batch_originals, rank_parallelisms)),
+            [0, 0, 0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_tensor_with_parallelism(batch_keys, batch_updates, rank_parallelisms)),
+            [0, 0, 0, 0],
+        )
+        invalid_results = list(
+            self.store.batch_put_tensor_with_parallelism(
+                keys,
+                originals,
+                parallelisms=base_parallelisms,
+                writer_partitions=[
+                    make_writer_partition(0, 2, 0),
+                    make_writer_partition(1, 2, 0),
+                ],
+            )
+        )
+        self.assertTrue(
+            all(result != 0 for result in invalid_results),
+            f"expected invalid combined routing request: {invalid_results}",
+        )
+
+        targets = []
+        for parallelism in base_parallelisms:
+            target = mooncake_store.ReadTarget()
+            target.mode = "shard"
+            target.parallelism = parallelism
+            targets.append(target)
+        results = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(torch.equal(results[0], updates[0].chunk(2, 1)[1]))
+        self.assertTrue(torch.equal(results[1], updates[1].chunk(2, 0)[1]))
+
+    def test_upsert_tensor_with_parallelism_from_multi_axis(self):
+        require_unified_parallelism_api(self)
+        key = "unified_multi_axis_upsert_from"
+        seed_key = "unified_multi_axis_upsert_from_seed"
+        tensor = torch.arange(8, dtype=torch.float32).view(2, 4).contiguous()
+        updated = (tensor + 77).contiguous()
+
+        self.assertEqual(self.store.put_tensor(seed_key, updated), 0)
+        buffer_size = serialized_tensor_size(updated)
+        buf = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buf)
+        self.assertEqual(self.store.register_buffer(ptr, buffer_size), 0)
+        try:
+            got = self.store.get_tensor_into(seed_key, ptr, buffer_size)
+            self.assertIsNotNone(got)
+
+            dp_axis = make_parallel_axis("dp", rank=0, size=2)
+            tp_axis = make_parallel_axis("tp", rank=1, size=2, split_dim=1)
+            parallelism = make_tensor_parallelism([dp_axis, tp_axis])
+
+            for rank in range(2):
+                rank_parallelism = clone_parallelism(parallelism)
+                rank_parallelism.axes[1].rank = rank
+                self.assertEqual(
+                    self.store.upsert_tensor_with_parallelism_from(
+                        key, ptr, buffer_size, rank_parallelism
+                    ),
+                    0,
+                )
+
+            target = mooncake_store.ReadTarget()
+            target.mode = "shard"
+            target.parallelism = parallelism
+            result = self.store.get_tensor_with_parallelism(key, target)
+            self.assertIsNotNone(result)
+            self.assertTrue(torch.equal(result, updated.chunk(2, 1)[1]))
+        finally:
+            self.store.unregister_buffer(ptr)
+
+    def test_upsert_tensor_with_writer_partition(self):
+        require_unified_parallelism_api(self)
+        key = "writer_partition_upsert"
+        original = torch.arange(8, dtype=torch.float32).view(2, 4).contiguous()
+        updated = (original + 33).contiguous()
+
+        for rank in range(2):
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(
+                    key,
+                    original,
+                    writer_partition=make_writer_partition(rank, 2, 1),
+                ),
+                0,
+            )
+        for rank in range(2):
+            self.assertEqual(
+                self.store.upsert_tensor_with_parallelism(
+                    key,
+                    updated,
+                    writer_partition=make_writer_partition(rank, 2, 1),
+                ),
+                0,
+            )
+
+        target = make_read_target("full")
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertIsNotNone(got)
+        self.assertTrue(torch.equal(got, updated))
+
+    def test_upsert_tensor_with_writer_partition_from(self):
+        require_unified_parallelism_api(self)
+        key = "writer_partition_upsert_from"
+        seed_key = "writer_partition_upsert_from_seed"
+        tensor = torch.arange(16, dtype=torch.float32).view(4, 4).contiguous()
+
+        self.assertEqual(self.store.put_tensor(seed_key, tensor), 0)
+        for rank in range(4):
+            self.assertEqual(
+                self.store.put_tensor_with_parallelism(
+                    key,
+                    tensor,
+                    writer_partition=make_writer_partition(rank, 4, 0),
+                ),
+                0,
+            )
+        buffer_size = serialized_tensor_size(tensor)
+        buf = ctypes.create_string_buffer(buffer_size)
+        ptr = ctypes.addressof(buf)
+        self.assertEqual(self.store.register_buffer(ptr, buffer_size), 0)
+        try:
+            got = self.store.get_tensor_into(seed_key, ptr, buffer_size)
+            self.assertIsNotNone(got)
+
+            for rank in range(4):
+                self.assertEqual(
+                    self.store.upsert_tensor_with_parallelism_from(
+                        key,
+                        ptr,
+                        buffer_size,
+                        writer_partition=make_writer_partition(rank, 4, 0),
+                    ),
+                    0,
+                )
+
+            target = mooncake_store.ReadTarget()
+            target.mode = "full"
+            target.parallelism = None
+            result = self.store.get_tensor_with_parallelism(key, target)
+            self.assertIsNotNone(result)
+            self.assertTrue(torch.equal(result, tensor))
+        finally:
+            self.store.unregister_buffer(ptr)
+
+    def test_batch_upsert_tensor_with_writer_partitions(self):
+        require_unified_parallelism_api(self)
+        keys = ["writer_partition_batch_upsert_0", "writer_partition_batch_upsert_1"]
+        originals = [
+            torch.arange(8, dtype=torch.float32).view(2, 4).contiguous(),
+            torch.arange(8, 16, dtype=torch.float32).view(2, 4).contiguous(),
+        ]
+        updates = [(tensor + 100).contiguous() for tensor in originals]
+
+        for rank in range(2):
+            writer_partitions = [
+                make_writer_partition(rank=rank, size=2, split_dim=1),
+                make_writer_partition(rank=rank, size=2, split_dim=1),
+            ]
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_with_parallelism(
+                        keys,
+                        originals,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_with_parallelism(
+                        keys,
+                        updates,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+
+        results = self.store.batch_get_tensor_with_parallelism(
+            keys, [make_read_target("full"), make_read_target("full")]
+        )
+        self.assertEqual(len(results), 2)
+        self.assertTrue(torch.equal(results[0], updates[0]))
+        self.assertTrue(torch.equal(results[1], updates[1]))
+
+    def test_batch_upsert_tensor_with_writer_partitions_from(self):
+        require_unified_parallelism_api(self)
+        keys = ["writer_partition_batch_upsert_from_0", "writer_partition_batch_upsert_from_1"]
+        seed_keys = [f"{key}_seed" for key in keys]
+        tensors = [
+            torch.arange(16, dtype=torch.float32).view(4, 4).contiguous(),
+            torch.arange(16, 32, dtype=torch.float32).view(4, 4).contiguous(),
+        ]
+
+        for seed_key, tensor in zip(seed_keys, tensors):
+            self.assertEqual(self.store.put_tensor(seed_key, tensor), 0)
+
+        for rank in range(4):
+            writer_partitions = [
+                make_writer_partition(rank=rank, size=4, split_dim=0),
+                make_writer_partition(rank=rank, size=4, split_dim=0),
+            ]
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_with_parallelism(
+                        keys,
+                        tensors,
+                        writer_partitions=writer_partitions,
+                    )
+                ),
+                [0, 0],
+            )
+
+        buffer_sizes = [serialized_tensor_size(tensor) for tensor in tensors]
+        backing_buffer = ctypes.create_string_buffer(sum(buffer_sizes))
+        base_ptr = ctypes.addressof(backing_buffer)
+        buffer_ptrs = []
+        offset = 0
+        for size in buffer_sizes:
+            buffer_ptrs.append(base_ptr + offset)
+            offset += size
+        self.assertEqual(self.store.register_buffer(base_ptr, len(backing_buffer)), 0)
+        try:
+            for seed_key, ptr, size in zip(seed_keys, buffer_ptrs, buffer_sizes):
+                got = self.store.get_tensor_into(seed_key, ptr, size)
+                self.assertIsNotNone(got)
+
+            for rank in range(4):
+                writer_partitions = [
+                    make_writer_partition(rank=rank, size=4, split_dim=0),
+                    make_writer_partition(rank=rank, size=4, split_dim=0),
+                ]
+                self.assertEqual(
+                    list(
+                        self.store.batch_upsert_tensor_with_parallelism_from(
+                            keys,
+                            buffer_ptrs,
+                            buffer_sizes,
+                            writer_partitions=writer_partitions,
+                        )
+                    ),
+                    [0, 0],
+                )
+
+            results = self.store.batch_get_tensor_with_parallelism(
+                keys, [make_read_target("full"), make_read_target("full")]
+            )
+            self.assertEqual(len(results), 2)
+            self.assertTrue(torch.equal(results[0], tensors[0]))
+            self.assertTrue(torch.equal(results[1], tensors[1]))
+        finally:
+            self.store.unregister_buffer(base_ptr)
+
+
+def clone_parallelism(parallelism):
+    cloned_axes = []
+    for axis in parallelism.axes:
+        cloned_axis = make_parallel_axis(
+            axis.kind,
+            rank=axis.rank,
+            size=axis.size,
+            split_dim=axis.split_dim,
+        )
+        if getattr(axis, "expert_id", None) is not None:
+            cloned_axis.expert_id = axis.expert_id
+        if getattr(axis, "stage_id", None) is not None:
+            cloned_axis.stage_id = axis.stage_id
+        cloned_axes.append(cloned_axis)
+    return make_tensor_parallelism(cloned_axes)
+
+
+class TestUpsertParallelTensor(UpsertTestBase):
+    """Parallelism-based tensor upsert coverage for TP cases."""
+
+    def test_upsert_tensor_with_parallelism_tp(self):
+        require_unified_parallelism_api(self)
+        tp_size = 2
+        split_dim = 1
+        key = "tp_upsert_single"
+        original = torch.arange(6, dtype=torch.float32).view(2, 3).contiguous()
+        updated = (original + 100).contiguous()
+        original_shard = original.chunk(tp_size, split_dim)[0].contiguous()
+        updated_shard = updated.chunk(tp_size, split_dim)[0].contiguous()
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        target = make_read_target("shard", parallelism)
+
+        self.assertEqual(
+            self.store.put_tensor_with_parallelism(key, original_shard, parallelism),
+            0,
+        )
+        self.assertEqual(
+            self.store.upsert_tensor_with_parallelism(key, updated_shard, parallelism),
+            0,
+        )
+
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertTrue(torch.equal(got, updated_shard))
+
+    def test_batch_upsert_tensor_with_parallelism_tp(self):
+        require_unified_parallelism_api(self)
+        tp_size = 2
+        split_dim = 0
+        keys = ["tp_batch_upsert_0", "tp_batch_upsert_1"]
+        originals = [torch.arange(16, dtype=torch.float32).view(4, 4).contiguous(),
+                     torch.arange(16, 32, dtype=torch.float32).view(4, 4).contiguous()]
+        updates = [(t + 1000).contiguous() for t in originals]
+        original_shards = [tensor.chunk(tp_size, split_dim)[0].contiguous() for tensor in originals]
+        update_shards = [tensor.chunk(tp_size, split_dim)[0].contiguous() for tensor in updates]
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        targets = [make_read_target("shard", parallelism) for _ in keys]
+
+        self.assertEqual(
+            list(self.store.batch_put_tensor_with_parallelism(keys, original_shards, [parallelism] * len(keys))),
+            [0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_tensor_with_parallelism(keys, update_shards, [parallelism] * len(keys))),
+            [0, 0],
+        )
+
+        got_shards = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        for got, expected in zip(got_shards, update_shards):
+            self.assertTrue(torch.equal(got, expected))
+
+    def test_upsert_tensor_with_parallelism_tp_with_config(self):
+        require_unified_parallelism_api(self)
+        tp_size = 2
+        split_dim = 1
+        key = "tp_upsert_pub_single"
+        config = ReplicateConfig()
+        config.replica_num = 1
+        base = torch.ones(4, 6, dtype=torch.float32).contiguous()
+        updated = torch.full((4, 6), 7.0, dtype=torch.float32).contiguous()
+        base_shard = base.chunk(tp_size, split_dim)[0].contiguous()
+        updated_shard = updated.chunk(tp_size, split_dim)[0].contiguous()
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        target = make_read_target("shard", parallelism)
+
+        self.assertEqual(
+            self.store.put_tensor_with_parallelism(key, base_shard, parallelism, config=config),
+            0,
+        )
+        self.assertEqual(
+            self.store.upsert_tensor_with_parallelism(key, updated_shard, parallelism, config=config),
+            0,
+        )
+
+        got = self.store.get_tensor_with_parallelism(key, target)
+        self.assertTrue(torch.equal(got, updated_shard))
+
+    def test_batch_upsert_tensor_with_parallelism_tp_with_config(self):
+        require_unified_parallelism_api(self)
+        tp_size = 2
+        split_dim = 0
+        config = ReplicateConfig()
+        config.replica_num = 1
+        keys = ["tp_upsert_pub_batch_0", "tp_upsert_pub_batch_1"]
+        base = [torch.ones(4, 4, dtype=torch.float32).contiguous(),
+                torch.full((4, 4), 2.0, dtype=torch.float32).contiguous()]
+        updates = [torch.full((4, 4), 9.0, dtype=torch.float32).contiguous(),
+                   torch.full((4, 4), 11.0, dtype=torch.float32).contiguous()]
+        base_shards = [tensor.chunk(tp_size, split_dim)[0].contiguous() for tensor in base]
+        update_shards = [tensor.chunk(tp_size, split_dim)[0].contiguous() for tensor in updates]
+        parallelism = make_tensor_parallelism(
+            [make_parallel_axis("tp", rank=0, size=tp_size, split_dim=split_dim)]
+        )
+        targets = [make_read_target("shard", parallelism) for _ in keys]
+
+        self.assertEqual(
+            list(self.store.batch_put_tensor_with_parallelism(keys, base_shards, [parallelism] * len(keys), config=config)),
+            [0, 0],
+        )
+        self.assertEqual(
+            list(self.store.batch_upsert_tensor_with_parallelism(keys, update_shards, [parallelism] * len(keys), config=config)),
+            [0, 0],
+        )
+
+        got_shards = self.store.batch_get_tensor_with_parallelism(keys, targets)
+        for got, expected in zip(got_shards, update_shards):
+            self.assertTrue(torch.equal(got, expected))
+
+
 # ==========================================
 #  6. Mixed Scenarios
 # ==========================================
@@ -522,7 +1119,9 @@ if __name__ == "__main__":
     print("   Raw bytes:  upsert, upsert_parts, upsert_batch,")
     print("               upsert_from, batch_upsert_from")
     print("   Tensor:     upsert_tensor, batch_upsert_tensor,")
-    print("               upsert_tensor_from, batch_upsert_tensor_from")
+    print("               upsert_tensor_from, batch_upsert_tensor_from,")
+    print("               upsert_tensor_with_parallelism,")
+    print("               batch_upsert_tensor_with_parallelism")
     print("   Pub tensor: upsert_pub_tensor, batch_upsert_pub_tensor")
     print("   Mixed:      cross-interface, sequential, size changes")
     unittest.main(verbosity=2)

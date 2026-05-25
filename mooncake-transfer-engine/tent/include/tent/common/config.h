@@ -124,6 +124,41 @@ class Config {
         *node = value;
     }
 
+    // Set a config value from a string with automatic type inference.
+    // Recognizes "true"/"false" (case-insensitive) as booleans and
+    // pure-integer strings as long long, falling back to std::string.
+    void setFromString(const std::string& key, const std::string& value) {
+        // Boolean detection (case-insensitive)
+        {
+            std::string lower = value;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower == "true") {
+                set(key, true);
+                return;
+            }
+            if (lower == "false") {
+                set(key, false);
+                return;
+            }
+        }
+        // Integer detection
+        if (!value.empty()) {
+            try {
+                size_t pos = 0;
+                long long int_val = std::stoll(value, &pos);
+                if (pos == value.size()) {
+                    set(key, int_val);
+                    return;
+                }
+            } catch (const std::exception&) {
+                // Not an integer, fall through
+            }
+        }
+        // Fallback: store as string
+        set(key, value);
+    }
+
     Status load(const std::string& content);
 
     Status loadFile(const std::string& file_path);

@@ -228,19 +228,31 @@ void setLogLevel(const std::string level) {
         FLAGS_minloglevel = google::ERROR;
 }
 
+static std::string readIdentityFile(const char* path) {
+    std::ifstream file(path);
+    if (!file) return "";
+    std::string content((std::istreambuf_iterator<char>(file)),
+                        std::istreambuf_iterator<char>());
+    if (!content.empty() && content.back() == '\n') content.pop_back();
+    return content;
+}
+
 std::string getMachineID() {
-    std::ifstream file("/etc/machine-id");
-    if (file) {
-        std::string content((std::istreambuf_iterator<char>(file)),
-                            std::istreambuf_iterator<char>());
-        if (!content.empty() && content.back() == '\n') content.pop_back();
-        return content;
-    } else {
-        std::string content = "undefined_machine_";
-        for (int i = 0; i < 16; ++i)
-            content += 'a' + SimpleRandom::Get().next(26);
-        return content;
+    const std::string boot_id =
+        readIdentityFile("/proc/sys/kernel/random/boot_id");
+    const std::string machine_id = readIdentityFile("/etc/machine-id");
+
+    if (!boot_id.empty() && !machine_id.empty()) {
+        return boot_id + ":" + machine_id;
     }
+
+    if (!boot_id.empty()) return boot_id;
+    if (!machine_id.empty()) return machine_id;
+
+    std::string content = "undefined_machine_";
+    for (int i = 0; i < 16; ++i) content += 'a' + SimpleRandom::Get().next(26);
+    LOG(WARNING) << "TENT getMachineID source=fallback value=" << content;
+    return content;
 }
 
 Status TransferEngineImpl::setupLocalSegment() {
@@ -291,6 +303,9 @@ Status TransferEngineImpl::construct() {
     local_segment_name_ = conf_->get("local_segment_name", "");
     CHECK_STATUS(getRpcServerPortFromConfig(*conf_, 0, port_));
     merge_requests_ = conf_->get("merge_requests", true);
+    max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
+    enable_auto_failover_on_poll_ =
+        conf_->get("enable_auto_failover_on_poll", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -593,9 +608,17 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
+    if (request_type != UNSPEC) {
+        if (request_type >= 0 && request_type < kSupportedTransportTypes &&
+            transport_list_[request_type]) {
+            result.push_back(request_type);
+        }
+        return result;
+    }
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
+    if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
@@ -611,6 +634,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
     auto transports = getSupportedTransports(options.type);
+    if (transports.empty()) {
+        return Status::InvalidArgument(
+            "No available transport for registerLocalMemory" LOC_MARK);
+    }
 
     // Build BufferDescs: warm-up → NUMA probe → fill location
     std::vector<BufferDesc> desc_list;
@@ -745,10 +772,14 @@ Status TransferEngineImpl::lazyFreeBatch() {
     return Status::OK();
 }
 
+static bool isGpuType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM;
+}
+
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local) {
     if (local == MTYPE_CPU) return xport && xport->capabilities().dram_to_file;
-    if (local == MTYPE_CUDA) return xport && xport->capabilities().gpu_to_file;
+    if (isGpuType(local)) return xport && xport->capabilities().gpu_to_file;
     return false;
 }
 
@@ -756,11 +787,11 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local, MemoryType remote) {
     if (local == MTYPE_CPU && remote == MTYPE_CPU)
         return xport && xport->capabilities().dram_to_dram;
-    if (local == MTYPE_CUDA && remote == MTYPE_CUDA)
+    if (isGpuType(local) && isGpuType(remote))
         return xport && xport->capabilities().gpu_to_gpu;
-    if (local == MTYPE_CPU && remote == MTYPE_CUDA)
+    if (local == MTYPE_CPU && isGpuType(remote))
         return xport && xport->capabilities().dram_to_gpu;
-    if (local == MTYPE_CUDA && remote == MTYPE_CPU)
+    if (isGpuType(local) && remote == MTYPE_CPU)
         return xport && xport->capabilities().gpu_to_dram;
     return false;
 }
@@ -769,6 +800,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
+    if (type == "rocm") return MTYPE_ROCM;
     return MTYPE_UNKNOWN;
 }
 
@@ -794,9 +826,13 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
     } else {
         auto entry = desc->findBuffer(request.target_offset, request.length);
         if (!entry) return UNSPEC;
-        bool same_machine =
-            (desc->machine_id ==
-             metadata_->segmentManager().getLocal()->machine_id);
+        bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
+        if (!same_machine) {
+            auto local_desc = metadata_->segmentManager().getLocal();
+            same_machine = local_desc && !desc->machine_id.empty() &&
+                           !local_desc->machine_id.empty() &&
+                           desc->machine_id == local_desc->machine_id;
+        }
         auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
@@ -806,6 +842,29 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
             }
         }
         return UNSPEC;
+    }
+}
+
+static const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case RDMA:
+            return "RDMA";
+        case MNNVL:
+            return "MNNVL";
+        case SHM:
+            return "SHM";
+        case NVLINK:
+            return "NVLINK";
+        case GDS:
+            return "GDS";
+        case IOURING:
+            return "IOURING";
+        case TCP:
+            return "TCP";
+        case AscendDirect:
+            return "AscendDirect";
+        default:
+            return "UNSPEC";
     }
 }
 
@@ -1211,13 +1270,31 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
+    auto prev_type = task.type;
+
+    if (++task.failover_count > max_failover_attempts_) {
+        LOG(WARNING) << "Task failover limit reached ("
+                     << max_failover_attempts_
+                     << "), last transport=" << transportTypeName(prev_type);
+        return Status::InvalidEntry(
+            "Failover limit exceeded, all transports exhausted");
+    }
+
     if (task.staging)
         task.staging = false;
     else
         task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
-    if (type == UNSPEC)
+    if (type == UNSPEC) {
+        LOG(WARNING) << "No more transports available after "
+                     << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
+    }
+
+    LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
+              << " -> " << transportTypeName(type) << " (attempt "
+              << task.failover_count << "/" << max_failover_attempts_ << ")";
+    TENT_RECORD_TRANSPORT_FAILOVER();
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])
@@ -1227,6 +1304,18 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     task.sub_task_id = sub_batch->size();
     task.type = type;
     return transport->submitTransferTasks(sub_batch, {task.request});
+}
+
+void TransferEngineImpl::updateTaskStatusFromPoll(Batch* batch, size_t task_id,
+                                                  TransferStatus& task_status) {
+    auto& task = batch->task_list[task_id];
+    task.status = task_status.s;
+    if (!enable_auto_failover_on_poll_ || task_status.s != FAILED) return;
+
+    if (resubmitTransferTask(batch, task_id).ok()) {
+        task_status.s = PENDING;
+        task.status = PENDING;
+    }
 }
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
@@ -1293,7 +1382,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
                                                   task_status));
     }
-    batch->task_list[task_id].status = task_status.s;
+    updateTaskStatusFromPoll(batch, task_id, task_status);
 
     // Record metrics when task transitions to terminal state
     recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
@@ -1323,7 +1412,16 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
+    size_t failed_tasks = 0;
     size_t total_tasks = 0;
+    TransferStatusEnum worst_failure = PENDING;
+    auto isWorse = [](TransferStatusEnum cur, TransferStatusEnum best) {
+        static const std::unordered_map<TransferStatusEnum, int> severity = {
+            {INITIAL, 0},  {PENDING, 0}, {COMPLETED, 0}, {INVALID, 1},
+            {CANCELED, 2}, {TIMEOUT, 3}, {FAILED, 4},
+        };
+        return severity.at(cur) > severity.at(best);
+    };
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
@@ -1334,7 +1432,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                 success_tasks++;
                 overall_status.transferred_bytes += task.request.length;
             } else {
-                overall_status.s = task.status;
+                failed_tasks++;
+                if (isWorse(task.status, worst_failure))
+                    worst_failure = task.status;
             }
             continue;
         }
@@ -1344,7 +1444,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         } else {
             if (task.type == UNSPEC) {
                 task.status = FAILED;
-                overall_status.s = FAILED;
+                failed_tasks++;
+                if (isWorse(FAILED, worst_failure)) worst_failure = FAILED;
                 continue;
             }
             auto& transport = transport_list_[task.type];
@@ -1356,20 +1457,31 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
+        // Preserve legacy auto-failover-on-poll before aggregating status.
+        updateTaskStatusFromPoll(batch, task_id, task_status);
+
         if (task_status.s == COMPLETED) {
             success_tasks++;
             overall_status.transferred_bytes += task_status.transferred_bytes;
-        } else {
-            overall_status.s = task_status.s;
+        } else if (task_status.s != PENDING) {
+            failed_tasks++;
+            if (isWorse(task_status.s, worst_failure))
+                worst_failure = task_status.s;
         }
-        // memorize task result
-        task.status = task_status.s;
 
         // Record metrics when task transitions to terminal state
         recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
                                     task_status.s);
     }
-    if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    // Determine overall status: COMPLETED only when all succeed; FAILED only
+    // when all tasks are terminal (no in-flight work) and at least one failed;
+    // otherwise PENDING (some tasks still running).
+    if (success_tasks == total_tasks) {
+        overall_status.s = COMPLETED;
+    } else if (success_tasks + failed_tasks == total_tasks) {
+        overall_status.s = worst_failure;
+    }
+    // else: some tasks still PENDING → overall_status.s stays PENDING
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }

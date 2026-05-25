@@ -14,17 +14,22 @@
 
 #include "transport/rdma_transport/rdma_context.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cassert>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <thread>
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "environ.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -38,6 +43,14 @@ static int isNullGid(union ibv_gid *gid) {
     }
     return 1;
 }
+
+namespace {
+bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
+    const auto region_start = reinterpret_cast<uintptr_t>(region.addr);
+    const auto region_length = static_cast<uintptr_t>(region.mr->length);
+    return region_start <= addr && addr - region_start < region_length;
+}
+}  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     : device_name_(device_name),
@@ -137,8 +150,20 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
+#ifdef USE_MLX5DV
+    {
+        mlx5dv_context dv_ctx = {};
+        dv_ctx.comp_mask = MLX5DV_CONTEXT_MASK_NUM_LAG_PORTS;
+        if (mlx5dv_query_device(context_, &dv_ctx) == 0)
+            num_lag_ports_ = dv_ctx.num_lag_ports;
+    }
+    LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
+              << ", GID: (GID_Index " << gid_index_ << ") " << gid()
+              << ", num_lag_ports: " << (int)num_lag_ports_;
+#else
     LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
+#endif
 
     return 0;
 }
@@ -162,13 +187,13 @@ int RdmaContext::deconstruct() {
 
     endpoint_store_->destroyQPs();
 
-    for (auto &entry : memory_region_list_) {
+    for (auto &[_, entry] : memory_region_map_) {
         int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister memory region";
         }
     }
-    memory_region_list_.clear();
+    memory_region_map_.clear();
 
     for (size_t i = 0; i < cq_list_.size(); ++i) {
         if (!cq_list_[i].native) continue;
@@ -217,7 +242,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -230,32 +255,88 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#if defined(USE_CUDA)
+    } else if (memType == CU_MEMORYTYPE_DEVICE &&
+               Environ::Get().GetWithNvidiaPeermem()) {
+        // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
+        // GPU memory (requires the nvidia-peermem kernel module to be loaded).
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
+#if defined(USE_CUDA)
+        // Ensure a CUDA context is current — worker threads or callers
+        // from non-CUDA threads may lack one.
+        unsigned int devOrd = 0;
+        cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                              (CUdeviceptr)addr);
+        CUdevice cuDev;
+        CUcontext cuCtx;
+        cuDeviceGet(&cuDev, devOrd);
+        cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        cuCtxSetCurrent(cuCtx);
+
+        // Use cuMemGetAddressRange to get the true allocation base and
+        // size — addr may sit at an offset within a larger cudaMalloc
+        // block (e.g. PyTorch caching allocator packs multiple tensors
+        // into one allocation).  cuMemGetHandleForAddressRange requires
+        // the exact allocation boundaries.
+#endif
+        CUdeviceptr allocBase;
         size_t allocSize;
+#if defined(USE_MLU)
+        allocBase = (CUdeviceptr)addr;
         result = cuPointerGetAttribute(
             &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+#else
+        result =
+            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
+#endif
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+#if defined(USE_MLU)
+            LOG(ERROR) << "Failed to call cuPointerGetAttribute range size for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
+#else
+            LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
+                       << (uintptr_t)addr << " cuda error=" << errStr;
+#endif
+#if defined(USE_CUDA)
+            cuDevicePrimaryCtxRelease(cuDev);
+#endif
             return ERR_CONTEXT;
         }
 
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
-            &dmabuf_fd, (CUdeviceptr)addr, allocSize,
+            &dmabuf_fd, allocBase, allocSize,
             CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
             LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
-                       << " cuda error=" << errStr;
+                       << " base=" << (uintptr_t)allocBase
+                       << " size=" << allocSize << " cuda error=" << errStr;
+#if defined(USE_CUDA)
+            cuDevicePrimaryCtxRelease(cuDev);
+#endif
             return ERR_CONTEXT;
         }
         mrMeta.addr = addr;
-        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+        uint64_t dmabuf_offset = (uintptr_t)addr - (uintptr_t)allocBase;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, dmabuf_offset, length,
                                       (uintptr_t)addr, dmabuf_fd, access);
+        const int regErrno = errno;
+        if (close(dmabuf_fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        if (!mrMeta.mr) {
+            errno = regErrno;
+        }
+#if defined(USE_CUDA)
+        cuDevicePrimaryCtxRelease(cuDev);
+#endif
     }
 #else
     mrMeta.addr = addr;
@@ -275,29 +356,21 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
         return ret;
     }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    memory_region_list_.push_back(mrMeta);
+    memory_region_map_[reinterpret_cast<uintptr_t>(mrMeta.addr)] = mrMeta;
     return 0;
 }
 
 int RdmaContext::unregisterMemoryRegion(void *addr) {
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    bool has_removed;
-    do {
-        has_removed = false;
-        for (auto iter = memory_region_list_.begin();
-             iter != memory_region_list_.end(); ++iter) {
-            if (iter->addr <= addr &&
-                addr < (char *)(iter->addr) + iter->mr->length) {
-                if (ibv_dereg_mr(iter->mr)) {
-                    LOG(ERROR) << "Failed to unregister memory " << addr;
-                    return ERR_CONTEXT;
-                }
-                memory_region_list_.erase(iter);
-                has_removed = true;
-                break;
-            }
-        }
-    } while (has_removed);
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter == memory_region_map_.end()) {
+        return 0;
+    }
+    if (ibv_dereg_mr(iter->second.mr)) {
+        LOG(ERROR) << "Failed to unregister memory " << addr;
+        return ERR_CONTEXT;
+    }
+    memory_region_map_.erase(iter);
     return 0;
 }
 
@@ -313,11 +386,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
 
 uint32_t RdmaContext::rkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
-    for (auto iter = memory_region_list_.begin();
-         iter != memory_region_list_.end(); ++iter)
-        if (iter->addr <= addr &&
-            addr < (char *)(iter->addr) + iter->mr->length)
-            return iter->mr->rkey;
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -325,14 +395,33 @@ uint32_t RdmaContext::rkey(void *addr) {
 
 uint32_t RdmaContext::lkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
-    for (auto iter = memory_region_list_.begin();
-         iter != memory_region_list_.end(); ++iter)
-        if (iter->addr <= addr &&
-            addr < (char *)(iter->addr) + iter->mr->length)
-            return iter->mr->lkey;
+    auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
+    if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
+}
+
+RdmaContext::MemoryRegionMap::iterator RdmaContext::findMemoryRegionContaining(
+    uintptr_t addr) {
+    auto upper = memory_region_map_.upper_bound(addr);
+    if (upper == memory_region_map_.begin()) {
+        return memory_region_map_.end();
+    }
+    auto candidate = std::prev(upper);
+    return containsAddress(candidate->second, addr) ? candidate
+                                                    : memory_region_map_.end();
+}
+
+RdmaContext::MemoryRegionMap::const_iterator
+RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
+    auto upper = memory_region_map_.upper_bound(addr);
+    if (upper == memory_region_map_.begin()) {
+        return memory_region_map_.end();
+    }
+    auto candidate = std::prev(upper);
+    return containsAddress(candidate->second, addr) ? candidate
+                                                    : memory_region_map_.end();
 }
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
@@ -357,12 +446,27 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     return endpoint;
 }
 
+std::shared_ptr<RdmaEndPoint> RdmaContext::getEndpointByPtr(
+    const RdmaEndPoint *endpoint_ptr) {
+    return endpoint_store_->getEndpointByPtr(endpoint_ptr);
+}
+
 int RdmaContext::disconnectAllEndpoints() {
     return endpoint_store_->disconnectQPs();
 }
 
 int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
+}
+
+void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
+
+size_t RdmaContext::waitingListSize() const {
+    return endpoint_store_->waitingListSize();
+}
+
+void RdmaContext::testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) {
+    endpoint_store_->testOnlyInsertWaiting(std::move(ep));
 }
 
 size_t RdmaContext::getTotalQPNumber() const {
@@ -560,27 +664,92 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-        // Verify dmabuf support which is required if not using nvidia-peermem.
-        // Assume device index matches.
-        CUdevice cuDevice;
-        CUresult result = cuDeviceGet(&cuDevice, i);
-        if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "Failed to query CUDA device";
-            return ERR_CONTEXT;
-        }
-        int dmaBufSupported;
-        result = cuDeviceGetAttribute(
-            &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice);
-        if (result != CUDA_SUCCESS) {
-            LOG(ERROR) << "Failed to query CUDA device attributes";
-            return ERR_CONTEXT;
-        }
-        if (!dmaBufSupported) {
-            LOG(ERROR) << "DMA BUF supported required for GPU RDMA without "
-                          "nvidia-peermem";
-            return ERR_CONTEXT;
-        }
+#if defined(USE_MACA) || defined(USE_CUDA)
+        // Verify DMA-BUF support against the GPU device(s) that the local
+        // topology explicitly maps to this RNIC, rather than assuming the
+        // verbs enumeration order matches GPU enumeration.
+        // Validate DMA-BUF support for every GPU that can reach this RNIC,
+        // not just GPUs listing it as preferred.  Runtime selection falls
+        // back to avail_hca when a preferred NIC is disabled, so we must
+        // validate both lists.
+        if (!Environ::Get().GetWithNvidiaPeermem()) {
+            std::vector<int> mapped_gpu_devices;
+            if (engine_.local_topology_) {
+                const auto topology_matrix =
+                    engine_.local_topology_->getMatrix();
+                for (const auto &entry : topology_matrix) {
+                    if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+                    bool in_preferred =
+                        std::find(entry.second.preferred_hca.begin(),
+                                  entry.second.preferred_hca.end(),
+                                  device_name) !=
+                        entry.second.preferred_hca.end();
+                    bool in_avail =
+                        std::find(entry.second.avail_hca.begin(),
+                                  entry.second.avail_hca.end(),
+                                  device_name) != entry.second.avail_hca.end();
+                    if (!in_preferred && !in_avail) continue;
+
+                    try {
+                        mapped_gpu_devices.push_back(
+                            std::stoi(entry.first.substr(GPU_PREFIX.size())));
+                    } catch (const std::exception &e) {
+                        LOG(WARNING) << "Ignore malformed topology GPU entry "
+                                     << entry.first << ": " << e.what();
+                    }
+                }
+            }
+
+            std::sort(mapped_gpu_devices.begin(), mapped_gpu_devices.end());
+            mapped_gpu_devices.erase(std::unique(mapped_gpu_devices.begin(),
+                                                 mapped_gpu_devices.end()),
+                                     mapped_gpu_devices.end());
+
+            if (mapped_gpu_devices.empty()) {
+                LOG(INFO) << "No GPU device is explicitly mapped to RNIC "
+                          << device_name
+                          << "; skip DMA-BUF affinity validation";
+            } else {
+                // cuInit is process-global and idempotent; call it once before
+                // the per-device loop, not per cuDeviceGet.
+#if defined(USE_CUDA)
+                CUresult result = cuInit(0);
+                if (result != CUDA_SUCCESS) {
+                    LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
+                               << device_name;
+                    goto cleanup_context_and_devices;
+                }
+#endif
+                for (int gpu_device : mapped_gpu_devices) {
+                    CUdevice cuDevice;
+                    CUresult result = cuDeviceGet(&cuDevice, gpu_device);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR) << "Failed to query GPU device "
+                                   << gpu_device << " for RNIC " << device_name;
+                        goto cleanup_context_and_devices;
+                    }
+                    int dmaBufSupported;
+                    result = cuDeviceGetAttribute(
+                        &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                        cuDevice);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR)
+                            << "Failed to query GPU device attributes for "
+                            << "GPU device " << gpu_device << " and RNIC "
+                            << device_name;
+                        goto cleanup_context_and_devices;
+                    }
+                    if (!dmaBufSupported) {
+                        LOG(ERROR)
+                            << "DMA BUF supported required for GPU RDMA "
+                               "without "
+                               "nvidia-peermem on GPU device "
+                            << gpu_device << " mapped to RNIC " << device_name;
+                        goto cleanup_context_and_devices;
+                    }
+                }
+            }
+        }  // !Environ::Get().GetWithNvidiaPeermem()
 #endif
 
         ibv_port_attr port_attr;

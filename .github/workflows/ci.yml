@@ -6,18 +6,25 @@ on:
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch: {}
 
 permissions:
   contents: read
-  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -27,26 +34,17 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
-    - name: Cancel workflow if checks failed
-      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
-      uses: actions/github-script@v7
-      with:
-        script: |
-          console.log('Cancelling workflow run due to spell-check or clang-format failure');
-          await github.rest.actions.cancelWorkflowRun({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId
-          });
-          // Wait for cancel to propagate
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          process.exit(1);
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Install and start etcd
       run: |
@@ -77,6 +75,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y lcov gcovr ninja-build
 
+    - name: Test HugeTLB sizing helper
+      run: |
+        python3 scripts/test_hicache_hugepage_requirements.py
+      shell: bash
+
     - name: Set up coverage compilation flags
       run: |
         echo "Setting up coverage compilation flags..."
@@ -105,7 +108,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
       shell: bash
 
     - name: Build project
@@ -130,6 +133,33 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
+    - name: Run Mooncake Store Rust smoke test and benchmark
+      run: |
+        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+          --eviction_high_watermark_ratio=0.95 \
+          --cluster_id=ci_rust_test_cluster \
+          --port 50051 &
+        MASTER_PID=$!
+        sleep 3
+        cd mooncake-store/rust
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
+        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
+        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
+        export MC_RUST_STORE_RUN_INTEGRATION=true
+        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
+        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
+        export MC_RUST_STORE_PROTOCOL=tcp
+        export MC_RUST_STORE_DEVICE_NAME=
+        cargo test --test minimal_smoke -- --nocapture
+        MC_RUST_BENCH_ITERATIONS=4 \
+        MC_RUST_BENCH_VALUE_SIZE=4096 \
+        MC_RUST_BENCH_WARMUP=1 \
+          cargo run --release --example store_benchmark
+        kill $MASTER_PID 2>/dev/null || true
+      shell: bash
+
     - name: Run Go store binding integration tests
       run: |
         $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
@@ -139,10 +169,12 @@ jobs:
         MASTER_PID=$!
         sleep 3
         cd mooncake-store/go
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
+        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
         export CGO_ENABLED=1
         export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-asio -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
+        if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
         ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
         kill $MASTER_PID 2>/dev/null || true
       shell: bash
@@ -152,7 +184,7 @@ jobs:
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure -E ub_transport_test
       shell: bash
 
     - name: Drain HTTP E2E test
@@ -239,28 +271,20 @@ jobs:
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
   build-musa:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
     steps:
-    - name: Cancel workflow if checks failed
-      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
-      uses: actions/github-script@v7
-      with:
-        script: |
-          console.log('Cancelling workflow run due to spell-check or clang-format failure');
-          await github.rest.actions.cancelWorkflowRun({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId
-          });
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          process.exit(1);
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Mark repository as safe
       run: git config --global --add safe.directory $GITHUB_WORKSPACE
@@ -289,6 +313,7 @@ jobs:
     if: >-
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
@@ -298,6 +323,8 @@ jobs:
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -353,6 +380,14 @@ jobs:
 
     - name: Run tests with ssd
       run: |
+        # Reserve port 50052 (mooncake_client RPC port) so the kernel never
+        # auto-allocates it as ephemeral source port for other outbound
+        # connections in the test suite. Without this, a random Python test
+        # connection can pick src_port=50052, leave a TIME_WAIT on
+        # <eth0_ip>:50052 for 60s, and block mooncake_client's bind to
+        # 0.0.0.0:50052 even with SO_REUSEADDR (Linux only relaxes
+        # TIME_WAIT+bind conflict for same-IP or loopback).
+        sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
         source test_env/bin/activate
         MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
         rm -rf /tmp/mooncake_test_ssd
@@ -430,7 +465,7 @@ jobs:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
     - name: Test Safetensor Functions
@@ -441,11 +476,14 @@ jobs:
       shell: bash
 
   build-flags:
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -457,20 +495,9 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
-    - name: Cancel workflow if checks failed
-      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
-      uses: actions/github-script@v7
-      with:
-        script: |
-          console.log('Cancelling workflow run due to spell-check or clang-format failure');
-          await github.rest.actions.cancelWorkflowRun({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId
-          });
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          process.exit(1);
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -526,7 +553,7 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
         cmake --build .
         sudo cmake --install .
         df -h
@@ -536,7 +563,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -565,19 +592,28 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Check Mooncake Store Rust bindings and example
+    - name: Check Mooncake Store Rust bindings, examples, and tests
       run: |
+        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
+        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd mooncake-store/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        cargo test --lib
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
-          cargo check --example basic_usage --tests
+          cargo test --examples --tests --no-run
       shell: bash
 
     - name: Configure project
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.0;2.9.1;2.10.0;2.11.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0"
       shell: bash
 
     - name: Build project
@@ -587,6 +623,26 @@ jobs:
         cd build
         cmake --build .
         sudo cmake --install .
+      shell: bash
+
+    - name: Configure project with TENT
+      run: |
+        mkdir build-tent
+        cd build-tent
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+      shell: bash
+
+    - name: Build project with TENT
+      run: |
+        cd build-tent
+        cmake --build .
+        sudo cmake --install .
+      shell: bash
+
+    - name: Test (TENT)
+      run: |
+        cd build-tent
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
       shell: bash
 
     - name: Build nvlink_allocator.so
@@ -619,27 +675,19 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    needs: [spell-check, clang-format]
+    needs: [spell-check, clang-format, check-paths]
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
-    - name: Cancel workflow if checks failed
-      if: ${{ needs.spell-check.result != 'success' || needs.clang-format.result != 'success' }}
-      uses: actions/github-script@v7
-      with:
-        script: |
-          console.log('Cancelling workflow run due to spell-check or clang-format failure');
-          await github.rest.actions.cancelWorkflowRun({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId
-          });
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          process.exit(1);
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
@@ -654,28 +702,33 @@ jobs:
   spell-check:
     name: Spell Check with Typos
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
     - name: Spell Check Repo
       uses: crate-ci/typos@v1.30.2
 
   clang-format:
     name: Check code format
     if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0  # Need full history for branch comparison
+        persist-credentials: false
 
     - name: Install clang-format 20
       run: |
@@ -691,7 +744,7 @@ jobs:
           echo "Error: code_format.sh not found or not executable"
           exit 1
         fi
-        
+
         # Determine base ref for comparison
         if [ "${{ github.event_name }}" == "pull_request" ]; then
           # For PRs: compare against the target branch
@@ -715,14 +768,25 @@ jobs:
   check-paths:
     if: >-
       github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
-      should-run-downstream: ${{ steps.filter.outputs.src }}
+      should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
     steps:
+      # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
+      - name: Default to true for workflow_dispatch
+        id: dispatch-override
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "src=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          fetch-depth: 2
+          persist-credentials: false
       - uses: dorny/paths-filter@v3
+        if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
           filters: |
@@ -730,8 +794,21 @@ jobs:
               - 'mooncake-*/**'
               - 'extern/**'
               - 'CMakeLists.txt'
+              - 'dependencies.sh'
               - 'scripts/**'
               - '.github/workflows/**'
+
+  build-wheel-cu13:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_cu13.yml
+    secrets: inherit
 
   ascend-test:
     needs: [build, check-paths]
@@ -756,6 +833,7 @@ jobs:
       - build-flags
       - build-docker
       - test-wheel-ubuntu
+      - build-wheel-cu13
       - ascend-test
       - integration-test
     runs-on: ubuntu-latest

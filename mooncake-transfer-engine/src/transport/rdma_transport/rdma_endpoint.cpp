@@ -20,6 +20,11 @@
 #include <cstddef>
 #include <chrono>
 #include <thread>
+#include <sstream>
+
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
 
 #include "common.h"
 #include "config.h"
@@ -36,7 +41,13 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
       cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
-    if (!qp_list_.empty()) deconstruct();
+    if (!qp_list_.empty()) {
+        // In normal flow, beginDestroy()+finishDestroy() should have been
+        // called already via endpoint_store. This is a fallback for abnormal
+        // shutdown (e.g., process exit).
+        RWSpinlock::WriteGuard guard(lock_);
+        deconstructLocked();
+    }
 }
 
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
@@ -90,7 +101,8 @@ int RdmaEndPoint::reconstruct() {
     auto max_inline_bytes = max_inline_bytes_;
 
     // Deconstruct and reconstruct to get fresh QPs (same as delete+create)
-    int ret = deconstruct();
+    // Use deconstructLocked because callers already hold lock_
+    int ret = deconstructLocked();
     if (ret) {
         LOG(ERROR) << "Failed to deconstruct endpoint: " << ret;
         return ret;
@@ -112,13 +124,15 @@ int RdmaEndPoint::reconstruct() {
 }
 
 int RdmaEndPoint::deconstruct() {
+    RWSpinlock::WriteGuard guard(lock_);
+    return deconstructLocked();
+}
+
+int RdmaEndPoint::deconstructLocked() {
+    // Adjust cq_outstanding_ before destroying QPs, so the counter is
+    // always corrected even if ibv_destroy_qp fails and we return early.
+    bool displayed = false;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP";
-            return ERR_ENDPOINT;
-        }
-        // After destroying QP, the wr_depth_list_ won't change
-        bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
                 LOG(WARNING) << "Outstanding work requests found, CQ will not "
@@ -129,13 +143,111 @@ int RdmaEndPoint::deconstruct() {
             wr_depth_list_[i] = 0;
         }
     }
+
+    int result = 0;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (!qp_list_[i]) continue;  // already destroyed in a previous call
+        if (ibv_destroy_qp(qp_list_[i])) {
+            PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
+            result = ERR_ENDPOINT;
+        } else {
+            qp_list_[i] = nullptr;
+        }
+    }
+
+    if (result) return result;
+
     qp_list_.clear();
     peer_qp_num_list_.clear();
     delete[] wr_depth_list_;
+    wr_depth_list_ = nullptr;
     return 0;
 }
 
 int RdmaEndPoint::destroyQP() { return deconstruct(); }
+
+void RdmaEndPoint::beginDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto current_status = status_.load(std::memory_order_relaxed);
+    if (current_status == DESTROYING || current_status == DESTROYED) return;
+
+    active_ = false;
+    inactive_time_ = getCurrentTimeInNano();
+    status_.store(DESTROYING, std::memory_order_release);
+
+    // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
+    // This allows performPollCq to drain them naturally.
+    ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_ERR;
+    for (size_t i = 0; i < qp_list_.size(); ++i) {
+        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE)) {
+            PLOG(WARNING) << "Failed to modify QP to ERR during beginDestroy";
+        }
+    }
+}
+
+bool RdmaEndPoint::finishDestroy() {
+    RWSpinlock::WriteGuard guard(lock_);
+    auto current_status = status_.load(std::memory_order_relaxed);
+
+    // Gate 1: already done.
+    if (current_status == DESTROYED) return true;
+
+    // Gate 2: non-two-phase path (status != DESTROYING). The endpoint
+    // reached waiting_list_ without going through beginDestroy(). This is
+    // the contract expected by EndpointStore::testOnlyInsertWaiting() and
+    // serves as a safety net for any future non-two-phase path. Mirror the
+    // pre-two-phase predicate (!hasOutstandingSlice == !active_): only
+    // inactive endpoints are eligible for reclaim; active ones must stay.
+    if (current_status != DESTROYING) {
+        if (active_) return false;
+        // Endpoints that never reached construct() own no RDMA resources
+        // and have wr_depth_list_ uninitialized; deconstructLocked() would
+        // delete[] a wild pointer. Drop them directly.
+        if (qp_list_.empty()) {
+            status_.store(DESTROYED, std::memory_order_relaxed);
+            return true;
+        }
+        LOG(WARNING) << "finishDestroy called in unexpected state: "
+                     << current_status
+                     << ", forcing destruction to avoid waiting_list_ leak";
+        // Fall through to the unified destroy path.
+    } else {
+        // Gate 3: two-phase path. Wait for inflight WRs to drain via CQ
+        // polling. If ibv_modify_qp-to-ERR failed in beginDestroy, WRs may
+        // never be flushed; enforce a timeout to avoid leaking forever.
+        bool has_outstanding = false;
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (wr_depth_list_[i] != 0) {
+                has_outstanding = true;
+                break;
+            }
+        }
+        if (has_outstanding) {
+            double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
+            if (elapsed < kFinishDestroyTimeoutSec) return false;
+            LOG(WARNING) << "finishDestroy timed out after " << elapsed
+                         << "s with outstanding WRs, forcing destruction";
+        }
+    }
+
+    // Unified destroy: tear down QPs (deconstructLocked handles
+    // cq_outstanding_ adjustment internally) and bound retries to avoid
+    // log flooding when ibv_destroy_qp fails permanently.
+    int ret = deconstructLocked();
+    if (ret) {
+        finish_destroy_retries_++;
+        LOG(ERROR) << "Failed to finish destroying endpoint (attempt "
+                   << finish_destroy_retries_ << "/" << kFinishDestroyMaxRetries
+                   << "): " << ret;
+        if (finish_destroy_retries_ < kFinishDestroyMaxRetries) return false;
+        LOG(ERROR) << "Giving up after " << finish_destroy_retries_
+                   << " retries (possible resource leak)";
+    }
+    status_.store(DESTROYED, std::memory_order_relaxed);
+    return true;
+}
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
@@ -160,16 +272,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            auto segment_desc =
-                context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-            if (segment_desc) {
-                for (auto &nic : segment_desc->devices)
-                    if (nic.name == context_.deviceName())
-                        return doSetupConnection(nic.gid, nic.lid, qpNum());
-            }
-            LOG(ERROR) << "Peer NIC " << context_.deviceName()
-                       << " not found in localhost";
-            return ERR_DEVICE_NOT_FOUND;
+            return doSetupConnection(context_.gid(), context_.lid(), qpNum());
         }
 
         // Only proceed with RPC if we are the first to transition from
@@ -189,6 +292,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
             }
 
             local_desc.local_nic_path = context_.nicPath();
+            local_desc.local_lid = context_.lid();
+            local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
         }
@@ -290,16 +395,26 @@ int RdmaEndPoint::setupConnectionsByActive() {
         return ERR_REJECT_HANDSHAKE;
     }
 
-    auto segment_desc =
-        context_.engine().meta()->getSegmentDescByName(peer_server_name);
-    if (segment_desc) {
-        for (auto &nic : segment_desc->devices) {
-            if (nic.name == peer_nic_name) {
-                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
-                if (ret != 0) {
-                    resetConnection("failed connection setup (active)");
+    if (!peer_desc.local_gid.empty()) {
+        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
+                                    peer_desc.qp_num);
+        if (ret != 0) {
+            resetConnection("failed connection setup (active)");
+        }
+        return ret;
+    } else {
+        auto segment_desc =
+            context_.engine().meta()->getSegmentDescByName(peer_server_name);
+        if (segment_desc) {
+            for (auto &nic : segment_desc->devices) {
+                if (nic.name == peer_nic_name) {
+                    int ret =
+                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
+                    if (ret != 0) {
+                        resetConnection("failed connection setup (active)");
+                    }
+                    return ret;
                 }
-                return ret;
             }
         }
     }
@@ -316,6 +431,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         // If already connected with the same peer QP info, return success
         if (peer_qp_num_list_ == peer_desc.qp_num) {
             local_desc.local_nic_path = context_.nicPath();
+            local_desc.local_lid = context_.lid();
+            local_desc.local_gid = context_.gid();
             local_desc.peer_nic_path = peer_nic_path_;
             local_desc.qp_num = qpNum();
             LOG(INFO) << "Received same peer QP numbers, reusing connection.";
@@ -357,20 +474,32 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     }
 
     local_desc.local_nic_path = context_.nicPath();
+    local_desc.local_lid = context_.lid();
+    local_desc.local_gid = context_.gid();
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = qpNum();
 
-    auto segment_desc =
-        context_.engine().meta()->getSegmentDescByName(peer_server_name);
-    if (segment_desc) {
-        for (auto &nic : segment_desc->devices) {
-            if (nic.name == peer_nic_name) {
-                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
-                                            &local_desc.reply_msg);
-                if (ret != 0) {
-                    resetConnection("failed connection setup (passive)");
+    if (!peer_desc.local_gid.empty()) {
+        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
+                                    peer_desc.qp_num, &local_desc.reply_msg);
+        if (ret != 0) {
+            resetConnection("failed connection setup (passive)");
+        }
+        return ret;
+    } else {
+        auto segment_desc =
+            context_.engine().meta()->getSegmentDescByName(peer_server_name);
+        if (segment_desc) {
+            for (auto &nic : segment_desc->devices) {
+                if (nic.name == peer_nic_name) {
+                    int ret =
+                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
+                                          &local_desc.reply_msg);
+                    if (ret != 0) {
+                        resetConnection("failed connection setup (passive)");
+                    }
+                    return ret;
                 }
-                return ret;
             }
         }
     }
@@ -441,22 +570,24 @@ const std::string RdmaEndPoint::toString() const {
     if (status == CONNECTED)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_;
+    else if (status == DESTROYING)
+        return "EndPoint: local " + context_.nicPath() + ", peer " +
+               peer_nic_path_ + " (destroying)";
+    else if (status == DESTROYED)
+        return "EndPoint: local " + context_.nicPath() + " (destroyed)";
     else
         return "EndPoint: local " + context_.nicPath() + " (unconnected)";
-}
-
-bool RdmaEndPoint::hasOutstandingSlice() const {
-    if (active_) return true;
-    for (size_t i = 0; i < qp_list_.size(); i++)
-        if (wr_depth_list_[i] != 0) return true;
-    return false;
 }
 
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_) return 0;
+    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
+        for (auto &slice : slice_list) failed_slice_list.push_back(slice);
+        slice_list.clear();
+        return 0;
+    }
 
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
@@ -542,6 +673,44 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     return ret;
 }
 
+static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
+    if (gid_str.empty()) {
+        LOG(ERROR) << "GID string is empty";
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    // Prepend a colon to the GID string to simplify parsing.
+    std::istringstream iss(":" + gid_str);
+    for (size_t i = 0; i < sizeof(gid_out.raw); i++) {
+        if (iss.get() != ':') {
+            LOG(ERROR) << "Invalid GID format at byte " << i
+                       << ", peer_gid=" << gid_str;
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        uint32_t byte = 0;
+        iss >> std::hex >> byte;
+
+        if (iss.fail() || byte > 0xFF) {
+            LOG(ERROR) << "Invalid GID format at byte " << i
+                       << ", peer_gid=" << gid_str;
+            return ERR_INVALID_ARGUMENT;
+        }
+
+        gid_out.raw[i] = static_cast<uint8_t>(byte);
+    }
+
+    // Ensure no trailing data remains after 16 bytes
+    char extra;
+    if (iss.get(extra)) {
+        LOG(ERROR) << "GID string has trailing data after 16 bytes"
+                   << ", peer_gid=" << gid_str;
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    return 0;
+}
+
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
@@ -555,8 +724,18 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         return ERR_INVALID_ARGUMENT;
     }
 
+    // Verify and parse the peer GID before proceeding.
+    ibv_gid peer_gid_raw = {};
+    int ret = parseGidString(peer_gid, peer_gid_raw);
+    if (ret) {
+        std::string message = "Invalid peer GID: " + peer_gid;
+        LOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message;
+        return ret;
+    }
+
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = doSetupConnection(qp_index, peer_gid, peer_lid,
+        int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
                                     peer_qp_num_list[qp_index], reply_msg);
         if (ret) return ret;
     }
@@ -566,7 +745,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
     return 0;
 }
 
-int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
+int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
                                     std::string *reply_msg) {
     if (qp_index < 0 || qp_index > (int)qp_list_.size())
@@ -589,7 +768,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
     attr.port_num = context_.portNum();
-    attr.pkey_index = 0;
+    attr.pkey_index = globalConfig().pkey_index;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC;
     ret = ibv_modify_qp(
@@ -609,15 +788,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     attr.path_mtu = context_.activeMTU();
     if (globalConfig().mtu_length < attr.path_mtu)
         attr.path_mtu = globalConfig().mtu_length;
-    ibv_gid peer_gid_raw;
-    std::istringstream iss(peer_gid);
-    for (int i = 0; i < 16; ++i) {
-        int value;
-        iss >> std::hex >> value;
-        peer_gid_raw.raw[i] = static_cast<uint8_t>(value);
-        if (i < 15) iss.ignore(1, ':');
-    }
-    attr.ah_attr.grh.dgid = peer_gid_raw;
+    attr.ah_attr.grh.dgid = peer_gid;
     // TODO gidIndex and portNum must fetch from REMOTE
     attr.ah_attr.grh.sgid_index = context_.gidIndex();
     attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
@@ -665,6 +836,66 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
+    }
+
+    // Optional: pin QP to a specific LAG port for even traffic distribution
+    // across bonded physical ports. num_lag_ports is queried from hardware at
+    // context construction time; this block is a no-op on non-LAG devices.
+    if (globalConfig().mlx5_qp_lag_port_balance) {
+#ifdef USE_MLX5DV
+        uint8_t n = context_.numLagPorts();
+        if (n > 1) {
+            uint8_t target = (uint8_t)(qp_index % n) + 1;
+            int lag_ret = mlx5dv_modify_qp_lag_port(qp, target);
+            if (lag_ret) {
+                LOG_FIRST_N(WARNING, 4)
+                    << "[RDMA] mlx5dv_modify_qp_lag_port failed"
+                    << " (qp_index=" << qp_index
+                    << ", target_port=" << (int)target
+                    << "): " << strerror(lag_ret);
+            } else {
+                uint8_t cfg = 0, active = 0;
+                if (mlx5dv_query_qp_lag_port(qp, &cfg, &active) == 0) {
+                    VLOG(1)
+                        << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                        << " lag_port cfg=" << (int)cfg
+                        << " active=" << (int)active;
+                } else {
+                    LOG_FIRST_N(WARNING, 4)
+                        << "[RDMA] mlx5dv_query_qp_lag_port failed"
+                        << " (qp_index=" << qp_index << ")";
+                }
+            }
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_LAG_PORT_BALANCE is set but binary was not built "
+               "with USE_MLX5DV; ignoring";
+#endif
+    }
+
+    // Optional: override the RoCEv2 UDP source port to spread QPs across
+    // different ECMP/LAG paths. Empty list = leave whatever the driver
+    // picked. Failure is non-fatal so unsupported devices/firmware degrade
+    // gracefully.
+    const auto &sports = globalConfig().mlx5_qp_udp_sports;
+    if (!sports.empty()) {
+#ifdef USE_MLX5DV
+        uint16_t sport = sports[qp_index % sports.size()];
+        int sp_ret = mlx5dv_modify_qp_udp_sport(qp, sport);
+        if (sp_ret) {
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] mlx5dv_modify_qp_udp_sport failed (qp_index="
+                << qp_index << ", sport=" << sport << "): " << strerror(sp_ret);
+        } else {
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " udp_sport=" << sport;
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_UDP_SPORTS is set but binary was not built with "
+               "USE_MLX5DV; ignoring";
+#endif
     }
 
     return 0;

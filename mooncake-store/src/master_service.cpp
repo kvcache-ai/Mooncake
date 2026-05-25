@@ -1,8 +1,10 @@
 #include "master_service.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -14,6 +16,9 @@
 
 #include "master_metric_manager.h"
 #include "segment.h"
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/oplog/etcd_oplog_store.h"
@@ -48,6 +53,13 @@ namespace {
 
 constexpr size_t kUnlimitedSnapshotList = 0;
 
+// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
+// when offload-on-evict mode is active. Defers memory eviction for at most
+// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
+// falls back according to `offload_force_evict_`. A future change may expose
+// this as a configurable parameter if workloads demand tuning.
+constexpr double kOffloadCapRatio = 0.5;
+
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
     kRedis,
@@ -72,18 +84,48 @@ int64_t CurrentTimeMs() {
         .count();
 }
 
+size_t RandomIndex(size_t upper_bound) {
+    static thread_local std::mt19937 generator(std::random_device{}());
+    std::uniform_int_distribution<size_t> dist(0, upper_bound - 1);
+    return dist(generator);
+}
+
+bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
+                                  size_t allocated_memory_replicas,
+                                  size_t allocated_nof_replicas) {
+    if (config.nof_replica_num == 0) {
+        return allocated_memory_replicas > 0;
+    }
+    if (DetermineReplicaWriteMode(config) ==
+        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        return allocated_memory_replicas + allocated_nof_replicas > 0;
+    }
+    return allocated_memory_replicas == config.replica_num &&
+           allocated_nof_replicas == config.nof_replica_num;
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : default_kv_lease_ttl_(config.default_kv_lease_ttl),
+    : graceful_unmount_scheduler_(this),
+      default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
+      nof_eviction_ratio_(config.nof_eviction_ratio),
+      nof_eviction_high_watermark_ratio_(
+          config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      nof_heartbeat_interval_sec_(
+          std::chrono::seconds(config.nof_heartbeat_interval_sec)),
+      nof_heartbeat_probe_timeout_ms_(
+          std::chrono::milliseconds(config.nof_heartbeat_probe_timeout_ms)),
+      nof_heartbeat_failures_threshold_(
+          config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
       ha_backend_type_(config.ha_backend_type),
@@ -94,6 +136,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       segment_manager_(config.memory_allocator, config.enable_cxl),
+      nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
           CreateAllocationStrategy(config.allocation_strategy_type)),
@@ -159,6 +202,73 @@ MasterService::MasterService(const MasterServiceConfig& config)
             "put_start_discard_timeout_sec");
     }
 
+#ifdef USE_NOF
+    if (nof_heartbeat_interval_sec_.count() <= 0) {
+        LOG(ERROR) << "nof_heartbeat_interval_sec must be positive, current "
+                   << nof_heartbeat_interval_sec_.count();
+        throw std::invalid_argument("Invalid nof heartbeat interval");
+    }
+    if (nof_heartbeat_probe_timeout_ms_.count() <= 0) {
+        LOG(ERROR) << "nof_heartbeat_probe_timeout_ms must be positive, "
+                   << "current " << nof_heartbeat_probe_timeout_ms_.count();
+        throw std::invalid_argument("Invalid nof heartbeat probe timeout");
+    }
+    if (nof_heartbeat_failures_threshold_ == 0) {
+        LOG(ERROR) << "nof_heartbeat_failures_threshold must be positive";
+        throw std::invalid_argument("Invalid nof heartbeat failure threshold");
+    }
+
+    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
+                       std::string* error_reason) {
+        return SpdkWrapper::GetInstance().ProbeNofSegment(
+            te_endpoint, timeout_ms, error_reason);
+    };
+#endif
+
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    offload_on_evict_ = enable_offload_ && config.offload_on_evict;
+    if (offload_on_evict_) {
+        LOG(INFO) << "Offload-on-evict mode enabled: DRAM offload to "
+                     "LOCAL_DISK will occur at eviction time instead of "
+                     "PutEnd";
+        offload_force_evict_ = config.offload_force_evict;
+        if (offload_force_evict_) {
+            LOG(INFO) << "Force-evict enabled: objects exceeding offload "
+                         "cap will be evicted without disk offload";
+        }
+    }
+
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY. Only meaningful when offload is enabled
+    // (otherwise no LOCAL_DISK replicas exist in the first place).
+    promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
+    promotion_admission_threshold_ = config.promotion_admission_threshold;
+    promotion_queue_limit_ = config.promotion_queue_limit;
+    // Defense-in-depth clamp: master.cpp clamps threshold into [1, 255]
+    // at flag-parse time, but direct MasterServiceConfig construction
+    // (tests, embedded users) bypasses that. Without the clamp here,
+    // threshold=0 would silently bypass the frequency gate entirely
+    // (freq < 0 is never true for uint8_t).
+    if (promotion_admission_threshold_ == 0) {
+        promotion_admission_threshold_ = 1;
+    } else if (promotion_admission_threshold_ > 255) {
+        promotion_admission_threshold_ = 255;
+    }
+    if (config.promotion_on_hit && !enable_offload_) {
+        LOG(WARNING) << "promotion_on_hit=true was requested but "
+                     << "enable_offload=false; promotion is silently "
+                     << "disabled because it requires offload to produce "
+                     << "LOCAL_DISK replicas. Set enable_offload=true to "
+                     << "use this feature.";
+    }
+    if (promotion_on_hit_) {
+        promotion_sketch_ = std::make_unique<CountMinSketch>();
+        LOG(INFO) << "Promotion-on-hit mode enabled: LOCAL_DISK-only Gets "
+                     "will queue async promotion to MEMORY (threshold="
+                  << promotion_admission_threshold_
+                  << ", queue_limit=" << promotion_queue_limit_ << ")";
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -168,6 +278,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
     client_monitor_thread_ =
         std::thread(&MasterService::ClientMonitorFunc, this);
     VLOG(1) << "action=start_client_monitor_thread";
+
+#ifdef USE_NOF
+    nof_heartbeat_running_ = true;
+    nof_heartbeat_thread_ =
+        std::thread(&MasterService::NofHeartbeatThreadFunc, this);
+    VLOG(1) << "action=start_nof_heartbeat_thread";
+#endif
 
     // Start task cleanup thread
     task_cleanup_running_ = true;
@@ -182,8 +299,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
-        MasterMetricManager::instance().inc_total_file_capacity(
-            global_file_segment_size_);
+        if (global_file_segment_size_ == std::numeric_limits<int64_t>::max()) {
+            MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
+        } else {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                global_file_segment_size_);
+        }
     }
 
     if (enable_snapshot_) {
@@ -244,6 +365,10 @@ MasterService::~MasterService() {
     snapshot_running_ = false;
     task_cleanup_running_ = false;
     job_dispatch_running_ = false;
+    graceful_unmount_scheduler_.Stop();
+#ifdef USE_NOF
+    nof_heartbeat_running_ = false;
+#endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
     task_cleanup_cv_.notify_all();
@@ -254,6 +379,11 @@ MasterService::~MasterService() {
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
+#ifdef USE_NOF
+    if (nof_heartbeat_thread_.joinable()) {
+        nof_heartbeat_thread_.join();
+    }
+#endif
     if (snapshot_thread_.joinable()) {
         snapshot_thread_.join();
     }
@@ -263,6 +393,50 @@ MasterService::~MasterService() {
     if (job_dispatch_thread_.joinable()) {
         job_dispatch_thread_.join();
     }
+}
+
+void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
+#ifdef USE_NOF
+    std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+    if (fn) {
+        nof_probe_fn_ = std::move(fn);
+        return;
+    }
+    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
+                       std::string* error_reason) {
+        return SpdkWrapper::GetInstance().ProbeNofSegment(
+            te_endpoint, timeout_ms, error_reason);
+    };
+#else
+    (void)fn;
+#endif
+}
+
+size_t MasterService::GetMountedNoFSegmentCountForTesting() {
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+    return mounted_segments.size();
+}
+
+bool MasterService::IsNoFSegmentMountedForTesting(const UUID& segment_id) {
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+    return std::any_of(
+        mounted_segments.begin(), mounted_segments.end(),
+        [&segment_id](const MountedNoFSegmentSnapshot& snapshot) {
+            return snapshot.segment_id == segment_id &&
+                   snapshot.status == SegmentStatus::OK;
+        });
+}
+
+std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
+    const UUID& segment_id) {
+    std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+    auto it = nof_heartbeat_states_.find(segment_id);
+    if (it == nof_heartbeat_states_.end()) {
+        return std::nullopt;
+    }
+    return it->second.consecutive_failures;
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -303,6 +477,31 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         return tl::make_unexpected(err);
     }
     return {};
+}
+
+auto MasterService::MountNoFSegment(const NoFSegment& segment,
+                                    const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << segment.name
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    ScopedNoFSegmentAccess nof_segment_access =
+        nof_segment_manager_.getNoFSegmentAccess();
+
+    LOG(INFO) << "NoF segment mount: " << "client_id=" << client_id
+              << ", action=mount_segment, segment_name=" << segment.name;
+
+    auto err = nof_segment_access.MountSegment(segment, client_id);
+    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        // Return OK because this is an idempotent operation
+        return {};
+    } else if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+#endif
 }
 
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
@@ -351,18 +550,60 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     return {};
 }
 
+auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
+                                      const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id
+               << ", segments_count=" << segments.size()
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    ScopedNoFSegmentAccess nof_segment_access =
+        nof_segment_manager_.getNoFSegmentAccess();
+    ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+#endif
+}
+
+std::unordered_set<UUID, boost::hash<UUID>>
+MasterService::getAliveClientsSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(client_mutex_);
+    return ok_client_;
+}
+
 void MasterService::ClearInvalidHandles() {
+    ClearInvalidHandles(getAliveClientsSnapshot());
+}
+
+void MasterService::ClearInvalidHandles(
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys,
-                // replication_tasks, and offloading_tasks.
+                // replication_tasks, offloading_tasks, and promotion_tasks.
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                // Promotion task cleanup: if the holder client expired, the
+                // LOCAL_DISK source is gone and the metadata is being erased
+                // here. Without this erase the dangling promotion_tasks
+                // entry stays pinned for up to put_start_release_timeout_sec_
+                // (~10 min default), inflating the global in-flight counter
+                // and blocking new admissions on busy clusters where many
+                // holders expire together (e.g. inference-worker rolling
+                // restarts).
+                if (shard->promotion_tasks.erase(it->first) > 0) {
+                    promotion_in_flight_.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                }
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -429,6 +670,89 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     return {};
 }
 
+auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
+                                           const UUID& client_id,
+                                           uint64_t grace_period_ms)
+    -> tl::expected<void, ErrorCode> {
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    // Verify ownership: the segment must belong to the calling client
+    std::vector<Segment> client_segments;
+    auto err = segment_access.GetClientSegments(client_id, client_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    bool owned = false;
+    for (auto& seg : client_segments) {
+        if (seg.id == segment_id) {
+            owned = true;
+            break;
+        }
+    }
+    if (!owned) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    err = segment_access.PrepareGracefulUnmountSegment(segment_id);
+    if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+        return {};
+    }
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    auto expire_time = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(grace_period_ms);
+    graceful_unmount_scheduler_.Schedule(segment_id, client_id, expire_time);
+    return {};
+}
+
+auto MasterService::UnmountNoFSegment(const UUID& segment_id,
+                                      const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", segment_id=" << segment_id
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    size_t metrics_dec_capacity = 0;  // to update the metrics
+
+    // 1. Prepare to unmount the segment by deleting its allocator
+    {
+        ScopedNoFSegmentAccess segment_access =
+            nof_segment_manager_.getNoFSegmentAccess();
+        ErrorCode err = segment_access.PrepareUnmountSegment(
+            segment_id, metrics_dec_capacity);
+        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+            // Return OK because this is an idempotent operation
+            return {};
+        }
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+    }  // Release the segment mutex before long-running step 2 and avoid
+       // deadlocks
+
+    // 2. Remove the metadata of the related objects
+    ClearInvalidHandles();
+
+    // 3. Commit the unmount operation
+    ScopedNoFSegmentAccess segment_access =
+        nof_segment_manager_.getNoFSegmentAccess();
+    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
+                                                   metrics_dec_capacity);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    {
+        std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+        nof_heartbeat_states_.erase(segment_id);
+    }
+    return {};
+#endif
+}
+
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -482,6 +806,24 @@ auto MasterService::GetAllSegments()
     return all_segments;
 }
 
+auto MasterService::GetAllNoFSegments()
+    -> tl::expected<std::vector<NoFSegment>, ErrorCode> {
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+
+    std::vector<NoFSegment> result;
+    for (const auto& segment : mounted_segments) {
+        result.push_back(segment.segment);
+    }
+
+    return result;
+}
+
+auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
+    -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> {
+    return nof_segment_manager_.GetSegmentsByName(segment_name);
+}
+
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -498,6 +840,17 @@ auto MasterService::QuerySegmentStatus(const std::string& segment_name)
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
     auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return status;
+}
+
+auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
+    -> tl::expected<SegmentStatus, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentStatus status = SegmentStatus::UNDEFINED;
+    auto err = segment_access.GetSegmentStatusById(segment_id, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -727,39 +1080,62 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this, key);
 
-    MasterMetricManager::instance().inc_total_get_nums();
+    GetReplicaListResponse resp({}, default_kv_lease_ttl_);
+    bool promotion_eligible = false;
+    {
+        MetadataAccessorRO accessor(this, key);
 
-    if (!accessor.Exists()) {
-        VLOG(1) << "key=" << key << ", info=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        MasterMetricManager::instance().inc_total_get_nums();
+
+        if (!accessor.Exists()) {
+            VLOG(1) << "key=" << key << ", info=object_not_found";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        const auto& metadata = accessor.Get();
+
+        std::vector<Replica::Descriptor> replica_list;
+        metadata.VisitReplicas(
+            &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+                replica_list.emplace_back(replica.get_descriptor());
+            });
+
+        if (replica_list.empty()) {
+            LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+        }
+
+        // TODO: NoF SSD support (ranhaojia)
+        if (replica_list[0].is_memory_replica()) {
+            MasterMetricManager::instance().inc_mem_cache_hit_nums();
+        } else if (replica_list[0].is_disk_replica()) {
+            MasterMetricManager::instance().inc_file_cache_hit_nums();
+        }
+        MasterMetricManager::instance().inc_valid_get_nums();
+        // Grant a lease to the object so it will not be removed
+        // when the client is reading it.
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+
+        // Promotion-on-hit eligibility: only when no MEMORY replica is
+        // present but at least one LOCAL_DISK replica is. Decided here while
+        // we hold the RO accessor; the actual enqueue happens after we
+        // release the accessor below to avoid lock-upgrade complexity.
+        if (promotion_on_hit_) {
+            const bool any_memory =
+                metadata.HasReplica(&Replica::fn_is_memory_replica);
+            const bool any_local_disk =
+                metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+            promotion_eligible = !any_memory && any_local_disk;
+        }
+
+        resp = GetReplicaListResponse(std::move(replica_list),
+                                      default_kv_lease_ttl_);
     }
-    const auto& metadata = accessor.Get();
-
-    std::vector<Replica::Descriptor> replica_list;
-    metadata.VisitReplicas(
-        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
-            replica_list.emplace_back(replica.get_descriptor());
-        });
-
-    if (replica_list.empty()) {
-        LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
-        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    // RO accessor released. Safe to take a fresh RW accessor now.
+    if (promotion_eligible) {
+        TryPushPromotionQueue(key);
     }
-
-    if (replica_list[0].is_memory_replica()) {
-        MasterMetricManager::instance().inc_mem_cache_hit_nums();
-    } else if (replica_list[0].is_disk_replica()) {
-        MasterMetricManager::instance().inc_file_cache_hit_nums();
-    }
-    MasterMetricManager::instance().inc_valid_get_nums();
-    // Grant a lease to the object so it will not be removed
-    // when the client is reading it.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+    return resp;
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -769,7 +1145,10 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     std::vector<Replica> replicas;
-    {
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    size_t allocated_memory_replicas = 0;
+    size_t allocated_nof_replicas = 0;
+    if (config.replica_num > 0) {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
@@ -791,11 +1170,73 @@ auto MasterService::AllocateAndInsertMetadata(
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            need_eviction_ = true;
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+                MasterMetricManager::instance().inc_put_start_alloc_failures();
+                need_mem_eviction_ = true;
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+        } else {
+            allocated_memory_replicas = allocation_result->size();
+            replicas = std::move(allocation_result.value());
         }
+    }
 
-        replicas = std::move(allocation_result.value());
+#ifdef USE_NOF
+    if (config.nof_replica_num > 0 &&
+        nof_segment_manager_.getMountedSegmentCount() > 0) {
+        ScopedAllocatorAccess allocator_access =
+            nof_segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        std::vector<std::string> preferred_segments =
+            config.preferred_nof_segments;
+
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocator_manager, value_length, config.nof_replica_num,
+            preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
+
+        if (!allocation_result.has_value()) {
+            VLOG(1) << "Failed to allocate nof replicas for key=" << key
+                    << ", error: " << allocation_result.error();
+            if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+                MasterMetricManager::instance().inc_put_start_alloc_failures();
+                need_nof_eviction_ = true;
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+        } else {
+            allocated_nof_replicas = allocation_result->size();
+            for (auto& replica : allocation_result.value()) {
+                replicas.push_back(std::move(replica));
+            }
+        }
+    }
+#endif
+
+    if (!HasExpectedReplicaAllocation(config, allocated_memory_replicas,
+                                      allocated_nof_replicas)) {
+        if ((config.replica_num > 0 &&
+             allocated_memory_replicas != config.replica_num) ||
+            (config.nof_replica_num > 0 &&
+             allocated_nof_replicas != config.nof_replica_num)) {
+            MasterMetricManager::instance().inc_put_start_alloc_failures();
+            if (config.replica_num > 0 &&
+                allocated_memory_replicas != config.replica_num) {
+                need_mem_eviction_ = true;
+            }
+            if (config.nof_replica_num > 0 &&
+                allocated_nof_replicas != config.nof_replica_num) {
+                need_nof_eviction_ = true;
+            }
+        }
+        VLOG(1) << "Failed to satisfy replica allocation requirement for key="
+                << key << ", requested_memory_replicas=" << config.replica_num
+                << ", allocated_memory_replicas=" << allocated_memory_replicas
+                << ", requested_nof_replicas=" << config.nof_replica_num
+                << ", allocated_nof_replicas=" << allocated_nof_replicas;
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
     if (use_disk_replica_) {
@@ -807,14 +1248,33 @@ auto MasterService::AllocateAndInsertMetadata(
 
     std::vector<Replica::Descriptor> replica_list;
     replica_list.reserve(replicas.size());
+    int i = 0;
+    VLOG(1) << "PutStart, create replicas: client_id=" << client_id
+            << ", key=" << key << ", value_length=" << value_length;
     for (const auto& replica : replicas) {
-        replica_list.emplace_back(replica.get_descriptor());
+        const auto desc = replica.get_descriptor();
+        replica_list.emplace_back(desc);
+
+        if (replica.is_memory_replica()) {
+            const auto& mem_desc = desc.get_memory_descriptor();
+            VLOG(1) << "Replica #" << ++i << ": buffer_address="
+                    << mem_desc.buffer_descriptor.buffer_address_
+                    << ", transport_endpoint="
+                    << mem_desc.buffer_descriptor.transport_endpoint_;
+        } else if (replica.is_nof_replica()) {
+            const auto& nof_desc = desc.get_nof_descriptor();
+            VLOG(1) << "Replica #" << ++i << ": buffer_address="
+                    << nof_desc.buffer_descriptor.buffer_address_
+                    << ", transport_endpoint="
+                    << nof_desc.buffer_descriptor.transport_endpoint_;
+        }
     }
 
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin));
+                              config.with_soft_pin, config.with_hard_pin,
+                              config.data_type));
     shard->processing_keys.insert(key);
 
     return replica_list;
@@ -824,12 +1284,30 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    if (config.replica_num == 0 || key.empty() || slice_length == 0) {
+    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+        key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", nof_replica_num=" << config.nof_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
+        LOG(ERROR) << "key=" << key
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", prefer_alloc_in_same_node="
+                   << config.prefer_alloc_in_same_node
+                   << ", error=nof_not_supported_with_prefer_same_node";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#ifndef USE_NOF
+    if (config.nof_replica_num > 0) {
+        LOG(ERROR) << "key=" << key
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", error=nof_pool_disabled";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#endif
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -842,13 +1320,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=put_start_begin";
 
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::system_clock::now();
     auto it = shard->metadata.find(key);
-    if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
+    if (it != shard->metadata.end() &&
+        !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -893,14 +1373,31 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     metadata.VisitReplicas(
         [replica_type](const Replica& replica) {
+            if (replica_type == ReplicaType::ALL) {
+                return (replica.is_memory_replica() &&
+                        !replica.has_invalid_mem_handle()) ||
+                       (replica.is_nof_replica() &&
+                        !replica.has_invalid_nof_handle());
+            }
+            if (replica_type == ReplicaType::MEMORY) {
+                return replica.is_memory_replica() &&
+                       !replica.has_invalid_mem_handle();
+            }
+            if (replica_type == ReplicaType::NOF_SSD) {
+                return replica.is_nof_replica() &&
+                       !replica.has_invalid_nof_handle();
+            }
             return replica.type() == replica_type;
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (enable_offload_) {
+    if (enable_offload_ && !offload_on_evict_) {
         auto& shard = accessor.GetShard();
         metadata.VisitReplicas(
-            &Replica::fn_is_completed, [this, &key, &shard](Replica& replica) {
+            [](const Replica& replica) {
+                return replica.is_completed() && replica.is_memory_replica();
+            },
+            [this, &key, &shard](Replica& replica) {
                 auto result = PushOffloadingQueue(key, replica);
                 if (result) {
                     replica.inc_refcnt();
@@ -917,11 +1414,12 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         accessor.EraseFromProcessing();
     }
 
-    if (replica_type == ReplicaType::MEMORY) {
+    if (replica_type == ReplicaType::MEMORY ||
+        (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().inc_mem_cache_nums();
     } else if (replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().inc_file_cache_nums();
-    }
+    }  // TODO: add inc_nof_cache_nums() (ranhaojia)
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
@@ -991,23 +1489,31 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep =
-        metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            return replica.type() == replica_type && !replica.is_processing();
-        });
+    auto processing_rep = metadata.GetFirstReplica([replica_type](
+                                                       const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
+                   !replica.is_processing();
+        }
+        return replica.type() == replica_type && !replica.is_processing();
+    });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
-    if (replica_type == ReplicaType::MEMORY) {
+    if (replica_type == ReplicaType::MEMORY ||
+        (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
         MasterMetricManager::instance().dec_mem_cache_nums();
     } else if (replica_type == ReplicaType::DISK) {
         MasterMetricManager::instance().dec_file_cache_nums();
     }
 
     metadata.EraseReplicas([replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return replica.is_memory_replica() || replica.is_nof_replica();
+        }
         return replica.type() == replica_type;
     });
 
@@ -1024,21 +1530,23 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, ReplicaType::MEMORY));
+        results.emplace_back(PutEnd(client_id, key, replica_type));
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys,
+    ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(client_id, key, ReplicaType::MEMORY));
+        results.emplace_back(PutRevoke(client_id, key, replica_type));
     }
     return results;
 }
@@ -1062,12 +1570,30 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     // --- Parameter validation (same as PutStart) ---
-    if (config.replica_num == 0 || key.empty() || slice_length == 0) {
+    if ((config.replica_num == 0 && config.nof_replica_num == 0) ||
+        key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", nof_replica_num=" << config.nof_replica_num
                    << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
+        LOG(ERROR) << "key=" << key
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", prefer_alloc_in_same_node="
+                   << config.prefer_alloc_in_same_node
+                   << ", error=nof_not_supported_with_prefer_same_node";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#ifndef USE_NOF
+    if (config.nof_replica_num > 0) {
+        LOG(ERROR) << "key=" << key
+                   << ", nof_replica_num=" << config.nof_replica_num
+                   << ", error=nof_pool_disabled";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#endif
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -1085,6 +1611,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     //   during full metadata snapshots.
     // shard lock (exclusive via MetadataShardAccessorRW): serializes all
     //   operations on keys that hash to the same shard.
+    auto alive_clients = getAliveClientsSnapshot();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -1094,8 +1621,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     // --- Step 0: stale handle cleanup ---
     // If all memory replicas point to unmounted segments (node crashed and
     // restarted), the metadata is useless — erase it and treat as new key.
-    if (it != shard->metadata.end() && CleanupStaleHandles(it->second)) {
+    // Also clean up local_disk replicas whose owner client has expired.
+    if (it != shard->metadata.end() &&
+        CleanupStaleHandles(it->second, alive_clients)) {
         shard->processing_keys.erase(key);
+        ErasePromotionTaskIfPresent(shard, key);
         shard->metadata.erase(it);
         it = shard->metadata.end();
     }
@@ -1136,6 +1666,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // If no COMPLETE replicas survive the preemption, this key
             // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                ErasePromotionTaskIfPresent(shard, key);
                 shard->metadata.erase(it);
                 it = shard->metadata.end();
             }
@@ -1803,6 +2334,7 @@ auto MasterService::Remove(const std::string& key, bool force)
 
     // Remove object metadata
     accessor.Erase();
+    ErasePromotionTaskIfPresent(accessor.GetShard(), key);
     return {};
 }
 
@@ -1856,6 +2388,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                ErasePromotionTaskIfPresent(shard, it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1931,6 +2464,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
+    auto alive_clients = getAliveClientsSnapshot();
+
     // Process each shard once, acquiring lock per shard
     for (auto& [shard_idx, key_group] : keys_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
@@ -1948,7 +2483,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
                 shard->processing_keys.erase(key);
                 shard->replication_tasks.erase(key);
                 shard->offloading_tasks.erase(key);
@@ -1996,10 +2531,16 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
-bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
-    // Remove those with invalid allocators
-    metadata.EraseReplicas([](const Replica& replica) {
-        return replica.has_invalid_mem_handle();
+bool MasterService::CleanupStaleHandles(
+    ObjectMetadata& metadata,
+    const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    // Remove those with invalid allocators (memory replicas on unmounted
+    // segments) and local_disk replicas whose owner client is no longer alive.
+    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
+        return (replica.has_invalid_mem_handle() ||
+                replica.has_invalid_nof_handle() ||
+                replica.has_stale_local_disk_client(alive_clients)) &&
+               replica.is_completed();
     });
 
     // Return true if no valid replicas remain after cleanup
@@ -2076,6 +2617,20 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+
+    // Notify the client monitor thread to start tracking this client's TTL.
+    // Without this, a client that only mounts a LOCAL_DISK segment (and
+    // doesn't ping) would be considered expired by ClientMonitorFunc, which
+    // would then clear all its LOCAL_DISK replicas.
+    PodUUID pod_client_id;
+    pod_client_id.first = client_id.first;
+    pod_client_id.second = client_id.second;
+    if (!client_ping_queue_.push(pod_client_id)) {
+        LOG(ERROR) << "client_id=" << client_id
+                   << ", error=client_ping_queue_full";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     return {};
 }
 
@@ -2093,10 +2648,75 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
+    std::unordered_map<std::string, int64_t> offloading_objects_copy;
+    {
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        local_disk_segment_it->second->enable_offloading = enable_offloading;
+        if (enable_offloading) {
+            return std::move(local_disk_segment_it->second->offloading_objects);
+        }
+        // Offloading is disabled: clear the pending queue to prevent
+        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
+        // PushOffloadingQueue. We must also clean up corresponding
+        // offloading_tasks and decrement source replica refcounts to avoid
+        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
+        // Copy keys out before releasing the mutex to avoid lock order
+        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
+        // must release offloading_mutex_ before taking shard locks via
+        // MetadataAccessorRW.
+        offloading_objects_copy =
+            std::move(local_disk_segment_it->second->offloading_objects);
+    }
+
+    for (auto& [key, size] : offloading_objects_copy) {
+        MetadataAccessorRW accessor(this, key);
+        if (accessor.Exists()) {
+            auto& shard = accessor.GetShard();
+            auto task_it = shard->offloading_tasks.find(key);
+            if (task_it != shard->offloading_tasks.end()) {
+                auto source =
+                    accessor.Get().GetReplicaByID(task_it->second.source_id);
+                if (source) {
+                    source->dec_refcnt();
+                }
+                shard->offloading_tasks.erase(task_it);
+            }
+        }
+    }
+    return {};
+}
+
+auto MasterService::ReportSsdCapacity(const UUID& client_id,
+                                      int64_t ssd_total_capacity_bytes)
+    -> tl::expected<void, ErrorCode> {
+    if (ssd_total_capacity_bytes < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not found with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    local_disk_segment_it->second->enable_offloading = enable_offloading;
-    if (enable_offloading) {
-        return std::move(local_disk_segment_it->second->offloading_objects);
+    int64_t old_capacity =
+        local_disk_segment_it->second->ssd_total_capacity_bytes;
+    if (ssd_total_capacity_bytes != old_capacity) {
+        local_disk_segment_it->second->ssd_total_capacity_bytes =
+            ssd_total_capacity_bytes;
+        if (old_capacity > 0) {
+            MasterMetricManager::instance().dec_total_file_capacity(
+                old_capacity);
+        }
+        if (ssd_total_capacity_bytes > 0) {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                ssd_total_capacity_bytes);
+        }
     }
     return {};
 }
@@ -2174,11 +2794,384 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             offloading_queue_limit_) {
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
-        local_disk_segment_it->second->offloading_objects.emplace(
+        auto res = local_disk_segment_it->second->offloading_objects.emplace(
             key, replica.get_descriptor()
                      .get_memory_descriptor()
                      .buffer_descriptor.size_);
+        if (!res.second) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
     }
+    return {};
+}
+
+// Promotion-on-hit
+
+// Push a key onto the holder client's promotion_objects map. Resolves the
+// holder via the LOCAL_DISK replica's embedded client_id rather than via
+// the segment-name reverse lookup.
+tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
+    const std::string& key, Replica& source_replica) {
+    auto holder_id = source_replica.get_local_disk_client_id();
+    if (!holder_id.has_value()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it =
+        client_local_disk_segment.find(holder_id.value());
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        // Holder client expired or never had a LocalDiskSegment registered;
+        // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
+        // its own schedule.
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    auto res = local_disk_segment_it->second->promotion_objects.emplace(
+        key, static_cast<int64_t>(source_replica.get_descriptor()
+                                      .get_local_disk_descriptor()
+                                      .object_size));
+    if (!res.second) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    return {};
+}
+
+void MasterService::TryPushPromotionQueue(const std::string& key) {
+    if (!promotion_on_hit_ || !promotion_sketch_) {
+        return;
+    }
+
+    // Frequency gate: bump and compare against the threshold. The sketch
+    // returns uint8_t (saturating at 255); promotion_admission_threshold_
+    // is clamped into [1, 255] at config parse time (see master.cpp), so
+    // direct comparison is well-defined and threshold=0 (which would
+    // bypass the gate entirely since freq is uint8_t) cannot reach here.
+    const uint8_t freq = promotion_sketch_->increment(key);
+    if (freq < promotion_admission_threshold_) {
+        return;
+    }
+
+    // Watermark gate: don't promote if DRAM is already under eviction
+    // pressure. The check is best-effort (state can change between this
+    // sample and the actual allocation in PromotionAllocStart).
+    const double used_ratio =
+        MasterMetricManager::instance().get_global_mem_used_ratio();
+    if (used_ratio >= eviction_high_watermark_ratio_) {
+        return;
+    }
+
+    // Acquire a fresh RW shard accessor for dedup, refcnt-pin, and task
+    // record. Safe to call here because GetReplicaList has already released
+    // its RO accessor.
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return;
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    // Dedup: don't queue twice if a promotion is already in flight or if a
+    // MEMORY replica has appeared since GetReplicaList observed only-disk.
+    if (shard->promotion_tasks.count(key) > 0) {
+        return;
+    }
+    if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
+        return;
+    }
+
+    // Cap gate: read the cluster-wide in-flight count. Soft cap — a
+    // benign TOCTOU race between this load and the emplace below can let
+    // a few extra tasks slip in, but the per-shard mutex already
+    // serializes inserts within a shard and the dedup gate above prevents
+    // duplicate work, so the worst case is N concurrent inserters across
+    // distinct shards each admitting one extra task. Atomic load is
+    // relaxed because the value is purely advisory.
+    if (promotion_in_flight_.load(std::memory_order_relaxed) >=
+        promotion_queue_limit_) {
+        return;
+    }
+
+    // Find the LOCAL_DISK source replica.
+    Replica* source = nullptr;
+    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
+                           [&source](Replica& r) {
+                               if (source == nullptr) source = &r;
+                           });
+    if (source == nullptr) {
+        return;
+    }
+
+    // Pin the source replica.
+    source->inc_refcnt();
+    const uint64_t object_size =
+        source->get_descriptor().get_local_disk_descriptor().object_size;
+
+    // Try to enqueue on the holder client. On failure, drop the refcnt back.
+    auto push_result = PushPromotionQueue(key, *source);
+    if (!push_result) {
+        source->dec_refcnt();
+        VLOG(1) << "promotion_push_failed key=" << key
+                << " error=" << push_result.error();
+        return;
+    }
+
+    // Capture the holder client_id so NotifyPromotionSuccess can reject
+    // calls from other clients. PushPromotionQueue already validated
+    // get_local_disk_client_id() returns a value, so .value() is safe.
+    const UUID holder_id = source->get_local_disk_client_id().value();
+
+    // Record the in-flight task. alloc_id is filled in by
+    // PromotionAllocStart once the new MEMORY replica is staged.
+    shard->promotion_tasks.emplace(
+        key, PromotionTask{.source_id = source->id(),
+                           .alloc_id = 0,
+                           .object_size = object_size,
+                           .start_time = std::chrono::system_clock::now(),
+                           .holder_id = holder_id});
+    promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
+}
+
+auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
+    -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    // Return at most kMaxPerHeartbeat tasks. Each task does a
+    // synchronous SSD read + RDMA write on the client side; allowing
+    // more than one per heartbeat risks blocking past the client-
+    // liveness window and the master marking the client dead. The rest
+    // stay queued in promotion_objects for subsequent heartbeats. The
+    // cap must live here (server side) rather than on the client so
+    // leftover work isn't silently dropped.
+    constexpr size_t kMaxPerHeartbeat = 1;
+    auto& src = local_disk_segment_it->second->promotion_objects;
+    std::unordered_map<std::string, int64_t> result;
+    while (result.size() < kMaxPerHeartbeat && !src.empty()) {
+        auto node = src.extract(src.begin());
+        result.insert(std::move(node));
+    }
+    return result;
+}
+
+auto MasterService::PromotionAllocStart(
+    const UUID& client_id, const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments)
+    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+
+    // Verify the in-flight task still exists before allocating. The
+    // reaper can sweep it between the holder's heartbeat and this
+    // AllocStart call (a hung client, GC pause, or HA failover can
+    // stall AllocStart past put_start_release_timeout_sec_). If we
+    // allocated and AddReplicas'd anyway, the staged PROCESSING MEMORY
+    // replica would have no PromotionTask pointing at it: the generic
+    // PROCESSING reaper iterates shard->processing_keys (never
+    // populated by promotion) and the promotion-task reaper would have
+    // nothing left to iterate, leaking the buffer until the object is
+    // removed or evicted. The shard mutex is held for the rest of this
+    // function, so the iterator stays valid across the allocation step.
+    auto& shard = accessor.GetShard();
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Defensive size check: must match the source LOCAL_DISK
+    // descriptor's object_size captured at admission. A mismatch would
+    // let a buggy caller request a wrong-sized allocation — smaller
+    // risks RDMA overflow, larger wastes DRAM pinned until reaper TTL.
+    if (task_it->second.object_size != size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Allocate a single MEMORY replica via the existing strategy, biased to
+    // the holder's mem segment when possible.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    if (!preferred_segments.empty()) {
+        config.preferred_segments = preferred_segments;
+    }
+
+    std::vector<Replica> staged_replicas;
+    {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+        auto allocation_result = allocation_strategy_->Allocate(
+            allocator_manager, size, config.replica_num, preferred_segments);
+        if (!allocation_result) {
+            return tl::make_unexpected(allocation_result.error());
+        }
+        staged_replicas = std::move(allocation_result.value());
+    }
+    if (staged_replicas.empty()) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Append the new PROCESSING MEMORY replica to the existing object's
+    // metadata. Visible only after NotifyPromotionSuccess flips it COMPLETE.
+    Replica::Descriptor desc = staged_replicas[0].get_descriptor();
+    const ReplicaID new_id = staged_replicas[0].id();
+    std::vector<Replica> to_add;
+    to_add.push_back(std::move(staged_replicas[0]));
+    metadata.AddReplicas(std::move(to_add));
+
+    // Record the new replica's ID on the in-flight PromotionTask so
+    // NotifyPromotionSuccess knows exactly which replica to commit. A
+    // concurrent Put on this key may stage other PROCESSING MEMORY
+    // replicas; using alloc_id avoids the "first PROCESSING memory"
+    // ambiguity.
+    //
+    // Also reset start_time so the reaper TTL covers the active-
+    // transfer phase (AllocStart -> SSD read -> RDMA write -> Notify)
+    // measured from when a master-allocated buffer becomes vulnerable,
+    // rather than being consumed by queue-waiting. Without the reset,
+    // a backlogged task could enter active transfer with little TTL
+    // remaining and the reaper could free the staged replica via
+    // EraseReplicaByID mid-RDMA-write. The queue-waiting phase
+    // (alloc_id == 0) is bounded by its own original start_time window
+    // during which the reaper's EraseReplicaByID branch is a no-op.
+    task_it->second.alloc_id = new_id;
+    task_it->second.start_time = std::chrono::system_clock::now();
+    return PromotionAllocStartResponse{std::move(desc)};
+}
+
+auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
+                                           const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    // Look up the in-flight task to find the exact replica we staged. A
+    // concurrent Put on this key may have created other PROCESSING MEMORY
+    // replicas, so we must not just "mark first PROCESSING memory
+    // complete" — that would risk committing someone else's half-written
+    // replica.
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end() ||
+        task_it->second.alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    bool committed = false;
+    Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
+    if (staged != nullptr && staged->is_memory_replica() &&
+        staged->is_processing()) {
+        staged->mark_complete();
+        committed = true;
+    }
+
+    // Drop the source LOCAL_DISK replica's refcnt and erase the task.
+    auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+
+    // Erase the per-client promotion_objects entry (best-effort; the
+    // heartbeat may have already drained it).
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto it = client_local_disk_segment.find(client_id);
+        if (it != client_local_disk_segment.end()) {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            it->second->promotion_objects.erase(key);
+        }
+    }
+
+    if (!committed) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    return {};
+}
+
+auto MasterService::NotifyPromotionFailure(const UUID& client_id,
+                                           const std::string& key)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    auto& shard = accessor.GetShard();
+
+    auto task_it = shard->promotion_tasks.find(key);
+    if (task_it == shard->promotion_tasks.end()) {
+        // No task to release. Either the reaper already swept it, or the
+        // client never had a task here. Return OK to keep this RPC
+        // idempotent — repeated failure notifications on the same key
+        // should be safe.
+        return {};
+    }
+
+    // Holder-only gate (see PromotionTask::holder_id doc).
+    if (task_it->second.holder_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Mirror the reaper's expiry path; see DiscardExpiredProcessingReplicas
+    // Part 4 for the full rationale on each step.
+    auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    if (task_it->second.alloc_id != 0) {
+        metadata.EraseReplicaByID(task_it->second.alloc_id);
+    }
+    shard->promotion_tasks.erase(task_it);
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+
+    // Clear the holder's per-client promotion_objects entry. Same
+    // best-effort cleanup pattern as NotifyPromotionSuccess — the
+    // heartbeat may have already drained it.
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto it = client_local_disk_segment.find(client_id);
+        if (it != client_local_disk_segment.end()) {
+            MutexLocker locker(&it->second->offloading_mutex_);
+            it->second->promotion_objects.erase(key);
+        }
+    }
+
     return {};
 }
 
@@ -2191,10 +3184,10 @@ void MasterService::EvictionThreadFunc() {
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
-            (need_eviction_ && eviction_ratio_ > 0.0)) {
+            (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
                       << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " need_eviction=" << need_eviction_
+                      << " need_mem_eviction=" << need_mem_eviction_
                       << " eviction_ratio=" << eviction_ratio_;
             double evict_ratio_target = std::max(
                 eviction_ratio_,
@@ -2219,6 +3212,22 @@ void MasterService::EvictionThreadFunc() {
             }
             last_discard_time = now;
         }
+
+#ifdef USE_NOF
+        double nof_used_ratio =
+            MasterMetricManager::instance().get_global_nof_used_ratio();
+        if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
+            (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
+            double nof_evict_ratio_target =
+                std::max(nof_eviction_ratio_,
+                         nof_used_ratio - nof_eviction_high_watermark_ratio_ +
+                             nof_eviction_ratio_);
+            double nof_evict_ratio_lowerbound =
+                std::max(nof_evict_ratio_target * 0.5,
+                         nof_used_ratio - nof_eviction_high_watermark_ratio_);
+            NoFBatchEvict(nof_evict_ratio_target, nof_evict_ratio_lowerbound);
+        }
+#endif
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
@@ -2353,6 +3362,45 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         LOG(WARNING) << "Offloading task expired for key: " << task_it->first;
         task_it = shard->offloading_tasks.erase(task_it);
+    }
+
+    // Part 4: Discard expired promotion-on-hit tasks. For each:
+    //   - Drop the source LOCAL_DISK refcnt so the source can be
+    //     evicted normally.
+    //   - If a PROCESSING MEMORY replica was staged (alloc_id != 0),
+    //     pop it via EraseReplicaByID. The staged replica is not in
+    //     shard->processing_keys, so this is the only place (besides
+    //     NotifyPromotionFailure) that reaps it; without this the
+    //     buffer leaks until the object is removed or evicted.
+    //   - Erase the task entry and decrement the in-flight counter.
+    // task.start_time is set at admission and reset at AllocStart, so
+    // queue-wait (alloc_id == 0) and active-transfer (alloc_id != 0)
+    // phases each get a full put_start_release_timeout_sec_ window.
+    // The per-client promotion_objects map is GC'd on the next
+    // heartbeat (entries for vanished tasks are harmless — Notify will
+    // return REPLICA_IS_NOT_READY since the task entry is gone).
+    for (auto task_it = shard->promotion_tasks.begin();
+         task_it != shard->promotion_tasks.end();) {
+        const auto ttl =
+            task_it->second.start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            task_it++;
+            continue;
+        }
+        auto metadata_it = shard->metadata.find(task_it->first);
+        if (metadata_it != shard->metadata.end()) {
+            auto source =
+                metadata_it->second.GetReplicaByID(task_it->second.source_id);
+            if (source != nullptr) {
+                source->dec_refcnt();
+            }
+            if (task_it->second.alloc_id != 0) {
+                metadata_it->second.EraseReplicaByID(task_it->second.alloc_id);
+            }
+        }
+        LOG(WARNING) << "Promotion task expired for key: " << task_it->first;
+        task_it = shard->promotion_tasks.erase(task_it);
+        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     if (!discarded_replicas.empty()) {
@@ -3466,9 +4514,84 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
+    // --- Offload-on-evict support ---
+    long offload_queued_this_cycle = 0;
+    long offload_deferred_count = 0;
+    long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
+    long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    const long offload_cap =
+        offload_on_evict_
+            ? static_cast<long>(offloading_queue_limit_ * kOffloadCapRatio)
+            : 0;
+
+    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
+        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    };
+
+    // Returns freed bytes. Returns 0 if offload-queued and no additional
+    // replicas were evicted (all MEMORY replicas of the key are now pinned).
+    auto try_evict_or_offload =
+        [&, this](const std::string& key, ObjectMetadata& metadata,
+                  MetadataShardAccessorRW& shard) -> uint64_t {
+        if (!offload_on_evict_) {
+            // Original behavior
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
+        if (has_local_disk_replica(metadata)) {
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Force-evict cap: if force_evict enabled and cap reached, force
+        // delete. Warning is aggregated at the end of the cycle to avoid log
+        // flooding.
+        if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
+            offload_cap_forced_count++;
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // Queue one MEMORY replica for offload; others will be evicted below.
+        bool queued = false;
+        metadata.VisitReplicas(
+            [](const Replica& r) {
+                return r.is_memory_replica() && r.is_completed() &&
+                       r.get_refcnt() == 0;
+            },
+            [this, &key, &shard, &queued, &now](Replica& replica) {
+                if (queued) return;  // only need to pin one replica for offload
+                auto result = PushOffloadingQueue(key, replica);
+                if (result) {
+                    replica.inc_refcnt();
+                    shard->offloading_tasks.emplace(
+                        key, OffloadingTask{replica.id(), now});
+                    queued = true;
+                }
+            });
+
+        if (queued) {
+            offload_queued_this_cycle++;
+            offload_deferred_count++;
+            // Any remaining MEMORY replicas with refcnt==0 are redundant copies
+            // (data survives via the pinned replica → disk). Evict them now to
+            // reclaim memory immediately rather than waiting another cycle.
+            return metadata.size * evict_replicas(metadata);
+        }
+
+        // PushOffloadingQueue failed. Default (data-preserving) behavior is to
+        // skip this cycle — the outer eviction loop will retry after the
+        // offload queue drains. Only force-evict when explicitly opted in, to
+        // prevent silent data loss when the queue is unavailable.
+        if (offload_force_evict_) {
+            offload_push_failed_forced++;
+            return metadata.size * evict_replicas(metadata);
+        }
+        return 0;
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
-    // shards. No need to use expensive random_device here.
-    size_t start_idx = rand() % kNumShards;
+    // shards.
+    size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // First pass: evict objects without soft pin and lease expired
@@ -3538,16 +4661,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
+                    // Evict this object (or defer for offload)
+                    uint64_t freed =
+                        try_evict_or_offload(it->first, it->second, shard);
+                    total_freed_size += freed;
                     if (it->second.IsValid() == false) {
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
-                    shard_evicted_count++;
+                    if (freed > 0) {
+                        shard_evicted_count++;
+                    }
                 } else {
                     // second pass candidates
                     no_pin_objects.push_back(it->second.lease_timeout);
@@ -3595,20 +4720,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto it = shard->metadata.begin();
                 while (it != shard->metadata.end() && target_evict_num > 0) {
                     if (!it->second.IsHardPinned() &&
+                        it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3616,9 +4743,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
             }
         } else if (!soft_pin_objects.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin, but
-            // also allow to evict soft pinned objects. The following code is
-            // error-prone if the soft pin objects are empty.
+            // allow_evict_soft_pinned_objects_ is implicitly true if
+            // soft_pin_objects is not empty Second pass B: Prioritize evicting
+            // objects without soft pin, but also allow to evict soft pinned
+            // objects. The following code is error-prone if the soft pin
+            // objects are empty.
 
             const long soft_pin_evict_num =
                 target_evict_num - static_cast<long>(no_pin_objects.size());
@@ -3648,16 +4777,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
+                        // Evict this object (or defer for offload)
+                        uint64_t freed =
+                            try_evict_or_offload(it->first, it->second, shard);
+                        total_freed_size += freed;
                         if (it->second.IsValid() == false) {
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
-                        evicted_count++;
+                        if (freed > 0) {
+                            evicted_count++;
+                        }
                         target_evict_num--;
                     } else {
                         ++it;
@@ -3678,18 +4809,123 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
-        need_eviction_ = false;
+    if (evicted_count > 0 || released_discarded_cnt > 0 ||
+        offload_deferred_count > 0) {
+        // Offload-deferred counts as partial success: work was done (objects
+        // queued for disk offload), so suppress re-triggering until the next
+        // watermark breach or explicit need_mem_eviction_ signal.
+        need_mem_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
+        MasterMetricManager::instance().inc_mem_eviction_success(
+            evicted_count, total_freed_size);
     } else {
         if (object_count == 0) {
             // No objects to evict, no need to check again
-            need_eviction_ = false;
+            need_mem_eviction_ = false;
         }
         MasterMetricManager::instance().inc_eviction_fail();
+        MasterMetricManager::instance().inc_mem_eviction_fail();
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+            << ", offload_deferred=" << offload_deferred_count
+            << ", offload_cap_forced=" << offload_cap_forced_count
+            << ", offload_push_failed_forced=" << offload_push_failed_forced
+            << ", total_freed_size=" << total_freed_size;
+    if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
+        LOG(WARNING) << "[EVICT] No memory freed this cycle; "
+                     << offload_deferred_count
+                     << " objects deferred for disk offload. "
+                        "Consider lowering eviction_high_watermark_ratio.";
+    }
+    if (offload_cap_forced_count > 0) {
+        LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
+                     << ") reached; force-evicted " << offload_cap_forced_count
+                     << " object(s) without disk offload this cycle.";
+    }
+    if (offload_push_failed_forced > 0) {
+        LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
+                     << offload_push_failed_forced
+                     << " object(s); force-evicted without disk offload "
+                        "(offload_force_evict=true).";
+    }
+}
+
+void MasterService::NoFBatchEvict(double evict_ratio_target,
+                                  double evict_ratio_lowerbound) {
+    if (evict_ratio_target < evict_ratio_lowerbound) {
+        LOG(ERROR) << "nof_evict_ratio_target=" << evict_ratio_target
+                   << ", nof_evict_ratio_lowerbound=" << evict_ratio_lowerbound
+                   << ", error=invalid_params";
+        evict_ratio_lowerbound = evict_ratio_target;
+    }
+
+    auto now = std::chrono::system_clock::now();
+    long evicted_count = 0;
+    long object_count = 0;
+    uint64_t total_freed_size = 0;
+
+    size_t start_idx = RandomIndex(metadata_shards_.size());
+    for (size_t i = 0; i < metadata_shards_.size(); i++) {
+        MetadataShardAccessorRW shard(
+            this, (start_idx + i) % metadata_shards_.size());
+        DiscardExpiredProcessingReplicas(shard, now);
+        object_count += shard->metadata.size();
+
+        const long ideal_evict_num =
+            std::ceil(object_count * evict_ratio_target) - evicted_count;
+        if (ideal_evict_num <= 0) {
+            continue;
+        }
+
+        long shard_evicted_count = 0;
+        for (auto it = shard->metadata.begin();
+             it != shard->metadata.end() &&
+             shard_evicted_count < ideal_evict_num;) {
+            auto& metadata = it->second;
+            if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
+                metadata.IsSoftPinned(now)) {
+                ++it;
+                continue;
+            }
+
+            const size_t erased =
+                metadata.EraseReplicas([](const Replica& replica) {
+                    return replica.is_nof_replica() && replica.is_completed() &&
+                           replica.get_refcnt() == 0;
+                });
+            if (erased == 0) {
+                ++it;
+                continue;
+            }
+
+            total_freed_size += metadata.size * erased;
+            shard_evicted_count++;
+            if (!metadata.IsValid()) {
+                it = shard->metadata.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        evicted_count += shard_evicted_count;
+    }
+
+    if (evicted_count > 0) {
+        need_nof_eviction_ = false;
+        MasterMetricManager::instance().inc_eviction_success(evicted_count,
+                                                             total_freed_size);
+        MasterMetricManager::instance().inc_nof_eviction_success(
+            evicted_count, total_freed_size);
+    } else {
+        if (object_count == 0) {
+            need_nof_eviction_ = false;
+        }
+        MasterMetricManager::instance().inc_eviction_fail();
+        MasterMetricManager::instance().inc_nof_eviction_fail();
+    }
+
+    VLOG(1) << "action=evict_nof_replicas"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -3723,6 +4959,12 @@ void MasterService::ClientMonitorFunc() {
 
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
+            // Notify graceful unmount scheduler to drop pending records
+            // for expired clients. The actual unmount is handled below.
+            for (auto& cid : expired_clients) {
+                graceful_unmount_scheduler_.RemoveClientRecords(cid);
+            }
+
             // Record which segments are unmounted, will be used in the commit
             // phase.
             std::vector<UUID> unmount_segments;
@@ -3744,6 +4986,7 @@ void MasterService::ClientMonitorFunc() {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (auto& client_id : expired_clients) {
+                    // mounted mem segemtns of this expired client
                     std::vector<Segment> segments;
                     segment_access.GetClientSegments(client_id, segments);
                     for (auto& seg : segments) {
@@ -3760,16 +5003,22 @@ void MasterService::ClientMonitorFunc() {
                                        << ", segment_name=" << seg.name
                                        << ", "
                                           "error=prepare_unmount_expired_"
-                                          "segment_failed";
+                                          "mem_segment_failed";
                         }
                     }
                 }
             }  // Release the mutex before long-running ClearInvalidHandles and
                // avoid deadlocks
 
-            if (!unmount_segments.empty()) {
-                ClearInvalidHandles();
+            // Always clean up invalid handles when there are expired clients,
+            // even if no memory segments were unmounted. This is necessary
+            // to clean up local_disk replicas whose owner client has expired.
+            ClearInvalidHandles();
 
+            // Commit unmount of memory segments and clean up local_disk
+            // segments for expired clients. Both require the exclusive
+            // segment lock.
+            {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (size_t i = 0; i < unmount_segments.size(); i++) {
@@ -3777,13 +5026,252 @@ void MasterService::ClientMonitorFunc() {
                         unmount_segments[i], client_ids[i], dec_capacities[i]);
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
-                              << ", action=unmount_expired_segment";
+                              << ", action=unmount_expired_mem_segment";
+                }
+                for (auto& client_id : expired_clients) {
+                    segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
+    }
+}
+
+bool MasterService::ProbeNoFSegment(const std::string& te_endpoint,
+                                    std::string* error_reason) {
+#ifndef USE_NOF
+    if (error_reason) {
+        *error_reason = "nof_pool_disabled";
+    }
+    return false;
+#else
+    NoFProbeFn probe_fn;
+    {
+        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+        probe_fn = nof_probe_fn_;
+    }
+    if (!probe_fn) {
+        if (error_reason) {
+            *error_reason = "probe_not_configured";
+        }
+        return false;
+    }
+    return probe_fn(
+        te_endpoint,
+        static_cast<uint32_t>(nof_heartbeat_probe_timeout_ms_.count()),
+        error_reason);
+#endif
+}
+
+bool MasterService::TryUnmountNoFSegmentByHeartbeat(
+    const MountedNoFSegmentSnapshot& snapshot,
+    const std::string& error_reason) {
+    size_t metrics_dec_capacity = 0;
+    {
+        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        ErrorCode err = nof_segment_access.PrepareUnmountSegment(
+            snapshot.segment_id, metrics_dec_capacity);
+        if (err == ErrorCode::SEGMENT_NOT_FOUND ||
+            err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+            nof_heartbeat_states_.erase(snapshot.segment_id);
+            VLOG(1) << "segment_id=" << snapshot.segment_id
+                    << ", action=skip_nof_heartbeat_unmount"
+                    << ", reason=" << toString(err);
+            return false;
+        }
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "segment_id=" << snapshot.segment_id
+                       << ", segment_name=" << snapshot.segment.name
+                       << ", error=prepare_unmount_nof_segment_by_"
+                          "heartbeat_failed"
+                       << ", reason=" << err;
+            return false;
+        }
+    }
+
+    ClearInvalidHandles();
+
+    {
+        auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        ErrorCode err = nof_segment_access.CommitUnmountSegment(
+            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
+        if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
+            LOG(ERROR) << "segment_id=" << snapshot.segment_id
+                       << ", segment_name=" << snapshot.segment.name
+                       << ", error=commit_unmount_nof_segment_by_"
+                          "heartbeat_failed"
+                       << ", reason=" << err;
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+        nof_heartbeat_states_.erase(snapshot.segment_id);
+    }
+    MasterMetricManager::instance()
+        .inc_nof_segments_unmounted_by_heartbeat_total();
+    LOG(INFO) << "segment_id=" << snapshot.segment_id
+              << ", client_id=" << snapshot.client_id
+              << ", segment_name=" << snapshot.segment.name
+              << ", endpoint=" << snapshot.segment.te_endpoint
+              << ", action=unmount_nof_segment_by_heartbeat"
+              << ", last_error_reason=" << error_reason;
+    return true;
+}
+
+void MasterService::NofHeartbeatThreadFunc() {
+    size_t next_probe_index = 0;
+    while (nof_heartbeat_running_) {
+        auto now = std::chrono::steady_clock::now();
+        std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+        nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+
+        std::vector<MountedNoFSegmentSnapshot> ok_segments;
+        ok_segments.reserve(mounted_segments.size());
+        for (const auto& snapshot : mounted_segments) {
+            if (snapshot.status == SegmentStatus::OK) {
+                ok_segments.push_back(snapshot);
+            }
+        }
+
+        std::optional<MountedNoFSegmentSnapshot> probe_target;
+        {
+            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+            std::unordered_set<UUID, boost::hash<UUID>> live_segment_ids;
+            live_segment_ids.reserve(ok_segments.size());
+
+            const auto interval_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    nof_heartbeat_interval_sec_);
+            for (size_t i = 0; i < ok_segments.size(); ++i) {
+                const auto& snapshot = ok_segments[i];
+                live_segment_ids.insert(snapshot.segment_id);
+                auto [it, inserted] =
+                    nof_heartbeat_states_.try_emplace(snapshot.segment_id);
+                auto& state = it->second;
+                state.owner_client_id = snapshot.client_id;
+                state.segment_name = snapshot.segment.name;
+                state.te_endpoint = snapshot.segment.te_endpoint;
+                if (inserted) {
+                    int64_t spread_ms = 0;
+                    if (!ok_segments.empty()) {
+                        spread_ms = static_cast<int64_t>(
+                            (interval_ms.count() * i) / ok_segments.size());
+                    }
+                    state.last_success_at = now;
+                    state.next_probe_at = now + nof_heartbeat_interval_sec_ +
+                                          std::chrono::milliseconds(spread_ms);
+                }
+            }
+
+            for (auto it = nof_heartbeat_states_.begin();
+                 it != nof_heartbeat_states_.end();) {
+                if (!live_segment_ids.contains(it->first)) {
+                    it = nof_heartbeat_states_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (!ok_segments.empty()) {
+                next_probe_index %= ok_segments.size();
+                for (size_t offset = 0; offset < ok_segments.size(); ++offset) {
+                    const auto& candidate =
+                        ok_segments[(next_probe_index + offset) %
+                                    ok_segments.size()];
+                    auto state_it =
+                        nof_heartbeat_states_.find(candidate.segment_id);
+                    if (state_it == nof_heartbeat_states_.end()) {
+                        continue;
+                    }
+                    if (state_it->second.next_probe_at <= now) {
+                        probe_target = candidate;
+                        next_probe_index = (next_probe_index + offset + 1) %
+                                           ok_segments.size();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!probe_target.has_value()) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kNoFHeartbeatThreadSleepMs));
+            continue;
+        }
+
+        auto probe_start = std::chrono::steady_clock::now();
+        std::string error_reason;
+        bool probe_success =
+            ProbeNoFSegment(probe_target->segment.te_endpoint, &error_reason);
+        auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - probe_start)
+                              .count();
+        MasterMetricManager::instance().observe_nof_heartbeat_probe_latency_ms(
+            latency_ms);
+
+        if (probe_success) {
+            MasterMetricManager::instance().inc_nof_heartbeat_success_total();
+            auto success_time = std::chrono::steady_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+                auto it = nof_heartbeat_states_.find(probe_target->segment_id);
+                if (it != nof_heartbeat_states_.end()) {
+                    it->second.consecutive_failures = 0;
+                    it->second.last_success_at = success_time;
+                    it->second.last_error_reason.clear();
+                    it->second.next_probe_at =
+                        success_time + nof_heartbeat_interval_sec_;
+                }
+            }
+            VLOG(1) << "segment_id=" << probe_target->segment_id
+                    << ", segment_name=" << probe_target->segment.name
+                    << ", endpoint=" << probe_target->segment.te_endpoint
+                    << ", action=nof_heartbeat_success"
+                    << ", latency_ms=" << latency_ms;
+            continue;
+        }
+
+        MasterMetricManager::instance().inc_nof_heartbeat_failure_total();
+        if (error_reason == "completion_timeout") {
+            MasterMetricManager::instance().inc_nof_heartbeat_timeout_total();
+        }
+
+        bool should_unmount = false;
+        uint32_t failure_count = 0;
+        auto failure_time = std::chrono::steady_clock::now();
+        auto alive_timeout =
+            nof_heartbeat_interval_sec_ *
+            static_cast<int64_t>(nof_heartbeat_failures_threshold_);
+        {
+            std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
+            auto it = nof_heartbeat_states_.find(probe_target->segment_id);
+            if (it != nof_heartbeat_states_.end()) {
+                it->second.consecutive_failures++;
+                failure_count = it->second.consecutive_failures;
+                it->second.last_error_reason = error_reason;
+                it->second.next_probe_at =
+                    failure_time + nof_heartbeat_interval_sec_;
+                should_unmount =
+                    failure_time - it->second.last_success_at >= alive_timeout;
+            }
+        }
+
+        LOG(WARNING) << "segment_id=" << probe_target->segment_id
+                     << ", segment_name=" << probe_target->segment.name
+                     << ", endpoint=" << probe_target->segment.te_endpoint
+                     << ", action=nof_heartbeat_failure"
+                     << ", failure_count=" << failure_count
+                     << ", latency_ms=" << latency_ms
+                     << ", reason=" << error_reason;
+
+        if (should_unmount) {
+            TryUnmountNoFSegmentByHeartbeat(*probe_target, error_reason);
+        }
     }
 }
 
@@ -4098,7 +5586,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
-                metadata_ptr->IsHardPinned()));
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -4113,12 +5601,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...,
-    // hard_pinned]
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
+    // replicas..., hard_pinned]
 
-    size_t array_size = 8;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 9;  // client_id, put_start_time, size, lease_timeout,
                             // has_soft_pin_timeout, soft_pin_timeout,
-                            // replicas_count + hard_pinned
+                            // replicas_count, data_type, hard_pinned
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -4158,6 +5646,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
+    // Serialize data_type
+    packer.pack(static_cast<uint8_t>(metadata.data_type));
+
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
@@ -4184,7 +5675,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
     // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    // (8th element = hard_pinned is optional for backward compat)
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -4217,13 +5707,33 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Array size: 7 + replicas_count (old format) or 8 + replicas_count (new
-    // format with hard_pinned)
-    if (obj.via.array.size != 7 + replicas_count &&
-        obj.via.array.size != 8 + replicas_count) {
+    // Format detection:
+    //   v1: 7 + replicas_count, no data_type or hard_pinned
+    //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
+    //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
+    constexpr uint32_t kOldFieldCount = 7;
+    constexpr uint32_t kOneExtraFieldCount = 8;
+    constexpr uint32_t kCurrentFieldCount = 9;
+    const uint32_t total_elements = obj.via.array.size;
+    const bool is_old_format =
+        (total_elements == kOldFieldCount + replicas_count);
+    const bool is_one_extra_format =
+        (total_elements == kOneExtraFieldCount + replicas_count);
+    const bool is_current_format =
+        (total_elements == kCurrentFieldCount + replicas_count);
+
+    if (!is_current_format && !is_one_extra_format && !is_old_format) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
+    }
+
+    ObjectDataType data_type = ObjectDataType::UNKNOWN;
+    if (is_current_format) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+    } else if (is_one_extra_format &&
+               array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
     }
 
     // Deserialize replicas
@@ -4251,7 +5761,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned);
+        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -5003,6 +6513,107 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
     }
 
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// GracefulUnmountScheduler implementation
+// ---------------------------------------------------------------------------
+
+MasterService::GracefulUnmountScheduler::GracefulUnmountScheduler(
+    MasterService* service)
+    : service_(service) {}
+
+MasterService::GracefulUnmountScheduler::~GracefulUnmountScheduler() { Stop(); }
+
+void MasterService::GracefulUnmountScheduler::Schedule(
+    const UUID& segment_id, const UUID& client_id,
+    std::chrono::steady_clock::time_point expire_time) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            return;
+        }
+        queue_.push(Record{segment_id, client_id, expire_time});
+        if (!timer_running_.load()) {
+            timer_running_.store(true);
+            timer_thread_ = std::thread([this]() { this->TimerLoop(); });
+        }
+    }
+    timer_cv_.notify_one();
+}
+
+void MasterService::GracefulUnmountScheduler::RemoveClientRecords(
+    const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<Record> remaining;
+    remaining.reserve(queue_.size());
+    while (!queue_.empty()) {
+        auto rec = queue_.top();
+        queue_.pop();
+        if (rec.client_id != client_id) {
+            remaining.push_back(rec);
+        }
+    }
+    for (auto& rec : remaining) {
+        queue_.push(rec);
+    }
+    timer_cv_.notify_one();
+}
+
+void MasterService::GracefulUnmountScheduler::Stop() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        timer_running_.store(false);
+    }
+    timer_cv_.notify_all();
+    if (timer_thread_.joinable()) {
+        timer_thread_.join();
+    }
+}
+
+void MasterService::GracefulUnmountScheduler::TimerLoop() {
+    while (timer_running_.load()) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            timer_cv_.wait(lock, [this]() {
+                return !timer_running_.load() || !queue_.empty();
+            });
+            if (!timer_running_.load()) break;
+            continue;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto next_expire = queue_.top().expire_time;
+        if (next_expire > now) {
+            timer_cv_.wait_until(lock, next_expire, [this, next_expire]() {
+                return !timer_running_.load() || queue_.empty() ||
+                       queue_.top().expire_time < next_expire;
+            });
+            if (!timer_running_.load()) break;
+            continue;
+        }
+
+        // Collect all expired records
+        std::vector<Record> expired;
+        while (!queue_.empty() && queue_.top().expire_time <= now) {
+            expired.push_back(queue_.top());
+            queue_.pop();
+        }
+
+        for (auto& rec : expired) {
+            if (service_) {
+                auto result =
+                    service_->UnmountSegment(rec.segment_id, rec.client_id);
+                if (!result.has_value()) {
+                    LOG(WARNING)
+                        << "Failed to complete graceful unmount, segment_id="
+                        << rec.segment_id << ", client_id=" << rec.client_id
+                        << ", error=" << toString(result.error());
+                }
+            }
+        }
+    }
 }
 
 }  // namespace mooncake
