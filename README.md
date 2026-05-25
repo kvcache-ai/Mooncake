@@ -377,9 +377,16 @@ The above presents two samples from our trace dataset. The trace includes the ti
 **_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
 
 <h2 id="citation">📑 Citation</h2>
-Please kindly cite our paper if you find the paper or the traces are useful:
+Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
+@article{sun2026survivingpartialrankfailures,
+  title     = {Surviving Partial Rank Failures in Wide Expert-Parallel MoE Inference}, 
+  author    = {Xun Sun and Shaoyuan Chen and Pingchuan Ma and Yue Chen and Ziwei Yuan and Zhanhao Cao and Han Han and Shangming Cai and Teng Ma and Xuchun Shang and Xinpeng Zhao and Ke Yang and Junlin Wei and Lianzhi Lin and Yuji Liu and Feng Ren and Haoran Hu and Cheng Wan and Yingdi Shan and Yongwei Wu and Mingxing Zhang},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2605.10670},
+}
+
 @article{qin2025mooncake_tos,
   author    = {Qin Ruoyu and Li Zheming and He Weiran and Cui Jialei and Tang Heyi and Ren Feng and Ma Teng and Cai Shangming and Zhang Yineng and Zhang Mingxing and Wu Yongwei and Zheng Weimin and Xu Xinran},
   title     = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
