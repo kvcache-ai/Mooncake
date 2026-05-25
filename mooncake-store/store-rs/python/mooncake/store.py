@@ -689,6 +689,51 @@ class MooncakeDistributedStore:
     ):
         return self._invoke_cache("get_into", key, buffer_ptr, size, tenant=tenant)
 
+    # ─── Tensor API ─────────────────────────────────────────────────────────
+
+    def put_tensor(self, key: str, tensor, *, tenant: str | None = None, config=None):
+        """Store a tensor with binary metadata header.
+
+        The stored object is [TensorMetadata(304 bytes) | raw_data].
+        """
+        return self._invoke(
+            "put_tensor", key, tensor, tenant=tenant, **_replication_kwargs_simple(config)
+        )
+
+    def put_tensor_from(self, key: str, tensor, *, tenant: str | None = None, config=None):
+        """Store a tensor via zero-copy from registered memory.
+
+        The metadata header is written into the WIRE_SIZE bytes preceding
+        tensor.data_ptr(). The caller must ensure that space is available.
+        """
+        return self._invoke(
+            "put_tensor_from", key, tensor, tenant=tenant, **_replication_kwargs_simple(config)
+        )
+
+    def get_tensor(self, key: str, *, tensor=None, tenant: str | None = None):
+        """Read a tensor from the store.
+
+        If *tensor* is provided, its storage is used as the destination buffer.
+        Otherwise a new tensor is allocated. Returns a torch.Tensor.
+        """
+        import torch
+
+        if tensor is not None:
+            buf_ptr = tensor.data_ptr() - TENSOR_METADATA_WIRE_SIZE
+            buf_size = TENSOR_METADATA_WIRE_SIZE + tensor.nelement() * tensor.element_size()
+            result = self._invoke("get_tensor_into", key, buf_ptr, buf_size, tenant=tenant)
+            return _tensor_from_read_result(result)
+
+        # Fallback: read raw bytes and reconstruct
+        raw = self._invoke("get", key, tenant=tenant)
+        return _tensor_from_raw_bytes(raw)
+
+    def get_tensor_into(self, key: str, buffer_ptr: int, size: int, *, tenant: str | None = None):
+        """Read a tensor into a pre-allocated buffer. Returns a TensorReadResult."""
+        return self._invoke("get_tensor_into", key, buffer_ptr, size, tenant=tenant)
+
+    # ─── End Tensor API ───────────────────────────────────────────────────
+
     def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
         return bool(self._invoke_cache("is_exist", key, tenant=tenant))
 
@@ -943,6 +988,88 @@ def _replication_kwargs(config) -> dict:
         ),
         "with_soft_pin": bool(getattr(config, "with_soft_pin", False)),
     }
+
+
+def _replication_kwargs_simple(config) -> dict:
+    """Extract only replica_count from config (for tensor APIs)."""
+    if config is None:
+        return {}
+    replica_count = int(getattr(config, "replica_num", 1))
+    if replica_count <= 1:
+        return {}
+    return {"replica_count": replica_count}
+
+
+# Size of the TensorMetadata wire-format struct (must match Rust TensorMetadata::WIRE_SIZE).
+TENSOR_METADATA_WIRE_SIZE = 304
+
+_DTYPE_MAP = {
+    0: "float32",
+    1: "float64",
+    2: "int8",
+    3: "uint8",
+    4: "int16",
+    5: "uint16",
+    6: "int32",
+    7: "uint32",
+    8: "int64",
+    9: "uint64",
+    10: "bool",
+    11: "float16",
+    12: "bfloat16",
+    13: "float8_e4m3fn",
+    14: "float8_e5m2",
+}
+
+
+def _tensor_from_read_result(result):
+    """Convert a TensorReadResult into a torch.Tensor view."""
+    import torch
+    import ctypes as _ctypes
+
+    dtype_str = _DTYPE_MAP.get(result.dtype)
+    if dtype_str is None:
+        raise ValueError(f"unsupported dtype code: {result.dtype}")
+    torch_dtype = getattr(torch, dtype_str)
+    numel = 1
+    for d in result.shape:
+        numel *= d
+    # Create tensor from data pointer
+    tensor = torch.frombuffer(
+        (_ctypes.c_char * result.data_bytes).from_address(result.data_ptr),
+        dtype=torch_dtype,
+    ).reshape(result.shape)
+    return tensor
+
+
+def _tensor_from_raw_bytes(raw: bytes):
+    """Parse TensorMetadata from raw bytes and return a torch.Tensor."""
+    import torch
+    import struct
+
+    if len(raw) < TENSOR_METADATA_WIRE_SIZE:
+        raise ValueError("raw data too short for tensor metadata")
+    magic, version, header_size, dtype_i32, ndim = struct.unpack_from("<IHHII", raw, 0)
+    if magic != 0x4D4F4F4E:
+        raise ValueError(f"bad tensor magic: {magic:#x}")
+    layout_kind, _reserved_flags, data_offset, data_bytes = struct.unpack_from(
+        "<IIqq", raw, 16
+    )
+    # Read local shape from layout (after header, offset 40 + 64 for global shape)
+    local_shape_offset = 40 + 64  # after header(40) + global_shape(64)
+    shape = []
+    for i in range(ndim):
+        dim = struct.unpack_from("<q", raw, local_shape_offset + i * 8)[0]
+        shape.append(dim)
+
+    dtype_str = _DTYPE_MAP.get(dtype_i32)
+    if dtype_str is None:
+        raise ValueError(f"unsupported dtype code: {dtype_i32}")
+    torch_dtype = getattr(torch, dtype_str)
+    # Single copy via bytearray from memoryview slice (avoids double-copy).
+    data = bytearray(memoryview(raw)[data_offset : data_offset + data_bytes])
+    tensor = torch.frombuffer(data, dtype=torch_dtype).reshape(shape)
+    return tensor
 
 
 def _normalize_key_value_items(

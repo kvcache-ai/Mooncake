@@ -15,6 +15,7 @@ libc = "0.2"
 mooncake-metadata = { path = "../mooncake-metadata" }
 mooncake-store-client = { path = "../mooncake-store-client" }
 mooncake-store-core = { path = "../mooncake-store-core" }
+mooncake-tensor = { path = "../mooncake-tensor" }
 mooncake-transport = { path = "../mooncake-transport" }
 parking_lot.workspace = true
 pyo3.workspace = true
