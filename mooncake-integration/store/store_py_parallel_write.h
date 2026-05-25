@@ -935,14 +935,14 @@ std::vector<int> batch_put_tensor_with_parallelism(
         },
         [this, &keys, &tensors_list, &config](size_t i,
                                               const py::handle &parallelism) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism(
                 keys[i], tensors_list[i],
                 py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &tensors_list, &config](
             size_t i, const py::handle &writer_partition) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism(
                 keys[i], tensors_list[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
@@ -1092,14 +1092,14 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &parallelism) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i],
                 py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &writer_partition) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
@@ -1391,14 +1391,14 @@ std::vector<int> batch_upsert_tensor_with_parallelism(
         },
         [this, &keys, &tensors_list, &config](size_t i,
                                               const py::handle &parallelism) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism(
                 keys[i], tensors_list[i],
                 py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &tensors_list, &config](
             size_t i, const py::handle &writer_partition) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism(
                 keys[i], tensors_list[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
@@ -1468,14 +1468,14 @@ std::vector<int> batch_upsert_tensor_with_parallelism_from(
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &parallelism) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i],
                 py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &writer_partition) {
-            ReplicateConfig key_config = MakeSingleKeyConfig(config, i);
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));

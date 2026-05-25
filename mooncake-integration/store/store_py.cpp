@@ -677,16 +677,6 @@ class MooncakeStorePyWrapper {
                                ReplicateConfig{});  // Default config
     }
 
-    ReplicateConfig MakeSingleKeyConfig(const ReplicateConfig &config,
-                                        size_t key_index) const {
-        ReplicateConfig key_config = config;
-        if (config.group_ids.has_value()) {
-            key_config.group_ids =
-                std::vector<std::string>{config.group_ids->at(key_index)};
-        }
-        return key_config;
-    }
-
     ReplicateConfig MakeIndexedConfig(
         const ReplicateConfig &config,
         const std::vector<size_t> &original_indices) const {

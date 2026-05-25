@@ -91,7 +91,19 @@ struct ReplicateConfig {
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    // Optional per-key routing group IDs. Empty string keeps that key
+    // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
+    // and memory eviction behavior.
     std::optional<std::vector<std::string>> group_ids{};
+
+    ReplicateConfig ForSingleKey(size_t key_index) const {
+        ReplicateConfig key_config = *this;
+        if (group_ids.has_value()) {
+            key_config.group_ids =
+                std::vector<std::string>{group_ids->at(key_index)};
+        }
+        return key_config;
+    }
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {

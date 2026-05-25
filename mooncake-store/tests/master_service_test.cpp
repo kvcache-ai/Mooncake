@@ -647,9 +647,9 @@ TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
     EXPECT_TRUE(service_->ExistKey(key).value_or(false));
 }
 
-TEST_F(MasterServiceTest, GroupedLeaseRefreshProtectsCurrentMembers) {
+TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(1000).build();
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(200).build();
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -669,6 +669,47 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshProtectsCurrentMembers) {
     auto exists = service_->ExistKey(key_a);
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    exists = service_->ExistKey(key_a);
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(exists.value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto remove_group_peer = service_->Remove(key_b);
+    ASSERT_FALSE(remove_group_peer.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_group_peer.error());
+
+    EXPECT_TRUE(service_->Remove(key_a, /*force=*/true).has_value());
+    EXPECT_TRUE(service_->Remove(key_b, /*force=*/true).has_value());
+}
+
+TEST_F(MasterServiceTest,
+       GroupedLeaseRefreshAfterMembershipChangeDoesNotWaitForTriggerExpiry) {
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(500).build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key_a = "lease_group_dirty_key_a";
+    const std::string key_b = "lease_group_dirty_key_b";
+    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids = std::vector<std::string>{group_id};
+
+    PutCompletedObject(*service_, client_id, key_a, config);
+    ASSERT_TRUE(service_->ExistKey(key_a).value_or(false));
+
+    PutCompletedObject(*service_, client_id, key_b, config);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    auto exists = service_->ExistKey(key_a);
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(exists.value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(390));
 
     auto remove_group_peer = service_->Remove(key_b);
     ASSERT_FALSE(remove_group_peer.has_value());

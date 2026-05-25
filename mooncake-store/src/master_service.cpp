@@ -118,17 +118,6 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     return config.group_ids->at(key_index);
 }
 
-ReplicateConfig MakeSingleKeyConfig(const ReplicateConfig& config,
-                                    size_t key_index) {
-    ReplicateConfig key_config = config;
-    if (config.group_ids.has_value()) {
-        key_config.group_ids = std::vector<std::string>{
-            config.group_ids->at(key_index),
-        };
-    }
-    return key_config;
-}
-
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -613,6 +602,7 @@ void MasterService::RegisterGroupMember(MetadataShard& shard,
     }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
     object_group_ids_[key] = group_id;
+    groups_needing_lease_refresh_.insert(group_id);
     shard.group_members[group_id].insert(key);
 }
 
@@ -622,17 +612,22 @@ void MasterService::UnregisterGroupMember(MetadataShard& shard,
     if (group_id.empty()) {
         return;
     }
+    bool group_empty = false;
     auto group_it = shard.group_members.find(group_id);
     if (group_it != shard.group_members.end()) {
         group_it->second.erase(key);
         if (group_it->second.empty()) {
             shard.group_members.erase(group_it);
+            group_empty = true;
         }
     }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
     auto route_it = object_group_ids_.find(key);
     if (route_it != object_group_ids_.end() && route_it->second == group_id) {
         object_group_ids_.erase(route_it);
+    }
+    if (group_empty) {
+        groups_needing_lease_refresh_.erase(group_id);
     }
 }
 
@@ -658,6 +653,7 @@ MasterService::EraseMetadataEntry(
 
 void MasterService::RebuildGroupRoutingIndex() {
     std::unordered_map<std::string, std::string> rebuilt_group_ids;
+    std::unordered_set<std::string> groups_needing_refresh;
     // Snapshot restore rebuilds this derived index after all metadata shards
     // have been deserialized. Take shard locks here so the helper does not
     // depend on callers touching guarded shard state directly.
@@ -670,12 +666,14 @@ void MasterService::RebuildGroupRoutingIndex() {
             }
             shard->group_members[metadata.group_id].insert(key);
             rebuilt_group_ids[key] = metadata.group_id;
+            groups_needing_refresh.insert(metadata.group_id);
         }
     }
 
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
         object_group_ids_ = std::move(rebuilt_group_ids);
+        groups_needing_lease_refresh_ = std::move(groups_needing_refresh);
     }
 }
 
@@ -684,6 +682,17 @@ void MasterService::GrantLeaseForGroup(const MetadataShard& shard,
                                        const ObjectMetadata& metadata) const {
     if (!metadata.IsGrouped()) {
         metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        return;
+    }
+
+    bool needs_refresh = metadata.NeedsLeaseRefresh(default_kv_lease_ttl_,
+                                                    default_kv_soft_pin_ttl_);
+    if (!needs_refresh) {
+        std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
+        needs_refresh = groups_needing_lease_refresh_.find(metadata.group_id) !=
+                        groups_needing_lease_refresh_.end();
+    }
+    if (!needs_refresh) {
         return;
     }
 
@@ -700,8 +709,12 @@ void MasterService::GrantLeaseForGroup(const MetadataShard& shard,
                                          default_kv_soft_pin_ttl_);
         }
     }
-    if (!group_it->second.contains(key)) {
+    if (group_it->second.find(key) == group_it->second.end()) {
         metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
+        groups_needing_lease_refresh_.erase(metadata.group_id);
     }
 }
 
@@ -2070,7 +2083,7 @@ MasterService::BatchUpsertStart(const UUID& client_id,
         results;
     results.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto key_config = MakeSingleKeyConfig(config, i);
+        auto key_config = config.ForSingleKey(i);
         results.emplace_back(
             UpsertStart(client_id, keys[i], slice_lengths[i], key_config));
     }
@@ -5811,6 +5824,7 @@ void MasterService::MetadataSerializer::Reset() {
         std::unique_lock<std::shared_mutex> lock(
             service_->group_routing_mutex_);
         service_->object_group_ids_.clear();
+        service_->groups_needing_lease_refresh_.clear();
     }
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);

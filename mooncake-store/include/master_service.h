@@ -952,6 +952,18 @@ class MasterService {
             }
         }
 
+        bool NeedsLeaseRefresh(const uint64_t ttl,
+                               const uint64_t soft_ttl) const {
+            SpinLocker locker(&lock);
+            const auto now = std::chrono::system_clock::now();
+            if (lease_timeout <= now + std::chrono::milliseconds(ttl / 2)) {
+                return true;
+            }
+            return soft_pin_timeout &&
+                   *soft_pin_timeout <=
+                       now + std::chrono::milliseconds(soft_ttl / 2);
+        }
+
         // Check if the lease has expired
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);
@@ -1075,6 +1087,8 @@ class MasterService {
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
     std::unordered_map<std::string, std::string> object_group_ids_
+        GUARDED_BY(group_routing_mutex_);
+    mutable std::unordered_set<std::string> groups_needing_lease_refresh_
         GUARDED_BY(group_routing_mutex_);
     mutable std::shared_mutex group_routing_mutex_;
 

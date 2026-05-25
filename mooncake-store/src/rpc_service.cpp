@@ -76,17 +76,6 @@ void SetServiceUnavailable(coro_http::coro_http_response& resp,
                                 payload);
 }
 
-ReplicateConfig MakeSingleKeyConfig(const ReplicateConfig& config,
-                                    size_t key_index) {
-    ReplicateConfig key_config = config;
-    if (config.group_ids.has_value()) {
-        key_config.group_ids = std::vector<std::string>{
-            config.group_ids->at(key_index),
-        };
-    }
-    return key_config;
-}
-
 struct HttpErrorResponse {
     bool success{false};
     int32_t error_code{0};
@@ -1032,7 +1021,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = MakeSingleKeyConfig(new_config, i);
+            auto key_config = new_config.ForSingleKey(i);
             auto result = master_service_.PutStart(
                 client_id, keys[i], slice_lengths[i], key_config);
             results.emplace_back(result);
@@ -1054,7 +1043,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         }
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = MakeSingleKeyConfig(config, i);
+            auto key_config = config.ForSingleKey(i);
             results.emplace_back(master_service_.PutStart(
                 client_id, keys[i], slice_lengths[i], key_config));
         }
