@@ -3294,9 +3294,20 @@ impl StoreClient {
         target_chunks: &[SegmentTargetChunk],
         replica: &ReplicaRoute,
     ) -> Result<u64> {
-        if target_chunks.is_empty() {
-            return Self::remote_replica_target_offset(info, replica);
+        if let Some(offset) = replica.offset {
+            if Self::segment_info_covers_target(info, offset, replica.length) {
+                return Ok(offset);
+            }
         }
+        if target_chunks.is_empty() {
+            return Self::segment_relative_target_offset(
+                info,
+                &replica.segment_name,
+                replica.segment_offset,
+                replica.length,
+            );
+        }
+
         let resolved = Self::storage_target_offset(
             target_chunks,
             &replica.segment_name,
@@ -3363,6 +3374,7 @@ impl StoreClient {
         Ok(target_chunks)
     }
 
+    #[cfg(test)]
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
         if let Some(offset) = replica.offset {
             if Self::segment_info_covers_target(info, offset, replica.length) {
