@@ -484,6 +484,9 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
         const UUID &client_id);
 
+    tl::expected<bool, ErrorCode> is_shm_mapped_internal(
+        uint64_t dummy_base_addr, const UUID &client_id);
+
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
@@ -697,6 +700,10 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects);
 
+    int64_t get_offload_rpc_read_count() const {
+        return offload_rpc_read_count_.load(std::memory_order_relaxed);
+    }
+
     /**
      * @brief Mount a shared memory file region and return segment ids.
      *        If size > max_mr_size, it will be split into multiple chunks
@@ -843,6 +850,9 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Counts every LOCAL_DISK read served via peer offload-RPC.
+    std::atomic<int64_t> offload_rpc_read_count_{0};
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

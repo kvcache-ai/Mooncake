@@ -2774,6 +2774,39 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
+    std::unordered_map<std::string, int64_t>& promotion_objects) {
+    auto response = master_client_.PromotionObjectHeartbeat(client_id_);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    promotion_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStart(
+    const std::string& key, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStart(client_id_, key, size,
+                                              preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key) {
+    return master_client_.NotifyPromotionSuccess(client_id_, key);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key) {
+    return master_client_.NotifyPromotionFailure(client_id_, key);
+}
+
+ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
+                                 std::vector<Slice>& slices) {
+    return TransferWrite(memory_descriptor, slices);
+}
+
 tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return master_client_.CreateCopyTask(key, targets);

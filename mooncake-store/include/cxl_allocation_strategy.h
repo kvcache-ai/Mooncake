@@ -31,7 +31,8 @@ class CxlAllocationStrategy : public AllocationStrategy {
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
-            std::set<std::string>()) {
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }

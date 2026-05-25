@@ -15,6 +15,17 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
+/**
+ * @brief Type of buffer allocator used in the system
+ */
+enum class ReplicaType {
+    MEMORY,      // Memory replica
+    DISK,        // Disk replica
+    LOCAL_DISK,  // Local disk replica
+    NOF_SSD,     // Nvme-oF SSD replica
+    ALL,         // All memory and NoF replicas in put finalize path
+};
+
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
@@ -147,7 +158,8 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
-                            StorageLevel level = StorageLevel::RAM);
+                            StorageLevel level = StorageLevel::RAM,
+                            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
@@ -181,6 +193,7 @@ class CachelibBufferAllocator
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     StorageLevel storage_level_;
+    const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -202,7 +215,8 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          StorageLevel level = StorageLevel::RAM);
+                          StorageLevel level = StorageLevel::RAM,
+                          ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
@@ -238,6 +252,7 @@ class OffsetBufferAllocator
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     StorageLevel storage_level_;
+    const ReplicaType replica_type_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

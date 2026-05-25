@@ -40,8 +40,12 @@ add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
+add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
+add_store_test(master_service_promotion_test_for_snapshot
+               ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)

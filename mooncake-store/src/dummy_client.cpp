@@ -117,17 +117,30 @@ std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
 
 namespace mooncake {
 
+template <auto ServiceMethod>
+constexpr bool can_invoke_when_disconnected() {
+    using Method = std::remove_reference_t<decltype(ServiceMethod)>;
+    return std::is_same_v<
+               Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::service_ready_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::is_shm_mapped_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_shm_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
+}
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
-    if constexpr (!std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<decltype(&RealClient::ping)>> &&
-                  !std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<
-                          decltype(&RealClient::service_ready_internal)>>) {
+    if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
         if (!connected_.load()) {
             LOG(ERROR) << "Dummy Client not connected";
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -266,6 +279,20 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
 int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
                                      bool is_local) {
 #ifdef USE_ASCEND_DIRECT
+    const auto dummy_base_addr = reinterpret_cast<uint64_t>(shm->base_addr);
+    auto mapped_result = invoke_rpc<&RealClient::is_shm_mapped_internal, bool>(
+        dummy_base_addr, client_id_);
+    if (!mapped_result.has_value()) {
+        LOG(WARNING) << "Failed to query real-side shared memory mapping, addr="
+                     << shm->base_addr;
+        return -1;
+    }
+    if (mapped_result.value()) {
+        LOG(INFO) << "Real-side shared memory mapping already exists, addr="
+                  << shm->base_addr << ", size=" << shm->size;
+        return 0;
+    }
+
     // Detect memory type: device memory uses IPC sharing
     aclrtPtrAttributes attributes;
     auto ret = aclrtPointerGetAttributes(shm->base_addr, &attributes);
@@ -288,8 +315,8 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
 
         std::string ipc_key_bytes(ipc_key, kIPCKeyLen);
         auto map_ret = invoke_rpc<&RealClient::ascend_ipc_shm_internal, void>(
-            reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
-            ipc_key_bytes, device_id_, client_id_);
+            dummy_base_addr, shm->size, is_local, ipc_key_bytes, device_id_,
+            client_id_);
         if (!map_ret.has_value()) {
             LOG(ERROR) << "Failed to map IPC buffer on real side";
             return -1;
@@ -331,8 +358,8 @@ int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
     std::string handle_bytes(reinterpret_cast<char*>(&export_handle),
                              sizeof(export_handle));
     auto map_ret = invoke_rpc<&RealClient::ascend_shm_internal, void>(
-        reinterpret_cast<uint64_t>(shm->base_addr), shm->size, is_local,
-        handle_bytes, device_id_, client_id_);
+        dummy_base_addr, shm->size, is_local, handle_bytes, device_id_,
+        client_id_);
     if (!map_ret.has_value()) {
         LOG(ERROR) << "Failed to map VMM buffer on real side";
         return -1;

@@ -1945,6 +1945,13 @@ PYBIND11_MODULE(store, m) {
              })
         .def("get", &mooncake::MooncakeStorePyWrapper::get)
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get_offload_rpc_read_count",
+             [](MooncakeStorePyWrapper &self) -> int64_t {
+                 auto real_client =
+                     std::dynamic_pointer_cast<RealClient>(self.store_);
+                 return real_client ? real_client->get_offload_rpc_read_count()
+                                    : 0;
+             })
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {

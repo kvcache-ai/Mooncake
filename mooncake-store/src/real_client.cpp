@@ -2776,6 +2776,22 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
     return {};
 }
 
+tl::expected<bool, ErrorCode> RealClient::is_shm_mapped_internal(
+    uint64_t dummy_base_addr, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto context_it = shm_contexts_.find(client_id);
+    if (context_it == shm_contexts_.end()) {
+        return false;
+    }
+
+    const auto target_addr = static_cast<uintptr_t>(dummy_base_addr);
+    const auto &mapped_shms = context_it->second.mapped_shms;
+    return std::any_of(mapped_shms.begin(), mapped_shms.end(),
+                       [target_addr](const MappedShm &shm) {
+                           return shm.dummy_base_addr == target_addr;
+                       });
+}
+
 tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     uint64_t dummy_base_addr, const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -5806,6 +5822,7 @@ tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, std::vector<Slice>> &objects) {
+    offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
