@@ -299,8 +299,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
-        MasterMetricManager::instance().inc_total_file_capacity(
-            global_file_segment_size_);
+        if (global_file_segment_size_ == std::numeric_limits<int64_t>::max()) {
+            MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
+        } else {
+            MasterMetricManager::instance().inc_total_file_capacity(
+                global_file_segment_size_);
+        }
     }
 
     if (enable_snapshot_) {
