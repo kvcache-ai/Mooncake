@@ -109,6 +109,19 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+
+    // KV Events publisher (RFC #1527) for cache-aware indexers.
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    uint32_t kv_events_queue_capacity = 65536;
 };
 
 class MasterServiceSupervisorConfig {
@@ -182,6 +195,17 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    uint32_t kv_events_queue_capacity = 65536;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -209,6 +233,17 @@ class MasterServiceSupervisorConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -350,6 +385,17 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -417,6 +463,17 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -502,6 +559,17 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -886,6 +954,17 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    uint32_t kv_events_queue_capacity = 65536;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -949,6 +1028,17 @@ class MasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;

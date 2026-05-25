@@ -57,6 +57,7 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     engram/engram_store.cpp
+    kv_event/kv_event_publisher.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -100,6 +101,18 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
+find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
+                                            /usr/lib64)
+find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+  message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+  list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
+  list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
+else()
+  message(FATAL_ERROR
+          "libzmq not found. Install libzmq3-dev to build mooncake_store.")
+endif()
+
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
   message(
     STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")

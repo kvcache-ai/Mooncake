@@ -18,6 +18,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "kv_event/kv_event_publisher.h"
 #include "segment.h"
 
 namespace mooncake {
@@ -242,6 +243,9 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type);
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
     MasterService master_service_;

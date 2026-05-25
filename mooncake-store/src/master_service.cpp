@@ -32,6 +32,7 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "utils.h"
+#include "kv_event/kv_event_config.h"
 
 namespace mooncake {
 
@@ -268,6 +269,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << promotion_admission_threshold_
                   << ", queue_limit=" << promotion_queue_limit_ << ")";
     }
+
+    kv_event_publisher_ =
+        std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
 
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
@@ -1424,6 +1428,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    PublishKvStored(key, replica_type, metadata);
     return {};
 }
 
@@ -1524,6 +1529,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
+        PublishKvRemoved(key, metadata);
         accessor.Erase();
     }
     return {};
@@ -2333,6 +2339,7 @@ auto MasterService::Remove(const std::string& key, bool force)
     }
 
     // Remove object metadata
+    PublishKvRemoved(key, metadata);
     accessor.Erase();
     ErasePromotionTaskIfPresent(accessor.GetShard(), key);
     return {};
@@ -4666,6 +4673,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         try_evict_or_offload(it->first, it->second, shard);
                     total_freed_size += freed;
                     if (it->second.IsValid() == false) {
+                        PublishKvRemoved(it->first, it->second);
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
@@ -4729,6 +4737,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
                         if (it->second.IsValid() == false) {
+                            PublishKvRemoved(it->first, it->second);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -4782,6 +4791,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
                         if (it->second.IsValid() == false) {
+                            PublishKvRemoved(it->first, it->second);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -6614,6 +6624,81 @@ void MasterService::GracefulUnmountScheduler::TimerLoop() {
             }
         }
     }
+}
+
+KvEventConfig MasterService::BuildKvEventConfig(
+    const MasterServiceConfig& config) {
+    KvEventConfig kv_config;
+    kv_config.enabled = config.enable_kv_events;
+    kv_config.bind_endpoint = config.kv_events_bind_endpoint;
+    kv_config.model_name = config.kv_events_model_name;
+    kv_config.backend_id = config.kv_events_backend_id;
+    kv_config.tenant_id = config.kv_events_tenant_id;
+    kv_config.additional_salt = config.kv_events_additional_salt;
+    kv_config.lora_name = config.kv_events_lora_name;
+    kv_config.block_size = config.kv_events_block_size;
+    kv_config.dp_rank = config.kv_events_dp_rank;
+    kv_config.emit_legacy_compat_fields = config.kv_events_emit_legacy_compat;
+    kv_config.queue_capacity = config.kv_events_queue_capacity;
+    return kv_config;
+}
+
+std::string MasterService::MediumForReplicaType(ReplicaType replica_type) {
+    switch (replica_type) {
+        case ReplicaType::MEMORY:
+            return "cpu";
+        case ReplicaType::DISK:
+        case ReplicaType::LOCAL_DISK:
+        case ReplicaType::NOF_SSD:
+            return "disk";
+        case ReplicaType::ALL:
+        default:
+            return "cpu";
+    }
+}
+
+std::string MasterService::MediumForMetadata(const ObjectMetadata& metadata) {
+    if (metadata.HasMemReplica()) {
+        return "cpu";
+    }
+    if (metadata.HasReplica(&Replica::fn_is_nof_replica) ||
+        metadata.HasReplica(&Replica::fn_is_disk_replica) ||
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        return "disk";
+    }
+    return "cpu";
+}
+
+void MasterService::PublishKvStored(const std::string& key,
+                                    ReplicaType replica_type,
+                                    const ObjectMetadata& metadata) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    std::string medium = MediumForReplicaType(replica_type);
+    if (replica_type == ReplicaType::ALL) {
+        medium = MediumForMetadata(metadata);
+    }
+    kv_event_publisher_->PublishStored(key, medium);
+}
+
+void MasterService::PublishKvRemoved(const std::string& key,
+                                     const ObjectMetadata& metadata) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    kv_event_publisher_->PublishRemoved(key, MediumForMetadata(metadata));
+}
+
+bool MasterService::KvEventsEnabled() const {
+    return kv_event_publisher_ && kv_event_publisher_->enabled();
+}
+
+KvEventPublisher::Stats MasterService::GetKvEventStats() const {
+    if (!kv_event_publisher_) {
+        return {};
+    }
+    return kv_event_publisher_->GetStats();
 }
 
 }  // namespace mooncake

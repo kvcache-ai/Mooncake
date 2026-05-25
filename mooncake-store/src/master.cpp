@@ -134,6 +134,26 @@ DEFINE_uint32(promotion_admission_threshold, 2,
               "(set 1 to disable second-touch gating)");
 DEFINE_uint32(promotion_queue_limit, 50000,
               "Max in-flight promotion tasks across all shards");
+DEFINE_bool(enable_kv_events, false,
+            "Enable RFC #1527 KV cache event publisher over ZMQ");
+DEFINE_string(kv_events_bind_endpoint, "",
+              "ZMQ PUB bind endpoint for KV events, e.g. tcp://0.0.0.0:5557");
+DEFINE_string(kv_events_model_name, "",
+              "Model name tag for published KV events");
+DEFINE_string(kv_events_backend_id, "",
+              "backend_id for published KV events (cache owner identity)");
+DEFINE_string(kv_events_tenant_id, "default",
+              "tenant_id for published KV events");
+DEFINE_string(kv_events_additional_salt, "",
+              "additional_salt for published KV events");
+DEFINE_string(kv_events_lora_name, "", "lora_name for published KV events");
+DEFINE_uint32(kv_events_block_size, 0,
+              "block_size for published KV events (0 = omit)");
+DEFINE_uint32(kv_events_dp_rank, 0, "dp_rank for published KV events");
+DEFINE_bool(kv_events_emit_legacy_compat, true,
+            "Include vLLM/SGLang-compatible type/block_hashes fields");
+DEFINE_uint32(kv_events_queue_capacity, 65536,
+              "Bounded queue capacity for async KV event publishing");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -358,6 +378,37 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_queue_limit",
                              &master_config.promotion_queue_limit,
                              FLAGS_promotion_queue_limit);
+    default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
+                           FLAGS_enable_kv_events);
+    default_config.GetString("kv_events_bind_endpoint",
+                             &master_config.kv_events_bind_endpoint,
+                             FLAGS_kv_events_bind_endpoint);
+    default_config.GetString("kv_events_model_name",
+                             &master_config.kv_events_model_name,
+                             FLAGS_kv_events_model_name);
+    default_config.GetString("kv_events_backend_id",
+                             &master_config.kv_events_backend_id,
+                             FLAGS_kv_events_backend_id);
+    default_config.GetString("kv_events_tenant_id",
+                             &master_config.kv_events_tenant_id,
+                             FLAGS_kv_events_tenant_id);
+    default_config.GetString("kv_events_additional_salt",
+                             &master_config.kv_events_additional_salt,
+                             FLAGS_kv_events_additional_salt);
+    default_config.GetString("kv_events_lora_name",
+                             &master_config.kv_events_lora_name,
+                             FLAGS_kv_events_lora_name);
+    default_config.GetUInt32("kv_events_block_size",
+                             &master_config.kv_events_block_size,
+                             FLAGS_kv_events_block_size);
+    default_config.GetUInt32("kv_events_dp_rank", &master_config.kv_events_dp_rank,
+                             FLAGS_kv_events_dp_rank);
+    default_config.GetBool("kv_events_emit_legacy_compat",
+                           &master_config.kv_events_emit_legacy_compat,
+                           FLAGS_kv_events_emit_legacy_compat);
+    default_config.GetUInt32("kv_events_queue_capacity",
+                             &master_config.kv_events_queue_capacity,
+                             FLAGS_kv_events_queue_capacity);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -637,6 +688,63 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.promotion_queue_limit = FLAGS_promotion_queue_limit;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_kv_events = FLAGS_enable_kv_events;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_bind_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_bind_endpoint = FLAGS_kv_events_bind_endpoint;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_model_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_model_name = FLAGS_kv_events_model_name;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_backend_id", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_backend_id = FLAGS_kv_events_backend_id;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_tenant_id", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_tenant_id = FLAGS_kv_events_tenant_id;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_additional_salt", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_additional_salt =
+            FLAGS_kv_events_additional_salt;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_lora_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_lora_name = FLAGS_kv_events_lora_name;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_block_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_block_size = FLAGS_kv_events_block_size;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_dp_rank", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_dp_rank = FLAGS_kv_events_dp_rank;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_emit_legacy_compat", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_emit_legacy_compat =
+            FLAGS_kv_events_emit_legacy_compat;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_queue_capacity", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_queue_capacity = FLAGS_kv_events_queue_capacity;
     }
     // Clamp promotion_admission_threshold into the sketch counter's
     // representable range. The CountMinSketch uses 8-bit saturating
@@ -1008,6 +1116,9 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_offload=" << master_config.enable_offload
+        << ", enable_kv_events=" << master_config.enable_kv_events
+        << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint
+        << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", ha_backend_type=" << master_config.ha_backend_type

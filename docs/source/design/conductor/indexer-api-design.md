@@ -360,3 +360,23 @@ normalizes `BlockStored` and `BlockRemoved` into the internal prefix index.
 Registration metadata supplies fields such as `modelname`, `tenant_id`,
 `instance_id`, `block_size`, and `additionalsalt` when the engine event does
 not carry the full standardized envelope.
+
+### Mooncake Store master publisher
+
+`mooncake_master` can optionally publish RFC #1527 events when
+`enable_kv_events=true`. The publisher binds a ZMQ PUB socket
+(`kv_events_bind_endpoint`) and emits the same three-frame batch format used by
+vLLM/SGLang: empty topic, big-endian sequence number, and a msgpack payload
+`[timestamp, [events], dp_rank]`.
+
+Each event map uses RFC #1527 field names (`event_type`, `seq_hashes`,
+`backend_id`, `medium`, and so on). When `kv_events_emit_legacy_compat` is
+enabled (default), the map also includes vLLM-compatible aliases such as
+`type` and `block_hashes` so Dynamo relay mode can forward events without an
+adapter.
+
+Object keys must encode the rolling `seq_hash` as a decimal or `0x`-prefixed
+hex string. Keys that cannot be parsed are skipped to avoid emitting invalid
+`removed` events. Configure `backend_id` to identify the cache owner (for
+example a per-node storage daemon) and register the bind endpoint with the
+indexer using publisher type `Mooncake`.

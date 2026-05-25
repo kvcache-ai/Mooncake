@@ -402,6 +402,29 @@ void MasterAdminServer::InitHttpServer() {
         });
 
     http_server_.set_http_handler<GET>(
+        "/kv_events/status",
+        [this](coro_http_request&, coro_http_response& resp) {
+            const auto snapshot = SnapshotState();
+            if (!snapshot.service_available || !snapshot.service) {
+                SetServiceUnavailable(resp, "master service is not available");
+                return;
+            }
+            const bool enabled = snapshot.service->KvEventsEnabled();
+            const auto stats = snapshot.service->GetKvEventStats();
+            const std::string payload =
+                std::string("{\"enabled\":") + (enabled ? "true" : "false") +
+                ",\"published_batches\":" +
+                std::to_string(stats.published_batches) +
+                ",\"published_events\":" +
+                std::to_string(stats.published_events) +
+                ",\"dropped_events\":" + std::to_string(stats.dropped_events) +
+                ",\"skipped_unparsed_keys\":" +
+                std::to_string(stats.skipped_unparsed_keys) + "}";
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(status_type::ok, payload);
+        });
+
+    http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request&, coro_http_response& resp) {
             const auto snapshot = SnapshotState();
             resp.add_header("Content-Type", "text/plain; charset=utf-8");
@@ -1622,6 +1645,14 @@ WrappedMasterService::BatchEvictDiskReplica(
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return results;
+}
+
+bool WrappedMasterService::KvEventsEnabled() const {
+    return master_service_.KvEventsEnabled();
+}
+
+KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
+    return master_service_.GetKvEventStats();
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
