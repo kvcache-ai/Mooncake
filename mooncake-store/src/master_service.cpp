@@ -1713,7 +1713,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
             }
 
             if (replica_type == ReplicaType::MEMORY ||
-                (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
                 MasterMetricManager::instance().inc_mem_cache_nums();
             } else if (replica_type == ReplicaType::DISK) {
                 MasterMetricManager::instance().inc_file_cache_nums();
@@ -1782,7 +1783,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
             }
 
             if (replica_type == ReplicaType::MEMORY ||
-                (replica_type == ReplicaType::ALL && metadata.HasMemReplica())) {
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
                 MasterMetricManager::instance().dec_mem_cache_nums();
             } else if (replica_type == ReplicaType::DISK) {
                 MasterMetricManager::instance().dec_file_cache_nums();
