@@ -53,13 +53,18 @@ struct LocalTransferConfig {
     // When mode == MEMCPY, the following parameters are used:
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
+};
 
-    // PreWrite / PinKey key lease: max lifetime (ms) of intermediate state on a
-    // key. 0 means use DataManager built-in default.
-    uint32_t p2p_key_lease_duration_ms = 0;
-    // Background scan interval (ms) for expired key leases. 0 means use
-    // DataManager built-in default.
-    uint32_t p2p_key_lease_scan_interval_ms = 0;
+/**
+ * @struct KeyLeaseConfig
+ * @brief PreWrite / PinKey key lease timing (independent of local transfer).
+ */
+struct KeyLeaseConfig {
+    // Max lifetime (ms) of intermediate lease state on a key. 0 = built-in
+    // default.
+    uint32_t duration_ms = 0;
+    // Background scan interval (ms) for expired leases. 0 = built-in default.
+    uint32_t scan_interval_ms = 0;
 };
 
 /**
@@ -96,7 +101,8 @@ class DataManager {
     DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                 std::shared_ptr<TransferEngine> transfer_engine,
                 size_t lock_shard_count = 1024,
-                const LocalTransferConfig& local_transfer_config = {});
+                const LocalTransferConfig& local_transfer_config = {},
+                const KeyLeaseConfig& key_lease_config = {});
 
     ~DataManager();
 
@@ -252,11 +258,10 @@ class DataManager {
     void ClearLeaseRecords();
 
     struct KeyCtx {
-        // Stable copy of the logical key. Incoming std::string_view often
-        // points at RPC/coro request buffers and is only valid for the lifetime
-        // of that handler; BuildKeyCtx copies immediately so async work, maps,
-        // and locks never retain dangling views.
-        std::string key;
+        // Non-owning view; valid only while caller storage (e.g. RPC/coro
+        // request buffers) remains alive. KeyCtx is stack-scoped within
+        // DataManager and must not be stored. Maps copy keys on insert.
+        std::string_view key;
         size_t hash = 0;
         size_t pending_write_shard_idx = 0;
         size_t pinned_key_shard_idx = 0;
@@ -284,15 +289,15 @@ class DataManager {
     struct RecordShard {
         mutable std::shared_mutex mutex;
         std::unordered_map<std::string, Record, StringHash, std::equal_to<>>
-            by_key;
+            existed_operation_key_map;
         OrderedDeadlineList ordered_list;
     };
 
     using PendingWriteShard = RecordShard<PendingWriteRecord>;
     using PinnedKeyShard = RecordShard<PinnedKeyRecord>;
 
-    // `key` must still point at valid storage for the duration of this call
-    // only (typically RPC/coro request buffers).
+    // `key` must point at storage that outlives the returned KeyCtx and any
+    // synchronous use on the current call stack (typically RPC/coro buffers).
     KeyCtx BuildKeyCtx(std::string_view key) const;
     PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
     PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
@@ -310,6 +315,25 @@ class DataManager {
         const KeyCtx& ctx, const UUID& write_operation_id);
     void AbortPendingWriteInternal(const KeyCtx& ctx,
                                    const UUID& write_operation_id);
+
+    enum class PendingWriteEraseResult {
+        Erased,
+        NotFound,
+        WriteOperationIdMismatch,
+    };
+
+    PendingWriteEraseResult ErasePendingWriteRecord(
+        PendingWriteShard& shard, std::string_view key,
+        const UUID& write_operation_id);
+    tl::expected<void, ErrorCode> ReservePendingWriteSlot(
+        PendingWriteShard& shard, std::string_view key, TimePoint now,
+        TimePoint deadline, const UUID& write_operation_id);
+    tl::expected<void, ErrorCode> AttachPendingWriteHandle(
+        PendingWriteShard& shard, std::string_view key,
+        const UUID& write_operation_id, const AllocationHandle& handle);
+    tl::expected<AllocationHandle, ErrorCode> TakePendingWriteForCommit(
+        PendingWriteShard& shard, std::string_view key, TimePoint now,
+        const UUID& write_operation_id);
 
     std::shared_mutex& GetKeyLock(std::string_view key) {
         return lock_shards_[StringHash{}(key) % lock_shard_count_];

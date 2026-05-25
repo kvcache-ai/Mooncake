@@ -321,14 +321,14 @@ TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
 
     auto second_prewrite = data_manager_->PreWrite(key, 256, GetTierId());
     ASSERT_FALSE(second_prewrite.has_value());
-    EXPECT_EQ(second_prewrite.error(), ErrorCode::OBJECT_HAS_LEASE);
+    EXPECT_EQ(second_prewrite.error(), ErrorCode::REPLICA_IS_PROCESSING);
 
     const auto kctx = data_manager_->BuildKeyCtx(key);
     auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.write_operation_id,
                   prewrite_result->write_operation_id);
     }
@@ -351,7 +351,7 @@ TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
     auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        EXPECT_EQ(shard.by_key.count(key), 0U);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
     }
 }
 
@@ -388,8 +388,8 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.write_operation_id,
                   prewrite_result->write_operation_id);
     }
@@ -417,8 +417,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.ref_count, 2U);
     }
 
@@ -428,8 +428,8 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         << "First UnPinKey failed: " << toString(first_unpin.error());
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.ref_count, 1U);
     }
 
@@ -439,7 +439,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
         << "Second UnPinKey failed: " << toString(second_unpin.error());
     {
         std::shared_lock shard_lock(shard.mutex);
-        EXPECT_EQ(shard.by_key.count(key), 0U);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
     }
 }
 
@@ -466,8 +466,8 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.ref_count, 1U);
         EXPECT_EQ(it->second.read_operation_id, pin_result->read_operation_id);
     }
@@ -486,8 +486,8 @@ TEST_F(DataManagerTest,
     auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::unique_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         const auto expired_deadline =
             std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
         it->second.deadline = expired_deadline;
@@ -501,7 +501,7 @@ TEST_F(DataManagerTest,
 
     {
         std::shared_lock shard_lock(shard.mutex);
-        EXPECT_EQ(shard.by_key.count(key), 0U);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
     }
 
     auto retry_prewrite = data_manager_->PreWrite(key, 512, GetTierId());
@@ -528,8 +528,8 @@ TEST_F(DataManagerTest,
     auto& shard = data_manager_->GetPinnedKeyShard(kctx);
     {
         std::unique_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
         const auto expired_deadline =
             std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
         it->second.deadline = expired_deadline;
@@ -543,7 +543,7 @@ TEST_F(DataManagerTest,
 
     {
         std::shared_lock shard_lock(shard.mutex);
-        EXPECT_EQ(shard.by_key.count(key), 0U);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
     }
 }
 
