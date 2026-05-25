@@ -3189,6 +3189,65 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+TEST_F(MasterServiceTest, BatchReplicaAndPutStatePreserveRequestOrder) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string ready_key = "batch_ready_key";
+    const std::string processing_key = "batch_processing_key";
+    const std::string missing_key = "batch_missing_key";
+
+    auto ready_put_start =
+        service_->PutStart(client_id, ready_key, 1024, config);
+    ASSERT_TRUE(ready_put_start.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, ready_key, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto processing_put_start =
+        service_->PutStart(client_id, processing_key, 1024, config);
+    ASSERT_TRUE(processing_put_start.has_value());
+
+    std::vector<std::string> query_keys = {missing_key, ready_key,
+                                           processing_key};
+    auto batch_get_results = service_->BatchGetReplicaList(query_keys);
+    ASSERT_EQ(batch_get_results.size(), query_keys.size());
+
+    ASSERT_FALSE(batch_get_results[0].has_value());
+    EXPECT_EQ(batch_get_results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(batch_get_results[1].has_value());
+    EXPECT_FALSE(batch_get_results[1].value().replicas.empty());
+
+    ASSERT_FALSE(batch_get_results[2].has_value());
+    EXPECT_EQ(batch_get_results[2].error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    auto batch_exist_results = service_->BatchExistKey(query_keys);
+    ASSERT_EQ(batch_exist_results.size(), query_keys.size());
+    ASSERT_FALSE(batch_exist_results[0].value());
+    ASSERT_TRUE(batch_exist_results[1].value());
+    ASSERT_FALSE(batch_exist_results[2].value());
+
+    std::vector<std::string> mixed_put_end_keys = {missing_key, processing_key,
+                                                   ready_key};
+    auto batch_put_end_results =
+        service_->BatchPutEnd(client_id, mixed_put_end_keys);
+    ASSERT_EQ(batch_put_end_results.size(), mixed_put_end_keys.size());
+
+    ASSERT_FALSE(batch_put_end_results[0].has_value());
+    EXPECT_EQ(batch_put_end_results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(batch_put_end_results[1].has_value());
+    ASSERT_TRUE(batch_put_end_results[2].has_value());
+
+    auto processing_get_after_end = service_->GetReplicaList(processing_key);
+    ASSERT_TRUE(processing_get_after_end.has_value());
+    EXPECT_FALSE(processing_get_after_end->replicas.empty());
+}
+
 TEST_F(MasterServiceTest, BatchQueryIpTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();

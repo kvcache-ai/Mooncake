@@ -1719,7 +1719,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::vector<BufferHandle> buffer_handles;
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    std::vector<std::vector<mooncake::Slice>> batched_slices;
     batched_slices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1735,25 +1735,11 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         }
         auto &buffer_handle = *alloc_result;
         memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
-        auto slices = split_into_slices(buffer_handle);
+        batched_slices.emplace_back(split_into_slices(buffer_handle));
         buffer_handles.emplace_back(std::move(*alloc_result));
-        batched_slices.emplace(key, std::move(slices));
     }
 
-    // Convert unordered_map to vector format expected by BatchPut
-    std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
-    ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
-        auto it = batched_slices.find(key);
-        if (it != batched_slices.end()) {
-            ordered_batched_slices.emplace_back(it->second);
-        } else {
-            LOG(ERROR) << "Missing slices for key: " << key;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+    auto results = client_->BatchPut(keys, batched_slices, config);
 
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {

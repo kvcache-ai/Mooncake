@@ -265,6 +265,9 @@ class MasterService {
     auto GetReplicaList(const std::string& key)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys);
+
     /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
