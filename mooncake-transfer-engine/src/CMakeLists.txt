@@ -95,7 +95,9 @@ endif()
 
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
-  target_link_libraries(transfer_engine PUBLIC hip::host rt)
+  # hsa-runtime64 provides hsa_amd_portable_export_dmabuf, used in the
+  # RDMA transport's HIP dmabuf MR registration path.
+  target_link_libraries(transfer_engine PUBLIC hip::host hsa-runtime64 rt)
 endif()
 
 if(USE_MLU)

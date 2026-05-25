@@ -30,6 +30,13 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "environ.h"
+#if defined(USE_HIP)
+// hsa_amd_portable_export_dmabuf is the ROCm equivalent of
+// cuMemGetHandleForAddressRange(...CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD...).
+// Used in the dmabuf branch of registerMemoryRegionInternal below.
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+#endif
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -337,6 +344,98 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #if defined(USE_CUDA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
+    }
+#elif defined(USE_HIP)
+    // ROCm/HIP equivalent of the CUDA dmabuf path above. Allows AMD GPU
+    // memory to be registered for RDMA without nvidia-peermem (which has
+    // no AMD equivalent in most distros). Mirrors the same host/device
+    // split: ibv_reg_mr() for host memory; ibv_reg_dmabuf_mr() for device
+    // memory, with the dmabuf fd obtained from
+    // hsa_amd_portable_export_dmabuf().
+    //
+    // Tested on:
+    //   - AMD MI355X (gfx950) + Pensando ionic, ROCm 7.2.2
+    //   - AMD MI300X (gfx942) + Broadcom Thor2 (bnxt_re), ROCm 7.0.2
+    hipPointerAttribute_t hipAttr{};
+    hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
+
+    if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
+        hipAttr.type == hipMemoryTypeUnregistered) {
+        // Host memory — standard ibv_reg_mr() path.
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (hipAttr.type == hipMemoryTypeDevice ||
+               hipAttr.type == hipMemoryTypeManaged) {
+        // Device memory — use dmabuf fd export + ibv_reg_dmabuf_mr().
+        // Worker threads (RDMA polling, etc.) may not have the device that
+        // owns `addr` set as their current HIP device. Mirror the CUDA path's
+        // ctx-retain/ctx-release dance with a small RAII guard: pin the
+        // active device to `hipAttr.device` for the duration of the
+        // hipMemGetAddressRange / hsa_amd_portable_export_dmabuf calls,
+        // then restore whatever device the caller had.
+        struct HipDeviceGuard {
+            int prev_device = 0;
+            bool need_restore = false;
+            bool set_ok = false;
+            explicit HipDeviceGuard(int target_device) {
+                if (hipGetDevice(&prev_device) == hipSuccess) {
+                    need_restore = (prev_device != target_device);
+                }
+                set_ok = (hipSetDevice(target_device) == hipSuccess);
+            }
+            ~HipDeviceGuard() {
+                if (need_restore) {
+                    (void)hipSetDevice(prev_device);
+                }
+            }
+        } dev_guard(hipAttr.device);
+        if (!dev_guard.set_ok) {
+            LOG(ERROR) << "Failed to set HIP device to " << hipAttr.device
+                       << " for dmabuf export of " << (uintptr_t)addr;
+            return ERR_CONTEXT;
+        }
+
+        // Get the allocation base + size, since `addr` may sit at an offset
+        // within a larger hipMalloc block (caching allocators pack tensors).
+        hipDeviceptr_t allocBase = nullptr;
+        size_t allocSize = 0;
+        hipRes = hipMemGetAddressRange(&allocBase, &allocSize,
+                                       reinterpret_cast<hipDeviceptr_t>(addr));
+        if (hipRes != hipSuccess) {
+            LOG(ERROR) << "Failed to call hipMemGetAddressRange for "
+                       << (uintptr_t)addr
+                       << " hip error=" << hipGetErrorString(hipRes);
+            return ERR_CONTEXT;
+        }
+
+        int dmabuf_fd = -1;
+        uint64_t hsa_dmabuf_offset = 0;
+        hsa_status_t hsaRes = hsa_amd_portable_export_dmabuf(
+            allocBase, allocSize, &dmabuf_fd, &hsa_dmabuf_offset);
+        if (hsaRes != HSA_STATUS_SUCCESS) {
+            const char *hsaErr = nullptr;
+            hsa_status_string(hsaRes, &hsaErr);
+            LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
+                       << " base=" << (uintptr_t)allocBase
+                       << " size=" << allocSize
+                       << " hsa error=" << (hsaErr ? hsaErr : "unknown");
+            return ERR_CONTEXT;
+        }
+
+        mrMeta.addr = addr;
+        // Offset within the dmabuf-backed region: distance from the
+        // allocation base, plus any offset hsa returned for the export.
+        uint64_t reg_offset =
+            (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, reg_offset, length, (uintptr_t)addr,
+                                      dmabuf_fd, access);
+        const int regErrno = errno;
+        if (close(dmabuf_fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        if (!mrMeta.mr) {
+            errno = regErrno;
+        }
     }
 #else
     mrMeta.addr = addr;
