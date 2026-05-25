@@ -507,24 +507,27 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
             << "Dedup gate should block re-enqueue while task is in flight";
     }
 
-    // Wait past the staleness window. The eviction thread reaps every
-    // kEvictionThreadSleepMs (10 ms) but gated by
-    // `now - last_discard_time > put_start_release_timeout_sec_` (strict).
-    // With release=1s a 2s sleep leaves only ~1s margin between reaper
-    // firing and the wake-up, which has flaked under CI load. 3s gives
-    // ~2s of margin and matches the schedule's strict-greater comparison.
-    std::this_thread::sleep_for(std::chrono::seconds(3));
-
-    // Trigger #3: with the task reaped, dedup is unblocked and a fresh
-    // GetReplicaList must enqueue again.
-    {
+    // Wait until the reaper actually sweeps the stale task. On slower
+    // coverage runners a fixed 2s sleep is not always enough to guarantee
+    // the background eviction thread has run after the 1s TTL expires.
+    // Keep issuing a fresh read because re-enqueue only happens on demand
+    // after the old PromotionTask has been removed.
+    bool requeued = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline) {
         auto r = service->GetReplicaList("k_cold", "default");
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->size(), 1u)
-            << "After reap, a fresh read must re-enqueue the same key";
+        if (pending->size() == 1u) {
+            requeued = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    EXPECT_TRUE(requeued)
+        << "After reap, a fresh read must re-enqueue the same key";
 
     EXPECT_EQ(mm.get_promotion_expired() - expired_pre, 1)
         << "Reaper expiry must bump promotion_expired";
