@@ -9,6 +9,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
