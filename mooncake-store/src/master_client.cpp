@@ -5,7 +5,6 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <csignal>
-#include <regex>
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -405,21 +404,9 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
-namespace {
-
-std::string EscapeRegexLiteral(const std::string& value) {
-    static const std::regex metacharacters(R"([.^$|()\\[\]{}*+?])");
-    return std::regex_replace(value, metacharacters, R"(\$&)");
-}
-
-}  // namespace
-
 MasterClient::~MasterClient() = default;
 
 std::string MasterClient::BuildStorageKey(const std::string& object_key) const {
-    if (ParseTenantScopedKey(object_key)) {
-        return object_key;
-    }
     return BuildTenantScopedKey(tenant_id_, object_key);
 }
 
@@ -431,15 +418,6 @@ std::vector<std::string> MasterClient::BuildStorageKeys(
         storage_keys.emplace_back(BuildStorageKey(object_key));
     }
     return storage_keys;
-}
-
-std::string MasterClient::BuildStorageRegex(
-    const std::string& object_regex) const {
-    const auto prefix = BuildTenantScopedKey(tenant_id_, "");
-    if (!object_regex.empty() && object_regex.front() == '^') {
-        return "^" + EscapeRegexLiteral(prefix) + object_regex.substr(1);
-    }
-    return "^" + EscapeRegexLiteral(prefix) + ".*(" + object_regex + ")";
 }
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
@@ -544,7 +522,7 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     auto result = invoke_rpc<
         &WrappedMasterService::GetReplicaListByRegex,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
-        BuildStorageRegex(str));
+        str, tenant_id_);
 
     timer.LogResponseExpected(result);
     return result;
@@ -773,7 +751,7 @@ tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
                      ", force=", force);
 
     auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(
-        BuildStorageRegex(str), force);
+        str, tenant_id_, force);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1066,13 +1044,19 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
 tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
     const std::string& key, const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
+    return CopyStartStorageKey(BuildStorageKey(key), src_segment, tgt_segments);
+}
+
+tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStartStorageKey(
+    const std::string& storage_key, const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
     ScopedVLogTimer timer(1, "MasterClient::CopyStart");
-    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+    timer.LogRequest("key=", storage_key, ", src_segment=", src_segment,
                      ", tgt_segments_count=", tgt_segments.size());
 
     auto result =
         invoke_rpc<&WrappedMasterService::CopyStart, CopyStartResponse>(
-            client_id_, BuildStorageKey(key), src_segment, tgt_segments);
+            client_id_, storage_key, src_segment, tgt_segments);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1090,11 +1074,16 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
 }
 
 tl::expected<void, ErrorCode> MasterClient::CopyEnd(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::CopyEnd");
-    timer.LogRequest("key=", key);
+    return CopyEndStorageKey(BuildStorageKey(key));
+}
 
-    auto result = invoke_rpc<&WrappedMasterService::CopyEnd, void>(
-        client_id_, BuildStorageKey(key));
+tl::expected<void, ErrorCode> MasterClient::CopyEndStorageKey(
+    const std::string& storage_key) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyEnd");
+    timer.LogRequest("key=", storage_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::CopyEnd, void>(client_id_,
+                                                                   storage_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1111,11 +1100,16 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
 }
 
 tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
+    return CopyRevokeStorageKey(BuildStorageKey(key));
+}
+
+tl::expected<void, ErrorCode> MasterClient::CopyRevokeStorageKey(
+    const std::string& storage_key) {
     ScopedVLogTimer timer(1, "MasterClient::CopyRevoke");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", storage_key);
 
     auto result = invoke_rpc<&WrappedMasterService::CopyRevoke, void>(
-        client_id_, BuildStorageKey(key));
+        client_id_, storage_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1123,33 +1117,49 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
 tl::expected<MoveStartResponse, ErrorCode> MasterClient::MoveStart(
     const std::string& key, const std::string& src_segment,
     const std::string& tgt_segment) {
+    return MoveStartStorageKey(BuildStorageKey(key), src_segment, tgt_segment);
+}
+
+tl::expected<MoveStartResponse, ErrorCode> MasterClient::MoveStartStorageKey(
+    const std::string& storage_key, const std::string& src_segment,
+    const std::string& tgt_segment) {
     ScopedVLogTimer timer(1, "MasterClient::MoveStart");
-    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+    timer.LogRequest("key=", storage_key, ", src_segment=", src_segment,
                      ", tgt_segment=", tgt_segment);
 
     auto result =
         invoke_rpc<&WrappedMasterService::MoveStart, MoveStartResponse>(
-            client_id_, BuildStorageKey(key), src_segment, tgt_segment);
+            client_id_, storage_key, src_segment, tgt_segment);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::MoveEnd(const std::string& key) {
-    ScopedVLogTimer timer(1, "MasterClient::MoveEnd");
-    timer.LogRequest("key=", key);
+    return MoveEndStorageKey(BuildStorageKey(key));
+}
 
-    auto result = invoke_rpc<&WrappedMasterService::MoveEnd, void>(
-        client_id_, BuildStorageKey(key));
+tl::expected<void, ErrorCode> MasterClient::MoveEndStorageKey(
+    const std::string& storage_key) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveEnd");
+    timer.LogRequest("key=", storage_key);
+
+    auto result = invoke_rpc<&WrappedMasterService::MoveEnd, void>(client_id_,
+                                                                   storage_key);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::MoveRevoke(const std::string& key) {
+    return MoveRevokeStorageKey(BuildStorageKey(key));
+}
+
+tl::expected<void, ErrorCode> MasterClient::MoveRevokeStorageKey(
+    const std::string& storage_key) {
     ScopedVLogTimer timer(1, "MasterClient::MoveRevoke");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", storage_key);
 
     auto result = invoke_rpc<&WrappedMasterService::MoveRevoke, void>(
-        client_id_, BuildStorageKey(key));
+        client_id_, storage_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1178,14 +1188,21 @@ tl::expected<void, ErrorCode> MasterClient::EvictDiskReplica(
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
+    return BatchEvictDiskReplicaStorageKeys(BuildStorageKeys(keys),
+                                            replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchEvictDiskReplicaStorageKeys(
+    const std::vector<std::string>& storage_keys, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::BatchEvictDiskReplica");
-    timer.LogRequest("keys_count=", keys.size(),
+    timer.LogRequest("keys_count=", storage_keys.size(),
                      ", replica_type=", replica_type,
                      ", tenant_id=", tenant_id_);
 
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchEvictDiskReplica, void>(
-            keys.size(), client_id_, BuildStorageKeys(keys), replica_type);
+            storage_keys.size(), client_id_, storage_keys, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

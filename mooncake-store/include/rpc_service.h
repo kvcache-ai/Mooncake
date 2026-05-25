@@ -50,7 +50,7 @@ class WrappedMasterService {
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
-    GetReplicaListByRegex(const std::string& str);
+    GetReplicaListByRegex(const std::string& str, const std::string& tenant_id);
 
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
@@ -111,6 +111,7 @@ class WrappedMasterService {
                                          bool force = false);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
+                                                const std::string& tenant_id,
                                                 bool force = false);
 
     long RemoveAll(bool force = false);

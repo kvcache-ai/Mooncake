@@ -581,15 +581,32 @@ class MasterClient {
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
                           ReplicaType replica_type);
 
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    CopyStartStorageKey(const std::string& storage_key,
+                        const std::string& src_segment,
+                        const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEndStorageKey(
+        const std::string& storage_key);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevokeStorageKey(
+        const std::string& storage_key);
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode>
+    MoveStartStorageKey(const std::string& storage_key,
+                        const std::string& src_segment,
+                        const std::string& tgt_segment);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEndStorageKey(
+        const std::string& storage_key);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevokeStorageKey(
+        const std::string& storage_key);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplicaStorageKeys(
+        const std::vector<std::string>& storage_keys, ReplicaType replica_type);
+
    private:
     [[nodiscard]] std::string BuildStorageKey(
         const std::string& object_key) const;
 
     [[nodiscard]] std::vector<std::string> BuildStorageKeys(
         const std::vector<std::string>& object_keys) const;
-
-    [[nodiscard]] std::string BuildStorageRegex(
-        const std::string& object_regex) const;
 
     /**
      * @brief Generic RPC invocation helper for single-result operations

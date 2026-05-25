@@ -211,6 +211,61 @@ TEST_F(MasterServiceTest, TenantScopedKeysAllowSameUserKeyIsolation) {
     EXPECT_TRUE(service->GetReplicaList(tenant_b_key).has_value());
 }
 
+TEST_F(MasterServiceTest, TenantScopedUserKeyMayLookLikeStorageKey) {
+    auto service = std::make_unique<MasterService>();
+    PrepareSimpleSegment(*service);
+
+    const UUID client_id = generate_uuid();
+    const std::string user_key = "1:a:b";
+    const std::string storage_key = BuildTenantScopedKey("tenant_x", user_key);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, storage_key, 1024, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, storage_key, ReplicaType::MEMORY)
+                    .has_value());
+
+    EXPECT_TRUE(service->GetReplicaList(storage_key).has_value());
+    EXPECT_EQ(service->GetReplicaList(user_key).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceTest, TenantRegexAlternationDoesNotCrossTenants) {
+    auto service = std::make_unique<MasterService>();
+    PrepareSimpleSegment(*service);
+
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const std::string tenant_a_foo = BuildTenantScopedKey("tenant_a", "foo");
+    const std::string tenant_b_bar = BuildTenantScopedKey("tenant_b", "bar");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service->PutStart(client_a, tenant_a_foo, 1024, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_a, tenant_a_foo, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutStart(client_b, tenant_b_bar, 1024, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_b, tenant_b_bar, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto matches = service->GetReplicaListByRegex("^foo|bar", "tenant_a");
+    ASSERT_TRUE(matches.has_value());
+    EXPECT_TRUE(matches->contains("foo"));
+    EXPECT_FALSE(matches->contains("bar"));
+
+    auto removed = service->RemoveByRegex("^foo|bar", "tenant_a", true);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, 1);
+    EXPECT_EQ(service->GetReplicaList(tenant_a_foo).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(service->GetReplicaList(tenant_b_bar).has_value());
+}
+
 TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
     auto service = std::make_unique<MasterService>();
     PrepareSimpleSegment(*service, "segment_1");

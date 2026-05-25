@@ -875,11 +875,14 @@ WrappedMasterService::BatchReplicaClear(
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
-WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
+WrappedMasterService::GetReplicaListByRegex(const std::string& str,
+                                            const std::string& tenant_id) {
     return execute_rpc(
         "GetReplicaListByRegex",
-        [&] { return master_service_.GetReplicaListByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("Regex=", str); },
+        [&] { return master_service_.GetReplicaListByRegex(str, tenant_id); },
+        [&](auto& timer) {
+            timer.LogRequest("Regex=", str, ", tenant_id=", tenant_id);
+        },
         [] {
             MasterMetricManager::instance()
                 .inc_get_replica_list_by_regex_requests();
@@ -1294,12 +1297,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::Remove(
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str, bool force) {
+    const std::string& str, const std::string& tenant_id, bool force) {
     return execute_rpc(
         "RemoveByRegex",
-        [&] { return master_service_.RemoveByRegex(str, force); },
+        [&] { return master_service_.RemoveByRegex(str, tenant_id, force); },
         [&](auto& timer) {
-            timer.LogRequest("regex=", str, ", force=", force);
+            timer.LogRequest("regex=", str, ", tenant_id=", tenant_id,
+                             ", force=", force);
         },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });

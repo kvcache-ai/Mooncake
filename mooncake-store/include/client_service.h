@@ -67,9 +67,6 @@ class Client {
     const UUID& getClientId() const { return client_id_; }
     const std::string& GetTenantId() const { return tenant_id_; }
     std::string BuildStorageKey(const std::string& object_key) const {
-        if (ParseTenantScopedKey(object_key)) {
-            return object_key;
-        }
         return BuildTenantScopedKey(tenant_id_, object_key);
     }
 
@@ -851,7 +848,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::string& source,
-                                       const std::vector<std::string>& targets);
+                                       const std::vector<std::string>& targets,
+                                       bool key_is_storage_key = false);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -862,7 +860,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
-                                       const std::string& target);
+                                       const std::string& target,
+                                       bool key_is_storage_key = false);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;

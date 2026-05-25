@@ -2596,12 +2596,15 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
-    const std::vector<std::string>& targets) {
+    const std::vector<std::string>& targets, bool key_is_storage_key) {
     LOG(INFO) << "action=replica_copy_start"
               << ", key=" << key << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
-    auto start_result = master_client_.CopyStart(key, source, targets);
+    auto start_result =
+        key_is_storage_key
+            ? master_client_.CopyStartStorageKey(key, source, targets)
+            : master_client_.CopyStart(key, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
         LOG(ERROR) << "action=replica_copy_failed"
@@ -2616,7 +2619,9 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped"
                   << ", key=" << key << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key);
+        auto copy_end_result = key_is_storage_key
+                                   ? master_client_.CopyEndStorageKey(key)
+                                   : master_client_.CopyEnd(key);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed"
@@ -2628,9 +2633,16 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key); },
-        [&]() { return master_client_.CopyRevoke(key); }, response.source,
-        response.targets);
+        key, "copy",
+        [&]() {
+            return key_is_storage_key ? master_client_.CopyEndStorageKey(key)
+                                      : master_client_.CopyEnd(key);
+        },
+        [&]() {
+            return key_is_storage_key ? master_client_.CopyRevokeStorageKey(key)
+                                      : master_client_.CopyRevoke(key);
+        },
+        response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success"
@@ -2643,14 +2655,18 @@ tl::expected<void, ErrorCode> Client::Copy(
 
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
-                                           const std::string& target) {
+                                           const std::string& target,
+                                           bool key_is_storage_key) {
     LOG(INFO) << "action=replica_move_start"
               << ", key=" << key << ", source_segment=" << source
               << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
-    auto move_start_result = master_client_.MoveStart(key, source, target);
+    auto move_start_result =
+        key_is_storage_key
+            ? master_client_.MoveStartStorageKey(key, source, target)
+            : master_client_.MoveStart(key, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
         LOG(ERROR) << "action=replica_move_failed"
@@ -2665,7 +2681,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         LOG(INFO) << "action=replica_move_skipped"
                   << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key);
+        auto move_end_result = key_is_storage_key
+                                   ? master_client_.MoveEndStorageKey(key)
+                                   : master_client_.MoveEnd(key);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed"
@@ -2679,9 +2697,16 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key); },
-        [&]() { return master_client_.MoveRevoke(key); }, response.source,
-        targets);
+        key, "move",
+        [&]() {
+            return key_is_storage_key ? master_client_.MoveEndStorageKey(key)
+                                      : master_client_.MoveEnd(key);
+        },
+        [&]() {
+            return key_is_storage_key ? master_client_.MoveRevokeStorageKey(key)
+                                      : master_client_.MoveRevoke(key);
+        },
+        response.source, targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success"
@@ -2782,8 +2807,9 @@ void Client::PutToLocalFile(const std::string& key,
         // Notify master about any evicted disk replicas (batch)
         if (!store_result.value().empty()) {
             const auto& evicted_keys = store_result.value();
-            auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_keys, replica_type);
+            auto evict_results =
+                master_client_.BatchEvictDiskReplicaStorageKeys(evicted_keys,
+                                                                replica_type);
             for (size_t i = 0; i < evict_results.size(); ++i) {
                 if (!evict_results[i]) {
                     LOG(WARNING)
@@ -2934,7 +2960,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
                 auto copy_result =
-                    Copy(payload.key, payload.source, payload.targets);
+                    Copy(payload.key, payload.source, payload.targets,
+                         /*key_is_storage_key=*/true);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -2946,7 +2973,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
                 auto move_result =
-                    Move(payload.key, payload.source, payload.target);
+                    Move(payload.key, payload.source, payload.target,
+                         /*key_is_storage_key=*/true);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
