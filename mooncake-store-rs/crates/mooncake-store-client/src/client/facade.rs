@@ -148,10 +148,21 @@ impl StoreClient {
             let routes = self
                 .route_directory
                 .get_object_routes_bounded(&self.lease, keys)?;
-            self.filter_routes_to_readable(routes)
+            let routes = routes
+                .into_iter()
+                .map(|route| route.filter(|route| route.state == RouteState::Active))
+                .collect::<Vec<_>>();
+            Ok(routes)
         })();
         tracker.finish(&result, result.as_ref().map(|routes| routes.len()).unwrap_or(0) as u64);
         result
+    }
+
+    fn query_readable_routes_by_object_keys_bounded(
+        &self,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Option<ObjectRoute>>> {
+        self.filter_routes_to_readable(self.query_routes_by_object_keys_bounded(keys)?)
     }
 
     pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
@@ -168,7 +179,7 @@ impl StoreClient {
                 })
                 .collect::<Vec<_>>();
             let result = self
-                .query_routes_by_object_keys_bounded(&keys)?
+                .query_readable_routes_by_object_keys_bounded(&keys)?
                 .into_iter()
                 .map(|route| route.is_some())
                 .collect();
@@ -983,8 +994,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     ObjectKey::from_scope(&scope, object.key)
                 })
                 .collect::<Vec<_>>();
-            Ok(self
-                .query_routes_by_object_keys_bounded(&keys)?
+            let routes = self.query_routes_by_object_keys_bounded(&keys)?;
+            self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+            Ok(routes
                 .into_iter()
                 .map(|route| route.is_some())
                 .collect())
