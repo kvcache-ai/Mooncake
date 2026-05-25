@@ -380,3 +380,91 @@ hex string. Keys that cannot be parsed are skipped to avoid emitting invalid
 `removed` events. Configure `backend_id` to identify the cache owner (for
 example a per-node storage daemon) and register the bind endpoint with the
 indexer using publisher type `Mooncake`.
+
+### Field provenance matrix (SGLang vs master vs indexer registration)
+
+In decoupled deployments (inference workers + Mooncake host/disk pool), the
+global KV indexer merges **three sources of truth**. Use this table when
+splitting publishers or writing PR/integration notes.
+
+**Legend**
+
+| Symbol | Meaning |
+|---|---|
+| **SGLang** | Inference engine ZMQ KV events (`BlockStored` / `BlockRemoved` / `AllBlocksCleared`) |
+| **Master** | `mooncake_master` optional RFC #1527 publisher (`enable_kv_events`) |
+| **Register** | Indexer HTTP `POST /register` (or CLI `--workers`) — not carried on the event wire |
+| **S+M** | Either source may supply; must agree on value for the stream |
+| **—** | Not applicable for that event type |
+
+#### Envelope and stream identity
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `event_id` | Yes | Yes | — | Each publisher maintains its own monotonic counter per stream. |
+| `timestamp` | Yes | Yes | — | Informational only; not used for ordering. |
+| `event_type` | Yes | Yes | — | `stored` / `removed` / `cleared`. |
+| `model_name` | S+M | S+M | S+M | Register uses `modelname`. Static config on master; runtime on engine. |
+| `block_size` | Yes | S+M | Yes | Required for token↔block mapping. Master uses `kv_events_block_size` if set. |
+| `additional_salt` | Yes | S+M | S+M | Register uses `additionalsalt`. Hash namespace salt from engine; master only static string. |
+| `lora_name` | Yes | — | S+M | Engine knows active LoRA; master has no adapter context. |
+| `tenant_id` | S+M | S+M | Yes | Register default `default`. |
+| `backend_id` | S+M | Yes | — | **Master**: storage daemon / pool owner. **SGLang**: often worker id; in decoupled mode prefer master=`daemon`, engine via **Register** `instance_id`. |
+| `medium` | Yes | Partial | — | **SGLang**: `GPU`, `CPU_PINNED`, `DISK`, `EXTERNAL`, etc. **Master**: only `cpu` / `disk` (host/disk pool), never GPU. |
+| `dp_rank` | Yes | S+M | Yes | SGLang may override per batch (`attn_dp_rank`). Master uses static `kv_events_dp_rank`. |
+
+#### `stored` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `seq_hashes` | Yes | Conditional | — | **Required from SGLang** for correct prefix index. Master: single hash parsed from object key only; no rolling chain; one hash per event. |
+| `block_hashes` (legacy) | Yes | Conditional | — | Alias of `seq_hashes` when `kv_events_emit_legacy_compat` is enabled on master. |
+| `parent_hash` | Yes | — | — | Radix parent link; master has no sequence tree. |
+| `parent_block_hash` (legacy) | Yes | — | — | Same as `parent_hash`. |
+| `base_block_idx` | Yes | — | — | Depth of first block in batch; master unknown. |
+| `token_ids` | Yes | — | — | Required for `/query` by tokens or hash recomputation when engine is non-standard. |
+| `block_size` (in-event) | Yes | — | — | Per-block token count in SGLang `BlockStored`; master uses envelope-level config only. |
+
+#### `removed` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `seq_hashes` | Yes | Conditional | — | **Required** on wire. Master skips keys that are not decimal/hex u64. |
+| `base_block_idx` | Yes | — | — | Optional but recommended for observability. |
+
+#### `cleared` payload
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| (no extra fields) | — | — | — | Event is envelope-only. |
+| `cleared` / `AllBlocksCleared` | Yes | — | — | Engine `reset()` / full cache flush. Master does not emit today. |
+
+#### Indexer / router plane (not in KV event JSON)
+
+| Field | SGLang | Master | Register | Notes |
+|---|---|---|---|---|
+| `instance_id` | — | — | Yes | Router-facing schedule target. Distinct from `backend_id`. |
+| `endpoint` | — | — | Yes | ZMQ PUB to subscribe (SGLang or master bind address). |
+| `replay_endpoint` | — | — | Yes | Optional gap replay (engine ROUTER). |
+| `type` | — | — | Yes | Publisher kind: `vLLM`, `SGLang`, `Mooncake`, etc. |
+
+#### Recommended split for Dynamo global KV indexer
+
+```mermaid
+flowchart LR
+  SGLang["SGLang ZMQ"]
+  Master["Mooncake master ZMQ"]
+  Reg["POST /register"]
+  Idx["Global KV indexer"]
+
+  SGLang -->|"GPU + HiCache tiers<br/>tokens, parent_hash, seq_hashes, lora"| Idx
+  Master -->|"Host/Disk pool<br/>backend_id, medium=cpu|disk"| Idx
+  Reg -->|"instance_id, model, block_size"| Idx
+```
+
+| Capability | Primary source |
+|---|---|
+| GPU prefix hits, LoRA-aware hashes, parent chain, multi-block batches | **SGLang** |
+| Pooled host/disk replica visibility | **Master** (if keys encode `seq_hash`) |
+| Request routing target | **Register** (`instance_id`) |
+| Tiered `/query` response (`gpu` / `cpu` / `disk`) | Merge **SGLang** + **Master** events (see RFC #1403) |
