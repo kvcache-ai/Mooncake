@@ -2781,7 +2781,8 @@ OffsetAllocatorStorageBackend::WriteFileAtomically(
     }
 
     std::string parent_dir = std::filesystem::path(path).parent_path().string();
-    int dir_fd = open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY);
+    int dir_fd = open(parent_dir.empty() ? "." : parent_dir.c_str(),
+                      O_RDONLY | O_DIRECTORY);
     if (dir_fd >= 0) {
         if (fsync(dir_fd) != 0) {
             LOG(ERROR) << "Failed to fsync snapshot directory: " << parent_dir
@@ -2815,8 +2816,7 @@ OffsetAllocatorStorageBackend::ReadFileBytes(const std::string& path) const {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    const uint64_t max_snapshot_bytes =
-        std::max<uint64_t>(capacity_ * 2, 64ULL * 1024 * 1024);
+    const uint64_t max_snapshot_bytes = 4ULL * 1024 * 1024 * 1024;
     if (static_cast<uint64_t>(st.st_size) > max_snapshot_bytes) {
         LOG(ERROR) << "Snapshot file is too large: " << path
                    << ", size=" << st.st_size
@@ -3298,8 +3298,17 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         const bool recovery_mode = fs::exists(recovery_manifest_path_);
         if (!recovery_mode) {
-            for (const auto& entry : fs::directory_iterator(storage_path_)) {
-                if (!entry.is_regular_file()) {
+            std::error_code ec_dir;
+            for (const auto& entry :
+                 fs::directory_iterator(storage_path_, ec_dir)) {
+                if (ec_dir) {
+                    LOG(ERROR)
+                        << "Failed to iterate storage directory: "
+                        << storage_path_ << ", error: " << ec_dir.message();
+                    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+                }
+                if (!entry.is_regular_file(ec_dir)) {
+                    ec_dir.clear();
                     continue;
                 }
                 const auto filename = entry.path().filename().string();
@@ -3310,6 +3319,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                                << filename;
                     return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
                 }
+            }
+            if (ec_dir) {
+                LOG(ERROR) << "Failed to iterate storage directory: "
+                           << storage_path_ << ", error: " << ec_dir.message();
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
             }
         }
         int flags = O_CLOEXEC | O_RDWR;
@@ -3609,11 +3623,13 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                                         update.size_delta, update.is_new_key);
         }
 
-        PersistedSnapshot snapshot = recovery_snapshot_state_;
-        snapshot.stale_allocations = std::move(stale_allocations);
+        recovery_snapshot_state_.stale_allocations =
+            std::move(stale_allocations);
         uint64_t generation =
             next_snapshot_generation_.load(std::memory_order_relaxed);
-        auto persist_result = PersistRecoverySnapshots(snapshot, generation);
+        auto persist_result =
+            PersistRecoverySnapshots(recovery_snapshot_state_, generation);
+        recovery_snapshot_state_.stale_allocations.clear();
         if (!persist_result) {
             for (auto it = published_updates.rbegin();
                  it != published_updates.rend(); ++it) {
