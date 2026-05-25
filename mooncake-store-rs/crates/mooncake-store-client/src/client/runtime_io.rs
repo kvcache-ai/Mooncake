@@ -2468,6 +2468,10 @@ impl StoreClient {
             .iter_mut()
             .map(|buffer| buffer.as_mut_ptr().cast::<c_void>())
             .collect::<Vec<_>>();
+        let local_open_segment_names = resolved
+            .iter()
+            .map(|entry| self.local_transport_open_segment_name(&entry.replica.segment_name))
+            .collect::<Vec<_>>();
 
         // Phase 1: single lock — classify local/remote, gather cached metadata,
         // and pre-compute copy instructions for cache-hit segments.
@@ -2489,16 +2493,18 @@ impl StoreClient {
             > = BTreeMap::new();
             let mut cache_miss_segments: Vec<SegmentName> = Vec::new();
 
-            for (entry, local) in resolved.iter().zip(local_paths.iter()) {
+            for ((entry, local), open_segment_name) in resolved
+                .iter()
+                .zip(local_paths.iter())
+                .zip(local_open_segment_names.iter())
+            {
                 if !*local
                     || segment_metadata.contains_key(&entry.replica.segment_name)
                     || cache_miss_segments.contains(&entry.replica.segment_name)
                 {
                     continue;
                 }
-                let open_segment_name =
-                    self.local_transport_open_segment_name(&entry.replica.segment_name);
-                let info = state.cached_segment_info(&open_segment_name);
+                let info = state.cached_segment_info(open_segment_name);
                 let chunks = state.cached_segment_target_chunks(
                     &entry.replica.owner,
                     &entry.replica.segment_name,
@@ -3153,7 +3159,6 @@ impl StoreClient {
         true
     }
 
-    #[cfg(test)]
     fn segment_relative_target_offset(
         info: &SegmentInfo,
         segment_name: &SegmentName,
@@ -3289,6 +3294,9 @@ impl StoreClient {
         target_chunks: &[SegmentTargetChunk],
         replica: &ReplicaRoute,
     ) -> Result<u64> {
+        if target_chunks.is_empty() {
+            return Self::remote_replica_target_offset(info, replica);
+        }
         let resolved = Self::storage_target_offset(
             target_chunks,
             &replica.segment_name,
@@ -3344,12 +3352,6 @@ impl StoreClient {
                     })?,
             }
         };
-        if segment.target_chunks.is_empty() {
-            return Err(StoreError::Transport(format!(
-                "segment {} for runtime {} exposes no storage target chunks",
-                replica.segment_name.0, replica.owner
-            )));
-        }
         let target_chunks = segment.target_chunks.clone();
         self.state.lock().cache_segment_target_metadata(
             &replica.owner,
@@ -3361,7 +3363,6 @@ impl StoreClient {
         Ok(target_chunks)
     }
 
-    #[cfg(test)]
     fn remote_replica_target_offset(info: &SegmentInfo, replica: &ReplicaRoute) -> Result<u64> {
         if let Some(offset) = replica.offset {
             if Self::segment_info_covers_target(info, offset, replica.length) {
