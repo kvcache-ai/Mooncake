@@ -6,6 +6,7 @@ pub mod dummy_service;
 mod hot_cache;
 pub mod runtime;
 mod shm;
+pub mod tensor;
 #[cfg(test)]
 mod test_support;
 
@@ -1476,6 +1477,7 @@ fn metrics_server_address() -> Option<String> {
 fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMooncakeDistributedStore>()?;
     module.add_class::<PyMooncakeHostMemAllocator>()?;
+    module.add_class::<tensor::TensorReadResult>()?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_text, module)?)?;
     module.add_function(wrap_pyfunction!(start_metrics_server, module)?)?;
