@@ -2108,14 +2108,14 @@ impl StoreClient {
     fn try_advance_resolved_replica(
         &self,
         entry: &mut ResolvedObject,
+        local_segments: &BTreeSet<SegmentName>,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> bool {
-        let local_segments = self.local_storage_segments();
         while let Some(candidate) = entry.fallback_replicas.pop_front() {
             if !Self::replica_is_readable(
                 &candidate,
                 &self.lease.runtime,
-                &local_segments,
+                local_segments,
                 readable_runtimes,
             ) {
                 continue;
@@ -2660,6 +2660,7 @@ impl StoreClient {
         let mut remote_registered_batch_chunks = 0usize;
         let mut remote_direct_fallbacks = 0usize;
         let mut checked_remote_runtimes = BTreeSet::new();
+        let fallback_local_segments = self.local_storage_segments();
         let fairness_slices = self.fairness_slice_remote_indices(resolved, &remote_indices);
         let fairness_rounds = fairness_slices.len();
         let shaping_chunk_limit = self.remote_batch_chunk_limit(
@@ -2700,8 +2701,8 @@ impl StoreClient {
                                     &mut resolved[*index],
                                     buffer,
                                     &mut checked_remote_runtimes,
+                                    &fallback_local_segments,
                                     request_deadline,
-                                    "remote_batch_get_fallback",
                                 )?;
                                 remote_direct_fallbacks += 1;
                             }
@@ -2732,8 +2733,8 @@ impl StoreClient {
                                         &mut resolved[*index],
                                         buffer,
                                         &mut checked_remote_runtimes,
+                                        &fallback_local_segments,
                                         request_deadline,
-                                        "remote_batch_get_fallback",
                                     )?;
                                     remote_direct_fallbacks += 1;
                                 }
@@ -2749,8 +2750,8 @@ impl StoreClient {
                             &mut resolved[index],
                             buffer,
                             &mut checked_remote_runtimes,
+                            &fallback_local_segments,
                             request_deadline,
-                            "remote_direct_get_fallback",
                         )?;
                         remote_direct_fallbacks += 1;
                         cursor += 1;
@@ -4034,8 +4035,8 @@ impl StoreClient {
         resolved: &mut ResolvedObject,
         buffer: &mut [u8],
         checked_runtimes: &mut BTreeSet<ClientRuntimeId>,
+        local_segments: &BTreeSet<SegmentName>,
         request_deadline: RequestDeadline,
-        _context: &'static str,
     ) -> Result<()> {
         loop {
             match self.execute_selected_replica_direct(
@@ -4049,7 +4050,11 @@ impl StoreClient {
                 Err(error) => {
                     let failed_owner = resolved.replica.owner.clone();
                     let readable_runtimes = self.readable_runtime_set(true)?;
-                    if !self.try_advance_resolved_replica(resolved, &readable_runtimes) {
+                    if !self.try_advance_resolved_replica(
+                        resolved,
+                        local_segments,
+                        &readable_runtimes,
+                    ) {
                         if Self::should_refresh_route_after_read_error(&error) {
                             if self.refresh_resolved_route_after_read_failure(resolved)? {
                                 debug!(

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -96,12 +96,14 @@ struct ProfilingConfig {
 struct ProfilingInner {
     config: ProfilingConfig,
     provider: Option<SdkTracerProvider>,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
 }
 
 struct ProfilingControl {
     enabled: AtomicBool,
     provider_ready: AtomicBool,
+    file_ready: AtomicBool,
+    sinks_ready: AtomicBool,
     inner: Mutex<ProfilingInner>,
 }
 
@@ -367,6 +369,8 @@ impl ProfilingControl {
         Self {
             enabled: AtomicBool::new(enabled),
             provider_ready: AtomicBool::new(false),
+            file_ready: AtomicBool::new(false),
+            sinks_ready: AtomicBool::new(false),
             inner: Mutex::new(ProfilingInner {
                 config,
                 provider: None,
@@ -376,7 +380,13 @@ impl ProfilingControl {
     }
 
     fn ensure_sinks(&self) -> Result<()> {
+        if self.sinks_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().expect("profiling control lock poisoned");
+        if self.sinks_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if inner.config.endpoint.is_none() && inner.config.file.is_none() {
             return Err(StoreError::InvalidState(format!(
                 "tracing sink is not configured; set {ENDPOINT_ENV}, \
@@ -386,8 +396,10 @@ impl ProfilingControl {
 
         if inner.config.file.is_some() && inner.file.is_none() {
             let path = inner.config.file.clone().expect("file path checked above");
-            inner.file = Some(open_jsonl_file(&path)?);
+            inner.file = Some(BufWriter::new(open_jsonl_file(&path)?));
         }
+        self.file_ready
+            .store(inner.file.is_some(), Ordering::Release);
 
         if inner.config.endpoint.is_some()
             && inner.provider.is_none()
@@ -404,6 +416,7 @@ impl ProfilingControl {
             self.provider_ready.store(true, Ordering::Release);
         }
         inner.config.last_error = None;
+        self.sinks_ready.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -451,6 +464,9 @@ impl ProfilingControl {
                             .to_string(),
                     ));
                 }
+                if inner.config.endpoint.as_ref() != Some(&endpoint) {
+                    self.sinks_ready.store(false, Ordering::Release);
+                }
                 inner.config.endpoint = Some(endpoint);
                 inner.config.last_error = None;
             }
@@ -489,6 +505,8 @@ impl ProfilingControl {
                     inner.file = None;
                     inner.config.file = next_file;
                     inner.config.last_error = None;
+                    self.file_ready.store(false, Ordering::Release);
+                    self.sinks_ready.store(false, Ordering::Release);
                 }
             }
         }
@@ -528,13 +546,7 @@ impl ProfilingControl {
         root_operation: &'static str,
         flow: &'static str,
     ) -> Option<LocalProfilingSpan> {
-        let has_file = self
-            .inner
-            .lock()
-            .expect("profiling control lock poisoned")
-            .file
-            .is_some();
-        if !has_file {
+        if !self.file_ready.load(Ordering::Acquire) {
             return None;
         }
         let mut attributes = BTreeMap::new();
@@ -573,6 +585,9 @@ impl ProfilingControl {
     }
 
     fn write_local_span(&self, span: LocalProfilingSpan, result: &'static str, bytes_out: u64) {
+        if !self.file_ready.load(Ordering::Acquire) {
+            return;
+        }
         let record = LocalSpanRecord {
             timestamp_unix_ms: span.started_unix_ms,
             duration_us: span.started.elapsed().as_micros() as u64,
@@ -596,6 +611,9 @@ impl ProfilingControl {
     }
 
     fn write_api_items(&self, record: ApiItemsTraceRecord<'_>) {
+        if !self.file_ready.load(Ordering::Acquire) {
+            return;
+        }
         let mut inner = self.inner.lock().expect("profiling control lock poisoned");
         if !inner.config.item_metadata {
             return;
@@ -1201,6 +1219,8 @@ mod tests {
         let control = ProfilingControl {
             enabled: AtomicBool::new(true),
             provider_ready: AtomicBool::new(false),
+            file_ready: AtomicBool::new(false),
+            sinks_ready: AtomicBool::new(false),
             inner: Mutex::new(ProfilingInner {
                 config: ProfilingConfig {
                     endpoint: None,
@@ -1262,6 +1282,8 @@ mod tests {
         let control = ProfilingControl {
             enabled: AtomicBool::new(true),
             provider_ready: AtomicBool::new(false),
+            file_ready: AtomicBool::new(false),
+            sinks_ready: AtomicBool::new(false),
             inner: Mutex::new(ProfilingInner {
                 config: ProfilingConfig {
                     endpoint: None,
