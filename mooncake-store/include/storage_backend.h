@@ -267,6 +267,11 @@ class StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
+    // Reset internal scan iterator so that the next ScanMeta() call
+    // starts from the beginning.  Required for backends that use
+    // cursor-based iteration (e.g. BucketStorageBackend).
+    virtual void ResetScanIterator() {}
+
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Default implementation does nothing (no failures injected).
     // Concrete backends can override to provide test failure injection.
@@ -780,6 +785,11 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    void ResetScanIterator() override {
+        MutexLocker locker(&iterator_mutex_);
+        next_bucket_ = -1;
+    }
 
     /**
      * @brief Checks whether the backend is allowed to continue offloading.

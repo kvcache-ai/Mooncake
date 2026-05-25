@@ -3039,6 +3039,43 @@ void Client::StorageHeartbeatThreadMain() {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
         }
+        // Re-publish Transfer Engine segment descriptors to the HTTP
+        // metadata server.  When Master (which hosts the HTTP metadata
+        // server in the same process) is killed and restarted, all
+        // in-memory KV entries are lost.  ReMountSegment above only
+        // restores Master-side allocation state; it does NOT write back
+        // the transport-level segment descriptors.  Without this, remote
+        // peers get HTTP 404 when querying our segment descriptor and
+        // data transfers fail.
+        auto metadata = transfer_engine_->getMetadata();
+        if (metadata) {
+            int rc = metadata->updateLocalSegmentDesc();
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to re-publish segment descriptor "
+                           << "to metadata server, rc=" << rc
+                           << ", will retry in next heartbeat cycle";
+                segment_desc_publish_pending_.store(true);
+            } else {
+                segment_desc_publish_pending_.store(false);
+            }
+            // Also re-publish RPC meta entry (mooncake/rpc_meta/<hostname>).
+            // Remote peers need this to locate our RDMA RPC port for
+            // handshake.  Like segment descriptors, this entry is lost
+            // when the HTTP metadata server is cleared on Master restart.
+            rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to re-publish RPC meta entry "
+                           << "to metadata server, rc=" << rc
+                           << ", will retry in next heartbeat cycle";
+                rpc_meta_publish_pending_.store(true);
+            } else {
+                rpc_meta_publish_pending_.store(false);
+            }
+        }
+        // Note: LOCAL_DISK segment remount is NOT done here.
+        // It is handled by FileStorage::Heartbeat() when it detects
+        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
+        // re-register offloaded object metadata.
     };
     // Use another thread to remount segments to avoid blocking the ping
     // thread
@@ -3064,6 +3101,41 @@ void Client::StorageHeartbeatThreadMain() {
                 // Ensure at most one remount segment thread is running
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
+            } else if (segment_desc_publish_pending_.load() &&
+                       !remount_segment_future.valid()) {
+                // Previous remount succeeded but updateLocalSegmentDesc()
+                // failed (e.g. transient HTTP error).  Retry it directly
+                // without re-running ReMountSegment.
+                auto metadata = transfer_engine_->getMetadata();
+                if (metadata) {
+                    int rc = metadata->updateLocalSegmentDesc();
+                    if (rc != 0) {
+                        LOG(ERROR)
+                            << "Retry: failed to re-publish segment "
+                            << "descriptor to metadata server, rc=" << rc;
+                    } else {
+                        LOG(INFO) << "Retry: successfully re-published "
+                                  << "segment descriptor to metadata server";
+                        segment_desc_publish_pending_.store(false);
+                    }
+                }
+            } else if (rpc_meta_publish_pending_.load() &&
+                       !remount_segment_future.valid()) {
+                // Previous remount succeeded but rePublishRpcMetaEntry()
+                // failed.  Retry it directly.
+                auto metadata = transfer_engine_->getMetadata();
+                if (metadata) {
+                    int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
+                    if (rc != 0) {
+                        LOG(ERROR)
+                            << "Retry: failed to re-publish RPC "
+                            << "meta entry to metadata server, rc=" << rc;
+                    } else {
+                        LOG(INFO) << "Retry: successfully re-published "
+                                  << "RPC meta entry to metadata server";
+                        rpc_meta_publish_pending_.store(false);
+                    }
+                }
             }
 
             std::this_thread::sleep_for(

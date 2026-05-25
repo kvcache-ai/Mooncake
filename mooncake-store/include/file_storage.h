@@ -118,6 +118,13 @@ class FileStorage {
 
     void ClientBufferGCThreadFunc();
 
+    /**
+     * @brief Re-registers all offloaded objects with the master.
+     * Called after master restart recovery to sync SSD object metadata.
+     * This is the same logic as the ScanMeta step in Init().
+     */
+    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
@@ -136,6 +143,8 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::future<void> rescan_future_;
+    std::atomic<bool> metadata_resync_pending_{false};
 };
 
 }  // namespace mooncake
