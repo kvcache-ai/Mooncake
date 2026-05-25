@@ -265,7 +265,7 @@ jobs:
       shell: bash
 
     - name: Upload wheel for ZMQ test job
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
@@ -668,9 +668,9 @@ jobs:
       shell: bash
 
     - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
+        archive: false
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   build-docker:
