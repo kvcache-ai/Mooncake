@@ -1105,13 +1105,13 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         switch (nof_segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint, StorageLevel::SSD,
-                    ReplicaType::NOF_SSD);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    StorageLevel::SSD, ReplicaType::NOF_SSD);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint, StorageLevel::SSD,
-                    ReplicaType::NOF_SSD);
+                    segment.name, buffer, size, segment.te_endpoint,
+                    StorageLevel::SSD, ReplicaType::NOF_SSD);
                 break;
             default:
                 LOG(ERROR) << "NoF segment mount: segment_name=" << segment.name
