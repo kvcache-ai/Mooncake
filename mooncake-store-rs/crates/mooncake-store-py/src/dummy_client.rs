@@ -74,8 +74,7 @@ impl DummySession {
                 }
                 Err(error) => {
                     return Err(StoreError::Transport(format!(
-                        "failed to connect to dummy server: {}",
-                        error,
+                        "failed to connect to dummy server {server_addr}: {error}",
                     )));
                 }
             }
