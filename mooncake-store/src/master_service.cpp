@@ -1055,47 +1055,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     -> tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode> {
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
-    std::regex pattern;
-
-    try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
-    } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
-                   << ", error: " << e.what();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRO shard(this, i);
-
-        for (const auto& [key, metadata] : shard->metadata) {
-            const auto& user_key = metadata.UserKeyOr(key);
-            if (std::regex_search(key, pattern) ||
-                std::regex_search(user_key, pattern)) {
-                std::vector<Replica::Descriptor> replica_list;
-                metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
-                    [&replica_list](const Replica& replica) {
-                        replica_list.emplace_back(replica.get_descriptor());
-                    });
-
-                if (replica_list.empty()) {
-                    LOG(WARNING)
-                        << "key=" << key
-                        << " matched by regex, but has no complete replicas.";
-                    continue;
-                }
-
-                results.emplace(user_key, std::move(replica_list));
-                metadata.GrantLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
-            }
-        }
-    }
-
-    return results;
+    return GetReplicaListByRegex(regex_pattern, "default");
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
@@ -1908,6 +1868,8 @@ MasterService::BatchUpsertStart(const UUID& client_id,
                                 const std::vector<uint64_t>& slice_lengths,
                                 const ReplicateConfig& config) {
     if (keys.size() != slice_lengths.size()) {
+        LOG(ERROR) << "BatchUpsertStart parameter size mismatch: keys="
+                   << keys.size() << ", slice_lengths=" << slice_lengths.size();
         return std::vector<
             tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
@@ -2531,61 +2493,7 @@ tl::expected<void, ErrorCode> MasterService::RemoveResolved(
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
-    long removed_count = 0;
-    std::regex pattern;
-
-    try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
-    } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
-                   << ", error: " << e.what();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t i = 0; i < kNumShards; ++i) {
-        MetadataShardAccessorRW shard(this, i);
-
-        for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
-            const auto& user_key = it->second.UserKeyOr(it->first);
-            if (std::regex_search(it->first, pattern) ||
-                std::regex_search(user_key, pattern)) {
-                if (!force && !it->second.IsLeaseExpired()) {
-                    VLOG(1) << "key=" << it->first
-                            << " matched by regex, but has lease. Skipping "
-                            << "removal.";
-                    ++it;
-                    continue;
-                }
-                if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
-                    LOG(WARNING) << "key=" << it->first
-                                 << " matched by regex, but not all replicas "
-                                    "are complete. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-                if (metadata_shards_[i].replication_tasks.contains(it->first)) {
-                    LOG(WARNING) << "key=" << it->first
-                                 << ", matched by regex, but has replication "
-                                    "task. Skipping removal.";
-                    ++it;
-                    continue;
-                }
-
-                VLOG(1) << "key=" << it->first
-                        << " matched by regex. Removing.";
-                ErasePromotionTaskIfPresent(shard, it->first);
-                it = shard->metadata.erase(it);
-                removed_count++;
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    VLOG(1) << "action=remove_by_regex, pattern=" << regex_pattern
-            << ", removed_count=" << removed_count;
-    return removed_count;
+    return RemoveByRegex(regex_pattern, "default", force);
 }
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern,
@@ -2925,14 +2833,12 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
 
     for (auto& [key, size] : offloading_objects_copy) {
-        auto parsed = ParseTenantScopedKey(key);
-        const auto internal_key =
-            parsed ? BuildTenantScopedKey(parsed->tenant_id, parsed->user_key)
-                   : BuildTenantScopedKey("default", key);
-        MetadataAccessorRW accessor(this, internal_key);
+        const auto resolved_key = ResolveObjectKey(key);
+        MetadataAccessorRW accessor(this, resolved_key.storage_key);
         if (accessor.Exists()) {
             auto& shard = accessor.GetShard();
-            auto task_it = shard->offloading_tasks.find(internal_key);
+            auto task_it =
+                shard->offloading_tasks.find(resolved_key.storage_key);
             if (task_it != shard->offloading_tasks.end()) {
                 auto source =
                     accessor.Get().GetReplicaByID(task_it->second.source_id);
@@ -2986,11 +2892,10 @@ auto MasterService::NotifyOffloadSuccess(
     const std::vector<StorageObjectMetadata>& metadatas)
     -> tl::expected<void, ErrorCode> {
     for (size_t i = 0; i < keys.size(); ++i) {
-        const auto& storage_key = keys[i];
-        auto parsed = ParseTenantScopedKey(storage_key);
-        const std::string tenant_id = parsed ? parsed->tenant_id : "default";
-        const std::string user_key = parsed ? parsed->user_key : storage_key;
-        const auto internal_key = BuildTenantScopedKey(tenant_id, user_key);
+        const auto resolved_key = ResolveObjectKey(keys[i]);
+        const auto& internal_key = resolved_key.storage_key;
+        const auto& tenant_id = resolved_key.tenant_id;
+        const auto& user_key = resolved_key.user_key;
         const auto& metadata = metadatas[i];
 
         // Release refcnt and clear offloading task.

@@ -807,6 +807,37 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     return results;
 }
 
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryStorageKeys(
+    const std::vector<std::string>& storage_keys) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto response = master_client_.BatchGetReplicaListStorageKeys(storage_keys);
+
+    if (response.size() != storage_keys.size()) {
+        LOG(ERROR) << "BatchQueryStorageKeys response size mismatch. Expected: "
+                   << storage_keys.size() << ", Got: " << response.size();
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
+        results.reserve(storage_keys.size());
+        for (size_t i = 0; i < storage_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (response[i]) {
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas),
+                start_time + std::chrono::milliseconds(
+                                 response[i].value().lease_ttl_ms)));
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
+}
+
 tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name) {

@@ -246,10 +246,17 @@ inline std::optional<TenantScopedKey> ParseTenantScopedKey(
         if (ch < '0' || ch > '9') {
             return std::nullopt;
         }
-        tenant_len = tenant_len * 10 + static_cast<size_t>(ch - '0');
+        const size_t digit = static_cast<size_t>(ch - '0');
+        if (tenant_len > (std::numeric_limits<size_t>::max() - digit) / 10) {
+            return std::nullopt;
+        }
+        tenant_len = tenant_len * 10 + digit;
     }
 
     const size_t tenant_begin = first_sep + 1;
+    if (tenant_len > scoped_key.size() - tenant_begin) {
+        return std::nullopt;
+    }
     const size_t second_sep = tenant_begin + tenant_len;
     if (second_sep >= scoped_key.size() || scoped_key[second_sep] != ':') {
         return std::nullopt;

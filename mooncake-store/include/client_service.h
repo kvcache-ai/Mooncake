@@ -151,6 +151,12 @@ class Client {
         const std::vector<std::string>& object_keys);
 
     /**
+     * @brief Batch query object metadata by already tenant-scoped storage keys.
+     */
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQueryStorageKeys(
+        const std::vector<std::string>& storage_keys);
+
+    /**
      * @brief Batch clear KV cache for specified object keys on a specific
      * segment for a given client.
      * @param object_keys Vector of object key strings to clear.
@@ -284,8 +290,7 @@ class Client {
         const std::vector<std::string>& keys, ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplicaStorageKeys(
-        const std::vector<std::string>& storage_keys,
-        ReplicaType replica_type);
+        const std::vector<std::string>& storage_keys, ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation

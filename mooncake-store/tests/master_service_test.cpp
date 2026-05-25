@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <random>
 #include <thread>
@@ -169,6 +170,22 @@ class MasterServiceTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST_F(MasterServiceTest, ParseTenantScopedKeyRejectsMalformedPrefixes) {
+    const auto normal =
+        ParseTenantScopedKey(BuildTenantScopedKey("tenant_a", "user:key"));
+    ASSERT_TRUE(normal.has_value());
+    EXPECT_EQ(normal->tenant_id, "tenant_a");
+    EXPECT_EQ(normal->user_key, "user:key");
+
+    EXPECT_FALSE(
+        ParseTenantScopedKey("999999999999999999999999999999:x").has_value());
+    EXPECT_FALSE(ParseTenantScopedKey(
+                     std::to_string(std::numeric_limits<size_t>::max()) + "0:x")
+                     .has_value());
+    EXPECT_FALSE(ParseTenantScopedKey("8:tenant_a").has_value());
+    EXPECT_FALSE(ParseTenantScopedKey("8:tenant").has_value());
+}
+
 TEST_F(MasterServiceTest, TenantScopedKeysAllowSameUserKeyIsolation) {
     auto service = std::make_unique<MasterService>();
     PrepareSimpleSegment(*service);
@@ -264,6 +281,48 @@ TEST_F(MasterServiceTest, TenantRegexAlternationDoesNotCrossTenants) {
     EXPECT_EQ(service->GetReplicaList(tenant_a_foo).error(),
               ErrorCode::OBJECT_NOT_FOUND);
     EXPECT_TRUE(service->GetReplicaList(tenant_b_bar).has_value());
+}
+
+TEST_F(MasterServiceTest, LegacyRegexOnlyMatchesDefaultTenantUserKeys) {
+    auto service = std::make_unique<MasterService>();
+    PrepareSimpleSegment(*service);
+
+    const UUID client_id = generate_uuid();
+    const std::string default_key = "default_key";
+    const std::string tenant_key = BuildTenantScopedKey("tenantA", "foo");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service->PutStart(client_id, default_key, 1024, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, default_key, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutStart(client_id, tenant_key, 1024, config).has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, tenant_key, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto legacy_matches = service->GetReplicaListByRegex("^7:tenantA:");
+    ASSERT_TRUE(legacy_matches.has_value());
+    EXPECT_TRUE(legacy_matches->empty());
+
+    auto tenant_matches = service->GetReplicaListByRegex("^foo$", "tenantA");
+    ASSERT_TRUE(tenant_matches.has_value());
+    ASSERT_EQ(tenant_matches->size(), 1);
+    EXPECT_TRUE(tenant_matches->contains("foo"));
+
+    auto legacy_removed = service->RemoveByRegex("^7:tenantA:", true);
+    ASSERT_TRUE(legacy_removed.has_value());
+    EXPECT_EQ(*legacy_removed, 0);
+    EXPECT_TRUE(service->GetReplicaList(tenant_key).has_value());
+
+    auto default_removed = service->RemoveByRegex("^default_key$", true);
+    ASSERT_TRUE(default_removed.has_value());
+    EXPECT_EQ(*default_removed, 1);
+    EXPECT_EQ(service->GetReplicaList(default_key).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_TRUE(service->GetReplicaList(tenant_key).has_value());
 }
 
 TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
@@ -5295,6 +5354,14 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     ASSERT_EQ(2, end_results.size());
     EXPECT_TRUE(end_results[0].has_value());
     EXPECT_TRUE(end_results[1].has_value());
+
+    auto mismatch_results =
+        service_->BatchUpsertStart(client_id, keys, {1024}, config);
+    ASSERT_EQ(keys.size(), mismatch_results.size());
+    for (const auto& result : mismatch_results) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
 }
 
 TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
