@@ -417,7 +417,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
-            auto results = client_->BatchEvictDiskReplica(
+            auto results = client_->BatchEvictDiskReplicaStorageKeys(
                 evicted_keys, ReplicaType::LOCAL_DISK);
             for (size_t i = 0; i < results.size(); ++i) {
                 if (!results[i]) {

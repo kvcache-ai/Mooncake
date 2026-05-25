@@ -155,10 +155,12 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        size_t shard_idx = svc->getShardIndex(key);
+        const auto resolved_key = MasterService::ResolveObjectKey(key);
+        size_t shard_idx = svc->getShardIndex(resolved_key.storage_key);
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        return shard.metadata.find(key) != shard.metadata.end();
+        return shard.metadata.find(resolved_key.storage_key) !=
+               shard.metadata.end();
     }
 
    private:

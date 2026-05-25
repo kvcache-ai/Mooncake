@@ -2117,6 +2117,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     return master_client_.BatchEvictDiskReplica(keys, replica_type);
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+Client::BatchEvictDiskReplicaStorageKeys(
+    const std::vector<std::string>& storage_keys, ReplicaType replica_type) {
+    return master_client_.BatchEvictDiskReplicaStorageKeys(storage_keys,
+                                                           replica_type);
+}
+
 std::vector<int> Client::GetNicNumaNodes() const {
     std::set<int> nodes;
     if (!transfer_engine_) return {};

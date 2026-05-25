@@ -71,6 +71,10 @@ class OffloadOnEvictTest : public ::testing::Test {
         return std::move(res.value());
     }
 
+    std::string DefaultStorageKey(const std::string& key) const {
+        return BuildTenantScopedKey("default", key);
+    }
+
     template <typename Predicate>
     void WaitUntil(
         Predicate&& predicate,
@@ -138,9 +142,9 @@ TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
     auto queued = DrainOffloadQueue(*service, ctx.client_id);
     EXPECT_EQ(queued.size(), 3u)
         << "Default: all 3 objects should be in offload queue after PutEnd";
-    EXPECT_TRUE(queued.count("key_a1"));
-    EXPECT_TRUE(queued.count("key_a2"));
-    EXPECT_TRUE(queued.count("key_a3"));
+    EXPECT_TRUE(queued.count(DefaultStorageKey("key_a1")));
+    EXPECT_TRUE(queued.count(DefaultStorageKey("key_a2")));
+    EXPECT_TRUE(queued.count(DefaultStorageKey("key_a3")));
 
     service->RemoveAll();
 }
