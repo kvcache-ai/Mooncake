@@ -38,6 +38,7 @@ struct tent_request {
     tent_segment_id_t target_id;
     uint64_t target_offset;
     uint64_t length;
+    int priority; /* Request priority (0=HIGH, 1=MEDIUM, 2=LOW) */
 };
 
 typedef struct tent_request tent_request_t;

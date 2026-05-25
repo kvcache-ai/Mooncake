@@ -340,6 +340,9 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::unordered_map<std::string, int64_t>& offloading_objects) {
+    if (offloading_objects.empty()) {
+        return {};
+    }
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
@@ -498,6 +501,26 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Join previous rescan if completed
+    if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
+                                      0)) == std::future_status::ready) {
+        rescan_future_ = std::future<void>();
+    }
+
+    // Retry metadata resync if previous attempt failed.
+    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+        LOG(INFO) << "Retrying background metadata rescan";
+        rescan_future_ = std::async(std::launch::async, [this]() {
+            auto result = ReRegisterOffloadedObjects();
+            if (!result) {
+                LOG(ERROR) << "Background metadata rescan retry "
+                           << "failed: " << result.error();
+            } else {
+                metadata_resync_pending_.store(false);
+            }
+        });
+    }
+
     std::unordered_map<std::string, int64_t>
         offloading_objects;  // Objects selected for offloading
 
@@ -507,12 +530,58 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
             enable_offloading_, offloading_objects);
         if (!heartbeat_result) {
-            LOG(ERROR) << "Failed to send heartbeat with error: "
-                       << heartbeat_result.error();
-            return heartbeat_result;
+            ErrorCode err = heartbeat_result.error();
+            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                // Master lost our LOCAL_DISK segment (likely restarted).
+                // Re-register the segment, retry the heartbeat, and
+                // trigger async ScanMeta to re-register object metadata.
+                LOG(WARNING) << "OffloadObjectHeartbeat returned "
+                             << "SEGMENT_NOT_FOUND, attempting to "
+                             << "re-register local disk segment and "
+                             << "re-register object metadata";
+                auto remount_result =
+                    client_->MountLocalDiskSegment(enable_offloading_);
+                if (remount_result) {
+                    heartbeat_result = client_->OffloadObjectHeartbeat(
+                        enable_offloading_, offloading_objects);
+                    if (!heartbeat_result) {
+                        LOG(ERROR) << "Heartbeat failed after re-registration: "
+                                   << heartbeat_result.error();
+                        return heartbeat_result;
+                    }
+                    // Master lost all object metadata on restart.
+                    // Trigger async ScanMeta to re-register them,
+                    // same as what Init() does on startup.
+                    if (!rescan_future_.valid()) {
+                        LOG(INFO) << "Triggering background metadata rescan "
+                                  << "after LOCAL_DISK segment re-registration";
+                        metadata_resync_pending_.store(true);
+                        rescan_future_ =
+                            std::async(std::launch::async, [this]() {
+                                auto result = ReRegisterOffloadedObjects();
+                                if (!result) {
+                                    LOG(ERROR) << "Background metadata rescan "
+                                               << "failed: " << result.error();
+                                } else {
+                                    metadata_resync_pending_.store(false);
+                                }
+                            });
+                    }
+                } else {
+                    LOG(ERROR) << "Failed to re-register local disk segment: "
+                               << remount_result.error();
+                    return tl::make_unexpected(remount_result.error());
+                }
+            } else {
+                LOG(ERROR) << "Failed to send heartbeat with error: " << err;
+                return heartbeat_result;
+            }
         }
     }
 
+    if (offloading_objects.empty()) {
+        return {};
+    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
@@ -855,6 +924,60 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     VLOG(1) << "batch_id " << batch_id
             << " not found (may have been GC'd already)";
     return false;
+}
+
+tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
+              << "offloaded objects with master";
+    int total_keys = 0;
+    int total_batches = 0;
+    int total_failures = 0;
+    // Reset the scan iterator so ScanMeta starts from the beginning.
+    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
+    // after Init() completes the cursor is 0 and HasNext() returns false,
+    // which would make ScanMeta skip all buckets.
+    storage_backend_->ResetScanIterator();
+    LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
+                 "storage_backend_->ScanMeta()";
+    auto scan_meta_result =
+        storage_backend_->ScanMeta(
+            [this, &total_keys, &total_batches, &total_failures](
+                const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metadatas) {
+                total_batches++;
+                total_keys += keys.size();
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = local_rpc_addr_;
+                }
+                auto add_object_result =
+                    client_->NotifyOffloadSuccess(keys, metadatas);
+                if (!add_object_result) {
+                    total_failures++;
+                    LOG(ERROR)
+                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                        << "failed for batch " << total_batches << " with "
+                        << keys.size()
+                        << " keys, error: " << add_object_result.error();
+                    return add_object_result.error();
+                }
+                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                          << "succeeded for batch " << total_batches << " with "
+                          << keys.size() << " keys";
+                return ErrorCode::OK;
+            });
+
+    LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
+              << scan_meta_result.has_value();
+    if (!scan_meta_result) {
+        LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
+    }
+    LOG(INFO) << "ReRegisterOffloadedObjects: completed. "
+              << "total_keys=" << total_keys
+              << " total_batches=" << total_batches
+              << " total_failures=" << total_failures;
+    return {};
 }
 
 }  // namespace mooncake

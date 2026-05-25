@@ -4925,10 +4925,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
-    LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
-              << "us, read store: " << read_store_time
-              << "us, with memory key count: " << valid_operations.size()
-              << ", offload key count: " << offload_object_count;
+    // LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
+    //           << "us, read store: " << read_store_time
+    //           << "us, with memory key count: " << valid_operations.size()
+    //           << ", offload key count: " << offload_object_count;
 
     return results;
 }
