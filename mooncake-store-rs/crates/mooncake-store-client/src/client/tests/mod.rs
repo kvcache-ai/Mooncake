@@ -12240,6 +12240,7 @@ fn stale_route_checksum_mismatch_refreshes_to_latest_route() {
     let mut resolved = resolved_object_for_route(&reader, "default", key, route_v1.clone());
     let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
     let mut checked_runtimes = BTreeSet::new();
+    let local_segments = reader.local_storage_segments();
     let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
     reader
         .read_single_object_with_failover(
@@ -12247,8 +12248,8 @@ fn stale_route_checksum_mismatch_refreshes_to_latest_route() {
             &mut resolved,
             &mut buffer,
             &mut checked_runtimes,
+            &local_segments,
             request_deadline,
-            "overwrite_refresh",
         )
         .expect("stale checksum should refresh to the latest route");
 
@@ -12370,6 +12371,7 @@ fn stale_route_transport_failure_refreshes_to_republished_route() {
         resolved_object_for_route(&reader, "default", "refresh-route-key", route_v1.clone());
     let mut buffer = vec![0u8; route_v1.replicas[0].length as usize];
     let mut checked_runtimes = BTreeSet::new();
+    let local_segments = reader.local_storage_segments();
     let request_deadline = reader.request_deadline_for_transfer(buffer.len() as u64, 1);
     reader
         .read_single_object_with_failover(
@@ -12377,8 +12379,8 @@ fn stale_route_transport_failure_refreshes_to_republished_route() {
             &mut resolved,
             &mut buffer,
             &mut checked_runtimes,
+            &local_segments,
             request_deadline,
-            "route_refresh_after_transport_failure",
         )
         .expect("stale transport failure should refresh to the republished route");
 
