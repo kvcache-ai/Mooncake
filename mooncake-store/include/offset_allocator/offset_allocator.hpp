@@ -42,12 +42,20 @@ struct OffsetAllocation {
     bool isNoSpace() const { return offset == NO_SPACE; }
 
     friend class __Allocator;
+    friend class OffsetAllocator;
     friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocStorageReport {
     uint64_t totalFreeSpace;
     uint64_t largestFreeRegion;
+};
+
+struct PersistedAllocationState {
+    uint32 allocation_offset;
+    NodeIndex allocation_metadata;
+    uint64_t real_base;
+    uint64_t requested_size;
 };
 
 struct OffsetAllocStorageReportFull {
@@ -106,6 +114,7 @@ class OffsetAllocationHandle {
     uint64_t requested_size;
 
     friend class OffsetAllocatorTest;  // for unit tests
+    friend class OffsetAllocator;
     friend class Serializer<OffsetAllocationHandle>;
 };
 
@@ -167,6 +176,15 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Get comprehensive metrics including fragmentation analysis (thread-safe)
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics() const;
+
+    [[nodiscard]] PersistedAllocationState GetPersistedAllocationState(
+        const OffsetAllocationHandle& handle) const;
+
+    [[nodiscard]] OffsetAllocationHandle RestoreAllocationHandle(
+        const PersistedAllocationState& state);
+
+    [[nodiscard]] bool ValidatePersistedAllocationState(
+        const PersistedAllocationState& state) const;
 
     // Serialize the allocator with serializer.
     template <typename T>

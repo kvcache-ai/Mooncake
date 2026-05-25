@@ -652,6 +652,51 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
     return get_metrics_internal();
 }
 
+PersistedAllocationState OffsetAllocator::GetPersistedAllocationState(
+    const OffsetAllocationHandle& handle) const {
+    return PersistedAllocationState{
+        .allocation_offset =
+            static_cast<uint32_t>(handle.m_allocation.getOffset()),
+        .allocation_metadata = handle.m_allocation.metadata,
+        .real_base = handle.real_base,
+        .requested_size = handle.requested_size,
+    };
+}
+
+OffsetAllocationHandle OffsetAllocator::RestoreAllocationHandle(
+    const PersistedAllocationState& state) {
+    return OffsetAllocationHandle(
+        shared_from_this(),
+        OffsetAllocation(state.allocation_offset, state.allocation_metadata),
+        state.real_base, state.requested_size);
+}
+
+bool OffsetAllocator::ValidatePersistedAllocationState(
+    const PersistedAllocationState& state) const {
+    if (state.requested_size == 0) {
+        return false;
+    }
+
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) {
+        return false;
+    }
+
+    OffsetAllocation allocation(state.allocation_offset,
+                                state.allocation_metadata);
+    uint64_t allocated_size =
+        static_cast<uint64_t>(m_allocator->allocationSize(allocation))
+        << m_multiplier_bits;
+    if (allocated_size == 0 || state.requested_size > allocated_size) {
+        return false;
+    }
+
+    uint64_t expected_base =
+        m_base +
+        (static_cast<uint64_t>(state.allocation_offset) << m_multiplier_bits);
+    return state.real_base == expected_base;
+}
+
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
     MutexLocker lock(&m_mutex);

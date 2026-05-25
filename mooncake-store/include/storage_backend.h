@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -1133,6 +1134,38 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // alive until all readers release their references
     using AllocationPtr = std::shared_ptr<RefCountedAllocationHandle>;
 
+    struct PersistedObjectEntry {
+        std::string key;
+        uint64_t offset;
+        uint32_t total_size;
+        uint32_t value_size;
+        uint32_t allocation_offset;
+        uint32_t allocation_metadata;
+        uint64_t allocation_real_base;
+        uint64_t allocation_requested_size;
+    };
+
+    struct PersistedSnapshot {
+        uint32_t version = 1;
+        uint64_t capacity = 0;
+        int64_t total_size = 0;
+        int64_t total_keys = 0;
+        std::vector<PersistedObjectEntry> entries;
+        std::vector<offset_allocator::PersistedAllocationState>
+            stale_allocations;
+    };
+
+    struct RecoveryManifest {
+        uint32_t version = 1;
+        uint64_t generation = 0;
+    };
+    YLT_REFL(PersistedObjectEntry, key, offset, total_size, value_size,
+             allocation_offset, allocation_metadata, allocation_real_base,
+             allocation_requested_size);
+    YLT_REFL(PersistedSnapshot, version, capacity, total_size, total_keys,
+             entries, stale_allocations);
+    YLT_REFL(RecoveryManifest, version, generation);
+
     // Metadata entry for a stored object. Protected by stripe lock for the key.
     struct ObjectEntry {
         // Byte offset in data file where record is stored
@@ -1144,18 +1177,25 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         // Value size only (excluding header and key)
         uint32_t value_size;
 
+        offset_allocator::PersistedAllocationState allocation_state;
+
         // Refcounted handle keeps physical extent alive during reads
         AllocationPtr allocation;
         ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
+                    offset_allocator::PersistedAllocationState persisted_state,
                     AllocationPtr alloc_ptr)
             : offset(off),
               total_size(total),
               value_size(val),
+              allocation_state(std::move(persisted_state)),
               allocation(std::move(alloc_ptr)) {}
     };
 
     // Returns full path to data file: {storage_path_}/kv_cache.data
     std::string GetDataFilePath() const;
+    std::string GetRecoveryManifestPath() const;
+    std::string GetAllocatorSnapshotPath(uint64_t generation) const;
+    std::string GetIndexSnapshotPath(uint64_t generation) const;
 
     static constexpr size_t kNumShards =
         1024;  // Number of shards (must be power of 2 for bitwise optimization)
@@ -1215,9 +1255,53 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // counting)
     std::atomic<int64_t> total_keys_{0};
 
+    tl::expected<void, ErrorCode> PersistRecoverySnapshots(
+        const PersistedSnapshot& snapshot, uint64_t generation);
+    tl::expected<void, ErrorCode> PersistAllocatorSnapshot(
+        const std::shared_ptr<offset_allocator::OffsetAllocator>& allocator,
+        uint64_t generation) const;
+    tl::expected<void, ErrorCode> PersistIndexSnapshot(
+        const PersistedSnapshot& snapshot, uint64_t generation) const;
+    tl::expected<RecoveryManifest, ErrorCode> LoadRecoveryManifest() const;
+    tl::expected<std::shared_ptr<offset_allocator::OffsetAllocator>, ErrorCode>
+    LoadAllocatorSnapshot(uint64_t generation) const;
+    tl::expected<PersistedSnapshot, ErrorCode> LoadIndexSnapshot(
+        uint64_t generation) const;
+    tl::expected<void, ErrorCode> LoadRecoverySnapshots();
+    tl::expected<void, ErrorCode> ValidateSnapshot(
+        const PersistedSnapshot& snapshot) const;
+    tl::expected<void, ErrorCode> WriteFileAtomically(
+        const std::string& path,
+        const std::vector<SerializedByte>& bytes) const;
+    tl::expected<std::vector<SerializedByte>, ErrorCode> ReadFileBytes(
+        const std::string& path) const;
+    tl::expected<void, ErrorCode> RebuildInMemoryState(
+        const PersistedSnapshot& snapshot);
+    void ClearInMemoryState();
+    void ResetRecoverySnapshotState();
+    void SetRecoverySnapshotState(const PersistedSnapshot& snapshot);
+    PersistedObjectEntry BuildPersistedObjectEntry(
+        const std::string& key, const ObjectEntry& entry) const;
+    static offset_allocator::PersistedAllocationState ToAllocationState(
+        const PersistedObjectEntry& entry);
+    void UpsertRecoverySnapshotEntry(const PersistedObjectEntry& entry,
+                                     int64_t size_delta, bool is_new_key);
+    void RemoveRecoverySnapshotEntry(const std::string& key, int64_t size_delta,
+                                     bool was_new_key);
+    void CleanupObsoleteRecoverySnapshots(uint64_t live_generation) const;
+    static constexpr uint32_t kSnapshotVersion = 1;
+    static constexpr uint32_t kManifestVersion = 1;
+
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
     std::function<bool(const std::string& key)> test_failure_predicate_;
+
+    std::string recovery_manifest_path_;
+    std::atomic<uint64_t> next_snapshot_generation_{1};
+    mutable SharedMutex recovery_state_mutex_;
+    mutable Mutex recovery_snapshot_io_mutex_;
+    PersistedSnapshot recovery_snapshot_state_;
+    std::unordered_map<std::string, size_t> recovery_snapshot_index_;
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
