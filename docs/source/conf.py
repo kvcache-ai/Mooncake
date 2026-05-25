@@ -55,7 +55,7 @@ myst_enable_extensions = [
 myst_fence_as_directive = ["mermaid"]
 autodoc2_packages = [
     {
-        "path": "../../Mooncake",
+        "path": "../../mooncake-wheel/mooncake",
         "exclude_dirs": ["__pycache__", "third_party"],
     },
 ]
