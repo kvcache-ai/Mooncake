@@ -9,7 +9,6 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
-    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -85,6 +84,7 @@ jobs:
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     permissions:
