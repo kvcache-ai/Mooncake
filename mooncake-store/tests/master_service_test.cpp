@@ -176,28 +176,27 @@ TEST_F(MasterServiceTest, TenantScopedKeysAllowSameUserKeyIsolation) {
     const UUID client_a = generate_uuid();
     const UUID client_b = generate_uuid();
     const std::string key = "shared_user_key";
+    const std::string tenant_a_key = BuildTenantScopedKey("tenant_a", key);
+    const std::string tenant_b_key = BuildTenantScopedKey("tenant_b", key);
     const uint64_t value_length = 1024;
 
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(
-        service->PutStart(client_a, key, value_length, config, "tenant_a")
-            .has_value());
-    ASSERT_TRUE(service->PutEnd(client_a, key, ReplicaType::MEMORY, "tenant_a")
+    ASSERT_TRUE(service->PutStart(client_a, tenant_a_key, value_length, config)
+                    .has_value());
+    ASSERT_TRUE(service->PutEnd(client_a, tenant_a_key, ReplicaType::MEMORY)
                     .has_value());
 
-    ASSERT_FALSE(
-        service->PutStart(client_a, key, value_length, config, "tenant_a")
-            .has_value());
-    ASSERT_TRUE(
-        service->PutStart(client_b, key, value_length, config, "tenant_b")
-            .has_value());
-    ASSERT_TRUE(service->PutEnd(client_b, key, ReplicaType::MEMORY, "tenant_b")
+    ASSERT_FALSE(service->PutStart(client_a, tenant_a_key, value_length, config)
+                     .has_value());
+    ASSERT_TRUE(service->PutStart(client_b, tenant_b_key, value_length, config)
+                    .has_value());
+    ASSERT_TRUE(service->PutEnd(client_b, tenant_b_key, ReplicaType::MEMORY)
                     .has_value());
 
-    EXPECT_TRUE(service->GetReplicaList(key, "tenant_a").has_value());
-    EXPECT_TRUE(service->GetReplicaList(key, "tenant_b").has_value());
+    EXPECT_TRUE(service->GetReplicaList(tenant_a_key).has_value());
+    EXPECT_TRUE(service->GetReplicaList(tenant_b_key).has_value());
     EXPECT_EQ(service->GetReplicaList(key).error(),
               ErrorCode::OBJECT_NOT_FOUND);
 
@@ -206,10 +205,10 @@ TEST_F(MasterServiceTest, TenantScopedKeysAllowSameUserKeyIsolation) {
     ASSERT_EQ(regex_a->size(), 1);
     EXPECT_TRUE(regex_a->contains(key));
 
-    ASSERT_TRUE(service->Remove(key, "tenant_a", true).has_value());
-    EXPECT_EQ(service->GetReplicaList(key, "tenant_a").error(),
+    ASSERT_TRUE(service->Remove(tenant_a_key, true).has_value());
+    EXPECT_EQ(service->GetReplicaList(tenant_a_key).error(),
               ErrorCode::OBJECT_NOT_FOUND);
-    EXPECT_TRUE(service->GetReplicaList(key, "tenant_b").has_value());
+    EXPECT_TRUE(service->GetReplicaList(tenant_b_key).has_value());
 }
 
 TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
@@ -220,44 +219,39 @@ TEST_F(MasterServiceTest, TenantScopedCopyMoveUseClientTenant) {
 
     const UUID client_id = generate_uuid();
     const std::string tenant_id = "tenant_a";
+    const std::string copy_key = BuildTenantScopedKey(tenant_id, "copy_key");
+    const std::string move_key = BuildTenantScopedKey(tenant_id, "move_key");
 
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segment = "segment_1";
 
     ASSERT_TRUE(
-        service->PutStart(client_id, "copy_key", 1024, config, tenant_id)
-            .has_value());
+        service->PutStart(client_id, copy_key, 1024, config).has_value());
     ASSERT_TRUE(
-        service->PutEnd(client_id, "copy_key", ReplicaType::MEMORY, tenant_id)
-            .has_value());
+        service->PutEnd(client_id, copy_key, ReplicaType::MEMORY).has_value());
     EXPECT_EQ(
         service->CopyStart(client_id, "copy_key", "segment_1", {"segment_2"})
             .error(),
         ErrorCode::OBJECT_NOT_FOUND);
-    ASSERT_TRUE(service
-                    ->CopyStart(client_id, "copy_key", "segment_1",
-                                {"segment_2"}, tenant_id)
-                    .has_value());
-    ASSERT_TRUE(service->CopyEnd(client_id, "copy_key", tenant_id).has_value());
+    ASSERT_TRUE(
+        service->CopyStart(client_id, copy_key, "segment_1", {"segment_2"})
+            .has_value());
+    ASSERT_TRUE(service->CopyEnd(client_id, copy_key).has_value());
 
     ASSERT_TRUE(
-        service->PutStart(client_id, "move_key", 1024, config, tenant_id)
-            .has_value());
+        service->PutStart(client_id, move_key, 1024, config).has_value());
     ASSERT_TRUE(
-        service->PutEnd(client_id, "move_key", ReplicaType::MEMORY, tenant_id)
-            .has_value());
+        service->PutEnd(client_id, move_key, ReplicaType::MEMORY).has_value());
     EXPECT_EQ(
         service->CreateMoveTask("move_key", "segment_1", "segment_3").error(),
         ErrorCode::OBJECT_NOT_FOUND);
-    ASSERT_TRUE(
-        service->CreateMoveTask("move_key", "segment_1", "segment_3", tenant_id)
-            .has_value());
-    ASSERT_TRUE(service
-                    ->MoveStart(client_id, "move_key", "segment_1", "segment_3",
-                                tenant_id)
+    ASSERT_TRUE(service->CreateMoveTask(move_key, "segment_1", "segment_3")
                     .has_value());
-    ASSERT_TRUE(service->MoveEnd(client_id, "move_key", tenant_id).has_value());
+    ASSERT_TRUE(
+        service->MoveStart(client_id, move_key, "segment_1", "segment_3")
+            .has_value());
+    ASSERT_TRUE(service->MoveEnd(client_id, move_key).has_value());
 }
 
 TEST_F(MasterServiceTest, TenantScopedReplicaTasksCarryStorageKey) {
@@ -277,16 +271,13 @@ TEST_F(MasterServiceTest, TenantScopedReplicaTasksCarryStorageKey) {
     config.replica_num = 1;
     config.preferred_segment = "segment_1";
 
+    ASSERT_TRUE(service->PutStart(client_id, expected_copy_key, 1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        service->PutStart(client_id, "copy_task_key", 1024, config, tenant_id)
+        service->PutEnd(client_id, expected_copy_key, ReplicaType::MEMORY)
             .has_value());
     ASSERT_TRUE(
-        service
-            ->PutEnd(client_id, "copy_task_key", ReplicaType::MEMORY, tenant_id)
-            .has_value());
-    ASSERT_TRUE(
-        service->CreateCopyTask("copy_task_key", {"segment_2"}, tenant_id)
-            .has_value());
+        service->CreateCopyTask(expected_copy_key, {"segment_2"}).has_value());
 
     auto copy_tasks = service->FetchTasks(ctx1.client_id, 1);
     ASSERT_TRUE(copy_tasks.has_value());
@@ -300,17 +291,14 @@ TEST_F(MasterServiceTest, TenantScopedReplicaTasksCarryStorageKey) {
                     .has_value());
     EXPECT_TRUE(service->CopyEnd(ctx1.client_id, copy_payload.key).has_value());
 
-    ASSERT_TRUE(
-        service->PutStart(client_id, "move_task_key", 1024, config, tenant_id)
-            .has_value());
-    ASSERT_TRUE(
-        service
-            ->PutEnd(client_id, "move_task_key", ReplicaType::MEMORY, tenant_id)
-            .has_value());
-    ASSERT_TRUE(service
-                    ->CreateMoveTask("move_task_key", "segment_1", "segment_3",
-                                     tenant_id)
+    ASSERT_TRUE(service->PutStart(client_id, expected_move_key, 1024, config)
                     .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(client_id, expected_move_key, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(
+        service->CreateMoveTask(expected_move_key, "segment_1", "segment_3")
+            .has_value());
 
     auto move_tasks = service->FetchTasks(ctx1.client_id, 1);
     ASSERT_TRUE(move_tasks.has_value());
@@ -4610,10 +4598,10 @@ TEST_F(MasterServiceTest, TenantScopedDrainJobSchedulesScopedMoveTask) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
-    ASSERT_TRUE(service_->PutStart(put_client_id, key, 1024, config, tenant_id)
+    ASSERT_TRUE(service_->PutStart(put_client_id, storage_key, 1024, config)
                     .has_value());
     ASSERT_TRUE(
-        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY, tenant_id)
+        service_->PutEnd(put_client_id, storage_key, ReplicaType::MEMORY)
             .has_value());
 
     CreateDrainJobRequest request;
@@ -4656,7 +4644,7 @@ TEST_F(MasterServiceTest, TenantScopedDrainJobSchedulesScopedMoveTask) {
         return query.has_value() && query->status == JobStatus::SUCCEEDED;
     });
 
-    auto replicas = service_->GetReplicaList(key, tenant_id);
+    auto replicas = service_->GetReplicaList(storage_key);
     ASSERT_TRUE(replicas.has_value());
     std::unordered_set<std::string> segment_names;
     for (const auto& replica : replicas->replicas) {
