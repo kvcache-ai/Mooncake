@@ -454,7 +454,7 @@ impl LocalMemoryState {
         target_offset: u64,
         length: usize,
         max_registration_bytes: Option<usize>,
-    ) -> Result<Vec<CopyInstruction>> {
+    ) -> Result<PreparedCopy> {
         let region = self
             .storage
             .get(segment)
@@ -990,9 +990,13 @@ impl RegisteredRegion {
         target_offset: u64,
         length: usize,
         max_registration_bytes: Option<usize>,
-    ) -> Result<Vec<CopyInstruction>> {
+    ) -> Result<PreparedCopy> {
+        let region_guard = Arc::clone(self);
         if length == 0 {
-            return Ok(Vec::new());
+            return Ok(PreparedCopy {
+                _region_guard: region_guard,
+                instructions: Vec::new(),
+            });
         }
         let mut mappings =
             self.target_mappings(target_info, target_offset, length, max_registration_bytes)?;
@@ -1028,7 +1032,6 @@ impl RegisteredRegion {
                 .ok_or_else(|| StoreError::Allocator("local source overflow".to_string()))?
                 as *const u8;
             instructions.push(CopyInstruction {
-                _region: Arc::clone(self),
                 source,
                 dest_offset: written,
                 copy_len,
@@ -1040,7 +1043,10 @@ impl RegisteredRegion {
                 .checked_add(copy_len as u64)
                 .ok_or_else(|| StoreError::Allocator("target cursor overflow".to_string()))?;
         }
-        Ok(instructions)
+        Ok(PreparedCopy {
+            _region_guard: region_guard,
+            instructions,
+        })
     }
 
     fn copy_target_to(
@@ -1123,8 +1129,13 @@ impl RegisteredRegion {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CopyInstruction {
-    _region: Arc<RegisteredRegion>,
+pub(crate) struct PreparedCopy {
+    _region_guard: Arc<RegisteredRegion>,
+    instructions: Vec<CopyInstruction>,
+}
+
+#[derive(Clone, Debug)]
+struct CopyInstruction {
     source: *const u8,
     dest_offset: usize,
     copy_len: usize,
@@ -1133,10 +1144,10 @@ pub(crate) struct CopyInstruction {
 /// Execute pre-computed copy instructions into `destination`.
 ///
 /// # Safety
-/// Each instruction keeps its source region alive. Callers must ensure that
+/// The prepared copy keeps its source region alive. Callers must ensure that
 /// `destination` is large enough for every instruction.
-pub(crate) fn execute_copy_instructions(instructions: &[CopyInstruction], destination: *mut u8) {
-    for instr in instructions {
+pub(crate) fn execute_copy_instructions(copy: &PreparedCopy, destination: *mut u8) {
+    for instr in &copy.instructions {
         unsafe {
             ptr::copy_nonoverlapping(
                 instr.source,

@@ -2522,7 +2522,7 @@ impl StoreClient {
 
             // Compute copy instructions for all cache-hit local items.
             let max_reg = transport.max_registration_bytes();
-            let mut copy_instructions: Vec<(Vec<CopyInstruction>, *mut u8)> = Vec::new();
+            let mut copy_instructions: Vec<(PreparedCopy, *mut u8)> = Vec::new();
             for ((entry, buffer), local) in resolved
                 .iter()
                 .zip(buffers.iter_mut())

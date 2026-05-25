@@ -31,8 +31,8 @@ use crate::control_plane::{
     ReserveSpecificOp, RouteTrafficReport,
 };
 use crate::memory::{
-    execute_copy_instructions, CopyInstruction, LocalMemoryConfig, LocalMemoryState,
-    RegionAllocation, ScratchReservation, StorageExtentInfo, StorageSegmentSpec,
+    execute_copy_instructions, LocalMemoryConfig, LocalMemoryState, PreparedCopy, RegionAllocation,
+    ScratchReservation, StorageExtentInfo, StorageSegmentSpec,
 };
 use crate::observability::{
     record_api_items, registry, ApiItemTrace, ApiItemsTraceRecord, OperationTracker,
