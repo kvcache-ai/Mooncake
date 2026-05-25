@@ -84,6 +84,9 @@ class DataManager {
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
         UUID write_operation_id{0, 0};
+        // Filled by PreWriteInternal for in-process callers (Put/WriteRemoteData).
+        // Public PreWrite omits this field for RPC responses.
+        AllocationHandle handle;
     };
 
     struct PinKeyResult {
@@ -311,8 +314,6 @@ class DataManager {
     tl::expected<void, ErrorCode> UnPinKeyInternal(
         const KeyCtx& ctx, const UUID& read_operation_id);
 
-    tl::expected<AllocationHandle, ErrorCode> LookupPendingWriteHandleInternal(
-        const KeyCtx& ctx, const UUID& write_operation_id);
     void AbortPendingWriteInternal(const KeyCtx& ctx,
                                    const UUID& write_operation_id);
 
@@ -331,7 +332,7 @@ class DataManager {
     tl::expected<void, ErrorCode> AttachPendingWriteHandle(
         PendingWriteShard& shard, std::string_view key,
         const UUID& write_operation_id, const AllocationHandle& handle);
-    tl::expected<AllocationHandle, ErrorCode> TakePendingWriteForCommit(
+    tl::expected<AllocationHandle, ErrorCode> ValidatePendingWriteForCommit(
         PendingWriteShard& shard, std::string_view key, TimePoint now,
         const UUID& write_operation_id);
 

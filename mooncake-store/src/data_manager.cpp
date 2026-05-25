@@ -279,32 +279,6 @@ template size_t
 DataManager::ScanExpiredRecordShard<DataManager::PinnedKeyRecord>(
     RecordShard<DataManager::PinnedKeyRecord>&, TimePoint);
 
-tl::expected<AllocationHandle, ErrorCode>
-DataManager::LookupPendingWriteHandleInternal(const KeyCtx& ctx,
-                                              const UUID& write_operation_id) {
-    const auto now = std::chrono::steady_clock::now();
-    auto& pending_write_shard = GetPendingWriteShard(ctx);
-    std::shared_lock pending_write_shard_lock(pending_write_shard.mutex);
-    auto it = pending_write_shard.existed_operation_key_map.find(ctx.key);
-    if (it == pending_write_shard.existed_operation_key_map.end()) {
-        LOG(ERROR) << "LookupPendingWriteHandle: no pending write for key: "
-                   << ctx.key;
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    if (it->second.deadline <= now) {
-        LOG(ERROR) << "LookupPendingWriteHandle: lease expired for key: "
-                   << ctx.key;
-        return tl::unexpected(ErrorCode::LEASE_EXPIRED);
-    }
-    if (it->second.write_operation_id != write_operation_id) {
-        LOG(ERROR) << "LookupPendingWriteHandle: write_operation_id mismatch "
-                      "for key: "
-                   << ctx.key;
-        return tl::unexpected(ErrorCode::INVALID_WRITE);
-    }
-    return it->second.handle;
-}
-
 DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id) {
@@ -370,7 +344,15 @@ tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
 tl::expected<void, ErrorCode> DataManager::AttachPendingWriteHandle(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id, const AllocationHandle& handle) {
-    std::unique_lock lock(shard.mutex);
+    // Shard shared_lock only: validates map lookup against concurrent shard
+    // readers (lease scan, WriteCommit). Does not change map/ordered_list
+    // topology—only PendingWriteRecord::handle on an existing entry.
+    //
+    // No per-record mutex today: a key under an active pending-write lease is
+    // not concurrently updated (second PreWrite gets REPLICA_IS_PROCESSING;
+    // WriteCommit matches write_operation_id). Fine-grained record locking can
+    // be added later if handle visibility needs stricter isolation.
+    std::shared_lock shard_lock(shard.mutex);
     auto it = shard.existed_operation_key_map.find(key);
     if (it == shard.existed_operation_key_map.end()) {
         LOG(ERROR) << "PreWrite: reserved pending write record missing"
@@ -389,18 +371,18 @@ tl::expected<void, ErrorCode> DataManager::AttachPendingWriteHandle(
 }
 
 tl::expected<AllocationHandle, ErrorCode>
-DataManager::TakePendingWriteForCommit(PendingWriteShard& shard,
-                                       std::string_view key, TimePoint now,
-                                       const UUID& write_operation_id) {
-    std::unique_lock lock(shard.mutex);
+DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
+                                           std::string_view key, TimePoint now,
+                                           const UUID& write_operation_id) {
+    // Hold the pending record through Commit so a new PreWrite cannot reserve
+    // the same key in the race window before tiered_backend_->Commit finishes.
+    std::shared_lock shard_lock(shard.mutex);
     auto record_it = shard.existed_operation_key_map.find(key);
     if (record_it == shard.existed_operation_key_map.end()) {
         LOG(ERROR) << "WriteCommit: no pending write record for key: " << key;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     if (record_it->second.deadline <= now) {
-        shard.ordered_list.erase(record_it->second.list_it);
-        shard.existed_operation_key_map.erase(record_it);
         LOG(ERROR) << "WriteCommit: pending write lease expired"
                    << ", key=" << key
                    << ", error=" << toString(ErrorCode::LEASE_EXPIRED);
@@ -418,10 +400,7 @@ DataManager::TakePendingWriteForCommit(PendingWriteShard& shard,
                    << ", error=" << toString(ErrorCode::INVALID_WRITE);
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
-    AllocationHandle handle = record_it->second.handle;
-    shard.ordered_list.erase(record_it->second.list_it);
-    shard.existed_operation_key_map.erase(record_it);
-    return handle;
+    return record_it->second.handle;
 }
 
 void DataManager::ShutdownLeaseScanner() {
@@ -511,14 +490,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
-
-    auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, write_operation_id);
-    if (!handle_result) {
-        AbortPendingWriteInternal(kctx, write_operation_id);
-        return tl::unexpected(handle_result.error());
-    }
-    AllocationHandle alloc_handle = handle_result.value();
+    AllocationHandle alloc_handle = prewrite_result->handle;
 
     auto submit_result = SubmitTeTransferInternal(
         alloc_handle, src_buffers, Transport::TransferRequest::READ);
@@ -594,14 +566,7 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
-
-    auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, write_operation_id);
-    if (!handle_result) {
-        AbortPendingWriteInternal(kctx, write_operation_id);
-        return tl::unexpected(handle_result.error());
-    }
-    AllocationHandle alloc_handle = handle_result.value();
+    AllocationHandle alloc_handle = prewrite_result->handle;
 
     auto write_fn = [this, key_owned = std::string(key), slice, alloc_handle,
                      write_operation_id]() -> tl::expected<void, ErrorCode> {
@@ -898,15 +863,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
         return tl::make_unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
-
-    auto handle_result =
-        LookupPendingWriteHandleInternal(kctx, write_operation_id);
-    if (!handle_result) {
-        AbortPendingWriteInternal(kctx, write_operation_id);
-        timer.LogResponse("error_code=", handle_result.error());
-        return tl::make_unexpected(handle_result.error());
-    }
-    AllocationHandle handle = handle_result.value();
+    AllocationHandle handle = prewrite_result->handle;
     UUID result_tier_id = handle->loc.tier->GetTierId();
 
     // Transfer phase — no long key lock held.
@@ -930,7 +887,15 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
 tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
-    return PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
+    auto internal_result =
+        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
+    if (!internal_result) {
+        return tl::make_unexpected(internal_result.error());
+    }
+    PreWriteResult rpc_result;
+    rpc_result.remote_buffer = std::move(internal_result->remote_buffer);
+    rpc_result.write_operation_id = internal_result->write_operation_id;
+    return rpc_result;
 }
 
 tl::expected<DataManager::PreWriteResult, ErrorCode>
@@ -957,7 +922,11 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
         return tl::make_unexpected(reserve_result.error());
     }
 
-    // Slow path: no pending_write_shard_lock during tier allocation.
+    // Reserve holds unique_lock because it inserts into existed_operation_key_map
+    // and ordered_list. Allocate runs without shard lock so other keys in the
+    // shard are not blocked. Attach only fills handle on the reserved record
+    // under shared_lock (see AttachPendingWriteHandle); the record itself has no
+    // separate lock while the write lease excludes concurrent writers.
     if (tiered_backend_->Exist(ctx.key)) {
         LOG(ERROR) << "PreWrite: key already exists"
                    << ", key=" << ctx.key
@@ -998,6 +967,7 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     PreWriteResult result;
     result.remote_buffer = std::move(remote_buffer_result.value());
     result.write_operation_id = write_operation_id;
+    result.handle = handle;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return result;
 }
@@ -1021,22 +991,44 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
 
     auto& pending_write_shard = GetPendingWriteShard(ctx);
 
-    auto handle_result = TakePendingWriteForCommit(
+    auto handle_result = ValidatePendingWriteForCommit(
         pending_write_shard, ctx.key, now, write_operation_id);
     if (!handle_result) {
-        timer.LogResponse("error_code=", handle_result.error());
-        return tl::make_unexpected(handle_result.error());
+        const ErrorCode err = handle_result.error();
+        LOG(ERROR) << "WriteCommit: pending write validation failed"
+                   << ", key=" << ctx.key << ", error=" << toString(err);
+        if (err == ErrorCode::LEASE_EXPIRED) {
+            const auto erased = ErasePendingWriteRecord(
+                pending_write_shard, ctx.key, write_operation_id);
+            if (erased == PendingWriteEraseResult::Erased) {
+                LOG(ERROR) << "WriteCommit: removed expired pending write record"
+                           << ", key=" << ctx.key;
+            } else {
+                LOG(WARNING) << "WriteCommit: expired pending write record not "
+                                "found for cleanup, key="
+                             << ctx.key;
+            }
+        }
+        timer.LogResponse("error_code=", err);
+        return tl::make_unexpected(err);
     }
     AllocationHandle handle = std::move(handle_result.value());
 
-    // Commit under key_lock to avoid concurrent Delete. Most commit failures
-    // are not recoverable by retrying WriteCommit alone; caller must restart
-    // PreWrite -> transfer -> WriteCommit. Duplicate WriteCommit ->
-    // OBJECT_NOT_FOUND.
+    // key_lock: serialize tiered_backend_->Commit vs Delete on this key.
+    // PendingWriteRecord is erased only after Commit (see Erase below); while
+    // it remains in existed_operation_key_map, another PreWrite on this key
+    // gets REPLICA_IS_PROCESSING at Reserve.
     tl::expected<void, ErrorCode> commit_result;
     {
         std::unique_lock<std::shared_mutex> key_lock(GetKeyLock(ctx.key));
         commit_result = tiered_backend_->Commit(ctx.key, handle);
+    }
+
+    const auto erased = ErasePendingWriteRecord(
+        pending_write_shard, ctx.key, write_operation_id);
+    if (erased != PendingWriteEraseResult::Erased) {
+        LOG(WARNING) << "WriteCommit: pending write record already removed"
+                     << " during commit, key=" << ctx.key;
     }
 
     if (!commit_result) {
@@ -1044,11 +1036,13 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
                    << ", key=" << ctx.key
                    << ", error=" << toString(commit_result.error());
         timer.LogResponse("error_code=", commit_result.error(),
-                          "record_erased=", true);
+                          "record_erased=",
+                          erased == PendingWriteEraseResult::Erased);
         return tl::make_unexpected(commit_result.error());
     }
 
-    timer.LogResponse("error_code=", ErrorCode::OK, "record_erased=", true);
+    timer.LogResponse("error_code=", ErrorCode::OK, "record_erased=",
+                      erased == PendingWriteEraseResult::Erased);
     return {};
 }
 
