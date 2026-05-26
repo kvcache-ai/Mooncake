@@ -42,7 +42,7 @@
 #include <musa_runtime.h>
 #include <musa_bf16.h>
 // MUSA type aliases for CUDA compatibility
-using nv_bfloat16 = musa_bfloat16;
+using nv_bfloat16 = mt_bfloat16;
 // MUSA runtime API aliases (host-side code uses cuda* names)
 #define cudaMalloc musaMalloc
 #define cudaMallocHost musaMallocHost

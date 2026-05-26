@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(USE_MUSA)
+#if defined(USE_MUSA) || defined(MOONCAKE_EP_USE_MUSA)
 #include <musa_runtime.h>
 #else
 #include <cuda_runtime.h>
