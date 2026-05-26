@@ -46,12 +46,11 @@
 #ifdef __MUSA_ARCH__
 using nv_bfloat16 = mt_bfloat16;
 #else
+// Host-side stub: same size as mt_bfloat16 (2 bytes), no mt_bfloat16 dependency
 struct nv_bfloat16 {
     unsigned short __x;
     nv_bfloat16() = default;
-    nv_bfloat16(const mt_bfloat16& v) { memcpy(this, &v, sizeof(*this)); }
-    nv_bfloat16& operator=(const mt_bfloat16& v) { memcpy(this, &v, sizeof(*this)); return *this; }
-    operator mt_bfloat16() const { mt_bfloat16 r; memcpy(&r, this, sizeof(r)); return r; }
+    nv_bfloat16& operator=(unsigned short v) { __x = v; return *this; }
 };
 #endif
 // MUSA FP8 stubs (MUSA does not support FP8, but templates still compile)
