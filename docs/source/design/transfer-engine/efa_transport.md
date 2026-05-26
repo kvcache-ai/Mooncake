@@ -211,6 +211,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
+(benchmark-results)=
 ### Benchmark Results
 
 #### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
