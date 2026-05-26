@@ -119,6 +119,8 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::InitDevices() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const uint32_t nsid = ParseConfiguredNsid();
+    const auto executor_type =
+        GetEnvStringOr("MOONCAKE_NVME_KV_EXECUTOR_TYPE", "ioctl");
     std::sort(configured_device_ids.begin(), configured_device_ids.end());
     configured_device_ids.erase(
         std::unique(configured_device_ids.begin(), configured_device_ids.end()),
@@ -131,12 +133,16 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::InitDevices() {
         if (device_path.empty()) {
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        auto connector =
-            std::make_shared<NvmeKvConnector>(device_id, device_path, nsid);
-        auto init_res = connector->Init();
-        if (!init_res) {
-            return tl::make_unexpected(init_res.error());
+        tl::expected<NvmeKvCommandExecutor::Capabilities, ErrorCode>
+            capabilities = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        auto executor = CreateNvmeKvExecutor(executor_type, device_path, nsid,
+                                             capabilities);
+        if (executor == nullptr || !capabilities) {
+            return tl::make_unexpected(capabilities ? ErrorCode::INTERNAL_ERROR
+                                                    : capabilities.error());
         }
+        auto connector =
+            std::make_shared<NvmeKvConnector>(device_id, std::move(executor));
         devices.emplace(device_id,
                         NvmeKvDeviceRuntime{device_id, std::move(connector),
                                             DeviceState::ENABLED});

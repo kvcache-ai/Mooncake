@@ -457,4 +457,16 @@ std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvIoctlExecutor(
     return executor;
 }
 
+std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvExecutor(
+    const std::string& type, const std::string& device_path, uint32_t nsid,
+    tl::expected<NvmeKvCommandExecutor::Capabilities, ErrorCode>&
+        capabilities) {
+    if (type.empty() || type == "ioctl") {
+        return CreateNvmeKvIoctlExecutor(device_path, nsid, capabilities);
+    }
+    LOG(ERROR) << "[NvmeKvExecutor] unsupported executor type: " << type;
+    capabilities = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return nullptr;
+}
+
 }  // namespace mooncake

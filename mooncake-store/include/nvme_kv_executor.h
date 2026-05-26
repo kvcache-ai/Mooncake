@@ -38,4 +38,11 @@ std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvIoctlExecutor(
     std::string device_path, uint32_t nsid,
     tl::expected<NvmeKvCommandExecutor::Capabilities, ErrorCode>& capabilities);
 
+// Create an executor by type string.
+// Supported types: "ioctl" (default). Extensible for "sim", "virtio", etc.
+// Returns nullptr and sets capabilities to an error on unknown type.
+std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvExecutor(
+    const std::string& type, const std::string& device_path, uint32_t nsid,
+    tl::expected<NvmeKvCommandExecutor::Capabilities, ErrorCode>& capabilities);
+
 }  // namespace mooncake

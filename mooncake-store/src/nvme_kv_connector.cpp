@@ -2,36 +2,11 @@
 
 #include <utility>
 
-#include "nvme_kv_executor.h"
-
 namespace mooncake {
 
-NvmeKvConnector::NvmeKvConnector(std::string device_id, std::string device_path,
-                                 uint32_t nsid)
-    : device_id_(std::move(device_id)),
-      device_path_(std::move(device_path)),
-      nsid_(nsid) {}
-
-tl::expected<void, ErrorCode> NvmeKvConnector::Init() {
-    if (executor_ != nullptr || device_id_.empty() || device_path_.empty()) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return InitExecutor();
-}
-
-tl::expected<void, ErrorCode> NvmeKvConnector::InitExecutor() {
-    tl::expected<Capabilities, ErrorCode> capabilities =
-        tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    auto executor =
-        CreateNvmeKvIoctlExecutor(device_path_, nsid_, capabilities);
-    if (executor == nullptr || !capabilities) {
-        return tl::make_unexpected(capabilities ? ErrorCode::INTERNAL_ERROR
-                                                : capabilities.error());
-    }
-
-    executor_ = std::move(executor);
-    return {};
-}
+NvmeKvConnector::NvmeKvConnector(
+    std::string device_id, std::unique_ptr<NvmeKvCommandExecutor> executor)
+    : device_id_(std::move(device_id)), executor_(std::move(executor)) {}
 
 tl::expected<void, ErrorCode> NvmeKvConnector::Store(const PhysicalKey& key,
                                                      std::string value) {
