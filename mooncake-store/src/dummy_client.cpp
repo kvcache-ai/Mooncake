@@ -32,54 +32,6 @@ size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
     return total;
 }
 
-uint64_t remaining_lease_ttl_ms(const mooncake::QueryResult& query_result,
-                                std::chrono::steady_clock::time_point now) {
-    if (query_result.IsLeaseExpired(now)) {
-        return 0;
-    }
-    return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            query_result.lease_timeout - now)
-            .count());
-}
-
-mooncake::CachedQueryResultResponse to_cached_query_result_response(
-    const tl::expected<mooncake::QueryResult, mooncake::ErrorCode>&
-        query_result,
-    std::chrono::steady_clock::time_point now) {
-    if (!query_result) {
-        return mooncake::CachedQueryResultResponse(query_result.error());
-    }
-    if (query_result->IsLeaseExpired(now)) {
-        return mooncake::CachedQueryResultResponse(
-            mooncake::ErrorCode::OBJECT_NOT_FOUND);
-    }
-    return mooncake::CachedQueryResultResponse(mooncake::GetReplicaListResponse(
-        std::vector<mooncake::Replica::Descriptor>(
-            query_result->replicas.begin(), query_result->replicas.end()),
-        remaining_lease_ttl_ms(*query_result, now)));
-}
-
-std::map<std::string, mooncake::CachedQueryResultResponse>
-build_cached_query_results(
-    const mooncake::PyClient::QueryResultCache* query_result_cache) {
-    std::map<std::string, mooncake::CachedQueryResultResponse>
-        cached_query_results;
-    if (query_result_cache == nullptr) {
-        return cached_query_results;
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    for (const auto& [key, query_result] : *query_result_cache) {
-        if (query_result && query_result->IsLeaseExpired(now)) {
-            continue;
-        }
-        cached_query_results.emplace(
-            key, to_cached_query_result_response(query_result, now));
-    }
-    return cached_query_results;
-}
-
 size_t sum_sizes(const std::vector<size_t>& sizes) {
     size_t total = 0;
     for (size_t size : sizes) {
@@ -1091,7 +1043,8 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
     const QueryResultCache* query_result_cache) {
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
-    auto cached_query_results = build_cached_query_results(query_result_cache);
+    auto cached_query_results =
+        build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,

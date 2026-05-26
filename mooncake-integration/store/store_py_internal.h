@@ -87,8 +87,7 @@ struct TensorIntoFragment {
 
 struct PlannedQueryResult {
     std::string read_key;
-    tl::expected<QueryResult, ErrorCode> query_result =
-        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    CachedQueryResultResponse cached_query_result;
 };
 
 struct TensorIntoPlan {
@@ -115,8 +114,7 @@ enum class ParallelismShardReadStorageRoute {
 struct ReconstructedShardSource {
     std::string read_key;
     ParsedTensorMetadata metadata;
-    tl::expected<QueryResult, ErrorCode> query_result =
-        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    CachedQueryResultResponse cached_query_result;
 };
 
 struct FullTensorReconstructionSources {

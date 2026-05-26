@@ -80,51 +80,6 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
 }
 #endif
 
-CachedQueryResultResponse to_cached_query_result_response(
-    const tl::expected<QueryResult, ErrorCode> &query_result,
-    std::chrono::steady_clock::time_point now) {
-    if (!query_result) {
-        return CachedQueryResultResponse(query_result.error());
-    }
-    const auto remaining_ttl_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            query_result->lease_timeout - now)
-            .count());
-    return CachedQueryResultResponse(GetReplicaListResponse(
-        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
-                                         query_result->replicas.end()),
-        remaining_ttl_ms));
-}
-
-tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
-    const CachedQueryResultResponse &cached_result,
-    std::chrono::steady_clock::time_point now) {
-    if (!cached_result.success) {
-        return tl::make_unexpected(cached_result.error);
-    }
-    return QueryResult(
-        std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
-                                         cached_result.value.replicas.end()),
-        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
-}
-
-PyClient::QueryResultCache build_query_result_cache_from_cached_results(
-    const std::map<std::string, CachedQueryResultResponse>
-        &cached_query_results) {
-    PyClient::QueryResultCache query_result_cache;
-    query_result_cache.reserve(cached_query_results.size());
-    auto now = std::chrono::steady_clock::now();
-    for (const auto &[key, cached_result] : cached_query_results) {
-        auto query_result =
-            from_cached_query_result_response(cached_result, now);
-        if (query_result && query_result->IsLeaseExpired(now)) {
-            continue;
-        }
-        query_result_cache.emplace(key, std::move(query_result));
-    }
-    return query_result_cache;
-}
-
 struct PreparedRangedReadRequest {
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
         results;

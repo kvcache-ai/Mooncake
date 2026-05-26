@@ -42,7 +42,24 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_prefix(
     return parsed;
 }
 
-std::optional<std::unordered_map<std::string, ReconstructedShardSource>>
+std::vector<CachedQueryResultResponse> batch_query_for_reuse(
+    const std::vector<std::string> &keys) {
+    if (auto real_client = std::dynamic_pointer_cast<RealClient>(store_)) {
+        return real_client->batch_get_query_results(keys);
+    }
+
+    auto query_results = store_->batch_query(keys);
+    std::vector<CachedQueryResultResponse> cached_results;
+    cached_results.reserve(query_results.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &query_result : query_results) {
+        cached_results.push_back(
+            to_cached_query_result_response(query_result, now));
+    }
+    return cached_results;
+}
+
+std::optional<std::vector<ReconstructedShardSource>>
 load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
                                        const std::string &context) {
     if (!is_client_initialized()) {
@@ -50,62 +67,67 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         return std::nullopt;
     }
     if (keys.empty()) {
-        return std::unordered_map<std::string, ReconstructedShardSource>{};
+        return std::vector<ReconstructedShardSource>{};
     }
 
-    std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+    std::vector<CachedQueryResultResponse> cached_query_results;
     {
         py::gil_scoped_release release_gil;
-        query_results = store_->batch_query(keys);
+        cached_query_results = batch_query_for_reuse(keys);
     }
-    if (query_results.size() != keys.size()) {
+    if (cached_query_results.size() != keys.size()) {
         LOG(ERROR) << context << ": BatchQuery result size mismatch";
         return std::nullopt;
     }
 
     mooncake::PyClient::QueryResultCache query_result_cache;
-    std::vector<std::shared_ptr<BufferHandle>> metadata_handles;
+    auto now = std::chrono::steady_clock::now();
     std::vector<void *> metadata_buffers;
     std::vector<size_t> metadata_key_indices;
-    metadata_handles.reserve(keys.size());
     metadata_buffers.reserve(keys.size());
     metadata_key_indices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!query_results[i]) {
-            continue;
+        auto query_result =
+            from_cached_query_result_response(cached_query_results[i], now);
+        if (!query_result) {
+            LOG(ERROR) << context << ": missing query result for key "
+                       << keys[i] << ": " << toString(query_result.error());
+            return std::nullopt;
         }
-
-        query_result_cache.emplace(keys[i], query_results[i]);
-
-        auto alloc_result =
-            store_->client_buffer_allocator_->allocate(sizeof(TensorMetadata));
-        if (!alloc_result) {
-            LOG(ERROR) << context
-                       << ": failed to allocate metadata buffer for key "
+        if (query_result->IsLeaseExpired(now)) {
+            LOG(ERROR) << context << ": expired query result for key "
                        << keys[i];
             return std::nullopt;
         }
-        auto metadata_handle =
-            std::make_shared<BufferHandle>(std::move(*alloc_result));
-        metadata_buffers.push_back(metadata_handle->ptr());
+
+        query_result_cache.emplace(keys[i], std::move(query_result));
         metadata_key_indices.push_back(i);
-        metadata_handles.push_back(std::move(metadata_handle));
     }
 
     std::vector<std::optional<ParsedTensorMetadata>> prefix_metadata(
         keys.size());
     if (!metadata_key_indices.empty()) {
+        std::unique_lock<std::mutex> scratch_lock(
+            metadata_prefix_scratch_mutex_);
+        if (!ensure_metadata_prefix_scratch_locked(metadata_key_indices.size(),
+                                                   context)) {
+            return std::nullopt;
+        }
+
+        char *scratch_base = metadata_prefix_scratch_.get();
         std::vector<std::vector<std::string>> metadata_all_keys(
             metadata_key_indices.size());
         std::vector<std::vector<std::vector<size_t>>> metadata_all_dst_offsets(
-            metadata_key_indices.size(), {{0}});
+            metadata_key_indices.size());
         std::vector<std::vector<std::vector<size_t>>> metadata_all_src_offsets(
             metadata_key_indices.size(), {{0}});
         std::vector<std::vector<std::vector<size_t>>> metadata_all_sizes(
             metadata_key_indices.size(), {{sizeof(TensorMetadata)}});
         for (size_t i = 0; i < metadata_key_indices.size(); ++i) {
+            metadata_buffers.push_back(scratch_base);
             metadata_all_keys[i] = {keys[metadata_key_indices[i]]};
+            metadata_all_dst_offsets[i] = {{i * sizeof(TensorMetadata)}};
         }
 
         py::gil_scoped_release release_gil;
@@ -115,39 +137,37 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         for (size_t i = 0;
              i < metadata_results.size() && i < metadata_key_indices.size();
              ++i) {
+            const size_t key_index = metadata_key_indices[i];
             if (metadata_results[i].size() == 1 &&
                 metadata_results[i][0].size() == 1 &&
                 metadata_results[i][0][0] ==
                     static_cast<int64_t>(sizeof(TensorMetadata))) {
-                prefix_metadata[metadata_key_indices[i]] =
-                    parse_tensor_metadata_from_prefix(
-                        metadata_buffers[i], context,
-                        keys[metadata_key_indices[i]]);
+                prefix_metadata[key_index] = parse_tensor_metadata_from_prefix(
+                    scratch_base + i * sizeof(TensorMetadata), context,
+                    keys[key_index]);
             }
         }
     }
 
-    std::unordered_map<std::string, ReconstructedShardSource> sources;
-    sources.reserve(metadata_key_indices.size());
+    std::vector<ReconstructedShardSource> sources;
+    sources.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!query_results[i]) {
-            continue;
-        }
-
         auto parsed = std::move(prefix_metadata[i]);
         if (!parsed.has_value()) {
             parsed = get_tensor_metadata(keys[i]);
         }
         if (!parsed.has_value()) {
-            continue;
+            LOG(ERROR) << context
+                       << ": missing reconstructed shard source for key "
+                       << keys[i];
+            return std::nullopt;
         }
-
-        sources.emplace(keys[i],
-                        ReconstructedShardSource{keys[i], *parsed,
-                                                 std::move(query_results[i])});
+        sources.push_back(ReconstructedShardSource{keys[i], *parsed,
+                                                   cached_query_results[i]});
     }
     return sources;
 }
+
 std::optional<TensorIntoPlan> build_tensor_into_plan(
     const std::string &read_key, uintptr_t buffer_ptr, size_t size,
     const std::string &context,
@@ -367,8 +387,8 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             covered[static_cast<size_t>(idx)] = true;
         }
 
-        plan.query_results.push_back(PlannedQueryResult{
-            source.read_key, std::move(source.query_result)});
+        plan.query_results.push_back(
+            PlannedQueryResult{source.read_key, source.cached_query_result});
         for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
             const size_t dst_offset =
                 region->offset + sizeof(TensorMetadata) +
@@ -626,10 +646,9 @@ load_tp_full_reconstruction_sources(
         return std::nullopt;
     }
 
-    FullTensorReconstructionSources reconstruction;
-    reconstruction.sources.reserve(axis.size);
+    std::vector<std::string> read_keys;
+    read_keys.reserve(axis.size);
     for (int shard_rank = 0; shard_rank < axis.size; ++shard_rank) {
-        std::string read_key;
         if (parallelism.has_value()) {
             auto shard_parallelism = *parallelism;
             auto tp_axis_index = find_tp_axis_index(shard_parallelism.axes);
@@ -639,33 +658,43 @@ load_tp_full_reconstruction_sources(
                 return std::nullopt;
             }
             shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
-            read_key = get_parallelism_key_name(key, shard_parallelism);
+            read_keys.push_back(
+                get_parallelism_key_name(key, shard_parallelism));
         } else {
-            read_key = resolve_tp_read_key(key, shard_rank, axis.size);
+            read_keys.push_back(
+                resolve_tp_read_key(key, shard_rank, axis.size));
         }
-        auto metadata = get_tensor_metadata(read_key);
-        if (!metadata.has_value()) {
-            return std::nullopt;
-        }
+    }
+
+    auto ordered_sources =
+        load_reconstructed_shard_sources_batch(read_keys, context);
+    if (!ordered_sources.has_value()) {
+        return std::nullopt;
+    }
+
+    FullTensorReconstructionSources reconstruction;
+    reconstruction.sources.reserve(axis.size);
+    for (int shard_rank = 0; shard_rank < axis.size; ++shard_rank) {
+        auto &source = (*ordered_sources)[shard_rank];
+        const auto &metadata = source.metadata;
         const LayoutAxis *tp_axis =
-            find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
-        if (!is_shard_tensor_metadata(metadata->metadata) || !tp_axis ||
+            find_layout_axis(metadata.metadata, LayoutAxisKind::TP);
+        if (!is_shard_tensor_metadata(metadata.metadata) || !tp_axis ||
             tp_axis->shard_rank != shard_rank ||
             tp_axis->shard_count != axis.size) {
             LOG(ERROR) << context << ": TP metadata mismatch for key "
-                       << read_key;
+                       << source.read_key;
             return std::nullopt;
         }
         if (parallelism.has_value()) {
             auto stored_parallelism =
                 resolve_tp_compatible_parallelism_from_metadata(
-                    *parallelism, metadata->metadata, context);
+                    *parallelism, metadata.metadata, context);
             if (!stored_parallelism.has_value()) {
                 return std::nullopt;
             }
         }
-        reconstruction.sources.push_back(
-            ReconstructedShardSource{read_key, *metadata});
+        reconstruction.sources.push_back(std::move(source));
     }
 
     reconstruction.global_shape = TensorShapeToVector(
@@ -720,32 +749,38 @@ std::optional<FullTensorReconstructionSources> load_writer_shard_reconstruction(
         return std::nullopt;
     }
 
-    FullTensorReconstructionSources reconstruction;
-    reconstruction.sources.reserve(shard_count);
+    std::vector<std::string> shard_keys;
+    shard_keys.reserve(shard_count);
     for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
         WriterPartitionSpec writer{
             .rank = shard_rank,
             .size = shard_count,
             .split_dim = split_dim,
         };
-        const std::string shard_key = get_writer_shard_key_name(key, writer);
-        auto metadata = get_tensor_metadata(shard_key);
-        if (!metadata.has_value()) {
-            LOG(ERROR) << context << ": missing writer shard key " << shard_key;
-            return std::nullopt;
-        }
-        auto writer_parallelism =
-            writer_partition_parallelism_from_metadata(metadata->metadata);
+        shard_keys.push_back(get_writer_shard_key_name(key, writer));
+    }
+
+    auto ordered_sources =
+        load_reconstructed_shard_sources_batch(shard_keys, context);
+    if (!ordered_sources.has_value()) {
+        return std::nullopt;
+    }
+
+    FullTensorReconstructionSources reconstruction;
+    reconstruction.sources.reserve(shard_count);
+    for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
+        auto &source = (*ordered_sources)[shard_rank];
+        auto writer_parallelism = writer_partition_parallelism_from_metadata(
+            source.metadata.metadata);
         if (!writer_parallelism.has_value() ||
             writer_parallelism->axes[0].rank != shard_rank ||
             writer_parallelism->axes[0].size != shard_count ||
             writer_parallelism->axes[0].split_dim != split_dim) {
             LOG(ERROR) << context << ": writer shard metadata mismatch for key "
-                       << shard_key;
+                       << source.read_key;
             return std::nullopt;
         }
-        reconstruction.sources.push_back(
-            ReconstructedShardSource{shard_key, *metadata});
+        reconstruction.sources.push_back(std::move(source));
     }
     reconstruction.global_shape = manifest.global_shape;
     reconstruction.split_dim = manifest.manifest.header.split_dim;
@@ -820,6 +855,21 @@ load_parallelism_manifest_reconstruction(
         return std::nullopt;
     }
 
+    std::vector<std::string> shard_keys;
+    shard_keys.reserve(shard_count);
+    for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
+        auto shard_parallelism = *canonical_parallelism;
+        shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
+        shard_parallelism.axes[*tp_axis_index].size = shard_count;
+        shard_keys.push_back(get_parallelism_key_name(key, shard_parallelism));
+    }
+
+    auto ordered_sources =
+        load_reconstructed_shard_sources_batch(shard_keys, context);
+    if (!ordered_sources.has_value()) {
+        return std::nullopt;
+    }
+
     FullTensorReconstructionSources reconstruction;
     reconstruction.global_shape = global_shape;
     reconstruction.split_dim = split_dim;
@@ -829,18 +879,10 @@ load_parallelism_manifest_reconstruction(
         auto shard_parallelism = *canonical_parallelism;
         shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
         shard_parallelism.axes[*tp_axis_index].size = shard_count;
-        const std::string shard_key =
-            get_parallelism_key_name(key, shard_parallelism);
-        auto metadata = get_tensor_metadata(shard_key);
-        if (!metadata.has_value()) {
-            LOG(ERROR) << context
-                       << ": no shard matched stored layout for TP rank "
-                       << shard_rank;
-            return std::nullopt;
-        }
+        auto &source = (*ordered_sources)[shard_rank];
         auto stored_parallelism =
             resolve_tp_compatible_parallelism_from_metadata(
-                shard_parallelism, metadata->metadata, context);
+                shard_parallelism, source.metadata.metadata, context);
         if (!stored_parallelism.has_value() ||
             !parallelism_specs_equal_by_kind(
                 shard_parallelism, *stored_parallelism,
@@ -849,8 +891,7 @@ load_parallelism_manifest_reconstruction(
                        << shard_rank;
             return std::nullopt;
         }
-        reconstruction.sources.push_back(
-            ReconstructedShardSource{shard_key, *metadata});
+        reconstruction.sources.push_back(std::move(source));
     }
     return reconstruction;
 }
@@ -920,21 +961,25 @@ load_parallelism_full_reconstruction_sources(
             return std::nullopt;
         }
         reconstruction.dtype = first_metadata->metadata.header.dtype;
+        std::vector<std::string> shard_keys;
+        shard_keys.reserve(stored_tp_axis->shard_count);
+        for (int shard_rank = 0; shard_rank < stored_tp_axis->shard_count;
+             ++shard_rank) {
+            shard_keys.push_back(resolve_tp_read_key(
+                key, shard_rank, stored_tp_axis->shard_count));
+        }
+        auto ordered_sources =
+            load_reconstructed_shard_sources_batch(shard_keys, context);
+        if (!ordered_sources.has_value()) {
+            return std::nullopt;
+        }
         reconstruction.sources.reserve(stored_tp_axis->shard_count);
         for (int shard_rank = 0; shard_rank < stored_tp_axis->shard_count;
              ++shard_rank) {
-            const std::string shard_key = resolve_tp_read_key(
-                key, shard_rank, stored_tp_axis->shard_count);
-            auto metadata = get_tensor_metadata(shard_key);
-            if (!metadata.has_value()) {
-                LOG(ERROR) << context
-                           << ": no shard matched stored layout for TP rank "
-                           << shard_rank;
-                return std::nullopt;
-            }
+            auto &source = (*ordered_sources)[shard_rank];
             const LayoutAxis *source_tp_axis =
-                find_layout_axis(metadata->metadata, LayoutAxisKind::TP);
-            if (!is_shard_tensor_metadata(metadata->metadata) ||
+                find_layout_axis(source.metadata.metadata, LayoutAxisKind::TP);
+            if (!is_shard_tensor_metadata(source.metadata.metadata) ||
                 !source_tp_axis || source_tp_axis->shard_rank != shard_rank ||
                 source_tp_axis->shard_count != stored_tp_axis->shard_count ||
                 source_tp_axis->split_dim != reconstruction.split_dim) {
@@ -943,29 +988,33 @@ load_parallelism_full_reconstruction_sources(
                            << shard_rank;
                 return std::nullopt;
             }
-            reconstruction.sources.push_back(
-                ReconstructedShardSource{shard_key, *metadata});
+            reconstruction.sources.push_back(std::move(source));
         }
         return reconstruction;
+    }
+
+    std::vector<std::string> shard_keys;
+    shard_keys.reserve(request_tp_axis->size);
+    for (int shard_rank = 0; shard_rank < request_tp_axis->size; ++shard_rank) {
+        auto shard_parallelism = *canonical_parallelism;
+        shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
+        shard_keys.push_back(get_parallelism_key_name(key, shard_parallelism));
+    }
+    auto ordered_sources =
+        load_reconstructed_shard_sources_batch(shard_keys, context);
+    if (!ordered_sources.has_value()) {
+        return std::nullopt;
     }
 
     reconstruction.sources.reserve(request_tp_axis->size);
     for (int shard_rank = 0; shard_rank < request_tp_axis->size; ++shard_rank) {
         auto shard_parallelism = *canonical_parallelism;
         shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
-        const std::string shard_key =
-            get_parallelism_key_name(key, shard_parallelism);
-        auto metadata = get_tensor_metadata(shard_key);
-        if (!metadata.has_value()) {
-            LOG(ERROR) << context
-                       << ": no shard matched requested layout for TP rank "
-                       << shard_rank;
-            return std::nullopt;
-        }
+        auto &source = (*ordered_sources)[shard_rank];
 
         auto stored_parallelism =
             resolve_tp_compatible_parallelism_from_metadata(
-                shard_parallelism, metadata->metadata, context);
+                shard_parallelism, source.metadata.metadata, context);
         if (!stored_parallelism.has_value() ||
             !parallelism_specs_equal_by_kind(
                 *canonical_parallelism, *stored_parallelism,
@@ -974,8 +1023,7 @@ load_parallelism_full_reconstruction_sources(
                        << shard_rank;
             return std::nullopt;
         }
-        reconstruction.sources.push_back(
-            ReconstructedShardSource{shard_key, *metadata});
+        reconstruction.sources.push_back(std::move(source));
     }
 
     const LayoutAxis *stored_tp_axis = find_layout_axis(
@@ -1183,11 +1231,16 @@ std::vector<bool> execute_tensor_into_plan_transfers(
     {
         py::gil_scoped_release release_gil;
         mooncake::PyClient::QueryResultCache merged_query_result_cache;
+        auto now = std::chrono::steady_clock::now();
         for (auto &plan : plans) {
             for (auto &planned_query_result : plan.query_results) {
-                merged_query_result_cache.emplace(
-                    std::move(planned_query_result.read_key),
-                    std::move(planned_query_result.query_result));
+                auto query_result = from_cached_query_result_response(
+                    planned_query_result.cached_query_result, now);
+                if (!query_result || query_result->IsLeaseExpired(now)) {
+                    continue;
+                }
+                merged_query_result_cache.emplace(planned_query_result.read_key,
+                                                  std::move(query_result));
             }
         }
         range_results = store_->get_into_ranges(
