@@ -113,13 +113,38 @@ __device__ __forceinline__ int ld_acquire_cta(const int *ptr) {
 // MUSA: no L1::no_allocate hint, use volatile as fallback
 template <typename dtype_t>
 __device__ __forceinline__ dtype_t ld_nc_global(const dtype_t *ptr) {
-    return *const_cast<volatile dtype_t*>(ptr);
+    dtype_t ret;
+    memcpy(&ret, const_cast<const dtype_t*>(ptr), sizeof(dtype_t));
+    return ret;
+}
+
+// Specialization for int4 (volatile cast doesn't work on aggregate)
+template <>
+__device__ __forceinline__ int4 ld_nc_global(const int4 *ptr) {
+    int4 ret;
+    memcpy(&ret, ptr, sizeof(int4));
+    return ret;
+}
+
+// Specialization for int2
+template <>
+__device__ __forceinline__ int2 ld_nc_global(const int2 *ptr) {
+    int2 ret;
+    memcpy(&ret, ptr, sizeof(int2));
+    return ret;
 }
 
 template <typename dtype_t>
 __device__ __forceinline__ void st_na_global(const dtype_t *ptr,
                                              const dtype_t &value) {
-    *const_cast<volatile dtype_t*>(ptr) = value;
+    memcpy(const_cast<dtype_t*>(ptr), &value, sizeof(dtype_t));
+}
+
+// Specialization for int4
+template <>
+__device__ __forceinline__ void st_na_global(const int4 *ptr,
+                                             const int4 &value) {
+    memcpy(const_cast<int4*>(ptr), &value, sizeof(int4));
 }
 
 __device__ __forceinline__ void st_na_release(const int *ptr, int val) {

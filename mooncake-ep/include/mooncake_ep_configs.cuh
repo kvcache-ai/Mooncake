@@ -43,6 +43,14 @@
 #include <musa_bf16.h>
 // MUSA type aliases for CUDA compatibility
 using nv_bfloat16 = mt_bfloat16;
+// MUSA FP8 stubs (MUSA does not support FP8, but templates still compile)
+using __nv_fp8_storage_t = uint8_t;
+using __nv_fp8x2_storage_t = uint16_t;
+#define __NV_SATFINITE 0
+#define __NV_E4M3 0
+__device__ __forceinline__ __nv_fp8x2_storage_t __nv_cvt_float2_to_fp8x2(float2, int, int) {
+    return 0;  // Never reached at runtime
+}
 // MUSA runtime API aliases (host-side code uses cuda* names)
 #define cudaMalloc musaMalloc
 #define cudaMallocHost musaMallocHost
