@@ -9,6 +9,7 @@ add_subdirectory(io_uring)
 add_subdirectory(bufio)
 add_subdirectory(ascend)
 add_subdirectory(sunrise_link)
+add_subdirectory(mtlink)
 
 add_library(tent_transport_all INTERFACE)
 foreach(
@@ -23,7 +24,8 @@ foreach(
   tent_xport_shm
   tent_xport_tcp
   tent_xport_ascend_direct
-  tent_xport_sunrise_link)
+  tent_xport_sunrise_link
+  tent_xport_mtlink)
   if(TARGET ${tgt})
     target_link_libraries(tent_transport_all INTERFACE ${tgt})
   endif()

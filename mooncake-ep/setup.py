@@ -94,8 +94,7 @@ setup(
             extra_link_args=[
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
-                "-l:engine.so",
-            ],
+            ] + ([] if use_musa else ["-l:engine.so"]),
         )
     ],
     cmdclass={"build_ext": BuildExtension},

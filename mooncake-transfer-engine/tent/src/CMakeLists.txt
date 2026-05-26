@@ -35,6 +35,17 @@ else()
   message(STATUS "ROCm/HIP: Disabled")
 endif()
 
+# MUSA (Moore Threads)
+if(USE_MUSA)
+  message(STATUS "MUSA: Enabled")
+  target_compile_definitions(tent_interface INTERFACE USE_MUSA)
+  target_include_directories(tent_interface INTERFACE /usr/local/musa/include)
+  target_link_directories(tent_interface INTERFACE /usr/local/musa/lib)
+  target_link_libraries(tent_interface INTERFACE musart)
+else()
+  message(STATUS "MUSA: Disabled")
+endif()
+
 # GDS
 find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
 find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
@@ -141,6 +152,7 @@ foreach(
   tent_xport_tcp
   tent_xport_ascend_direct
   tent_xport_sunrise_link
+  tent_xport_mtlink
   tent_metrics)
   if(TARGET ${tgt})
     target_link_libraries(tent_link_group INTERFACE ${tgt})

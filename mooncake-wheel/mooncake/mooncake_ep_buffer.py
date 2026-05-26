@@ -1,6 +1,32 @@
+import os
 import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
+
+# Detect MUSA platform
+USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+if USE_MUSA:
+    import torch_musa  # noqa: F401
+
+
+def _current_device():
+    if USE_MUSA:
+        return torch.musa.current_device()
+    return torch.cuda.current_device()
+
+
+def _device_str(device_id=None):
+    prefix = "musa" if USE_MUSA else "cuda"
+    if device_id is not None:
+        return f"{prefix}:{device_id}"
+    return prefix
+
+
+def _synchronize():
+    if USE_MUSA:
+        torch.musa.synchronize()
+    else:
+        torch.cuda.synchronize()
 
 
 class EventOverlap:
@@ -77,8 +103,8 @@ class Buffer:
         self._metadata_session = Buffer._metadata_session_counter
         Buffer._metadata_session_counter += 1
         self._metadata_epoch = 0
-        preferred_hca = pg.get_preferred_hca(
-            self.group, f"cuda:{torch.cuda.current_device()}"
+        preferred_hca = "" if USE_MUSA else pg.get_preferred_hca(
+            self.group, f"{_device_str(_current_device())}"
         )
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca
@@ -625,7 +651,7 @@ class Buffer:
     # -----------------
     class _DummyEvent:
         def current_stream_wait(self):
-            torch.cuda.synchronize()
+            _synchronize()
 
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
