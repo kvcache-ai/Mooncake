@@ -23,33 +23,28 @@ std::optional<ParsedTensorMetadata> get_tensor_metadata(
 }
 
 std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_prefix(
-    const void *buffer_ptr, size_t prefix_size, const std::string &context,
+    const void *buffer_ptr, const std::string &context,
     const std::string &key) {
-    if (buffer_ptr == nullptr || prefix_size < sizeof(TensorMetadata)) {
+    if (buffer_ptr == nullptr) {
         LOG(ERROR) << context << ": invalid metadata prefix for key " << key;
         return std::nullopt;
     }
 
     TensorMetadata metadata{};
     std::memcpy(&metadata, buffer_ptr, sizeof(TensorMetadata));
-    const size_t total_length =
+    auto parsed = ParseTensorMetadata(
+        static_cast<const char *>(buffer_ptr),
         static_cast<size_t>(metadata.header.data_offset) +
-        static_cast<size_t>(metadata.header.data_bytes);
-    if (!ValidateTensorMetadata(metadata, total_length)) {
+            static_cast<size_t>(metadata.header.data_bytes));
+    if (!parsed.has_value()) {
         LOG(ERROR) << context << ": invalid tensor metadata for key " << key;
-        return std::nullopt;
     }
-
-    return ParsedTensorMetadata{.metadata = metadata,
-                                .data_offset = static_cast<size_t>(
-                                    metadata.header.data_offset),
-                                .data_bytes = static_cast<size_t>(
-                                    metadata.header.data_bytes)};
+    return parsed;
 }
 
 std::optional<std::unordered_map<std::string, ReconstructedShardSource>>
-load_reconstructed_shard_sources_batch(
-    const std::vector<std::string> &keys, const std::string &context) {
+load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
+                                       const std::string &context) {
     if (!is_client_initialized()) {
         LOG(ERROR) << context << ": client is not initialized";
         return std::nullopt;
@@ -69,21 +64,19 @@ load_reconstructed_shard_sources_batch(
     }
 
     mooncake::PyClient::QueryResultCache query_result_cache;
-    query_result_cache.reserve(keys.size());
-    std::vector<std::shared_ptr<BufferHandle>> metadata_handles(keys.size(),
-                                                                nullptr);
-    std::vector<std::string> metadata_keys;
+    std::vector<std::shared_ptr<BufferHandle>> metadata_handles;
     std::vector<void *> metadata_buffers;
     std::vector<size_t> metadata_key_indices;
-    metadata_keys.reserve(keys.size());
+    metadata_handles.reserve(keys.size());
     metadata_buffers.reserve(keys.size());
     metadata_key_indices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        query_result_cache.emplace(keys[i], query_results[i]);
         if (!query_results[i]) {
             continue;
         }
+
+        query_result_cache.emplace(keys[i], query_results[i]);
 
         auto alloc_result =
             store_->client_buffer_allocator_->allocate(sizeof(TensorMetadata));
@@ -93,43 +86,55 @@ load_reconstructed_shard_sources_batch(
                        << keys[i];
             return std::nullopt;
         }
-        metadata_handles[i] =
+        auto metadata_handle =
             std::make_shared<BufferHandle>(std::move(*alloc_result));
-        metadata_keys.push_back(keys[i]);
-        metadata_buffers.push_back(metadata_handles[i]->ptr());
+        metadata_buffers.push_back(metadata_handle->ptr());
         metadata_key_indices.push_back(i);
+        metadata_handles.push_back(std::move(metadata_handle));
     }
 
-    std::vector<int64_t> metadata_results_by_key(
-        keys.size(), static_cast<int64_t>(toInt(ErrorCode::INVALID_PARAMS)));
-    if (!metadata_keys.empty()) {
+    std::vector<std::optional<ParsedTensorMetadata>> prefix_metadata(
+        keys.size());
+    if (!metadata_key_indices.empty()) {
+        std::vector<std::vector<std::string>> metadata_all_keys(
+            metadata_key_indices.size());
+        std::vector<std::vector<std::vector<size_t>>> metadata_all_dst_offsets(
+            metadata_key_indices.size(), {{0}});
+        std::vector<std::vector<std::vector<size_t>>> metadata_all_src_offsets(
+            metadata_key_indices.size(), {{0}});
+        std::vector<std::vector<std::vector<size_t>>> metadata_all_sizes(
+            metadata_key_indices.size(), {{sizeof(TensorMetadata)}});
+        for (size_t i = 0; i < metadata_key_indices.size(); ++i) {
+            metadata_all_keys[i] = {keys[metadata_key_indices[i]]};
+        }
+
         py::gil_scoped_release release_gil;
-        auto metadata_results = store_->batch_get_metadata_prefixes(
-            metadata_keys, metadata_buffers, sizeof(TensorMetadata),
-            &query_result_cache);
-        for (size_t i = 0; i < metadata_results.size() &&
-                           i < metadata_key_indices.size();
+        auto metadata_results = store_->get_into_ranges(
+            metadata_buffers, metadata_all_keys, metadata_all_dst_offsets,
+            metadata_all_src_offsets, metadata_all_sizes, &query_result_cache);
+        for (size_t i = 0;
+             i < metadata_results.size() && i < metadata_key_indices.size();
              ++i) {
-            metadata_results_by_key[metadata_key_indices[i]] = metadata_results[i];
+            if (metadata_results[i].size() == 1 &&
+                metadata_results[i][0].size() == 1 &&
+                metadata_results[i][0][0] ==
+                    static_cast<int64_t>(sizeof(TensorMetadata))) {
+                prefix_metadata[metadata_key_indices[i]] =
+                    parse_tensor_metadata_from_prefix(
+                        metadata_buffers[i], context,
+                        keys[metadata_key_indices[i]]);
+            }
         }
     }
 
     std::unordered_map<std::string, ReconstructedShardSource> sources;
-    sources.reserve(keys.size());
+    sources.reserve(metadata_key_indices.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto cache_it = query_result_cache.find(keys[i]);
-        if (cache_it == query_result_cache.end() || !cache_it->second) {
+        if (!query_results[i]) {
             continue;
         }
 
-        std::optional<ParsedTensorMetadata> parsed;
-        if (metadata_handles[i] &&
-            metadata_results_by_key[i] ==
-                static_cast<int64_t>(sizeof(TensorMetadata))) {
-            parsed = parse_tensor_metadata_from_prefix(
-                metadata_handles[i]->ptr(), sizeof(TensorMetadata), context,
-                keys[i]);
-        }
+        auto parsed = std::move(prefix_metadata[i]);
         if (!parsed.has_value()) {
             parsed = get_tensor_metadata(keys[i]);
         }
@@ -139,7 +144,7 @@ load_reconstructed_shard_sources_batch(
 
         sources.emplace(keys[i],
                         ReconstructedShardSource{keys[i], *parsed,
-                                                 std::move(cache_it->second)});
+                                                 std::move(query_results[i])});
     }
     return sources;
 }
@@ -324,6 +329,7 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
     plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
     plan.registered_buffer_size = region->size;
     plan.total_length = total_length;
+    plan.query_results.reserve(sources.size());
     plan.materialized_metadata = materialized_metadata;
 
     int64_t elements_before = 1;
@@ -361,8 +367,8 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             covered[static_cast<size_t>(idx)] = true;
         }
 
-        plan.query_result_cache.emplace(source.read_key,
-                                        std::move(source.query_result));
+        plan.query_results.push_back(PlannedQueryResult{
+            source.read_key, std::move(source.query_result)});
         for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
             const size_t dst_offset =
                 region->offset + sizeof(TensorMetadata) +
@@ -1143,6 +1149,11 @@ std::vector<bool> execute_tensor_into_plan_transfers(
         std::vector<std::vector<size_t>> dst_offsets;
         std::vector<std::vector<size_t>> src_offsets;
         std::vector<std::vector<size_t>> sizes;
+        key_to_index.reserve(plan.fragments.size());
+        keys.reserve(plan.fragments.size());
+        dst_offsets.reserve(plan.fragments.size());
+        src_offsets.reserve(plan.fragments.size());
+        sizes.reserve(plan.fragments.size());
 
         for (const auto &fragment : plan.fragments) {
             if (fragment.read_key.empty() || fragment.size == 0) {
@@ -1152,9 +1163,9 @@ std::vector<bool> execute_tensor_into_plan_transfers(
                 key_to_index.emplace(fragment.read_key, keys.size());
             if (inserted) {
                 keys.push_back(fragment.read_key);
-                dst_offsets.push_back({});
-                src_offsets.push_back({});
-                sizes.push_back({});
+                dst_offsets.emplace_back();
+                src_offsets.emplace_back();
+                sizes.emplace_back();
             }
             const size_t key_index = it->second;
             dst_offsets[key_index].push_back(fragment.dst_offset);
@@ -1172,15 +1183,12 @@ std::vector<bool> execute_tensor_into_plan_transfers(
     {
         py::gil_scoped_release release_gil;
         mooncake::PyClient::QueryResultCache merged_query_result_cache;
-        size_t merged_cache_size = 0;
-        for (const auto &plan : plans) {
-            merged_cache_size += plan.query_result_cache.size();
-        }
-        merged_query_result_cache.reserve(merged_cache_size);
         for (auto &plan : plans) {
-            merged_query_result_cache.insert(
-                std::make_move_iterator(plan.query_result_cache.begin()),
-                std::make_move_iterator(plan.query_result_cache.end()));
+            for (auto &planned_query_result : plan.query_results) {
+                merged_query_result_cache.emplace(
+                    std::move(planned_query_result.read_key),
+                    std::move(planned_query_result.query_result));
+            }
         }
         range_results = store_->get_into_ranges(
             buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,

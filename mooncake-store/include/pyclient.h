@@ -211,8 +211,7 @@ class PyClient {
     // subsequent ranged reads in the same operation. Callers should not retain
     // entries across independent requests.
     using QueryResultCache =
-        std::unordered_map<std::string,
-                           tl::expected<QueryResult, ErrorCode>>;
+        std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
 
     virtual ~PyClient() = 0;
     virtual int setup_real(
@@ -255,40 +254,6 @@ class PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) = 0;
-
-    std::vector<int64_t> batch_get_metadata_prefixes(
-        const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-        size_t prefix_size, const QueryResultCache *query_result_cache = nullptr) {
-        std::vector<std::vector<std::string>> all_keys;
-        std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
-        std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
-        std::vector<std::vector<std::vector<size_t>>> all_sizes;
-        all_keys.reserve(keys.size());
-        all_dst_offsets.reserve(keys.size());
-        all_src_offsets.reserve(keys.size());
-        all_sizes.reserve(keys.size());
-        for (const auto &key : keys) {
-            all_keys.push_back({key});
-            all_dst_offsets.push_back({{0}});
-            all_src_offsets.push_back({{0}});
-            all_sizes.push_back({{prefix_size}});
-        }
-        auto results = get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                       all_src_offsets, all_sizes,
-                                       query_result_cache);
-        std::vector<int64_t> flattened;
-        flattened.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (i >= results.size() || results[i].size() != 1 ||
-                results[i][0].size() != 1) {
-                flattened.push_back(static_cast<int64_t>(
-                    toInt(ErrorCode::INVALID_PARAMS)));
-                continue;
-            }
-            flattened.push_back(results[i][0][0]);
-        }
-        return flattened;
-    }
 
     virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) = 0;

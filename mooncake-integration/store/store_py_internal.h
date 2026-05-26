@@ -85,7 +85,11 @@ struct TensorIntoFragment {
     size_t size{0};
 };
 
-using QueryResultCache = mooncake::PyClient::QueryResultCache;
+struct PlannedQueryResult {
+    std::string read_key;
+    tl::expected<QueryResult, ErrorCode> query_result =
+        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+};
 
 struct TensorIntoPlan {
     uintptr_t user_buffer_ptr{0};
@@ -93,7 +97,7 @@ struct TensorIntoPlan {
     size_t registered_buffer_size{0};
     size_t total_length{0};
     std::vector<TensorIntoFragment> fragments;
-    QueryResultCache query_result_cache;
+    std::vector<PlannedQueryResult> query_results;
     std::optional<TensorMetadata> materialized_metadata;
 };
 

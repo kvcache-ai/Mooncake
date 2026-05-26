@@ -37,14 +37,15 @@ uint64_t remaining_lease_ttl_ms(const mooncake::QueryResult& query_result,
     if (query_result.IsLeaseExpired(now)) {
         return 0;
     }
-    return static_cast<uint64_t>(std::chrono::duration_cast<
-                                      std::chrono::milliseconds>(
-                                      query_result.lease_timeout - now)
-                                      .count());
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result.lease_timeout - now)
+            .count());
 }
 
 mooncake::CachedQueryResultResponse to_cached_query_result_response(
-    const tl::expected<mooncake::QueryResult, mooncake::ErrorCode>& query_result,
+    const tl::expected<mooncake::QueryResult, mooncake::ErrorCode>&
+        query_result,
     std::chrono::steady_clock::time_point now) {
     if (!query_result) {
         return mooncake::CachedQueryResultResponse(query_result.error());
@@ -54,8 +55,8 @@ mooncake::CachedQueryResultResponse to_cached_query_result_response(
             mooncake::ErrorCode::OBJECT_NOT_FOUND);
     }
     return mooncake::CachedQueryResultResponse(mooncake::GetReplicaListResponse(
-        std::vector<mooncake::Replica::Descriptor>(query_result->replicas.begin(),
-                                                   query_result->replicas.end()),
+        std::vector<mooncake::Replica::Descriptor>(
+            query_result->replicas.begin(), query_result->replicas.end()),
         remaining_lease_ttl_ms(*query_result, now)));
 }
 
@@ -70,7 +71,7 @@ build_cached_query_results(
 
     auto now = std::chrono::steady_clock::now();
     for (const auto& [key, query_result] : *query_result_cache) {
-        if (!query_result || query_result->IsLeaseExpired(now)) {
+        if (query_result && query_result->IsLeaseExpired(now)) {
             continue;
         }
         cached_query_results.emplace(
@@ -1116,9 +1117,9 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     const std::vector<std::string>& keys) {
-    auto cached_results = invoke_rpc<&RealClient::batch_get_query_results,
-                                     std::vector<CachedQueryResultResponse>>(
-        keys);
+    auto cached_results =
+        invoke_rpc<&RealClient::batch_get_query_results,
+                   std::vector<CachedQueryResultResponse>>(keys);
     if (!cached_results) {
         return std::vector<tl::expected<QueryResult, ErrorCode>>(
             keys.size(), tl::unexpected(cached_results.error()));
@@ -1139,8 +1140,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
             continue;
         }
         results.emplace_back(QueryResult(
-            std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
-                                             cached_result.value.replicas.end()),
+            std::vector<Replica::Descriptor>(
+                cached_result.value.replicas.begin(),
+                cached_result.value.replicas.end()),
             now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
     }
     return results;

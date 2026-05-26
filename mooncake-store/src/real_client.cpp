@@ -115,8 +115,9 @@ PyClient::QueryResultCache build_query_result_cache_from_cached_results(
     query_result_cache.reserve(cached_query_results.size());
     auto now = std::chrono::steady_clock::now();
     for (const auto &[key, cached_result] : cached_query_results) {
-        auto query_result = from_cached_query_result_response(cached_result, now);
-        if (!query_result || query_result->IsLeaseExpired(now)) {
+        auto query_result =
+            from_cached_query_result_response(cached_result, now);
+        if (query_result && query_result->IsLeaseExpired(now)) {
             continue;
         }
         query_result_cache.emplace(key, std::move(query_result));
@@ -227,11 +228,11 @@ PreparedBatchReadSet prepare_batch_read_operations(
         auto key_slices = build_slices_for_index(i, replica);
         if (replica.is_local_disk_replica()) {
             prepared.local_disk_operations.emplace(
-                key, PreparedBatchReadOp{.key = key,
-                                         .original_index = i,
-                                         .query_result =
-                                             std::move(filtered_query_result),
-                                         .slices = std::move(key_slices)});
+                key, PreparedBatchReadOp{
+                         .key = key,
+                         .original_index = i,
+                         .query_result = std::move(filtered_query_result),
+                         .slices = std::move(key_slices)});
         } else {
             prepared.memory_operations.push_back(
                 {.key = key,
@@ -262,7 +263,8 @@ size_t execute_local_disk_batch_reads(
     size_t offload_object_count = 0;
     for (auto &[transport_endpoint, objects] : offload_objects) {
         offload_object_count += objects.size();
-        auto batch_get_offload_result = execute_batch(transport_endpoint, objects);
+        auto batch_get_offload_result =
+            execute_batch(transport_endpoint, objects);
         if (!batch_get_offload_result) {
             LOG(ERROR) << "Batch get store object failed with error: "
                        << batch_get_offload_result.error();
@@ -288,8 +290,8 @@ validate_batch_get_inputs(bool client_ready, size_t key_count,
             key_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
     if (key_count != buffer_count || key_count != size_count) {
-        LOG(ERROR) << "Input vector sizes mismatch: keys=" << key_count
-                   << ", " << buffer_label << "=" << buffer_count
+        LOG(ERROR) << "Input vector sizes mismatch: keys=" << key_count << ", "
+                   << buffer_label << "=" << buffer_count
                    << ", sizes=" << size_count;
         return std::vector<tl::expected<int64_t, ErrorCode>>(
             key_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
@@ -332,9 +334,8 @@ BatchReadExecutionStats execute_batch_read_operations(
         batch_slices[op.key] = op.slices;
     }
     if (!prepared.memory_operations.empty()) {
-        auto batch_get_results = execute_memory_batch(batch_keys,
-                                                      batch_query_results,
-                                                      batch_slices);
+        auto batch_get_results =
+            execute_memory_batch(batch_keys, batch_query_results, batch_slices);
         apply_batch_get_failures(batch_get_results, prepared.memory_operations,
                                  results);
     }
@@ -3428,13 +3429,13 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto read_via_offload = [&](void *dst, size_t read_size)
-        -> tl::expected<void, ErrorCode> {
+    auto read_via_offload =
+        [&](void *dst, size_t read_size) -> tl::expected<void, ErrorCode> {
         const auto &endpoint =
             replica.get_local_disk_descriptor().transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
-        objects.emplace(key,
-                        std::vector<Slice>{{static_cast<char *>(dst), read_size}});
+        objects.emplace(
+            key, std::vector<Slice>{{static_cast<char *>(dst), read_size}});
         return batch_get_into_offload_object_internal(endpoint, objects);
     };
 
@@ -3494,9 +3495,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
-    auto read_result = get_via_client(static_cast<char *>(buffer) + dst_offset,
-                                      src_offset, src_offset == 0 &&
-                                                      size == total_size);
+    auto read_result =
+        get_via_client(static_cast<char *>(buffer) + dst_offset, src_offset,
+                       src_offset == 0 && size == total_size);
     if (!read_result) {
         return tl::unexpected(read_result.error());
     }
@@ -3563,7 +3564,8 @@ RealClient::get_into_ranges_internal(
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return build_ranged_read_internal_error_results(
-            buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
+            buffers.size(), all_keys, all_dst_offsets,
+            ErrorCode::INVALID_PARAMS);
     }
 
     const size_t buffer_count = buffers.size();
@@ -3616,7 +3618,7 @@ RealClient::get_into_ranges_internal(
     auto now = std::chrono::steady_clock::now();
     if (query_result_cache != nullptr) {
         for (const auto &[key, query_result] : *query_result_cache) {
-            if (!query_result || query_result->IsLeaseExpired(now)) {
+            if (query_result && query_result->IsLeaseExpired(now)) {
                 continue;
             }
             resolved_query_results.emplace(key, query_result);
@@ -3628,8 +3630,8 @@ RealClient::get_into_ranges_internal(
     std::unordered_set<std::string> seen_missing_keys;
     seen_missing_keys.reserve(key_count_hint);
     for (size_t i = 0; i < buffer_count; ++i) {
-        if (buffer_capacities == nullptr && resolved_buffer_capacities[i] == 0 &&
-            !all_keys[i].empty()) {
+        if (buffer_capacities == nullptr &&
+            resolved_buffer_capacities[i] == 0 && !all_keys[i].empty()) {
             continue;
         }
         if (all_keys[i].size() != prepared.valid_fragments[i].size()) {
@@ -3641,10 +3643,10 @@ RealClient::get_into_ranges_internal(
                 resolved_query_results.end()) {
                 continue;
             }
-            const bool has_valid_fragment = std::any_of(
-                prepared.valid_fragments[i][j].begin(),
-                prepared.valid_fragments[i][j].end(),
-                [](bool valid_fragment) { return valid_fragment; });
+            const bool has_valid_fragment =
+                std::any_of(prepared.valid_fragments[i][j].begin(),
+                            prepared.valid_fragments[i][j].end(),
+                            [](bool valid_fragment) { return valid_fragment; });
             if (!has_valid_fragment) {
                 continue;
             }
@@ -3739,11 +3741,9 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     auto results =
         execute_timed_operation<std::vector<std::vector<std::vector<int64_t>>>>(
             [&]() {
-                return convert_ranged_read_results(
-                    get_into_ranges_internal(buffers, all_keys, all_dst_offsets,
-                                             all_src_offsets, all_sizes,
-                                             nullptr, nullptr, nullptr,
-                                             query_result_cache));
+                return convert_ranged_read_results(get_into_ranges_internal(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, nullptr, nullptr, nullptr, query_result_cache));
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -4843,7 +4843,9 @@ RealClient::batch_get_into_multi_buffers_internal(
     const auto query_results = client_->BatchQuery(keys);
     execute_batch_read_operations(
         keys, query_results, results, client_->GetLocalEndpoints(),
-        [&](size_t i) { return static_cast<uint64_t>(sum_sizes(all_sizes[i])); },
+        [&](size_t i) {
+            return static_cast<uint64_t>(sum_sizes(all_sizes[i]));
+        },
         [&](size_t i, const Replica::Descriptor &) {
             const auto &buffers = all_buffers[i];
             const auto &sizes = all_sizes[i];
@@ -5177,7 +5179,8 @@ std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
     std::vector<CachedQueryResultResponse> cached_results;
     cached_results.reserve(keys.size());
     if (query_results.size() != keys.size()) {
-        LOG(ERROR) << "Batch query response size mismatch in batch_get_query_results: expected "
+        LOG(ERROR) << "Batch query response size mismatch in "
+                      "batch_get_query_results: expected "
                    << keys.size() << ", got " << query_results.size() << ".";
         return std::vector<CachedQueryResultResponse>(
             keys.size(), CachedQueryResultResponse(ErrorCode::RPC_FAIL));
