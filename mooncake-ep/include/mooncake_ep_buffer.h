@@ -1,15 +1,24 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAContext.h>
+#include <musa_runtime.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#endif
 #include <fstream>
 #include <memory>
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <tent/device/mtlink_musa.cuh>
+#else
 #include <tent/device/ibgda.h>
 #include <tent/device/nvlink.h>
+#endif
 #else
 #include <tent/transport/ibgda/detail/memheap.h>
 #include <tent/transport/ibgda/detail/mlx5gda.h>
@@ -82,7 +91,7 @@ struct MooncakeEpBuffer {
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
-    // IBGDA
+    // IBGDA (not available on MUSA)
     static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
 #ifndef MOONCAKE_EP_USE_TENT
@@ -95,12 +104,18 @@ struct MooncakeEpBuffer {
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
+#ifndef MOONCAKE_EP_USE_MUSA
     tent::IbGdaDeviceContext tent_ibgda_ctx_;
+#endif
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
     int gid_index_ = -1;  // Dynamically discovered GID index
+#ifdef MOONCAKE_EP_USE_MUSA
+    int USE_QP_COUNT = 1;  // MUSA: no QPs, but need a non-zero value
+#else
     int USE_QP_COUNT = MAX_QP_COUNT;
+#endif
 
 #ifndef MOONCAKE_EP_USE_TENT
     mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
@@ -109,28 +124,39 @@ struct MooncakeEpBuffer {
     memheap* ctrl_buf_heap = nullptr;
 #endif
 #ifdef MOONCAKE_EP_USE_TENT
+#ifndef MOONCAKE_EP_USE_MUSA
     std::unique_ptr<tent::IbGdaDeviceTransport> tent_ibgda_transport_;
+#endif
 #endif
 
     // Fabric memory (MNNVL)
     bool use_fabric_mem_ = false;
+#ifndef MOONCAKE_EP_USE_MUSA
     CUmemGenericAllocationHandle fabric_mem_handle_{};
+#endif
     size_t fabric_alloc_size_ = 0;
 
-    // NVLink P2P
+    // NVLink/MTLink P2P
     int32_t* nvlink_available = nullptr;
 #ifndef MOONCAKE_EP_USE_TENT
     void** ipc_peer_ptrs_host = nullptr;
 #endif
     void** ipc_peer_ptrs = nullptr;
     bool p2p_ipc_all_enabled_ = false;
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
+    tent::MtLinkDeviceContext tent_mtlink_ctx_;
+    std::unique_ptr<tent::MtLinkDeviceTransport> tent_mtlink_transport_;
+#elif defined(MOONCAKE_EP_USE_TENT)
     tent::NvLinkDeviceContext tent_nvlink_ctx_;
     std::unique_ptr<tent::NvLinkDeviceTransport> tent_nvlink_transport_;
 #endif
 
     // Stream for communication
+#ifdef MOONCAKE_EP_USE_MUSA
+    at::musa::MUSAStream comm_stream;
+#else
     at::cuda::CUDAStream comm_stream;
+#endif
 
     // Workspace
     void* workspace = nullptr;
@@ -220,56 +246,51 @@ struct MooncakeEpBuffer {
         const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
         auto metadata = tent_ibgda_transport_->localMetadata();
         return {metadata.raddr, metadata.rkey};
 #else
-        return {(int64_t)mr->addr, (int32_t)mr->rkey};
+        return {(int64_t)0, (int32_t)0};
 #endif
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
         auto metadata = tent_ibgda_transport_->localMetadata();
         return {metadata.subnet_prefix, metadata.interface_id};
 #else
-        return {(int64_t)gid.global.subnet_prefix,
-                (int64_t)gid.global.interface_id};
+        return {(int64_t)0, (int64_t)0};
 #endif
     }
 
     std::vector<int32_t> get_local_qpns() {
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
         return tent_ibgda_transport_->localMetadata().qpns;
 #else
-        std::vector<int32_t> local_qpns;
-        for (int i = 0; i < USE_QP_COUNT; ++i) {
-            local_qpns.push_back((int32_t)qps[i]->qpn);
-        }
-        return local_qpns;
+        return {};
 #endif
     }
 
     std::vector<int32_t> get_local_lids() {
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
         return tent_ibgda_transport_->localMetadata().lids;
 #else
-        std::vector<int32_t> local_lids;
-        for (int i = 0; i < USE_QP_COUNT; ++i) {
-            local_lids.push_back((int32_t)qps[i]->port_attr.lid);
-        }
-        return local_lids;
+        return {};
 #endif
     }
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
     get_tent_ibgda_context_info() {
+#ifndef MOONCAKE_EP_USE_MUSA
         return {static_cast<int32_t>(tent_ibgda_ctx_.abi_version),
                 static_cast<int32_t>(tent_ibgda_ctx_.num_ranks),
                 static_cast<int32_t>(tent_ibgda_ctx_.num_qps),
                 reinterpret_cast<int64_t>(tent_ibgda_ctx_.raddrs),
                 reinterpret_cast<int64_t>(tent_ibgda_ctx_.rkeys),
                 reinterpret_cast<int64_t>(tent_ibgda_ctx_.qp_devctxs)};
+#else
+        return {0, 0, 0, 0, 0, 0};
+#endif
     }
 
     std::vector<int32_t> get_ipc_handle();

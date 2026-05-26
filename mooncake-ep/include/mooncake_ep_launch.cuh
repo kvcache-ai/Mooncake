@@ -2,6 +2,26 @@
 
 #include <mooncake_ep_configs.cuh>
 
+#ifdef MOONCAKE_EP_USE_MUSA
+// MUSA: no cudaLaunchConfig_t / cudaLaunchKernelEx / cooperative groups.
+// Use triple-chevron launch. Cooperative grid sync is not supported;
+// send+recv phases must be split into separate kernel launches.
+#ifndef SETUP_LAUNCH_CONFIG
+#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
+    dim3 _launch_grid(num_sms), _launch_block(num_threads); \
+    musaStream_t _launch_stream = stream
+#endif
+
+#ifndef LAUNCH_KERNEL
+#define LAUNCH_KERNEL(config, kernel, ...) \
+    do { \
+        kernel<<<_launch_grid, _launch_block, 0, _launch_stream>>>(__VA_ARGS__); \
+        CUDA_CHECK(musaGetLastError()); \
+    } while(0)
+#endif
+
+#else  // CUDA path
+
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
     cudaLaunchConfig_t cfg = {                            \
@@ -17,6 +37,8 @@
 #define LAUNCH_KERNEL(config, kernel, ...) \
     CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 #endif
+
+#endif  // MOONCAKE_EP_USE_MUSA
 
 #define SWITCH_RANKS(case_macro)                           \
     switch (num_ranks) {                                   \
@@ -75,6 +97,20 @@
             EP_HOST_ASSERT(false && "Unsupported type"); \
     }                                                    \
     while (false)
+
+#ifdef MOONCAKE_EP_USE_MUSA
+// MUSA does not support FP8; force use_fp8=false at caller level
+#define SWITCH_TYPES_NO_FP8(case_macro)                  \
+    switch (type) {                                      \
+        case CUDA_R_16BF:                                \
+            case_macro(nv_bfloat16);                     \
+        case CUDA_R_32F:                                 \
+            case_macro(float);                           \
+        default:                                         \
+            EP_HOST_ASSERT(false && "Unsupported type"); \
+    }                                                    \
+    while (false)
+#endif
 
 #define SWITCH_HIDDEN(case_macro)                          \
     switch (hidden) {                                      \

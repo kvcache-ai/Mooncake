@@ -2,11 +2,21 @@
 #include <arpa/inet.h>
 #include <glog/logging.h>
 
+#ifdef MOONCAKE_EP_USE_MUSA
+// MUSA: no InfiniBand headers available
+#else
+#include <infiniband/mlx5dv.h>
+#endif
+
 namespace mooncake {
 
 // Check if all GPUs support fabric memory handles (MNNVL).
 // Mirrors the check in nvlink_transport.cpp.
 static bool supportFabricMem() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no fabric memory support yet
+    return false;
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     return tent::nvLinkSupportsFabricMemory();
 #else
@@ -27,6 +37,7 @@ static bool supportFabricMem() {
     }
     return true;
 #endif
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 #ifndef MOONCAKE_EP_USE_TENT
@@ -61,6 +72,7 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port,
 #endif
 
 void MooncakeEpBuffer::refresh_tent_ibgda_context() {
+#ifndef MOONCAKE_EP_USE_MUSA
     tent_ibgda_ctx_.abi_version = tent::kIbGdaDeviceContextAbiVersion;
     tent_ibgda_ctx_.rank = rank;
     tent_ibgda_ctx_.num_ranks = num_ranks;
@@ -68,6 +80,7 @@ void MooncakeEpBuffer::refresh_tent_ibgda_context() {
     tent_ibgda_ctx_.raddrs = raddrs;
     tent_ibgda_ctx_.rkeys = rkeys;
     tent_ibgda_ctx_.qp_devctxs = qp_devctxs;
+#endif
 }
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
@@ -77,7 +90,11 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       device_name(std::move(device_name)),
+#ifdef MOONCAKE_EP_USE_MUSA
+      comm_stream(at::musa::getStreamFromPool(true)) {
+#else
       comm_stream(at::cuda::getStreamFromPool(true)) {
+#endif
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -88,6 +105,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // handle so the buffer is accessible cross-node via NVLink fabric.
     // On IB clusters or single-node setups, fall back to cudaMalloc.
     use_fabric_mem_ = supportFabricMem();
+#ifndef MOONCAKE_EP_USE_MUSA
     if (use_fabric_mem_) {
         CUdevice cu_dev;
         CUresult res = cuDeviceGet(&cu_dev, device_id);
@@ -168,8 +186,13 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     } else {
         CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
     }
+#else  // MOONCAKE_EP_USE_MUSA
+    // MUSA: no fabric memory, simple musaMalloc
+    CUDA_CHECK(musaMalloc(&gdr_buffer, num_ep_buffer_bytes));
+#endif  // MOONCAKE_EP_USE_MUSA
     CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
+#ifndef MOONCAKE_EP_USE_MUSA
 #ifdef MOONCAKE_EP_USE_TENT
     CUDA_CHECK(cudaMalloc(
         &qp_devctxs, USE_QP_COUNT * tent::ibGdaQueuePairDeviceContextSize()));
@@ -178,9 +201,22 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                           USE_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
 #endif
     refresh_tent_ibgda_context();
+#endif  // MOONCAKE_EP_USE_MUSA
 
-    // Allocate NVLink P2P arrays
-#ifdef MOONCAKE_EP_USE_TENT
+    // Allocate NVLink/MTLink P2P arrays
+#if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
+    tent_mtlink_transport_ = tent::createMtLinkDeviceTransport();
+    auto mtlink_status =
+        tent_mtlink_transport_->allocatePeerAccessTables(rank, num_ranks);
+    if (!mtlink_status.ok()) {
+        LOG(ERROR) << "[EP] Failed to allocate TENT MTLink peer tables: "
+                   << std::string(mtlink_status.message());
+        throw std::runtime_error("Failed to allocate TENT MTLink peer tables");
+    }
+    tent_mtlink_ctx_ = tent_mtlink_transport_->deviceContext();
+    nvlink_available = tent_mtlink_ctx_.available;
+    ipc_peer_ptrs = tent_mtlink_ctx_.peer_ptrs;
+#elif defined(MOONCAKE_EP_USE_TENT)
     tent_nvlink_transport_ = tent::createNvLinkDeviceTransport();
     auto nvlink_status =
         tent_nvlink_transport_->allocatePeerAccessTables(rank, num_ranks);
@@ -203,10 +239,15 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMemset(ipc_peer_ptrs, 0, num_ranks * sizeof(void*)));
 #endif
 
+#ifndef MOONCAKE_EP_USE_MUSA
     int ret = init_ibgda();
     if (ret != 0) {
         ibgda_disabled_ = true;
     }
+#else
+    // MUSA: no IBGDA, always disabled
+    ibgda_disabled_ = true;
+#endif
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
@@ -214,7 +255,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-#ifndef MOONCAKE_EP_USE_TENT
+#if !defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
     for (auto* qp : qps) {
         if (qp && ctrl_buf_heap) {
             mlx5gda_destroy_qp(ctrl_buf_heap, qp);
@@ -223,17 +264,18 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     qps.clear();
     if (ctrl_buf_heap) memheap_destroy(ctrl_buf_heap);
 #endif
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
     // TENT owns QP/heap/control-buffer/PD/MR in the migration path. It must be
     // destroyed before gdr_buffer free so its MR is deregistered while the GPU
     // buffer is still valid.
     if (tent_ibgda_transport_) tent_ibgda_transport_.reset();
-#else
+#elif !defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
     if (ctrl_buf_umem) mlx5dv_devx_umem_dereg(ctrl_buf_umem);
     if (mr) ibv_dereg_mr(mr);
     if (pd) ibv_dealloc_pd(pd);
     if (ctrl_buf) cudaFree(ctrl_buf);
 #endif
+#ifndef MOONCAKE_EP_USE_MUSA
     if (use_fabric_mem_) {
         CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
         cuMemUnmap(dptr, fabric_alloc_size_);
@@ -242,10 +284,15 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     } else {
         cudaFree(gdr_buffer);
     }
+#else
+    musaFree(gdr_buffer);
+#endif
     cudaFree(raddrs);
     cudaFree(rkeys);
+#ifndef MOONCAKE_EP_USE_MUSA
     cudaFree(qp_devctxs);
-#ifndef MOONCAKE_EP_USE_TENT
+#endif
+#if !defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
     if (nvlink_available) cudaFree(nvlink_available);
     if (ipc_peer_ptrs) cudaFree(ipc_peer_ptrs);
     if (ipc_peer_ptrs_host) {
@@ -258,7 +305,9 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
         }
         cudaFreeHost(ipc_peer_ptrs_host);
     }
-#else
+#elif defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
+    if (tent_mtlink_transport_) tent_mtlink_transport_.reset();
+#elif defined(MOONCAKE_EP_USE_TENT)
     if (tent_nvlink_transport_) tent_nvlink_transport_.reset();
 #endif
 }
@@ -299,7 +348,11 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
+#ifdef MOONCAKE_EP_USE_MUSA
+    auto compute_stream = at::musa::getCurrentMUSAStream();
+#else
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+#endif
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -311,12 +364,12 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
     auto packed_recv_src_info = torch::empty(
         {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank},
-        torch::dtype(torch::kInt32).device(torch::kCUDA));
+        torch::dtype(torch::kInt32).device(kDeviceType));
     auto packed_recv_layout_range =
         torch::empty({num_local_experts, num_ranks},
-                     torch::dtype(torch::kInt64).device(torch::kCUDA));
+                     torch::dtype(torch::kInt64).device(kDeviceType));
     auto packed_recv_count = torch::zeros(
-        {num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+        {num_local_experts}, torch::dtype(torch::kInt32).device(kDeviceType));
 
     // Allocate column-majored scales
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
@@ -328,7 +381,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         packed_recv_x_scales =
             torch::empty({num_local_experts, num_scales,
                           num_ranks * num_max_dispatch_tokens_per_rank},
-                         torch::dtype(torch::kFloat32).device(torch::kCUDA));
+                         torch::dtype(torch::kFloat32).device(kDeviceType));
         packed_recv_x_scales =
             torch::transpose(packed_recv_x_scales.value(), 1, 2);
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr<float>();
@@ -428,7 +481,11 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
+#ifdef MOONCAKE_EP_USE_MUSA
+    auto compute_stream = at::musa::getCurrentMUSAStream();
+#else
     auto compute_stream = at::cuda::getCurrentCUDAStream();
+#endif
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -507,10 +564,14 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
          hidden},
         {num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems,
          num_msg_elems, 1},
-        torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+        torch::TensorOptions().dtype(dtype).device(kDeviceType));
 }
 
 int MooncakeEpBuffer::init_ibgda() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no IBGDA support
+    return -1;
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     tent_ibgda_transport_ = tent::createIbGdaDeviceTransport();
     auto status = tent_ibgda_transport_->initializeDevice(device_name, 1);
@@ -677,9 +738,13 @@ int MooncakeEpBuffer::init_ibgda() {
     }
 #endif
     return 0;
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 bool MooncakeEpBuffer::update_local_qpns() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return true;
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     auto status = tent_ibgda_transport_->recreateQueuePairs(
         USE_QP_COUNT, 16384, comm_stream.stream(), qp_devctxs);
@@ -731,6 +796,7 @@ bool MooncakeEpBuffer::update_local_qpns() {
     }
 #endif
     return true;
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
@@ -738,6 +804,9 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                                const std::vector<int32_t>& remote_qpns,
                                const std::vector<int32_t>& remote_lids,
                                const std::vector<int>& active_ranks_mask) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no IB support
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     LOG(FATAL) << "sync_ib legacy path must not be called in TENT mode";
 #else
@@ -769,6 +838,7 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
                    cudaMemcpyHostToDevice);
     }
 #endif
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
@@ -777,6 +847,9 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int64_t>& subnet_prefixes,
                                  const std::vector<int64_t>& interface_ids,
                                  const std::vector<int>& active_ranks_mask) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no RoCE support
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     LOG(FATAL) << "sync_roce legacy path must not be called in TENT mode";
 #else
@@ -815,6 +888,7 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                    cudaMemcpyHostToDevice);
     }
 #endif
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 void MooncakeEpBuffer::sync_ibgda_peers(
@@ -825,6 +899,9 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     const std::vector<int64_t>& subnet_prefixes,
     const std::vector<int64_t>& interface_ids,
     const std::vector<int>& active_ranks_mask) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no IBGDA peer sync
+#else
 #ifdef MOONCAKE_EP_USE_TENT
     auto status = tent_ibgda_transport_->connectPeers(
         remote_addrs, remote_keys, peer_qpns, peer_lids, subnet_prefixes,
@@ -860,6 +937,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
                 active_ranks_mask);
     }
 #endif
+#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
@@ -869,7 +947,16 @@ std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
         // to skip IPC for this rank.
         return {};
     }
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
+    tent::MtLinkIpcHandle handle;
+    auto status = tent_mtlink_transport_->exportIpcHandle(gdr_buffer, handle);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] Failed to export TENT MTLink IPC handle: "
+                   << std::string(status.message());
+        throw std::runtime_error("Failed to export TENT MTLink IPC handle");
+    }
+    return handle.words;
+#elif defined(MOONCAKE_EP_USE_TENT)
     tent::NvLinkIpcHandle handle;
     auto status = tent_nvlink_transport_->exportIpcHandle(gdr_buffer, handle);
     if (!status.ok()) {
@@ -894,7 +981,23 @@ std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
 void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
-#ifdef MOONCAKE_EP_USE_TENT
+#if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
+    std::vector<tent::MtLinkIpcHandle> handles(remote_handles.size());
+    for (size_t i = 0; i < remote_handles.size(); ++i) {
+        handles[i].words = remote_handles[i];
+    }
+    auto status = tent_mtlink_transport_->configurePeers(
+        device_id, gdr_buffer, handles, active_ranks_mask, use_fabric_mem_);
+    if (!status.ok()) {
+        LOG(ERROR) << "[EP] Failed to configure TENT MTLink peers: "
+                   << std::string(status.message());
+        throw std::runtime_error("Failed to configure TENT MTLink peers");
+    }
+    tent_mtlink_ctx_ = tent_mtlink_transport_->deviceContext();
+    nvlink_available = tent_mtlink_ctx_.available;
+    ipc_peer_ptrs = tent_mtlink_ctx_.peer_ptrs;
+    p2p_ipc_all_enabled_ = tent_mtlink_transport_->allPeersAccessible();
+#elif defined(MOONCAKE_EP_USE_TENT)
     std::vector<tent::NvLinkIpcHandle> handles(remote_handles.size());
     for (size_t i = 0; i < remote_handles.size(); ++i) {
         handles[i].words = remote_handles[i];

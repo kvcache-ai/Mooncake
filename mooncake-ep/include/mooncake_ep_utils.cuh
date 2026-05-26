@@ -49,9 +49,127 @@ struct VecInt<16> {
 
 __device__ __forceinline__ void trap() { asm("trap;"); }
 
+#ifdef MOONCAKE_EP_USE_MUSA
+// MUSA equivalents using __threadfence_system() and volatile accesses
 __device__ __forceinline__ void memory_fence() {
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    __threadfence_system();
 }
+
+__device__ __forceinline__ void memory_fence_gpu() {
+    __threadfence();
+}
+
+__device__ __forceinline__ void memory_fence_cta() {
+    __syncthreads();
+}
+
+__device__ __forceinline__ void st_relaxed_sys_global(const int *ptr, int val) {
+    *const_cast<int*>(ptr) = val;
+}
+
+__device__ __forceinline__ void st_release_sys_global(const int *ptr, int val) {
+    *const_cast<int*>(ptr) = val;
+    __threadfence_system();
+}
+
+__device__ __forceinline__ void st_release_cta(const int *ptr, int val) {
+    *const_cast<int*>(ptr) = val;
+    __threadfence();
+}
+
+__device__ __forceinline__ int ld_acquire_sys_global(const int *ptr) {
+    __threadfence_system();
+    return *const_cast<volatile int*>(ptr);
+}
+
+__device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
+    __threadfence_system();
+    return *const_cast<volatile uint64_t*>(ptr);
+}
+
+__device__ __forceinline__ int ld_acquire_global(const int *ptr) {
+    __threadfence();
+    return *const_cast<volatile int*>(ptr);
+}
+
+__device__ __forceinline__ int atomic_add_release_sys_global(const int *ptr,
+                                                             int value) {
+    int ret = atomicAdd(const_cast<int*>(ptr), value);
+    __threadfence_system();
+    return ret;
+}
+
+__device__ __forceinline__ int atomic_add_release_global(const int *ptr,
+                                                         int value) {
+    int ret = atomicAdd(const_cast<int*>(ptr), value);
+    __threadfence();
+    return ret;
+}
+
+__device__ __forceinline__ int ld_acquire_cta(const int *ptr) {
+    return *const_cast<volatile int*>(ptr);
+}
+
+// MUSA: no L1::no_allocate hint, use volatile as fallback
+template <typename dtype_t>
+__device__ __forceinline__ dtype_t ld_nc_global(const dtype_t *ptr) {
+    return *const_cast<volatile dtype_t*>(ptr);
+}
+
+template <typename dtype_t>
+__device__ __forceinline__ void st_na_global(const dtype_t *ptr,
+                                             const dtype_t &value) {
+    *const_cast<volatile dtype_t*>(ptr) = value;
+}
+
+__device__ __forceinline__ void st_na_release(const int *ptr, int val) {
+    *const_cast<volatile int*>(ptr) = val;
+    __threadfence();
+}
+
+__device__ __forceinline__ void st_na_release(const uint32_t *ptr,
+                                              uint32_t val) {
+    *const_cast<volatile uint32_t*>(ptr) = val;
+    __threadfence();
+}
+
+__device__ __forceinline__ void st_na_release(const uint64_t *ptr,
+                                              uint64_t val) {
+    *const_cast<volatile uint64_t*>(ptr) = val;
+    __threadfence();
+}
+
+__device__ __forceinline__ int ld_volatile_global(const int *ptr) {
+    return *const_cast<volatile int*>(ptr);
+}
+
+__device__ __forceinline__ float ld_volatile_global(const float *ptr) {
+    return *const_cast<volatile float*>(ptr);
+}
+
+__device__ __forceinline__ int64_t ld_volatile_global(const int64_t *ptr) {
+    return *const_cast<volatile int64_t*>(ptr);
+}
+
+__device__ __forceinline__ int64_t ld_volatile_global(const uint64_t *ptr) {
+    return *const_cast<volatile int64_t*>(reinterpret_cast<const int64_t*>(ptr));
+}
+
+// MUSA: __ldg cache hint not available, use regular load
+#ifndef __ldg
+#define __ldg(ptr) (*(ptr))
+#endif
+
+// MUSA: __activemask not available, assume full warp
+#ifndef __activemask
+#define __activemask() (0xffffffff)
+#endif
+
+// MUSA: named barrier replacement (bar.sync N,M not available)
+// Use __syncthreads() as conservative full-CTA sync
+#define MUSA_BAR_SYNC_ALL() __syncthreads()
+
+#else  // CUDA path
 
 __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
@@ -415,6 +533,7 @@ template <int N = 0>
 __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
+#endif  // MOONCAKE_EP_USE_MUSA
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
@@ -487,9 +606,13 @@ __forceinline__ __device__ float half_warp_reduce_max(float value) {
 }
 
 __forceinline__ __device__ int get_lane_id() {
+#ifdef MOONCAKE_EP_USE_MUSA
+    return threadIdx.x % 32;
+#else
     int lane_id;
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
+#endif
 }
 
 template <int kNumRanks>
@@ -526,11 +649,21 @@ __forceinline__ __device__ void barrier_device(int **task_fifo_ptrs, int head,
     EP_DEVICE_ASSERT(kNumRanks <= 32);
 
     if (thread_id < kNumRanks) {
+#ifdef MOONCAKE_EP_USE_MUSA
+        // MUSA: no atomicAdd_system, use block-scope atomic + fence
+        atomicAdd(task_fifo_ptrs[rank] + head + thread_id,
+                  FINISHED_SUM_TAG);
+        __threadfence_system();
+        atomicSub(task_fifo_ptrs[thread_id] + head + rank,
+                  FINISHED_SUM_TAG);
+        __threadfence_system();
+#else
         atomicAdd_system(task_fifo_ptrs[rank] + head + thread_id,
                          FINISHED_SUM_TAG);
         memory_fence();
         atomicSub_system(task_fifo_ptrs[thread_id] + head + rank,
                          FINISHED_SUM_TAG);
+#endif
     }
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }

@@ -1,6 +1,10 @@
 #pragma once
 
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <musa_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 namespace mooncake {
 

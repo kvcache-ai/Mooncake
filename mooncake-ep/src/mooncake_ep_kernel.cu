@@ -1,15 +1,21 @@
 // clang-format off
 
+#ifndef MOONCAKE_EP_USE_MUSA
 #include <cooperative_groups.h>
-#include <cstdio>
 #include <cuda/atomic>
+#endif
+#include <cstdio>
 
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <tent/device/mtlink_musa.cuh>
+#else
 #include <tent/device/ibgda.cuh>
 #include <tent/device/nvlink.cuh>
+#endif
 #else
 #include <tent/transport/ibgda/detail/mlx5gda.h>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
@@ -23,6 +29,7 @@ namespace mooncake {
 inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
 #endif
 
+#ifndef MOONCAKE_EP_USE_MUSA
 using mooncake::tent::device::cuda_platform::cudaDeviceOps;
 using mooncake::tent::device::ibgda::IbGdaCtx;
 using mooncake::tent::device::ibgda::IbGdaQpDevCtx;
@@ -37,6 +44,7 @@ using mooncake::tent::device::nvlink::peer_ptr;
 static_assert(sizeof(IbGdaQpDevCtx) == sizeof(mlx5gda_qp_devctx),
               "IbGdaQpDevCtx must stay ABI-compatible with mlx5gda_qp_devctx");
 #endif
+#endif  // MOONCAKE_EP_USE_MUSA
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
@@ -81,6 +89,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
     // IBGDA
+#ifndef MOONCAKE_EP_USE_MUSA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
@@ -96,13 +105,23 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
+#endif  // MOONCAKE_EP_USE_MUSA
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+    tent::MtLinkDeviceContext mtlink_ctx = {
+        tent::kMtLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+#else
     tent::NvLinkDeviceContext nvlink_ctx = {
         tent::kNvLinkDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
+#endif
 #endif
 
     // Sending phase
@@ -169,7 +188,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                         rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                     }
                 }
+#ifdef MOONCAKE_EP_USE_MUSA
+            __syncthreads();
+#else
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
+#endif
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
@@ -185,15 +208,25 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 if (dst_rank != rank) {
                     bool use_nvlink =
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                        tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+#else
                         is_available(nvlink_ctx, dst_rank);
+#endif
 #else
                         nvlink_available[dst_rank] != 0;
 #endif
                     if (use_nvlink) {
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                        void* peer_dst_ptr = tent::device::mtlink::peer_ptr(
+                            mtlink_ctx, dst_rank, mxa_buffer,
+                            reinterpret_cast<const void*>(dst_ptr));
+#else
                         void* peer_dst_ptr = peer_ptr(
                             nvlink_ctx, dst_rank, mxa_buffer,
                             reinterpret_cast<const void*>(dst_ptr));
+#endif
 #else
                         size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                         void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
@@ -203,12 +236,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                     } else {
+#ifndef MOONCAKE_EP_USE_MUSA
                         if (lane_id == 0) {
                             ibgda_put(&ibgda_ctx, dst_expert_local_idx,
                                       reinterpret_cast<void*>(dst_ptr),
                                       reinterpret_cast<const void*>(src_ptr),
                                       num_bytes_per_msg, dst_rank);
                         }
+#endif
                     }
                 } else {
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
@@ -273,27 +308,40 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
             bool use_nvlink =
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+#else
                 is_available(nvlink_ctx, dst_rank);
+#endif
 #else
                 nvlink_available[dst_rank] != 0;
 #endif
             if (use_nvlink) {
                 int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                int* peer_signal_ptr = reinterpret_cast<int*>(
+                    tent::device::mtlink::peer_ptr(mtlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#else
                 int* peer_signal_ptr = reinterpret_cast<int*>(
                     peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#endif
 #else
                 size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                 int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
 #endif
                 st_na_release(peer_signal_ptr, -num_tokens_sent - 1);
-            } else {
-                ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
-                              rdma_recv_signal_buffer +
-                                  dst_expert_local_idx * num_ranks + rank,
-                              static_cast<uint64_t>(-num_tokens_sent - 1),
-                              dst_rank);
-            }
+#ifndef MOONCAKE_EP_USE_MUSA
+                    } else {
+                        ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
+                                      rdma_recv_signal_buffer +
+                                          dst_expert_local_idx * num_ranks + rank,
+                                      static_cast<uint64_t>(-num_tokens_sent - 1),
+                                      dst_rank);
+                    }
+#else
+                    }
+#endif
         } else {
             st_na_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
         }
@@ -315,7 +363,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE)
+#ifndef MOONCAKE_EP_USE_MUSA
         cooperative_groups::this_grid().sync();
+#else
+        // MUSA: no cooperative groups. Send+recv phases must be separate kernel launches.
+        // If both phases are requested, we can only proceed if the data is already visible.
+        __syncthreads();
+#endif
 
     // Receiving and packing
     if (responsible_expert_idx < num_experts) {
@@ -355,7 +409,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
+#ifdef MOONCAKE_EP_USE_MUSA
+        __syncthreads();
+#else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
+#endif
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
@@ -415,6 +473,10 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto atomic_counter_per_expert = reinterpret_cast<int*>(workspace);
     auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
+
+#ifdef MOONCAKE_EP_USE_MUSA
+    EP_HOST_ASSERT(!use_fp8 && "MUSA does not support FP8");
+#endif
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
@@ -477,6 +539,7 @@ combine(void* combined_x, int32_t* active_ranks,
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
     // IBGDA
+#ifndef MOONCAKE_EP_USE_MUSA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
@@ -492,13 +555,23 @@ combine(void* combined_x, int32_t* active_ranks,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
+#endif  // MOONCAKE_EP_USE_MUSA
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+    tent::MtLinkDeviceContext mtlink_ctx = {
+        tent::kMtLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+#else
     tent::NvLinkDeviceContext nvlink_ctx = {
         tent::kNvLinkDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
+#endif
 #endif
 
     // Sending phase
@@ -549,15 +622,25 @@ combine(void* combined_x, int32_t* active_ranks,
             } else {
                 bool use_nvlink =
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                    tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+#else
                     is_available(nvlink_ctx, dst_rank);
+#endif
 #else
                     nvlink_available[dst_rank] != 0;
 #endif
                 if (use_nvlink) {
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                    void* peer_dst_ptr = tent::device::mtlink::peer_ptr(
+                        mtlink_ctx, dst_rank, mxa_buffer,
+                        reinterpret_cast<const void*>(dst_ptr));
+#else
                     void* peer_dst_ptr = peer_ptr(
                         nvlink_ctx, dst_rank, mxa_buffer,
                         reinterpret_cast<const void*>(dst_ptr));
+#endif
 #else
                     size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                     void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
@@ -565,6 +648,7 @@ combine(void* combined_x, int32_t* active_ranks,
                     const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 } else {
+#ifndef MOONCAKE_EP_USE_MUSA
                     const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                     if (not zero_copy)
                         UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
@@ -576,36 +660,52 @@ combine(void* combined_x, int32_t* active_ranks,
                                   reinterpret_cast<const void*>(buf_ptr),
                                   num_bytes_per_slot, dst_rank);
                     }
+#endif
                 }
             }
         }
 
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+#ifdef MOONCAKE_EP_USE_MUSA
+        __syncthreads();
+#else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
+#endif
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
                 bool use_nvlink =
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                    tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+#else
                     is_available(nvlink_ctx, dst_rank);
+#endif
 #else
                     nvlink_available[dst_rank] != 0;
 #endif
                 if (use_nvlink) {
                     int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
 #ifdef MOONCAKE_EP_USE_TENT
+#ifdef MOONCAKE_EP_USE_MUSA
+                    int* peer_signal_ptr = reinterpret_cast<int*>(
+                        tent::device::mtlink::peer_ptr(mtlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#else
                     int* peer_signal_ptr = reinterpret_cast<int*>(
                         peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
+#endif
 #else
                     size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                     int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
 #endif
                     st_na_release(peer_signal_ptr, 1);
                 } else {
+#ifndef MOONCAKE_EP_USE_MUSA
                     ibgda_red_add(&ibgda_ctx, local_expert_idx,
                                   rdma_recv_signal_buffer + global_expert_idx,
                                   1, dst_rank);
+#endif
                 }
             } else {
                 st_na_release(rdma_recv_signal_buffer + global_expert_idx, 1);
@@ -637,7 +737,11 @@ combine(void* combined_x, int32_t* active_ranks,
             }
         }
     }
+#ifndef MOONCAKE_EP_USE_MUSA
     cooperative_groups::this_grid().sync();
+#else
+    __syncthreads();
+#endif
 
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
