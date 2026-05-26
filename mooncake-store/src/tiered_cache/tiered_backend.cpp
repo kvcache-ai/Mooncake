@@ -29,7 +29,12 @@ AllocationEntry::~AllocationEntry() {
     }
 }
 
-TieredBackend::TieredBackend() = default;
+TieredBackend::TieredBackend() {
+    metadata_shards_.reserve(metadata_shard_count_);
+    for (size_t i = 0; i < metadata_shard_count_; ++i) {
+        metadata_shards_.push_back(std::make_unique<MetadataShard>());
+    }
+}
 
 void TieredBackend::SetMetadataShardCount(size_t count) {
     if (!tiers_.empty()) {
@@ -152,14 +157,6 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     } catch (const std::logic_error& e) {
         LOG(ERROR) << "Failed to build DataCopier: " << e.what();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    // Initialize metadata shards if not already set
-    if (metadata_shards_.empty()) {
-        metadata_shards_.reserve(metadata_shard_count_);
-        for (size_t i = 0; i < metadata_shard_count_; ++i) {
-            metadata_shards_.push_back(std::make_unique<MetadataShard>());
-        }
     }
 
     // Register callback for syncing metadata to Master
