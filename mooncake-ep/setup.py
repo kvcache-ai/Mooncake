@@ -35,8 +35,9 @@ if use_musa:
     # MUSA: no IB verbs, no mlx5, use MUSAExtension
     cuda_libraries = []
     cuda_library_dirs = []
-    from torch_musa.utils.musa_extension import MUSAExtension
+    from torch_musa.utils.musa_extension import MUSAExtension, BuildExtension as MUSABuildExtension
     ExtensionClass = MUSAExtension
+    BuildClass = MUSABuildExtension
     if use_tent:
         sources.append("../mooncake-transfer-engine/tent/src/transport/mtlink/mtlink_device.cpp")
 else:
@@ -44,6 +45,7 @@ else:
     cuda_libraries = ["ibverbs", "mlx5"]
     cuda_library_dirs = []
     ExtensionClass = CUDAExtension
+    BuildClass = BuildExtension
     if not use_tent:
         sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp")
 
@@ -79,13 +81,13 @@ setup(
                     "-O3",
                     "-g0",
                 ],
-                "nvcc": [
+                ("mcc" if use_musa else "nvcc"): [
                     f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
                     *[f"-D{d}" for d in defines],
                     "-std=c++20",
-                    "-Xcompiler",
+                    *([] if use_musa else ["-Xcompiler"]),
                     "-O3",
-                    "-Xcompiler",
+                    *([] if use_musa else ["-Xcompiler"]),
                     "-g0",
                 ],
             },
@@ -97,5 +99,5 @@ setup(
             ] + ([] if use_musa else ["-l:engine.so"]),
         )
     ],
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": BuildClass},
 )
