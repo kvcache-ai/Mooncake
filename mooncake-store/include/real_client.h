@@ -540,9 +540,28 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
 
+    tl::expected<int64_t, ErrorCode> execute_ranged_read(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const RangedReadMetadata &metadata,
+        bool size_is_buffer_capacity = false);
+
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_internal(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::vector<size_t> *buffer_capacities = nullptr,
+        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+            *prepared_results = nullptr,
+        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
+            nullptr,
+        const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
@@ -882,26 +901,6 @@ class RealClient : public PyClient {
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
-
-   private:
-    tl::expected<int64_t, ErrorCode> execute_ranged_read(
-        const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
-
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-    get_into_ranges_internal(
-        const std::vector<void *> &buffers,
-        const std::vector<std::vector<std::string>> &all_keys,
-        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-        const std::vector<size_t> *buffer_capacities = nullptr,
-        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-            *prepared_results = nullptr,
-        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
-            nullptr,
-        const QueryResultCache *query_result_cache = nullptr);
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
