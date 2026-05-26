@@ -156,7 +156,7 @@ class Buffer:
     def _encode_ibgda_metadata(self, metadata: dict) -> torch.Tensor:
         from mooncake import ep
 
-        payload = torch.zeros(8 + 2 * ep.MAX_QP_COUNT, dtype=torch.int64, device="cuda")
+        payload = torch.zeros(8 + 2 * ep.MAX_QP_COUNT, dtype=torch.int64, device=_device_str())
         payload[0] = metadata["version"]
         payload[1] = metadata["rank"]
         payload[2] = metadata["raddr"]
@@ -167,10 +167,10 @@ class Buffer:
         payload[7] = len(metadata["qpns"])
         qpns = metadata["qpns"]
         lids = metadata["lids"]
-        payload[8 : 8 + len(qpns)] = torch.tensor(qpns, dtype=torch.int64, device="cuda")
+        payload[8 : 8 + len(qpns)] = torch.tensor(qpns, dtype=torch.int64, device=_device_str())
         lid_base = 8 + ep.MAX_QP_COUNT
         payload[lid_base : lid_base + len(lids)] = torch.tensor(
-            lids, dtype=torch.int64, device="cuda"
+            lids, dtype=torch.int64, device=_device_str()
         )
         return payload
 
@@ -303,17 +303,17 @@ class Buffer:
 
         (raddr, rkey) = self.runtime.get_mr_info()
 
-        raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+        raddr = torch.tensor([raddr], dtype=torch.int64, device=_device_str())
         raddrs = [
-            torch.empty(1, dtype=torch.int64, device="cuda")
+            torch.empty(1, dtype=torch.int64, device=_device_str())
             for _ in range(self.group_size)
         ]
         dist.all_gather(raddrs, raddr, self.group)
         raddrs = torch.cat(raddrs).tolist()
 
-        rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+        rkey = torch.tensor([rkey], dtype=torch.int32, device=_device_str())
         rkeys = [
-            torch.empty(1, dtype=torch.int32, device="cuda")
+            torch.empty(1, dtype=torch.int32, device=_device_str())
             for _ in range(self.group_size)
         ]
         dist.all_gather(rkeys, rkey, self.group)
@@ -327,13 +327,13 @@ class Buffer:
         local_qpns = self.runtime.get_local_qpns()
         local_qpns = list(
             torch.unbind(
-                torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                torch.tensor(local_qpns, dtype=torch.int32, device=_device_str()).view(
                     -1, all_to_all_size
                 )
             )
         )
         remote_qpns = [
-            torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+            torch.empty(all_to_all_size, dtype=torch.int32, device=_device_str())
             for _ in range(self.group_size)
         ]
         dist.all_to_all(remote_qpns, local_qpns, self.group)
@@ -343,17 +343,17 @@ class Buffer:
         if self.runtime.is_roce():
             (subnet_prefix, interface_id) = self.runtime.get_gid()
 
-            subnet_prefix = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefix = torch.tensor([subnet_prefix], dtype=torch.int64, device=_device_str())
             subnet_prefixes = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=_device_str())
                 for _ in range(self.group_size)
             ]
             dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
             subnet_prefixes = torch.cat(subnet_prefixes).tolist()
 
-            interface_id = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_id = torch.tensor([interface_id], dtype=torch.int64, device=_device_str())
             interface_ids = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=_device_str())
                 for _ in range(self.group_size)
             ]
             dist.all_gather(interface_ids, interface_id, self.group)
@@ -371,13 +371,13 @@ class Buffer:
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_lids, dtype=torch.int32, device=_device_str()).view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_lids = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(all_to_all_size, dtype=torch.int32, device=_device_str())
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_lids, local_lids, self.group)
@@ -409,10 +409,10 @@ class Buffer:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
+                local_handle_ints, dtype=torch.int32, device=_device_str()
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                torch.empty(len(local_handle_ints), dtype=torch.int32, device=_device_str())
                 for _ in range(self.group_size)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
@@ -639,7 +639,7 @@ class Buffer:
                         hidden,
                     ),
                     dtype=torch.bfloat16,
-                    device="cuda",
+                    device=_device_str(),
                 )
             return self._fallback_next_combine_buffer
         return self.runtime.get_next_combine_buffer(

@@ -40,6 +40,7 @@ if use_musa:
     BuildClass = MUSABuildExtension
     if use_tent:
         sources.append("../mooncake-transfer-engine/tent/src/transport/mtlink/mtlink_device.cpp")
+        sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
 else:
     # CUDA: link IB verbs and mlx5
     cuda_libraries = ["ibverbs", "mlx5"]
