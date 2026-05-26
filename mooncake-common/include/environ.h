@@ -50,6 +50,9 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    bool GetEfaLoopbackPreferEmulated() const {
+        return efa_loopback_prefer_emulated_;
+    }
 
    private:
     Environ();
@@ -101,6 +104,7 @@ class Environ {
     bool intra_nvlink_;
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
+    bool efa_loopback_prefer_emulated_;
 };
 
 }  // namespace mooncake
