@@ -23,6 +23,9 @@ class NvmeKvConnector {
     tl::expected<void, ErrorCode> Store(const PhysicalKey& key,
                                         std::string value);
     tl::expected<std::string, ErrorCode> Retrieve(const PhysicalKey& key) const;
+    tl::expected<uint32_t, ErrorCode> RetrieveInto(const PhysicalKey& key,
+                                                   void* buffer,
+                                                   uint32_t buffer_size) const;
     tl::expected<bool, ErrorCode> Exists(const PhysicalKey& key) const;
     const Capabilities& GetCapabilities() const;
     const std::string& GetDeviceId() const { return device_id_; }
