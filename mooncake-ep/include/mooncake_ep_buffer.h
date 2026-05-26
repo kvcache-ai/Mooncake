@@ -15,6 +15,7 @@
 #ifdef MOONCAKE_EP_USE_TENT
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <tent/device/mtlink_musa.cuh>
+#include <tent/device/mtlink.h>
 #else
 #include <tent/device/ibgda.h>
 #include <tent/device/nvlink.h>
