@@ -3254,9 +3254,8 @@ TEST_F(MasterServiceTest, BatchPutEndHandlesMixedResultsAndQueuesOffload) {
     std::unique_ptr<MasterService> service_(new MasterService(config));
     const auto segment_owner =
         PrepareSimpleSegment(*service_, "batch_put_end_segment");
-    ASSERT_TRUE(
-        service_->MountLocalDiskSegment(segment_owner.client_id, true)
-            .has_value());
+    ASSERT_TRUE(service_->MountLocalDiskSegment(segment_owner.client_id, true)
+                    .has_value());
 
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
@@ -3267,17 +3266,17 @@ TEST_F(MasterServiceTest, BatchPutEndHandlesMixedResultsAndQueuesOffload) {
     const std::string wrong_client_key = "batch_put_end_wrong_client";
     const std::string ok_key = "batch_put_end_ok";
 
-    ASSERT_TRUE(service_->PutStart(writer_client, ok_key, 1024,
-                                   replicate_config)
-                    .has_value());
-    ASSERT_TRUE(service_->PutStart(other_writer, wrong_client_key, 1024,
-                                   replicate_config)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, ok_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutStart(other_writer, wrong_client_key, 1024, replicate_config)
+            .has_value());
 
-    auto results =
-        service_->BatchPutEnd(writer_client,
-                              {missing_key, wrong_client_key, ok_key},
-                              ReplicaType::MEMORY);
+    auto results = service_->BatchPutEnd(
+        writer_client, {missing_key, wrong_client_key, ok_key},
+        ReplicaType::MEMORY);
     ASSERT_EQ(results.size(), 3u);
 
     ASSERT_FALSE(results[0].has_value());
@@ -3297,8 +3296,8 @@ TEST_F(MasterServiceTest, BatchPutEndHandlesMixedResultsAndQueuesOffload) {
     ASSERT_FALSE(wrong_client_get.has_value());
     EXPECT_EQ(wrong_client_get.error(), ErrorCode::REPLICA_IS_NOT_READY);
 
-    auto offload = service_->OffloadObjectHeartbeat(segment_owner.client_id,
-                                                    true);
+    auto offload =
+        service_->OffloadObjectHeartbeat(segment_owner.client_id, true);
     ASSERT_TRUE(offload.has_value());
     ASSERT_EQ(offload->count(ok_key), 1u);
     EXPECT_EQ(offload->at(ok_key), 1024);
@@ -3319,24 +3318,24 @@ TEST_F(MasterServiceTest, BatchPutRevokeHandlesMixedResultsAndErasesMetadata) {
     const std::string completed_key = "batch_put_revoke_completed";
     const std::string revoked_key = "batch_put_revoke_processing";
 
-    ASSERT_TRUE(service_->PutStart(writer_client, revoked_key, 1024,
-                                   replicate_config)
-                    .has_value());
-    ASSERT_TRUE(service_->PutStart(other_writer, wrong_client_key, 1024,
-                                   replicate_config)
-                    .has_value());
-    ASSERT_TRUE(service_->PutStart(writer_client, completed_key, 1024,
-                                   replicate_config)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, revoked_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutStart(other_writer, wrong_client_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, completed_key, 1024, replicate_config)
+            .has_value());
     ASSERT_TRUE(
         service_->PutEnd(writer_client, completed_key, ReplicaType::MEMORY)
             .has_value());
 
-    auto results =
-        service_->BatchPutRevoke(writer_client,
-                                 {missing_key, wrong_client_key,
-                                  completed_key, revoked_key},
-                                 ReplicaType::MEMORY);
+    auto results = service_->BatchPutRevoke(
+        writer_client,
+        {missing_key, wrong_client_key, completed_key, revoked_key},
+        ReplicaType::MEMORY);
     ASSERT_EQ(results.size(), 4u);
 
     ASSERT_FALSE(results[0].has_value());

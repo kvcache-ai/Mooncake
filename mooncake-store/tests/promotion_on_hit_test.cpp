@@ -234,9 +234,10 @@ TEST_F(PromotionOnHitTest,
     PutObject(*service, ctx.client_id, "k_mem_only");
     ReplicateConfig processing_config;
     processing_config.replica_num = 1;
-    ASSERT_TRUE(service->PutStart(ctx.client_id, "k_processing", 1024,
-                                  processing_config)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->PutStart(ctx.client_id, "k_processing", 1024, processing_config)
+            .has_value());
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
 
