@@ -32,6 +32,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     } else if (storage_backend_descriptor ==
                "offset_allocator_storage_backend") {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    } else if (storage_backend_descriptor == "distributed_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kDistributed;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }

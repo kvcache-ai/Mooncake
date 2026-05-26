@@ -353,6 +353,14 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+
+    // DFS errors (Range: -1600 to -1699)
+    DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
+    DFS_SERVICE_UNAVAILABLE = -1601,  ///< DFS service unavailable.
+    DFS_QUOTA_EXCEEDED = -1602,       ///< DFS quota exceeded.
+    DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
+    DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
+    DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
