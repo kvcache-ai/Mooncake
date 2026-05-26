@@ -74,6 +74,19 @@ struct NvLinkDeviceContext {
     void** peer_ptrs = nullptr;
 };
 
+inline constexpr uint32_t kMtLinkDeviceContextAbiVersion = 1;
+
+// GPU-visible MTLink/P2P resources for Moore Threads GPUs.  Structurally
+// identical to NvLinkDeviceContext — same IPC-based P2P model with peer base
+// pointers and availability flags.  Separate type for future divergence.
+struct MtLinkDeviceContext {
+    uint32_t abi_version = kMtLinkDeviceContextAbiVersion;
+    int rank = 0;
+    int num_ranks = 0;
+    int32_t* available = nullptr;
+    void** peer_ptrs = nullptr;
+};
+
 }  // namespace tent
 }  // namespace mooncake
 

@@ -3,7 +3,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(USE_MUSA)
+#include <musa_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 namespace mooncake::tent::device {
 
