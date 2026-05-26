@@ -36,8 +36,7 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Shutdown() {
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
     const std::string& path, std::span<const char> data) {
-    int fd =
-        open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
@@ -91,8 +90,8 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
     return total_written;
 }
 
-tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(
-    const std::string& path, void* buf, size_t len) {
+tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(const std::string& path,
+                                                       void* buf, size_t len) {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
@@ -117,9 +116,8 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(
     while (total_read < len) {
         size_t chunk = std::min(len - total_read, resource->config_.iov_size);
 
-        int ret =
-            hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base, fd,
-                          offset, chunk, nullptr);
+        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
+                                fd, offset, chunk, nullptr);
         if (ret < 0) break;
 
         ret = hf3fs_submit_ios(&ior_read);
@@ -149,8 +147,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
     const std::string& path, const iovec* iov, int iovcnt, off_t offset) {
-    int fd =
-        open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
@@ -184,8 +181,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
         size_t copied = 0;
         char* dest = reinterpret_cast<char*>(threefs_iov.base);
         while (copied < chunk && iov_idx < iovcnt) {
-            size_t n =
-                std::min(chunk - copied, iov[iov_idx].iov_len - iov_off);
+            size_t n = std::min(chunk - copied, iov[iov_idx].iov_len - iov_off);
             memcpy(dest + copied,
                    static_cast<char*>(iov[iov_idx].iov_base) + iov_off, n);
             copied += n;
@@ -196,9 +192,9 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
             }
         }
 
-        int ret = hf3fs_prep_io(&ior_write, &threefs_iov, false,
-                                threefs_iov.base, fd, current_offset, chunk,
-                                nullptr);
+        int ret =
+            hf3fs_prep_io(&ior_write, &threefs_iov, false, threefs_iov.base, fd,
+                          current_offset, chunk, nullptr);
         if (ret < 0) break;
         ret = hf3fs_submit_ios(&ior_write);
         if (ret < 0) break;
@@ -255,15 +251,14 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorReadFile(
     while (remaining > 0) {
         size_t chunk = std::min(remaining, resource->config_.iov_size);
 
-        int ret =
-            hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base, fd,
-                          current_offset, chunk, nullptr);
+        int ret = hf3fs_prep_io(&ior_read, &threefs_iov, true, threefs_iov.base,
+                                fd, current_offset, chunk, nullptr);
         if (ret < 0) break;
         ret = hf3fs_submit_ios(&ior_read);
         if (ret < 0) break;
         struct hf3fs_cqe cqe;
         ret = hf3fs_wait_for_ios(&ior_read, &cqe, 1, 1, nullptr);
-        if (ret < 0) break;
+        if (ret < 0 || cqe.result < 0) break;
 
         size_t bytes_read = cqe.result;
         if (bytes_read == 0) break;
@@ -272,10 +267,8 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorReadFile(
         size_t to_copy = bytes_read;
         char* src = reinterpret_cast<char*>(threefs_iov.base);
         while (to_copy > 0 && iov_idx < iovcnt) {
-            size_t n =
-                std::min(to_copy, iov[iov_idx].iov_len - iov_off);
-            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src,
-                   n);
+            size_t n = std::min(to_copy, iov[iov_idx].iov_len - iov_off);
+            memcpy(static_cast<char*>(iov[iov_idx].iov_base) + iov_off, src, n);
             src += n;
             to_copy -= n;
             total_read += n;

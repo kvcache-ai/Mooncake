@@ -33,8 +33,8 @@ class FileSystemAdapter {
         const std::string& path, std::span<const char> data) = 0;
 
     // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
-    virtual tl::expected<size_t, ErrorCode> ReadFile(
-        const std::string& path, void* buf, size_t len) = 0;
+    virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
+                                                     void* buf, size_t len) = 0;
 
     virtual tl::expected<size_t, ErrorCode> VectorWriteFile(
         const std::string& path, const iovec* iov, int iovcnt,
@@ -55,6 +55,15 @@ class FileSystemAdapter {
     virtual tl::expected<std::vector<std::string>, ErrorCode> ListFiles(
         const std::string& dir) = 0;
 
+    virtual tl::expected<size_t, ErrorCode> GetFileSize(
+        const std::string& path) {
+        struct stat st;
+        if (::stat(path.c_str(), &st) != 0) {
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return static_cast<size_t>(st.st_size);
+    }
+
     // === Batch operations (default implementations, adapters may override) ===
 
     virtual tl::expected<void, ErrorCode> DeleteFiles(
@@ -74,10 +83,10 @@ class FileSystemAdapter {
         std::vector<FileInfo> result;
         result.reserve(files->size());
         for (const auto& name : *files) {
-            struct stat st;
             std::string full_path = dir + "/" + name;
-            if (::stat(full_path.c_str(), &st) == 0) {
-                result.push_back({name, static_cast<size_t>(st.st_size)});
+            auto size = GetFileSize(full_path);
+            if (size) {
+                result.push_back({name, *size});
             }
         }
         return result;
