@@ -9,8 +9,33 @@ import torch.testing as testing
 import faulthandler
 import traceback
 
+# Detect MUSA platform
+USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+if USE_MUSA:
+    import torch_musa  # noqa: F401
+
 from mooncake.mooncake_ep_buffer import Buffer
 import mooncake.pg as pg
+
+
+def _device_count():
+    if USE_MUSA:
+        return torch.musa.device_count()
+    return torch.cuda.device_count()
+
+
+def _set_device(rank):
+    if USE_MUSA:
+        torch.musa.set_device(rank)
+    else:
+        torch.cuda.set_device(rank)
+
+
+def _synchronize():
+    if USE_MUSA:
+        torch.musa.synchronize()
+    else:
+        torch.cuda.synchronize()
 
 
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -114,7 +139,7 @@ def run_test_iteration(
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _synchronize()
     # Fault-tolerance check
     if fail_rank != -1:
         assert active_ranks[fail_rank].item() == 0, (
@@ -170,7 +195,7 @@ def run_test_iteration(
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _synchronize()
 
     testing.assert_close(
         combined_x,
@@ -180,23 +205,24 @@ def run_test_iteration(
         msg=lambda msg: f"[Rank {rank}] Combine Mismatch. {msg}",
     )
 
-    torch.cuda.synchronize()
+    _synchronize()
     dist.barrier(cpu_group)
 
 
 def worker(rank, world_size, config_dict):
-    # Device filter
-    device_filter = [
-        f
-        for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
-        if f
-    ]
-    if device_filter:
-        pg.set_device_filter(device_filter)
+    # Device filter (MUSA has no Mellanox NICs)
+    if not USE_MUSA:
+        device_filter = [
+            f
+            for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
+            if f
+        ]
+        if device_filter:
+            pg.set_device_filter(device_filter)
 
-    torch.cuda.set_device(rank)
+    _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
+    torch.set_default_device("musa" if USE_MUSA else "cuda")
 
     dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
     group = dist.group.WORLD
@@ -219,7 +245,7 @@ def worker(rank, world_size, config_dict):
 
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
-        self.world_size = torch.cuda.device_count()
+        self.world_size = _device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
@@ -269,7 +295,7 @@ def make_test_name(cfg):
 
 def generate_tests():
     test_grid = {
-        "use_fp8": [False, True],
+        "use_fp8": [False] if USE_MUSA else [False, True],
         "zero_copy": [False, True],
         "async_finish": [False, True],
         "return_recv_hook": [False, True],

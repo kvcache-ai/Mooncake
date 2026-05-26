@@ -406,9 +406,14 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
             timeout_ticks, phases);
     };
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no cooperative grid sync, must use separate kernel launches
+    launcher(LOW_LATENCY_SEND_PHASE);
+#else
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
                  : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -423,8 +428,13 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: always launch recv phase as a separate kernel
+    recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+#else
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+#endif
 
     // Return values
     return {packed_recv_x,
@@ -521,9 +531,14 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy);
     };
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: no cooperative grid sync, must use separate kernel launches
+    launcher(LOW_LATENCY_SEND_PHASE);
+#else
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
                  : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+#endif
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -538,8 +553,13 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA: always launch recv phase as a separate kernel
+    recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+#else
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+#endif
 
     // Return values
     return {combined_x, event, recv_hook};
@@ -987,7 +1007,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         handles[i].words = remote_handles[i];
     }
     auto status = tent_mtlink_transport_->configurePeers(
-        device_id, gdr_buffer, handles, active_ranks_mask, use_fabric_mem_);
+        device_id, gdr_buffer, handles, active_ranks_mask);
     if (!status.ok()) {
         LOG(ERROR) << "[EP] Failed to configure TENT MTLink peers: "
                    << std::string(status.message());
