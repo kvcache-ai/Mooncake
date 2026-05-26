@@ -1391,6 +1391,18 @@ impl AdminService {
         })
     }
 
+    fn backend_for_tenant(&self, tenant: Option<&str>) -> AdminResult<Arc<dyn MetadataBackend>> {
+        match tenant.map(str::trim).filter(|tenant| !tenant.is_empty()) {
+            Some(tenant) => self.backend.for_tenant(tenant).ok_or_else(|| {
+                StoreError::Unsupported(format!(
+                    "metadata backend {} does not support tenant-scoped admin queries",
+                    self.backend.route_namespace()
+                ))
+            }),
+            None => Ok(self.backend.clone()),
+        }
+    }
+
     pub fn submit_route_migration_task(
         &self,
         mode: RouteMigrationMode,
@@ -1411,8 +1423,9 @@ impl AdminService {
     }
 
     pub fn get_route_policy(&self, tenant: Option<&str>) -> AdminResult<RoutePolicyResponse> {
+        let backend = self.backend_for_tenant(tenant)?;
         let domain = route_policy_domain(tenant);
-        let policy = self.backend.get_route_policy(&domain)?;
+        let policy = backend.get_route_policy(&domain)?;
         Ok(RoutePolicyResponse {
             domain: format_route_policy_domain(&domain),
             found: policy.is_some(),
@@ -1427,11 +1440,11 @@ impl AdminService {
         object_set: Option<&str>,
         effective: bool,
     ) -> AdminResult<GetTenantPolicyResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         if effective {
             let namespace = NamespaceScope::with_defaults(Some(tenant), domain, object_set);
-            let effective_spec =
-                resolve_effective_tenant_policy(self.backend.as_ref(), &namespace)?;
+            let effective_spec = resolve_effective_tenant_policy(backend.as_ref(), &namespace)?;
             return Ok(GetTenantPolicyResponse {
                 scope,
                 effective: true,
@@ -1441,7 +1454,7 @@ impl AdminService {
             });
         }
 
-        let policy = self.backend.get_tenant_policy(&scope)?;
+        let policy = backend.get_tenant_policy(&scope)?;
         Ok(GetTenantPolicyResponse {
             scope,
             effective: false,
@@ -1460,6 +1473,7 @@ impl AdminService {
         expected_version: Option<u64>,
         updated_by: &str,
     ) -> AdminResult<TenantPolicy> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let patch = tenant_policy_patch(&patch)?;
         if policy_patch_is_empty(&patch) {
@@ -1467,10 +1481,10 @@ impl AdminService {
                 "at least one policy flag must be provided".to_string(),
             ));
         }
-        let current = self.backend.get_tenant_policy(&scope)?;
+        let current = backend.get_tenant_policy(&scope)?;
         let policy = merge_tenant_policy(current.as_ref(), scope.clone(), patch, updated_by);
         let expected = expected_version.or_else(|| current.as_ref().map(|policy| policy.version));
-        let stored = self.backend.put_tenant_policy(&policy, expected)?;
+        let stored = backend.put_tenant_policy(&policy, expected)?;
         Ok(stored)
     }
 
@@ -1481,19 +1495,18 @@ impl AdminService {
         object_set: Option<&str>,
         expected_version: Option<u64>,
     ) -> AdminResult<DeleteTenantPolicyResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
-        let removed = self
-            .backend
-            .delete_tenant_policy(&scope, expected_version)?;
+        let removed = backend.delete_tenant_policy(&scope, expected_version)?;
         if removed && is_root_tenant_scope(&scope) {
-            self.backend
-                .delete_route_policy(&RoutePolicyDomain::Tenant(scope.tenant.clone()))?;
+            backend.delete_route_policy(&RoutePolicyDomain::Tenant(scope.tenant.clone()))?;
         }
         Ok(DeleteTenantPolicyResponse { scope, removed })
     }
 
     pub fn list_tenant_policies(&self, tenant: Option<&str>) -> AdminResult<Vec<TenantPolicy>> {
-        let mut policies = self.backend.list_tenant_policies(tenant)?;
+        let backend = self.backend_for_tenant(tenant)?;
+        let mut policies = backend.list_tenant_policies(tenant)?;
         policies.sort_by(|left, right| left.scope.cmp(&right.scope));
         Ok(policies)
     }
@@ -1504,9 +1517,10 @@ impl AdminService {
         domain: Option<&str>,
         object_set: Option<&str>,
     ) -> AdminResult<GetTenantQuotaStateResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
-        let state = self.backend.get_tenant_quota_state(&root_scope)?;
+        let state = backend.get_tenant_quota_state(&root_scope)?;
         Ok(GetTenantQuotaStateResponse {
             scope: root_scope,
             found: state.is_some(),
@@ -1521,6 +1535,7 @@ impl AdminService {
         object_set: Option<&str>,
         key: &str,
     ) -> AdminResult<GetTenantObjectAccountingResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
         let object_id = LogicalObjectId::new(
@@ -1528,7 +1543,7 @@ impl AdminService {
             key.to_string(),
         );
         let scoped_key = ObjectKey::from_logical_id(&object_id);
-        let accounting = self.backend.get_tenant_object_accounting(&scoped_key)?;
+        let accounting = backend.get_tenant_object_accounting(&scoped_key)?;
         Ok(GetTenantObjectAccountingResponse {
             scope: root_scope,
             key: scoped_key.0,
@@ -1544,9 +1559,10 @@ impl AdminService {
         object_set: Option<&str>,
         state: Option<TenantQuotaReservationState>,
     ) -> AdminResult<ListTenantQuotaReservationsResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
-        let mut reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
+        let mut reservations = backend.list_tenant_quota_reservations(&root_scope)?;
         if let Some(state) = state {
             reservations.retain(|reservation| reservation.state == state);
         }
@@ -1570,10 +1586,10 @@ impl AdminService {
         reservation_id: &str,
         dry_run: bool,
     ) -> AdminResult<TenantQuotaAbortResponse> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
-        let reservation = self
-            .backend
+        let reservation = backend
             .get_tenant_quota_reservation(reservation_id)?
             .filter(|entry| entry.scope == root_scope)
             .ok_or_else(|| {
@@ -1591,7 +1607,7 @@ impl AdminService {
             });
         }
         if !dry_run {
-            let abort_result = self.backend.abort_tenant_quota(reservation_id);
+            let abort_result = backend.abort_tenant_quota(reservation_id);
             record_tenant_quota_reconcile(match &abort_result {
                 Ok(_) => "aborted",
                 Err(_) => "error",
@@ -1613,10 +1629,11 @@ impl AdminService {
         object_set: Option<&str>,
         dry_run: bool,
     ) -> AdminResult<TenantQuotaReconcileReport> {
+        let backend = self.backend_for_tenant(Some(tenant))?;
         let scope = tenant_policy_scope(tenant, domain, object_set)?;
         let root_scope = root_tenant_scope(&scope)?;
         let now = now_ms();
-        let mut reservations = self.backend.list_tenant_quota_reservations(&root_scope)?;
+        let mut reservations = backend.list_tenant_quota_reservations(&root_scope)?;
         reservations.sort_by(|left, right| {
             left.created_at_ms
                 .cmp(&right.created_at_ms)
@@ -1638,7 +1655,7 @@ impl AdminService {
             }
             if reservation.expires_at_ms <= now {
                 if !dry_run {
-                    let abort_result = self.backend.abort_tenant_quota(&reservation.reservation_id);
+                    let abort_result = backend.abort_tenant_quota(&reservation.reservation_id);
                     record_tenant_quota_reconcile(match &abort_result {
                         Ok(_) => "aborted",
                         Err(_) => "error",
@@ -1654,10 +1671,8 @@ impl AdminService {
                 });
                 continue;
             }
-            let route = self.backend.get_object_route(&reservation.key)?;
-            let accounting = self
-                .backend
-                .get_tenant_object_accounting(&reservation.key)?;
+            let route = backend.get_object_route(&reservation.key)?;
+            let accounting = backend.get_tenant_object_accounting(&reservation.key)?;
             let route_matches_accounting = route
                 .as_ref()
                 .and_then(|route| {
@@ -1690,18 +1705,17 @@ impl AdminService {
                         })
                         .unwrap_or(0);
                     let finalize_result =
-                        self.backend
-                            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
-                                reservation_id: reservation.reservation_id.clone(),
-                                expected_object_version: reservation.expected_object_version,
-                                committed_length: Some(committed_length),
-                                route_version: accounting
-                                    .as_ref()
-                                    .and_then(|accounting| accounting.route_version),
-                                state: TenantObjectAccountingState::Active,
-                                updated_at_ms: now,
-                                updated_by: "admin-reconcile".to_string(),
-                            });
+                        backend.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                            reservation_id: reservation.reservation_id.clone(),
+                            expected_object_version: reservation.expected_object_version,
+                            committed_length: Some(committed_length),
+                            route_version: accounting
+                                .as_ref()
+                                .and_then(|accounting| accounting.route_version),
+                            state: TenantObjectAccountingState::Active,
+                            updated_at_ms: now,
+                            updated_by: "admin-reconcile".to_string(),
+                        });
                     record_tenant_quota_reconcile(match &finalize_result {
                         Ok(_) => "finalized",
                         Err(_) => "error",
