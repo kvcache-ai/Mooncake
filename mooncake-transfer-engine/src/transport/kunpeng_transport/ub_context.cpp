@@ -80,6 +80,29 @@ int UbSIEVEEndpointStore::deleteEndpoint(const std::string& peer_nic_path) {
     return 0;
 }
 
+int UbSIEVEEndpointStore::deleteEndpointByPtr(UbEndPoint* point_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         iter++) {
+        if (iter->second.first.get() == point_ptr) {
+            std::string peer_nic_path = iter->first;
+            iter->second.first->deconstruct();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return 0;
+}
+
 void UbSIEVEEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) {
         return;
@@ -339,7 +362,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(entry.first);
+                context_.deleteEndpointByPtr(endpoint.get());
             // enable for re-establishation
             for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
@@ -360,6 +383,10 @@ void UbWorkerPool::performPostSend(int thread_id) {
             }
             entry.second.clear();
             continue;
+        }
+        // Set endpoint pointer for each slice before submitting
+        for (auto& slice : entry.second) {
+            slice->ub.endpoint = endpoint.get();
         }
         endpoint->submitPostSend(entry.second, failed_slice_list);
 #endif
@@ -400,7 +427,10 @@ void UbWorkerPool::performPoll(int thread_id) {
                 }
                 slice->ub.retry_cnt++;
                 if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
-                    context_.deleteEndpoint(slice->peer_nic_path);
+                    if (slice->ub.endpoint) {
+                        auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
+                        context_.deleteEndpointByPtr(ptr);
+                    }
                     slice->markFailed();
                     processed_slice_count_++;
                 } else {
