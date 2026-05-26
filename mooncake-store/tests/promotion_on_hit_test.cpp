@@ -1736,6 +1736,33 @@ TEST_F(PromotionOnHitTest, MetricsRejectionCountersIncrementOnGateMiss) {
     EXPECT_EQ(mm.get_promotion_rejected_cap() - cap_pre, 1);
 
     service->RemoveAll();
+
+    // Watermark gate uses a fresh service configured with
+    // eviction_high_watermark_ratio = 0.0 so any non-negative DRAM
+    // usage trips it. threshold = 1 makes the first Get clear the
+    // frequency gate and reach the watermark check.
+    MasterServiceConfig wm_config;
+    wm_config.enable_offload = true;
+    wm_config.promotion_on_hit = true;
+    wm_config.promotion_admission_threshold = 1;
+    wm_config.promotion_queue_limit = 50;
+    wm_config.eviction_high_watermark_ratio = 0.0;
+    wm_config.default_kv_lease_ttl = 2000;
+    auto wm_service = std::make_unique<MasterService>(wm_config);
+
+    auto wm_seg =
+        PrepareSegment(*wm_service, "wm_seg", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*wm_service, wm_seg.client_id, "k_w",
+                                       1024, wm_seg.segment_name));
+
+    const int64_t wm_pre = mm.get_promotion_rejected_watermark();
+    {
+        auto r = wm_service->GetReplicaList("k_w");
+        ASSERT_TRUE(r.has_value());
+    }
+    EXPECT_EQ(mm.get_promotion_rejected_watermark() - wm_pre, 1);
+
+    wm_service->RemoveAll();
 }
 
 // promotion_max_per_heartbeat controls how many tasks
