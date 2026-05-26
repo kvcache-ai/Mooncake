@@ -50,7 +50,7 @@ struct PyTensorInfo {
         // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
         // excluding UNKNOWN=-1)
         if (validated.header.dtype >=
-            static_cast<uint32_t>(TensorDtype::NR_DTYPES)) {
+            static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
             return false;
         }
 
@@ -340,14 +340,15 @@ class MooncakeStorePyWrapper {
         return result;
     }
 
-    int unmount_segment(const std::vector<std::string> &segment_ids) {
+    int unmount_segment(const std::vector<std::string> &segment_ids,
+                        uint64_t grace_period_seconds = 0) {
         auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
         if (!real_client) {
             LOG(ERROR) << "unmount_segment requires RealClient";
             return -1;
         }
         py::gil_scoped_release release;
-        return real_client->unmountSegment(segment_ids);
+        return real_client->unmountSegment(segment_ids, grace_period_seconds);
     }
 
     py::dict allocate_and_mount_segment(size_t size,
@@ -377,14 +378,16 @@ class MooncakeStorePyWrapper {
         return result;
     }
 
-    int unmount_and_free_segment(const std::vector<std::string> &segment_ids) {
+    int unmount_and_free_segment(const std::vector<std::string> &segment_ids,
+                                 uint64_t grace_period_seconds = 0) {
         auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
         if (!real_client) {
             LOG(ERROR) << "unmount_and_free_segment requires RealClient";
             return -1;
         }
         py::gil_scoped_release release;
-        return real_client->unmountAndFreeSegment(segment_ids);
+        return real_client->unmountAndFreeSegment(segment_ids,
+                                                  grace_period_seconds);
     }
 
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
@@ -1574,6 +1577,20 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    // Object data type classification
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .value("GENERAL", ObjectDataType::GENERAL)
+        .export_values();
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1585,6 +1602,7 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -1616,6 +1634,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
@@ -1909,14 +1930,14 @@ PYBIND11_MODULE(store, m) {
              py::arg("path"), py::arg("size"), py::arg("offset") = 0,
              py::arg("protocol") = "tcp", py::arg("location") = "")
         .def("unmount_segment", &MooncakeStorePyWrapper::unmount_segment,
-             py::arg("segment_ids"))
+             py::arg("segment_ids"), py::arg("grace_period_seconds") = 0)
         .def("allocate_and_mount_segment",
              &MooncakeStorePyWrapper::allocate_and_mount_segment,
              py::arg("size"), py::arg("protocol") = "tcp",
              py::arg("location") = "")
         .def("unmount_and_free_segment",
              &MooncakeStorePyWrapper::unmount_and_free_segment,
-             py::arg("segment_ids"))
+             py::arg("segment_ids"), py::arg("grace_period_seconds") = 0)
         .def("alloc_from_mem_pool",
              [](MooncakeStorePyWrapper &self, size_t size) {
                  py::gil_scoped_release release;
@@ -1924,6 +1945,13 @@ PYBIND11_MODULE(store, m) {
              })
         .def("get", &mooncake::MooncakeStorePyWrapper::get)
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get_offload_rpc_read_count",
+             [](MooncakeStorePyWrapper &self) -> int64_t {
+                 auto real_client =
+                     std::dynamic_pointer_cast<RealClient>(self.store_);
+                 return real_client ? real_client->get_offload_rpc_read_count()
+                                    : 0;
+             })
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {

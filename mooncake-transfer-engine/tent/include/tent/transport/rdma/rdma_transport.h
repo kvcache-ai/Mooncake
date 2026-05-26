@@ -114,6 +114,8 @@ class RdmaTransport : public Transport {
    public:
     Status setupLocalSegment();
 
+    std::shared_ptr<Config> config() const { return conf_; }
+
    private:
     bool installed_;
     std::shared_ptr<Config> conf_;

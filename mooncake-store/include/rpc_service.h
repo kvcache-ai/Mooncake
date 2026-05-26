@@ -18,6 +18,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "segment.h"
 
 namespace mooncake {
 
@@ -61,13 +62,13 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
-                                         const std::string& key,
-                                         ReplicaType replica_type);
+    tl::expected<void, ErrorCode> PutEnd(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL);
 
-    tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
-                                            const std::string& key,
-                                            ReplicaType replica_type);
+    tl::expected<void, ErrorCode> PutRevoke(
+        const UUID& client_id, const std::string& key,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
@@ -75,10 +76,12 @@ class WrappedMasterService {
                   const ReplicateConfig& config);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
@@ -118,11 +121,30 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
 
+    tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
+                                                  const UUID& client_id);
+
     tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 
+    tl::expected<void, ErrorCode> ReMountNoFSegment(
+        const std::vector<NoFSegment>& segments, const UUID& client_id);
+
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
+
+    tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, const UUID& client_id,
+        uint64_t grace_period_ms);
+
+    tl::expected<void, ErrorCode> UnmountNoFSegment(const UUID& segment_id,
+                                                    const UUID& client_id);
+
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    GetAllNoFSegments();
+
+    [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+    GetNoFSegmentsByName(const std::string& segment_name);
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
@@ -152,6 +174,20 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // Promotion-on-hit RPCs.
+    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
+        const UUID& client_id, const std::string& key, uint64_t size,
+        const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 
@@ -161,6 +197,8 @@ class WrappedMasterService {
 
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatus(
         const std::string& segment_name);
+    tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 

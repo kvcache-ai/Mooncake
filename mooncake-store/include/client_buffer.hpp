@@ -57,6 +57,7 @@ class ClientBufferAllocator
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
 
     void* buffer_;
+    size_t buffer_size_;
     bool use_hugepage_ = false;
 
    private:
@@ -66,7 +67,6 @@ class ClientBufferAllocator
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
-    size_t buffer_size_;
     bool is_external_memory_ = false;
 };
 

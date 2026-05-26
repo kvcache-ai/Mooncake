@@ -1147,6 +1147,36 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     return 0;
 }
 
+int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return 0;
+    }
+    const std::string full_key = rpc_meta_prefix_ + server_name;
+
+    Json::Value existing;
+    if (storage_plugin_->get(full_key, existing)) {
+        Json::Value desired;
+        desired["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
+        desired["rpc_port"] =
+            static_cast<Json::UInt64>(local_rpc_meta_.rpc_port);
+        if (existing == desired) {
+            return 0;
+        }
+        storage_plugin_->remove(full_key);
+    }
+
+    LOG(INFO) << "Re-publishing RPC meta entry for " << server_name;
+    Json::Value rpcMetaJSON;
+    rpcMetaJSON["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
+    rpcMetaJSON["rpc_port"] =
+        static_cast<Json::UInt64>(local_rpc_meta_.rpc_port);
+    if (!storage_plugin_->set(full_key, rpcMetaJSON)) {
+        LOG(ERROR) << "Failed to re-publish RPC meta entry for " << server_name;
+        return ERR_METADATA;
+    }
+    return 0;
+}
+
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
     {

@@ -45,7 +45,7 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate buffer for " << operation_name
                            << " key: " << keys[i];
-                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
                 continue;
             }
 

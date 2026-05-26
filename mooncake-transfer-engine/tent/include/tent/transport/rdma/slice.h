@@ -96,6 +96,7 @@ struct RdmaSlice {
     // WorkerContext::rails stores values via unique_ptr, so rehashes do
     // not invalidate the pointee.
     RailMonitor* rail_monitor = nullptr;
+    int priority = PRIO_HIGH;
 };
 
 static inline void updateSliceStatus(RdmaSlice* slice,

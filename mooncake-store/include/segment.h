@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
+#include <chrono>
 #include <ostream>
 #include <shared_mutex>
 #include <string>
@@ -10,6 +11,7 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -21,7 +23,8 @@ enum class SegmentStatus {
     OK,             // Segment is mounted and available for allocation
     DRAINING,       // Segment remains readable but accepts no new allocations
     DRAINED,        // Segment has been drained and awaits unmount
-    UNMOUNTING,     // Segment is under unmounting
+    GRACEFULLY_UNMOUNTING,  // Readable, no new allocations, timer running
+    UNMOUNTING,             // Segment is under unmounting
 };
 
 /**
@@ -30,11 +33,13 @@ enum class SegmentStatus {
 inline std::ostream& operator<<(std::ostream& os,
                                 const SegmentStatus& status) noexcept {
     static const std::unordered_map<SegmentStatus, std::string_view>
-        status_strings{{SegmentStatus::UNDEFINED, "UNDEFINED"},
-                       {SegmentStatus::OK, "OK"},
-                       {SegmentStatus::DRAINING, "DRAINING"},
-                       {SegmentStatus::DRAINED, "DRAINED"},
-                       {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
+        status_strings{
+            {SegmentStatus::UNDEFINED, "UNDEFINED"},
+            {SegmentStatus::OK, "OK"},
+            {SegmentStatus::DRAINING, "DRAINING"},
+            {SegmentStatus::DRAINED, "DRAINED"},
+            {SegmentStatus::GRACEFULLY_UNMOUNTING, "GRACEFULLY_UNMOUNTING"},
+            {SegmentStatus::UNMOUNTING, "UNMOUNTING"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
@@ -47,12 +52,48 @@ struct MountedSegment {
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
 };
 
+struct MountedNoFSegment {
+    NoFSegment segment;
+    UUID client_id;
+    SegmentStatus status;
+    std::shared_ptr<BufferAllocatorBase> buf_allocator;
+};
+
+struct MountedNoFSegmentSnapshot {
+    UUID segment_id;
+    UUID client_id;
+    NoFSegment segment;
+    SegmentStatus status;
+};
+
+/**
+ * @brief Stream operator for MountedNoFSegmentSnapshot
+ */
+inline std::ostream& operator<<(
+    std::ostream& os, const MountedNoFSegmentSnapshot& snapshot) noexcept {
+    os << "{segment_id=" << snapshot.segment_id
+       << ", client_id=" << snapshot.client_id
+       << ", segment.id=" << snapshot.segment.id
+       << ", segment.name=" << snapshot.segment.name
+       << ", segment.base=" << snapshot.segment.base
+       << ", segment.size=" << snapshot.segment.size
+       << ", segment.te_endpoint=" << snapshot.segment.te_endpoint
+       << ", status=" << snapshot.status << "}";
+    return os;
+}
+
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         offloading_objects;
+    // Promotion-on-hit pending work for this client. Populated by master's
+    // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
+    // client. Drained by PromotionObjectHeartbeat. Same locking as
+    // offloading_objects (offloading_mutex_).
+    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
+        promotion_objects;
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 
@@ -101,6 +142,12 @@ class ScopedSegmentAccess {
      */
     ErrorCode PrepareUnmountSegment(const UUID& segment_id,
                                     size_t& metrics_dec_capacity);
+
+    /**
+     * @brief Prepare a segment for graceful unmount: remove allocator but keep
+     *        segment metadata. Status becomes GRACEFULLY_UNMOUNTING.
+     */
+    ErrorCode PrepareGracefulUnmountSegment(const UUID& segment_id);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation
@@ -166,6 +213,12 @@ class ScopedSegmentAccess {
                                      SegmentStatus& status) const;
 
     /**
+     * @brief Query the lifecycle status of a segment by id.
+     */
+    ErrorCode GetSegmentStatusById(const UUID& segment_id,
+                                   SegmentStatus& status) const;
+
+    /**
      * @brief Update the lifecycle status of a segment by name.
      */
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
@@ -179,6 +232,78 @@ class ScopedSegmentAccess {
 
    private:
     SegmentManager* segment_manager_;
+    std::unique_lock<std::shared_mutex> lock_;
+};
+
+class NoFSegmentManager;
+
+/**
+ * @brief RAII-style access to NoF ssd segment mutex for thread-safe segment
+ * operations
+ */
+class ScopedNoFSegmentAccess {
+   public:
+    /**
+     * @brief Acquires a lock on the segment mutex
+     * @param mutex Reference to the segment mutex
+     */
+    explicit ScopedNoFSegmentAccess(NoFSegmentManager* segment_manager,
+                                    std::shared_mutex& mutex)
+        : nof_segment_manager_(segment_manager), lock_(mutex) {}
+
+    /**
+     * @brief Mount a segment
+     */
+    ErrorCode MountSegment(const NoFSegment& segment, const UUID& client_id);
+
+    /**
+     * @brief Re-mount a segment. To avoid infinite remount trying, only the
+     * errors that may be solved by subsequent remount tryings are considered as
+     * errors. When encounters unsolvable errors, the segment will not be
+     * mounted while the return value will be OK.
+     */
+    ErrorCode ReMountSegment(const std::vector<NoFSegment>& segments,
+                             const UUID& client_id);
+
+    /**
+     * @brief Prepare to unmount a segment by deleting its allocator
+     */
+    ErrorCode PrepareUnmountSegment(const UUID& segment_id,
+                                    size_t& metrics_dec_capacity);
+
+    /**
+     * @brief Deleting the segment to complete the unmounting operation
+     */
+    ErrorCode CommitUnmountSegment(const UUID& segment_id,
+                                   const UUID& client_id,
+                                   const size_t& metrics_dec_capacity);
+
+    /**
+     * @brief Get all the segments of a client
+     */
+    ErrorCode GetClientSegments(const UUID& client_id,
+                                std::vector<NoFSegment>& segments) const;
+
+    /**
+     * @brief Get all mounted NoF segments with owner information
+     */
+    ErrorCode GetMountedSegments(
+        std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
+    /**
+     * @brief Get the names of all the segments
+     */
+    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
+
+    /**
+     * @brief Get the segment by name. If there are multiple segments with the
+     * same name, return the first one.
+     */
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
+
+   private:
+    NoFSegmentManager* nof_segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
 };
 
@@ -335,6 +460,78 @@ class SegmentManager {
     friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
     friend class SegmentSerializer;  // for fork serialize
+};
+
+class NoFSegmentManager {
+   public:
+    /**
+     * @brief Constructor for SegmentManager
+     * @param memory_allocator Type of buffer allocator to use for new segments
+     */
+    explicit NoFSegmentManager(
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
+        : memory_allocator_(memory_allocator) {}
+
+    /**
+     * @brief Get RAII-style access to segment management operations
+     * @return ScopedSegmentAccess object that holds the lock
+     */
+    ScopedNoFSegmentAccess getNoFSegmentAccess() {
+        return ScopedNoFSegmentAccess(this, segment_mutex_);
+    }
+
+    /**
+     * @brief Get RAII-style access to use allocators
+     * @return ScopedAllocatorAccess object that holds the lock
+     */
+    ScopedAllocatorAccess getAllocatorAccess() {
+        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_);
+    }
+
+    /**
+     * @brief Get the number of mounted NoF segments
+     * @return the mounted NoF segment count
+     */
+    int getMountedSegmentCount() const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        return mounted_segments_.size();
+    }
+
+    void GetMountedSegmentsSnapshot(
+        std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
+    tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
+        const std::string& segment_name) const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        std::vector<NoFSegmentOwnerInfo> result;
+        for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+            if (mounted_segment.segment.name == segment_name) {
+                result.emplace_back(segment_id, mounted_segment.client_id);
+            }
+        }
+        if (result.empty()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        return result;
+    }
+
+   private:
+    mutable std::shared_mutex segment_mutex_;
+    std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    const BufferAllocatorType
+        memory_allocator_;  // Type of buffer allocator to use
+    // allocator_manager_ only contains allocators whose segment status is OK.
+    AllocatorManager allocator_manager_;
+    std::unordered_map<UUID, MountedNoFSegment, boost::hash<UUID>>
+        mounted_segments_;  // segment_id -> mounted segment
+    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
+        client_segments_;  // client_id -> segment_ids
+
+    std::unordered_map<std::string, UUID>
+        client_by_name_;  // segment name -> client_id
+
+    friend class ScopedNoFSegmentAccess;
+    friend class SegmentTest;
 };
 
 }  // namespace mooncake

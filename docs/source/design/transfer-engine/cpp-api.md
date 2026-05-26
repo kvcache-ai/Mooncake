@@ -337,7 +337,7 @@ The HTTP server should implement three following RESTful APIs, while the metadat
 2. `PUT /metadata?key=$KEY`: Update the metadata corresponding to `$KEY` to the value of the request body.
 3. `DELETE /metadata?key=$KEY`: Delete the metadata corresponding to `$KEY`.
 
-For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](../../../mooncake-transfer-engine/example/http-metadata-server).
+For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](gh-dir:mooncake-transfer-engine/example/http-metadata-server).
 
 ### Initialization
 

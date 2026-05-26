@@ -26,10 +26,9 @@ constexpr auto kSupervisorRetryInterval = std::chrono::seconds(1);
 
 std::string ResolveHABackendConnstring(
     const MasterServiceSupervisorConfig& config) {
-    if (!config.ha_backend_connstring.empty()) {
-        return config.ha_backend_connstring;
-    }
-    return config.etcd_endpoints;
+    return ResolveConfiguredHABackendConnstring(config.ha_backend_type,
+                                                config.ha_backend_connstring,
+                                                config.etcd_endpoints);
 }
 
 tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
@@ -37,6 +36,11 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
     auto backend_type = ParseHABackendType(config.ha_backend_type);
     if (!backend_type.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto availability = ValidateHABackendAvailability(backend_type.value());
+    if (availability != ErrorCode::OK) {
+        return tl::make_unexpected(availability);
     }
 
     auto connstring = ResolveHABackendConnstring(config);

@@ -735,7 +735,8 @@ int TransferEnginePy::transferCheckStatus(batch_id_t batch_id) {
 }
 
 int TransferEnginePy::batchRegisterMemory(
-    std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities) {
+    std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities,
+    const std::string& location) {
     pybind11::gil_scoped_release release;
     auto batch_size = buffer_addresses.size();
     std::vector<BufferEntry> buffers;
@@ -743,7 +744,7 @@ int TransferEnginePy::batchRegisterMemory(
         buffers.push_back(
             BufferEntry{(void*)buffer_addresses[i], capacities[i]});
     }
-    return engine_->registerLocalMemoryBatch(buffers, kWildcardLocation);
+    return engine_->registerLocalMemoryBatch(buffers, location);
 }
 
 int TransferEnginePy::batchUnregisterMemory(
@@ -757,9 +758,10 @@ int TransferEnginePy::batchUnregisterMemory(
     return engine_->unregisterLocalMemoryBatch(buffers);
 }
 
-int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity) {
+int TransferEnginePy::registerMemory(uintptr_t buffer_addr, size_t capacity,
+                                     const std::string& location) {
     char* buffer = reinterpret_cast<char*>(buffer_addr);
-    return engine_->registerLocalMemory(buffer, capacity);
+    return engine_->registerLocalMemory(buffer, capacity, location);
 }
 
 int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
@@ -1011,6 +1013,12 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
     return result;
 }
 
+int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
+    if (!engine_) return -1;
+    pybind11::gil_scoped_release release;
+    return engine_->getMetadata()->sendProbe(peer_server_name);
+}
+
 namespace py = pybind11;
 
 // Implementation of coro_rpc_interface binding function
@@ -1094,10 +1102,14 @@ PYBIND11_MODULE(engine, m) {
             .def("write_bytes_to_buffer", &TransferEnginePy::writeBytesToBuffer)
             .def("read_bytes_from_buffer",
                  &TransferEnginePy::readBytesFromBuffer)
-            .def("register_memory", &TransferEnginePy::registerMemory)
+            .def("register_memory", &TransferEnginePy::registerMemory,
+                 py::arg("buffer_addr"), py::arg("capacity"),
+                 py::arg("location") = kWildcardLocation)
             .def("unregister_memory", &TransferEnginePy::unregisterMemory)
             .def("batch_register_memory",
-                 &TransferEnginePy::batchRegisterMemory)
+                 &TransferEnginePy::batchRegisterMemory,
+                 py::arg("buffer_addresses"), py::arg("capacities"),
+                 py::arg("location") = kWildcardLocation)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
             .def("get_local_topology", &TransferEnginePy::getLocalTopology,
@@ -1107,6 +1119,11 @@ PYBIND11_MODULE(engine, m) {
             .def("warmup_efa_segment", &TransferEnginePy::warmupEfaSegment,
                  py::arg("segment_name"))
             .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("send_probe", &TransferEnginePy::sendProbe,
+                 py::arg("peer_server_name"),
+                 "Send a JSON-RPC probe to peer to verify reachability. "
+                 "Returns 0 on success, non-zero on failure. Used by "
+                 "SGLang's failed-session blacklist recovery.")
             .def("get_engine", &TransferEnginePy::getEngine)
             .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 

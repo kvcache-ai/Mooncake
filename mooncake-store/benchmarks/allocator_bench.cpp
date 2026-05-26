@@ -20,7 +20,8 @@ class OffsetAllocatorBenchHelper {
           rd_(),
           gen_(rd_()) {}
 
-    void allocate(uint32_t size) {
+    void allocate(uint32_t size, double evict_ratio = 0.0,
+                  std::vector<double>* pre_evict_util_ratios = nullptr) {
         while (true) {
             auto handle = allocator_->allocate(size);
             if (handle.has_value()) {
@@ -32,14 +33,26 @@ class OffsetAllocatorBenchHelper {
             if (allocated_.size() == 0) {
                 break;
             }
-            std::uniform_int_distribution<uint32_t> dist(0,
-                                                         allocated_.size() - 1);
-            auto index = dist(gen_);
-            std::swap(allocated_[index], allocated_.back());
-            std::swap(allocated_sizes_[index], allocated_sizes_.back());
-            allocated_size_ -= allocated_sizes_.back();
-            allocated_.pop_back();
-            allocated_sizes_.pop_back();
+            if (pre_evict_util_ratios != nullptr) {
+                pre_evict_util_ratios->push_back(get_allocated_ratio());
+            }
+            size_t evict_count = 1;
+            if (evict_ratio > 0.0) {
+                evict_count = std::max<size_t>(
+                    1, static_cast<size_t>(allocated_.size() * evict_ratio));
+            }
+            evict_count = std::min(evict_count, allocated_.size());
+
+            for (size_t i = 0; i < evict_count; ++i) {
+                std::uniform_int_distribution<uint32_t> dist(
+                    0, allocated_.size() - 1);
+                auto index = dist(gen_);
+                std::swap(allocated_[index], allocated_.back());
+                std::swap(allocated_sizes_[index], allocated_sizes_.back());
+                allocated_size_ -= allocated_sizes_.back();
+                allocated_.pop_back();
+                allocated_sizes_.pop_back();
+            }
         }
     }
 
@@ -182,12 +195,12 @@ void paired_kv_indexer_allocation_benchmark() {
               << "=== Paired KV/Indexer Allocation Benchmark (DSA) ==="
               << std::endl;
 
-    const uint32_t kvcache_size = 3274752;                 // 3,274,752 B
-    const uint32_t indexer_size = 643u * 1024;             // 643 KB
-    const size_t pool_size = 600ull * 1024 * 1024 * 1024;  // 600 GB
+    const uint32_t kvcache_size = 3274752;                  // 3,274,752 B
+    const uint32_t indexer_size = 643u * 1024;              // 643 KB
+    const size_t pool_size = 1024ull * 1024 * 1024 * 1024;  // 1TB
     const int max_per_round = 128;
     const int warmup_rounds = 5000;
-    const int num_rounds = 500000;
+    const int num_rounds = 50000;
 
     size_t max_allocs = pool_size / indexer_size + 1024;
     BenchHelper bench_helper(0x1000, pool_size, max_allocs);
@@ -200,26 +213,27 @@ void paired_kv_indexer_allocation_benchmark() {
     for (int round = 0; round < warmup_rounds; round++) {
         int per_round = per_round_dist(gen);
         for (int i = 0; i < per_round; i++) {
-            bench_helper.allocate(kvcache_size);
+            bench_helper.allocate(kvcache_size, 0.05);
         }
         for (int i = 0; i < per_round; i++) {
-            bench_helper.allocate(indexer_size);
+            bench_helper.allocate(indexer_size, 0.05);
         }
     }
 
     std::vector<double> util_ratios;
-    util_ratios.reserve(static_cast<size_t>(num_rounds) * 2 * max_per_round);
+    util_ratios.reserve(num_rounds);
 
     auto start_time = std::chrono::high_resolution_clock::now();
+    size_t total_alloc_count = 0;
     for (int round = 0; round < num_rounds; round++) {
         int per_round = per_round_dist(gen);
         for (int i = 0; i < per_round; i++) {
-            bench_helper.allocate(kvcache_size);
-            util_ratios.push_back(bench_helper.get_allocated_ratio());
+            bench_helper.allocate(kvcache_size, 0.05, &util_ratios);
+            ++total_alloc_count;
         }
         for (int i = 0; i < per_round; i++) {
-            bench_helper.allocate(indexer_size);
-            util_ratios.push_back(bench_helper.get_allocated_ratio());
+            bench_helper.allocate(indexer_size, 0.05, &util_ratios);
+            ++total_alloc_count;
         }
     }
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -228,17 +242,22 @@ void paired_kv_indexer_allocation_benchmark() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(end_time -
                                                              start_time)
             .count() /
-        static_cast<double>(util_ratios.size());
+        static_cast<double>(total_alloc_count);
 
     std::sort(util_ratios.begin(), util_ratios.end());
-    const double min_util = util_ratios.front();
-    const double max_util = util_ratios.back();
-    const double p50 = util_ratios[util_ratios.size() * 0.50];
-    const double p90 = util_ratios[util_ratios.size() * 0.10];
-    const double p99 = util_ratios[util_ratios.size() * 0.01];
+    const double min_util = util_ratios.empty() ? 0.0 : util_ratios.front();
+    const double max_util = util_ratios.empty() ? 0.0 : util_ratios.back();
+    const double p50 =
+        util_ratios.empty() ? 0.0 : util_ratios[util_ratios.size() * 0.50];
+    const double p90 =
+        util_ratios.empty() ? 0.0 : util_ratios[util_ratios.size() * 0.10];
+    const double p99 =
+        util_ratios.empty() ? 0.0 : util_ratios[util_ratios.size() * 0.01];
     const double mean_util =
-        std::accumulate(util_ratios.begin(), util_ratios.end(), 0.0) /
-        util_ratios.size();
+        util_ratios.empty()
+            ? 0.0
+            : std::accumulate(util_ratios.begin(), util_ratios.end(), 0.0) /
+                  util_ratios.size();
 
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "kvcache size: " << kvcache_size
@@ -249,6 +268,8 @@ void paired_kv_indexer_allocation_benchmark() {
     std::cout << "util ratio (min / p99 / p90 / p50 / max / avg): " << min_util
               << " / " << p99 << " / " << p90 << " / " << p50 << " / "
               << max_util << " / " << mean_util << std::endl;
+    std::cout << "eviction-trigger samples: " << util_ratios.size()
+              << std::endl;
     std::cout << "avg alloc time: " << avg_time_ns << " ns/op" << std::endl;
 }
 

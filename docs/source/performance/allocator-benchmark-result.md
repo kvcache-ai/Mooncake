@@ -214,10 +214,13 @@ In this configuration, Mooncake Store stores data at the page granularity, where
 - KV cache object size: 3.12 MB
 - Indexer object size: 643 KB
 
+Each benchmark round samples `N` uniformly from `[1, 128]`, then issues `N` KV cache allocations followed by `N` indexer allocations. The pool size is 1024 GB. On allocation failure, the benchmark randomly evicts 5% of all live objects and retries. The utilization ratio below is sampled only when eviction is triggered, immediately before evicting objects.
+
 **OffsetAllocator**
 
 ```
 util ratio (min / p99 / p90 / p50 / max / avg):
-0.948299 / 0.948765 / 0.949311 / 0.949884 / 0.952491 / 0.950091
-avg alloc time: 232.420141 ns/op
+0.951814 / 0.951879 / 0.952077 / 0.952382 / 0.952621 / 0.952343
+eviction-trigger samples: 243
+avg alloc time: 352.207986 ns/op
 ```

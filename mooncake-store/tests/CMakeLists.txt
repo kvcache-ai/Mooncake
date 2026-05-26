@@ -40,8 +40,12 @@ add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
+add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
+add_store_test(master_service_promotion_test_for_snapshot
+               ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
@@ -55,6 +59,7 @@ add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
@@ -84,6 +89,7 @@ add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
+add_store_test(object_data_type_test object_data_type_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
@@ -119,6 +125,11 @@ if(STORE_USE_REDIS)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
+if(STORE_USE_K8S_LEASE)
+  target_sources(
+    high_availability_test
+    PRIVATE ha/leadership/backends/k8s/high_availability_k8s_test.cpp)
+endif()
 target_link_libraries(
   high_availability_test
   PUBLIC mooncake_store
@@ -129,9 +140,15 @@ target_link_libraries(
          gtest
          gtest_main
          pthread)
-if(STORE_USE_ETCD OR STORE_USE_REDIS)
+if(STORE_USE_K8S_LEASE)
+  target_link_libraries(high_availability_test
+                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+endif()
+if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
+add_ha_test(ha_backend_availability_test
+            ha/leadership/ha_backend_availability_test.cpp)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(

@@ -32,6 +32,12 @@ struct PeerConnection {
     std::optional<BatchID> warmupBatchId{std::nullopt};
     std::optional<TransferMetadata::SegmentID> segmentId{std::nullopt};
 
+    // Whether this peer has been counted in `totalConnectedPeers_`.
+    // Note that ConnectionPoller may establish connections for ranks beyond
+    // the current groupSize_ (when pollingLimit_ > groupSize_). In that case we
+    // delay counting until the rank officially enters the group.
+    bool countedInGroup{false};
+
     // Back off to avoid frequently checking store.
     std::chrono::steady_clock::time_point last_check_store;
     size_t check_store_backoff_ms{kCheckStoreInitialBackoffMs};
@@ -55,6 +61,11 @@ class ConnectionContext {
     int rank_;
 
     std::atomic<int> groupSize_;
+
+    // Upper bound of peer polling range.
+    // This can be larger than groupSize_ so that existing ranks can observe
+    // joiners without calling extendGroupSizeTo().
+    std::atomic<int> pollingLimit_;
 
     bool isDummy_;
 
@@ -119,6 +130,9 @@ class ConnectionContext {
      * @param newGroupSize The target size for the extended group.
      */
     void extendGroupSizeTo(int newGroupSize);
+
+    // Allow polling ranks beyond groupSize_ without changing groupSize_.
+    void setPollingLimitTo(int pollingLimit);
 
     /**
      * @brief Checks whether all peers within the group have
