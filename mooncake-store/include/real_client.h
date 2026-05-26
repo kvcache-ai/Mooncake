@@ -526,6 +526,20 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
                                                            size_t size);
 
+    struct RangedReadMetadata {
+        QueryResult query_result;
+        Replica::Descriptor replica;
+        uint64_t total_size;
+    };
+
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key,
+        const tl::expected<QueryResult, ErrorCode> &query_result);
+
+    tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
+        const std::string &key);
+
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
@@ -871,9 +885,8 @@ class RealClient : public PyClient {
 
    private:
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
-        const std::string &key,
-        const tl::expected<QueryResult, ErrorCode> &query_result, void *buffer,
-        size_t dst_offset, size_t src_offset, size_t size,
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const RangedReadMetadata &metadata,
         bool size_is_buffer_capacity = false);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>

@@ -49,7 +49,8 @@ struct CachedQueryResultResponse {
     CachedQueryResultResponse()
         : success(false), value(), error(ErrorCode::INVALID_PARAMS) {}
     CachedQueryResultResponse(GetReplicaListResponse&& value_param)
-        : success(true), value(std::move(value_param)),
+        : success(true),
+          value(std::move(value_param)),
           error(ErrorCode::INVALID_PARAMS) {}
     CachedQueryResultResponse(ErrorCode error_param)
         : success(false), value(), error(error_param) {}
