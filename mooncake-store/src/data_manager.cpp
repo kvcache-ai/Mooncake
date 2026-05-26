@@ -1143,7 +1143,7 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     record.handle = handle;
     record.ref_count = 1;
     record.list_it = list_it;
-    pin_shard.existed_operation_key_map.insert_or_assign(ctx.key,
+    pin_shard.existed_operation_key_map.insert_or_assign(std::string(ctx.key),
                                                          std::move(record));
 
     PinKeyResult result;

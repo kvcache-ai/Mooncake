@@ -36,7 +36,10 @@ void TieredBackend::SetMetadataShardCount(size_t count) {
         LOG(FATAL) << "SetMetadataShardCount must be called before Init()";
     }
     metadata_shard_count_ = count > 0 ? count : kDefaultMetadataShardCount;
-    metadata_shards_.assign(metadata_shard_count_, MetadataShard{});
+    metadata_shards_.reserve(metadata_shard_count_);
+    for (size_t i = 0; i < metadata_shard_count_; ++i) {
+        metadata_shards_.push_back(std::make_unique<MetadataShard>());
+    }
 }
 
 bool TieredBackend::KeyExistsInShard(const MetadataShard& shard,
@@ -149,6 +152,14 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     } catch (const std::logic_error& e) {
         LOG(ERROR) << "Failed to build DataCopier: " << e.what();
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Initialize metadata shards if not already set
+    if (metadata_shards_.empty()) {
+        metadata_shards_.reserve(metadata_shard_count_);
+        for (size_t i = 0; i < metadata_shard_count_; ++i) {
+            metadata_shards_.push_back(std::make_unique<MetadataShard>());
+        }
     }
 
     // Register callback for syncing metadata to Master
@@ -944,7 +955,7 @@ void TieredBackend::ForEachKeyBatch(
     const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
     // Iterate per-shard. Each shard is locked independently.
     for (size_t s = 0; s < metadata_shard_count_; ++s) {
-        auto& shard = metadata_shards_[s];
+        auto& shard = *metadata_shards_[s];
 
         // Copy entry pointers under shard shared lock
         std::vector<std::pair<std::string, std::shared_ptr<MetadataEntry>>>

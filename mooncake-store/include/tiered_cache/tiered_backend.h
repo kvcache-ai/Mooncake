@@ -309,15 +309,15 @@ class TieredBackend {
     static constexpr size_t kDefaultMetadataShardCount = 64;
 
     size_t metadata_shard_count_ = kDefaultMetadataShardCount;
-    std::vector<MetadataShard> metadata_shards_{kDefaultMetadataShardCount};
+    std::vector<std::unique_ptr<MetadataShard>> metadata_shards_;
 
     MetadataShard& GetMetadataShard(std::string_view key) {
-        return metadata_shards_[std::hash<std::string_view>{}(key) %
-                                metadata_shard_count_];
+        return *metadata_shards_[std::hash<std::string_view>{}(key) %
+                                 metadata_shard_count_];
     }
     const MetadataShard& GetMetadataShard(std::string_view key) const {
-        return metadata_shards_[std::hash<std::string_view>{}(key) %
-                                metadata_shard_count_];
+        return *metadata_shards_[std::hash<std::string_view>{}(key) %
+                                 metadata_shard_count_];
     }
 
     static bool KeyExistsInShard(const MetadataShard& shard,
