@@ -28,7 +28,7 @@ use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "").upper() in {
 sources = [
     "src/ep_py.cpp",
     "src/mooncake_ep_buffer.cpp",
-    "src/mooncake_ep_kernel.cu",
+    "src/mooncake_ep_kernel.mu" if use_musa else "src/mooncake_ep_kernel.cu",
 ]
 
 if use_musa:
