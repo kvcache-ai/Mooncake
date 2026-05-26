@@ -4431,8 +4431,8 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 
-    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
-                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
     [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
 
