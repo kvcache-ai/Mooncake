@@ -50,9 +50,7 @@ class Environ {
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
-    bool GetEfaLoopbackPreferEmulated() const {
-        return efa_loopback_prefer_emulated_;
-    }
+    bool GetEfaLoopbackPreferEmulated() const { return efa_loopback_prefer_emulated_; }
 
    private:
     Environ();

@@ -103,8 +103,8 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // emulated RDMA path, which detects the same-host case and resolves
     // the write to a memcpy.
     //
-    // Measured on p5.48xlarge (1 NIC, 80 MB transfer, two Mooncake
-    // Store clients on the same host, put_from):
+    // Measured on p5.48xlarge (1 NIC, ~1.2 GiB per put_from call, two
+    // Mooncake Store clients on the same host):
     //   FI_EFA_USE_DEVICE_RDMA=1 (default after #2041):  ~830 ms / call
     //   FI_EFA_USE_DEVICE_RDMA=0 (emulated):              ~390 ms / call
     //

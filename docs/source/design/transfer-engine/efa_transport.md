@@ -349,7 +349,7 @@ EFA NICs have no hardware loopback short-circuit: even when both endpoints resol
 
 Set `MC_EFA_LOOPBACK_PREFER_EMULATED=1` to opt into the emulated path. It is opt-in, not auto-detect, because a single `EfaTransport` instance may serve a mix of loopback and cross-host peers, and `FI_EFA_USE_DEVICE_RDMA` is a provider-level flag resolved at `fi_getinfo` time — flipping it disables device RDMA for **every** transfer in the process, including cross-host ones. Use this for single-host workloads; leave it unset for production cross-host fan-out.
 
-Measured on p5.48xlarge (1 NIC, 80 MB write, same-host producer/consumer, Mooncake Store `put_from`):
+Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, same-host producer/consumer):
 
 | `MC_EFA_LOOPBACK_PREFER_EMULATED` | per-write latency |
 |---|---:|
