@@ -111,7 +111,8 @@ enum class ParallelismShardReadStorageRoute {
 struct ReconstructedShardSource {
     std::string read_key;
     ParsedTensorMetadata metadata;
-    tl::expected<QueryResult, ErrorCode> query_result;
+    tl::expected<QueryResult, ErrorCode> query_result =
+        tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 };
 
 struct FullTensorReconstructionSources {
