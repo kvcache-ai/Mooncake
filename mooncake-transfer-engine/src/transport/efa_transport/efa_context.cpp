@@ -19,7 +19,6 @@
 
 #include <atomic>
 #include <cassert>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -29,7 +28,6 @@
 
 #include "config.h"
 #include "cuda_alike.h"
-#include "environ.h"
 #include "transport/efa_transport/efa_endpoint.h"
 #include "transport/efa_transport/efa_transport.h"
 #include "transport/transport.h"
@@ -90,36 +88,6 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
 #endif
         ;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
-
-    // Single-host loopback opt-out (MC_EFA_LOOPBACK_PREFER_EMULATED).
-    //
-    // EFA NICs have no hardware loopback short-circuit: even when two
-    // endpoints resolve to the same host, fi_write/fi_read drive a DMA
-    // round-trip through the EFA device (PCIe out, NIC packet processing,
-    // PCIe back) instead of taking a memcpy fast path. For Mooncake Store
-    // deployments where producer and consumer run as separate processes
-    // on the same host (single-machine development, benchmarks,
-    // co-located workers), this is strictly slower than libfabric's
-    // emulated RDMA path, which detects the same-host case and resolves
-    // the write to a memcpy.
-    //
-    // Measured on p5.48xlarge (1 NIC, ~1.2 GiB per put_from call, two
-    // Mooncake Store clients on the same host):
-    //   FI_EFA_USE_DEVICE_RDMA=1 (default after #2041):  ~830 ms / call
-    //   FI_EFA_USE_DEVICE_RDMA=0 (emulated):              ~390 ms / call
-    //
-    // Only set FI_EFA_USE_DEVICE_RDMA=0 here when the user has not
-    // already set it explicitly. The getenv guard also serves as a
-    // dedup: this function runs once per NIC (up to 32 times on
-    // p5.48xlarge), but after the first NIC the env var is set, so
-    // subsequent NICs skip the block entirely and we log exactly once.
-    if (Environ::Get().GetEfaLoopbackPreferEmulated() &&
-        std::getenv("FI_EFA_USE_DEVICE_RDMA") == nullptr) {
-        setenv("FI_EFA_USE_DEVICE_RDMA", "0", 0);
-        LOG(INFO) << "[EFA] MC_EFA_LOOPBACK_PREFER_EMULATED=1 -> "
-                     "FI_EFA_USE_DEVICE_RDMA=0 (emulated RDMA path, "
-                     "optimal for same-host loopback transfers)";
-    }
 
     // Get fabric info.
     //
