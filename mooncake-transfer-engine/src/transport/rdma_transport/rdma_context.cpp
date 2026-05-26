@@ -65,7 +65,7 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 #if defined(USE_HIP)
 // AMD GPU dmabuf RDMA requires two kernel features to be present, otherwise
 // `ibv_reg_dmabuf_mr()` may return a valid-looking MR but subsequent RDMA
-// transfers fail (or silently mis-behave) because the kernel cannot route
+// transfers fail (or silently misbehave) because the kernel cannot route
 // PCIe peer-to-peer DMA through the dmabuf fd:
 //
 //   CONFIG_PCI_P2PDMA=y
@@ -460,7 +460,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                !isKernelDmabufSupported()) {
         // Device memory but kernel lacks CONFIG_PCI_P2PDMA /
         // CONFIG_DMABUF_MOVE_NOTIFY — `ibv_reg_dmabuf_mr` may succeed but
-        // subsequent transfers will fail (or worse, silently mis-route).
+        // subsequent transfers will fail (or worse, silently misroute).
         // Fall back to `ibv_reg_mr` so the failure surfaces here, at
         // registration time, instead of mid-transfer.
         mrMeta.addr = addr;
