@@ -60,9 +60,8 @@ __device__ __forceinline__ void mtlink_put(DeviceOps* dops,
                                            void* recv, const void* send,
                                            size_t n) {
     void* peer_dst = peer_ptr(ctx, dst_rank, local_base, recv);
-    // Direct copy to peer memory, then release fence
-    dops->store_relaxed(peer_dst, send, n);
-    dops->fence_acq_rel();
+    // store_release = copy + __threadfence_system(), ensures P2P visibility
+    dops->store_release(peer_dst, send, n);
 }
 
 __device__ __forceinline__ void mtlink_signal(DeviceOps* dops,
