@@ -251,9 +251,10 @@ size_t DataManager::ScanExpiredRecordShard(RecordShard<Record>& shard,
         }
         auto record_it = shard.existed_operation_key_map.find(list_it->first);
         if (record_it == shard.existed_operation_key_map.end()) {
-            LOG(WARNING) << "ScanExpiredRecordShard: expired ordered_list entry "
-                            "missing from existed_operation_key_map, key="
-                         << list_it->first;
+            LOG(WARNING)
+                << "ScanExpiredRecordShard: expired ordered_list entry "
+                   "missing from existed_operation_key_map, key="
+                << list_it->first;
             shard.ordered_list.erase(list_it);
             continue;
         }
@@ -301,12 +302,14 @@ void DataManager::AbortPendingWriteInternal(const KeyCtx& ctx,
     switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
                                     write_operation_id)) {
         case PendingWriteEraseResult::NotFound:
-            LOG(WARNING) << "AbortPendingWrite: no pending write record for key: "
-                         << ctx.key;
+            LOG(WARNING)
+                << "AbortPendingWrite: no pending write record for key: "
+                << ctx.key;
             break;
         case PendingWriteEraseResult::WriteOperationIdMismatch:
-            LOG(ERROR) << "AbortPendingWrite: write_operation_id mismatch for key: "
-                       << ctx.key;
+            LOG(ERROR)
+                << "AbortPendingWrite: write_operation_id mismatch for key: "
+                << ctx.key;
             break;
         case PendingWriteEraseResult::Erased:
             break;
@@ -596,10 +599,10 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         return {};
     };
 
-    auto write_and_commit = [write_fn = std::move(write_fn),
-                             commit_fn = std::move(commit_fn),
-                             key_owned = std::string(key)]() mutable
-        -> tl::expected<void, ErrorCode> {
+    auto write_and_commit =
+        [write_fn = std::move(write_fn), commit_fn = std::move(commit_fn),
+         key_owned =
+             std::string(key)]() mutable -> tl::expected<void, ErrorCode> {
         ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
         timer.LogRequest("key=", key_owned);
         auto write_result = write_fn();
@@ -921,11 +924,12 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
         return tl::make_unexpected(reserve_result.error());
     }
 
-    // Reserve holds unique_lock because it inserts into existed_operation_key_map
-    // and ordered_list. Allocate runs without shard lock so other keys in the
-    // shard are not blocked. Attach only fills handle on the reserved record
-    // under shared_lock (see AttachPendingWriteHandle); the record itself has no
-    // separate lock while the write lease excludes concurrent writers.
+    // Reserve holds unique_lock because it inserts into
+    // existed_operation_key_map and ordered_list. Allocate runs without shard
+    // lock so other keys in the shard are not blocked. Attach only fills handle
+    // on the reserved record under shared_lock (see AttachPendingWriteHandle);
+    // the record itself has no separate lock while the write lease excludes
+    // concurrent writers.
     if (tiered_backend_->Exist(ctx.key)) {
         LOG(ERROR) << "PreWrite: key already exists"
                    << ", key=" << ctx.key
@@ -948,8 +952,8 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     }
 
     auto handle = std::move(handle_result.value());
-    auto attach_result = AttachPendingWriteHandle(
-        pending_write_shard, ctx.key, write_operation_id, handle);
+    auto attach_result = AttachPendingWriteHandle(pending_write_shard, ctx.key,
+                                                  write_operation_id, handle);
     if (!attach_result) {
         timer.LogResponse("error_code=", attach_result.error());
         return tl::make_unexpected(attach_result.error());
@@ -1000,8 +1004,9 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
             const auto erased = ErasePendingWriteRecord(
                 pending_write_shard, ctx.key, write_operation_id);
             if (erased == PendingWriteEraseResult::Erased) {
-                LOG(ERROR) << "WriteCommit: removed expired pending write record"
-                           << ", key=" << ctx.key;
+                LOG(ERROR)
+                    << "WriteCommit: removed expired pending write record"
+                    << ", key=" << ctx.key;
             } else {
                 LOG(WARNING) << "WriteCommit: expired pending write record not "
                                 "found for cleanup, key="
@@ -1019,8 +1024,8 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     // metadata updates on this key via its internal shard lock.
     auto commit_result = tiered_backend_->Commit(ctx.key, handle);
 
-    const auto erased = ErasePendingWriteRecord(
-        pending_write_shard, ctx.key, write_operation_id);
+    const auto erased = ErasePendingWriteRecord(pending_write_shard, ctx.key,
+                                                write_operation_id);
     if (erased != PendingWriteEraseResult::Erased) {
         LOG(WARNING) << "WriteCommit: pending write record already removed"
                      << " during commit, key=" << ctx.key;
@@ -1030,9 +1035,9 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
         LOG(ERROR) << "WriteCommit: tier commit failed"
                    << ", key=" << ctx.key
                    << ", error=" << toString(commit_result.error());
-        timer.LogResponse("error_code=", commit_result.error(),
-                          "record_erased=",
-                          erased == PendingWriteEraseResult::Erased);
+        timer.LogResponse(
+            "error_code=", commit_result.error(),
+            "record_erased=", erased == PendingWriteEraseResult::Erased);
         return tl::make_unexpected(commit_result.error());
     }
 
@@ -1138,7 +1143,8 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     record.handle = handle;
     record.ref_count = 1;
     record.list_it = list_it;
-    pin_shard.existed_operation_key_map.insert_or_assign(ctx.key, std::move(record));
+    pin_shard.existed_operation_key_map.insert_or_assign(ctx.key,
+                                                         std::move(record));
 
     PinKeyResult result;
     result.remote_buffer = std::move(remote_buffer_result.value());

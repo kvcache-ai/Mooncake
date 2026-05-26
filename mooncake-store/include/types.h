@@ -152,7 +152,8 @@ enum class ErrorCode : int32_t {
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
     REPLICA_NUM_EXCEEDED = -713,    ///< Replica number exceeded.
-    REPLICA_IS_PROCESSING = -714,  ///< Replica is processing an in-flight write.
+    REPLICA_IS_PROCESSING =
+        -714,  ///< Replica is processing an in-flight write.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

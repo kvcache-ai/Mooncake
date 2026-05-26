@@ -35,8 +35,7 @@ void TieredBackend::SetMetadataShardCount(size_t count) {
     if (!tiers_.empty()) {
         LOG(FATAL) << "SetMetadataShardCount must be called before Init()";
     }
-    metadata_shard_count_ =
-        count > 0 ? count : kDefaultMetadataShardCount;
+    metadata_shard_count_ = count > 0 ? count : kDefaultMetadataShardCount;
     metadata_shards_.assign(metadata_shard_count_, MetadataShard{});
 }
 
@@ -62,8 +61,8 @@ bool TieredBackend::KeyExistsInShard(const MetadataShard& shard,
 
 ConditionalExecuteResult<void> TieredBackend::conditionalExecute(
     std::string_view key, std::optional<UUID> tier_id,
-    std::function<void()> on_exists, std::function<void()> on_not_exists)
-    const {
+    std::function<void()> on_exists,
+    std::function<void()> on_not_exists) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
     const bool exists = KeyExistsInShard(shard, key, tier_id);

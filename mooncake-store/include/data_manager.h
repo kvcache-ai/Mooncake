@@ -84,8 +84,9 @@ class DataManager {
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
         UUID write_operation_id{0, 0};
-        // Filled by PreWriteInternal for in-process callers (Put/WriteRemoteData).
-        // Public PreWrite omits this field for RPC responses.
+        // Filled by PreWriteInternal for in-process callers
+        // (Put/WriteRemoteData). Public PreWrite omits this field for RPC
+        // responses.
         AllocationHandle handle;
     };
 
