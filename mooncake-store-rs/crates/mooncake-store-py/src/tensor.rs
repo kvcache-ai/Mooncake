@@ -147,8 +147,18 @@ impl PyMooncakeDistributedStore {
 
     /// Store a tensor using zero-copy from the tensor's data pointer.
     ///
-    /// The tensor data must reside in registered memory with at least
-    /// `WIRE_SIZE` (304) bytes of writable space before `data_ptr`.
+    /// # Safety contract
+    ///
+    /// The tensor data **must** reside in a buffer previously passed to
+    /// `register_buffer()`. The registered region must have at least
+    /// `WIRE_SIZE` (304) bytes of writable space before `data_ptr` — this is
+    /// where the metadata header is written.
+    ///
+    /// For tensors NOT in registered memory, use `put_tensor()` instead (it
+    /// copies into an internal buffer and does not require registration).
+    ///
+    /// If the buffer is not registered, the downstream `put_from` call will
+    /// fail with a transport/allocator error after the header write.
     #[pyo3(signature = (key, tensor, *, tenant = None, replica_count = None))]
     fn put_tensor_from(
         &self,
@@ -174,7 +184,14 @@ impl PyMooncakeDistributedStore {
                 )
             })?;
 
+        // Validate the buffer pointer before the unsafe write. put_from will
+        // perform the full registered-memory check downstream; this catches
+        // null/unmapped pointers early.
+        let _ = pointer_from_usize(buffer_ptr)?;
+
         // Write metadata header into the space before tensor data.
+        // Safety: buffer_ptr is validated non-null above and the caller
+        // guarantees the region is registered with sufficient headroom.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 metadata.as_bytes().as_ptr(),

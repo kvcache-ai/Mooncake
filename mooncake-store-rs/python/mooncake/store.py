@@ -703,8 +703,11 @@ class MooncakeDistributedStore:
     def put_tensor_from(self, key: str, tensor, *, tenant: str | None = None, config=None):
         """Store a tensor via zero-copy from registered memory.
 
-        The metadata header is written into the WIRE_SIZE bytes preceding
-        tensor.data_ptr(). The caller must ensure that space is available.
+        The tensor MUST reside in a buffer previously passed to
+        register_buffer(), with at least TENSOR_METADATA_WIRE_SIZE (304)
+        bytes of headroom before tensor.data_ptr().
+
+        For tensors NOT in registered memory, use put_tensor() instead.
         """
         return self._invoke(
             "put_tensor_from", key, tensor, tenant=tenant, **_replication_kwargs_simple(config)
@@ -714,7 +717,12 @@ class MooncakeDistributedStore:
         """Read a tensor from the store.
 
         If *tensor* is provided, its storage is used as the destination buffer.
-        Otherwise a new tensor is allocated. Returns a torch.Tensor.
+        This path requires that the tensor resides in a buffer previously
+        passed to register_buffer(), with at least TENSOR_METADATA_WIRE_SIZE
+        (304) bytes of headroom before tensor.data_ptr().
+
+        For tensors NOT in registered memory, omit the *tensor* parameter —
+        the fallback path allocates internally and returns a new torch.Tensor.
         """
         import torch
 
