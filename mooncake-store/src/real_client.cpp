@@ -3152,40 +3152,6 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::build_ranged_read_metadata_from_query_result(
-    const std::string &key,
-    const tl::expected<QueryResult, ErrorCode> &query_result) {
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return tl::unexpected(query_result.error());
-        }
-        LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(query_result.error());
-        return tl::unexpected(query_result.error());
-    }
-
-    const auto &replica_list = query_result->replicas;
-    if (replica_list.empty()) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
-    if (!best_replica) {
-        LOG(ERROR) << "No usable replica for key: " << key;
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-
-    auto query_value = query_result.value();
-    auto replica = *best_replica;
-    return RangedReadMetadata{.query_result = std::move(query_value),
-                              .replica = std::move(replica),
-                              .total_size = calculate_total_size(replica)};
-}
-
-tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(const std::string &key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -3218,6 +3184,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (src_offset == 0 && size == total_size) {
+        // LOCAL_DISK full-object read: destination buffer is passed
+        // directly to SSD RPC (same pattern as single-buffer batch_get_into;
+        // GPU buffers are pre-registered by vLLM via register_buffer).
         if (replica.is_local_disk_replica()) {
             const auto &endpoint =
                 replica.get_local_disk_descriptor().transport_endpoint;
@@ -3232,6 +3201,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         }
 
         if (replica.is_disk_replica()) {
+            // DISK full read: local file I/O (vector_read) cannot write to
+            // GPU memory. Use temp CPU buffer, then scatter to dst.
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for DISK full "
@@ -3272,6 +3243,13 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return static_cast<int64_t>(total_size);
     }
 
+    // Partial disk read: allocate temp CPU buffer, invoke read_op to
+    // fill it, then scatter [src_offset, src_offset+size) to dst.
+    //
+    // buf_size controls how much to allocate / read.  DISK must use
+    // total_size (allocateSlices requires full-object slices).
+    // LOCAL_DISK can use src_offset + size (offload RPC transfers
+    // sequentially from remote offset 0).
     auto partial_disk_read =
         [&](auto &&read_op,
             size_t buf_size) -> tl::expected<int64_t, ErrorCode> {
@@ -3296,6 +3274,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     };
 
     if (replica.is_local_disk_replica()) {
+        // LOCAL_DISK: offload RPC transfers sequentially from remote offset
+        // 0, so we only need src_offset + size bytes (not total_size).
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 const auto &endpoint =
@@ -3311,6 +3291,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (replica.is_disk_replica()) {
+        // DISK: client_->Get + allocateSlices requires full-object slices,
+        // so we must allocate total_size.
         return partial_disk_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
@@ -3374,16 +3356,6 @@ int64_t RealClient::get_into(const std::string &key, void *buffer,
                 static_cast<uint64_t>(ret.value()), latency_us);
         });
     return to_py_ret(result);
-}
-
-std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
-    const std::vector<std::string> &keys) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<tl::expected<QueryResult, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return client_->BatchQuery(keys);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
@@ -3549,6 +3521,50 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     sum_positive_ranges(ret), latency_us);
             });
     return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchQuery(keys);
+}
+
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::build_ranged_read_metadata_from_query_result(
+    const std::string &key,
+    const tl::expected<QueryResult, ErrorCode> &query_result) {
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            return tl::unexpected(query_result.error());
+        }
+        LOG(ERROR) << "Query failed for key: " << key
+                   << " with error: " << toString(query_result.error());
+        return tl::unexpected(query_result.error());
+    }
+
+    const auto &replica_list = query_result->replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto local_endpoints = client_->GetLocalEndpoints();
+    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    if (!best_replica) {
+        LOG(ERROR) << "No usable replica for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto query_value = query_result.value();
+    auto replica = *best_replica;
+    return RangedReadMetadata{.query_result = std::move(query_value),
+                              .replica = std::move(replica),
+                              .total_size = calculate_total_size(replica)};
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
