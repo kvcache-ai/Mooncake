@@ -507,6 +507,14 @@ export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 
 > **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
 
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. By default (unset or `0`), Mooncake creates one CQ poller thread per EFA context. When multiple EFA consumers coexist in the same process (e.g., Mooncake KV cache transfer + DeepEP/UCCL-EP MoE all-to-all), these pollers compete for CPU and can degrade the other consumer's latency. Set `MC_EFA_CQ_THREADS=1` to limit Mooncake to a single CQ poller, freeing CPU for other EFA consumers with no measurable impact on Mooncake transfer throughput.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # use 1 CQ poller (recommended when co-located with DeepEP/UCCL-EP)
+> ```
+>
+> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
+
 ### 3. Prefill Instance
 
 ```bash
