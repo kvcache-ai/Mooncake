@@ -34,6 +34,10 @@
 // hsa_amd_portable_export_dmabuf is the ROCm equivalent of
 // cuMemGetHandleForAddressRange(...CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD...).
 // Used in the dmabuf branch of registerMemoryRegionInternal below.
+#include <sys/utsname.h>
+
+#include <vector>
+
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
 #endif
@@ -57,6 +61,93 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
     return region_start <= addr && addr - region_start < region_length;
 }
+
+#if defined(USE_HIP)
+// AMD GPU dmabuf RDMA requires two kernel features to be present, otherwise
+// `ibv_reg_dmabuf_mr()` may return a valid-looking MR but subsequent RDMA
+// transfers fail (or silently mis-behave) because the kernel cannot route
+// PCIe peer-to-peer DMA through the dmabuf fd:
+//
+//   CONFIG_PCI_P2PDMA=y
+//   CONFIG_DMABUF_MOVE_NOTIFY=y
+//
+// Mirrors RCCL's check at projects/rccl/src/misc/rocmwrap.cc:266 and the
+// equivalent gate in UCX's ROCm backend. Cached after the first call.
+//
+// Distros known to ship both options enabled by default: Ubuntu 24.04 (5.15
+// HWE -> 6.8), RHEL 9.4+ (5.14+), kernel >= 6.x in general. Ubuntu 22.04
+// stock 5.15 lacks them; if you need this PR's dmabuf path on an older
+// distro, rebuild the kernel with both options enabled.
+bool isKernelDmabufSupported() {
+    static const bool supported = []() {
+        struct utsname uts{};
+        std::string release;
+        if (uname(&uts) == 0) release = uts.release;
+
+        const char *needles[] = {"CONFIG_PCI_P2PDMA=y",
+                                 "CONFIG_DMABUF_MOVE_NOTIFY=y"};
+        std::vector<bool> found(2, false);
+
+        const std::vector<std::string> candidates = {
+            "/proc/config.gz",  // compressed; checked below via gzip-magic skip
+            "/boot/config-" + release,
+            "/usr/src/linux-" + release + "/.config",
+            "/usr/src/linux/.config",
+            "/usr/lib/modules/" + release + "/config",
+            "/usr/lib/ostree-boot/config-" + release,
+            "/usr/lib/kernel/config-" + release,
+            "/usr/src/linux-headers-" + release + "/.config",
+            "/lib/modules/" + release + "/build/.config",
+        };
+
+        for (const auto &path : candidates) {
+            std::ifstream f(path);
+            if (!f.good()) continue;
+            // /proc/config.gz is gzipped; we skip it here (the kallsyms
+            // fallback below covers that case in practice).
+            if (path.find(".gz") != std::string::npos) continue;
+            std::string line;
+            while (std::getline(f, line)) {
+                for (size_t i = 0; i < 2; ++i) {
+                    if (!found[i] && line.find(needles[i]) != std::string::npos)
+                        found[i] = true;
+                }
+                if (found[0] && found[1]) break;
+            }
+            if (found[0] && found[1]) break;
+        }
+
+        // Fallback: probe /proc/kallsyms for the corresponding kernel symbols.
+        if (!found[0] || !found[1]) {
+            std::ifstream f("/proc/kallsyms");
+            if (f.good()) {
+                std::string line;
+                while (std::getline(f, line)) {
+                    if (!found[0] &&
+                        line.find("pci_p2pdma") != std::string::npos)
+                        found[0] = true;
+                    if (!found[1] &&
+                        line.find("dma_buf_move_notify") != std::string::npos)
+                        found[1] = true;
+                    if (found[0] && found[1]) break;
+                }
+            }
+        }
+
+        bool ok = found[0] && found[1];
+        if (!ok) {
+            LOG(WARNING)
+                << "Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY "
+                << "(p2pdma=" << found[0] << " move_notify=" << found[1]
+                << "); HIP dmabuf MR registration disabled, falling back to "
+                << "ibv_reg_mr() (which requires an amdgpu peermem driver). "
+                << "Rebuild kernel with both options for GPU-direct RDMA.";
+        }
+        return ok;
+    }();
+    return supported;
+}
+#endif  // USE_HIP
 }  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
@@ -364,13 +455,23 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // Host memory — standard ibv_reg_mr() path.
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if ((hipAttr.type == hipMemoryTypeDevice ||
+                hipAttr.type == hipMemoryTypeManaged) &&
+               !isKernelDmabufSupported()) {
+        // Device memory but kernel lacks CONFIG_PCI_P2PDMA /
+        // CONFIG_DMABUF_MOVE_NOTIFY — `ibv_reg_dmabuf_mr` may succeed but
+        // subsequent transfers will fail (or worse, silently mis-route).
+        // Fall back to `ibv_reg_mr` so the failure surfaces here, at
+        // registration time, instead of mid-transfer.
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (hipAttr.type == hipMemoryTypeDevice ||
                hipAttr.type == hipMemoryTypeManaged) {
-        // Device memory — use dmabuf fd export + ibv_reg_dmabuf_mr().
-        // Worker threads (RDMA polling, etc.) may not have the device that
-        // owns `addr` set as their current HIP device. Mirror the CUDA path's
-        // ctx-retain/ctx-release dance with a small RAII guard: pin the
-        // active device to `hipAttr.device` for the duration of the
+        // Device memory + supported kernel — dmabuf fd export +
+        // ibv_reg_dmabuf_mr(). Worker threads (RDMA polling, etc.) may not have
+        // the device that owns `addr` set as their current HIP device. Mirror
+        // the CUDA path's ctx-retain/ctx-release dance with a small RAII guard:
+        // pin the active device to `hipAttr.device` for the duration of the
         // hipMemGetAddressRange / hsa_amd_portable_export_dmabuf calls,
         // then restore whatever device the caller had.
         struct HipDeviceGuard {
