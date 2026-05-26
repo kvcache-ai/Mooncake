@@ -2093,6 +2093,10 @@ mod tests {
             self.inner.route_namespace()
         }
 
+        fn for_tenant(&self, tenant: &str) -> Option<Arc<dyn MetadataBackend>> {
+            self.inner.for_tenant(tenant)
+        }
+
         fn upsert_client_lease(
             &self,
             lease: &mooncake_store_core::ClientLease,
@@ -4275,5 +4279,216 @@ mod tests {
         );
         assert_eq!(status.domain.as_deref(), Some("domain-a"));
         assert_eq!(status.object_set.as_deref(), Some("set-a"));
+    }
+
+    fn hard_isolated_service() -> AdminService {
+        let backend: Arc<dyn MetadataBackend> =
+            Arc::new(InMemoryMetadataBackend::new_hard_isolated());
+        AdminService::new(
+            backend,
+            "memory://hard-isolated",
+            MetadataKeyspace::default(),
+        )
+    }
+
+    #[test]
+    fn hard_isolated_tenant_policies_are_isolated() {
+        let service = hard_isolated_service();
+        let patch_a = PolicyPatchInput {
+            route_topk: Some(3),
+            ..PolicyPatchInput::default()
+        };
+        let patch_b = PolicyPatchInput {
+            route_topk: Some(5),
+            ..PolicyPatchInput::default()
+        };
+
+        // Write policy for tenant-a via service (goes through backend_for_tenant)
+        service
+            .set_tenant_policy("tenant-a", None, None, patch_a, None, "admin")
+            .expect("set tenant-a policy should succeed");
+
+        // Write policy for tenant-b
+        service
+            .set_tenant_policy("tenant-b", None, None, patch_b, None, "admin")
+            .expect("set tenant-b policy should succeed");
+
+        // tenant-a can read its own policy
+        let resp = service
+            .get_tenant_policy("tenant-a", None, None, false)
+            .expect("get tenant-a policy should succeed");
+        assert!(resp.found);
+        assert_eq!(
+            resp.policy
+                .as_ref()
+                .unwrap()
+                .spec
+                .routing
+                .as_ref()
+                .unwrap()
+                .route_topk,
+            Some(3)
+        );
+
+        // tenant-b can read its own policy
+        let resp = service
+            .get_tenant_policy("tenant-b", None, None, false)
+            .expect("get tenant-b policy should succeed");
+        assert!(resp.found);
+        assert_eq!(
+            resp.policy
+                .as_ref()
+                .unwrap()
+                .spec
+                .routing
+                .as_ref()
+                .unwrap()
+                .route_topk,
+            Some(5)
+        );
+
+        // Directly reading from tenant-a's backend should NOT see tenant-b's data
+        let backend_a = service.backend_for_tenant(Some("tenant-a")).unwrap();
+        let policies_a = backend_a
+            .list_tenant_policies(Some("tenant-a"))
+            .expect("list from tenant-a backend should succeed");
+        assert_eq!(policies_a.len(), 1);
+        assert_eq!(policies_a[0].scope.tenant, "tenant-a");
+
+        let backend_b = service.backend_for_tenant(Some("tenant-b")).unwrap();
+        let policies_b = backend_b
+            .list_tenant_policies(Some("tenant-b"))
+            .expect("list from tenant-b backend should succeed");
+        assert_eq!(policies_b.len(), 1);
+        assert_eq!(policies_b[0].scope.tenant, "tenant-b");
+    }
+
+    #[test]
+    fn hard_isolated_delete_policy_does_not_affect_other_tenant() {
+        let service = hard_isolated_service();
+        let patch_a = PolicyPatchInput {
+            route_topk: Some(3),
+            ..PolicyPatchInput::default()
+        };
+        let patch_b = PolicyPatchInput {
+            route_topk: Some(5),
+            ..PolicyPatchInput::default()
+        };
+
+        service
+            .set_tenant_policy("tenant-a", None, None, patch_a, None, "admin")
+            .expect("set tenant-a policy");
+        service
+            .set_tenant_policy("tenant-b", None, None, patch_b, None, "admin")
+            .expect("set tenant-b policy");
+
+        // Delete tenant-a's policy
+        let del = service
+            .delete_tenant_policy("tenant-a", None, None, None)
+            .expect("delete tenant-a policy should succeed");
+        assert!(del.removed);
+
+        // tenant-b's policy still exists
+        let resp = service
+            .get_tenant_policy("tenant-b", None, None, false)
+            .expect("get tenant-b policy should still succeed");
+        assert!(resp.found);
+        assert_eq!(
+            resp.policy.unwrap().spec.routing.unwrap().route_topk,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn hard_isolated_quota_state_is_per_tenant() {
+        let service = hard_isolated_service();
+
+        // Set up quota policies for both tenants (write directly to each tenant backend)
+        let backend_a = service.backend_for_tenant(Some("tenant-a")).unwrap();
+        backend_a
+            .put_tenant_policy(
+                &TenantPolicy {
+                    scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                    spec: TenantPolicySpec {
+                        quota: Some(TenantQuotaPolicy {
+                            max_bytes: Some(1024),
+                            max_objects: Some(16),
+                        }),
+                        ..TenantPolicySpec::default()
+                    },
+                    version: 1,
+                    updated_at_ms: 1,
+                    updated_by: "tester".to_string(),
+                },
+                None,
+            )
+            .expect("tenant-a quota policy should store");
+
+        // Reserve quota for tenant-a via its backend
+        backend_a
+            .reserve_tenant_quota(&TenantQuotaReservationRequest {
+                reservation_id: "res-a".to_string(),
+                scope: TenantPolicyScope::new("tenant-a", None::<String>, None::<String>),
+                key: ObjectKey::new("tenant-a::object-a"),
+                expected_object_version: None,
+                delta_bytes: 100,
+                delta_objects: 1,
+                limit: TenantQuotaPolicy {
+                    max_bytes: Some(1024),
+                    max_objects: Some(16),
+                },
+                expires_at_ms: u64::MAX,
+                created_at_ms: 5,
+                writer_runtime: ClientRuntimeId::new("writer-a", ClientEpoch(1)),
+            })
+            .expect("reservation for tenant-a should store");
+
+        // Query quota state via service
+        let state_a = service
+            .get_tenant_quota_state("tenant-a", None, None)
+            .expect("tenant-a quota state should read");
+        assert!(state_a.state.is_some());
+        assert_eq!(state_a.state.unwrap().pending_reserved_bytes, 100);
+
+        // tenant-b has no quota state
+        let state_b = service
+            .get_tenant_quota_state("tenant-b", None, None)
+            .expect("tenant-b quota state should read");
+        assert!(state_b.state.is_none());
+
+        // tenant-b reservations list is empty
+        let reservations_b = service
+            .list_tenant_quota_reservations("tenant-b", None, None, None)
+            .expect("tenant-b reservations should read");
+        assert_eq!(reservations_b.count, 0);
+    }
+
+    #[test]
+    fn hard_isolated_backend_for_tenant_none_returns_root() {
+        let service = hard_isolated_service();
+
+        // None tenant returns root backend (same arc as service.backend())
+        let root = service
+            .backend_for_tenant(None)
+            .expect("None tenant should return root backend");
+        assert_eq!(root.route_namespace(), service.backend().route_namespace());
+
+        // Empty string also returns root backend
+        let root_empty = service
+            .backend_for_tenant(Some(""))
+            .expect("empty tenant should return root backend");
+        assert_eq!(
+            root_empty.route_namespace(),
+            service.backend().route_namespace()
+        );
+
+        // Whitespace-only also returns root
+        let root_ws = service
+            .backend_for_tenant(Some("  "))
+            .expect("whitespace tenant should return root backend");
+        assert_eq!(
+            root_ws.route_namespace(),
+            service.backend().route_namespace()
+        );
     }
 }
