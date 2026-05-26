@@ -46,7 +46,13 @@
 #ifdef __MUSA_ARCH__
 using nv_bfloat16 = mt_bfloat16;
 #else
-struct nv_bfloat16 { char __data[2]; };
+struct nv_bfloat16 {
+    unsigned short __x;
+    nv_bfloat16() = default;
+    nv_bfloat16(const mt_bfloat16& v) { memcpy(this, &v, sizeof(*this)); }
+    nv_bfloat16& operator=(const mt_bfloat16& v) { memcpy(this, &v, sizeof(*this)); return *this; }
+    operator mt_bfloat16() const { mt_bfloat16 r; memcpy(&r, this, sizeof(r)); return r; }
+};
 #endif
 // MUSA FP8 stubs (MUSA does not support FP8, but templates still compile)
 using __nv_fp8_storage_t = uint8_t;
