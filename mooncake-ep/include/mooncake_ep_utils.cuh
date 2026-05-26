@@ -47,7 +47,11 @@ struct VecInt<16> {
     using vec_t = int4;
 };
 
+#ifdef MOONCAKE_EP_USE_MUSA
+__device__ __forceinline__ void trap() { __trap(); }
+#else
 __device__ __forceinline__ void trap() { asm("trap;"); }
+#endif
 
 #ifdef MOONCAKE_EP_USE_MUSA
 // MUSA equivalents using __threadfence_system() and volatile accesses
