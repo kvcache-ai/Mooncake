@@ -121,6 +121,11 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
     re = metadata_client->removeRpcMetaEntry("test_server");
     ASSERT_EQ(re, 0);
+    if (metadata_server != P2PHANDSHAKE) {
+        TransferMetadata::RpcMetaDesc desc2;
+        re = metadata_client->getRpcMetaEntry("test_server", desc2);
+        ASSERT_NE(re, 0);
+    }
 }
 
 }  // namespace mooncake

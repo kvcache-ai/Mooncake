@@ -772,18 +772,19 @@ auto MasterService::ExistKey(const std::string& key)
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
         MetadataShardAccessorRO shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -1166,11 +1167,8 @@ std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
         keys.size());
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
@@ -1180,7 +1178,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
     promotion_keys.reserve(keys.size());
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
         MetadataShardAccessorRO shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -1636,18 +1638,19 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
         MetadataShardAccessorRW shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -1730,18 +1733,19 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
-    std::unordered_map<size_t,
-                       std::vector<std::pair<size_t, const std::string*>>>
-        keys_by_shard;
-    keys_by_shard.reserve(
-        std::min(keys.size(), static_cast<size_t>(kNumShards)));
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (auto& [shard_idx, key_group] : keys_by_shard) {
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
         MetadataShardAccessorRW shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;

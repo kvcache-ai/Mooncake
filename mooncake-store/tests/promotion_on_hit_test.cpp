@@ -215,6 +215,64 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
+// BatchGetReplicaList should preserve request order while still taking the
+// same promotion-on-hit path as single-key GetReplicaList for LOCAL_DISK-only
+// entries.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListQueuesPromotionForLocalDiskOnlyHits) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+
+    PutObject(*service, ctx.client_id, "k_mem_only");
+    ReplicateConfig processing_config;
+    processing_config.replica_num = 1;
+    ASSERT_TRUE(service->PutStart(ctx.client_id, "k_processing", 1024,
+                                  processing_config)
+                    .has_value());
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    std::vector<std::string> keys = {"k_missing", "k_mem_only", "k_cold",
+                                     "k_processing"};
+    auto results = service->BatchGetReplicaList(keys);
+    ASSERT_EQ(results.size(), keys.size());
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(results[1].has_value());
+    ASSERT_EQ(results[1]->replicas.size(), 1u);
+    EXPECT_TRUE(results[1]->replicas[0].is_memory_replica());
+
+    ASSERT_TRUE(results[2].has_value());
+    ASSERT_EQ(results[2]->replicas.size(), 1u);
+    EXPECT_TRUE(results[2]->replicas[0].is_local_disk_replica());
+
+    ASSERT_FALSE(results[3].has_value());
+    EXPECT_EQ(results[3].error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+    EXPECT_FALSE(WaitForPromotionTaskReaped(service.get(), "k_cold",
+                                            std::chrono::milliseconds(0),
+                                            std::chrono::milliseconds(0)));
+
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 1u);
+    EXPECT_EQ(pending->count("k_cold"), 1u);
+    EXPECT_EQ(pending->count("k_mem_only"), 0u);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty map when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
