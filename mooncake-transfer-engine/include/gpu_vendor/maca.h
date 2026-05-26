@@ -36,6 +36,7 @@ const static std::string GPU_PREFIX = "maca:";
 #define CUmemFabricHandle mcMemFabricHandle_t
 #define CUmemGenericAllocationHandle mcMemGenericAllocationHandle
 #define CUmemAllocationProp mcMemAllocationProp
+#define CUmemAllocationHandleType mcMemAllocationHandleType
 #define CUmemAccessDesc mcMemAccessDesc
 #define CUmemAllocationType mcMemAllocationType
 #define CU_MEM_ALLOCATION_TYPE_PINNED mcMemAllocationTypePinned
