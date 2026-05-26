@@ -2,6 +2,7 @@
 
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <musa_runtime.h>
+typedef musaStream_t cudaStream_t;
 #else
 #include <cuda_runtime.h>
 #endif

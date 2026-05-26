@@ -42,7 +42,12 @@
 #include <musa_runtime.h>
 #include <musa_bf16.h>
 // MUSA type aliases for CUDA compatibility
+// mt_bfloat16 is only available in device code; for host code sizeof, use a 2-byte struct
+#ifdef __MUSA_ARCH__
 using nv_bfloat16 = mt_bfloat16;
+#else
+struct nv_bfloat16 { char __data[2]; };
+#endif
 // MUSA FP8 stubs (MUSA does not support FP8, but templates still compile)
 using __nv_fp8_storage_t = uint8_t;
 using __nv_fp8x2_storage_t = uint16_t;
