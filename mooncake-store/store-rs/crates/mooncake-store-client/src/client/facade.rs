@@ -528,6 +528,7 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
+        let _ = self.flush_due_reclaims();
         let result = self.prepare_heartbeat(expires_at_ms).publish();
         match result {
             Ok(()) => {
@@ -1079,6 +1080,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
                             None,
                         );
                     }
+                    // Opportunistic drain: flush any segment reclaims that
+                    // have passed their grace period.  Without this, a
+                    // remove-only workload would never trigger physical
+                    // segment byte release.
+                    let _ = self.flush_due_reclaims();
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -1173,6 +1179,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 return result;
             }
         }
+        // Opportunistic drain: flush segment reclaims past their grace period.
+        let _ = self.flush_due_reclaims();
         let result = Ok(());
         tracker.finish(&result, 0);
         result
@@ -1650,6 +1658,7 @@ impl StoreClient {
 impl Drop for StoreClient {
     fn drop(&mut self) {
         self.membership_sync.shutdown();
+        let _ = self.flush_all_reclaims();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {
