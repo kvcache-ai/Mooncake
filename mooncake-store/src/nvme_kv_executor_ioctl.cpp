@@ -363,6 +363,50 @@ class NvmeKvIoctlExecutor : public NvmeKvCommandExecutor {
         return std::string(dma_buffer.get(), dma_buffer.get() + actual_size);
     }
 
+    tl::expected<uint32_t, ErrorCode> RetrieveInto(
+        const PhysicalKey& key, void* buffer,
+        uint32_t buffer_size) const override {
+        auto dma_buffer =
+            AllocateAlignedBuffer(capabilities_.effective_max_value_size);
+        if (dma_buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        nvme_passthru_cmd64 cmd{};
+        cmd.opcode = kNvmeKvRetrieveOpcode;
+        cmd.nsid = nsid_;
+        cmd.addr = reinterpret_cast<uint64_t>(dma_buffer.get());
+        cmd.data_len = capabilities_.effective_max_value_size;
+        cmd.cdw10 = capabilities_.effective_max_value_size;
+        cmd.cdw11 = BuildKeyLengthField(key.size());
+        auto block_count =
+            ComputeKvBlockCountMinusOne(capabilities_.effective_max_value_size);
+        if (!block_count) {
+            return tl::make_unexpected(block_count.error());
+        }
+        cmd.cdw12 = block_count.value();
+        cmd.cdw13 = 0;
+        cmd.timeout_ms = kNvmeIoctlTimeoutMs;
+        EncodeKeyIntoCommand(key, cmd);
+
+        auto result = Submit(cmd, false, "retrieve_into", key);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+
+        const uint32_t actual_size = ResolveNvmeKvObjectValueSize(
+            dma_buffer.get(), result.value(),
+            capabilities_.effective_max_value_size);
+        if (actual_size == 0 ||
+            actual_size > capabilities_.effective_max_value_size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (actual_size > buffer_size) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::memcpy(buffer, dma_buffer.get(), actual_size);
+        return actual_size;
+    }
+
     tl::expected<bool, ErrorCode> Exists(
         const PhysicalKey& key) const override {
         nvme_passthru_cmd64 cmd{};

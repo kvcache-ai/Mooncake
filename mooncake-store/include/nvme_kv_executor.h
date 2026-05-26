@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 
@@ -28,6 +29,21 @@ class NvmeKvCommandExecutor {
                                                 std::string value) = 0;
     virtual tl::expected<std::string, ErrorCode> Retrieve(
         const PhysicalKey& key) const = 0;
+    // Retrieve directly into a caller-provided buffer, avoiding an extra copy.
+    // Returns the actual number of bytes written to `buffer`.
+    // Default implementation falls back to Retrieve() + memcpy.
+    virtual tl::expected<uint32_t, ErrorCode> RetrieveInto(
+        const PhysicalKey& key, void* buffer, uint32_t buffer_size) const {
+        auto res = Retrieve(key);
+        if (!res) {
+            return tl::make_unexpected(res.error());
+        }
+        if (res.value().size() > buffer_size) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::memcpy(buffer, res.value().data(), res.value().size());
+        return static_cast<uint32_t>(res.value().size());
+    }
     virtual tl::expected<bool, ErrorCode> Exists(
         const PhysicalKey& key) const = 0;
     virtual const Capabilities& GetCapabilities() const = 0;

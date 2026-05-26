@@ -24,6 +24,14 @@ tl::expected<std::string, ErrorCode> NvmeKvConnector::Retrieve(
     return executor_->Retrieve(key);
 }
 
+tl::expected<uint32_t, ErrorCode> NvmeKvConnector::RetrieveInto(
+    const PhysicalKey& key, void* buffer, uint32_t buffer_size) const {
+    if (executor_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return executor_->RetrieveInto(key, buffer, buffer_size);
+}
+
 tl::expected<bool, ErrorCode> NvmeKvConnector::Exists(
     const PhysicalKey& key) const {
     if (executor_ == nullptr) {

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <ranges>
@@ -531,7 +532,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             continue;
         }
 
-        std::string payload;
         size_t payload_size = 0;
         for (const auto& slice : slices) {
             if (slice.size > 0 && slice.ptr == nullptr) {
@@ -539,14 +539,25 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             }
             payload_size += slice.size;
         }
-        payload.resize(payload_size);
-        size_t write_offset = 0;
-        for (const auto& slice : slices) {
-            if (slice.size == 0) {
-                continue;
+
+        // Avoid full copy when there is a single contiguous slice.
+        std::string payload_storage;
+        std::string_view payload_view;
+        if (slices.size() == 1 && slices[0].size == payload_size) {
+            payload_view = std::string_view(
+                static_cast<const char*>(slices[0].ptr), payload_size);
+        } else {
+            payload_storage.resize(payload_size);
+            size_t write_offset = 0;
+            for (const auto& slice : slices) {
+                if (slice.size == 0) {
+                    continue;
+                }
+                std::memcpy(payload_storage.data() + write_offset, slice.ptr,
+                            slice.size);
+                write_offset += slice.size;
             }
-            std::memcpy(payload.data() + write_offset, slice.ptr, slice.size);
-            write_offset += slice.size;
+            payload_view = payload_storage;
         }
 
         if (payload_size >
@@ -566,11 +577,11 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 .object_type = static_cast<uint32_t>(NvmeKvObjectType::kInline),
                 .payload_size = static_cast<uint32_t>(payload_size),
                 .verify_hash = verify_hash,
-                .payload_checksum = ComputeNvmeKvPayloadChecksum(payload),
+                .payload_checksum = ComputeNvmeKvPayloadChecksum(payload_view),
                 .header_checksum = 0,
             };
             header.header_checksum = ComputeNvmeKvHeaderChecksum(header);
-            root_value = BuildNvmeKvObjectValue(header, payload);
+            root_value = BuildNvmeKvObjectValue(header, payload_view);
         } else {
             const uint32_t chunk_payload_limit = ChunkPayloadLimit();
             if (chunk_payload_limit == 0) {
@@ -593,7 +604,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 const size_t chunk_size =
                     std::min(static_cast<size_t>(chunk_payload_limit),
                              payload_size - offset);
-                std::string_view chunk_payload(payload.data() + offset,
+                std::string_view chunk_payload(payload_view.data() + offset,
                                                chunk_size);
                 const auto chunk_key =
                     EncodeNvmeKvChunkPhysicalKey(key, chunk_index);
@@ -635,6 +646,16 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
 
+        // Fast path: if key is already COMMITTED in catalog, skip entirely.
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            auto catalog_it = catalog_.find(key);
+            if (catalog_it != catalog_.end() &&
+                catalog_it->second.state == ObjectState::COMMITTED) {
+                continue;
+            }
+        }
+
         bool key_committed = false;
         for (size_t retry_count = 0; retry_count < enabled_device_ids.size();
              ++retry_count) {
@@ -646,9 +667,15 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 continue;
             }
 
-            auto existing_value_res = connector->Retrieve(physical_key);
-            if (existing_value_res) {
-                if (existing_value_res.value() == root_value) {
+            // Use lightweight Exists() instead of full Retrieve() to check
+            // device-level presence (e.g. after crash without catalog persist).
+            auto exists_res = connector->Exists(physical_key);
+            if (exists_res && exists_res.value()) {
+                // Key exists on device but not in catalog (crash recovery).
+                // Retrieve to verify content integrity.
+                auto existing_value_res = connector->Retrieve(physical_key);
+                if (existing_value_res &&
+                    existing_value_res.value() == root_value) {
                     bool inserted_new_key = false;
                     {
                         SharedMutexLocker lock(&mutex_);
@@ -678,10 +705,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                                             ? static_cast<int64_t>(payload_size)
                                             : 0,
                                         inserted_new_key);
-                    auto persist_res = PersistCatalog();
-                    if (!persist_res) {
-                        return tl::make_unexpected(persist_res.error());
-                    }
                     keys.push_back(key);
                     metadatas.emplace_back(BuildStorageObjectMetadata(
                         key, static_cast<uint32_t>(payload_size)));
@@ -691,7 +714,9 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                 LOG(ERROR) << "NVMe KV hash collision for key: " << key;
                 break;
             }
-            if (existing_value_res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            if (exists_res && !exists_res.value()) {
+                // Key does not exist on device, proceed to write below.
+            } else if (!exists_res) {
                 RecordDeviceFailure(device_id);
                 continue;
             }
@@ -738,7 +763,7 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
                     const size_t chunk_size =
                         std::min(static_cast<size_t>(chunk_payload_limit),
                                  payload_size - offset);
-                    std::string_view chunk_payload(payload.data() + offset,
+                    std::string_view chunk_payload(payload_view.data() + offset,
                                                    chunk_size);
                     ObjectHeader chunk_header{
                         .magic = ObjectHeader::kMagic,
@@ -799,10 +824,6 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
             }
             RecordDeviceSuccess(device_id, static_cast<int64_t>(payload_size),
                                 true);
-            auto persist_res = PersistCatalog();
-            if (!persist_res) {
-                return tl::make_unexpected(persist_res.error());
-            }
 
             keys.push_back(key);
             metadatas.emplace_back(BuildStorageObjectMetadata(
@@ -815,6 +836,13 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
         remaining_reserved_keys -= 1;
         if (!key_committed) {
             continue;
+        }
+    }
+
+    if (!keys.empty()) {
+        auto persist_res = PersistCatalog();
+        if (!persist_res) {
+            return tl::make_unexpected(persist_res.error());
         }
     }
 
@@ -917,15 +945,39 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
+        // Parallel chunk retrieval: each chunk writes to a disjoint
+        // region of dest_slice, so no synchronization is needed for memcpy.
+        struct ChunkResult {
+            tl::expected<std::string, ErrorCode> data;
+            size_t dest_offset;
+            size_t chunk_idx;
+        };
+        std::vector<std::future<ChunkResult>> chunk_futures;
+        chunk_futures.reserve(chunk_records.size());
+        size_t dest_offset = 0;
+        for (size_t i = 0; i < chunk_records.size(); ++i) {
+            const size_t offset_capture = dest_offset;
+            dest_offset += chunk_records[i].payload_size;
+            chunk_futures.push_back(std::async(
+                std::launch::async,
+                [&connector, &chunk_records, i,
+                 offset_capture]() -> ChunkResult {
+                    auto res =
+                        connector->Retrieve(chunk_records[i].physical_key);
+                    return ChunkResult{std::move(res), offset_capture, i};
+                }));
+        }
+
         size_t copied = 0;
-        for (const auto& chunk_record : chunk_records) {
-            auto chunk_res = connector->Retrieve(chunk_record.physical_key);
-            if (!chunk_res) {
-                return tl::make_unexpected(chunk_res.error());
+        for (auto& fut : chunk_futures) {
+            auto result = fut.get();
+            if (!result.data) {
+                return tl::make_unexpected(result.data.error());
             }
+            const auto& chunk_record = chunk_records[result.chunk_idx];
             ObjectHeader chunk_header{};
             std::string_view chunk_payload;
-            if (!ParseNvmeKvObjectValue(chunk_res.value(), chunk_header,
+            if (!ParseNvmeKvObjectValue(result.data.value(), chunk_header,
                                         chunk_payload) ||
                 !ValidateNvmeKvHeader(chunk_header, plan.key,
                                       chunk_record.payload_size,
@@ -935,12 +987,14 @@ tl::expected<void, ErrorCode> NvmeKvStorageBackend::BatchLoad(
                 chunk_header.payload_checksum !=
                     ComputeNvmeKvPayloadChecksum(chunk_payload) ||
                 chunk_payload.size() != chunk_record.payload_size ||
-                copied + chunk_payload.size() > plan.dest_slice.size) {
+                result.dest_offset + chunk_payload.size() >
+                    plan.dest_slice.size) {
                 MarkCorrupted(plan.key);
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-            std::memcpy(static_cast<char*>(plan.dest_slice.ptr) + copied,
-                        chunk_payload.data(), chunk_payload.size());
+            std::memcpy(
+                static_cast<char*>(plan.dest_slice.ptr) + result.dest_offset,
+                chunk_payload.data(), chunk_payload.size());
             copied += chunk_payload.size();
         }
 
