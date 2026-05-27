@@ -148,7 +148,7 @@ Each object is stored as an individual file. The file path is derived from the k
 
 ### OffsetAllocatorStorageBackend
 
-A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | key | value]`.
+A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space within the file is managed by an `OffsetAllocator`. Metadata is sharded across 1024 independent maps to reduce lock contention under high concurrency. Records follow the layout `[key_len: u32 | value_len: u32 | key | value]`. Restart recovery persists generation-scoped allocator/index snapshots plus a manifest (`kv_cache.allocator.<generation>`, `kv_cache.index.<generation>`, `kv_cache.manifest`) next to the data file and rebuilds in-memory metadata from them on startup.
 
 ---
 
@@ -242,6 +242,6 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 ## Metadata Recovery on Restart
 
-On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
+On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reports each discovered object through a callback. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for backends that preserve restart metadata, including `BucketStorageBackend`, the file-per-key backend, and `OffsetAllocatorStorageBackend`. For `OffsetAllocatorStorageBackend`, `ScanMeta` iterates the in-memory map rebuilt earlier from recovery snapshots rather than re-reading object metadata from the data file.
 
-`OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
+For `OffsetAllocatorStorageBackend`, restart recovery depends on generation-scoped allocator/index snapshots plus `kv_cache.manifest`. Startup fails fast if manifest-referenced snapshot deserialization fails, if persisted allocation state does not match the allocator snapshot, if recovery snapshot files exist without a manifest, or if the backing `kv_cache.data` file is missing/truncated relative to the configured capacity.

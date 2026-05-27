@@ -13,16 +13,77 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <system_error>
 #include <unordered_set>
 
+#include <ylt/struct_pack.hpp>
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "serializer.h"
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
+namespace {
+
+constexpr std::string_view kRecoveryManifestFilename = "kv_cache.manifest";
+constexpr std::string_view kAllocatorSnapshotPrefix = "kv_cache.allocator.";
+constexpr std::string_view kIndexSnapshotPrefix = "kv_cache.index.";
+
+struct FdGuard {
+    int fd;
+    explicit FdGuard(int fd) : fd(fd) {}
+    ~FdGuard() {
+        if (fd >= 0) close(fd);
+    }
+    int release() {
+        int ret = fd;
+        fd = -1;
+        return ret;
+    }
+    int get() const { return fd; }
+};
+
+std::string BuildRecoverySnapshotPath(const std::string& storage_path,
+                                      std::string_view prefix,
+                                      uint64_t generation) {
+    return (std::filesystem::path(storage_path) /
+            (std::string(prefix) + std::to_string(generation)))
+        .string();
+}
+
+struct AllocationStateKey {
+    uint32_t allocation_offset;
+    uint32_t allocation_metadata;
+    uint64_t real_base;
+    uint64_t requested_size;
+
+    bool operator==(const AllocationStateKey& other) const = default;
+};
+
+AllocationStateKey MakeAllocationStateKey(
+    const offset_allocator::PersistedAllocationState& state) {
+    return AllocationStateKey{state.allocation_offset,
+                              state.allocation_metadata, state.real_base,
+                              state.requested_size};
+}
+
+struct AllocationStateKeyHash {
+    size_t operator()(const AllocationStateKey& key) const {
+        size_t seed = std::hash<uint32_t>{}(key.allocation_offset);
+        seed ^= std::hash<uint32_t>{}(key.allocation_metadata) + 0x9e3779b9 +
+                (seed << 6) + (seed >> 2);
+        seed ^= std::hash<uint64_t>{}(key.real_base) + 0x9e3779b9 +
+                (seed << 6) + (seed >> 2);
+        seed ^= std::hash<uint64_t>{}(key.requested_size) + 0x9e3779b9 +
+                (seed << 6) + (seed >> 2);
+        return seed;
+    }
+};
+
+}  // namespace
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -2658,6 +2719,560 @@ std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
 }
 
+std::string OffsetAllocatorStorageBackend::GetRecoveryManifestPath() const {
+    return (std::filesystem::path(storage_path_) / kRecoveryManifestFilename)
+        .string();
+}
+
+std::string OffsetAllocatorStorageBackend::GetAllocatorSnapshotPath(
+    uint64_t generation) const {
+    return BuildRecoverySnapshotPath(storage_path_, kAllocatorSnapshotPrefix,
+                                     generation);
+}
+
+std::string OffsetAllocatorStorageBackend::GetIndexSnapshotPath(
+    uint64_t generation) const {
+    return BuildRecoverySnapshotPath(storage_path_, kIndexSnapshotPrefix,
+                                     generation);
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::WriteFileAtomically(
+    const std::string& path, const std::vector<SerializedByte>& bytes) const {
+    const std::string tmp_path = path + ".tmp";
+    unlink(tmp_path.c_str());
+    int fd = open(tmp_path.c_str(),
+                  O_CLOEXEC | O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open temp snapshot file: " << tmp_path;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    FdGuard fd_guard(fd);
+
+    size_t total_written = 0;
+    while (total_written < bytes.size()) {
+        ssize_t n = write(fd, bytes.data() + total_written,
+                          bytes.size() - total_written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG(ERROR) << "Failed to write temp snapshot file: " << tmp_path
+                       << ", error: " << strerror(errno);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        total_written += static_cast<size_t>(n);
+    }
+
+    if (fsync(fd) != 0) {
+        LOG(ERROR) << "Failed to fsync temp snapshot file: " << tmp_path
+                   << ", error: " << strerror(errno);
+        unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (rename(tmp_path.c_str(), path.c_str()) != 0) {
+        LOG(ERROR) << "Failed to rename snapshot file from " << tmp_path
+                   << " to " << path << ", error: " << strerror(errno);
+        unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    std::string parent_dir = std::filesystem::path(path).parent_path().string();
+    int dir_fd = open(parent_dir.empty() ? "." : parent_dir.c_str(),
+                      O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        if (fsync(dir_fd) != 0) {
+            LOG(ERROR) << "Failed to fsync snapshot directory: " << parent_dir
+                       << ", error: " << strerror(errno);
+            close(dir_fd);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        close(dir_fd);
+    }
+
+    return {};
+}
+
+tl::expected<std::vector<SerializedByte>, ErrorCode>
+OffsetAllocatorStorageBackend::ReadFileBytes(const std::string& path) const {
+    int fd = open(path.c_str(), O_CLOEXEC | O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open snapshot file: " << path;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    FdGuard fd_guard(fd);
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG(ERROR) << "Failed to stat snapshot file: " << path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (st.st_size < 0) {
+        LOG(ERROR) << "Snapshot file has invalid size: " << path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    const uint64_t max_snapshot_bytes = 4ULL * 1024 * 1024 * 1024;
+    if (static_cast<uint64_t>(st.st_size) > max_snapshot_bytes) {
+        LOG(ERROR) << "Snapshot file is too large: " << path
+                   << ", size=" << st.st_size
+                   << ", limit=" << max_snapshot_bytes;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::vector<SerializedByte> bytes(st.st_size);
+    size_t total_read = 0;
+    while (total_read < bytes.size()) {
+        ssize_t n =
+            read(fd, bytes.data() + total_read, bytes.size() - total_read);
+        if (n < 0) {
+            LOG(ERROR) << "Failed to read snapshot file: " << path
+                       << ", error: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (n == 0) {
+            break;
+        }
+        total_read += static_cast<size_t>(n);
+    }
+
+    if (total_read != bytes.size()) {
+        LOG(ERROR) << "Short read for snapshot file: " << path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    return bytes;
+}
+
+void OffsetAllocatorStorageBackend::ResetRecoverySnapshotState() {
+    recovery_snapshot_state_ = PersistedSnapshot{};
+    recovery_snapshot_state_.version = kSnapshotVersion;
+    recovery_snapshot_state_.capacity = capacity_;
+    recovery_snapshot_index_.clear();
+}
+
+void OffsetAllocatorStorageBackend::SetRecoverySnapshotState(
+    const PersistedSnapshot& snapshot) {
+    recovery_snapshot_state_ = snapshot;
+    recovery_snapshot_state_.version = kSnapshotVersion;
+    recovery_snapshot_state_.capacity = capacity_;
+    recovery_snapshot_state_.stale_allocations.clear();
+    recovery_snapshot_index_.clear();
+    recovery_snapshot_index_.reserve(recovery_snapshot_state_.entries.size());
+    for (size_t i = 0; i < recovery_snapshot_state_.entries.size(); ++i) {
+        recovery_snapshot_index_.emplace(
+            recovery_snapshot_state_.entries[i].key, i);
+    }
+}
+
+OffsetAllocatorStorageBackend::PersistedObjectEntry
+OffsetAllocatorStorageBackend::BuildPersistedObjectEntry(
+    const std::string& key, const ObjectEntry& entry) const {
+    return PersistedObjectEntry{
+        .key = key,
+        .offset = entry.offset,
+        .total_size = entry.total_size,
+        .value_size = entry.value_size,
+        .allocation_offset = entry.allocation_state.allocation_offset,
+        .allocation_metadata = entry.allocation_state.allocation_metadata,
+        .allocation_real_base = entry.allocation_state.real_base,
+        .allocation_requested_size = entry.allocation_state.requested_size,
+    };
+}
+
+offset_allocator::PersistedAllocationState
+OffsetAllocatorStorageBackend::ToAllocationState(
+    const PersistedObjectEntry& entry) {
+    return offset_allocator::PersistedAllocationState{
+        .allocation_offset = entry.allocation_offset,
+        .allocation_metadata = entry.allocation_metadata,
+        .real_base = entry.allocation_real_base,
+        .requested_size = entry.allocation_requested_size,
+    };
+}
+
+void OffsetAllocatorStorageBackend::UpsertRecoverySnapshotEntry(
+    const PersistedObjectEntry& entry, int64_t size_delta, bool is_new_key) {
+    auto it = recovery_snapshot_index_.find(entry.key);
+    if (it == recovery_snapshot_index_.end()) {
+        recovery_snapshot_index_.emplace(
+            entry.key, recovery_snapshot_state_.entries.size());
+        recovery_snapshot_state_.entries.push_back(entry);
+    } else {
+        recovery_snapshot_state_.entries[it->second] = entry;
+    }
+    recovery_snapshot_state_.total_size += size_delta;
+    if (is_new_key) {
+        recovery_snapshot_state_.total_keys++;
+    }
+}
+
+void OffsetAllocatorStorageBackend::RemoveRecoverySnapshotEntry(
+    const std::string& key, int64_t size_delta, bool was_new_key) {
+    auto it = recovery_snapshot_index_.find(key);
+    if (it == recovery_snapshot_index_.end()) {
+        return;
+    }
+
+    const size_t idx = it->second;
+    const size_t last_idx = recovery_snapshot_state_.entries.size() - 1;
+    if (idx != last_idx) {
+        recovery_snapshot_state_.entries[idx] =
+            std::move(recovery_snapshot_state_.entries[last_idx]);
+        recovery_snapshot_index_[recovery_snapshot_state_.entries[idx].key] =
+            idx;
+    }
+    recovery_snapshot_state_.entries.pop_back();
+    recovery_snapshot_index_.erase(it);
+    recovery_snapshot_state_.total_size -= size_delta;
+    if (was_new_key) {
+        recovery_snapshot_state_.total_keys--;
+    }
+}
+
+void OffsetAllocatorStorageBackend::ClearInMemoryState() {
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+        shards_[i].map.clear();
+    }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
+    ResetRecoverySnapshotState();
+}
+
+void OffsetAllocatorStorageBackend::CleanupObsoleteRecoverySnapshots(
+    uint64_t live_generation) const {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(storage_path_, ec)) {
+        if (ec) {
+            LOG(WARNING) << "Failed to iterate recovery snapshot directory: "
+                         << storage_path_ << ", error: " << ec.message();
+            return;
+        }
+        if (!entry.is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+
+        const auto filename = entry.path().filename().string();
+        auto cleanup_generation = [&](std::string_view prefix) {
+            if (filename.rfind(prefix, 0) != 0) {
+                return;
+            }
+            const std::string generation_str(filename.substr(prefix.size()));
+            if (generation_str.empty()) {
+                return;
+            }
+            char* end = nullptr;
+            errno = 0;
+            uint64_t generation = strtoull(generation_str.c_str(), &end, 10);
+            if (errno != 0 || end == generation_str.c_str() || *end != '\0') {
+                LOG(WARNING) << "Skipping malformed recovery snapshot file: "
+                             << filename;
+                return;
+            }
+            if (generation == live_generation) {
+                return;
+            }
+            std::error_code remove_ec;
+            if (!fs::remove(entry.path(), remove_ec) && remove_ec) {
+                LOG(WARNING)
+                    << "Failed to remove obsolete recovery snapshot: "
+                    << entry.path() << ", error: " << remove_ec.message();
+            }
+        };
+
+        cleanup_generation(kAllocatorSnapshotPrefix);
+        cleanup_generation(kIndexSnapshotPrefix);
+    }
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ValidateSnapshot(
+    const PersistedSnapshot& snapshot) const {
+    if (snapshot.version != kSnapshotVersion) {
+        LOG(ERROR) << "Unsupported snapshot version: " << snapshot.version;
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (snapshot.capacity != capacity_) {
+        LOG(ERROR) << "Snapshot capacity mismatch: expected " << capacity_
+                   << ", got " << snapshot.capacity;
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (snapshot.total_size < 0 || snapshot.total_keys < 0) {
+        LOG(ERROR) << "Snapshot has negative aggregate counters: total_size="
+                   << snapshot.total_size
+                   << ", total_keys=" << snapshot.total_keys;
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (snapshot.total_keys != static_cast<int64_t>(snapshot.entries.size())) {
+        LOG(ERROR) << "Snapshot key count mismatch: expected "
+                   << snapshot.total_keys << ", got "
+                   << snapshot.entries.size();
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+
+    std::unordered_set<std::string> seen_keys;
+    seen_keys.reserve(snapshot.entries.size());
+    std::unordered_set<AllocationStateKey, AllocationStateKeyHash>
+        seen_allocations;
+    seen_allocations.reserve(snapshot.entries.size() +
+                             snapshot.stale_allocations.size());
+
+    int64_t recomputed_total_size = 0;
+    for (const auto& entry : snapshot.entries) {
+        if (!seen_keys.insert(entry.key).second) {
+            LOG(ERROR) << "Snapshot contains duplicate key: " << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        if (entry.total_size <
+            RecordHeader::SIZE + entry.key.size() + entry.value_size) {
+            LOG(ERROR) << "Snapshot entry has invalid total size for key: "
+                       << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        if (entry.offset + entry.total_size > capacity_) {
+            LOG(ERROR) << "Snapshot entry range exceeds capacity for key: "
+                       << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        auto allocation_state = ToAllocationState(entry);
+        if (!allocator_ ||
+            !allocator_->ValidatePersistedAllocationState(allocation_state)) {
+            LOG(ERROR) << "Snapshot has invalid allocation state for key: "
+                       << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        if (!seen_allocations.insert(MakeAllocationStateKey(allocation_state))
+                 .second) {
+            LOG(ERROR) << "Snapshot reuses an allocation state for key: "
+                       << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        recomputed_total_size += entry.total_size;
+    }
+    for (const auto& stale : snapshot.stale_allocations) {
+        if (!allocator_ ||
+            !allocator_->ValidatePersistedAllocationState(stale)) {
+            LOG(ERROR) << "Snapshot has invalid stale allocation state";
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        if (!seen_allocations.insert(MakeAllocationStateKey(stale)).second) {
+            LOG(ERROR) << "Snapshot stale allocation overlaps a live or stale "
+                          "allocation";
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+    }
+
+    if (snapshot.total_size != recomputed_total_size) {
+        LOG(ERROR) << "Snapshot total size mismatch: expected "
+                   << snapshot.total_size << ", got " << recomputed_total_size;
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::RebuildInMemoryState(
+    const PersistedSnapshot& snapshot) {
+    std::array<std::vector<std::pair<std::string, ObjectEntry>>, kNumShards>
+        rebuilt_shards;
+    std::vector<offset_allocator::OffsetAllocationHandle> stale_handles;
+    stale_handles.reserve(snapshot.stale_allocations.size());
+
+    for (const auto& entry : snapshot.entries) {
+        auto allocation_state = ToAllocationState(entry);
+        if (!allocator_->ValidatePersistedAllocationState(allocation_state)) {
+            LOG(ERROR)
+                << "Snapshot has invalid allocation state during rebuild "
+                   "for key: "
+                << entry.key;
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        auto restored_handle =
+            allocator_->RestoreAllocationHandle(allocation_state);
+        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(restored_handle));
+        auto& rebuilt_shard = rebuilt_shards[ShardForKey(entry.key)];
+        rebuilt_shard.emplace_back(
+            entry.key,
+            ObjectEntry(entry.offset, entry.total_size, entry.value_size,
+                        allocation_state, std::move(allocation_ptr)));
+    }
+    for (const auto& stale : snapshot.stale_allocations) {
+        stale_handles.push_back(allocator_->RestoreAllocationHandle(stale));
+    }
+
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+    }
+
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shards_[i].map.clear();
+        shards_[i].map.reserve(rebuilt_shards[i].size());
+        for (auto& [key, entry] : rebuilt_shards[i]) {
+            shards_[i].map.emplace(std::move(key), std::move(entry));
+        }
+    }
+
+    total_size_.store(snapshot.total_size, std::memory_order_relaxed);
+    total_keys_.store(snapshot.total_keys, std::memory_order_relaxed);
+    SetRecoverySnapshotState(snapshot);
+    return {};
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::PersistAllocatorSnapshot(
+    const std::shared_ptr<offset_allocator::OffsetAllocator>& allocator,
+    uint64_t generation) const {
+    std::vector<SerializedByte> buffer;
+    auto error = serialize_to(allocator, buffer);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to serialize allocator snapshot: " << error;
+        return tl::make_unexpected(error);
+    }
+    return WriteFileAtomically(GetAllocatorSnapshotPath(generation), buffer);
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::PersistIndexSnapshot(
+    const PersistedSnapshot& snapshot, uint64_t generation) const {
+    auto packed = struct_pack::serialize(snapshot);
+    std::vector<SerializedByte> buffer(packed.begin(), packed.end());
+    return WriteFileAtomically(GetIndexSnapshotPath(generation), buffer);
+}
+
+tl::expected<OffsetAllocatorStorageBackend::RecoveryManifest, ErrorCode>
+OffsetAllocatorStorageBackend::LoadRecoveryManifest() const {
+    auto bytes_result = ReadFileBytes(recovery_manifest_path_);
+    if (!bytes_result) {
+        return tl::make_unexpected(bytes_result.error());
+    }
+
+    RecoveryManifest manifest;
+    const auto& buffer = bytes_result.value();
+    auto deserialize_result = struct_pack::deserialize_to(
+        manifest, std::string_view(reinterpret_cast<const char*>(buffer.data()),
+                                   buffer.size()));
+    if (deserialize_result != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize recovery manifest, error_code="
+                   << static_cast<int>(deserialize_result);
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    if (manifest.version != kManifestVersion || manifest.generation == 0) {
+        LOG(ERROR) << "Invalid recovery manifest: version=" << manifest.version
+                   << ", generation=" << manifest.generation;
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    return manifest;
+}
+
+tl::expected<std::shared_ptr<offset_allocator::OffsetAllocator>, ErrorCode>
+OffsetAllocatorStorageBackend::LoadAllocatorSnapshot(
+    uint64_t generation) const {
+    auto bytes_result = ReadFileBytes(GetAllocatorSnapshotPath(generation));
+    if (!bytes_result) {
+        return tl::make_unexpected(bytes_result.error());
+    }
+    auto allocator = deserialize_from<offset_allocator::OffsetAllocator>(
+        bytes_result.value());
+    if (!allocator) {
+        LOG(ERROR) << "Failed to deserialize allocator snapshot";
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+    return allocator;
+}
+
+tl::expected<OffsetAllocatorStorageBackend::PersistedSnapshot, ErrorCode>
+OffsetAllocatorStorageBackend::LoadIndexSnapshot(uint64_t generation) const {
+    auto bytes_result = ReadFileBytes(GetIndexSnapshotPath(generation));
+    if (!bytes_result) {
+        return tl::make_unexpected(bytes_result.error());
+    }
+
+    const auto& buffer = bytes_result.value();
+    PersistedSnapshot snapshot;
+    auto deserialize_result = struct_pack::deserialize_to(
+        snapshot, std::string_view(reinterpret_cast<const char*>(buffer.data()),
+                                   buffer.size()));
+    if (deserialize_result != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize index snapshot, error_code="
+                   << static_cast<int>(deserialize_result);
+        return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
+
+    auto validate_result = ValidateSnapshot(snapshot);
+    if (!validate_result) {
+        return tl::make_unexpected(validate_result.error());
+    }
+    return snapshot;
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::PersistRecoverySnapshots(
+    const PersistedSnapshot& snapshot, uint64_t generation) {
+    MutexLocker persist_lock(&recovery_snapshot_io_mutex_);
+
+    auto allocator_result = PersistAllocatorSnapshot(allocator_, generation);
+    if (!allocator_result) {
+        return allocator_result;
+    }
+    auto index_result = PersistIndexSnapshot(snapshot, generation);
+    if (!index_result) {
+        return index_result;
+    }
+
+    RecoveryManifest manifest{.version = kManifestVersion,
+                              .generation = generation};
+    auto packed = struct_pack::serialize(manifest);
+    std::vector<SerializedByte> buffer(packed.begin(), packed.end());
+    auto manifest_result = WriteFileAtomically(recovery_manifest_path_, buffer);
+    if (!manifest_result) {
+        return manifest_result;
+    }
+
+    CleanupObsoleteRecoverySnapshots(generation);
+    return {};
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::LoadRecoverySnapshots() {
+    auto manifest_result = LoadRecoveryManifest();
+    if (!manifest_result) {
+        return tl::make_unexpected(manifest_result.error());
+    }
+
+    uint64_t generation = manifest_result->generation;
+    auto allocator_result = LoadAllocatorSnapshot(generation);
+    if (!allocator_result) {
+        return tl::make_unexpected(allocator_result.error());
+    }
+    allocator_ = std::move(allocator_result.value());
+
+    auto snapshot_result = LoadIndexSnapshot(generation);
+    if (!snapshot_result) {
+        return tl::make_unexpected(snapshot_result.error());
+    }
+
+    auto rebuild_result = RebuildInMemoryState(snapshot_result.value());
+    if (!rebuild_result) {
+        return rebuild_result;
+    }
+    next_snapshot_generation_.store(generation + 1, std::memory_order_relaxed);
+    return {};
+}
+
 //-----------------------------------------------------------------------------
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
@@ -2675,60 +3290,75 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // Clear in-memory maps (V1: no persistence, start fresh)
-        // Lock all shards to ensure exclusive access during initialization
-        {
-            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
-            shard_locks.reserve(kNumShards);
-            for (size_t i = 0; i < kNumShards; ++i) {
-                shard_locks.emplace_back(
-                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
-                shards_[i].map.clear();
-            }
-            total_size_.store(0, std::memory_order_relaxed);
-            total_keys_.store(0, std::memory_order_relaxed);
-        }
+        ClearInMemoryState();
 
-        // Get data file path
+        // Get data and snapshot file paths
         data_file_path_ = GetDataFilePath();
+        recovery_manifest_path_ = GetRecoveryManifestPath();
 
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
+        const bool recovery_mode = fs::exists(recovery_manifest_path_);
+        if (!recovery_mode) {
+            std::error_code ec_dir;
+            for (const auto& entry :
+                 fs::directory_iterator(storage_path_, ec_dir)) {
+                if (ec_dir) {
+                    LOG(ERROR)
+                        << "Failed to iterate storage directory: "
+                        << storage_path_ << ", error: " << ec_dir.message();
+                    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+                }
+                if (!entry.is_regular_file(ec_dir)) {
+                    ec_dir.clear();
+                    continue;
+                }
+                const auto filename = entry.path().filename().string();
+                if (filename.rfind(kAllocatorSnapshotPrefix, 0) == 0 ||
+                    filename.rfind(kIndexSnapshotPrefix, 0) == 0) {
+                    LOG(ERROR) << "Recovery snapshot mismatch: manifest "
+                                  "missing but recovery snapshot file exists: "
+                               << filename;
+                    return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
                 }
             }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
+            if (ec_dir) {
+                LOG(ERROR) << "Failed to iterate storage directory: "
+                           << storage_path_ << ", error: " << ec_dir.message();
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
             }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
-
-        // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        }
+        int flags = O_CLOEXEC | O_RDWR;
+        if (!recovery_mode) {
+            flags |= O_CREAT | O_TRUNC;
+        }
+        int raw_fd = open(data_file_path_.c_str(), flags | O_NOFOLLOW, 0600);
         if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
         FdGuard fd_guard(raw_fd);
 
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        if (!recovery_mode) {
+            if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+                if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                    LOG(ERROR)
+                        << "Failed to preallocate file: " << data_file_path_
+                        << ", capacity: " << capacity_
+                        << ", error: " << strerror(errno);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+        } else {
+            struct stat data_stat;
+            if (fstat(fd_guard.get(), &data_stat) != 0) {
+                LOG(ERROR) << "Failed to stat data file: " << data_file_path_;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (data_stat.st_size < 0 ||
+                static_cast<uint64_t>(data_stat.st_size) < capacity_) {
+                LOG(ERROR) << "Recovered data file is truncated: "
+                           << data_file_path_ << ", size=" << data_stat.st_size
+                           << ", expected_at_least=" << capacity_;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
 
@@ -2744,16 +3374,32 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                                                      fd_guard.release());
         }
 
-        // Create allocator with base=0, size=capacity
-        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
-        if (!allocator_) {
-            LOG(ERROR) << "Failed to create OffsetAllocator";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        if (recovery_mode) {
+            auto load_result = LoadRecoverySnapshots();
+            if (!load_result) {
+                return load_result;
+            }
+        } else {
+            allocator_ =
+                offset_allocator::OffsetAllocator::create(0, capacity_);
+            if (!allocator_) {
+                LOG(ERROR) << "Failed to create OffsetAllocator";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            ResetRecoverySnapshotState();
+            auto persist_result = PersistRecoverySnapshots(
+                recovery_snapshot_state_,
+                next_snapshot_generation_.load(std::memory_order_relaxed));
+            if (!persist_result) {
+                return persist_result;
+            }
+            next_snapshot_generation_.fetch_add(1, std::memory_order_relaxed);
         }
 
         initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
-                  << capacity_ << " bytes, data file: " << data_file_path_;
+                  << capacity_ << " bytes, data file: " << data_file_path_
+                  << (recovery_mode ? " (recovered)" : " (fresh)");
     } catch (const std::exception& e) {
         LOG(ERROR) << "OffsetAllocatorStorageBackend initialize error: "
                    << e.what();
@@ -2790,10 +3436,35 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
 
+    struct PendingWrite {
+        std::string key;
+        uint64_t offset;
+        uint32_t record_size;
+        uint32_t value_size;
+        offset_allocator::PersistedAllocationState allocation_state;
+        AllocationPtr allocation_ptr;
+        size_t shard_idx;
+    };
+
+    struct PublishedUpdate {
+        size_t shard_idx;
+        std::string key;
+        int64_t size_delta;
+        bool is_new_key;
+        std::optional<ObjectEntry> old_entry;
+        PersistedObjectEntry persisted_entry;
+    };
+
+    std::vector<PendingWrite> pending_writes;
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
+    std::vector<offset_allocator::PersistedAllocationState> stale_allocations;
+    std::vector<PublishedUpdate> published_updates;
+    pending_writes.reserve(batch_object.size());
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
+    stale_allocations.reserve(batch_object.size());
+    published_updates.reserve(batch_object.size());
 
     // Process each object in the batch; continue on individual failures to
     // support partial success
@@ -2879,50 +3550,111 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             continue;  // Continue processing other keys
         }
 
-        // Step 3: Wrap allocation in refcounted handle
+        // Step 3: Stage metadata update; publish it only after the batch has
+        // finished its allocation and I/O work.
+        auto allocation_state =
+            allocator_->GetPersistedAllocationState(allocation.value());
         auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
             std::move(allocation.value()));
+        pending_writes.push_back(PendingWrite{
+            .key = key,
+            .offset = offset,
+            .record_size = static_cast<uint32_t>(record_size),
+            .value_size = value_size,
+            .allocation_state = allocation_state,
+            .allocation_ptr = std::move(allocation_ptr),
+            .shard_idx = ShardForKey(key),
+        });
+    }
 
-        // Step 4: Update metadata map under exclusive shard lock
-        // Lock only the shard for this key (other shards can proceed in
-        // parallel)
-        {
-            size_t shard_idx = ShardForKey(key);
-            auto& shard = shards_[shard_idx];
-            SharedMutexLocker lock(&shard.mutex);
+    if (!pending_writes.empty()) {
+        SharedMutexLocker recovery_lock(&recovery_state_mutex_);
 
-            // Check if key exists to update size accounting
-            auto it = shard.map.find(key);
-            int64_t size_delta = static_cast<int64_t>(record_size);
-            bool is_new_key = (it == shard.map.end());
+        for (auto& pending : pending_writes) {
+            auto& shard = shards_[pending.shard_idx];
+            int64_t size_delta = static_cast<int64_t>(pending.record_size);
+            bool is_new_key = false;
+            std::optional<ObjectEntry> old_entry;
+            {
+                SharedMutexLocker lock(&shard.mutex);
+                auto it = shard.map.find(pending.key);
+                is_new_key = (it == shard.map.end());
+                if (!is_new_key) {
+                    size_delta -= static_cast<int64_t>(it->second.total_size);
+                    old_entry.emplace(it->second.offset, it->second.total_size,
+                                      it->second.value_size,
+                                      it->second.allocation_state,
+                                      it->second.allocation);
+                }
 
-            if (!is_new_key) {
-                // Overwrite: subtract old size
-                size_delta -= static_cast<int64_t>(it->second.total_size);
-                // Old AllocationPtr will be dropped, refcount decremented
-                // Physical extent freed when last reader releases it
+                shard.map.insert_or_assign(
+                    pending.key,
+                    ObjectEntry(pending.offset, pending.record_size,
+                                pending.value_size, pending.allocation_state,
+                                pending.allocation_ptr));
+                total_size_.fetch_add(size_delta, std::memory_order_relaxed);
+                if (is_new_key) {
+                    total_keys_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
-            // Update map (insert_or_assign handles both insert and overwrite)
-            shard.map.insert_or_assign(
-                key, ObjectEntry(offset, record_size, value_size,
-                                 std::move(allocation_ptr)));
-
-            // Update total size atomically (lock-free, separate from map
-            // updates)
-            total_size_.fetch_add(size_delta, std::memory_order_relaxed);
-
-            // Update total keys only if inserting a new key
-            if (is_new_key) {
-                total_keys_.fetch_add(1, std::memory_order_relaxed);
+            if (old_entry.has_value()) {
+                stale_allocations.push_back(old_entry->allocation_state);
             }
+            published_updates.push_back(PublishedUpdate{
+                .shard_idx = pending.shard_idx,
+                .key = pending.key,
+                .size_delta = size_delta,
+                .is_new_key = is_new_key,
+                .old_entry = std::move(old_entry),
+                .persisted_entry = BuildPersistedObjectEntry(
+                    pending.key, shard.map.at(pending.key)),
+            });
+
+            keys.push_back(pending.key);
+            metadatas.push_back(StorageObjectMetadata{
+                0, static_cast<int64_t>(pending.offset),
+                static_cast<int64_t>(pending.key.size()),
+                static_cast<int64_t>(pending.value_size), ""});
         }
 
-        keys.push_back(key);
-        metadatas.push_back(StorageObjectMetadata{
-            0,  // bucket_id not used for this backend
-            static_cast<int64_t>(offset), static_cast<int64_t>(header.key_len),
-            static_cast<int64_t>(value_size), ""});
+        for (const auto& update : published_updates) {
+            UpsertRecoverySnapshotEntry(update.persisted_entry,
+                                        update.size_delta, update.is_new_key);
+        }
+
+        recovery_snapshot_state_.stale_allocations =
+            std::move(stale_allocations);
+        uint64_t generation =
+            next_snapshot_generation_.load(std::memory_order_relaxed);
+        auto persist_result =
+            PersistRecoverySnapshots(recovery_snapshot_state_, generation);
+        recovery_snapshot_state_.stale_allocations.clear();
+        if (!persist_result) {
+            for (auto it = published_updates.rbegin();
+                 it != published_updates.rend(); ++it) {
+                auto& shard = shards_[it->shard_idx];
+                SharedMutexLocker rollback_lock(&shard.mutex);
+                if (it->is_new_key) {
+                    shard.map.erase(it->key);
+                    total_keys_.fetch_sub(1, std::memory_order_relaxed);
+                } else {
+                    shard.map.insert_or_assign(it->key,
+                                               std::move(*it->old_entry));
+                }
+                total_size_.fetch_sub(it->size_delta,
+                                      std::memory_order_relaxed);
+                RemoveRecoverySnapshotEntry(it->key, it->size_delta,
+                                            it->is_new_key);
+                if (!it->is_new_key && it->old_entry.has_value()) {
+                    UpsertRecoverySnapshotEntry(
+                        BuildPersistedObjectEntry(it->key, *it->old_entry),
+                        -it->size_delta, false);
+                }
+            }
+            return tl::make_unexpected(persist_result.error());
+        }
+        next_snapshot_generation_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Invoke complete handler only if we have successful keys to report

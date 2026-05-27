@@ -11,6 +11,7 @@
 #include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
+#include <ylt/struct_pack.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -19,10 +20,131 @@
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
+namespace {
+
+struct PersistedObjectEntryMirror {
+    std::string key;
+    uint64_t offset;
+    uint32_t total_size;
+    uint32_t value_size;
+    uint32_t allocation_offset;
+    uint32_t allocation_metadata;
+    uint64_t allocation_real_base;
+    uint64_t allocation_requested_size;
+};
+
+struct PersistedSnapshotMirror {
+    uint32_t version = 1;
+    uint64_t capacity = 0;
+    int64_t total_size = 0;
+    int64_t total_keys = 0;
+    std::vector<PersistedObjectEntryMirror> entries;
+    std::vector<offset_allocator::PersistedAllocationState> stale_allocations;
+};
+
+YLT_REFL(PersistedObjectEntryMirror, key, offset, total_size, value_size,
+         allocation_offset, allocation_metadata, allocation_real_base,
+         allocation_requested_size);
+YLT_REFL(PersistedSnapshotMirror, version, capacity, total_size, total_keys,
+         entries, stale_allocations);
+
+PersistedSnapshotMirror ReadPersistedSnapshot(const fs::path& path) {
+    PersistedSnapshotMirror snapshot;
+    int fd = open(path.c_str(), O_RDONLY);
+    EXPECT_GE(fd, 0);
+    if (fd < 0) {
+        return snapshot;
+    }
+
+    struct stat st;
+    int stat_result = fstat(fd, &st);
+    EXPECT_EQ(stat_result, 0);
+    if (stat_result != 0) {
+        close(fd);
+        return snapshot;
+    }
+
+    std::string bytes(st.st_size, '\0');
+    EXPECT_EQ(read(fd, bytes.data(), bytes.size()),
+              static_cast<ssize_t>(bytes.size()));
+    close(fd);
+
+    auto result = struct_pack::deserialize_to(snapshot, bytes);
+    EXPECT_EQ(result, struct_pack::errc::ok);
+    return snapshot;
+}
+
+void WritePersistedSnapshot(const fs::path& path,
+                            const PersistedSnapshotMirror& snapshot) {
+    auto packed = struct_pack::serialize(snapshot);
+    int fd = open(path.c_str(), O_WRONLY | O_TRUNC);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(write(fd, packed.data(), packed.size()),
+              static_cast<ssize_t>(packed.size()));
+    close(fd);
+}
+
+fs::path RecoveryManifestPath(const std::string& data_path) {
+    return fs::path(data_path) / "kv_cache.manifest";
+}
+
+fs::path IndexSnapshotPath(const std::string& data_path, uint64_t generation) {
+    return fs::path(data_path) /
+           ("kv_cache.index." + std::to_string(generation));
+}
+
+fs::path AllocatorSnapshotPath(const std::string& data_path,
+                               uint64_t generation) {
+    return fs::path(data_path) /
+           ("kv_cache.allocator." + std::to_string(generation));
+}
+
+}  // namespace
 
 class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    static FileStorageConfig MakeOffsetAllocatorConfig(
+        const std::string& storage_path,
+        int64_t total_size_limit = 100 * 1024 * 1024,
+        int64_t total_keys_limit = 10000,
+        int64_t scanmeta_iterator_keys_limit = 20000) {
+        FileStorageConfig config;
+        config.storage_filepath = storage_path;
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+        config.total_size_limit = total_size_limit;
+        config.total_keys_limit = total_keys_limit;
+        config.scanmeta_iterator_keys_limit = scanmeta_iterator_keys_limit;
+        return config;
+    }
+
+    static void PutSingleValue(OffsetAllocatorStorageBackend& backend,
+                               const std::string& key,
+                               const std::string& value) {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        batch_object.emplace(
+            key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        auto offload_res = backend.BatchOffload(
+            batch_object,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_res);
+        ASSERT_EQ(offload_res.value(), 1);
+    }
+
+    static std::string LoadSingleValue(OffsetAllocatorStorageBackend& backend,
+                                       const std::string& key,
+                                       size_t value_size) {
+        auto buf = std::make_unique<char[]>(value_size);
+        std::unordered_map<std::string, Slice> load_slices;
+        load_slices.emplace(key, Slice{buf.get(), value_size});
+        auto load_res = backend.BatchLoad(load_slices);
+        EXPECT_TRUE(load_res);
+        return std::string(buf.get(), value_size);
+    }
 
     // Helper function to test partial success behavior for any
     // StorageBackendInterface. Uses deterministic failure injection on a batch
@@ -1512,6 +1634,325 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_ScanMetaEmpty) {
     ASSERT_TRUE(scan_res);
     EXPECT_FALSE(handler_called)
         << "Handler should not be called for empty backend";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_RestartRecovery) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key1", "value1");
+        PutSingleValue(storage_backend, "key2", "value2-longer");
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+    EXPECT_EQ(LoadSingleValue(recovered_backend, "key1", 6), "value1");
+    EXPECT_EQ(LoadSingleValue(recovered_backend, "key2", 13), "value2-longer");
+
+    std::vector<std::string> scan_keys;
+    auto scan_res = recovered_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            EXPECT_EQ(keys.size(), metas.size());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_res);
+    EXPECT_EQ(scan_keys.size(), 2);
+    EXPECT_NE(std::find(scan_keys.begin(), scan_keys.end(), "key1"),
+              scan_keys.end());
+    EXPECT_NE(std::find(scan_keys.begin(), scan_keys.end(), "key2"),
+              scan_keys.end());
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_RestartOverwriteRecovery) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "dup", "before");
+    }
+
+    {
+        OffsetAllocatorStorageBackend recovered_backend(config);
+        ASSERT_TRUE(recovered_backend.Init());
+        PutSingleValue(recovered_backend, "dup", "after-update");
+    }
+
+    OffsetAllocatorStorageBackend second_recovered_backend(config);
+    ASSERT_TRUE(second_recovered_backend.Init());
+    EXPECT_EQ(LoadSingleValue(second_recovered_backend, "dup", 12),
+              "after-update");
+
+    std::vector<std::string> scan_keys;
+    auto scan_res = second_recovered_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            EXPECT_EQ(keys.size(), metas.size());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_res);
+    EXPECT_EQ(std::count(scan_keys.begin(), scan_keys.end(), "dup"), 1);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(
+    StorageBackendTest,
+    OffsetAllocatorStorageBackend_RestartRecoveryAfterOverwriteBatchFailure) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+
+    OffsetAllocatorStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init());
+    PutSingleValue(backend, "same_key", std::string(1024, 'a'));
+
+    backend.SetTestFailurePredicate(
+        [](const std::string& key) { return key == "fail_key"; });
+
+    std::string overwrite_value(2048, 'b');
+    std::string fail_value(512, 'c');
+    auto overwrite_buf = std::make_unique<char[]>(overwrite_value.size());
+    auto fail_buf = std::make_unique<char[]>(fail_value.size());
+    std::memcpy(overwrite_buf.get(), overwrite_value.data(),
+                overwrite_value.size());
+    std::memcpy(fail_buf.get(), fail_value.data(), fail_value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(
+        "same_key",
+        std::vector<Slice>{Slice{overwrite_buf.get(), overwrite_value.size()}});
+    batch_object.emplace("fail_key", std::vector<Slice>{Slice{
+                                         fail_buf.get(), fail_value.size()}});
+
+    auto offload_res = backend.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res);
+    ASSERT_EQ(offload_res.value(), 1);
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+    EXPECT_EQ(
+        LoadSingleValue(recovered_backend, "same_key", overwrite_value.size()),
+        overwrite_value);
+    auto fail_exist_res = recovered_backend.IsExist("fail_key");
+    ASSERT_TRUE(fail_exist_res);
+    EXPECT_FALSE(fail_exist_res.value());
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_RestartEmptyBaseline) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+    bool handler_called = false;
+    auto scan_res = recovered_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            handler_called = true;
+            EXPECT_TRUE(keys.empty());
+            EXPECT_TRUE(metas.empty());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_res);
+    EXPECT_FALSE(handler_called);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_CleansObsoleteRecoverySnapshots) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        ASSERT_TRUE(fs::exists(AllocatorSnapshotPath(data_path, 1)));
+        ASSERT_TRUE(fs::exists(IndexSnapshotPath(data_path, 1)));
+
+        PutSingleValue(storage_backend, "key1", "value1");
+        ASSERT_FALSE(fs::exists(AllocatorSnapshotPath(data_path, 1)));
+        ASSERT_FALSE(fs::exists(IndexSnapshotPath(data_path, 1)));
+        ASSERT_TRUE(fs::exists(AllocatorSnapshotPath(data_path, 2)));
+        ASSERT_TRUE(fs::exists(IndexSnapshotPath(data_path, 2)));
+
+        PutSingleValue(storage_backend, "key2", "value2");
+        ASSERT_FALSE(fs::exists(AllocatorSnapshotPath(data_path, 2)));
+        ASSERT_FALSE(fs::exists(IndexSnapshotPath(data_path, 2)));
+        ASSERT_TRUE(fs::exists(AllocatorSnapshotPath(data_path, 3)));
+        ASSERT_TRUE(fs::exists(IndexSnapshotPath(data_path, 3)));
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+    EXPECT_EQ(LoadSingleValue(recovered_backend, "key1", 6), "value1");
+    EXPECT_EQ(LoadSingleValue(recovered_backend, "key2", 6), "value2");
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_InitFailsWhenSnapshotPairMissing) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key", "value");
+    }
+
+    ASSERT_TRUE(fs::remove(RecoveryManifestPath(data_path)));
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    auto init_res = recovered_backend.Init();
+    EXPECT_FALSE(init_res.has_value());
+    EXPECT_EQ(init_res.error(), ErrorCode::FILE_NOT_FOUND);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_InitFailsOnCorruptedIndexSnapshot) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key", "value");
+    }
+
+    auto index_path = IndexSnapshotPath(data_path, 2);
+    std::string corrupted = "not-a-valid-snapshot";
+    {
+        int fd = open(index_path.c_str(), O_WRONLY | O_TRUNC);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(write(fd, corrupted.data(), corrupted.size()),
+                  static_cast<ssize_t>(corrupted.size()));
+        close(fd);
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    auto init_res = recovered_backend.Init();
+    EXPECT_FALSE(init_res.has_value());
+    EXPECT_EQ(init_res.error(), ErrorCode::DESERIALIZE_FAIL);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_InitFailsOnDuplicateSnapshotKeys) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key", "value");
+    }
+
+    auto index_path = IndexSnapshotPath(data_path, 2);
+    auto snapshot = ReadPersistedSnapshot(index_path);
+    ASSERT_EQ(snapshot.entries.size(), 1U);
+    snapshot.entries.push_back(snapshot.entries.front());
+    snapshot.total_keys += 1;
+    snapshot.total_size += snapshot.entries.front().total_size;
+    WritePersistedSnapshot(index_path, snapshot);
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    auto init_res = recovered_backend.Init();
+    EXPECT_FALSE(init_res.has_value());
+    EXPECT_EQ(init_res.error(), ErrorCode::DESERIALIZE_FAIL);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_InitFailsOnDuplicateSnapshotAllocations) {
+    auto config = MakeOffsetAllocatorConfig(data_path);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key", "value");
+    }
+
+    auto index_path = IndexSnapshotPath(data_path, 2);
+    auto snapshot = ReadPersistedSnapshot(index_path);
+    ASSERT_EQ(snapshot.entries.size(), 1U);
+    auto duplicated = snapshot.entries.front();
+    duplicated.key = "foo";
+    snapshot.entries.push_back(duplicated);
+    snapshot.total_keys += 1;
+    snapshot.total_size += duplicated.total_size;
+    WritePersistedSnapshot(index_path, snapshot);
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    auto init_res = recovered_backend.Init();
+    EXPECT_FALSE(init_res.has_value());
+    EXPECT_EQ(init_res.error(), ErrorCode::DESERIALIZE_FAIL);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_ScanMetaBatchesAfterRecovery) {
+    auto config =
+        MakeOffsetAllocatorConfig(data_path, 100 * 1024 * 1024, 10000, 2);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key1", "v1");
+        PutSingleValue(storage_backend, "key2", "v2");
+        PutSingleValue(storage_backend, "key3", "v3");
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+
+    int callback_count = 0;
+    size_t total_keys = 0;
+    auto scan_res = recovered_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            callback_count++;
+            total_keys += keys.size();
+            EXPECT_EQ(keys.size(), metas.size());
+            EXPECT_LE(keys.size(), 2);
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_res);
+    EXPECT_EQ(total_keys, 3);
+    EXPECT_EQ(callback_count, 2);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_IsEnableOffloadingRestoredAfterRecovery) {
+    auto config = MakeOffsetAllocatorConfig(data_path, 100 * 1024 * 1024, 2);
+    {
+        OffsetAllocatorStorageBackend storage_backend(config);
+        ASSERT_TRUE(storage_backend.Init());
+        PutSingleValue(storage_backend, "key1", "value1");
+        PutSingleValue(storage_backend, "key2", "value2");
+        auto enabled = storage_backend.IsEnableOffloading();
+        ASSERT_TRUE(enabled);
+        EXPECT_FALSE(enabled.value());
+    }
+
+    OffsetAllocatorStorageBackend recovered_backend(config);
+    ASSERT_TRUE(recovered_backend.Init());
+    auto enabled = recovered_backend.IsEnableOffloading();
+    ASSERT_TRUE(enabled);
+    EXPECT_FALSE(enabled.value());
 }
 
 //-----------------------------------------------------------------------------

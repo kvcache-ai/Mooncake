@@ -1182,6 +1182,8 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(const std::string& key,
                                                      Replica& source_replica);
+    void ClearPromotionQueueEntry(const UUID& client_id,
+                                  const std::string& key);
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
@@ -1192,6 +1194,14 @@ class MasterService {
      * GetReplicaList's RO accessor has been released.
      */
     void TryPushPromotionQueue(const std::string& key);
+
+    [[nodiscard]] bool IsPromotionTaskExpired(
+        const PromotionTask& task,
+        const std::chrono::system_clock::time_point& now) const;
+    void CleanupPromotionTask(ObjectMetadata* metadata,
+                              MetadataShardAccessorRW& shard,
+                              const std::string& key, const PromotionTask& task)
+        NO_THREAD_SAFETY_ANALYSIS;
 
     // Erase any in-flight PromotionTask for `key` and decrement the
     // cluster-wide in-flight counter. Safe no-op if no task exists.

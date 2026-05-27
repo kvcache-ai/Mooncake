@@ -34,6 +34,55 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static bool HasPromotionTaskForTesting(MasterService* service,
+                                           const std::string& key) {
+        MasterService::MetadataShardAccessorRO shard(
+            service, service->getShardIndex(key));
+        return shard->promotion_tasks.count(key) > 0;
+    }
+
+    template <typename Predicate>
+    static bool WaitUntil(
+        Predicate&& predicate,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5),
+        std::chrono::milliseconds interval = std::chrono::milliseconds(10)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            std::this_thread::sleep_for(interval);
+        }
+        return predicate();
+    }
+
+    static bool WaitForPromotionTaskReapedForTesting(
+        MasterService* service, const std::string& key,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        return WaitUntil(
+            [&] { return !HasPromotionTaskForTesting(service, key); }, timeout);
+    }
+
+    static bool BackdatePromotionTaskForTesting(MasterService* service,
+                                                const std::string& key,
+                                                std::chrono::seconds age) {
+        MasterService::MetadataShardAccessorRW shard(
+            service, service->getShardIndex(key));
+        auto it = shard->promotion_tasks.find(key);
+        if (it == shard->promotion_tasks.end()) {
+            return false;
+        }
+        it->second.start_time = std::chrono::system_clock::now() - age;
+        return true;
+    }
+
+    static void StopEvictionThreadForTesting(MasterService* service) {
+        service->eviction_running_.store(false, std::memory_order_relaxed);
+        if (service->eviction_thread_.joinable()) {
+            service->eviction_thread_.join();
+        }
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
@@ -329,9 +378,8 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     }
 
     // Wait past the staleness window; the eviction thread reaps the task.
-    // Eviction loop sleeps for kEvictionThreadSleepMs (10 ms), so 2s wall
-    // clock gives ~200 attempts — plenty.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    ASSERT_TRUE(WaitForPromotionTaskReapedForTesting(service.get(), "k_cold"))
+        << "promotion task should be reaped after the release timeout";
 
     // Trigger #3: with the task reaped, dedup is unblocked and a fresh
     // GetReplicaList must enqueue again.
@@ -390,7 +438,8 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
 
     // Wait for the reaper; it must tolerate the missing metadata entry
     // (the source replica it would dec_refcnt is already gone).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    ASSERT_TRUE(WaitForPromotionTaskReapedForTesting(service.get(), "k_cold"))
+        << "promotion task should be reaped even after metadata removal";
 
     // Re-injecting the key and re-triggering must work end-to-end, proving
     // the per-shard PromotionTask was reaped (not stuck).
@@ -702,17 +751,18 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     // Poll instead of a fixed sleep — the eviction thread cadence and
     // the test runner's scheduling jitter (especially under suite load)
     // both vary, so a hard 2s sleep is flaky here.
-    constexpr auto kPollDeadline = std::chrono::seconds(5);
-    constexpr auto kPollInterval = std::chrono::milliseconds(50);
-    const auto poll_start = std::chrono::steady_clock::now();
     size_t used_after_reap = 0;
-    while (std::chrono::steady_clock::now() - poll_start < kPollDeadline) {
-        auto q = service->QuerySegments(ctx.segment_name);
-        ASSERT_TRUE(q.has_value());
-        used_after_reap = q->first;
-        if (used_after_reap == used_baseline) break;
-        std::this_thread::sleep_for(kPollInterval);
-    }
+    ASSERT_TRUE(WaitUntil(
+        [&] {
+            auto q = service->QuerySegments(ctx.segment_name);
+            EXPECT_TRUE(q.has_value());
+            if (!q.has_value()) {
+                return false;
+            }
+            used_after_reap = q->first;
+            return used_after_reap == used_baseline;
+        },
+        std::chrono::seconds(5), std::chrono::milliseconds(50)));
     EXPECT_EQ(used_after_reap, used_baseline)
         << "after reap: staged PROCESSING MEMORY replica's buffer must "
         << "be freed back to the DRAM allocator. If this fires, the "
@@ -968,6 +1018,68 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
     service->RemoveAll();
 }
 
+// PromotionAllocStart must also defend against expired tasks before the
+// async reaper thread gets a chance to sweep them. Otherwise a holder
+// that stalls past the release TTL can still allocate a PROCESSING MEMORY
+// replica in the stale task window, and that orphaned buffer lives until
+// object removal or eviction.
+TEST_F(PromotionOnHitTest, AllocStartRejectsExpiredTaskBeforeReaperRuns) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.put_start_discard_timeout_sec = 0;
+    config.put_start_release_timeout_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    auto seg_baseline = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_baseline.has_value());
+    const size_t used_baseline = seg_baseline->first;
+
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+
+    // Freeze out the background reaper so the next AllocStart call itself
+    // must notice and clean up the expired task.
+    StopEvictionThreadForTesting(service.get());
+    ASSERT_TRUE(BackdatePromotionTaskForTesting(service.get(), "k_cold",
+                                                std::chrono::seconds(5)));
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+
+    auto alloc =
+        service->PromotionAllocStart(ctx.client_id, "k_cold", 1024, {});
+    ASSERT_FALSE(alloc.has_value());
+    EXPECT_EQ(alloc.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+
+    auto seg_after = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after.has_value());
+    EXPECT_EQ(seg_after->first, used_baseline)
+        << "expired AllocStart must not stage a PROCESSING MEMORY replica";
+
+    // The synchronous cleanup path must fully release the slot so a fresh
+    // read can re-admit the same key even with eviction disabled.
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+        auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_EQ(pending->size(), 1u);
+        EXPECT_EQ(pending->count("k_cold"), 1u);
+    }
+
+    service->RemoveAll();
+}
+
 // PromotionAllocStart must reject when the in-flight task has been
 // reaped between the holder's heartbeat and the AllocStart RPC arriving
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
@@ -1005,12 +1117,9 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     // Wait past the TTL so the reaper sweeps the task. AllocStart has
     // not yet been called, so alloc_id is 0; the reaper's
     // EraseReplicaByID branch is a no-op and only the task entry is
-    // removed. We can't easily poll for reap externally (the only
-    // user-facing observable would be re-admitting through the gate,
-    // which would create a fresh task and defeat the test), so use a
-    // fixed sleep with margin. Matches the StalePromotionReaper pattern
-    // (TTL=1s, sleep=2s).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // removed.
+    ASSERT_TRUE(WaitForPromotionTaskReapedForTesting(service.get(), "k_cold"))
+        << "promotion task should be reaped before AllocStart arrives";
 
     // AllocStart on a reaped task must reject without allocating.
     // Allocating would leave an orphaned PROCESSING MEMORY replica
@@ -1030,6 +1139,54 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
         << "grew here, AllocStart got to AddReplicas before the task-"
         << "existence check and the staged buffer is now orphaned (no "
         << "reaper iterates it).";
+
+    service->RemoveAll();
+}
+
+// NotifyPromotionSuccess must also reject expired tasks even if the async
+// reaper has not run yet. Otherwise a late success RPC can still commit a
+// MEMORY replica after its transfer window expired.
+TEST_F(PromotionOnHitTest, NotifySuccessRejectsExpiredTaskBeforeReaperRuns) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    config.put_start_discard_timeout_sec = 0;
+    config.put_start_release_timeout_sec = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    auto seg_baseline = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_baseline.has_value());
+    const size_t used_baseline = seg_baseline->first;
+
+    {
+        auto r = service->GetReplicaList("k_cold");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto alloc =
+        service->PromotionAllocStart(ctx.client_id, "k_cold", 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+
+    StopEvictionThreadForTesting(service.get());
+    ASSERT_TRUE(BackdatePromotionTaskForTesting(service.get(), "k_cold",
+                                                std::chrono::seconds(5)));
+
+    auto notify = service->NotifyPromotionSuccess(ctx.client_id, "k_cold");
+    ASSERT_FALSE(notify.has_value());
+    EXPECT_EQ(notify.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_FALSE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+
+    auto seg_after = service->QuerySegments(ctx.segment_name);
+    ASSERT_TRUE(seg_after.has_value());
+    EXPECT_EQ(seg_after->first, used_baseline)
+        << "expired NotifyPromotionSuccess must release the staged buffer";
 
     service->RemoveAll();
 }
