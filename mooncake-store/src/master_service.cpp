@@ -3178,7 +3178,13 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
-    auto last_discard_time = std::chrono::system_clock::now();
+    // Start with an already-elapsed window so the first loop iteration
+    // (after kEvictionThreadSleepMs) triggers DiscardExpiredProcessingReplicas.
+    // Without this, a task admitted shortly after thread startup can survive
+    // the first reaper cycle and not be cleaned until ~2s later, causing
+    // promotion-on-hit tests that sleep for 2s to flake.
+    auto last_discard_time =
+        std::chrono::system_clock::now() - put_start_release_timeout_sec_;
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
