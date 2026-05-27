@@ -102,7 +102,12 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(const std::string& path,
     }
 
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);
@@ -248,7 +253,12 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorReadFile(
     }
 
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);

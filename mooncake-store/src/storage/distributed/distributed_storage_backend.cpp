@@ -17,6 +17,12 @@ bool DistributedStorageConfig::Validate() const {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
         return false;
     }
+    if (!std::filesystem::path(fsdir).is_absolute()) {
+        LOG(ERROR)
+            << "DistributedStorageConfig: fsdir must be an absolute path: "
+            << fsdir;
+        return false;
+    }
     if (fs_adapter_type.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fs_adapter_type is empty";
         return false;
@@ -59,6 +65,11 @@ DistributedStorageBackend::DistributedStorageBackend(
       hash_bucket_count_(distributed_config.hash_bucket_count) {}
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
+    if (initialized_) {
+        LOG(WARNING) << "DistributedStorageBackend is already initialized";
+        return {};
+    }
+
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
 
@@ -209,6 +220,9 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    std::vector<std::string> batch_keys;
+    std::vector<StorageObjectMetadata> batch_metas;
+
     for (int i = 0; i < hash_bucket_count_; ++i) {
         std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
         auto file_infos = fs_adapter_->ListFilesWithInfo(bucket_dir);
@@ -221,8 +235,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
             return tl::make_unexpected(file_infos.error());
         }
 
-        std::vector<std::string> batch_keys;
-        std::vector<StorageObjectMetadata> batch_metas;
         for (const auto& info : *file_infos) {
             std::string key = UnescapeFilename(info.name);
             batch_keys.push_back(key);
@@ -237,10 +249,10 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
                 batch_metas.clear();
             }
         }
-        if (!batch_keys.empty()) {
-            auto err = handler(batch_keys, batch_metas);
-            if (err != ErrorCode::OK) return tl::make_unexpected(err);
-        }
+    }
+    if (!batch_keys.empty()) {
+        auto err = handler(batch_keys, batch_metas);
+        if (err != ErrorCode::OK) return tl::make_unexpected(err);
     }
     return {};
 }
