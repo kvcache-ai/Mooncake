@@ -218,6 +218,47 @@ TransferStatus pollUntilDone(
     return ts;
 }
 
+struct CorruptedRdmaBatch {
+    std::shared_ptr<FakeTransport> fake_rdma;
+    std::shared_ptr<FakeTransport> fake_tcp;
+    std::vector<uint8_t> buf;
+    BatchID batch_id{0};
+};
+
+void submitCorruptedRdmaBatch(TransferEngineImpl& engine,
+                              CorruptedRdmaBatch& batch, uint8_t fill) {
+    batch.fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    batch.fake_tcp = std::make_shared<FakeTransport>(TCP);
+
+    FaultPolicy rdma_policy;
+    rdma_policy.status_corrupt_rate = 1.0;
+    auto proxied_rdma =
+        std::make_shared<FaultProxyTransport>(batch.fake_rdma, rdma_policy);
+
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(proxied_rdma->install(seg_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(batch.fake_tcp->install(seg_name, nullptr, nullptr).ok());
+
+    engine.swapTransportForTest(RDMA, proxied_rdma);
+    engine.swapTransportForTest(TCP, batch.fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    batch.buf.assign(kBufLen, fill);
+    ASSERT_TRUE(engine.registerLocalMemory(batch.buf.data(), kBufLen).ok());
+
+    batch.batch_id = engine.allocateBatch(8);
+    ASSERT_NE(batch.batch_id, (BatchID)0);
+
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = batch.buf.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(batch.buf.data());
+    req.length = kBufLen;
+
+    ASSERT_TRUE(engine.submitTransfer(batch.batch_id, {req}).ok());
+}
+
 // ---------------------------------------------------------------------------
 // P0: Completion reports FAILED (simulates WC error / QP error / peer drop
 // mid-transfer). Engine must failover.
@@ -269,6 +310,67 @@ TEST(EngineFailoverE2E, StatusCorruptionTriggersFailoverToSecondary) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledLeavesTaskFailed) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    CorruptedRdmaBatch batch;
+    submitCorruptedRdmaBatch(engine, batch, 0xA1);
+
+    TransferStatus status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(batch.fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch.batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
+}
+
+TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToVectorStatus) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    CorruptedRdmaBatch batch;
+    submitCorruptedRdmaBatch(engine, batch, 0xA2);
+
+    std::vector<TransferStatus> status_list;
+    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, status_list).ok());
+    ASSERT_EQ(status_list.size(), 1);
+    EXPECT_EQ(status_list[0].s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(batch.fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch.batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
+}
+
+TEST(EngineFailoverE2E, AutoFailoverOnPollDisabledAppliesToOverallStatus) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_auto_failover_on_poll", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    CorruptedRdmaBatch batch;
+    submitCorruptedRdmaBatch(engine, batch, 0xA3);
+
+    TransferStatus overall_status{};
+    ASSERT_TRUE(engine.getTransferStatus(batch.batch_id, overall_status).ok());
+    EXPECT_EQ(overall_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(batch.fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(batch.fake_tcp->submit_calls.load(), 0);
+
+    EXPECT_TRUE(engine.freeBatch(batch.batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(batch.buf.data(), batch.buf.size()).ok());
 }
 
 // ---------------------------------------------------------------------------

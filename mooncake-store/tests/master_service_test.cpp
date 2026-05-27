@@ -44,6 +44,22 @@ class MasterServiceTest : public ::testing::Test {
         return segment;
     }
 
+#ifdef USE_NOF
+    NoFSegment MakeNoFSegment(
+        std::string name = "test_nof_segment",
+        std::string endpoint = "test_nof_segment_endpoint",
+        size_t base = kDefaultSegmentBase + kDefaultSegmentSize,
+        size_t size = kDefaultSegmentSize) const {
+        NoFSegment segment;
+        segment.id = generate_uuid();
+        segment.name = std::move(name);
+        segment.base = base;
+        segment.size = size;
+        segment.te_endpoint = std::move(endpoint);
+        return segment;
+    }
+#endif
+
     MountedSegmentContext PrepareSimpleSegment(
         MasterService& service, std::string name = "test_segment",
         size_t base = kDefaultSegmentBase,
@@ -406,8 +422,9 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     std::string key = "test_key";
     ReplicateConfig config;
 
-    // Test invalid replica_num
+    // Test invalid replica config
     config.replica_num = 0;
+    config.nof_replica_num = 0;
     auto put_result1 = service_->PutStart(client_id, key, 1024, config);
     EXPECT_FALSE(put_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
@@ -417,7 +434,105 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     auto put_result2 = service_->PutStart(client_id, key, 0, config);
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
+
+    // Test prefer_alloc_in_same_node with nof replicas
+    config.nof_replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    auto put_result3 = service_->PutStart(client_id, key, 1024, config);
+    EXPECT_FALSE(put_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
 }
+
+#ifdef USE_NOF
+TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    NoFSegment nof_segment = MakeNoFSegment();
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_all", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    auto put_end_result =
+        service_->PutEnd(client_id, "test_key_all", ReplicaType::ALL);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto get_replica_result = service_->GetReplicaList("test_key_all");
+    ASSERT_TRUE(get_replica_result.has_value());
+
+    bool has_complete_memory = false;
+    bool has_complete_nof = false;
+    for (const auto& replica : get_replica_result->replicas) {
+        if (replica.is_memory_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            has_complete_memory = true;
+        }
+        if (replica.is_nof_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            has_complete_nof = true;
+        }
+    }
+    EXPECT_TRUE(has_complete_memory);
+    EXPECT_TRUE(has_complete_nof);
+}
+
+TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    NoFSegment nof_segment =
+        MakeNoFSegment("test_nof_segment_2", "test_nof_segment_endpoint_2");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountNoFSegment(nof_segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_split", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    auto put_end_result =
+        service_->PutEnd(client_id, "test_key_split", ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    auto get_replica_result = service_->GetReplicaList("test_key_split");
+    ASSERT_TRUE(get_replica_result.has_value());
+    ASSERT_EQ(get_replica_result->replicas.size(), 1u);
+    EXPECT_TRUE(get_replica_result->replicas[0].is_memory_replica());
+    EXPECT_EQ(get_replica_result->replicas[0].status, ReplicaStatus::COMPLETE);
+
+    auto put_revoke_result =
+        service_->PutRevoke(client_id, "test_key_split", ReplicaType::NOF_SSD);
+    ASSERT_TRUE(put_revoke_result.has_value());
+
+    auto final_replica_result = service_->GetReplicaList("test_key_split");
+    ASSERT_TRUE(final_replica_result.has_value());
+    ASSERT_EQ(final_replica_result->replicas.size(), 1u);
+    EXPECT_TRUE(final_replica_result->replicas[0].is_memory_replica());
+    EXPECT_EQ(final_replica_result->replicas[0].status,
+              ReplicaStatus::COMPLETE);
+}
+
+TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto mem_context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, "test_key_one_plus_one", 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_EQ(put_start_result->size(), 1u);
+    EXPECT_TRUE(put_start_result->front().is_memory_replica());
+}
+#endif
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -3011,8 +3126,8 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
         *service_, "single_segment", kBaseAddr, kSegmentSize);
 
-    // Request replication factor 2 with a single 1KB slice
-    // With best-effort semantics, should succeed with 1 replica
+    // Request replication factor 2 with a single 1KB slice.
+    // With best-effort semantics, should succeed with 1 replica.
     const std::string key = "replication_factor_two_single_segment";
     uint64_t slice_length = 1024;
     ReplicateConfig config;
@@ -3023,11 +3138,11 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     ASSERT_TRUE(put_start_result.has_value());
     auto replicas = put_start_result.value();
 
-    // Should get 1 replica instead of the requested 2 (best-effort)
+    // Should get 1 replica instead of the requested 2 (best-effort).
     EXPECT_EQ(1u, replicas.size());
     EXPECT_TRUE(replicas[0].is_memory_replica());
 
-    // Verify the replica is properly allocated on the single segment
+    // Verify the replica is properly allocated on the single segment.
     auto mem_desc = replicas[0].get_memory_descriptor();
     EXPECT_EQ("single_segment", mem_desc.buffer_descriptor.transport_endpoint_);
     EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
@@ -4316,8 +4431,8 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
 TEST_F(MasterServiceTest, CancelDrainJobRestoresSegmentStatus) {
     auto service_ = std::make_unique<MasterService>();
 
-    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
-                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx0 = PrepareSimpleSegment(
+        *service_, "segment_0", 0x300000000, kDefaultSegmentSize);
     [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
         *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
 
@@ -5157,6 +5272,236 @@ TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
     ASSERT_TRUE(service_->GetReplicaList("hp_key").has_value());
 
     service_->RemoveAll();
+}
+
+// ===================== Graceful Unmount Tests =====================
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_SetsCorrectStatus) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto segment = MakeSegment("graceful_test_segment");
+    UUID client_id = generate_uuid();
+
+    // Mount segment
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Verify initial status
+    auto status_before = service_->QuerySegmentStatus(segment.name);
+    ASSERT_TRUE(status_before.has_value());
+    EXPECT_EQ(status_before.value(), SegmentStatus::OK);
+
+    // Graceful unmount with 1 second grace period
+    auto graceful_result = service_->GracefulUnmountSegment(
+        segment.id, client_id, /*grace_period_ms=*/1000);
+    ASSERT_TRUE(graceful_result.has_value())
+        << "Graceful unmount should succeed: "
+        << toString(graceful_result.error());
+
+    // Verify status is GRACEFULLY_UNMOUNTING
+    auto status_after = service_->QuerySegmentStatus(segment.name);
+    ASSERT_TRUE(status_after.has_value());
+    EXPECT_EQ(status_after.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    // Wait for timer to expire and clean up
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_RejectWrongClient) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto segment = MakeSegment("graceful_owner_segment");
+    UUID owner_client = generate_uuid();
+    UUID wrong_client = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, owner_client).has_value());
+
+    // Wrong client trying to graceful unmount should fail
+    auto graceful_result = service_->GracefulUnmountSegment(
+        segment.id, wrong_client, /*grace_period_ms=*/1000);
+    ASSERT_FALSE(graceful_result.has_value());
+    EXPECT_EQ(graceful_result.error(), ErrorCode::SEGMENT_NOT_FOUND);
+
+    // Owner should still be able to unmount
+    auto owner_result = service_->GracefulUnmountSegment(
+        segment.id, owner_client, /*grace_period_ms=*/1000);
+    EXPECT_TRUE(owner_result.has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_Idempotent) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto segment = MakeSegment("graceful_idempotent_segment");
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // First graceful unmount should succeed
+    auto result1 = service_->GracefulUnmountSegment(segment.id, client_id,
+                                                    /*grace_period_ms=*/1000);
+    ASSERT_TRUE(result1.has_value());
+
+    // Second graceful unmount on the same segment should also succeed
+    // (idempotent)
+    auto result2 = service_->GracefulUnmountSegment(segment.id, client_id,
+                                                    /*grace_period_ms=*/1000);
+    EXPECT_TRUE(result2.has_value()) << "Graceful unmount should be idempotent";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_TimerExpiresAndUnmounts) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto segment = MakeSegment("graceful_timer_segment");
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Graceful unmount with a short grace period (50ms)
+    auto graceful_result = service_->GracefulUnmountSegment(
+        segment.id, client_id, /*grace_period_ms=*/50);
+    ASSERT_TRUE(graceful_result.has_value());
+
+    // Immediately after graceful unmount, segment should still exist
+    auto status_immediate = service_->QuerySegmentStatus(segment.name);
+    ASSERT_TRUE(status_immediate.has_value());
+    EXPECT_EQ(status_immediate.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    // Wait for timer to expire and unmount (give some margin)
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // After timer expires, segment should be fully unmounted (UNDEFINED or
+    // error)
+    auto status_after = service_->QuerySegmentStatus(segment.name);
+    // Segment may be UNDEFINED (not found) or return an error
+    EXPECT_TRUE(!status_after.has_value() ||
+                status_after.value() == SegmentStatus::UNDEFINED)
+        << "Segment should be unmounted after timer expires, got status="
+        << (status_after.has_value() ? static_cast<int>(status_after.value())
+                                     : -1);
+}
+
+TEST_F(MasterServiceTest,
+       GracefulUnmountSegment_QueryStatusByIdWithReusedName) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto old_segment = MakeSegment("graceful_reused_name_segment");
+    auto new_segment = MakeSegment(old_segment.name, /*base=*/0x400000000);
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(old_segment, client_id).has_value());
+    ASSERT_TRUE(service_
+                    ->GracefulUnmountSegment(old_segment.id, client_id,
+                                             /*grace_period_ms=*/50)
+                    .has_value());
+    ASSERT_TRUE(service_->MountSegment(new_segment, client_id).has_value());
+
+    auto old_status = service_->QuerySegmentStatusById(old_segment.id);
+    ASSERT_TRUE(old_status.has_value());
+    EXPECT_EQ(old_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    auto new_status = service_->QuerySegmentStatusById(new_segment.id);
+    ASSERT_TRUE(new_status.has_value());
+    EXPECT_EQ(new_status.value(), SegmentStatus::OK);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    EXPECT_FALSE(service_->QuerySegmentStatusById(old_segment.id).has_value());
+    ASSERT_TRUE(service_->QuerySegmentStatusById(new_segment.id).has_value());
+
+    auto status_by_name = service_->QuerySegmentStatus(new_segment.name);
+    ASSERT_TRUE(status_by_name.has_value());
+    EXPECT_EQ(status_by_name.value(), SegmentStatus::OK);
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_EarlierTimerPreemptsWait) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto long_segment = MakeSegment("graceful_long_timer_segment");
+    auto short_segment =
+        MakeSegment("graceful_short_timer_segment", /*base=*/0x400000000);
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(long_segment, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(short_segment, client_id).has_value());
+
+    ASSERT_TRUE(service_
+                    ->GracefulUnmountSegment(long_segment.id, client_id,
+                                             /*grace_period_ms=*/1000)
+                    .has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    ASSERT_TRUE(service_
+                    ->GracefulUnmountSegment(short_segment.id, client_id,
+                                             /*grace_period_ms=*/50)
+                    .has_value());
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    auto short_status = service_->QuerySegmentStatus(short_segment.name);
+    EXPECT_TRUE(!short_status.has_value() ||
+                short_status.value() == SegmentStatus::UNDEFINED);
+
+    auto long_status = service_->QuerySegmentStatus(long_segment.name);
+    ASSERT_TRUE(long_status.has_value());
+    EXPECT_EQ(long_status.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+}
+
+TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    auto segment1 = MakeSegment("graceful_seg1");
+    auto segment2 = MakeSegment("graceful_seg2", /*base=*/0x400000000);
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    // Put an object on segment1
+    std::string key = "test_key_prevent_alloc";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = segment1.name;
+
+    auto put_start = service_->PutStart(client_id, key, 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+
+    // Graceful unmount segment1
+    ASSERT_TRUE(service_->GracefulUnmountSegment(segment1.id, client_id, 1000)
+                    .has_value());
+
+    // Segment1 status should be GRACEFULLY_UNMOUNTING
+    auto status1 = service_->QuerySegmentStatus(segment1.name);
+    ASSERT_TRUE(status1.has_value());
+    EXPECT_EQ(status1.value(), SegmentStatus::GRACEFULLY_UNMOUNTING);
+
+    // Existing replicas on the graceful segment should remain readable during
+    // the grace window.
+    auto existing_replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(existing_replicas.has_value());
+    ASSERT_EQ(existing_replicas->replicas.size(), 1u);
+    EXPECT_EQ(existing_replicas->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment1.name);
+
+    // Segment2 status should still be OK
+    auto status2 = service_->QuerySegmentStatus(segment2.name);
+    ASSERT_TRUE(status2.has_value());
+    EXPECT_EQ(status2.value(), SegmentStatus::OK);
+
+    // New put without preferred_segment should succeed on segment2
+    std::string key2 = "test_key_after_graceful";
+    ReplicateConfig config2;
+    config2.replica_num = 1;
+
+    auto put_start2 = service_->PutStart(client_id, key2, 1024, config2);
+    ASSERT_TRUE(put_start2.has_value());
+    auto replicas = put_start2.value();
+    ASSERT_EQ(replicas.size(), 1u);
+    // Should be placed on segment2, not segment1
+    EXPECT_EQ(replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment2.name);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 }
 
 }  // namespace mooncake::test

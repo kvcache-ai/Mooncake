@@ -336,10 +336,11 @@ class MooncakeStoreService:
                     content_type="application/json",
                 )
 
+            grace_period_seconds = data.get("grace_period_seconds", 0)
             failed_segment_ids = []
             async with self._state_lock:
                 for sid in segment_ids:
-                    ret = self.store.unmount_segment([sid])
+                    ret = self.store.unmount_segment([sid], grace_period_seconds)
                     if ret != 0:
                         failed_segment_ids.append(sid)
                         continue
@@ -427,7 +428,10 @@ class MooncakeStoreService:
                     content_type="application/json",
                 )
 
-            ret = self.store.unmount_and_free_segment(segment_ids)
+            grace_period_seconds = data.get("grace_period_seconds", 0)
+            ret = self.store.unmount_and_free_segment(
+                segment_ids, grace_period_seconds
+            )
             if ret != 0:
                 return web.Response(
                     status=500,

@@ -32,11 +32,11 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--allow_evict_soft_pinned_objects` (bool, default `true`): Allow evicting soft-pinned objects.
   - `--eviction_ratio` (double, default `0.05`): Fraction evicted when hitting high watermark.
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
+  - `--client_ttl` (int64, default `10` s): Seconds a client stays considered alive after the last heartbeat. If this TTL elapses without a refresh, the master treats the client as disconnected and may unmount its segments.
 
 - High Availability (optional)
   - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
-  - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
 - Task Manager (optional)
@@ -54,10 +54,10 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
   - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
   - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
-  - `--snapshot_backend_type` (str, required when snapshot enabled): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
+  - `--snapshot_object_store_type` (str, required when snapshot enabled): Snapshot object store type: `local` for local filesystem, `s3` for S3 storage.
   - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the backend fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
   - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
-  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_backend_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_object_store_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
 
   > **Warning: Managed Directory**
   >
