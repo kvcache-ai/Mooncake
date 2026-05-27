@@ -113,6 +113,19 @@ calling `openSegment`, matching the descriptor shape TE normally obtains from Re
 
 Redis authentication can come from URL-embedded credentials or from `MC_REDIS_USERNAME` / `MC_REDIS_PASSWORD`. Prefer environment variables when passwords contain URL-reserved characters such as `@`.
 
+## Check Without Native Build
+
+`mooncake-transport-sys` builds the upstream Mooncake TE/TENT native libraries by default.
+Developer machines that only need Rust type analysis can skip that native CMake step:
+
+```bash
+MOONCAKE_SKIP_NATIVE_BUILD=1 cargo check
+```
+
+This is intended for IDE analysis and for CI jobs that provide native artifacts through
+`MOONCAKE_UPSTREAM_BUILD_DIR` and the explicit shim library path variables. Runtime builds that need
+fresh TE/TENT artifacts should leave `MOONCAKE_SKIP_NATIVE_BUILD` unset.
+
 ## Enable Routed Writes
 
 Use `PlacementPlanner` and `routed_writes(...)` when a client should route writes to storage nodes.

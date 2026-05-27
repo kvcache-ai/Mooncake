@@ -1212,6 +1212,7 @@ fn target_range_covered_by_mappings(
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum RegionOwner {
     Transport,
     HugePageMmap { mapped_len: usize },
@@ -1243,33 +1244,44 @@ fn allocate_hugepage_region(
         )));
     }
 
-    let effective_alignment = alignment.max(hugepage.bytes());
-    let mapped_len = align_up(capacity, effective_alignment);
-    let flags = libc::MAP_PRIVATE
-        | libc::MAP_ANONYMOUS
-        | libc::MAP_POPULATE
-        | libc::MAP_HUGETLB
-        | hugepage_map_flag(hugepage);
-    let base = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            mapped_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            flags,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(StoreError::Allocator(format!(
-            "hugepage mmap failed for {} (size={}): {} (check /proc/sys/vm/nr_hugepages)",
-            hugepage.label(),
-            mapped_len,
-            std::io::Error::last_os_error()
-        )));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (alignment, hugepage);
+        return Err(StoreError::Unsupported(
+            "hugepage local memory is only supported on Linux".to_string(),
+        ));
     }
-    bind_mapped_region_to_location(base, mapped_len, location);
-    Ok((base, mapped_len, RegionOwner::HugePageMmap { mapped_len }))
+
+    #[cfg(target_os = "linux")]
+    {
+        let effective_alignment = alignment.max(hugepage.bytes());
+        let mapped_len = align_up(capacity, effective_alignment);
+        let flags = libc::MAP_PRIVATE
+            | libc::MAP_ANONYMOUS
+            | libc::MAP_POPULATE
+            | libc::MAP_HUGETLB
+            | hugepage_map_flag(hugepage);
+        let base = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                mapped_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(StoreError::Allocator(format!(
+                "hugepage mmap failed for {} (size={}): {} (check /proc/sys/vm/nr_hugepages)",
+                hugepage.label(),
+                mapped_len,
+                std::io::Error::last_os_error()
+            )));
+        }
+        bind_mapped_region_to_location(base, mapped_len, location);
+        Ok((base, mapped_len, RegionOwner::HugePageMmap { mapped_len }))
+    }
 }
 
 fn free_hugepage_region(base: *mut c_void, mapped_len: usize) -> Result<()> {
@@ -1283,6 +1295,7 @@ fn free_hugepage_region(base: *mut c_void, mapped_len: usize) -> Result<()> {
     )))
 }
 
+#[cfg(target_os = "linux")]
 fn hugepage_map_flag(hugepage: HugePageConfig) -> i32 {
     match hugepage.bytes() {
         size if size == 2 * 1024 * 1024 => libc::MAP_HUGE_2MB,
@@ -1399,6 +1412,7 @@ fn discovered_cpu_locations_impl() -> Vec<String> {
     Vec::new()
 }
 
+#[cfg(target_os = "linux")]
 fn bind_mapped_region_to_location(base: *mut c_void, size: usize, location: &str) {
     let Some(node) = parse_cpu_location(location) else {
         return;
@@ -1413,9 +1427,6 @@ fn bind_mapped_region_to_numa_node(base: *mut c_void, size: usize, node: i32) {
     }
     unsafe { linux_numa::numa_tonode_memory(base, size, node) };
 }
-
-#[cfg(not(target_os = "linux"))]
-fn bind_mapped_region_to_numa_node(_base: *mut c_void, _size: usize, _node: i32) {}
 
 #[cfg(target_os = "linux")]
 fn linux_numa_available() -> bool {

@@ -452,18 +452,29 @@ pub fn map_registered_region(fd: OwnedFd, size: usize) -> Result<OwnedMappedRegi
 fn memfd_create(name: &str, hugepage: Option<HugePageConfig>) -> Result<OwnedFd> {
     let name =
         CString::new(name).map_err(|_| StoreError::Allocator("invalid memfd name".to_string()))?;
-    let flags = libc::MFD_CLOEXEC | hugepage.map(hugepage_memfd_flags).unwrap_or(0);
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(StoreError::Allocator(format!(
-            "memfd_create failed{}: {}",
-            hugepage
-                .map(|cfg| format!(" for hugepage {}", cfg.label()))
-                .unwrap_or_default(),
-            std::io::Error::last_os_error()
-        )));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (name, hugepage);
+        return Err(StoreError::Unsupported(
+            "memfd-backed shared memory is only supported on Linux".to_string(),
+        ));
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+
+    #[cfg(target_os = "linux")]
+    {
+        let flags = libc::MFD_CLOEXEC | hugepage.map(hugepage_memfd_flags).unwrap_or(0);
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(StoreError::Allocator(format!(
+                "memfd_create failed{}: {}",
+                hugepage
+                    .map(|cfg| format!(" for hugepage {}", cfg.label()))
+                    .unwrap_or_default(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
 }
 
 fn ftruncate(fd: RawFd, size: usize) -> Result<()> {
@@ -483,7 +494,7 @@ fn mmap_shared(fd: RawFd, size: usize) -> Result<*mut u8> {
             ptr::null_mut(),
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
+            libc::MAP_SHARED | map_populate_flag(),
             fd,
             0,
         )
@@ -497,6 +508,17 @@ fn mmap_shared(fd: RawFd, size: usize) -> Result<*mut u8> {
     Ok(ptr.cast::<u8>())
 }
 
+#[cfg(target_os = "linux")]
+fn map_populate_flag() -> i32 {
+    libc::MAP_POPULATE
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_populate_flag() -> i32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
 fn hugepage_memfd_flags(hugepage: HugePageConfig) -> u32 {
     libc::MFD_HUGETLB
         | match hugepage.bytes() {
@@ -535,7 +557,7 @@ fn send_fd(sock: RawFd, fd: RawFd, payload: &[u8]) -> Result<()> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as _;
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
@@ -547,7 +569,7 @@ fn send_fd(sock: RawFd, fd: RawFd, payload: &[u8]) -> Result<()> {
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as _) as _;
         ptr::write(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd);
-        msg.msg_controllen = (*cmsg).cmsg_len;
+        msg.msg_controllen = (*cmsg).cmsg_len as _;
     }
     let sent = unsafe { libc::sendmsg(sock, &msg, 0) };
     if sent < 0 || sent as usize != payload.len() {
@@ -570,7 +592,7 @@ fn recv_fd<T>(sock: RawFd) -> Result<(T, OwnedFd)> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    msg.msg_controllen = control.len() as _;
     let received = unsafe { libc::recvmsg(sock, &mut msg, 0) };
     if received < 0 || received as usize != size_of::<T>() {
         return Err(StoreError::Transport(format!(

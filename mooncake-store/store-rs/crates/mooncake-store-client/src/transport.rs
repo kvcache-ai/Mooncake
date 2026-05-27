@@ -454,6 +454,7 @@ impl StoreTransport for TentStoreTransport {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum ClassicAllocationOwner {
     Borrowed,
     Posix,
@@ -1823,11 +1824,11 @@ fn try_allocate_classic_numa_memory(
     size: usize,
     location: &str,
 ) -> Result<Option<(*mut c_void, ClassicAllocationOwner)>> {
-    let Some(node) = parse_classic_cpu_location(location) else {
-        return Ok(None);
-    };
     #[cfg(target_os = "linux")]
     {
+        let Some(node) = parse_classic_cpu_location(location) else {
+            return Ok(None);
+        };
         if !classic_numa_available() {
             if node == 0 {
                 return Ok(None);
@@ -1858,6 +1859,7 @@ fn try_allocate_classic_numa_memory(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn parse_classic_cpu_location(location: &str) -> Option<i32> {
     let node = location.strip_prefix("cpu:")?.parse::<i32>().ok()?;
     (node >= 0).then_some(node)
