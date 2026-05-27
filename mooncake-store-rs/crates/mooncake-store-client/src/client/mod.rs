@@ -41,7 +41,7 @@ use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
     authority_list_routes, authority_list_routes_by_replica_owner, authority_replace,
-    authority_replace_many, build_route_directory, route_tombstone,
+    authority_replace_many, build_route_directory,
 };
 use crate::transport::{
     registration_chunks, wait_for_batch_completion_detailed, StoreTransport, StoreTransportFactory,

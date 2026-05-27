@@ -907,15 +907,12 @@ impl StoreClient {
                 }
 
                 let expected_version = current.as_ref().map(|route| route.version);
-                let next_version = current
-                    .as_ref()
-                    .map(|route| route.version.next())
-                    .unwrap_or_else(|| {
-                        self.route_directory
-                            .get_version_floor(&self.lease, &entry.scoped_key)
-                            .map(|v| v.next())
-                            .unwrap_or(RouteVersion(1))
-                    });
+                let next_version = next_route_version(
+                    current.as_ref(),
+                    self.route_directory.as_ref(),
+                    &self.lease,
+                    &entry.scoped_key,
+                );
                 let mut route = ObjectRoute {
                     key: entry.scoped_key.clone(),
                     namespace: None,

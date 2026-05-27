@@ -367,11 +367,6 @@ pub trait RouteDirectory: Send + Sync {
         ))
     }
 
-    /// Returns the last known route version for a deleted key, if any.
-    ///
-    /// When a route entry is fully removed (CAS to `None`), the version is
-    /// preserved here so that a subsequent `put` can continue version
-    /// numbering rather than resetting to 1.
     fn get_version_floor(&self, _observer: &ClientLease, _key: &ObjectKey) -> Option<RouteVersion> {
         None
     }
