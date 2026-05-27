@@ -15,7 +15,8 @@ if USE_MUSA:
     import torch_musa  # noqa: F401
 
 from mooncake.mooncake_ep_buffer import Buffer
-import mooncake.pg as pg
+if not USE_MUSA:
+    import mooncake.pg as pg
 
 
 def _device_count():

@@ -189,7 +189,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     }
                 }
 #ifdef MOONCAKE_EP_USE_MUSA
-            __syncthreads();
+            // MUSA has no named barriers (bar.sync N, M).  Use
+            // __threadfence_block() to make the global-buffer writes
+            // visible to other warps in the same CTA, then __syncwarp()
+            // to order this warp's subsequent reads after the fence.
+            __threadfence_block();
+            __syncwarp();
 #else
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
 #endif
@@ -366,9 +371,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #ifndef MOONCAKE_EP_USE_MUSA
         cooperative_groups::this_grid().sync();
 #else
-        // MUSA: no cooperative groups. Send+recv phases must be separate kernel launches.
-        // If both phases are requested, we can only proceed if the data is already visible.
-        __syncthreads();
+        // MUSA: no cooperative groups.  The host-side buffer.cpp always
+        // launches send and recv as separate kernel invocations, so this
+        // code path (both phases in one launch) is never reached at
+        // runtime.  If it were, __syncthreads() would be insufficient
+        // (not grid-scope), so trap to surface the programming error.
+        EP_DEVICE_ASSERT(false && "MUSA requires separate send/recv kernel launches");
 #endif
 
     // Receiving and packing
@@ -410,7 +418,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
 #ifdef MOONCAKE_EP_USE_MUSA
-        __syncthreads();
+        // MUSA has no named barriers.  Sub-warp 1 wrote to shared memory
+        // above; __threadfence_block() makes it visible to all CTA threads,
+        // then __syncwarp() orders each warp's subsequent reads.
+        __threadfence_block();
+        __syncwarp();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
 #endif
@@ -668,7 +680,11 @@ combine(void* combined_x, int32_t* active_ranks,
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
 #ifdef MOONCAKE_EP_USE_MUSA
-        __syncthreads();
+        // MUSA has no named barriers.  All sub-warps must finish their
+        // sends before sub-warp 1 signals completion.  __threadfence_block()
+        // ensures prior global writes are visible, __syncwarp() orders.
+        __threadfence_block();
+        __syncwarp();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
 #endif
