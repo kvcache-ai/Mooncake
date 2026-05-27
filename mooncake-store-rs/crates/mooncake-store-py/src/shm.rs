@@ -752,10 +752,14 @@ mod tests {
             Err(StoreError::Allocator(_))
         ));
 
-        let two_mb = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
-        let one_gb = HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
-        assert_ne!(hugepage_memfd_flags(two_mb) & libc::MFD_HUGETLB, 0);
-        assert_ne!(hugepage_memfd_flags(one_gb) & libc::MFD_HUGETLB, 0);
+        #[cfg(target_os = "linux")]
+        {
+            let two_mb = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
+            let one_gb =
+                HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
+            assert_ne!(hugepage_memfd_flags(two_mb) & libc::MFD_HUGETLB, 0);
+            assert_ne!(hugepage_memfd_flags(one_gb) & libc::MFD_HUGETLB, 0);
+        }
 
         let ptr = allocate_shared_region(1024).expect("shared alloc should succeed");
         assert!(matches!(

@@ -1495,10 +1495,12 @@ mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        align_up, allocate_hugepage_region, free_hugepage_region, hugepage_map_flag,
-        with_test_numa_locations, LocalMemoryConfig, LocalMemoryState, LocalRegionPlan,
-        MemoryRegistration, RegionOwner, RegisteredRegion, StorageSegmentSpec, StoreTransport,
+        align_up, allocate_hugepage_region, with_test_numa_locations, LocalMemoryConfig,
+        LocalMemoryState, LocalRegionPlan, MemoryRegistration, RegionOwner, RegisteredRegion,
+        StorageSegmentSpec, StoreTransport,
     };
+    #[cfg(target_os = "linux")]
+    use super::{free_hugepage_region, hugepage_map_flag};
 
     struct NoopTransport;
 
@@ -2727,23 +2729,31 @@ mod tests {
     fn hugepage_allocator_surfaces_kernel_result_without_hidden_branches() {
         let hugepage = HugePageConfig::new(2 * 1024 * 1024).expect("2MB hugepage should resolve");
         let result = allocate_hugepage_region(4096, 64, "cpu:0", hugepage);
-        if hugepages_available(hugepage.bytes()) {
-            let (base, mapped_len, owner) =
-                result.expect("hugetlb mmap should succeed when pages are available");
-            assert_eq!(mapped_len, hugepage.bytes());
-            owner
-                .release(&NoopTransport, base)
-                .expect("hugetlb region should unmap cleanly");
-        } else {
-            assert!(matches!(result, Err(StoreError::Allocator(_))));
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(matches!(result, Err(StoreError::Unsupported(_))));
         }
+        #[cfg(target_os = "linux")]
+        {
+            if hugepages_available(hugepage.bytes()) {
+                let (base, mapped_len, owner) =
+                    result.expect("hugetlb mmap should succeed when pages are available");
+                assert_eq!(mapped_len, hugepage.bytes());
+                owner
+                    .release(&NoopTransport, base)
+                    .expect("hugetlb region should unmap cleanly");
+            } else {
+                assert!(matches!(result, Err(StoreError::Allocator(_))));
+            }
 
-        let one_gb = HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
-        assert_eq!(hugepage_map_flag(hugepage), libc::MAP_HUGE_2MB);
-        assert_eq!(hugepage_map_flag(one_gb), libc::MAP_HUGE_1GB);
-        assert!(matches!(
-            free_hugepage_region(std::ptr::dangling_mut::<c_void>(), 4096),
-            Err(StoreError::Allocator(_))
-        ));
+            let one_gb =
+                HugePageConfig::new(1024 * 1024 * 1024).expect("1GB hugepage should resolve");
+            assert_eq!(hugepage_map_flag(hugepage), libc::MAP_HUGE_2MB);
+            assert_eq!(hugepage_map_flag(one_gb), libc::MAP_HUGE_1GB);
+            assert!(matches!(
+                free_hugepage_region(std::ptr::dangling_mut::<c_void>(), 4096),
+                Err(StoreError::Allocator(_))
+            ));
+        }
     }
 }
