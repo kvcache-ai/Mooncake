@@ -1121,7 +1121,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
                    << ", error=" << te.error();
         WriteRevokeRequest revoke_req;
         revoke_req.key = write_req->key;
-        revoke_req.pending_write_token = pre.value().pending_write_token;
+        revoke_req.write_operation_id = pre.value().write_operation_id;
         tl::expected<void, ErrorCode> revoke_res;
         for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts; ++attempt) {
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
@@ -1148,7 +1148,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
 
     WriteCommitRequest commit;
     commit.key = write_req->key;
-    commit.pending_write_token = pre.value().pending_write_token;
+    commit.write_operation_id = pre.value().write_operation_id;
     auto cm = co_await peer->AsyncWriteCommit(commit);
     if (!cm) {
         promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, cm.error()));
@@ -1695,7 +1695,7 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
                    << ", error=" << tr.error();
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
-        cleanup.pin_token = pin.value().pin_token;
+        cleanup.read_operation_id = pin.value().read_operation_id;
         tl::expected<void, ErrorCode> cleanup_unpin;
         for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts;
              ++attempt) {
@@ -1722,7 +1722,7 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     }
     UnPinKeyRequest unpin_req;
     unpin_req.key = req->key;
-    unpin_req.pin_token = pin.value().pin_token;
+    unpin_req.read_operation_id = pin.value().read_operation_id;
     tl::expected<void, ErrorCode> unpin_res;
     for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts; ++attempt) {
         unpin_res = co_await route.peer->AsyncUnPinKey(unpin_req);

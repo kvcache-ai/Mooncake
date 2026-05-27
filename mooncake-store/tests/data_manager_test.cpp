@@ -332,7 +332,7 @@ TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
         auto it = shard.existed_operation_key_map.find(key);
         ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.write_operation_id,
-                  prewrite_result->pending_write_token);
+                  prewrite_result->write_operation_id);
     }
 }
 
@@ -344,7 +344,7 @@ TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
         << "PreWrite failed: " << toString(prewrite_result.error());
 
     auto commit_result =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_TRUE(commit_result.has_value())
         << "WriteCommit failed: " << toString(commit_result.error());
     EXPECT_TRUE(data_manager_->Exist(key));
@@ -364,11 +364,11 @@ TEST_F(DataManagerTest, WriteCommitWithoutPendingWriteFails) {
     ASSERT_TRUE(prewrite_result.has_value());
 
     auto first_commit =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_TRUE(first_commit.has_value());
 
     auto second_commit =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_FALSE(second_commit.has_value());
     EXPECT_EQ(second_commit.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -380,7 +380,7 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
     ASSERT_TRUE(prewrite_result.has_value())
         << "PreWrite failed: " << toString(prewrite_result.error());
 
-    UUID wrong_token = prewrite_result->pending_write_token;
+    UUID wrong_token = prewrite_result->write_operation_id;
     wrong_token.first += 1;
     auto wrong_commit = data_manager_->WriteCommit(key, wrong_token);
     ASSERT_FALSE(wrong_commit.has_value());
@@ -393,7 +393,7 @@ TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
         auto it = shard.existed_operation_key_map.find(key);
         ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.write_operation_id,
-                  prewrite_result->pending_write_token);
+                  prewrite_result->write_operation_id);
     }
 }
 
@@ -405,14 +405,15 @@ TEST_F(DataManagerTest, WriteRevokeErasesPendingWriteRecord) {
         << "PreWrite failed: " << toString(prewrite_result.error());
 
     auto revoke_result =
-        data_manager_->WriteRevoke(key, prewrite_result->pending_write_token);
+        data_manager_->WriteRevoke(key, prewrite_result->write_operation_id);
     ASSERT_TRUE(revoke_result.has_value())
         << "WriteRevoke failed: " << toString(revoke_result.error());
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        EXPECT_EQ(shard.by_key.count(key), 0U);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
     }
 }
 
@@ -423,19 +424,20 @@ TEST_F(DataManagerTest, WriteRevokeTokenMismatchKeepsPendingWriteRecord) {
     ASSERT_TRUE(prewrite_result.has_value())
         << "PreWrite failed: " << toString(prewrite_result.error());
 
-    UUID wrong_token = prewrite_result->pending_write_token;
+    UUID wrong_token = prewrite_result->write_operation_id;
     wrong_token.first += 1;
     auto wrong_revoke = data_manager_->WriteRevoke(key, wrong_token);
     ASSERT_FALSE(wrong_revoke.has_value());
     EXPECT_EQ(wrong_revoke.error(), ErrorCode::INVALID_WRITE);
 
-    auto& shard = data_manager_->GetPendingWriteShard(key);
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
     {
         std::shared_lock shard_lock(shard.mutex);
-        auto it = shard.by_key.find(key);
-        ASSERT_NE(it, shard.by_key.end());
-        EXPECT_EQ(it->second.pending_write_token,
-                  prewrite_result->pending_write_token);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
     }
 }
 
@@ -455,7 +457,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     auto second_pin = data_manager_->PinKey(key, GetTierId());
     ASSERT_TRUE(second_pin.has_value())
         << "Second PinKey failed: " << toString(second_pin.error());
-    EXPECT_EQ(first_pin->pin_token, second_pin->pin_token);
+    EXPECT_EQ(first_pin->read_operation_id, second_pin->read_operation_id);
 
     const auto kctx = data_manager_->BuildKeyCtx(key);
     auto& shard = data_manager_->GetPinnedKeyShard(kctx);
@@ -467,7 +469,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     }
 
     auto first_unpin =
-        data_manager_->UnPinKey(key, first_pin->pin_token);
+        data_manager_->UnPinKey(key, first_pin->read_operation_id);
     ASSERT_TRUE(first_unpin.has_value())
         << "First UnPinKey failed: " << toString(first_unpin.error());
     {
@@ -478,7 +480,7 @@ TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
     }
 
     auto second_unpin =
-        data_manager_->UnPinKey(key, second_pin->pin_token);
+        data_manager_->UnPinKey(key, second_pin->read_operation_id);
     ASSERT_TRUE(second_unpin.has_value())
         << "Second UnPinKey failed: " << toString(second_unpin.error());
     {
@@ -500,7 +502,7 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
     ASSERT_TRUE(pin_result.has_value())
         << "PinKey failed: " << toString(pin_result.error());
 
-    UUID wrong_token = pin_result->pin_token;
+    UUID wrong_token = pin_result->read_operation_id;
     wrong_token.first += 1;
     auto wrong_unpin = data_manager_->UnPinKey(key, wrong_token);
     ASSERT_FALSE(wrong_unpin.has_value());
@@ -513,7 +515,7 @@ TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
         auto it = shard.existed_operation_key_map.find(key);
         ASSERT_NE(it, shard.existed_operation_key_map.end());
         EXPECT_EQ(it->second.ref_count, 1U);
-        EXPECT_EQ(it->second.read_operation_id, pin_result->pin_token);
+        EXPECT_EQ(it->second.read_operation_id, pin_result->read_operation_id);
     }
 }
 
@@ -539,7 +541,7 @@ TEST_F(DataManagerTest,
     }
 
     auto commit_result =
-        data_manager_->WriteCommit(key, prewrite_result->pending_write_token);
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
     ASSERT_FALSE(commit_result.has_value());
     EXPECT_EQ(commit_result.error(), ErrorCode::LEASE_EXPIRED);
 
@@ -581,7 +583,7 @@ TEST_F(DataManagerTest,
     }
 
     auto unpin_result =
-        data_manager_->UnPinKey(key, pin_result->pin_token);
+        data_manager_->UnPinKey(key, pin_result->read_operation_id);
     ASSERT_FALSE(unpin_result.has_value());
     EXPECT_EQ(unpin_result.error(), ErrorCode::LEASE_EXPIRED);
 

@@ -247,14 +247,14 @@ TEST_F(ClientRpcServiceTest, PinKeyAfterPutThenUnPin) {
     ASSERT_TRUE(pin_res.has_value())
         << "PinKey failed: " << static_cast<int>(pin_res.error());
     EXPECT_GT(pin_res->remote_buffer.size, 0u);
-    EXPECT_NE(pin_res->pin_token.first, 0u);
-    EXPECT_NE(pin_res->pin_token.second, 0u);
+    EXPECT_NE(pin_res->read_operation_id.first, 0u);
+    EXPECT_NE(pin_res->read_operation_id.second, 0u);
 
     // TransferEngine is not initialized in this unit test, so no TE read
     // occurs; UnPinKey only drives DataManager pin refcount.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = pin_res->pin_token;
+    unpin.read_operation_id = pin_res->read_operation_id;
     auto unpin_res = rpc_service_->UnPinKey(unpin);
     ASSERT_TRUE(unpin_res.has_value())
         << "UnPinKey failed: " << static_cast<int>(unpin_res.error());
@@ -280,13 +280,13 @@ TEST_F(ClientRpcServiceTest, PinKeyTwiceSameTokenThenUnpinTwice) {
     ASSERT_TRUE(second.has_value())
         << "second PinKey failed: " << static_cast<int>(second.error());
 
-    EXPECT_EQ(first->pin_token, second->pin_token);
+    EXPECT_EQ(first->read_operation_id, second->read_operation_id);
 
     // TransferEngine is not initialized in this unit test, so no TE read
     // occurs; UnPinKey only drives DataManager pin refcount.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = first->pin_token;
+    unpin.read_operation_id = first->read_operation_id;
     auto u1 = rpc_service_->UnPinKey(unpin);
     ASSERT_TRUE(u1.has_value())
         << "first UnPinKey failed: " << static_cast<int>(u1.error());
@@ -317,7 +317,7 @@ TEST_F(ClientRpcServiceTest, PinKeyAfterUnpinNewToken) {
     // occurs; UnPinKey only drives DataManager pin refcount.
     UnPinKeyRequest unpin1;
     unpin1.key = key;
-    unpin1.pin_token = pin1->pin_token;
+    unpin1.read_operation_id = pin1->read_operation_id;
     auto un1 = rpc_service_->UnPinKey(unpin1);
     ASSERT_TRUE(un1.has_value())
         << "first UnPinKey failed: " << static_cast<int>(un1.error());
@@ -326,11 +326,11 @@ TEST_F(ClientRpcServiceTest, PinKeyAfterUnpinNewToken) {
     ASSERT_TRUE(pin2.has_value())
         << "second PinKey after unpin failed: "
         << static_cast<int>(pin2.error());
-    EXPECT_NE(pin1->pin_token, pin2->pin_token);
+    EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
     unpin2.key = key;
-    unpin2.pin_token = pin2->pin_token;
+    unpin2.read_operation_id = pin2->read_operation_id;
     auto un2 = rpc_service_->UnPinKey(unpin2);
     ASSERT_TRUE(un2.has_value())
         << "second UnPinKey failed: " << static_cast<int>(un2.error());
@@ -339,7 +339,7 @@ TEST_F(ClientRpcServiceTest, PinKeyAfterUnpinNewToken) {
 TEST_F(ClientRpcServiceTest, UnPinKeyEmptyKey) {
     UnPinKeyRequest req;
     req.key = "";
-    req.pin_token = {1, 2};
+    req.read_operation_id = {1, 2};
 
     auto result = rpc_service_->UnPinKey(req);
     ASSERT_FALSE(result.has_value());
@@ -349,7 +349,7 @@ TEST_F(ClientRpcServiceTest, UnPinKeyEmptyKey) {
 TEST_F(ClientRpcServiceTest, UnPinKeyZeroToken) {
     UnPinKeyRequest req;
     req.key = "rpc_svc_unpin_zero";
-    req.pin_token = {0, 0};
+    req.read_operation_id = {0, 0};
 
     auto result = rpc_service_->UnPinKey(req);
     ASSERT_FALSE(result.has_value());
@@ -373,15 +373,15 @@ TEST_F(ClientRpcServiceTest, UnPinKeyWrongTokenAfterPin) {
 
     UnPinKeyRequest bad;
     bad.key = key;
-    bad.pin_token = pin_res->pin_token;
-    bad.pin_token.first += 1;
+    bad.read_operation_id = pin_res->read_operation_id;
+    bad.read_operation_id.first += 1;
     auto bad_res = rpc_service_->UnPinKey(bad);
     ASSERT_FALSE(bad_res.has_value());
     EXPECT_EQ(bad_res.error(), ErrorCode::INVALID_READ);
 
     UnPinKeyRequest ok;
     ok.key = key;
-    ok.pin_token = pin_res->pin_token;
+    ok.read_operation_id = pin_res->read_operation_id;
     auto ok_res = rpc_service_->UnPinKey(ok);
     ASSERT_TRUE(ok_res.has_value())
         << "UnPinKey with correct token failed: "
@@ -479,7 +479,7 @@ TEST_F(ClientRpcServiceTest, WriteRemoteDataWithTierId) {
 TEST_F(ClientRpcServiceTest, WriteRevokeInvalidKey) {
     WriteRevokeRequest request;
     request.key = "";
-    request.pending_write_token = {1, 0};
+    request.write_operation_id = {1, 0};
 
     auto result = rpc_service_->WriteRevoke(request);
     ASSERT_FALSE(result.has_value());
@@ -490,7 +490,7 @@ TEST_F(ClientRpcServiceTest, WriteRevokeInvalidZeroToken) {
     const std::string key = "rpc_svc_revoke_zero_token";
     WriteRevokeRequest request;
     request.key = key;
-    request.pending_write_token = {0, 0};
+    request.write_operation_id = {0, 0};
 
     auto result = rpc_service_->WriteRevoke(request);
     ASSERT_FALSE(result.has_value());
@@ -501,7 +501,7 @@ TEST_F(ClientRpcServiceTest, WriteRevokeIdempotentNoPendingRecord) {
     const std::string key = "rpc_svc_revoke_no_pending";
     WriteRevokeRequest request;
     request.key = key;
-    request.pending_write_token = {100, 200};
+    request.write_operation_id = {100, 200};
 
     auto result = rpc_service_->WriteRevoke(request);
     ASSERT_TRUE(result.has_value())
@@ -524,7 +524,7 @@ TEST_F(ClientRpcServiceTest, WriteRevokeAfterPreWrite) {
 
     WriteRevokeRequest revoke;
     revoke.key = key;
-    revoke.pending_write_token = pre_res->pending_write_token;
+    revoke.write_operation_id = pre_res->write_operation_id;
     auto rev_res = rpc_service_->WriteRevoke(revoke);
     ASSERT_TRUE(rev_res.has_value())
         << "WriteRevoke failed: " << static_cast<int>(rev_res.error());
@@ -547,19 +547,19 @@ TEST_F(ClientRpcServiceTest, WriteRevokeTokenMismatch) {
     auto pre_res = rpc_service_->PreWrite(pre);
     ASSERT_TRUE(pre_res.has_value());
 
-    UUID wrong_token = pre_res->pending_write_token;
+    UUID wrong_token = pre_res->write_operation_id;
     wrong_token.first += 1;
 
     WriteRevokeRequest bad;
     bad.key = key;
-    bad.pending_write_token = wrong_token;
+    bad.write_operation_id = wrong_token;
     auto bad_res = rpc_service_->WriteRevoke(bad);
     ASSERT_FALSE(bad_res.has_value());
     EXPECT_EQ(bad_res.error(), ErrorCode::INVALID_WRITE);
 
     WriteRevokeRequest good;
     good.key = key;
-    good.pending_write_token = pre_res->pending_write_token;
+    good.write_operation_id = pre_res->write_operation_id;
     auto good_res = rpc_service_->WriteRevoke(good);
     ASSERT_TRUE(good_res.has_value());
 }

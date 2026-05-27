@@ -95,25 +95,25 @@ YLT_REFL(PreWriteRequest, key, size_bytes, target_tier_id);
 
 struct PreWriteResponse {
     RemoteBufferDesc remote_buffer;
-    UUID pending_write_token;
+    UUID write_operation_id;
 };
 
-YLT_REFL(PreWriteResponse, remote_buffer, pending_write_token);
+YLT_REFL(PreWriteResponse, remote_buffer, write_operation_id);
 
 struct WriteCommitRequest {
     std::string_view key;
-    UUID pending_write_token;
+    UUID write_operation_id;
 };
 
-YLT_REFL(WriteCommitRequest, key, pending_write_token);
+YLT_REFL(WriteCommitRequest, key, write_operation_id);
 
 /** Drops a pending PreWrite allocation without committing (e.g. after TE failure). */
 struct WriteRevokeRequest {
     std::string_view key;
-    UUID pending_write_token;
+    UUID write_operation_id;
 };
 
-YLT_REFL(WriteRevokeRequest, key, pending_write_token);
+YLT_REFL(WriteRevokeRequest, key, write_operation_id);
 
 struct PinKeyRequest {
     std::string_view key;
@@ -124,16 +124,16 @@ YLT_REFL(PinKeyRequest, key, target_tier_id);
 
 struct PinKeyResponse {
     RemoteBufferDesc remote_buffer;
-    UUID pin_token;
+    UUID read_operation_id;
 };
 
-YLT_REFL(PinKeyResponse, remote_buffer, pin_token);
+YLT_REFL(PinKeyResponse, remote_buffer, read_operation_id);
 
 struct UnPinKeyRequest {
     std::string_view key;
-    UUID pin_token;
+    UUID read_operation_id;
 };
 
-YLT_REFL(UnPinKeyRequest, key, pin_token);
+YLT_REFL(UnPinKeyRequest, key, read_operation_id);
 
 }  // namespace mooncake

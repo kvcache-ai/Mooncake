@@ -316,14 +316,14 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterPut) {
     ASSERT_TRUE(pin_res.has_value())
         << "AsyncPinKey failed: " << static_cast<int>(pin_res.error());
     EXPECT_GT(pin_res->remote_buffer.size, 0u);
-    EXPECT_NE(pin_res->pin_token.first, 0u);
-    EXPECT_NE(pin_res->pin_token.second, 0u);
+    EXPECT_NE(pin_res->read_operation_id.first, 0u);
+    EXPECT_NE(pin_res->read_operation_id.second, 0u);
 
     // TransferEngine is not initialized in this unit test, so no TE read
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = pin_res->pin_token;
+    unpin.read_operation_id = pin_res->read_operation_id;
     auto unpin_res =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
     ASSERT_TRUE(unpin_res.has_value())
@@ -352,13 +352,13 @@ TEST_F(PeerClientTest, AsyncPinKeyTwiceSameTokenThenUnpinTwice) {
     ASSERT_TRUE(second.has_value())
         << "second AsyncPinKey failed: " << static_cast<int>(second.error());
 
-    EXPECT_EQ(first->pin_token, second->pin_token);
+    EXPECT_EQ(first->read_operation_id, second->read_operation_id);
 
     // TransferEngine is not initialized in this unit test, so no TE read
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = first->pin_token;
+    unpin.read_operation_id = first->read_operation_id;
     auto u1 =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
     ASSERT_TRUE(u1.has_value())
@@ -392,7 +392,7 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin1;
     unpin1.key = key;
-    unpin1.pin_token = pin1->pin_token;
+    unpin1.read_operation_id = pin1->read_operation_id;
     auto un1 =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin1));
     ASSERT_TRUE(un1.has_value())
@@ -403,11 +403,11 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
     ASSERT_TRUE(pin2.has_value())
         << "second AsyncPinKey after unpin failed: "
         << static_cast<int>(pin2.error());
-    EXPECT_NE(pin1->pin_token, pin2->pin_token);
+    EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
     unpin2.key = key;
-    unpin2.pin_token = pin2->pin_token;
+    unpin2.read_operation_id = pin2->read_operation_id;
     auto un2 =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin2));
     ASSERT_TRUE(un2.has_value())
@@ -417,7 +417,7 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
 TEST_F(PeerClientTest, AsyncUnPinKeyEmptyKey) {
     UnPinKeyRequest req;
     req.key = "";
-    req.pin_token = {1, 2};
+    req.read_operation_id = {1, 2};
 
     auto result =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(req));
@@ -429,7 +429,7 @@ TEST_F(PeerClientTest, AsyncUnPinKeyZeroToken) {
     const std::string key = "peer_async_unpin_zero_token";
     UnPinKeyRequest req;
     req.key = key;
-    req.pin_token = {0, 0};
+    req.read_operation_id = {0, 0};
 
     auto result =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(req));
@@ -455,8 +455,8 @@ TEST_F(PeerClientTest, AsyncUnPinKeyWrongTokenAfterPin) {
 
     UnPinKeyRequest bad;
     bad.key = key;
-    bad.pin_token = pin_res->pin_token;
-    bad.pin_token.first += 1;
+    bad.read_operation_id = pin_res->read_operation_id;
+    bad.read_operation_id.first += 1;
     auto bad_res =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(bad));
     ASSERT_FALSE(bad_res.has_value());
@@ -464,7 +464,7 @@ TEST_F(PeerClientTest, AsyncUnPinKeyWrongTokenAfterPin) {
 
     UnPinKeyRequest ok;
     ok.key = key;
-    ok.pin_token = pin_res->pin_token;
+    ok.read_operation_id = pin_res->read_operation_id;
     auto ok_res =
         async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(ok));
     ASSERT_TRUE(ok_res.has_value())
@@ -597,12 +597,12 @@ TEST_F(PeerClientTest, AsyncPreWriteValidRequest) {
     ASSERT_TRUE(result.has_value())
         << "AsyncPreWrite failed: " << static_cast<int>(result.error());
     EXPECT_GT(result->remote_buffer.size, 0u);
-    EXPECT_NE(result->pending_write_token.first, 0u);
-    EXPECT_NE(result->pending_write_token.second, 0u);
+    EXPECT_NE(result->write_operation_id.first, 0u);
+    EXPECT_NE(result->write_operation_id.second, 0u);
 
     WriteRevokeRequest revoke;
     revoke.key = key;
-    revoke.pending_write_token = result->pending_write_token;
+    revoke.write_operation_id = result->write_operation_id;
     auto rev = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev.has_value())
@@ -648,7 +648,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
     // this case only checks WriteCommit RPC / metadata outcome.
     WriteCommitRequest commit;
     commit.key = key;
-    commit.pending_write_token = pre_res->pending_write_token;
+    commit.write_operation_id = pre_res->write_operation_id;
     auto commit_res = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteCommit(commit));
     ASSERT_TRUE(commit_res.has_value())
@@ -658,7 +658,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
 TEST_F(PeerClientTest, AsyncWriteCommitEmptyKey) {
     WriteCommitRequest commit;
     commit.key = "";
-    commit.pending_write_token = {1, 2};
+    commit.write_operation_id = {1, 2};
 
     auto result = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteCommit(commit));
@@ -670,7 +670,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitZeroToken) {
     const std::string key = "peer_async_commit_zero_token";
     WriteCommitRequest commit;
     commit.key = key;
-    commit.pending_write_token = {0, 0};
+    commit.write_operation_id = {0, 0};
 
     auto result = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteCommit(commit));
@@ -694,9 +694,9 @@ TEST_F(PeerClientTest, AsyncWriteCommitTokenMismatchAfterPreWrite) {
 
     WriteCommitRequest commit;
     commit.key = key;
-    UUID wrong_token = pre_res->pending_write_token;
+    UUID wrong_token = pre_res->write_operation_id;
     wrong_token.first += 1;
-    commit.pending_write_token = wrong_token;
+    commit.write_operation_id = wrong_token;
 
     auto bad = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteCommit(commit));
@@ -705,7 +705,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitTokenMismatchAfterPreWrite) {
 
     WriteRevokeRequest revoke;
     revoke.key = key;
-    revoke.pending_write_token = pre_res->pending_write_token;
+    revoke.write_operation_id = pre_res->write_operation_id;
     auto rev = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev.has_value());
@@ -714,7 +714,7 @@ TEST_F(PeerClientTest, AsyncWriteCommitTokenMismatchAfterPreWrite) {
 TEST_F(PeerClientTest, AsyncWriteRevokeEmptyKey) {
     WriteRevokeRequest request;
     request.key = "";
-    request.pending_write_token = {1, 2};
+    request.write_operation_id = {1, 2};
 
     auto result = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteRevoke(request));
@@ -726,7 +726,7 @@ TEST_F(PeerClientTest, AsyncWriteRevokeZeroToken) {
     const std::string key = "peer_async_revoke_zero_token";
     WriteRevokeRequest request;
     request.key = key;
-    request.pending_write_token = {0, 0};
+    request.write_operation_id = {0, 0};
 
     auto result = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteRevoke(request));
@@ -751,7 +751,7 @@ TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
 
     WriteRevokeRequest revoke;
     revoke.key = key;
-    revoke.pending_write_token = pre_res->pending_write_token;
+    revoke.write_operation_id = pre_res->write_operation_id;
     auto rev_res = async_simple::coro::syncAwait(
         peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev_res.has_value())
@@ -857,7 +857,7 @@ TEST_F(PeerClientTest, SyncPinKeyAfterPut) {
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = pin_res->pin_token;
+    unpin.read_operation_id = pin_res->read_operation_id;
     auto unpin_res = peer_client_->UnPinKey(unpin);
     ASSERT_TRUE(unpin_res.has_value())
         << "UnPinKey failed: " << static_cast<int>(unpin_res.error());
@@ -883,13 +883,13 @@ TEST_F(PeerClientTest, SyncPinKeyTwiceSameTokenThenUnpinTwice) {
     ASSERT_TRUE(second.has_value())
         << "second PinKey failed: " << static_cast<int>(second.error());
 
-    EXPECT_EQ(first->pin_token, second->pin_token);
+    EXPECT_EQ(first->read_operation_id, second->read_operation_id);
 
     // TransferEngine is not initialized in this unit test, so no TE read
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin;
     unpin.key = key;
-    unpin.pin_token = first->pin_token;
+    unpin.read_operation_id = first->read_operation_id;
     auto u1 = peer_client_->UnPinKey(unpin);
     ASSERT_TRUE(u1.has_value())
         << "first UnPinKey failed: " << static_cast<int>(u1.error());
@@ -920,7 +920,7 @@ TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
     // occurs; UnPinKey only drives DataManager pin refcount via RPC.
     UnPinKeyRequest unpin1;
     unpin1.key = key;
-    unpin1.pin_token = pin1->pin_token;
+    unpin1.read_operation_id = pin1->read_operation_id;
     auto un1 = peer_client_->UnPinKey(unpin1);
     ASSERT_TRUE(un1.has_value())
         << "first UnPinKey failed: " << static_cast<int>(un1.error());
@@ -929,11 +929,11 @@ TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
     ASSERT_TRUE(pin2.has_value())
         << "second PinKey after unpin failed: "
         << static_cast<int>(pin2.error());
-    EXPECT_NE(pin1->pin_token, pin2->pin_token);
+    EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
     unpin2.key = key;
-    unpin2.pin_token = pin2->pin_token;
+    unpin2.read_operation_id = pin2->read_operation_id;
     auto un2 = peer_client_->UnPinKey(unpin2);
     ASSERT_TRUE(un2.has_value())
         << "second UnPinKey failed: " << static_cast<int>(un2.error());
@@ -942,7 +942,7 @@ TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
 TEST_F(PeerClientTest, SyncUnPinKeyZeroToken) {
     UnPinKeyRequest req;
     req.key = "peer_sync_unpin_zero";
-    req.pin_token = {0, 0};
+    req.read_operation_id = {0, 0};
 
     auto result = peer_client_->UnPinKey(req);
     ASSERT_FALSE(result.has_value());
@@ -1003,7 +1003,7 @@ TEST_F(PeerClientTest, SyncPreWriteEmptyKey) {
 TEST_F(PeerClientTest, SyncWriteCommitEmptyKey) {
     WriteCommitRequest commit;
     commit.key = "";
-    commit.pending_write_token = {5, 6};
+    commit.write_operation_id = {5, 6};
 
     auto result = peer_client_->WriteCommit(commit);
     ASSERT_FALSE(result.has_value());
@@ -1029,7 +1029,7 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
     // this case only checks WriteCommit RPC / metadata outcome.
     WriteCommitRequest commit;
     commit.key = key;
-    commit.pending_write_token = pre_res->pending_write_token;
+    commit.write_operation_id = pre_res->write_operation_id;
     auto commit_res = peer_client_->WriteCommit(commit);
     ASSERT_TRUE(commit_res.has_value())
         << "WriteCommit failed: " << static_cast<int>(commit_res.error());
@@ -1038,7 +1038,7 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
 TEST_F(PeerClientTest, SyncWriteRevokeEmptyKey) {
     WriteRevokeRequest request;
     request.key = "";
-    request.pending_write_token = {3, 4};
+    request.write_operation_id = {3, 4};
 
     auto result = peer_client_->WriteRevoke(request);
     ASSERT_FALSE(result.has_value());
@@ -1061,7 +1061,7 @@ TEST_F(PeerClientTest, SyncWriteRevokeAfterPreWrite) {
 
     WriteRevokeRequest revoke;
     revoke.key = key;
-    revoke.pending_write_token = pre_res->pending_write_token;
+    revoke.write_operation_id = pre_res->write_operation_id;
     auto rev_res = peer_client_->WriteRevoke(revoke);
     ASSERT_TRUE(rev_res.has_value())
         << "WriteRevoke failed: " << static_cast<int>(rev_res.error());
@@ -1145,7 +1145,7 @@ TEST_F(PeerClientTest, AsyncUnPinKeyWithoutConnect) {
 
     UnPinKeyRequest req;
     req.key = "k";
-    req.pin_token = {1, 1};
+    req.read_operation_id = {1, 1};
 
     auto result =
         async_simple::coro::syncAwait(unconnected_client.AsyncUnPinKey(req));
@@ -1170,7 +1170,7 @@ TEST_F(PeerClientTest, SyncUnPinKeyWithoutConnect) {
 
     UnPinKeyRequest req;
     req.key = "k";
-    req.pin_token = {1, 1};
+    req.read_operation_id = {1, 1};
 
     auto result = unconnected_client.UnPinKey(req);
     ASSERT_FALSE(result.has_value());
@@ -1182,7 +1182,7 @@ TEST_F(PeerClientTest, AsyncWriteRevokeWithoutConnect) {
 
     WriteRevokeRequest request;
     request.key = "test_key";
-    request.pending_write_token = {1, 1};
+    request.write_operation_id = {1, 1};
 
     auto result = async_simple::coro::syncAwait(
         unconnected_client.AsyncWriteRevoke(request));
@@ -1195,7 +1195,7 @@ TEST_F(PeerClientTest, SyncWriteRevokeWithoutConnect) {
 
     WriteRevokeRequest request;
     request.key = "test_key";
-    request.pending_write_token = {2, 2};
+    request.write_operation_id = {2, 2};
 
     auto result = unconnected_client.WriteRevoke(request);
     ASSERT_FALSE(result.has_value());

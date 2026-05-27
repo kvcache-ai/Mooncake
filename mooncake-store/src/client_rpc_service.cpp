@@ -67,7 +67,7 @@ bool IsValidRequest(const PreWriteRequest& request) {
 }
 
 bool IsValidRequest(const WriteCommitRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.pending_write_token)) {
+    if (request.key.empty() || IsZeroUuid(request.write_operation_id)) {
         LOG(ERROR) << "WriteCommitRequest: invalid key or token";
         return false;
     }
@@ -75,7 +75,7 @@ bool IsValidRequest(const WriteCommitRequest& request) {
 }
 
 bool IsValidRequest(const WriteRevokeRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.pending_write_token)) {
+    if (request.key.empty() || IsZeroUuid(request.write_operation_id)) {
         LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
         return false;
     }
@@ -91,7 +91,7 @@ bool IsValidRequest(const PinKeyRequest& request) {
 }
 
 bool IsValidRequest(const UnPinKeyRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.pin_token)) {
+    if (request.key.empty() || IsZeroUuid(request.read_operation_id)) {
         LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
         return false;
     }
@@ -238,7 +238,7 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     }
 
     auto result =
-        data_manager_.WriteCommit(request.key, request.pending_write_token);
+        data_manager_.WriteCommit(request.key, request.write_operation_id);
     if (!result) {
         LOG(ERROR) << "WriteCommit failed for key: " << request.key
                    << ", error: " << toString(result.error());
@@ -261,7 +261,7 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
     }
 
     auto result =
-        data_manager_.WriteRevoke(request.key, request.pending_write_token);
+        data_manager_.WriteRevoke(request.key, request.write_operation_id);
     if (!result) {
         LOG(ERROR) << "WriteRevoke failed for key: " << request.key
                    << ", error: " << toString(result.error());
@@ -305,7 +305,7 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto result = data_manager_.UnPinKey(request.key, request.pin_token);
+    auto result = data_manager_.UnPinKey(request.key, request.read_operation_id);
     if (!result) {
         LOG(ERROR) << "UnPinKey failed for key: " << request.key
                    << ", error: " << toString(result.error());

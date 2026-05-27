@@ -231,7 +231,7 @@ class DataManager {
      *        Used when forward TE fails after PreWrite on the peer.
      */
     tl::expected<void, ErrorCode> WriteRevoke(std::string_view key,
-                                             const UUID& pending_write_token);
+                                             const UUID& write_operation_id);
 
     tl::expected<PinKeyResponse, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);

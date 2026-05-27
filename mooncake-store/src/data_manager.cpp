@@ -381,23 +381,23 @@ DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteRevoke(
-    std::string_view key, const UUID& pending_write_token) {
-    return WriteRevokeInternal(BuildKeyCtx(key), pending_write_token);
+    std::string_view key, const UUID& write_operation_id) {
+    return WriteRevokeInternal(BuildKeyCtx(key), write_operation_id);
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
-    const KeyCtx& ctx, const UUID& pending_write_token) {
+    const KeyCtx& ctx, const UUID& write_operation_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteRevoke");
     timer.LogRequest("key=", ctx.key);
 
-    if (ctx.key.empty() || IsZeroUUID(pending_write_token)) {
+    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     auto& pending_write_shard = GetPendingWriteShard(ctx);
     switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
-                                    pending_write_token)) {
+                                    write_operation_id)) {
         case PendingWriteEraseResult::Erased:
             timer.LogResponse("error_code=", ErrorCode::OK, "record_erased=",
                               true);
@@ -907,7 +907,7 @@ tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     }
     PreWriteResponse out;
     out.remote_buffer = std::move(internal_result->remote_buffer);
-    out.pending_write_token = internal_result->write_operation_id;
+    out.write_operation_id = internal_result->write_operation_id;
     return out;
 }
 
@@ -1083,7 +1083,7 @@ tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
     }
     PinKeyResponse out;
     out.remote_buffer = std::move(internal_result->remote_buffer);
-    out.pin_token = internal_result->read_operation_id;
+    out.read_operation_id = internal_result->read_operation_id;
     return out;
 }
 
