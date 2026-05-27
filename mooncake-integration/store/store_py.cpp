@@ -1685,8 +1685,7 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
                const std::vector<std::vector<size_t>>& all_sizes,
                bool aggregate_same_segment_task = false,
-               const std::optional<ReadConfigExt>& config_opt =
-                   std::nullopt) {
+               const std::optional<ReadConfigExt>& config_opt = std::nullopt) {
                 ReadConfigExt config = config_opt.value_or(ReadConfigExt{});
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {

@@ -21,9 +21,9 @@ namespace {
 
 // UnPin after forward read (or cleanup after TE failure): retry only for
 // "other" errors. INVALID_READ = token mismatch (treat as released for flow).
-// RPC_FAIL = transport/timeout-like (no repeat; owner may TTL-clean). LEASE_EXPIRED
-// = server already expired the pin record.
-// Same max-attempt count is used for WriteRevoke after forward write TE failure.
+// RPC_FAIL = transport/timeout-like (no repeat; owner may TTL-clean).
+// LEASE_EXPIRED = server already expired the pin record. Same max-attempt count
+// is used for WriteRevoke after forward write TE failure.
 constexpr int kForwardReadUnpinMaxAttempts = 3;
 
 bool UnPinErrorTreatAsEffectiveOk(ErrorCode e) {
@@ -1004,8 +1004,8 @@ std::unique_ptr<TaskHandle<void>> P2PClientService::RemoteWriteOp::Dispatch() {
             });
     }
     if (rdma_direction_mode == RdmaDirectionMode::FORWARD) {
-        return owner_service->StartForwardRemotePut(
-            peer_ptr, forward_dm, forward_slices, write_req);
+        return owner_service->StartForwardRemotePut(peer_ptr, forward_dm,
+                                                    forward_slices, write_req);
     }
     return owner_service->RunReverseRemotePut(peer_ptr, write_req, proxy,
                                               route_cache);
@@ -1081,10 +1081,10 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
         promise,
     PeerClient* peer, DataManager* dm,
-    std::shared_ptr<RemoteWriteRequest> write_req,
-    std::vector<Slice>* slices) {
+    std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
     if (!peer || !dm || !write_req || !slices) {
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INTERNAL_ERROR));
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpect, ErrorCode::INTERNAL_ERROR));
         co_return;
     }
     if (!SlicesAreContiguous(*slices)) {
@@ -1107,15 +1107,16 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
             LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
                        << ", error=" << pre.error();
         }
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, pre.error()));
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpect, pre.error()));
         co_return;
     }
 
     std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
     void* base = slices->front().ptr;
-    auto te = dm->TransferWithTeNoTierStaging(
-        base, TotalSliceBytes(*slices), dest,
-        Transport::TransferRequest::WRITE);
+    auto te =
+        dm->TransferWithTeNoTierStaging(base, TotalSliceBytes(*slices), dest,
+                                        Transport::TransferRequest::WRITE);
     if (!te) {
         LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
                    << ", error=" << te.error();
@@ -1123,7 +1124,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
         revoke_req.key = write_req->key;
         revoke_req.write_operation_id = pre.value().write_operation_id;
         tl::expected<void, ErrorCode> revoke_res;
-        for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts; ++attempt) {
+        for (int attempt = 0; attempt < kForwardReadUnpinMaxAttempts;
+             ++attempt) {
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
             if (revoke_res) {
                 break;
@@ -1140,9 +1142,10 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
         }
         if (!revoke_res) {
             LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
-                         << write_req->key << ", error=" << revoke_res.error();
+                       << write_req->key << ", error=" << revoke_res.error();
         }
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, te.error()));
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpect, te.error()));
         co_return;
     }
 
@@ -1151,7 +1154,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     commit.write_operation_id = pre.value().write_operation_id;
     auto cm = co_await peer->AsyncWriteCommit(commit);
     if (!cm) {
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, cm.error()));
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpect, cm.error()));
         co_return;
     }
     promise->setValue(tl::expected<void, ErrorCode>{});
@@ -1381,8 +1385,7 @@ P2PClientService::BatchCreateGetHandles(
 std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
-    std::vector<std::vector<Slice>>& all_slices,
-    const ReadConfigExt& config) {
+    std::vector<std::vector<Slice>>& all_slices, const ReadConfigExt& config) {
     auto local_get = [&](std::string_view key,
                          size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
         if (!data_manager_.has_value()) {
@@ -1485,7 +1488,8 @@ P2PClientService::BatchFetchReadRoutes(
 
     // Single batch RPC to master
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> responses;
-    responses = master_client_.BatchGetReplicaList(miss_keys, config.route_config);
+    responses =
+        master_client_.BatchGetReplicaList(miss_keys, config.route_config);
     for (size_t k = 0; k < responses.size(); ++k) {
         if (!responses[k]) {
             if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -1584,8 +1588,8 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
     auto read_buf = std::make_shared<BufferHandle>(std::move(*alloc_result));
     std::vector<Slice> slices = {{read_buf->ptr(), object_size}};
 
-    auto result =
-        InnerGetViaRoute(key, slices, std::move(*iter), config.rdma_direction_mode);
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter),
+                                   config.rdma_direction_mode);
     if (!result) {
         LOG(ERROR) << "Failed to get via route, key=" << key
                    << ", error=" << result.error();
@@ -1609,8 +1613,8 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
         }
         return tl::unexpected(iter.error());
     }
-    auto result =
-        InnerGetViaRoute(key, slices, std::move(*iter), config.rdma_direction_mode);
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter),
+                                   config.rdma_direction_mode);
     if (!result) {
         LOG(ERROR) << "Failed to get via route, key=" << key
                    << ", error=" << result.error();
@@ -1654,19 +1658,15 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     RouteIterator& iter, ErrorCode& final_result) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "Forward RDMA read requires DataManager";
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INTERNAL_ERROR));
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpect, ErrorCode::INTERNAL_ERROR));
         co_return true;
     }
     if (!RemoteDestBuffersContiguous(req->dest_buffers)) {
         LOG(ERROR) << "Forward RDMA read requires contiguous dest buffers, key="
                    << req->key;
-<<<<<<< HEAD
-        promise->setValue(tl::expected<void, ErrorCode>(tl::unexpect, ErrorCode::INVALID_PARAMS));
-=======
-        tl::expected<void, ErrorCode> err2 =
-            tl::make_unexpected(ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED);
-        promise->setValue(std::move(err2));
->>>>>>> 92f08293 (add errorcode NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED for non-contiguous buffers check)
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpect, ErrorCode::INVALID_PARAMS));
         co_return true;
     }
     PinKeyRequest pin_req;
@@ -1708,14 +1708,15 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
                 break;
             }
             if (attempt + 1 < kForwardReadUnpinMaxAttempts) {
-                LOG(WARNING) << "AsyncUnPinKey retry after TE failure, key="
-                             << req->key << ", attempt=" << (attempt + 1)
-                             << ", error=" << cleanup_unpin.error();
+                LOG(WARNING)
+                    << "AsyncUnPinKey retry after TE failure, key=" << req->key
+                    << ", attempt=" << (attempt + 1)
+                    << ", error=" << cleanup_unpin.error();
             }
         }
         if (!cleanup_unpin) {
             LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
-                         << req->key << ", error=" << cleanup_unpin.error();
+                       << req->key << ", error=" << cleanup_unpin.error();
         }
         iter.Evict(route);
         co_return false;
@@ -1762,8 +1763,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
         while (auto route = co_await iter.AsyncNext()) {
             try {
                 if (rdma_direction_mode == RdmaDirectionMode::FORWARD) {
-                    if (co_await RunForwardReadOnRoute(*route, req, promise, iter,
-                                                       final_result)) {
+                    if (co_await RunForwardReadOnRoute(*route, req, promise,
+                                                       iter, final_result)) {
                         co_return;
                     }
                     continue;
@@ -2022,7 +2023,8 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // Query master for replica list
-    auto result = master_client_.GetReplicaList(object_key, config.route_config);
+    auto result =
+        master_client_.GetReplicaList(object_key, config.route_config);
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
                      << ", key=" << object_key << ", error=" << result.error();

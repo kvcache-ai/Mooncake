@@ -263,7 +263,8 @@ CentralizedClientService::Query(const std::string& object_key,
     }
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto result = master_client_.GetReplicaList(object_key, config.route_config);
+    auto result =
+        master_client_.GetReplicaList(object_key, config.route_config);
     if (!result) {
         LOG(ERROR) << "Failed to get replica list: " << result.error();
         return tl::unexpected(result.error());
@@ -283,8 +284,7 @@ CentralizedClientService::Query(const std::string& object_key,
 
 std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
 CentralizedClientService::BatchQuery(
-    const std::vector<std::string>& object_keys,
-    const ReadConfigExt& config) {
+    const std::vector<std::string>& object_keys, const ReadConfigExt& config) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -300,7 +300,8 @@ CentralizedClientService::BatchQuery(
         std::chrono::steady_clock::now();
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
-    auto response = master_client_.BatchGetReplicaList(key_views, config.route_config);
+    auto response =
+        master_client_.BatchGetReplicaList(key_views, config.route_config);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {

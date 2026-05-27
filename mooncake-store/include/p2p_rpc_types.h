@@ -49,7 +49,8 @@ struct WriteConfigExt {
     RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
 
     WriteConfigExt() = default;
-    /** Promotes legacy write-route-only config for variant overload resolution. */
+    /** Promotes legacy write-route-only config for variant overload resolution.
+     */
     WriteConfigExt(WriteRouteRequestConfig r) : route_config(std::move(r)) {}
 };
 YLT_REFL(WriteConfigExt, route_config, rdma_direction_mode);

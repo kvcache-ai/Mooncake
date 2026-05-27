@@ -656,8 +656,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         rcfg.rdma_direction_mode = RdmaDirectionMode::FORWARD;
 
         std::vector<char> buf(payload.size(), 0);
-        auto get_res = remote_writer->Get(key, {(void*)buf.data()}, {buf.size()},
-                                          rcfg);
+        auto get_res =
+            remote_writer->Get(key, {(void*)buf.data()}, {buf.size()}, rcfg);
         ASSERT_TRUE(get_res.has_value())
             << "Forward Get failed mode=" << mode
             << " err=" << static_cast<int>(get_res.error());

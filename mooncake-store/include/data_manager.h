@@ -84,8 +84,8 @@ class DataManager {
     struct PreWriteResult {
         RemoteBufferDesc remote_buffer;
         UUID write_operation_id{0, 0};
-        // Filled by PreWriteInternal for in-process callers (Put/WriteRemoteData).
-        // Not exposed on PreWriteResponse (RPC).
+        // Filled by PreWriteInternal for in-process callers
+        // (Put/WriteRemoteData). Not exposed on PreWriteResponse (RPC).
         AllocationHandle handle;
     };
 
@@ -231,7 +231,7 @@ class DataManager {
      *        Used when forward TE fails after PreWrite on the peer.
      */
     tl::expected<void, ErrorCode> WriteRevoke(std::string_view key,
-                                             const UUID& write_operation_id);
+                                              const UUID& write_operation_id);
 
     tl::expected<PinKeyResponse, ErrorCode> PinKey(
         std::string_view key, std::optional<UUID> tier_id = std::nullopt);
@@ -417,8 +417,9 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& remote_buffers,
         Transport::TransferRequest::OpCode opcode);
 
-    tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
-                 ErrorCode>
+    tl::expected<
+        std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+        ErrorCode>
     SubmitTeTransferBatches(void* transfer_ptr, size_t total_data_size,
                             const std::vector<RemoteBufferDesc>& remote_buffers,
                             Transport::TransferRequest::OpCode opcode);

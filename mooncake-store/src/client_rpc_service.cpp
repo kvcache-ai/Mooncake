@@ -305,7 +305,8 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto result = data_manager_.UnPinKey(request.key, request.read_operation_id);
+    auto result =
+        data_manager_.UnPinKey(request.key, request.read_operation_id);
     if (!result) {
         LOG(ERROR) << "UnPinKey failed for key: " << request.key
                    << ", error: " << toString(result.error());

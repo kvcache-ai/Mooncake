@@ -399,12 +399,12 @@ tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
     switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
                                     write_operation_id)) {
         case PendingWriteEraseResult::Erased:
-            timer.LogResponse("error_code=", ErrorCode::OK, "record_erased=",
-                              true);
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              "record_erased=", true);
             return {};
         case PendingWriteEraseResult::NotFound:
-            timer.LogResponse("error_code=", ErrorCode::OK, "idempotent=",
-                              true);
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              "idempotent=", true);
             return {};
         case PendingWriteEraseResult::WriteOperationIdMismatch:
             timer.LogResponse("error_code=", ErrorCode::INVALID_WRITE);
@@ -492,7 +492,8 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(validate_result.error());
     }
 
-    // Local Put: allocation follows tier backend policy (not restricted to DRAM).
+    // Local Put: allocation follows tier backend policy (not restricted to
+    // DRAM).
     auto prewrite_result =
         PreWriteInternal(kctx, total_size, std::nullopt, false);
     if (!prewrite_result) {
@@ -866,8 +867,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
     // Reverse RDMA path: still one RPC, but internally use the 3-phase write
     // model (PreWrite -> transfer -> WriteCommit). Target tier may be non-DRAM.
-    auto prewrite_result =
-        PreWriteInternal(kctx, total_size, tier_id, false);
+    auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id, false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
         return tl::make_unexpected(prewrite_result.error());
@@ -897,8 +897,8 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 
 tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
-    auto internal_result = PreWriteInternal(BuildKeyCtx(key), size_bytes,
-                                            tier_id, true);
+    auto internal_result =
+        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id, true);
     if (!internal_result) {
         LOG(WARNING) << "PreWrite failed"
                      << ", key=" << key
@@ -911,7 +911,7 @@ tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     return out;
 }
 
-tl::expected<PreWriteResult, ErrorCode>
+tl::expected<DataManager::PreWriteResult, ErrorCode>
 DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
                               std::optional<UUID> tier_id,
                               bool enforce_dram_allocation) {
@@ -968,14 +968,14 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     // Cross-node PreWrite (enforce_dram_allocation): data-owner forward TE path
     // requires DRAM today. Local Put / WriteRemoteData pass false.
     // TODO: Data-owner forward path currently supports DRAM tier only.
-    if (enforce_dram_allocation &&
-        handle->loc.data.type != MemoryType::DRAM) {
+    if (enforce_dram_allocation && handle->loc.data.type != MemoryType::DRAM) {
         LOG(ERROR) << "PreWrite: DRAM allocation failed"
-                   << ", key=" << ctx.key
-                   << ", error=" << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+                   << ", key=" << ctx.key << ", error="
+                   << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
                                       write_operation_id);
-        timer.LogResponse("error_code=", ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        timer.LogResponse("error_code=",
+                          ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
 
@@ -1087,7 +1087,7 @@ tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
     return out;
 }
 
-tl::expected<PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
+tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     const KeyCtx& ctx, std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::PinKey");
     timer.LogRequest("key=", ctx.key);
@@ -1105,11 +1105,11 @@ tl::expected<PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     // Active pin: bump ref_count / renew lease; no tiered_backend::Get.
     const auto bump_existing_pin =
         [&](auto it) -> tl::expected<PinKeyResult, ErrorCode> {
-        // PinKey forward path: DRAM-only for now; non-DRAM replica handling TODO.
+        // PinKey forward path: DRAM-only for now; non-DRAM replica handling
+        // TODO.
         if (it->second.handle->loc.data.type != MemoryType::DRAM) {
             LOG(ERROR) << "PinKey: DRAM-only forward path, non-DRAM replica"
-                       << ", key=" << ctx.key
-                       << ", error="
+                       << ", key=" << ctx.key << ", error="
                        << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
             timer.LogResponse("error_code=",
                               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1348,8 +1348,8 @@ DataManager::SubmitTeTransferInternal(
             std::move(buffer_result.value());
     }
 
-    auto batches_result = SubmitTeTransferBatches(
-        transfer_ptr, total_data_size, remote_buffers, opcode);
+    auto batches_result = SubmitTeTransferBatches(transfer_ptr, total_data_size,
+                                                  remote_buffers, opcode);
     if (!batches_result) {
         return tl::unexpected(batches_result.error());
     }

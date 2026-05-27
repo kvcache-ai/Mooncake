@@ -281,8 +281,7 @@ TEST_F(PeerClientTest, AsyncPinKeyEmptyKey) {
     req.key = "";
     req.target_tier_id = std::nullopt;
 
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
+    auto result = async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -292,8 +291,7 @@ TEST_F(PeerClientTest, AsyncPinKeyKeyNotFound) {
     req.key = "peer_async_pin_missing_key";
     req.target_tier_id = std::nullopt;
 
-    auto result =
-        async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
+    auto result = async_simple::coro::syncAwait(peer_client_->AsyncPinKey(req));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -359,13 +357,11 @@ TEST_F(PeerClientTest, AsyncPinKeyTwiceSameTokenThenUnpinTwice) {
     UnPinKeyRequest unpin;
     unpin.key = key;
     unpin.read_operation_id = first->read_operation_id;
-    auto u1 =
-        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    auto u1 = async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
     ASSERT_TRUE(u1.has_value())
         << "first AsyncUnPinKey failed: " << static_cast<int>(u1.error());
 
-    auto u2 =
-        async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    auto u2 = async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
     ASSERT_TRUE(u2.has_value())
         << "second AsyncUnPinKey failed: " << static_cast<int>(u2.error());
 }
@@ -400,9 +396,8 @@ TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
 
     auto pin2 =
         async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
-    ASSERT_TRUE(pin2.has_value())
-        << "second AsyncPinKey after unpin failed: "
-        << static_cast<int>(pin2.error());
+    ASSERT_TRUE(pin2.has_value()) << "second AsyncPinKey after unpin failed: "
+                                  << static_cast<int>(pin2.error());
     EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
@@ -564,8 +559,8 @@ TEST_F(PeerClientTest, AsyncPreWriteEmptyKey) {
     pre.size_bytes = 64;
     // target_tier_id optional; invalid key fails before tier selection.
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncPreWrite(pre));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -576,8 +571,8 @@ TEST_F(PeerClientTest, AsyncPreWriteZeroSize) {
     pre.key = key;
     pre.size_bytes = 0;
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncPreWrite(pre));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -592,8 +587,8 @@ TEST_F(PeerClientTest, AsyncPreWriteValidRequest) {
     pre.size_bytes = 256;
     pre.target_tier_id = tier_id;
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncPreWrite(pre));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
     ASSERT_TRUE(result.has_value())
         << "AsyncPreWrite failed: " << static_cast<int>(result.error());
     EXPECT_GT(result->remote_buffer.size, 0u);
@@ -603,8 +598,8 @@ TEST_F(PeerClientTest, AsyncPreWriteValidRequest) {
     WriteRevokeRequest revoke;
     revoke.key = key;
     revoke.write_operation_id = result->write_operation_id;
-    auto rev = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRevoke(revoke));
+    auto rev =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev.has_value())
         << "Cleanup AsyncWriteRevoke failed: " << static_cast<int>(rev.error());
 }
@@ -622,8 +617,8 @@ TEST_F(PeerClientTest, AsyncPreWriteWhenObjectAlreadyExists) {
     pre.key = key;
     pre.size_bytes = 128;
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncPreWrite(pre));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 }
@@ -643,14 +638,14 @@ TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
     ASSERT_TRUE(pre_res.has_value())
         << "AsyncPreWrite failed: " << static_cast<int>(pre_res.error());
 
-    // TransferEngine is not initialized in this unit test, so no real data-plane
-    // write occurs. Assume the access side has already filled the buffer via TE;
-    // this case only checks WriteCommit RPC / metadata outcome.
+    // TransferEngine is not initialized in this unit test, so no real
+    // data-plane write occurs. Assume the access side has already filled the
+    // buffer via TE; this case only checks WriteCommit RPC / metadata outcome.
     WriteCommitRequest commit;
     commit.key = key;
     commit.write_operation_id = pre_res->write_operation_id;
-    auto commit_res = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteCommit(commit));
+    auto commit_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_TRUE(commit_res.has_value())
         << "AsyncWriteCommit failed: " << static_cast<int>(commit_res.error());
 }
@@ -660,8 +655,8 @@ TEST_F(PeerClientTest, AsyncWriteCommitEmptyKey) {
     commit.key = "";
     commit.write_operation_id = {1, 2};
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteCommit(commit));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -672,8 +667,8 @@ TEST_F(PeerClientTest, AsyncWriteCommitZeroToken) {
     commit.key = key;
     commit.write_operation_id = {0, 0};
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteCommit(commit));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -698,16 +693,16 @@ TEST_F(PeerClientTest, AsyncWriteCommitTokenMismatchAfterPreWrite) {
     wrong_token.first += 1;
     commit.write_operation_id = wrong_token;
 
-    auto bad = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteCommit(commit));
+    auto bad =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_FALSE(bad.has_value());
     EXPECT_EQ(bad.error(), ErrorCode::INVALID_WRITE);
 
     WriteRevokeRequest revoke;
     revoke.key = key;
     revoke.write_operation_id = pre_res->write_operation_id;
-    auto rev = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRevoke(revoke));
+    auto rev =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev.has_value());
 }
 
@@ -716,8 +711,8 @@ TEST_F(PeerClientTest, AsyncWriteRevokeEmptyKey) {
     request.key = "";
     request.write_operation_id = {1, 2};
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRevoke(request));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -728,8 +723,8 @@ TEST_F(PeerClientTest, AsyncWriteRevokeZeroToken) {
     request.key = key;
     request.write_operation_id = {0, 0};
 
-    auto result = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRevoke(request));
+    auto result =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(request));
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
@@ -752,8 +747,8 @@ TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
     WriteRevokeRequest revoke;
     revoke.key = key;
     revoke.write_operation_id = pre_res->write_operation_id;
-    auto rev_res = async_simple::coro::syncAwait(
-        peer_client_->AsyncWriteRevoke(revoke));
+    auto rev_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(revoke));
     ASSERT_TRUE(rev_res.has_value())
         << "AsyncWriteRevoke failed: " << static_cast<int>(rev_res.error());
 
@@ -926,9 +921,8 @@ TEST_F(PeerClientTest, SyncPinKeyAfterUnpinNewToken) {
         << "first UnPinKey failed: " << static_cast<int>(un1.error());
 
     auto pin2 = peer_client_->PinKey(pin_req);
-    ASSERT_TRUE(pin2.has_value())
-        << "second PinKey after unpin failed: "
-        << static_cast<int>(pin2.error());
+    ASSERT_TRUE(pin2.has_value()) << "second PinKey after unpin failed: "
+                                  << static_cast<int>(pin2.error());
     EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
@@ -1024,9 +1018,9 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
     ASSERT_TRUE(pre_res.has_value())
         << "PreWrite failed: " << static_cast<int>(pre_res.error());
 
-    // TransferEngine is not initialized in this unit test, so no real data-plane
-    // write occurs. Assume the access side has already filled the buffer via TE;
-    // this case only checks WriteCommit RPC / metadata outcome.
+    // TransferEngine is not initialized in this unit test, so no real
+    // data-plane write occurs. Assume the access side has already filled the
+    // buffer via TE; this case only checks WriteCommit RPC / metadata outcome.
     WriteCommitRequest commit;
     commit.key = key;
     commit.write_operation_id = pre_res->write_operation_id;

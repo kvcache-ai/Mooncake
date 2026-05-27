@@ -193,8 +193,7 @@ PeerClient::AsyncUnPinKey(const UnPinKeyRequest& request) {
 
     auto result = co_await std::move(ret.value());
     if (!result) {
-        LOG(ERROR) << "AsyncUnPinKey: RPC call failed: "
-                   << result.error().msg;
+        LOG(ERROR) << "AsyncUnPinKey: RPC call failed: " << result.error().msg;
         co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
 

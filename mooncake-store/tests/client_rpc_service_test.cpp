@@ -323,9 +323,8 @@ TEST_F(ClientRpcServiceTest, PinKeyAfterUnpinNewToken) {
         << "first UnPinKey failed: " << static_cast<int>(un1.error());
 
     auto pin2 = rpc_service_->PinKey(pin_req);
-    ASSERT_TRUE(pin2.has_value())
-        << "second PinKey after unpin failed: "
-        << static_cast<int>(pin2.error());
+    ASSERT_TRUE(pin2.has_value()) << "second PinKey after unpin failed: "
+                                  << static_cast<int>(pin2.error());
     EXPECT_NE(pin1->read_operation_id, pin2->read_operation_id);
 
     UnPinKeyRequest unpin2;
@@ -383,9 +382,8 @@ TEST_F(ClientRpcServiceTest, UnPinKeyWrongTokenAfterPin) {
     ok.key = key;
     ok.read_operation_id = pin_res->read_operation_id;
     auto ok_res = rpc_service_->UnPinKey(ok);
-    ASSERT_TRUE(ok_res.has_value())
-        << "UnPinKey with correct token failed: "
-        << static_cast<int>(ok_res.error());
+    ASSERT_TRUE(ok_res.has_value()) << "UnPinKey with correct token failed: "
+                                    << static_cast<int>(ok_res.error());
 }
 
 // ============================================================================

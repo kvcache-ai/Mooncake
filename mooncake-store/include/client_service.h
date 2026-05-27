@@ -158,8 +158,7 @@ class ClientService {
      */
     virtual tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadConfigExt& config = {}) = 0;
+        const std::vector<size_t>& sizes, const ReadConfigExt& config = {}) = 0;
 
     /**
      * @brief Batch get data into user-provided buffers

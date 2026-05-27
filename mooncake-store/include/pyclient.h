@@ -44,15 +44,13 @@ class PyClient {
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadConfigExt& config = {}) = 0;
+        const std::vector<size_t>& sizes, const ReadConfigExt& config = {}) = 0;
 
     virtual std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task,
-        const ReadConfigExt& config = {}) = 0;
+        bool aggregate_same_segment_task, const ReadConfigExt& config = {}) = 0;
 
     virtual int put_from(const std::string& key, void* buffer, size_t size,
                          const WriteConfig& config) = 0;

@@ -440,8 +440,7 @@ class RealClient : public PyClient {
         const ReadConfigExt& config = {});
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
-        const std::vector<std::string>& keys,
-        const ReadConfigExt& config = {});
+        const std::vector<std::string>& keys, const ReadConfigExt& config = {});
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string>& keys);
