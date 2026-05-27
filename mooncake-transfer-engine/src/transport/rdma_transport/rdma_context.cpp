@@ -30,10 +30,7 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "environ.h"
-#if defined(USE_HIP)
-// hsa_amd_portable_export_dmabuf is the ROCm equivalent of
-// cuMemGetHandleForAddressRange(...CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD...).
-// Used in the dmabuf branch of registerMemoryRegionInternal below.
+#if defined(USE_HIP_DMABUF)
 #include <sys/utsname.h>
 
 #include <vector>
@@ -62,24 +59,19 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     return region_start <= addr && addr - region_start < region_length;
 }
 
-#if defined(USE_HIP)
-// AMD GPU dmabuf RDMA requires two kernel features to be present, otherwise
-// `ibv_reg_dmabuf_mr()` may return a valid-looking MR but subsequent RDMA
-// transfers fail (or silently misbehave) because the kernel cannot route
-// PCIe peer-to-peer DMA through the dmabuf fd:
-//
-//   CONFIG_PCI_P2PDMA=y
-//   CONFIG_DMABUF_MOVE_NOTIFY=y
-//
-// Mirrors RCCL's check at projects/rccl/src/misc/rocmwrap.cc:266 and the
-// equivalent gate in UCX's ROCm backend. Cached after the first call.
-//
-// Distros known to ship both options enabled by default: Ubuntu 24.04 (5.15
-// HWE -> 6.8), RHEL 9.4+ (5.14+), kernel >= 6.x in general. Ubuntu 22.04
-// stock 5.15 lacks them; if you need this PR's dmabuf path on an older
-// distro, rebuild the kernel with both options enabled.
+#if defined(USE_HIP_DMABUF)
+// Returns true when the kernel has CONFIG_PCI_P2PDMA and
+// CONFIG_DMABUF_MOVE_NOTIFY enabled, which are required for ibv_reg_dmabuf_mr
+// to produce working RDMA transfers (not just successful registration).
+// Result is cached after the first call.
 bool isKernelDmabufSupported() {
     static const bool supported = []() {
+        if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
+            if (std::string(env) != "0") {
+                LOG(INFO) << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
+                return false;
+            }
+        }
         struct utsname uts{};
         std::string release;
         if (uname(&uts) == 0) release = uts.release;
@@ -147,7 +139,7 @@ bool isKernelDmabufSupported() {
     }();
     return supported;
 }
-#endif  // USE_HIP
+#endif  // USE_HIP_DMABUF
 }  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
@@ -436,17 +428,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
     }
-#elif defined(USE_HIP)
-    // ROCm/HIP equivalent of the CUDA dmabuf path above. Allows AMD GPU
-    // memory to be registered for RDMA without nvidia-peermem (which has
-    // no AMD equivalent in most distros). Mirrors the same host/device
-    // split: ibv_reg_mr() for host memory; ibv_reg_dmabuf_mr() for device
-    // memory, with the dmabuf fd obtained from
-    // hsa_amd_portable_export_dmabuf().
-    //
-    // Tested on:
-    //   - AMD MI355X (gfx950) + Pensando ionic, ROCm 7.2.2
-    //   - AMD MI300X (gfx942) + Broadcom Thor2 (bnxt_re), ROCm 7.0.2
+#elif defined(USE_HIP_DMABUF)
     hipPointerAttribute_t hipAttr{};
     hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
 
@@ -455,25 +437,25 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         // Host memory — standard ibv_reg_mr() path.
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
-    } else if ((hipAttr.type == hipMemoryTypeDevice ||
-                hipAttr.type == hipMemoryTypeManaged) &&
-               !isKernelDmabufSupported()) {
-        // Device memory but kernel lacks CONFIG_PCI_P2PDMA /
-        // CONFIG_DMABUF_MOVE_NOTIFY — `ibv_reg_dmabuf_mr` may succeed but
-        // subsequent transfers will fail (or worse, silently misroute).
-        // Fall back to `ibv_reg_mr` so the failure surfaces here, at
-        // registration time, instead of mid-transfer.
+    } else if (hipAttr.type == hipMemoryTypeManaged) {
+        // Managed (unified) memory pages can migrate between host and device;
+        // hsa_amd_portable_export_dmabuf captures the device-side handle at
+        // export time only, making the dmabuf fd stale after migration. Fall
+        // back to ibv_reg_mr() for safety.
+        LOG(WARNING) << "HIP managed memory at " << (uintptr_t)addr
+                     << " — dmabuf export skipped (pages may migrate); "
+                        "falling back to ibv_reg_mr";
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
-    } else if (hipAttr.type == hipMemoryTypeDevice ||
-               hipAttr.type == hipMemoryTypeManaged) {
-        // Device memory + supported kernel — dmabuf fd export +
-        // ibv_reg_dmabuf_mr(). Worker threads (RDMA polling, etc.) may not have
-        // the device that owns `addr` set as their current HIP device. Mirror
-        // the CUDA path's ctx-retain/ctx-release dance with a small RAII guard:
-        // pin the active device to `hipAttr.device` for the duration of the
-        // hipMemGetAddressRange / hsa_amd_portable_export_dmabuf calls,
-        // then restore whatever device the caller had.
+    } else if (hipAttr.type == hipMemoryTypeDevice && !isKernelDmabufSupported()) {
+        // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
+        // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
+        // Fail at registration time instead.
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (hipAttr.type == hipMemoryTypeDevice) {
+        // Device memory + kernel support — export dmabuf fd and register.
+        // Pin to the owning device for the duration of the export calls.
         struct HipDeviceGuard {
             int prev_device = 0;
             bool need_restore = false;

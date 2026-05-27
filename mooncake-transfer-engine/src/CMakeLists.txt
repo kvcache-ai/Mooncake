@@ -95,13 +95,23 @@ endif()
 
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
-  # hsa-runtime64 provides hsa_amd_portable_export_dmabuf, used in the
-  # RDMA transport's HIP dmabuf MR registration path. Discovered via the
-  # CMake config that ROCm ships (resolved against CMAKE_PREFIX_PATH,
-  # which already includes the ROCm cmake dir per common.cmake), so the
-  # ROCm install location isn't hard-coded here.
-  find_package(hsa-runtime64 CONFIG REQUIRED)
-  target_link_libraries(transfer_engine PUBLIC hip::host hsa-runtime64::hsa-runtime64 rt)
+  target_link_libraries(transfer_engine PUBLIC hip::host rt)
+
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a
+  # kernel with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
+  if(USE_HIP_DMABUF)
+    find_package(hsa-runtime64 CONFIG)
+    if(hsa-runtime64_FOUND)
+      target_compile_definitions(transfer_engine PRIVATE USE_HIP_DMABUF)
+      target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
+      message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
+    else()
+      message(STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+    endif()
+  else()
+    message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
+  endif()
 endif()
 
 if(USE_MLU)
