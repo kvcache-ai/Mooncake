@@ -261,10 +261,12 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
         "20240104_000000_000", "20240105_000000_000"};
 
     for (const auto& id : snapshot_ids) {
-        std::string key = "mooncake_master_snapshot/" + id + "/metadata";
+        std::string key = std::string("mooncake_master_snapshot/") +
+                          DEFAULT_CLUSTER_ID + "/" + id + "/metadata";
         backend->UploadString(key, "dummy_metadata");
-        std::string manifest_key =
-            "mooncake_master_snapshot/" + id + "/manifest.txt";
+        std::string manifest_key = std::string("mooncake_master_snapshot/") +
+                                   DEFAULT_CLUSTER_ID + "/" + id +
+                                   "/manifest.txt";
         backend->UploadString(manifest_key, "messagepack|1.0.0|" + id);
 
         auto descriptor =
@@ -282,7 +284,9 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
 
     // Verify: list remaining objects
     std::vector<std::string> remaining;
-    backend->ListObjectsWithPrefix("mooncake_master_snapshot/", remaining);
+    backend->ListObjectsWithPrefix(
+        std::string("mooncake_master_snapshot/") + DEFAULT_CLUSTER_ID + "/",
+        remaining);
 
     // Only the 2 newest (20240104, 20240105) should remain
     for (const auto& key : remaining) {
@@ -298,7 +302,8 @@ TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
 TEST_F(SnapshotChildProcessTest, UploadSnapshotPayloadFile_Success) {
     CreateDefaultService();
     std::vector<uint8_t> data = {10, 20, 30, 40, 50};
-    std::string path = "mooncake_master_snapshot/test_upload/metadata";
+    std::string path = std::string("mooncake_master_snapshot/") +
+                       DEFAULT_CLUSTER_ID + "/test_upload/metadata";
     auto result =
         CallUploadSnapshotPayloadFile(data, path, "metadata", "test_upload");
     ASSERT_TRUE(result.has_value())
@@ -331,8 +336,8 @@ TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
     std::this_thread::sleep_for(std::chrono::seconds(5));
 
     // Check if latest.txt was generated
-    std::string latest_path =
-        tmp_dir() + "/mooncake_master_snapshot/latest.txt";
+    std::string latest_path = tmp_dir() + "/mooncake_master_snapshot/" +
+                              std::string(DEFAULT_CLUSTER_ID) + "/latest.txt";
     bool found = fs::exists(latest_path);
 
     // Destroy service to stop snapshot thread before assertions
@@ -365,9 +370,11 @@ TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
 
     EXPECT_EQ(latest->value().snapshot_id, snapshot_id);
     EXPECT_EQ(latest->value().manifest_key,
-              "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt");
+              std::string("mooncake_master_snapshot/") + DEFAULT_CLUSTER_ID +
+                  "/" + snapshot_id + "/manifest.txt");
     EXPECT_EQ(latest->value().object_prefix,
-              "mooncake_master_snapshot/" + snapshot_id + "/");
+              std::string("mooncake_master_snapshot/") + DEFAULT_CLUSTER_ID +
+                  "/" + snapshot_id + "/");
     EXPECT_EQ(latest->value().last_included_seq, 0u);
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
     const auto created_at_ms = latest->value().created_at_ms;
@@ -383,9 +390,11 @@ TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
         ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
     descriptor.last_included_seq = 123;
     descriptor.producer_view_version = 41;
-    descriptor.manifest_key =
-        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
-    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.manifest_key = std::string("mooncake_master_snapshot/") +
+                              DEFAULT_CLUSTER_ID + "/" + snapshot_id +
+                              "/manifest.txt";
+    descriptor.object_prefix = std::string("mooncake_master_snapshot/") +
+                               DEFAULT_CLUSTER_ID + "/" + snapshot_id + "/";
     descriptor.created_at_ms = 1717243200123;
 
     auto persist_result = CallPersistState(descriptor);
@@ -592,9 +601,9 @@ TEST_F(SnapshotChildProcessTest,
         << "PersistState for snapshot2 failed: "
         << persist_result.error().message;
 
-    const fs::path corrupted_metadata = fs::path(tmp_dir()) /
-                                        "mooncake_master_snapshot" /
-                                        snapshot_id2 / "metadata";
+    const fs::path corrupted_metadata =
+        fs::path(tmp_dir()) / "mooncake_master_snapshot" / DEFAULT_CLUSTER_ID /
+        snapshot_id2 / "metadata";
     std::ofstream corrupt_stream(corrupted_metadata, std::ios::binary);
     ASSERT_TRUE(corrupt_stream.is_open())
         << "Failed to corrupt latest snapshot metadata";

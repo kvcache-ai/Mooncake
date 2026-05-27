@@ -36,7 +36,8 @@ static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_ROOT = "mooncake_master_snapshot";
+// SNAPSHOT_ROOT is now replaced by MasterService::GetSnapshotRoot()
+// to support multiple clusters sharing a single S3 bucket.
 static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
     "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
@@ -2566,7 +2567,8 @@ void MasterService::SnapshotThreadFunc() {
             continue;
         }
 
-        const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+        const std::string path_prefix =
+            GetSnapshotRoot() + "/" + snapshot_id + "/";
         const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         auto descriptor =
             BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
@@ -2886,7 +2888,7 @@ MasterService::BuildSnapshotDescriptor(const std::string& snapshot_id,
 
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
-    const std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
+    const std::string path_prefix = GetSnapshotRoot() + "/" + snapshot_id + "/";
     const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
     auto descriptor =
         BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
@@ -3054,7 +3056,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         }
 
         // Publish snapshot catalog entry and advance the latest marker.
-        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
+        std::string latest_path =
+            GetSnapshotRoot() + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
         auto publish_result = snapshot_catalog_store->Publish(descriptor);
@@ -3284,7 +3287,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
     const std::string& state_id = snapshot.snapshot_id;
     std::string path_prefix = snapshot.object_prefix;
     if (path_prefix.empty()) {
-        path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
+        path_prefix = GetSnapshotRoot() + "/" + state_id + "/";
     }
 
     std::string manifest_path = snapshot.manifest_key;

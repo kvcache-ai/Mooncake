@@ -1230,6 +1230,13 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+
+    // Returns the S3 snapshot root path, scoped by cluster_id to support
+    // multiple clusters sharing a single S3 bucket.
+    std::string GetSnapshotRoot() const {
+        return "mooncake_master_snapshot/" + cluster_id_;
+    }
+
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size

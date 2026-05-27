@@ -188,7 +188,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return tmp_dir() + "/mooncake_master_snapshot/" + snapshot_id + "/";
+        return tmp_dir() + "/mooncake_master_snapshot/" +
+               std::string(DEFAULT_CLUSTER_ID) + "/" + snapshot_id + "/";
     }
 
     // Get backup directory path
