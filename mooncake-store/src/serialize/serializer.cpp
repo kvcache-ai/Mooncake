@@ -782,14 +782,23 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             if (!buffer_result) {
                 return tl::unexpected(buffer_result.error());
             }
-            // When storage_level is present in the serialized data, verify it
-            // matches the allocator to catch data corruption early.
-            if (arr_size == 5) {
-                DCHECK_EQ(static_cast<int8_t>(storage_level),
-                          static_cast<int8_t>(
-                              buffer_result.value()->getStorageLevel()))
-                    << "storage_level mismatch between serialized data and "
-                       "allocator";
+            // When storage_level is present in the serialized data, log a
+            // warning if it differs from the allocator's value. A mismatch is
+            // expected when restoring a snapshot across different hardware
+            // configurations (e.g. SSD-backed memory restored onto a DRAM-only
+            // node). The serialized value will be restored below to keep
+            // save→restore→save round-trips idempotent.
+            if (arr_size == 5 &&
+                static_cast<int8_t>(storage_level) !=
+                    static_cast<int8_t>(
+                        buffer_result.value()->getStorageLevel())) {
+                LOG(WARNING)
+                    << "Replica storage_level mismatch: serialized="
+                    << static_cast<int>(storage_level) << " allocator="
+                    << static_cast<int>(
+                           buffer_result.value()->getStorageLevel())
+                    << "; restoring serialized value (expected during "
+                       "cross-hardware snapshot restore)";
             }
             replica = std::make_shared<Replica>(
                 std::move(buffer_result.value()), status);
@@ -849,6 +858,15 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
     // Restore the original id (overwrite the auto-generated one)
     // Note: refcnt_ is not restored, it remains 0 (default value)
     replica->id_ = id;
+    // Restore the serialized storage_level so that save→restore→save
+    // round-trips produce identical snapshots. The Replica constructor for
+    // MEMORY type derives storage_level_ from the current allocator, which
+    // may differ from the original (e.g. after cross-hardware restore). We
+    // always trust the serialized value here because it was written by a
+    // previous serialize() call and reflects the intended storage tier.
+    if (arr_size == 5) {
+        replica->storage_level_ = storage_level;
+    }
 
     return replica;
 }
