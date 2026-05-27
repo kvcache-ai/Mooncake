@@ -106,7 +106,29 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION}0
+                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
+            else
+                pip install torch==$version
+            fi
+            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cd ..
+fi
+
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake PG"
+    cd mooncake-pg
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
+        python setup.py build_ext --build-lib .
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             else
                 pip install torch==$version
             fi
@@ -135,6 +157,20 @@ else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
 
+# Handle package name modification for CU13 builds
+if [ "$CU13_BUILD" = "1" ]; then
+    echo "Modifying package name for CU13 build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cu13"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cu13"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-cu13"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
 rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
@@ -147,18 +183,59 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-# Detect architecture and set appropriate platform tag
+# Detect architecture and glibc version for platform tag
 ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_aarch64"}
-    echo "Building for ARM64 architecture"
-elif [ "$ARCH" = "x86_64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
-    echo "Building for x86_64 architecture"
-else
-    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
-    exit 1
+
+# Detect glibc version and convert to manylinux format (e.g., "2.39" -> "2_39")
+# Requires getconf (checked in dependencies.sh) or ldd as fallback
+detect_glibc_version() {
+    local ver=""
+
+    # Method 1: use getconf (POSIX standard, most reliable)
+    # getconf is checked in dependencies.sh, so it should be available
+    ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || true)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Method 2: use ldd --version (fallback, should also be available)
+    ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Final fallback: conservative baseline (should not reach here if dependencies are met)
+    echo "2_17"
+}
+
+GLIBC_VERSION=$(detect_glibc_version)
+if [ -z "$GLIBC_VERSION" ]; then
+    GLIBC_VERSION="2_17"  # Conservative fallback
+    echo "Warning: Could not detect glibc version, using fallback: $GLIBC_VERSION"
 fi
+
+# Determine architecture (simplified)
+case "$ARCH" in
+    aarch64|arm64)
+        ARCH_SUFFIX="aarch64"
+        ;;
+    x86_64)
+        ARCH_SUFFIX="x86_64"
+        ;;
+    *)
+        echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+        exit 1
+        ;;
+esac
+
+# Set platform tag if not already set
+PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
+
+echo "Detected architecture: $ARCH_SUFFIX"
+echo "Detected glibc version: $GLIBC_VERSION"
+echo "Using platform tag: $PLATFORM_TAG"
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"

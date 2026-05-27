@@ -3,6 +3,7 @@
 #include <json/json.h>
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <iomanip>
 #include <memory>
 #include <string>

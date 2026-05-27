@@ -255,7 +255,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 };
 
 // Static members initialization
-std::shared_ptr<CentralizedClientService> ClientIntegrationTestCxl::test_client_ = nullptr;
+std::shared_ptr<CentralizedClientService>
+    ClientIntegrationTestCxl::test_client_ = nullptr;
 void* ClientIntegrationTestCxl::segment_ptr_ = nullptr;
 void* ClientIntegrationTestCxl::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>

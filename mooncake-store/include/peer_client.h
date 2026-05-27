@@ -2,6 +2,7 @@
 
 #include "client_rpc_types.h"
 #include "types.h"
+#include <csignal>
 #include <vector>
 #include <string>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>

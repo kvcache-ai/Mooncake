@@ -139,9 +139,9 @@ class P2PClientService final : public ClientService {
      * @param size Size of the buffer in bytes.
      * @return An ErrorCode indicating success or failure.
      */
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                               size_t size,
-                                               const std::string& protocol = "tcp") override;
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size,
+        const std::string& protocol = "tcp") override;
 
     /**
      * @brief Unmount a memory segment in P2P mode.
@@ -168,7 +168,7 @@ class P2PClientService final : public ClientService {
      * success, or an ErrorCode on failure.
      */
     tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
-                                                 bool force = false) override;
+                                                bool force = false) override;
 
     /**
      * @brief Removes all objects and all its replicas

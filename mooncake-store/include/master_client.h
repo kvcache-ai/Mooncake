@@ -122,7 +122,7 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key,
-                                                   bool force = false);
+                                                       bool force = false);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.

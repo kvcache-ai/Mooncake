@@ -1778,9 +1778,8 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
 // MountSegment / UnmountSegment (Not Supported)
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::MountSegment(const void* buffer,
-                                                             size_t size,
-                                                             const std::string& protocol) {
+tl::expected<void, ErrorCode> P2PClientService::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";

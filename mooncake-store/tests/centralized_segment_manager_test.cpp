@@ -94,8 +94,8 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
     segment.id = generate_uuid();
     segment.name = "test_segment";
     segment.size = 1024 * 1024 * 16;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     // Get segment access and attempt to mount
     // Get segment access and attempt to mount
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
@@ -117,8 +117,8 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     segment.id = generate_uuid();
     segment.name = "test_segment";
     segment.size = 1024 * 1024 * 16;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     // Get segment access and mount first time
     // Get segment access and mount first time
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
@@ -140,7 +140,8 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     segment2.size = segment.size * 2;
     segment2.extra = CentralizedSegmentExtraData{
         .base = segment.GetCentralizedExtra().base + segment.size,
-        .te_endpoint = "", .protocol = "tcp"};
+        .te_endpoint = "",
+        .protocol = "tcp"};
 
     // Mount the second segment
     ASSERT_TRUE(segment_manager.MountSegment(segment2).has_value());
@@ -162,8 +163,8 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
     segment.id = generate_uuid();
     segment.name = "test_segment";
     segment.size = 1024 * 1024 * 16;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     // Get segment access and mount
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
 
@@ -191,8 +192,8 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
     segment.id = generate_uuid();
     segment.name = "test_segment";
     segment.size = 1024 * 1024 * 16;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     // Get segment access and mount
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
 
@@ -249,7 +250,8 @@ TEST_F(SegmentTest, QuerySegments) {
         segment.size = 1024 * 1024 * 16;
         segment.extra = CentralizedSegmentExtraData{
             .base = static_cast<uintptr_t>(0x100000000 + (i * 0x100000000)),
-            .te_endpoint = "", .protocol = "tcp"};
+            .te_endpoint = "",
+            .protocol = "tcp"};
 
         // Create client ID
 
@@ -349,7 +351,8 @@ TEST_F(SegmentTest, ConcurrentMountAndUnmount) {
             segment.extra = CentralizedSegmentExtraData{
                 .base =
                     static_cast<uintptr_t>(0x100000000 + i * 0x100000000ULL),
-                .te_endpoint = "", .protocol = "tcp"};
+                .te_endpoint = "",
+                .protocol = "tcp"};
 
             auto mount_result = segment_manager.MountSegment(segment);
             ASSERT_TRUE(mount_result.has_value());
@@ -379,8 +382,8 @@ TEST_F(SegmentTest, ConcurrentMountSameSegment) {
     segment.id = generate_uuid();
     segment.name = "same_segment";
     segment.size = 1024 * 1024 * 16;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     std::vector<std::thread> threads;
     std::atomic<int> mount_success{0};
     std::atomic<int> mount_duplicate{0};
@@ -416,8 +419,10 @@ TEST_F(SegmentTest, QuerySegmentAndIp) {
     segment.id = generate_uuid();
     segment.name = "test_ip_segment";
     segment.size = 1024;
-    segment.extra = CentralizedSegmentExtraData{
-        .base = 0x100000000, .te_endpoint = "192.168.1.100:1234", .protocol = "tcp"};
+    segment.extra =
+        CentralizedSegmentExtraData{.base = 0x100000000,
+                                    .te_endpoint = "192.168.1.100:1234",
+                                    .protocol = "tcp"};
 
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
 
@@ -450,8 +455,7 @@ TEST_F(SegmentTest, Callbacks) {
     bool allocator_add_triggered = false;
     bool allocator_remove_triggered = false;
     segment_manager.SetAllocatorChangeCallback(
-        [&](const Segment& seg,
-            std::shared_ptr<BufferAllocatorBase>& allocator,
+        [&](const Segment& seg, std::shared_ptr<BufferAllocatorBase>& allocator,
             bool is_add) -> tl::expected<void, ErrorCode> {
             allocator_change_segment_name = seg.name;
             if (is_add)
@@ -465,8 +469,8 @@ TEST_F(SegmentTest, Callbacks) {
     segment.id = generate_uuid();
     segment.name = "callback_seg";
     segment.size = 1024;
-    segment.extra =
-        CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
+    segment.extra = CentralizedSegmentExtraData{
+        .base = 0x100000000, .te_endpoint = "", .protocol = "tcp"};
     // Test Mount calls AllocatorChangeCallback
     ASSERT_TRUE(segment_manager.MountSegment(segment).has_value());
     EXPECT_TRUE(allocator_add_triggered);

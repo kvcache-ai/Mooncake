@@ -247,8 +247,8 @@ tl::expected<void, ErrorCode> MasterClient::Remove(std::string_view key,
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
-    std::string_view str, bool force) {
+tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(std::string_view str,
+                                                          bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
     timer.LogRequest("key=", str, ", force=", force);
 

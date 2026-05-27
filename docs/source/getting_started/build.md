@@ -153,6 +153,7 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
+- `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+

@@ -6,6 +6,7 @@
 #include <thread>
 #include <chrono>
 
+#include <csignal>
 #include "client_config_builder.h"
 #include "client_metric.h"
 #include "p2p_client_metric.h"

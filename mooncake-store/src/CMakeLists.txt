@@ -92,6 +92,7 @@ target_link_libraries(mooncake_store
         ${ETCD_WRAPPER_LIB}
         glog::glog
         gflags::gflags
+        JsonCpp::JsonCpp
         ${EXTRA_LIBS}
         asio_shared
     PRIVATE

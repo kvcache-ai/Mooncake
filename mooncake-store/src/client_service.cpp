@@ -271,7 +271,7 @@ ErrorCode ClientService::InitTransferEngine(
     // this only performs RPC calls
     if (protocol == "rpc_only") {
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
-        return client;
+        return ErrorCode::OK;
     }
 
     // Check if using TENT mode - TENT handles transport configuration

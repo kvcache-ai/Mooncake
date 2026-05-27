@@ -345,8 +345,8 @@ WrappedMasterService::BatchGetReplicaList(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    std::string_view key, bool force) {
+tl::expected<void, ErrorCode> WrappedMasterService::Remove(std::string_view key,
+                                                           bool force) {
     return execute_rpc(
         "Remove", [&] { return GetMasterService().Remove(key, force); },
         [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },

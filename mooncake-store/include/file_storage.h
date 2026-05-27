@@ -90,12 +90,10 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
     std::vector<std::shared_ptr<AllocatedBatch>> GUARDED_BY(
-        client_buffer_mutex_)
-    client_buffer_allocated_batches_;
+        client_buffer_mutex_) client_buffer_allocated_batches_;
 
     mutable Mutex offloading_mutex_;
-    bool GUARDED_BY(offloading_mutex_)
-    enable_offloading_;
+    bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;

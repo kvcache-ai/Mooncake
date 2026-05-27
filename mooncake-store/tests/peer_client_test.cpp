@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <json/json.h>
+#include <csignal>
 #include <memory>
 #include <string>
 #include <thread>

@@ -172,13 +172,13 @@ class CentralizedClientService
                                          bool force = false) override;
 
     tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
-                                                 bool force = false) override;
+                                                bool force = false) override;
 
     tl::expected<long, ErrorCode> RemoveAll(bool force = false) override;
 
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                               size_t size,
-                                               const std::string& protocol = "tcp") override;
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size,
+        const std::string& protocol = "tcp") override;
 
     tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
                                                  size_t size) override;

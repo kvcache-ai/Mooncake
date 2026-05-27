@@ -860,21 +860,19 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::string storage_path_;
     int64_t physical_used_bytes_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
-    object_bucket_map_;
-    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(mutex_)
-    buckets_;
-    int64_t GUARDED_BY(mutex_)
-    next_bucket_ = -1;
+        object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
+        mutex_) buckets_;
+    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
     LocalStorageSpaceManager space_manager_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-    ungrouped_offloading_objects_;
+        ungrouped_offloading_objects_;
 
     // Track valid key count per bucket for fragmentation calculation
-    std::unordered_map<int64_t, int> GUARDED_BY(mutex_)
-    bucket_valid_keys_;
+    std::unordered_map<int64_t, int> GUARDED_BY(mutex_) bucket_valid_keys_;
 
     std::mutex deletion_mutex_;
     std::condition_variable deletion_cv_;

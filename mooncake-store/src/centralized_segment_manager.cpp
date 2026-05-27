@@ -143,7 +143,7 @@ tl::expected<void, ErrorCode> CentralizedSegmentManager::InnerMountSegment(
             }
         }
         MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                                size);
+                                                               size);
     }
 
     auto mounted_segment = std::make_shared<MountedCentralizedSegment>();

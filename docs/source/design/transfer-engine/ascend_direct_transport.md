@@ -72,3 +72,5 @@ Complete command format is shown below:
 10. **Async transfer**: The asynchronous transfer mode can be enabled by configuring the ASCEND_USE_ASYNC_TRANSFER environment variable.
 
 12. **Fabric Memory mode**: On the A3, with the latest drivers and CANN installed, when using Mooncake store, the ASCEND_ENABLE_USE_FABRIC_MEM environment variable can be set to enable fabric memory transfer mode (which allows direct access remote HOST memory).
+
+13. **Auto Connect**: The auto connect feature can be enabled by configuring the `ASCEND_AUTO_CONNECT` environment variable. The default value is 0 (disabled).

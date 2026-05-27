@@ -54,10 +54,10 @@ class WrappedMasterService {
                             GetReplicaListRequestConfig());
 
     tl::expected<void, ErrorCode> Remove(std::string_view key,
-                                       bool force = false);
+                                         bool force = false);
 
     tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str,
-                                            bool force = false);
+                                                bool force = false);
 
     long RemoveAll(bool force = false);
 

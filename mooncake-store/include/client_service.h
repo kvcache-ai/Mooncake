@@ -209,7 +209,7 @@ class ClientService {
      * @return ErrorCode indicating success/failure
      */
     virtual tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
-                                             bool force = false) = 0;
+                                                 bool force = false) = 0;
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
@@ -218,8 +218,8 @@ class ClientService {
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    virtual tl::expected<long, ErrorCode> RemoveByRegex(
-        const ObjectKey& str, bool force = false) = 0;
+    virtual tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                        bool force = false) = 0;
 
     /**
      * @brief Removes all objects and all its replicas
@@ -234,9 +234,9 @@ class ClientService {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                                       size_t size,
-                                                       const std::string& protocol = "tcp") = 0;
+    virtual tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size,
+        const std::string& protocol = "tcp") = 0;
 
     /**
      * @brief Unregisters a memory segment from master
