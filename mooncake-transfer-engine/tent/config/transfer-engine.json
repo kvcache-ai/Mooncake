@@ -89,5 +89,18 @@
         "mnnvl": {
             "enable" : false
         }
-    }
+    },
+    "policy": [
+        {
+            "name": "default_memory",
+            "segment_type": "memory",
+            "devices": ["mlx5_0", "mlx5_2"],
+            "transports": ["nvlink", "rdma", "shm"]
+        },
+        {
+            "name": "file_storage",
+            "segment_type": "file",
+            "transports": ["gds", "io_uring", "rdma"]
+        }
+    ]
 }

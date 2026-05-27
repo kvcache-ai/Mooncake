@@ -338,6 +338,18 @@ Status TransferEngineImpl::construct() {
         local_segment_name_ = randomSegmentName();
 
     CHECK_STATUS(setupLocalSegment());
+
+    // Initialize transport selector
+    transport_selector_ = std::make_unique<TransportSelector>(conf_);
+    transport_selector_->setTopology(topology_);
+
+    // Check if legacy mode is enabled (use original getTransportType logic)
+    bool legacy_mode = conf_->get("use_legacy_transport_selection", false);
+    transport_selector_->setLegacyMode(legacy_mode);
+    if (legacy_mode) {
+        LOG(INFO) << "Using legacy transport selection (original logic)";
+    }
+
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
@@ -804,44 +816,91 @@ static MemoryType getTypeEnum(const std::string& type) {
     return MTYPE_UNKNOWN;
 }
 
-TransportType TransferEngineImpl::getTransportType(const Request& request,
-                                                   int priority) {
+SelectionResult TransferEngineImpl::getTransportType(const Request& request,
+                                                     int transport_index) {
     SegmentDesc* desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
         desc = metadata_->segmentManager().getLocal().get();
     } else {
         auto status = metadata_->segmentManager().getRemoteCached(
             desc, request.target_id);
-        if (!status.ok()) return UNSPEC;
+        if (!status.ok()) return SelectionResult{};
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
-    if (desc->type == SegmentType::File) {
-        if (checkAvailability(transport_list_[GDS], local_mtype)) {
-            if (priority-- == 0) return GDS;
-        }
-        if (checkAvailability(transport_list_[IOURING], local_mtype)) {
-            if (priority-- == 0) return IOURING;
-        }
-        return UNSPEC;
-    } else {
-        auto entry = desc->findBuffer(request.target_offset, request.length);
-        if (!entry) return UNSPEC;
-        bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
-        if (!same_machine) {
-            auto local_desc = metadata_->segmentManager().getLocal();
-            same_machine = local_desc && !desc->machine_id.empty() &&
-                           !local_desc->machine_id.empty() &&
-                           desc->machine_id == local_desc->machine_id;
-        }
-        auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
-        for (auto type : entry->transports) {
-            if ((type == NVLINK || type == SHM) && !same_machine) continue;
-            if (checkAvailability(transport_list_[type], local_mtype,
-                                  remote_mtype)) {
-                if (priority-- == 0) return type;
+
+    // Legacy mode: use original logic (before TransportSelector)
+    if (transport_selector_ && transport_selector_->isLegacyMode()) {
+        SelectionResult result;
+        if (desc->type == SegmentType::File) {
+            if (checkAvailability(transport_list_[GDS], local_mtype)) {
+                if (transport_index-- == 0) result.transport = GDS;
+            }
+            if (checkAvailability(transport_list_[IOURING], local_mtype)) {
+                if (transport_index-- == 0) result.transport = IOURING;
+            }
+        } else {
+            auto entry =
+                desc->findBuffer(request.target_offset, request.length);
+            if (entry) {
+                bool same_machine = (request.target_id == LOCAL_SEGMENT_ID);
+                if (!same_machine) {
+                    auto local_desc = metadata_->segmentManager().getLocal();
+                    same_machine = local_desc && !desc->machine_id.empty() &&
+                                   !local_desc->machine_id.empty() &&
+                                   desc->machine_id == local_desc->machine_id;
+                }
+                auto remote_mtype =
+                    getTypeEnum(LocationParser(entry->location).type());
+                for (auto type : entry->transports) {
+                    if ((type == NVLINK || type == SHM) && !same_machine)
+                        continue;
+                    if (checkAvailability(transport_list_[type], local_mtype,
+                                          remote_mtype)) {
+                        if (transport_index-- == 0) {
+                            result.transport = type;
+                            break;
+                        }
+                    }
+                }
             }
         }
-        return UNSPEC;
+        return result;
+    }
+
+    // New TransportSelector-based logic
+    // Build selection context
+    SelectionContext ctx;
+    ctx.transfer_size = request.length;
+    ctx.priority_level =
+        request.priority;  // Use request priority for selection
+
+    if (desc->type == SegmentType::File) {
+        // File segment: use selector with empty buffer_transports
+        ctx.segment_type = SegmentType::File;
+        ctx.same_machine = true;  // File is always local
+        ctx.local_memory_type = local_mtype;
+        ctx.remote_memory_type = MTYPE_CPU;
+        ctx.buffer_transports = nullptr;  // Empty - use policy priority
+
+        return transport_selector_->select(ctx, transport_list_,
+                                           transport_index);
+    } else {
+        // Memory segment
+        auto entry = desc->findBuffer(request.target_offset, request.length);
+        if (!entry) return SelectionResult{};
+        bool same_machine =
+            (desc->machine_id ==
+             metadata_->segmentManager().getLocal()->machine_id);
+        auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
+
+        ctx.segment_type = SegmentType::Memory;
+        ctx.same_machine = same_machine;
+        ctx.local_memory_type = local_mtype;
+        ctx.remote_memory_type = remote_mtype;
+        ctx.buffer_transports = &entry->transports;
+
+        return transport_selector_->select(ctx, transport_list_,
+                                           transport_index);
     }
 }
 
@@ -1106,15 +1165,15 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     }
 }
 
-TransportType TransferEngineImpl::resolveTransport(const Request& req,
-                                                   int priority,
-                                                   bool invalidate_on_fail) {
-    auto type = getTransportType(req, priority);
-    if (type == UNSPEC && invalidate_on_fail) {
+SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
+                                                     int transport_index,
+                                                     bool invalidate_on_fail) {
+    auto result = getTransportType(req, transport_index);
+    if (result.transport == UNSPEC && invalidate_on_fail) {
         metadata_->segmentManager().invalidateRemote(req.target_id);
-        type = getTransportType(req, priority);
+        result = getTransportType(req, transport_index);
     }
-    return type;
+    return result;
 }
 
 Status TransferEngineImpl::submitTransfer(
@@ -1152,13 +1211,16 @@ Status TransferEngineImpl::submitTransfer(
             continue;
         }
 
+        task.failover_count = 0;
         task.xport_priority = 0;
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
         task.start_time =
             submit_time;  // Record start time for latency tracking
-        task.type = resolveTransport(merged_request, 0);
+        auto select_result = resolveTransport(merged_request, 0);
+        task.type = select_result.transport;
+        task.device_mask = select_result.device_mask;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1204,6 +1266,15 @@ Status TransferEngineImpl::submitTransfer(
         if (classified_request_list[type].empty()) continue;
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
+
+        // Set device_mask on SubBatch for RDMA transport
+        if (type == RDMA && !task_id_list[type].empty()) {
+            // Use the device_mask from the first task (we assume all tasks in
+            // this batch should have the same policy)
+            sub_batch->device_mask =
+                batch->task_list[task_id_list[type][0]].device_mask;
+        }
+
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
@@ -1283,8 +1354,10 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     if (task.staging)
         task.staging = false;
     else
-        task.xport_priority++;
-    auto type = resolveTransport(task.request, task.xport_priority);
+        task.xport_priority = task.failover_count;
+
+    auto result = resolveTransport(task.request, task.xport_priority);
+    auto type = result.transport;
     if (type == UNSPEC) {
         LOG(WARNING) << "No more transports available after "
                      << transportTypeName(prev_type) << " failed";
