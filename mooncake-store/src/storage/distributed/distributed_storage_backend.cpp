@@ -118,6 +118,11 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         complete_handler,
     std::function<void(const std::vector<std::string>& evicted_keys)>
         eviction_handler) {
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     if (eviction_handler) {
         LOG_FIRST_N(WARNING, 1)
             << "DistributedStorageBackend does not support eviction, "
@@ -161,6 +166,11 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     for (auto& [key, slice] : batched_slices) {
         auto path = GetObjectPath(key);
 
@@ -174,6 +184,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
     const std::string& key) {
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     auto path = GetObjectPath(key);
     return fs_adapter_->FileExists(path);
 }
@@ -186,10 +201,18 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     for (int i = 0; i < hash_bucket_count_; ++i) {
         std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
         auto file_infos = fs_adapter_->ListFilesWithInfo(bucket_dir);
         if (!file_infos) {
+            if (file_infos.error() == ErrorCode::FILE_NOT_FOUND) {
+                continue;
+            }
             LOG(ERROR) << "Failed to list files in bucket " << bucket_dir
                        << ": " << static_cast<int>(file_infos.error());
             return tl::make_unexpected(file_infos.error());

@@ -156,6 +156,12 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(const std::string& path,
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
     const std::string& path, const iovec* iov, int iovcnt, off_t offset) {
+    for (int i = 0; i < iovcnt; ++i) {
+        if (!iov[i].iov_base && iov[i].iov_len > 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
