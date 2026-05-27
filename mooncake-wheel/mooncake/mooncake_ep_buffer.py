@@ -411,11 +411,12 @@ class Buffer:
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
+            # Use CPU tensors for all_gather (gloo backend doesn't support MUSA tensors)
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device=_device_str()
+                local_handle_ints, dtype=torch.int32, device="cpu"
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device=_device_str())
+                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cpu")
                 for _ in range(self.group_size)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
@@ -686,11 +687,13 @@ class Buffer:
             num_local_experts = num_experts // num_ranks
 
             # Gather sizes first to handle variable num_tokens per rank
+            # MUSA/gloo: all_gather requires CPU tensors
+            gather_device = "cpu" if USE_MUSA else x.device
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=x.device
+                [num_tokens], dtype=torch.int64, device=gather_device
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=x.device)
+                torch.empty(1, dtype=torch.int64, device=gather_device)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
@@ -727,14 +730,27 @@ class Buffer:
             num_max_dispatch_tokens = num_ranks * num_max_dispatch_tokens_per_rank
 
             # Gather inputs from all ranks (all have same shape after padding)
-            all_x = torch.empty(
-                (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
-            all_topk = torch.empty(
-                (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
+            # MUSA/gloo: all_gather requires CPU tensors, then copy to device
+            if USE_MUSA:
+                all_x_cpu = torch.empty(
+                    (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device="cpu"
+                )
+                dist.all_gather_into_tensor(all_x_cpu, x_padded.cpu(), group=self.group)
+                all_x = all_x_cpu.to(x.device)
+                all_topk_cpu = torch.empty(
+                    (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device="cpu"
+                )
+                dist.all_gather_into_tensor(all_topk_cpu, topk_padded.cpu(), group=self.group)
+                all_topk = all_topk_cpu.to(x.device)
+            else:
+                all_x = torch.empty(
+                    (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
+                )
+                dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
+                all_topk = torch.empty(
+                    (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device=x.device
+                )
+                dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
 
             # Prepare outputs per local expert
             recv_x_list: List[torch.Tensor] = []
@@ -912,11 +928,13 @@ class Buffer:
             num_local_experts = num_experts // num_ranks
 
             # Gather sizes first to handle variable num_tokens per rank
+            # MUSA/gloo: all_gather requires CPU tensors
+            gather_device = "cpu" if USE_MUSA else topk_idx.device
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=topk_idx.device
+                [num_tokens], dtype=torch.int64, device=gather_device
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=topk_idx.device)
+                torch.empty(1, dtype=torch.int64, device=gather_device)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
@@ -959,18 +977,35 @@ class Buffer:
                 topk_padded = topk_idx
                 topk_w_padded = topk_weights
 
-            all_topk_idx = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_idx.dtype,
-                device=topk_idx.device,
-            )
-            dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
-            all_topk_w = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_weights.dtype,
-                device=topk_weights.device,
-            )
-            dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
+            # MUSA/gloo: all_gather requires CPU tensors, then copy to device
+            if USE_MUSA:
+                all_topk_idx_cpu = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_idx.dtype,
+                    device="cpu",
+                )
+                dist.all_gather_into_tensor(all_topk_idx_cpu, topk_padded.cpu(), group=self.group)
+                all_topk_idx = all_topk_idx_cpu.to(topk_idx.device)
+                all_topk_w_cpu = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_weights.dtype,
+                    device="cpu",
+                )
+                dist.all_gather_into_tensor(all_topk_w_cpu, topk_w_padded.cpu(), group=self.group)
+                all_topk_w = all_topk_w_cpu.to(topk_weights.device)
+            else:
+                all_topk_idx = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_idx.dtype,
+                    device=topk_idx.device,
+                )
+                dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
+                all_topk_w = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_weights.dtype,
+                    device=topk_weights.device,
+                )
+                dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
 
             expert_buffers = self._fallback_next_combine_buffer if zero_copy else x
             # Ensure bf16 input for accumulation
