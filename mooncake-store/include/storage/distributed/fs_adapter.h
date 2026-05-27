@@ -97,17 +97,6 @@ class FileSystemAdapter {
         return result;
     }
 
-    // === Capability declaration ===
-
-    struct Capabilities {
-        bool supports_vector_io = false;
-        bool supports_direct_io = false;
-        bool supports_batch_delete = false;
-        bool supports_list_with_info = false;
-        bool is_distributed = true;
-    };
-    virtual Capabilities GetCapabilities() const = 0;
-
     // === Lifecycle ===
 
     virtual tl::expected<void, ErrorCode> Init(

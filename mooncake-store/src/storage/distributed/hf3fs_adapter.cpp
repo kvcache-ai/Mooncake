@@ -19,18 +19,15 @@ Hf3fsAdapter::Hf3fsAdapter() = default;
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
-    mount_path_ = mount_path;
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
     Hf3fsConfig config{};
     config.mount_root = mount_path;
     resource_manager_->setDefaultParams(config);
-    initialized_ = true;
     return {};
 }
 
 tl::expected<void, ErrorCode> Hf3fsAdapter::Shutdown() {
     resource_manager_.reset();
-    initialized_ = false;
     return {};
 }
 
@@ -369,6 +366,13 @@ tl::expected<std::vector<std::string>, ErrorCode> Hf3fsAdapter::ListFiles(
     while ((entry = readdir(d)) != nullptr) {
         std::string name = entry->d_name;
         if (name == "." || name == "..") continue;
+        if (entry->d_type == DT_DIR) continue;
+        if (entry->d_type == DT_UNKNOWN) {
+            struct stat st;
+            if (::stat((dir + "/" + name).c_str(), &st) == 0 &&
+                S_ISDIR(st.st_mode))
+                continue;
+        }
         result.push_back(name);
     }
     closedir(d);

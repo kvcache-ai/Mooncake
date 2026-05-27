@@ -38,14 +38,6 @@ class Hf3fsAdapter : public FileSystemAdapter {
     tl::expected<std::vector<std::string>, ErrorCode> ListFiles(
         const std::string& dir) override;
 
-    Capabilities GetCapabilities() const override {
-        return Capabilities{.supports_vector_io = true,
-                            .supports_direct_io = false,
-                            .supports_batch_delete = false,
-                            .supports_list_with_info = false,
-                            .is_distributed = true};
-    }
-
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 
     tl::expected<void, ErrorCode> Shutdown() override;
@@ -54,8 +46,6 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
    private:
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
-    std::string mount_path_;
-    bool initialized_ = false;
 };
 
 }  // namespace mooncake

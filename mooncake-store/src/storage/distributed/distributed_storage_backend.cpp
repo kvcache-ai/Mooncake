@@ -43,6 +43,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
     config.fsdir =
         GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir);
+    if (!std::filesystem::path(config.fsdir).is_absolute()) {
+        config.fsdir = std::filesystem::absolute(config.fsdir).string();
+    }
     config.fs_adapter_type =
         GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", config.fs_adapter_type);
     config.enable_health_check =
@@ -264,7 +267,7 @@ std::string DistributedStorageBackend::GetObjectPath(
     uint64_t hash = XXH64(key.data(), key.size(), 0);
     std::string bucket = fmt::format("{:02x}", hash % hash_bucket_count_);
     std::string safe_key = EscapeFilename(key);
-    return root_dir_ + "/" + bucket + "/" + safe_key;
+    return (std::filesystem::path(root_dir_) / bucket / safe_key).string();
 }
 
 std::string DistributedStorageBackend::EscapeFilename(const std::string& key) {
