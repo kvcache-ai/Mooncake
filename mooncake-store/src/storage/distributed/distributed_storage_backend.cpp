@@ -3,6 +3,7 @@
 #include <fmt/format.h>
 
 #include <cstdlib>
+#include <xxhash.h>
 #include <filesystem>
 
 #include "utils.h"
@@ -62,7 +63,9 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (!init_result) return init_result;
 
     if (distributed_config_.enable_health_check) {
-        std::string probe_path = root_dir_ + "/.mooncake_health_probe";
+        std::string probe_path =
+            fmt::format("{}/.mooncake_health_probe_{}", root_dir_,
+                        UuidToString(generate_uuid()));
         std::string probe_data = "health_check";
         auto write_result = fs_adapter_->WriteFile(
             probe_path,
@@ -79,7 +82,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         if (!read_result || *read_result != probe_data.size() ||
             std::string(read_buf.data(), read_buf.size()) != probe_data) {
             LOG(ERROR) << "DFS health check failed (read back mismatch)";
-            fs_adapter_->DeleteFile(probe_path);
+            auto del_err = fs_adapter_->DeleteFile(probe_path);
+            if (!del_err) {
+                LOG(WARNING) << "Failed to delete health-check probe: "
+                             << static_cast<int>(del_err.error());
+            }
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
 
@@ -137,8 +144,8 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         }
 
         success_keys.push_back(key);
-        StorageObjectMetadata meta;
-        meta.data_size = *result;
+        StorageObjectMetadata meta{-1, 0, static_cast<int64_t>(key.size()),
+                                   static_cast<int64_t>(*result), ""};
         success_metas.push_back(meta);
     }
 
@@ -193,8 +200,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
         for (const auto& info : *file_infos) {
             std::string key = UnescapeFilename(info.name);
             batch_keys.push_back(key);
-            StorageObjectMetadata meta;
-            meta.data_size = info.size;
+            StorageObjectMetadata meta{-1, 0, static_cast<int64_t>(key.size()),
+                                       static_cast<int64_t>(info.size), ""};
             batch_metas.push_back(meta);
 
             if (batch_keys.size() >= 256) {
@@ -216,7 +223,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
 
 std::string DistributedStorageBackend::GetObjectPath(
     const std::string& key) const {
-    size_t hash = std::hash<std::string>{}(key);
+    uint64_t hash = XXH64(key.data(), key.size(), 0);
     std::string bucket = fmt::format("{:02x}", hash % hash_bucket_count_);
     std::string safe_key = EscapeFilename(key);
     return root_dir_ + "/" + bucket + "/" + safe_key;

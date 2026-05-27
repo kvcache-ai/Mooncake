@@ -59,7 +59,10 @@ class FileSystemAdapter {
         const std::string& path) {
         struct stat st;
         if (::stat(path.c_str(), &st) != 0) {
-            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+            if (errno == ENOENT) {
+                return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+            }
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
         return static_cast<size_t>(st.st_size);
     }
@@ -87,6 +90,8 @@ class FileSystemAdapter {
             auto size = GetFileSize(full_path);
             if (size) {
                 result.push_back({name, *size});
+            } else if (size.error() != ErrorCode::FILE_NOT_FOUND) {
+                return tl::make_unexpected(size.error());
             }
         }
         return result;

@@ -21,7 +21,7 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::Init(
     const std::string& mount_path) {
     mount_path_ = mount_path;
     resource_manager_ = std::make_unique<USRBIOResourceManager>();
-    Hf3fsConfig config;
+    Hf3fsConfig config{};
     config.mount_root = mount_path;
     resource_manager_->setDefaultParams(config);
     initialized_ = true;
@@ -41,6 +41,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);
+        ::unlink(path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -48,6 +49,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
     if (!resource || !resource->initialized) {
         hf3fs_dereg_fd(fd);
         close(fd);
+        ::unlink(path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -84,7 +86,10 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
     close(fd);
 
     if (total_written != length) {
-        ::unlink(path.c_str());
+        auto unlink_ret = ::unlink(path.c_str());
+        if (unlink_ret != 0) {
+            LOG(WARNING) << "Failed to clean up partial write: " << path;
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return total_written;
@@ -92,6 +97,10 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteFile(
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadFile(const std::string& path,
                                                        void* buf, size_t len) {
+    if (!buf && len > 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
@@ -152,6 +161,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
 
     if (hf3fs_reg_fd(fd, 0) > 0) {
         close(fd);
+        ::unlink(path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -159,6 +169,7 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
     if (!resource || !resource->initialized) {
         hf3fs_dereg_fd(fd);
         close(fd);
+        ::unlink(path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -213,7 +224,10 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
     close(fd);
 
     if (total_written != total_length) {
-        ::unlink(path.c_str());
+        auto unlink_ret = ::unlink(path.c_str());
+        if (unlink_ret != 0) {
+            LOG(WARNING) << "Failed to clean up partial write: " << path;
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return total_written;
@@ -221,6 +235,12 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorWriteFile(
 
 tl::expected<size_t, ErrorCode> Hf3fsAdapter::VectorReadFile(
     const std::string& path, const iovec* iov, int iovcnt, off_t offset) {
+    for (int i = 0; i < iovcnt; ++i) {
+        if (!iov[i].iov_base && iov[i].iov_len > 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
@@ -303,16 +323,31 @@ tl::expected<void, ErrorCode> Hf3fsAdapter::DeleteFile(
     return {};
 }
 
+// Note: FileExists and DeleteFile use POSIX access()/unlink() via the
+// kernel VFS mount. This assumes 3FS's FUSE mount namespace is consistent
+// with the USRBIO namespace used for read/write I/O.
+
 tl::expected<bool, ErrorCode> Hf3fsAdapter::FileExists(
     const std::string& path) {
-    return ::access(path.c_str(), F_OK) == 0;
+    if (::access(path.c_str(), F_OK) == 0) {
+        return true;
+    }
+    if (errno == ENOENT) {
+        return false;
+    }
+    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode> Hf3fsAdapter::ListFiles(
     const std::string& dir) {
-    std::vector<std::string> result;
     DIR* d = opendir(dir.c_str());
-    if (!d) return result;  // empty dir or not accessible
+    if (!d) {
+        if (errno == ENOENT) {
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    std::vector<std::string> result;
 
     struct dirent* entry;
     while ((entry = readdir(d)) != nullptr) {

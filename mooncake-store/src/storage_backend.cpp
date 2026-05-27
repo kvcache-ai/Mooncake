@@ -3208,18 +3208,18 @@ CreateStorageBackend(const FileStorageConfig& config) {
 #ifdef USE_3FS
                 adapter = std::make_unique<Hf3fsAdapter>();
 #else
-                LOG(FATAL) << "hf3fs adapter requires USE_3FS";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {
-                LOG(FATAL) << "Unsupported distributed fs adapter: "
-                           << distributed_config.fs_adapter_type;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return std::make_shared<DistributedStorageBackend>(
                 config, distributed_config, std::move(adapter));
         }
         default: {
-            LOG(FATAL) << "Unsupported backend type";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            LOG(ERROR) << "Unsupported backend type: "
+                       << static_cast<int>(config.storage_backend_type);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 }
