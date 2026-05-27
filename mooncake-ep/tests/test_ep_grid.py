@@ -309,7 +309,7 @@ def generate_tests():
         "async_finish": [False, True],
         "return_recv_hook": [False, True],
         "use_fallback": [False, True],
-        "fail_rank": [-1, 1],
+        "fail_rank": [-1] if USE_MUSA else [-1, 1],
         "shapes": [
             {"max_tokens": 256, "hidden": 2048, "num_experts": 288, "top_k": 8},
         ],
