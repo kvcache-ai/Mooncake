@@ -3,6 +3,7 @@ members = [
     "crates/mooncake-transport-sys",
     "crates/mooncake-transport",
     "crates/mooncake-store-core",
+    "crates/mooncake-store-route",
     "crates/mooncake-store-transport-core",
     "crates/mooncake-metadata",
     "crates/mooncake-store-client",

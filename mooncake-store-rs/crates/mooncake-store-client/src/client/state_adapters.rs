@@ -25,7 +25,7 @@ impl LocalAuthorityAdapter {
     }
 }
 
-impl AuthorityService for LocalAuthorityAdapter {
+impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
     fn get_route(
         &self,
         namespace: &str,
@@ -90,9 +90,7 @@ impl AuthorityService for LocalAuthorityAdapter {
     ) -> Vec<Result<CasResult>> {
         let _guard = match self.write_guard() {
             Ok(guard) => guard,
-            Err(error) => {
-                return requests.iter().map(|_| Err(error.clone())).collect();
-            }
+            Err(error) => return requests.iter().map(|_| Err(error.clone())).collect(),
         };
         match authority_compare_and_swap_many(namespace, authority, requests) {
             Ok(results) => results.into_iter().map(Ok).collect(),
@@ -111,9 +109,7 @@ impl AuthorityService for LocalAuthorityAdapter {
     ) -> Vec<Result<()>> {
         let _guard = match self.write_guard() {
             Ok(guard) => guard,
-            Err(error) => {
-                return requests.iter().map(|_| Err(error.clone())).collect();
-            }
+            Err(error) => return requests.iter().map(|_| Err(error.clone())).collect(),
         };
         match authority_replace_many(namespace, authority, requests) {
             Ok(()) => requests.iter().map(|_| Ok(())).collect(),

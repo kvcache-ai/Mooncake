@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 mooncake-store-core           = { path = "../mooncake-store-core" }
+mooncake-store-route          = { path = "../mooncake-store-route" }
 mooncake-store-transport-core = { path = "../mooncake-store-transport-core" }
 mooncake-transport            = { path = "../mooncake-transport" }
 opentelemetry.workspace = true

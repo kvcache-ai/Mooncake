@@ -697,10 +697,16 @@ class MooncakeDistributedStore:
         The stored object is [TensorMetadata(304 bytes) | raw_data].
         """
         return self._invoke(
-            "put_tensor", key, tensor, tenant=tenant, **_replication_kwargs_simple(config)
+            "put_tensor",
+            key,
+            tensor,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
         )
 
-    def put_tensor_from(self, key: str, tensor, *, tenant: str | None = None, config=None):
+    def put_tensor_from(
+        self, key: str, tensor, *, tenant: str | None = None, config=None
+    ):
         """Store a tensor via zero-copy from registered memory.
 
         The tensor MUST reside in a buffer previously passed to
@@ -710,7 +716,11 @@ class MooncakeDistributedStore:
         For tensors NOT in registered memory, use put_tensor() instead.
         """
         return self._invoke(
-            "put_tensor_from", key, tensor, tenant=tenant, **_replication_kwargs_simple(config)
+            "put_tensor_from",
+            key,
+            tensor,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
         )
 
     def get_tensor(self, key: str, *, tensor=None, tenant: str | None = None):
@@ -728,15 +738,21 @@ class MooncakeDistributedStore:
 
         if tensor is not None:
             buf_ptr = tensor.data_ptr() - TENSOR_METADATA_WIRE_SIZE
-            buf_size = TENSOR_METADATA_WIRE_SIZE + tensor.nelement() * tensor.element_size()
-            result = self._invoke("get_tensor_into", key, buf_ptr, buf_size, tenant=tenant)
+            buf_size = (
+                TENSOR_METADATA_WIRE_SIZE + tensor.nelement() * tensor.element_size()
+            )
+            result = self._invoke(
+                "get_tensor_into", key, buf_ptr, buf_size, tenant=tenant
+            )
             return _tensor_from_read_result(result)
 
         # Fallback: read raw bytes and reconstruct
         raw = self._invoke("get", key, tenant=tenant)
         return _tensor_from_raw_bytes(raw)
 
-    def get_tensor_into(self, key: str, buffer_ptr: int, size: int, *, tenant: str | None = None):
+    def get_tensor_into(
+        self, key: str, buffer_ptr: int, size: int, *, tenant: str | None = None
+    ):
         """Read a tensor into a pre-allocated buffer. Returns a TensorReadResult."""
         return self._invoke("get_tensor_into", key, buffer_ptr, size, tenant=tenant)
 
