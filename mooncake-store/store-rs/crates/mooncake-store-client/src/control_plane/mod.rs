@@ -27,83 +27,9 @@ const CONTROL_PLANE_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_THREADS";
 const DEFAULT_CONTROL_PLANE_SERVER_THREADS: usize = 4;
 const CONTROL_PLANE_SERVER_THREADS_ENV: &str = "MC_STORE_RS_CONTROL_PLANE_SERVER_THREADS";
 
-pub(crate) trait AuthorityService: Send + Sync {
-    fn get_route(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectRoute>>;
+pub(crate) trait AuthorityService: mooncake_store_route::RouteAuthorityService {}
 
-    fn list_routes_by_replica_owner(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-    ) -> Result<Vec<ObjectRoute>>;
-
-    fn compare_and_swap_route(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-        expected: Option<RouteVersion>,
-        next: Option<&ObjectRoute>,
-    ) -> Result<CasResult>;
-
-    fn replace_route(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-        next: Option<&ObjectRoute>,
-    ) -> Result<()>;
-
-    fn batch_get_routes(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        keys: &[ObjectKey],
-    ) -> Vec<Result<Option<ObjectRoute>>> {
-        keys.iter()
-            .map(|key| self.get_route(namespace, authority, key))
-            .collect()
-    }
-
-    fn batch_compare_and_swap_routes(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        requests: &[RouteCasRequest],
-    ) -> Vec<Result<CasResult>> {
-        requests
-            .iter()
-            .map(|request| {
-                self.compare_and_swap_route(
-                    namespace,
-                    authority,
-                    &request.key,
-                    request.expected,
-                    request.next.as_ref(),
-                )
-            })
-            .collect()
-    }
-
-    fn batch_replace_routes(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        requests: &[RouteCasRequest],
-    ) -> Vec<Result<()>> {
-        requests
-            .iter()
-            .map(|request| {
-                self.replace_route(namespace, authority, &request.key, request.next.as_ref())
-            })
-            .collect()
-    }
-}
+impl<T> AuthorityService for T where T: mooncake_store_route::RouteAuthorityService {}
 
 pub(crate) trait AllocatorService: Send + Sync {
     fn reserve_any(&self, owner: &ClientRuntimeId, length_bytes: u64)

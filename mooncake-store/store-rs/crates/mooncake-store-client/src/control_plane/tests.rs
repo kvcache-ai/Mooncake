@@ -43,7 +43,7 @@ impl TestAuthority {
     }
 }
 
-impl AuthorityService for TestAuthority {
+impl mooncake_store_route::RouteAuthorityService for TestAuthority {
     fn get_route(
         &self,
         _namespace: &str,

@@ -26,9 +26,9 @@ use tracing::{debug, info, info_span, trace, warn};
 
 use crate::control_plane::pb;
 use crate::control_plane::{
-    control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
-    ControlPlaneHandle, EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp,
-    ReserveSpecificOp, RouteTrafficReport,
+    control_address_label, AllocatorService, ControlPlaneClient, ControlPlaneHandle,
+    EvictionService, MigrationExecutionStatus, MigrationService, ReleaseOp, ReserveSpecificOp,
+    RouteTrafficReport,
 };
 use crate::memory::{
     execute_copy_instructions, LocalMemoryConfig, LocalMemoryState, PreparedCopy, RegionAllocation,

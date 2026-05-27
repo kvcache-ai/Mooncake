@@ -31,8 +31,7 @@ use super::{
 };
 use crate::{
     control_plane::{
-        control_address_label, AllocatorService, AuthorityService, ControlPlaneClient,
-        ControlPlaneHandle, ReleaseOp,
+        control_address_label, AllocatorService, ControlPlaneClient, ControlPlaneHandle, ReleaseOp,
     },
     memory::{with_test_numa_locations, RegionAllocation},
     metrics_test_lock, render_prometheus_metrics, reset_metrics,
@@ -42,6 +41,7 @@ use crate::{
     ObjectRef, PlacementPlanner, PutFromRequest, PutRequest, ReplicationPolicy, RouteControlMode,
     StoreClient, StoreClientBuilder,
 };
+use mooncake_store_route::RouteAuthorityService;
 
 use mooncake_store_test_utils::transport::TestTransport;
 
