@@ -222,10 +222,6 @@ DataManager::PinnedKeyShard& DataManager::GetPinnedKeyShard(const KeyCtx& ctx) {
     return pinned_key_shards_[ctx.pinned_key_shard_idx];
 }
 
-bool DataManager::IsExpired(TimePoint deadline) const {
-    return deadline <= std::chrono::steady_clock::now();
-}
-
 tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
     const AllocationHandle& handle) const {
     const auto& loc_data = handle->loc.data;
@@ -955,6 +951,8 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     auto attach_result = AttachPendingWriteHandle(pending_write_shard, ctx.key,
                                                   write_operation_id, handle);
     if (!attach_result) {
+        (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
+            write_operation_id);
         timer.LogResponse("error_code=", attach_result.error());
         return tl::make_unexpected(attach_result.error());
     }
@@ -1722,12 +1720,6 @@ tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
     // entry) from the in-memory index. It does NOT directly free underlying
     // memory. The actual buffer lifetime is still governed by
     // AllocationHandle's RAII reference counting.
-    //
-    // We still guard Delete against in-flight 3-phase contexts:
-    // - PendingWriteRecord holds a strong handle reference until WriteCommit or
-    //   lease cleanup.
-    // - PinnedKeyRecord holds a strong handle reference until UnPinKey reaches
-    //   ref_count==0 or lease cleanup.
     auto result = tiered_backend_->Delete(key, tier_id, notify_master);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to delete key: " << key;

@@ -483,7 +483,6 @@ class DataManager {
     const std::chrono::milliseconds& lease_duration() const {
         return lease_duration_;
     }
-    bool IsExpired(TimePoint deadline) const;
     tl::expected<RemoteBufferDesc, ErrorCode> BuildRemoteBufferDesc(
         const AllocationHandle& handle) const;
     void LeaseScannerMain();
