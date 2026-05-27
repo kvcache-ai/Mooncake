@@ -116,3 +116,16 @@ target_include_directories(tent_engine_failover_e2e_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_engine_failover_e2e_test
          COMMAND tent_engine_failover_e2e_test)
+
+# ProgressWorker skeleton test: covers default-off behavior, event-driven
+# progress without poll-failover, and freeBatch races (issue #2116).
+add_executable(tent_progress_worker_test progress_worker_test.cpp)
+target_link_libraries(tent_progress_worker_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_progress_worker_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_progress_worker_test
+         COMMAND tent_progress_worker_test)
