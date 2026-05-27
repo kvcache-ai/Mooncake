@@ -474,8 +474,7 @@ impl StoreClient {
             let expected_version = current.as_ref().map(|route| route.version);
             let next_version = next_route_version(
                 current.as_ref(),
-                self.route_directory.as_ref(),
-                &self.lease,
+                &self.route_ops(),
                 &scoped_key,
             );
             let checksum = payload_checksum(value);
@@ -510,12 +509,9 @@ impl StoreClient {
                 .attribute_str("mooncake.tenant", tenant)
                 .attribute_u64("mooncake.item_count", 1);
             let publish_started = Instant::now();
-            let cas_result = self.route_directory.compare_and_swap_object_route(
-                &self.lease,
-                &route.key,
-                expected_version,
-                Some(&route),
-            );
+            let cas_result = self
+                .route_ops()
+                .publish_route(&route.key, expected_version, &route);
             registry::record_replication_publish(
                 match &cas_result {
                     Ok(cas) if cas.applied => "ok",
@@ -582,8 +578,8 @@ impl StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.item_count", 1);
         let current_result = self
-            .route_directory
-            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
+            .route_ops()
+            .load_route(&mooncake_store_core::ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
         self.put_object_with_policy_current(
@@ -615,8 +611,8 @@ impl StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.item_count", 1);
         let current_result = self
-            .route_directory
-            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(&object_id));
+            .route_ops()
+            .load_route(&mooncake_store_core::ObjectKey::from_logical_id(&object_id));
         load_tracker.finish(&current_result, 0);
         let current = current_result?;
         let value = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size) };
@@ -784,8 +780,7 @@ impl StoreClient {
     }
 
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        self.route_directory
-            .list_routes_by_replica_owner(&self.lease, owner)
+        self.route_ops().list_routes_by_replica_owner(owner)
     }
 
     fn route_object_id(&self, route: &ObjectRoute) -> Result<LogicalObjectId> {
@@ -990,8 +985,8 @@ impl StoreClient {
         self.flush_due_reclaims()?;
 
         let current = self
-            .route_directory
-            .get_object_route(&self.lease, &ObjectKey::from_logical_id(object_id))?
+            .route_ops()
+            .load_route(&ObjectKey::from_logical_id(object_id))?
             .ok_or_else(|| {
                 StoreError::NotFound(format!(
                     "tenant={} key={} has no active route",
@@ -1059,12 +1054,10 @@ impl StoreClient {
             }
         };
 
-        let cas = match self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &current.key,
-            Some(current.version),
-            Some(&next_route),
-        ) {
+        let cas = match self
+            .route_ops()
+            .repair_route(&current.key, Some(current.version), &next_route)
+        {
             Ok(cas) => cas,
             Err(error) => {
                 self.best_effort_release_reserved_allocations(
@@ -1527,7 +1520,7 @@ impl StoreClient {
     ) -> Result<()> {
         let namespace = self.metadata.route_namespace();
         if authority.runtime.stable_id == self.lease.runtime.stable_id {
-            return authority_replace(
+            return self.route_ops().replace_authority_route(
                 &namespace,
                 &authority.runtime.stable_id,
                 &route.key,
@@ -1555,7 +1548,9 @@ impl StoreClient {
     ) -> Result<Option<ObjectRoute>> {
         let namespace = self.metadata.route_namespace();
         if authority.runtime.stable_id == self.lease.runtime.stable_id {
-            return authority_get(&namespace, &authority.runtime.stable_id, key);
+            return self
+                .route_ops()
+                .load_authority_route(&namespace, &authority.runtime.stable_id, key);
         }
         let results = self.control_client.batch_get_routes(
             authority,
@@ -1647,7 +1642,7 @@ impl StoreClient {
         if self.route_control == RouteControlMode::MetadataOnly {
             return Ok(0);
         }
-        let routes = authority_list_routes(
+        let routes = self.route_ops().list_authority_routes(
             &self.metadata.route_namespace(),
             &self.lease.runtime.stable_id,
         )?;
@@ -2000,12 +1995,10 @@ impl StoreClient {
             })
             .collect::<Vec<_>>();
 
-        match self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &route.key,
-            Some(route.version),
-            Some(&next),
-        ) {
+        match self
+            .route_ops()
+            .prune_route(&route.key, Some(route.version), &next)
+        {
             Ok(cas) if cas.applied => debug!(
                 runtime = %self.lease.runtime,
                 key = %route.key.0,
@@ -2236,8 +2229,7 @@ impl StoreClient {
                     (tenant.to_string(), mooncake_store_core::ObjectKey::from_logical_id(&object_id))
                 })
                 .collect::<Vec<_>>();
-            let routes = self.route_directory.get_object_routes(
-                &self.lease,
+            let routes = self.route_ops().load_routes(
                 &scoped
                     .iter()
                     .map(|(_, scoped)| scoped.clone())

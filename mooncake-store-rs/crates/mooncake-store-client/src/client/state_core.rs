@@ -240,8 +240,7 @@ struct SegmentTransportMetadata {
 
 struct StorageOwnerState {
     runtime: ClientRuntimeId,
-    observer: ClientLease,
-    route_directory: Arc<dyn RouteDirectory>,
+    route_ops: RouteOperations,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     clock: Mutex<StorageClockState>,
 }

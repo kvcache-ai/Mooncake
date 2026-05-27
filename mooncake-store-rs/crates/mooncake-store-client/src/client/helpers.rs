@@ -22,18 +22,10 @@ fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64)
 
 fn next_route_version(
     current: Option<&ObjectRoute>,
-    route_directory: &dyn RouteDirectory,
-    lease: &ClientLease,
+    route_ops: &RouteOperations,
     key: &ObjectKey,
 ) -> RouteVersion {
-    current
-        .map(|route| route.version.next())
-        .unwrap_or_else(|| {
-            route_directory
-                .get_version_floor(lease, key)
-                .map(|v| v.next())
-                .unwrap_or(RouteVersion(1))
-        })
+    route_ops.next_route_version(current, key)
 }
 
 fn payload_checksum(payload: &[u8]) -> u64 {
@@ -118,6 +110,10 @@ fn now_ms() -> u64 {
 }
 
 impl StoreClient {
+    fn route_ops(&self) -> RouteOperations {
+        RouteOperations::new(self.route_directory.clone(), self.lease.clone())
+    }
+
     pub fn local_memory_base_addr(&self) -> Result<*mut c_void> {
         self.ensure_local_memory()?;
         let segment = self.segment_name()?;
@@ -131,6 +127,12 @@ impl StoreClient {
             .storage_bytes
             .saturating_add(self.local_memory.scratch_bytes);
         u64::try_from(total).unwrap_or(u64::MAX)
+    }
+}
+
+impl RouteHitReporter for StoreClient {
+    fn report_route_hits(&self, routes: &[&ObjectRoute]) {
+        self.report_route_hits_best_effort(routes.iter().copied());
     }
 }
 use xxhash_rust::xxh3::xxh3_64;

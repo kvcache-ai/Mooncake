@@ -24,7 +24,7 @@ Steady-state request hot paths must not depend on backend round trips.
 | Component | Responsibility | Hot Path |
 |-----------|----------------|----------|
 | `StoreClient` | User-facing API, local state, batching, reclaim scheduling | Yes |
-| `RouteDirectory` | Route lookup and route CAS | Yes |
+| `RouteOperations` / `RouteDirectory` | Operation-level route table facade plus lookup/CAS implementation | Yes |
 | `ControlPlaneClient` | Peer-to-peer route and allocator RPC | Yes |
 | `StorageOwnerState` | Local replica tracking, CLOCK eviction, route-aware reclaim | Yes on storage nodes |
 | `MetadataBackend` | Leases, segments, route policy, handoff, and `MetadataOnly` route persistence | No for default `EmbeddedWrh` route lookups |
@@ -34,7 +34,7 @@ Steady-state request hot paths must not depend on backend round trips.
 ```mermaid
 graph LR
     A["Store API"] --> B["StoreClient"]
-    B --> C["RouteDirectory"]
+    B --> C["RouteOperations / RouteDirectory"]
     B --> D["Allocator"]
     B --> E["ControlPlaneClient"]
     B --> J["StorageOwnerState"]
@@ -161,7 +161,7 @@ observe the same bytes even when the transport target coordinate is not the proc
 sequenceDiagram
     participant App
     participant Client as StoreClient
-    participant Route as RouteDirectory
+    participant Route as RouteOperations
     participant Alloc as Allocator/ControlPlane
     participant Evict as Storage Owner State
     participant Peer as Remote Storage Client
@@ -217,7 +217,7 @@ restore read, without adding metadata-backend traffic to the request path.
 sequenceDiagram
     participant App
     participant Client as StoreClient
-    participant Route as RouteDirectory
+    participant Route as RouteOperations
     participant Evict as Storage Owner State
     participant TE as TE/TENT
     participant Peer as Remote Storage Client
@@ -281,7 +281,7 @@ sequenceDiagram
     participant Client as StoreClient
     participant Alloc as LocalAllocatorState
     participant Evict as StorageOwnerState
-    participant Route as RouteDirectory
+    participant Route as RouteOperations
 
     Client->>Alloc: reserve local space
     Alloc-->>Client: Allocator error
@@ -449,7 +449,7 @@ The Python package exposes two runtime paths over the same Rust implementation.
 
 That means:
 
-- route lookups use the same `RouteDirectory`
+- route lookups use the same `RouteOperations` facade and `RouteDirectory` implementation
 - allocation uses the same local / remote allocator logic
 - data transfer uses the same TE/TENT transport path
 - lifecycle, reclaim, tracing, and metrics share the same implementation as Rust callers
@@ -472,7 +472,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-route` | route table abstractions and implementation modules: `directory`, `mesh`, `traits`, `metrics`, and `util` |
+| `crates/mooncake-store-route` | route table operation facade and implementation modules: `operations`, `directory`, `mesh`, `traits`, `metrics`, and `util` |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
 | `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |

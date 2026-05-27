@@ -546,8 +546,7 @@ impl StoreClient {
                     mooncake_store_core::ObjectKey::from_logical_id(&object_id)
                 })
                 .collect::<Vec<_>>();
-            let current_routes_result =
-                self.route_directory.get_object_routes(&self.lease, &object_keys);
+            let current_routes_result = self.route_ops().load_routes(&object_keys);
             route_load_tracker.finish(&current_routes_result, 0);
             let current_routes = current_routes_result?;
 
@@ -754,8 +753,7 @@ impl StoreClient {
         let prepared = reserve_result?;
         let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
             .attribute_u64("mooncake.item_count", prepared.len() as u64);
-        let current_routes_result = self.route_directory.get_object_routes(
-            &self.lease,
+        let current_routes_result = self.route_ops().load_routes(
             &prepared
                 .iter()
                 .map(|entry| entry.scoped_key.clone())
@@ -909,8 +907,7 @@ impl StoreClient {
                 let expected_version = current.as_ref().map(|route| route.version);
                 let next_version = next_route_version(
                     current.as_ref(),
-                    self.route_directory.as_ref(),
-                    &self.lease,
+                    &self.route_ops(),
                     &entry.scoped_key,
                 );
                 let mut route = ObjectRoute {
@@ -1190,9 +1187,7 @@ impl StoreClient {
             .collect::<Vec<_>>();
         let cas_tracker = OperationTracker::new("batch_put_stage_route_cas");
         let publish_started = Instant::now();
-        let cas_results_result = self
-            .route_directory
-            .compare_and_swap_object_routes(&self.lease, &cas_requests);
+        let cas_results_result = self.route_ops().publish_routes(&cas_requests);
         registry::record_replication_publish(
             match &cas_results_result {
                 Ok(results) if results.iter().any(|result| result.is_err()) => "error",
