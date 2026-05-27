@@ -539,6 +539,17 @@ class Buffer:
             packed_recv_src_info,
             packed_recv_layout_range,
         )
+        # MUSA: no cooperative grid sync. The C++ runtime launches only the
+        # SEND phase and returns the RECV phase as a hook.  We must ensure
+        # all ranks finish their SEND before any rank starts RECV.  Wrap
+        # the hook to insert a device sync + host barrier.
+        if USE_MUSA and hook is not None:
+            _orig_hook = hook
+            def _musa_recv_hook(_h=_orig_hook):
+                _synchronize()
+                dist.barrier(self.group)
+                _h()
+            hook = _musa_recv_hook
         return (
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
             packed_recv_count,
@@ -612,6 +623,14 @@ class Buffer:
             layout_range,
             combined_x,
         )
+        # MUSA: same barrier-before-recv pattern as dispatch
+        if USE_MUSA and hook is not None:
+            _orig_hook = hook
+            def _musa_recv_hook(_h=_orig_hook):
+                _synchronize()
+                dist.barrier(self.group)
+                _h()
+            hook = _musa_recv_hook
         return (
             combined_x,
             EventOverlap(event, tensors_to_record if async_finish else None),
@@ -730,18 +749,17 @@ class Buffer:
             num_max_dispatch_tokens = num_ranks * num_max_dispatch_tokens_per_rank
 
             # Gather inputs from all ranks (all have same shape after padding)
-            # MUSA/gloo: all_gather requires CPU tensors, then copy to device
+            # MUSA/gloo: all_gather requires CPU tensors, then copy to device.
+            # gloo's all_gather_into_tensor requires flat (1D) output tensors.
             if USE_MUSA:
-                all_x_cpu = torch.empty(
-                    (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device="cpu"
-                )
-                dist.all_gather_into_tensor(all_x_cpu, x_padded.cpu(), group=self.group)
-                all_x = all_x_cpu.to(x.device)
-                all_topk_cpu = torch.empty(
-                    (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device="cpu"
-                )
-                dist.all_gather_into_tensor(all_topk_cpu, topk_padded.cpu(), group=self.group)
-                all_topk = all_topk_cpu.to(x.device)
+                flat_x_size = num_ranks * max_num_tokens * hidden
+                flat_topk_size = num_ranks * max_num_tokens * k
+                all_x_cpu = torch.empty(flat_x_size, dtype=x.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_x_cpu, x_padded.cpu().reshape(-1), group=self.group)
+                all_x = all_x_cpu.view(num_ranks, max_num_tokens, hidden).to(x.device)
+                all_topk_cpu = torch.empty(flat_topk_size, dtype=topk_idx.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_topk_cpu, topk_padded.cpu().reshape(-1), group=self.group)
+                all_topk = all_topk_cpu.view(num_ranks, max_num_tokens, k).to(x.device)
             else:
                 all_x = torch.empty(
                     (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
@@ -977,22 +995,20 @@ class Buffer:
                 topk_padded = topk_idx
                 topk_w_padded = topk_weights
 
-            # MUSA/gloo: all_gather requires CPU tensors, then copy to device
+            # MUSA/gloo: all_gather requires CPU tensors, then copy to device.
+            # gloo's all_gather_into_tensor requires flat (1D) output tensors.
             if USE_MUSA:
+                flat_topk_size = num_ranks * max_num_tokens * k
                 all_topk_idx_cpu = torch.empty(
-                    (num_ranks, max_num_tokens, k),
-                    dtype=topk_idx.dtype,
-                    device="cpu",
+                    flat_topk_size, dtype=topk_idx.dtype, device="cpu"
                 )
-                dist.all_gather_into_tensor(all_topk_idx_cpu, topk_padded.cpu(), group=self.group)
-                all_topk_idx = all_topk_idx_cpu.to(topk_idx.device)
+                dist.all_gather_into_tensor(all_topk_idx_cpu, topk_padded.cpu().reshape(-1), group=self.group)
+                all_topk_idx = all_topk_idx_cpu.view(num_ranks, max_num_tokens, k).to(topk_idx.device)
                 all_topk_w_cpu = torch.empty(
-                    (num_ranks, max_num_tokens, k),
-                    dtype=topk_weights.dtype,
-                    device="cpu",
+                    flat_topk_size, dtype=topk_weights.dtype, device="cpu"
                 )
-                dist.all_gather_into_tensor(all_topk_w_cpu, topk_w_padded.cpu(), group=self.group)
-                all_topk_w = all_topk_w_cpu.to(topk_weights.device)
+                dist.all_gather_into_tensor(all_topk_w_cpu, topk_w_padded.cpu().reshape(-1), group=self.group)
+                all_topk_w = all_topk_w_cpu.view(num_ranks, max_num_tokens, k).to(topk_weights.device)
             else:
                 all_topk_idx = torch.empty(
                     (num_ranks, max_num_tokens, k),
@@ -1050,8 +1066,14 @@ class Buffer:
                         send_buf[src_rank, tokens_valid] += contrib_valid * weights
 
             # All-reduce then take local slice (only valid tokens)
-            dist.all_reduce(send_buf, group=self.group)
-            combined_x = send_buf[self.rank, :num_tokens]
+            # MUSA/gloo: all_reduce requires CPU tensors
+            if USE_MUSA:
+                send_buf_cpu = send_buf.cpu()
+                dist.all_reduce(send_buf_cpu, group=self.group)
+                combined_x = send_buf_cpu[self.rank, :num_tokens].to(x.device)
+            else:
+                dist.all_reduce(send_buf, group=self.group)
+                combined_x = send_buf[self.rank, :num_tokens]
 
             # Write to out if provided
             if out is not None:

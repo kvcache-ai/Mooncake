@@ -980,7 +980,7 @@ std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
     }
 #if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
     tent::MtLinkIpcHandle handle;
-    auto status = tent_mtlink_transport_->exportIpcHandle(gdr_buffer, handle);
+    auto status = tent_mtlink_transport_->exportIpcHandle(device_id, gdr_buffer, handle);
     if (!status.ok()) {
         LOG(ERROR) << "[EP] Failed to export TENT MTLink IPC handle: "
                    << std::string(status.message());

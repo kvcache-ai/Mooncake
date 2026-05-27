@@ -39,7 +39,8 @@ class MtLinkDeviceTransport {
     virtual Status allocatePeerAccessTables(int rank, int num_ranks) = 0;
 
     // Export an IPC handle for a musaMalloc-style local buffer.
-    virtual Status exportIpcHandle(void* local_buffer,
+    // device_id is needed to call musaSetDevice before musaIpcGetMemHandle.
+    virtual Status exportIpcHandle(int device_id, void* local_buffer,
                                    MtLinkIpcHandle& handle) = 0;
 
     virtual Status configurePeers(

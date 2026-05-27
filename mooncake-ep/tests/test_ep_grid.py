@@ -135,7 +135,9 @@ def run_test_iteration(
         return_recv_hook=return_recv_hook,
     )
 
-    if return_recv_hook:
+    # For MUSA: the hook always includes a barrier+recv phase launch.
+    # For CUDA: the hook is only set when return_recv_hook=True.
+    if hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -191,7 +193,7 @@ def run_test_iteration(
         out=out_tensor,
     )
 
-    if return_recv_hook:
+    if hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -244,7 +246,10 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    dist.destroy_process_group()
+    try:
+        dist.destroy_process_group()
+    except RuntimeError:
+        pass  # MUSA/gloo: destroy_process_group may fail for musa device type
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):

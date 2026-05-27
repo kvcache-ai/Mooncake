@@ -190,10 +190,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 }
 #ifdef MOONCAKE_EP_USE_MUSA
             // MUSA has no named barriers (bar.sync N, M).  Use
-            // __threadfence_block() to make the global-buffer writes
-            // visible to other warps in the same CTA, then __syncwarp()
-            // to order this warp's subsequent reads after the fence.
-            __threadfence_block();
+            // __threadfence_system() to make global-buffer writes
+            // visible to other SMs/GPUs, then __syncwarp() to order
+            // this warp's subsequent reads after the fence.  Each warp
+            // only reads its own per-token slot, so per-warp fence is
+            // sufficient (no cross-warp dependency within a token).
+            __threadfence_system();
             __syncwarp();
 #else
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
@@ -419,10 +421,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
 #ifdef MOONCAKE_EP_USE_MUSA
         // MUSA has no named barriers.  Sub-warp 1 wrote to shared memory
-        // above; __threadfence_block() makes it visible to all CTA threads,
-        // then __syncwarp() orders each warp's subsequent reads.
-        __threadfence_block();
-        __syncwarp();
+        // above; __syncthreads() ensures all CTA threads see the write.
+        // This is safe because num_sms = ceil(num_experts/kNumWarpGroups),
+        // so ALL threads enter this if-block and reach the barrier.
+        __syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
 #endif
@@ -681,10 +683,10 @@ combine(void* combined_x, int32_t* active_ranks,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
 #ifdef MOONCAKE_EP_USE_MUSA
         // MUSA has no named barriers.  All sub-warps must finish their
-        // sends before sub-warp 1 signals completion.  __threadfence_block()
-        // ensures prior global writes are visible, __syncwarp() orders.
-        __threadfence_block();
-        __syncwarp();
+        // sends before sub-warp 1 signals completion.  __syncthreads()
+        // ensures all CTA threads see prior writes.  More conservative
+        // than bar.sync but correct.
+        __syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
 #endif

@@ -106,7 +106,7 @@ __device__ __forceinline__ int atomic_add_release_sys_global(const int *ptr,
 __device__ __forceinline__ int atomic_add_release_global(const int *ptr,
                                                          int value) {
     int ret = atomicAdd(const_cast<int*>(ptr), value);
-    __threadfence();
+    __threadfence_system();
     return ret;
 }
 
@@ -153,19 +153,19 @@ __device__ __forceinline__ void st_na_global(const int4 *ptr,
 
 __device__ __forceinline__ void st_na_release(const int *ptr, int val) {
     *const_cast<volatile int*>(ptr) = val;
-    __threadfence();
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void st_na_release(const uint32_t *ptr,
                                               uint32_t val) {
     *const_cast<volatile uint32_t*>(ptr) = val;
-    __threadfence();
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void st_na_release(const uint64_t *ptr,
                                               uint64_t val) {
     *const_cast<volatile uint64_t*>(ptr) = val;
-    __threadfence();
+    __threadfence_system();
 }
 
 __device__ __forceinline__ int ld_volatile_global(const int *ptr) {
