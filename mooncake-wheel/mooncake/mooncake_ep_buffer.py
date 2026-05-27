@@ -91,7 +91,7 @@ class Buffer:
     _metadata_session_counter = 0
 
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
-        from mooncake import ep, pg
+        from mooncake import ep
 
         # Initialize the CPP runtime
         self.rank = group.rank()
@@ -103,9 +103,12 @@ class Buffer:
         self._metadata_session = Buffer._metadata_session_counter
         Buffer._metadata_session_counter += 1
         self._metadata_epoch = 0
-        preferred_hca = "" if USE_MUSA else pg.get_preferred_hca(
-            self.group, f"{_device_str(_current_device())}"
-        )
+        preferred_hca = ""
+        if not USE_MUSA:
+            from mooncake import pg
+            preferred_hca = pg.get_preferred_hca(
+                self.group, f"{_device_str(_current_device())}"
+            )
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca
         )

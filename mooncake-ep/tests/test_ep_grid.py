@@ -224,9 +224,12 @@ def worker(rank, world_size, config_dict):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("musa" if USE_MUSA else "cuda")
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    # MUSA: use gloo backend (mooncake PG not yet ported)
+    backend = "gloo" if USE_MUSA else "mooncake"
+    cpu_backend = "gloo" if USE_MUSA else "mooncake-cpu"
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
-    cpu_group = dist.new_group(list(range(world_size)), backend="mooncake-cpu")
+    cpu_group = dist.new_group(list(range(world_size)), backend=cpu_backend)
 
     try:
         run_test_iteration(

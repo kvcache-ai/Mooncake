@@ -33,7 +33,8 @@ sources = [
 
 if use_musa:
     # MUSA: no IB verbs, no mlx5, use MUSAExtension
-    cuda_libraries = []
+    # glog is needed by mooncake_ep_buffer.cpp and mtlink_device.cpp
+    cuda_libraries = ["glog"]
     cuda_library_dirs = []
     from torch_musa.utils.musa_extension import MUSAExtension, BuildExtension as MUSABuildExtension
     ExtensionClass = MUSAExtension
