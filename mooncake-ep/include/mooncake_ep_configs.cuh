@@ -42,16 +42,25 @@
 #include <musa_runtime.h>
 #include <musa_bf16.h>
 // MUSA type aliases for CUDA compatibility
-// mt_bfloat16 is only available in device code; for host code sizeof, use a 2-byte struct
+// When compiling .mu kernels with mcc, both host and device passes need
+// mt_bfloat16 (not a stub), because __bfloat162float/__float2bfloat16
+// require __mt_bfloat16 arguments.  The host stub is only needed when
+// compiling pure .cpp files (buffer.cpp etc.) that never call these
+// conversion functions.
 #ifdef __MUSA_ARCH__
 using nv_bfloat16 = mt_bfloat16;
 #else
-// Host-side stub: same size as mt_bfloat16 (2 bytes), no mt_bfloat16 dependency
+// Host-side compilation: use mt_bfloat16 if available (mcc host pass),
+// otherwise fall back to a 2-byte stub (pure C++ host compiler like g++).
+#ifdef __MUSA__
+using nv_bfloat16 = mt_bfloat16;
+#else
 struct nv_bfloat16 {
     unsigned short __x;
     nv_bfloat16() = default;
     nv_bfloat16& operator=(unsigned short v) { __x = v; return *this; }
 };
+#endif
 #endif
 // MUSA FP8 stubs (MUSA does not support FP8, but templates still compile)
 using __nv_fp8_storage_t = uint8_t;
