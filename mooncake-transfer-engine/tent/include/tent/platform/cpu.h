@@ -23,7 +23,8 @@ namespace tent {
 
 class CpuPlatform : public Platform {
    public:
-    CpuPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
+    CpuPlatform(std::shared_ptr<Config> config)
+        : Platform(config), conf(std::move(config)) {}
 
     virtual ~CpuPlatform() {}
 

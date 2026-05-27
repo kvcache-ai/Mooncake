@@ -23,7 +23,7 @@ namespace tent {
 
 class SunrisePlatform : public Platform {
    public:
-    SunrisePlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
+    SunrisePlatform(std::shared_ptr<Config> config) : Platform(config), conf(std::move(config)) {}
 
     virtual ~SunrisePlatform() {}
 
