@@ -14,33 +14,29 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class CacheAwareRouter():
-    def __init__(self, address, endpoint):
+    def __init__(self, address, endpoint, block_size):
         self.address = address
         self.endpoint = endpoint
         self.client = httpx.AsyncClient(timeout=None, base_url=f'http://{address}')
+        self.block_size = block_size
 
-    async def get_best_prefiller(self, token_ids: list, ready_instances, req_data):
-        # call conductor restful api to get cache hit situation
-        model_name = req_data.get("model", "ds")
-        lora_id = req_data.get("lora_id", -1)
+    async def get_best_prefiller(self, token_ids: list, req_data):
+        model_name = req_data.get("model", "deepseek")
         request_data = {
-            "instances": ready_instances,
             "token_ids": token_ids,
-            "model_name": model_name,
-            "lora_id": lora_id
-
+            "model": model_name,
+            "block_size": self.block_size,
         }
         headers = {
             "Content-Type": "application/json",
         }
-        logger.debug(f"conductor request_data: {request_data}")
         response = await self.client.post(self.endpoint, json=request_data, headers=headers)
+        logger.debug(f"conductor query response: {response.json()}")
         response.raise_for_status()
-        return response.json()["HitStatus"]
+        return response.json()
 
     async def close(self) -> None:
         if self.client:
@@ -57,35 +53,33 @@ async def lifespan(app: FastAPI):
     app.state.decode_clients = []
 
     # Create prefill clients
-    for i, (host, port) in enumerate(global_args.prefiller_instances):
-        prefiller_base_url = f'http://{host}:{port}'
+    for i, endpoint in enumerate(global_args.prefiller_endpoints):
+        prefiller_base_url = f'http://{endpoint}'
         app.state.prefill_clients.append({
             'client':
             httpx.AsyncClient(timeout=None, base_url=prefiller_base_url),
-            'host':
-            host,
-            'port':
-            port,
+            'endpoint':
+            endpoint,
+            'name':
+            global_args.prefill_names[i],
             'id':
             i
         })
 
     # Create decode clients
-    for i, (host, port) in enumerate(global_args.decoder_instances):
-        decoder_base_url = f'http://{host}:{port}'
+    for i, endpoint in enumerate(global_args.decoder_endpoints):
+        decoder_base_url = f'http://{endpoint}'
         app.state.decode_clients.append({
             'client':
             httpx.AsyncClient(timeout=None, base_url=decoder_base_url),
-            'host':
-            host,
-            'port':
-            port,
+            'endpoint':
+            endpoint,
             'id':
             i
         })
 
     # Create conductor client
-    app.state.conductor_client = CacheAwareRouter(global_args.conductor_address, "/cache")
+    app.state.conductor_client = CacheAwareRouter(global_args.conductor_address, "/query", global_args.block_size)
 
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(
@@ -119,47 +113,63 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
 
-    # For prefiller instances
-    parser.add_argument("--prefiller-hosts",
-                        "--prefiller-host",
+    # For prefiller instances (format: host:port)
+    parser.add_argument("--prefiller-endpoints",
+                        "--prefiller-endpoint",
                         type=str,
                         nargs="+",
-                        default=["localhost"])
-    parser.add_argument("--prefiller-ports",
-                        "--prefiller-port",
-                        type=int,
+                        default=["localhost:8100"],
+                        help="Prefiller instances in host:port format")
+    parser.add_argument("--prefill-names",
+                        "--prefill-name",
+                        type=str,
                         nargs="+",
-                        default=[8100])
+                        default=None,
+                        help="Names for prefill instances")
 
-    # For decoder instances
-    parser.add_argument("--decoder-hosts",
-                        "--decoder-host",
+    # For decoder instances (format: host:port)
+    parser.add_argument("--decoder-endpoints",
+                        "--decoder-endpoint",
                         type=str,
                         nargs="+",
-                        default=["localhost"])
-    parser.add_argument("--decoder-ports",
-                        "--decoder-port",
-                        type=int,
-                        nargs="+",
-                        default=[8200])
+                        default=["localhost:8200"],
+                        help="Decoder endpoints in host:port format")
     
     parser.add_argument("--conductor-address", type=str, default="127.0.0.1:13333")
+    parser.add_argument("--block-size", type=int, default=128)
 
     args = parser.parse_args()
 
-    # Validate and pair hosts with ports
-    if len(args.prefiller_hosts) != len(args.prefiller_ports):
-        raise ValueError(
-            "Number of prefiller hosts must match number of prefiller ports")
+    # Parse prefill instances (host:port format)
+    for instance_str in args.prefiller_endpoints:
+        if ':' not in instance_str:
+            raise ValueError(
+                f"Prefiller endpoint '{instance_str}' must be in host:port format")
+        _, port_str = instance_str.rsplit(':', 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid port in prefiller endpoint '{instance_str}'")
 
-    if len(args.decoder_hosts) != len(args.decoder_ports):
+    # Validate and pair prefill names
+    if args.prefill_names is None:
+        args.prefill_names = [None] * len(args.prefiller_endpoints)
+    elif len(args.prefill_names) != len(args.prefiller_endpoints):
         raise ValueError(
-            "Number of decoder hosts must match number of decoder ports")
+            "Number of prefill names must match number of prefiller endpoints")
 
-    # Create tuples of (host, port) for each service type
-    args.prefiller_instances = list(
-        zip(args.prefiller_hosts, args.prefiller_ports))
-    args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
+    # Parse decode instances (host:port format)
+    for instance_str in args.decoder_endpoints:
+        if ':' not in instance_str:
+            raise ValueError(
+                f"Decoder endpoint '{instance_str}' must be in host:port format")
+        _, port_str = instance_str.rsplit(':', 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid port in decoder endpoint '{instance_str}'")
 
     return args
 
@@ -186,25 +196,27 @@ def get_next_client(app, service_type: str):
 
 
 async def get_best_prefiller(app, token_ids: list, round_robin_prefill, req_data):
-    # Get all prefill instances
-    ready_instances = []
     index_map = {}
     for index, client_info in enumerate(app.state.prefill_clients):
         if client_info['client'].is_closed:
             continue
-        ready_instances.append(client_info['host'])
-        index_map[client_info['host']] = index
+        index_map[client_info['name']] = index
     
-    cache_hit_status = await app.state.conductor_client.get_best_prefiller(token_ids, ready_instances, req_data)
+    cache_hit_status = await app.state.conductor_client.get_best_prefiller(token_ids, req_data)
 
     if not cache_hit_status:
         return round_robin_prefill
-    best_prefiller_index = None
+    
+    # The current demo is only suitable for quick verification, 
+    # so it does not consider the scenario where an instance runs multiple DPs
     max_hit_value = -1
-    for k, v in cache_hit_status.items():
-        if v > max_hit_value:
-            best_prefiller_index = index_map[k]
-            max_hit_value = v
+    best_prefiller_index = None
+    instances = cache_hit_status.get("default", {})
+    for instance_name, hit_value in instances.items():
+        if hit_value["longest_matched"] > max_hit_value:
+            max_hit_value = hit_value["longest_matched"]
+            best_prefiller_index = index_map[instance_name]
+    
     return app.state.prefill_clients[best_prefiller_index]
 
 
@@ -251,7 +263,6 @@ async def send_request_to_service(client_info: dict, endpoint: str,
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id
     }
-    logger.debug(f"req_data: {req_data}")
 
     response = await client_info['client'].post(endpoint,
                                                 json=req_data,
@@ -288,6 +299,7 @@ async def _handle_completions(api: str, request: Request):
         # select tokenizer client in round-robin fashion
         remote_tokenizer_client_info = get_next_client(request.app, 'prefill')
         token_ids = await get_tokenid(remote_tokenizer_client_info, req_data, request_id)
+        logger.debug(f"Successfully get token_ids: {token_ids}")
 
         # choice best cache hit prefill instance
         prefill_client_info = await get_best_prefiller(request.app, token_ids, remote_tokenizer_client_info, req_data)
@@ -352,4 +364,15 @@ if __name__ == '__main__':
     global_args = parse_args()
 
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
+    
+    # Uvicorn has its own logging system that overrides Python's default logging configuration.
+    # When using Uvicorn, simply configuring a logger with logging.basicConfig() or adding handlers directly
+    # won't work because Uvicorn replaces the root logger configuration. We need to explicitly add our
+    # app's logger to Uvicorn's logging config to ensure our logs are properly displayed alongside Uvicorn's logs.
+    LOGGING_CONFIG["loggers"]["__main__"] = {
+        "handlers": ["default"],
+        "level": "INFO",
+        "propagate": False
+    }
     uvicorn.run(app, host=global_args.host, port=global_args.port)

@@ -7,7 +7,7 @@ const (
 
 type ServiceConfig struct {
 	Endpoint       string // kv publisher endpoint
-	ReplayEndpoint string // (optional)
+	ReplayEndpoint string // replay publisher endpoint
 	Type           string // kv publisher type, support: vLLM,Mooncake
 	ModelName      string // Model name hosted by the service
 	LoraName       string

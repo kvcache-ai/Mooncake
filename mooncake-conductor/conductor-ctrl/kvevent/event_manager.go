@@ -75,7 +75,7 @@ func NewEventManager(
 ) *EventManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	indexer := prefixindex.NewPrefixCacheTable()
-	// TODO 每个ModelContext创建一个独立的indexer
+	// TODO Create an independent indexer for each ModelContext
 
 	return &EventManager{
 		services:          services,
@@ -309,6 +309,8 @@ func (m *EventManager) StartHTTPServer() error {
 				response_result[tenantID][*req.InstanceID] = *result
 			}
 		} else {
+			m.tenantMutex.RLock()
+			defer m.tenantMutex.RUnlock()
 			if instanceSet, exists := m.tenantInstanceMap[tenantID]; exists {
 				for instanceID := range instanceSet {
 					modelContext := &prefixindex.ModelContext{

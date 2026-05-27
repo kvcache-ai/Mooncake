@@ -57,7 +57,7 @@ jobs:
     - name: Install coverage tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y lcov gcovr
+        sudo apt-get install -y lcov gcovr ninja-build libzmq3-dev
 
     - name: Set up coverage compilation flags
       run: |

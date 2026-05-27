@@ -108,10 +108,12 @@ func NewPrefixCacheTable() *PrefixCacheTable {
 
 func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext) *ContextData {
 	ctx_value := *modelcontext
-	value, exists := p.contextMap.Load(ctx_value)
-	if exists {
+
+	// already exists
+	if value, exists := p.contextMap.Load(ctx_value); exists {
 		return value.(*ContextData)
 	}
+
 	seedValue := xxhash.Sum64String(modelcontext.AdditionalSalt)
 	newContextData := &ContextData{
 		prefixStore: &HashMapStore{
@@ -124,9 +126,15 @@ func (p *PrefixCacheTable) getContextData(modelcontext *ModelContext) *ContextDa
 		DpSize:           make(map[int64]struct{}),
 	}
 	newContextData.prefixStore.lastAccess.Store(time.Now().Unix())
-	p.contextMap.Store(ctx_value, newContextData)
-	slog.Debug("in getContextData", "modelcontext", modelcontext)
+
+	actual, created := p.contextMap.LoadOrStore(ctx_value, newContextData)
+	if !created {
+		// Another goroutine beat us — discard newContextData, use the existing one
+		return actual.(*ContextData)
+	}
+
 	p.contextCount.Add(1)
+	slog.Debug("in getContextData", "modelcontext", modelcontext)
 	return newContextData
 }
 
@@ -137,7 +145,11 @@ func (p *PrefixCacheTable) AddDpSize(modelcontext *ModelContext, dpRank int64) {
 }
 
 func (p *PrefixCacheTable) ComputePrefixHash(modelcontext *ModelContext, tokenIds []int32, cacheSalt uint64) []uint64 {
-	// cacheSalt is used to seperate hash from different customers
+	// cacheSalt is used to separate hash from different customers
+	if modelcontext.BlockSize <= 0 {
+		slog.Warn("ComputePrefixHash: BlockSize must be greater than zero", "blockSize", modelcontext.BlockSize)
+		return nil
+	}
 	numBlocks := len(tokenIds) / int(modelcontext.BlockSize)
 	prefixHashes := make([]uint64, 0, numBlocks)
 
@@ -175,6 +187,13 @@ func (p *PrefixCacheTable) CacheHitCompute(modelcontext *ModelContext, tokenIds 
 	cacheSalt := xxhash.Sum64String(modelcontext.AdditionalSalt)
 
 	prefixHashes := p.ComputePrefixHash(modelcontext, tokenIds, cacheSalt)
+	if prefixHashes == nil {
+		slog.Error("CacheHitCompute: ComputePrefixHash returned nil, likely due to invalid BlockSize",
+			"modelName", modelcontext.ModelName,
+			"instanceID", modelcontext.InstanceID,
+			"blockSize", modelcontext.BlockSize)
+		return prefixMatchResult
+	}
 
 	// TODO @yejj710
 	// When there is no data in contextData, what information should be returned for the matched modelcontext
@@ -246,14 +265,6 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent, dpRank in
 		if len(event.BlockHashes) != 1 {
 			return fmt.Errorf("block hashes and tokens length mismatch")
 		}
-		// TOOO mooncake event, only one block hash, in the furture, remove it
-		// prefixStore := contextData.prefixStore
-		// for _, blockHash := range event.BlockHashes {
-		// 	if existingHash, exists := proxyHashMap[blockHash]; exists {
-		// 		p.addNewPrefixStore(prefixStore, existingHash, instanceID, event.Medium)
-		// 	}
-		// }
-		// return nil
 	}
 
 	newPrefixStore := make([]struct {
@@ -371,7 +382,7 @@ func (p *PrefixCacheTable) computeHash(parentHash uint64, blockTokenIDs []int32)
 	binary.LittleEndian.PutUint64(parentHashBytes[:], parentHash)
 	_, _ = digest.Write(parentHashBytes[:])
 
-	var tokenIDsBytes [8]byte
+	var tokenIDsBytes [4]byte
 	for _, tokenID := range blockTokenIDs {
 		binary.LittleEndian.PutUint32(tokenIDsBytes[:], uint32(tokenID))
 		_, _ = digest.Write(tokenIDsBytes[:])

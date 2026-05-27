@@ -71,7 +71,7 @@ func ExtractTokenIdFromRequest(data map[string]interface{}, key string) ([]int32
 		case int:
 			result[i] = int32(val)
 		default:
-			return nil, fmt.Errorf("unsupported value type of token_id at [%d], the type is %s", i, val)
+			return nil, fmt.Errorf("unsupported value type of token_id at [%d], the type is %T, value: %v", i, val, val)
 		}
 	}
 	return result, nil

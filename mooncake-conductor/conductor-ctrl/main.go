@@ -6,15 +6,23 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"conductor/common"
 	"conductor/kvevent"
 )
 
+func defaultConductorConfigPath() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "~/.mooncake/conductor_config.json"
+	}
+	return filepath.Join(homeDir, ".mooncake", "conductor_config.json")
+}
+
 var (
-	// TODO change default config path
-	conductorConfigPath = common.LoadEnv("CONDUCTOR_CONFIG_PATH", "/root/conductor_config.json")
+	conductorConfigPath = common.LoadEnv("CONDUCTOR_CONFIG_PATH", defaultConductorConfigPath())
 	httpServerPort      = 13333
 )
 
