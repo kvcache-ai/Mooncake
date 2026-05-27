@@ -45,7 +45,7 @@ namespace tent {
 namespace {
 constexpr uint8_t kRedisMaxDbIndex = 255;
 constexpr uint8_t kRedisDefaultDbIndex = 0;
-}
+}  // namespace
 
 struct Batch {
     Batch() : max_size(0) { sub_batch.fill(nullptr); }
