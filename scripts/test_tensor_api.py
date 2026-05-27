@@ -1941,6 +1941,16 @@ class TestMooncakeFunctional(MooncakeTestBase):
             (6, 3, [(0, 4, 2, "tp"), (1, 4, 2, "pp_tp"), (2, 4, 2, "ep_tp")]),
         ]
 
+        def expand_jobs(cases, worker_count):
+            jobs = list(enumerate(cases))
+            if worker_count <= len(cases):
+                return jobs
+            extra_jobs = worker_count - len(cases)
+            for extra_index in range(extra_jobs):
+                case_index = extra_index % len(cases)
+                jobs.append((case_index, cases[case_index]))
+            return jobs
+
         def put_worker(key, split_dim, put_tp_size, mode):
             return put_full_tensor_with_parallelism_mode(
                 self.store, key, original, split_dim, put_tp_size, mode
@@ -1965,23 +1975,46 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
         for scenario_index, (put_workers, get_workers, cases) in enumerate(scenarios):
             with self.subTest(put_workers=put_workers, get_workers=get_workers):
-                keys = [
-                    f"func_unified_concurrency_{scenario_index}_{case_index}"
-                    for case_index in range(len(cases))
+                put_jobs = [
+                    (
+                        case_index,
+                        f"func_unified_concurrency_{scenario_index}_put_{job_index}_case_{case_index}",
+                        split_dim,
+                        put_tp_size,
+                        get_tp_size,
+                        mode,
+                    )
+                    for job_index, (case_index, (split_dim, put_tp_size, get_tp_size, mode)) in enumerate(
+                        expand_jobs(cases, put_workers)
+                    )
                 ]
+                case_keys = {}
+                for case_index, key, split_dim, put_tp_size, get_tp_size, mode in put_jobs:
+                    case_keys.setdefault(case_index, []).append(
+                        (key, split_dim, put_tp_size, get_tp_size, mode)
+                    )
+
+                get_jobs = []
+                case_read_counts = {}
+                for case_index, (split_dim, put_tp_size, get_tp_size, mode) in expand_jobs(cases, get_workers):
+                    read_index = case_read_counts.get(case_index, 0)
+                    key, _split_dim, _put_tp_size, _get_tp_size, _mode = case_keys[case_index][
+                        read_index % len(case_keys[case_index])
+                    ]
+                    get_jobs.append((key, split_dim, put_tp_size, get_tp_size, mode))
+                    case_read_counts[case_index] = read_index + 1
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(put_workers, get_workers)) as executor:
                     put_futures = [
                         executor.submit(put_worker, key, split_dim, put_tp_size, mode)
-                        for key, (split_dim, put_tp_size, _get_tp_size, mode) in zip(keys, cases)
-                        for _ in range(max(1, put_workers // len(cases)))
+                        for _case_index, key, split_dim, put_tp_size, _get_tp_size, mode in put_jobs
                     ]
                     for future in concurrent.futures.as_completed(put_futures):
                         self.assertEqual(future.result(), 0)
 
                     get_futures = [
                         executor.submit(get_worker, key, split_dim, get_tp_size, mode)
-                        for key, (split_dim, _put_tp_size, get_tp_size, mode) in zip(keys, cases)
-                        for _ in range(max(1, get_workers // len(cases)))
+                        for key, split_dim, _put_tp_size, get_tp_size, mode in get_jobs
                     ]
                     for future in concurrent.futures.as_completed(get_futures):
                         error = future.result()
