@@ -1084,7 +1084,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
     if (!peer || !dm || !write_req || !slices) {
         promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpect, ErrorCode::INTERNAL_ERROR));
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
         co_return;
     }
     if (!SlicesAreContiguous(*slices)) {
@@ -1108,7 +1108,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
                        << ", error=" << pre.error();
         }
         promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpect, pre.error()));
+            tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
         co_return;
     }
 
@@ -1145,7 +1145,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
                        << write_req->key << ", error=" << revoke_res.error();
         }
         promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpect, te.error()));
+            tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
         co_return;
     }
 
@@ -1155,7 +1155,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
     auto cm = co_await peer->AsyncWriteCommit(commit);
     if (!cm) {
         promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpect, cm.error()));
+            tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
         co_return;
     }
     promise->setValue(tl::expected<void, ErrorCode>{});
@@ -1659,14 +1659,14 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "Forward RDMA read requires DataManager";
         promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpect, ErrorCode::INTERNAL_ERROR));
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
         co_return true;
     }
     if (!RemoteDestBuffersContiguous(req->dest_buffers)) {
         LOG(ERROR) << "Forward RDMA read requires contiguous dest buffers, key="
                    << req->key;
         promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpect, ErrorCode::INVALID_PARAMS));
+            tl::unexpected(ErrorCode::INVALID_PARAMS)));
         co_return true;
     }
     PinKeyRequest pin_req;
