@@ -178,6 +178,9 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
         if (!result) {
             return tl::make_unexpected(result.error());
         }
+        if (*result != slice.size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
     }
     return {};
 }
