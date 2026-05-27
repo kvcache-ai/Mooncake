@@ -22,8 +22,10 @@ static __device__ __forceinline__ void cuda_store_release(void* dst,
 static __device__ __forceinline__ void cuda_load_acquire(void* dst,
                                                          const void* src,
                                                          size_t len) {
-    cuda_byte_copy(dst, src, len);
+    // Acquire semantics: fence BEFORE the load prevents subsequent
+    // memory operations from being reordered before the load.
     asm volatile("fence.acq_rel.sys;" ::: "memory");
+    cuda_byte_copy(dst, src, len);
 }
 
 static __device__ __forceinline__ void cuda_store_relaxed(void* dst,
@@ -36,6 +38,38 @@ static __device__ __forceinline__ void cuda_load_relaxed(void* dst,
                                                          const void* src,
                                                          size_t len) {
     cuda_byte_copy(dst, src, len);
+}
+
+// ---------------------------------------------------------------------------
+// Atomic-width store_release / load_acquire
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ void cuda_store_release_32(volatile void* dst,
+                                                              uint32_t value) {
+    asm volatile("st.release.sys.global.b32 [%0], %1;"
+                 : : "l"(dst), "r"(value) : "memory");
+}
+
+static __device__ __forceinline__ void cuda_store_release_64(volatile void* dst,
+                                                              uint64_t value) {
+    asm volatile("st.release.sys.global.b64 [%0], %1;"
+                 : : "l"(dst), "l"(value) : "memory");
+}
+
+static __device__ __forceinline__ uint32_t
+cuda_load_acquire_32(const volatile void* src) {
+    uint32_t value;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+                 : "=r"(value) : "l"(src) : "memory");
+    return value;
+}
+
+static __device__ __forceinline__ uint64_t
+cuda_load_acquire_64(const volatile void* src) {
+    uint64_t value;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];"
+                 : "=l"(value) : "l"(src) : "memory");
+    return value;
 }
 
 static __device__ __forceinline__ void cuda_atomic_add_release(void* addr,
@@ -119,10 +153,11 @@ static __device__ __forceinline__ void cuda_memcpy_async(void* dst,
 
 static __device__ DeviceOps cuda_device_ops = {
     cuda_store_release,      cuda_load_acquire,       cuda_store_relaxed,
-    cuda_load_relaxed,       cuda_atomic_add_release, cuda_atomic_load_acquire,
-    cuda_atomic_cas_acquire, cuda_mmio_write64,       cuda_mmio_write32,
-    cuda_fence_acq_rel,      cuda_spin_wait_eq,       cuda_spin_wait_ne,
-    cuda_memcpy_async};
+    cuda_load_relaxed,       cuda_store_release_32,   cuda_store_release_64,
+    cuda_load_acquire_32,    cuda_load_acquire_64,    cuda_atomic_add_release,
+    cuda_atomic_load_acquire,cuda_atomic_cas_acquire, cuda_mmio_write64,
+    cuda_mmio_write32,       cuda_fence_acq_rel,      cuda_spin_wait_eq,
+    cuda_spin_wait_ne,       cuda_memcpy_async};
 
 struct CudaPlatform {
     static __device__ __forceinline__ DeviceOps* getOps() {

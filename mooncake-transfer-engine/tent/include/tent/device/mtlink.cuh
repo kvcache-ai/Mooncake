@@ -90,7 +90,7 @@ __device__ __forceinline__ void mtlink_wait_signal(DeviceOps* dops,
 __device__ __forceinline__ void mtlink_wait_signal_32(DeviceOps* dops,
                                                       void* sig,
                                                       uint32_t expected) {
-    dops->spin_wait_ne(sig, expected);
+    dops->spin_wait_eq(sig, expected);
 }
 
 __device__ __forceinline__ void mtlink_red_add(DeviceOps* dops,

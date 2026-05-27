@@ -78,6 +78,41 @@ static __device__ __forceinline__ void musa_load_relaxed(void* dst,
 }
 
 // ---------------------------------------------------------------------------
+// Atomic-width store_release / load_acquire
+//
+// MUSA lacks st.release / ld.acquire PTX equivalents. Use the proven
+// fence + volatile store/load pattern with system-scope fence.
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ void musa_store_release_32(volatile void* dst,
+                                                              uint32_t value) {
+    __threadfence_system();
+    volatile uint32_t* vptr = reinterpret_cast<volatile uint32_t*>(dst);
+    *vptr = value;
+}
+
+static __device__ __forceinline__ void musa_store_release_64(volatile void* dst,
+                                                              uint64_t value) {
+    __threadfence_system();
+    volatile uint64_t* vptr = reinterpret_cast<volatile uint64_t*>(dst);
+    *vptr = value;
+}
+
+static __device__ __forceinline__ uint32_t
+musa_load_acquire_32(const volatile void* src) {
+    __threadfence_system();
+    volatile const uint32_t* vptr = reinterpret_cast<volatile const uint32_t*>(src);
+    return *vptr;
+}
+
+static __device__ __forceinline__ uint64_t
+musa_load_acquire_64(const volatile void* src) {
+    __threadfence_system();
+    volatile const uint64_t* vptr = reinterpret_cast<volatile const uint64_t*>(src);
+    return *vptr;
+}
+
+// ---------------------------------------------------------------------------
 // atomic_add_release
 //
 // IMPORTANT: Do NOT use atomicAdd_system / atomicCAS_system — they cause the
@@ -216,10 +251,11 @@ static __device__ __forceinline__ void musa_memcpy_async(void* dst,
 // ---------------------------------------------------------------------------
 static __device__ DeviceOps musa_device_ops = {
     musa_store_release,     musa_load_acquire,      musa_store_relaxed,
-    musa_load_relaxed,      musa_atomic_add_release, musa_atomic_load_acquire,
-    musa_atomic_cas_acquire, musa_mmio_write64,      musa_mmio_write32,
-    musa_fence_acq_rel,     musa_spin_wait_eq,       musa_spin_wait_ne,
-    musa_memcpy_async};
+    musa_load_relaxed,      musa_store_release_32,  musa_store_release_64,
+    musa_load_acquire_32,   musa_load_acquire_64,   musa_atomic_add_release,
+    musa_atomic_load_acquire, musa_atomic_cas_acquire, musa_mmio_write64,
+    musa_mmio_write32,      musa_fence_acq_rel,     musa_spin_wait_eq,
+    musa_spin_wait_ne,      musa_memcpy_async};
 
 struct MusaPlatform {
     static __device__ __forceinline__ DeviceOps* getOps() {

@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cuda/atomic>
-
 #include <tent/device/ir/device_ops.cuh>
 #include <tent/device/network/ibgda/mlx5_wqe.cuh>
 
@@ -45,31 +43,39 @@ static __device__ __forceinline__ uint64_t local_atomic_addr(IbGdaCtx* ctx,
            (local_ptr - reinterpret_cast<const char*>(ctx->local_base));
 }
 
-static __device__ __forceinline__ void lock_channel(IbGdaQpDevCtx* qp) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
-    while (lock.exchange(1, cuda::memory_order_acquire) != 0) {
-    }
+// Channel lock/unlock — go through DeviceOps for portability.
+// lock_channel: spin until mutex is 0, then CAS 0→1 with acquire semantics.
+// unlock_channel: store 0 with release semantics.
+static __device__ __forceinline__ void lock_channel(IbGdaCtx* ctx,
+                                                    IbGdaQpDevCtx* qp) {
+    uint32_t old;
+    do {
+        old = ctx->dops->atomic_cas_acquire(&qp->mutex, 0, 1);
+    } while (old != 0);
 }
 
-static __device__ __forceinline__ void unlock_channel(IbGdaQpDevCtx* qp) {
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
-    lock.store(0, cuda::memory_order_release);
+static __device__ __forceinline__ void unlock_channel(IbGdaCtx* ctx,
+                                                      IbGdaQpDevCtx* qp) {
+    ctx->dops->store_release_32(&qp->mutex, 0);
 }
 
-static __device__ __forceinline__ uint16_t load_cq_counter(IbGdaQpDevCtx* qp) {
-    uint16_t value;
-    asm volatile("ld.acquire.sys.global.L1::no_allocate.b16 %0, [%1];"
-                 : "=h"(value)
-                 : "l"(&qp->cq->wqe_counter)
-                 : "memory");
-    return value;
+// CQ counter polling — go through DeviceOps for portability.
+// Note: DeviceOps load_acquire_32 reads a 32-bit value, but the CQ counter
+// is a 16-bit big-endian field. We read the containing 32-bit word and
+// extract the lower 16 bits (the wqe_counter is the first field in the CQE).
+static __device__ __forceinline__ uint16_t load_cq_counter(IbGdaCtx* ctx,
+                                                           IbGdaQpDevCtx* qp) {
+    // The wqe_counter is a __be16 at the start of the CQE.
+    // Read 32 bits via DeviceOps and extract the lower 16 bits.
+    uint32_t raw = ctx->dops->load_acquire_32(&qp->cq->wqe_counter);
+    return static_cast<uint16_t>(raw & 0xFFFF);
 }
 
-static __device__ __forceinline__ void poll_cq(IbGdaQpDevCtx* qp,
+static __device__ __forceinline__ void poll_cq(IbGdaCtx* ctx, IbGdaQpDevCtx* qp,
                                                uint16_t expected) {
     uint16_t wq_tail = qp->wq_tail;
     while (static_cast<int16_t>(wq_tail - expected) <= 0) {
-        uint16_t cq_wqe_counter_be = load_cq_counter(qp);
+        uint16_t cq_wqe_counter_be = load_cq_counter(ctx, qp);
         uint8_t opcode = qp->cq->op_own >> 4;
         if (opcode == 0xD) {
             printf("Requester_Error: syndrome = 0x%lx\n",
@@ -158,13 +164,13 @@ static __device__ __forceinline__ void ibgda_put(void* opaque, int ch,
                                                  size_t n, int dst) {
     auto* ctx = reinterpret_cast<IbGdaCtx*>(opaque);
     auto* qp = channel(ctx, ch, dst);
-    lock_channel(qp);
+    lock_channel(ctx, qp);
     write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send),
                          bswap32(ctx->local_lkey), remote_addr(ctx, recv, dst),
                          bswap32(ctx->rkey_per_rank[dst]),
                          static_cast<uint32_t>(n));
     post_send_db(ctx, qp);
-    unlock_channel(qp);
+    unlock_channel(ctx, qp);
 }
 
 static __device__ __forceinline__ void ibgda_get(void*, int, const void*, void*,
@@ -177,13 +183,13 @@ static __device__ __forceinline__ void ibgda_red_add(void* opaque, int ch,
                                                      int dst) {
     auto* ctx = reinterpret_cast<IbGdaCtx*>(opaque);
     auto* qp = channel(ctx, ch, dst);
-    lock_channel(qp);
+    lock_channel(ctx, qp);
     write_rdma_atomic_add_wqe(
         qp, static_cast<int32_t>(val), local_atomic_addr(ctx, sym),
         bswap32(ctx->local_lkey), remote_addr(ctx, sym, dst),
         bswap32(ctx->rkey_per_rank[dst]));
     post_send_db(ctx, qp);
-    unlock_channel(qp);
+    unlock_channel(ctx, qp);
 }
 
 static __device__ __forceinline__ void ibgda_signal(void* opaque, int ch,
@@ -193,16 +199,11 @@ static __device__ __forceinline__ void ibgda_signal(void* opaque, int ch,
     ibgda_red_add(ctx, ch, sym, action, dst);
 }
 
-static __device__ __forceinline__ void ibgda_wait_signal(void*, void* sig,
+static __device__ __forceinline__ void ibgda_wait_signal(void* opaque, void* sig,
                                                          uint64_t expected) {
-    uint32_t loaded;
+    auto* ctx = reinterpret_cast<IbGdaCtx*>(opaque);
     auto expected32 = static_cast<uint32_t>(expected);
-    do {
-        asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
-                     : "=r"(loaded)
-                     : "l"(sig)
-                     : "memory");
-    } while (loaded != expected32);
+    ctx->dops->spin_wait_eq(sig, expected32);
 }
 
 static __device__ __forceinline__ void ibgda_flush(void*, int, int) {}
@@ -211,9 +212,9 @@ static __device__ __forceinline__ void ibgda_wait(void* opaque, int ch,
                                                   uint16_t expected) {
     auto* ctx = reinterpret_cast<IbGdaCtx*>(opaque);
     auto* qp = channel(ctx, ch, ctx->rank);
-    lock_channel(qp);
-    poll_cq(qp, expected);
-    unlock_channel(qp);
+    lock_channel(ctx, qp);
+    poll_cq(ctx, qp, expected);
+    unlock_channel(ctx, qp);
 }
 
 static __device__ __forceinline__ void ibgda_barrier(void*, int) {
