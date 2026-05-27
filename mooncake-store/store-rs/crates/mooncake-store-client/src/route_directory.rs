@@ -7,8 +7,8 @@ use mooncake_store_core::{
 };
 pub(crate) use mooncake_store_route::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
-    authority_list_routes, authority_list_routes_by_replica_owner, authority_replace,
-    authority_replace_many, bind_local_authority_service,
+    authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
+    bind_local_authority_service,
 };
 use mooncake_store_route::{
     set_route_metrics_sink, RouteAuthorityClient, RouteMembershipProvider, RouteMetricsSink,

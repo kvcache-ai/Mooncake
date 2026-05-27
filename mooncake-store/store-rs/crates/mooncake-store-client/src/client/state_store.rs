@@ -745,8 +745,7 @@ impl StorageOwnerState {
     ) -> Self {
         Self {
             runtime,
-            observer,
-            route_directory,
+            route_ops: RouteOperations::new(route_directory, observer),
             allocator,
             clock: Mutex::new(StorageClockState::default()),
         }
@@ -889,8 +888,8 @@ impl StorageOwnerState {
 
     fn evict_candidate(&self, victim: &ClockEntryId) -> Result<bool> {
         let Some(route) = self
-            .route_directory
-            .get_object_route(&self.observer, &victim.route_key)?
+            .route_ops
+            .load_route(&victim.route_key)?
         else {
             self.clock.lock().remove_id(victim);
             return Ok(false);
@@ -932,12 +931,12 @@ impl StorageOwnerState {
             })
         };
 
-        let cas = self.route_directory.compare_and_swap_object_route(
-            &self.observer,
-            &route.key,
-            Some(route.version),
-            next.as_ref(),
-        )?;
+        let cas = match next.as_ref() {
+            Some(next_route) => self
+                .route_ops
+                .prune_route(&route.key, Some(route.version), next_route)?,
+            None => self.route_ops.delete_route(&route.key, Some(route.version))?,
+        };
         if !cas.applied {
             match cas.current.as_ref() {
                 Some(current) => self.sync_route(current),
@@ -1001,8 +1000,7 @@ impl StorageOwnerState {
     }
 
     fn collect_routes_by_replica_owner(&self, owner: &ClientRuntimeId) -> Result<Vec<ObjectRoute>> {
-        self.route_directory
-            .list_routes_by_replica_owner(&self.observer, owner)
+        self.route_ops.list_routes_by_replica_owner(owner)
     }
 }
 

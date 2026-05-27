@@ -18,6 +18,7 @@ use mooncake_store_core::{
     StoreError, TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
+use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
 };
@@ -40,8 +41,8 @@ use crate::observability::{
 use crate::placement::PlacementPlanner;
 use crate::route_directory::{
     authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
-    authority_list_routes, authority_list_routes_by_replica_owner, authority_replace,
-    authority_replace_many, build_route_directory,
+    authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
+    build_route_directory,
 };
 use crate::transport::{
     registration_chunks, wait_for_batch_completion_detailed, StoreTransport, StoreTransportFactory,

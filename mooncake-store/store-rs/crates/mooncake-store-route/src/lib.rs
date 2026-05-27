@@ -1,6 +1,7 @@
 mod directory;
 mod mesh;
 mod metrics;
+mod operations;
 mod traits;
 mod util;
 
@@ -12,4 +13,5 @@ pub use mesh::{
     authority_replace_many, bind_local_authority_service,
 };
 pub use metrics::{set_route_metrics_sink, RouteMetricsSink};
+pub use operations::{RouteHitReporter, RouteOperations};
 pub use traits::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};

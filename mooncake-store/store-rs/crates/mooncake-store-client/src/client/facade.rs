@@ -144,16 +144,8 @@ impl StoreClient {
         let tracker = OperationTracker::new("route_lookup_many")
             .scope("route_lookup")
             .attribute_u64("mooncake.item_count", keys.len() as u64);
-        let result: Result<Vec<Option<ObjectRoute>>> = (|| {
-            let routes = self
-                .route_directory
-                .get_object_routes_bounded(&self.lease, keys)?;
-            let routes = routes
-                .into_iter()
-                .map(|route| route.filter(|route| route.state == RouteState::Active))
-                .collect::<Vec<_>>();
-            Ok(routes)
-        })();
+        let result: Result<Vec<Option<ObjectRoute>>> =
+            self.route_ops().load_active_routes_bounded(keys);
         tracker.finish(&result, result.as_ref().map(|routes| routes.len()).unwrap_or(0) as u64);
         result
     }
@@ -193,12 +185,10 @@ impl StoreClient {
         &self,
         object_id: &LogicalObjectId,
     ) -> Result<Option<ObjectRoute>> {
-        let route = self
-            .route_directory
-            .get_object_route(&self.lease, &mooncake_store_core::ObjectKey::from_logical_id(object_id))?
-            .filter(|route| route.state == RouteState::Active);
-        self.report_route_hits_best_effort(route.iter());
-        Ok(route)
+        self.route_ops().load_active_route_and_report(
+            &mooncake_store_core::ObjectKey::from_logical_id(object_id),
+            self,
+        )
     }
 
     fn shared_batch_replication_policy(
@@ -867,11 +857,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
-        self.route_directory.list_routes_in_scope(&self.lease, scope)
+        self.route_ops().list_routes_in_scope(scope)
     }
 
     fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>> {
-        self.route_directory.list_reuse_candidates(&self.lease, reuse)
+        self.route_ops().list_reuse_candidates(reuse)
     }
 
     fn cas_route(
@@ -892,12 +882,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
     ) -> Result<CasResult> {
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
-        self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &object_key,
-            expected,
-            next,
-        )
+        self.route_ops()
+            .compare_and_swap_route(&object_key, expected, next)
     }
 
     fn register_local_memory(&self) -> Result<()> {
@@ -995,7 +981,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 })
                 .collect::<Vec<_>>();
             let routes = self.query_routes_by_object_keys_bounded(&keys)?;
-            self.report_route_hits_best_effort(routes.iter().filter_map(Option::as_ref));
+            self.route_ops().report_route_hits(&routes, self);
             Ok(routes
                 .into_iter()
                 .map(|route| route.is_some())
@@ -1022,8 +1008,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         let Some(route) = self
-            .route_directory
-            .get_object_route(&self.lease, &object_key)?
+            .route_ops()
+            .load_route(&object_key)?
         else {
             let result = if force {
                 Ok(())
@@ -1043,12 +1029,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             return result;
         }
         let quota_reservation = self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-        let cas = self.route_directory.compare_and_swap_object_route(
-            &self.lease,
-            &object_key,
-            Some(route.version),
-            None,
-        )?;
+        let cas = self.route_ops().delete_route(&object_key, Some(route.version))?;
         let result = if cas.applied {
             match self.finalize_tenant_quota_delete(quota_reservation.as_ref()) {
                 Ok(()) => {
@@ -1095,8 +1076,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             );
             let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
             let Some(route) = self
-                .route_directory
-                .get_object_route(&self.lease, &object_key)?
+                .route_ops()
+                .load_route(&object_key)?
             else {
                 if force {
                     continue;
@@ -1115,12 +1096,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             }
             let quota_reservation =
                 self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-            let cas = self.route_directory.compare_and_swap_object_route(
-                &self.lease,
-                &object_key,
-                Some(route.version),
-                None,
-            )?;
+            let cas = self.route_ops().delete_route(&object_key, Some(route.version))?;
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
                 if let Err(error) = self.schedule_route_reclaim(&route) {
