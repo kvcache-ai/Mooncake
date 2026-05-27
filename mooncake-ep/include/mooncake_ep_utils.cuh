@@ -200,6 +200,10 @@ __device__ __forceinline__ int64_t ld_volatile_global(const uint64_t *ptr) {
 
 #else  // CUDA path
 
+__device__ __forceinline__ void memory_fence() {
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
+
 __device__ __forceinline__ void memory_fence_gpu() {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
