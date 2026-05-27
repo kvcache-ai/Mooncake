@@ -952,7 +952,7 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
                                                   write_operation_id, handle);
     if (!attach_result) {
         (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
-            write_operation_id);
+                                      write_operation_id);
         timer.LogResponse("error_code=", attach_result.error());
         return tl::make_unexpected(attach_result.error());
     }
