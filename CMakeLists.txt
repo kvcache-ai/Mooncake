@@ -94,8 +94,12 @@ if (WITH_EP)
     include_directories(mooncake-pg/include)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+
+    # MUSA path: no CUDA toolkit, no engine.so dependency
+    if(NOT USE_MUSA)
+      find_package(CUDAToolkit REQUIRED)
+      message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    endif()
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
@@ -111,10 +115,14 @@ if (WITH_EP)
       set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
     endif()
     if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      if(USE_MUSA)
+        set(TORCH_CUDA_ARCH_LIST "mp_21;mp_31")
+      else()
+        set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+      endif()
     endif()
     set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
-        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
+        "CUDA/MUSA arch list for EP/PG extension builds")
 
     # Staging directory: EP/PG .so files are placed here during make and later
     # injected into the wheel AFTER auditwheel, so patchelf never touches the
@@ -126,39 +134,71 @@ if (WITH_EP)
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
 
-    add_custom_target(mooncake_ep_ext ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
-        "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
-        "-DEP_USE_TENT=${USE_TENT}"
-        "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
-        "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
-      COMMENT "Building Mooncake EP Python extension(s)"
-      DEPENDS engine
-      VERBATIM
-    )
+    if(USE_MUSA)
+      # MUSA: no engine.so dependency, build EP standalone
+      add_custom_target(mooncake_ep_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
+          "-DEP_USE_MUSA=1"
+          "-DEP_USE_TENT=${USE_TENT}"
+          "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+          "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
+        COMMENT "Building Mooncake EP Python extension (MUSA)"
+        VERBATIM
+      )
+    else()
+      add_custom_target(mooncake_ep_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
+          "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
+          "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+          "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
+          "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+          "-DEP_USE_TENT=${USE_TENT}"
+          "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
+        COMMENT "Building Mooncake EP Python extension(s)"
+        DEPENDS engine
+        VERBATIM
+      )
+    endif()
 
-    add_custom_target(mooncake_pg_ext ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
-        "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
-        "-DEP_USE_TENT=${USE_TENT}"
-        "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
-        "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
-      COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS engine mooncake_ep_ext
-      VERBATIM
-    )
+    if(USE_MUSA)
+      add_custom_target(mooncake_pg_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
+          "-DEP_USE_MUSA=1"
+          "-DEP_USE_TENT=${USE_TENT}"
+          "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+          "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
+        COMMENT "Building Mooncake PG Python extension (MUSA)"
+        DEPENDS mooncake_ep_ext
+        VERBATIM
+      )
+    else()
+      add_custom_target(mooncake_pg_ext ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+        COMMAND ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
+          "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
+          "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+          "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
+          "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+          "-DEP_USE_TENT=${USE_TENT}"
+          "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
+        COMMENT "Building Mooncake PG Python extension(s)"
+        DEPENDS engine mooncake_ep_ext
+        VERBATIM
+      )
+    endif()
   endif ()
 endif()
 

@@ -14,21 +14,34 @@ else ()
   list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
 endif()
 
-set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
-
-find_package(CUDAToolkit REQUIRED)
-# https://discuss.pytorch.org/t/failed-to-find-nvtoolsext/179635/13
-if(NOT TARGET CUDA::nvToolsExt AND TARGET CUDA::nvtx3)
-  add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
-  target_compile_definitions(
-      CUDA::nvToolsExt INTERFACE
-      TORCH_CUDA_USE_NVTX3
-  )
-  target_link_libraries(CUDA::nvToolsExt INTERFACE CUDA::nvtx3)
+if(USE_MUSA)
+  set(TORCH_CUDA_ARCH_LIST "mp_21;mp_31")
+else()
+  set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+  find_package(CUDAToolkit REQUIRED)
+  # https://discuss.pytorch.org/t/failed-to-find-nvtoolsext/179635/13
+  if(NOT TARGET CUDA::nvToolsExt AND TARGET CUDA::nvtx3)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    target_compile_definitions(
+        CUDA::nvToolsExt INTERFACE
+        TORCH_CUDA_USE_NVTX3
+    )
+    target_link_libraries(CUDA::nvToolsExt INTERFACE CUDA::nvtx3)
+  endif()
 endif()
+
 find_package(Torch REQUIRED)
 include_directories(${TORCH_INCLUDE_DIRS})
 
 include_directories(include)
 include_directories(../mooncake-transfer-engine/tent/include)
+
+if(USE_MUSA)
+  add_compile_definitions(MOONCAKE_EP_USE_MUSA USE_MUSA)
+  include_directories(/usr/local/musa/include)
+endif()
+if(USE_TENT)
+  add_compile_definitions(MOONCAKE_EP_USE_TENT)
+endif()
+
 add_subdirectory(src)
