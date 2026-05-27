@@ -144,11 +144,11 @@ pub(super) fn pb_route_state(state: mooncake_store_core::RouteState) -> i32 {
 pub(super) fn try_route_state(state: i32) -> Result<mooncake_store_core::RouteState> {
     Ok(
         match pb::RouteState::try_from(state).unwrap_or(pb::RouteState::Unspecified) {
-            pb::RouteState::Active => mooncake_store_core::RouteState::Active,
-            pb::RouteState::Deleting => mooncake_store_core::RouteState::Deleting,
-            pb::RouteState::Tombstone | pb::RouteState::Unspecified => {
-                mooncake_store_core::RouteState::Tombstone
+            pb::RouteState::Active | pb::RouteState::Unspecified => {
+                mooncake_store_core::RouteState::Active
             }
+            pb::RouteState::Deleting => mooncake_store_core::RouteState::Deleting,
+            pb::RouteState::Tombstone => mooncake_store_core::RouteState::Tombstone,
         },
     )
 }

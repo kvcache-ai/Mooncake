@@ -56,14 +56,6 @@ pub(crate) fn bind_local_authority_service(
         .bind_local_service(authority, service);
 }
 
-pub(crate) fn route_tombstone(route: &ObjectRoute) -> ObjectRoute {
-    let mut tombstone = route.clone();
-    tombstone.version = route.version.next();
-    tombstone.state = RouteState::Tombstone;
-    tombstone.replicas.clear();
-    tombstone
-}
-
 struct MetadataRouteDirectory {
     metadata: Arc<dyn MetadataBackend>,
 }
@@ -1336,13 +1328,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
     fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
         let candidates = self.authority_candidates(observer).ok()?;
         let ranked = self.ranked_authorities_from_candidates(&candidates, key);
-        for authority in ranked {
-            if self.authority_is_local(&authority) {
-                return authority_get_version_floor(
-                    &self.namespace,
-                    &authority.runtime.stable_id,
-                    key,
-                );
+        for authority in ranked.iter().take(self.route_topk) {
+            if let Some(floor) =
+                authority_get_version_floor(&self.namespace, &authority.runtime.stable_id, key)
+            {
+                return Some(floor);
             }
         }
         None
@@ -1387,6 +1377,20 @@ pub(crate) fn authority_get_many(
         .iter()
         .map(|key| routes.and_then(|routes| routes.get(&key.0)).cloned())
         .collect())
+}
+
+pub(crate) fn authority_get_version_floor(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> Option<RouteVersion> {
+    let mesh = route_mesh(namespace);
+    let guard = mesh.lock();
+    guard
+        .version_floors
+        .get(&authority.0)
+        .and_then(|floors| floors.get(&key.0))
+        .copied()
 }
 
 pub(crate) fn authority_list_routes_by_replica_owner(
@@ -1481,6 +1485,27 @@ pub(crate) fn authority_list_reuse_candidates(
         .collect())
 }
 
+/// Returns true if a CAS(None→Some(route)) should be rejected because a version
+/// floor exists that is >= the proposed route's version (anti-resurrection guard).
+fn version_floor_blocks_insert(
+    mesh: &ClusterRouteMesh,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+    expected: Option<RouteVersion>,
+    next: Option<&ObjectRoute>,
+) -> bool {
+    if expected.is_some() {
+        return false;
+    }
+    let Some(route) = next else {
+        return false;
+    };
+    mesh.version_floors
+        .get(&authority.0)
+        .and_then(|floors| floors.get(&key.0))
+        .is_some_and(|floor| route.version <= *floor)
+}
+
 pub(crate) fn authority_compare_and_swap(
     namespace: &str,
     authority: &ClientStableId,
@@ -1507,7 +1532,7 @@ pub(crate) fn authority_compare_and_swap(
         (Some(version), Some(route)) => route.version == version,
         _ => false,
     };
-    if !matches {
+    if !matches || version_floor_blocks_insert(&guard, authority, key, expected, next) {
         let result = CasResult {
             applied: false,
             current,
@@ -1550,7 +1575,15 @@ pub(crate) fn authority_compare_and_swap_many(
             (Some(version), Some(route)) => route.version == version,
             _ => false,
         };
-        if !matches {
+        if !matches
+            || version_floor_blocks_insert(
+                &guard,
+                authority,
+                &request.key,
+                request.expected,
+                request.next.as_ref(),
+            )
+        {
             let result = CasResult {
                 applied: false,
                 current,
@@ -1607,16 +1640,6 @@ pub(crate) fn authority_replace_many(
     Ok(())
 }
 
-pub(crate) fn authority_get_version_floor(
-    namespace: &str,
-    authority: &ClientStableId,
-    _key: &ObjectKey,
-) -> Option<RouteVersion> {
-    let mesh = route_mesh(namespace);
-    let guard = mesh.lock();
-    guard.version_hwm.get(&authority.0).copied()
-}
-
 fn apply_route_update(
     mesh: &mut ClusterRouteMesh,
     authority: &ClientStableId,
@@ -1639,19 +1662,18 @@ fn apply_route_update(
         match next {
             Some(route) => {
                 routes.insert(key.0.clone(), route.clone());
+                if let Some(floors) = mesh.version_floors.get_mut(&authority.0) {
+                    floors.remove(&key.0);
+                }
             }
             None => {
-                // Advance the per-authority high-water mark so that a future
-                // put of *any* key on this authority starts above every
-                // version ever observed.  O(1) per authority, zero per-key
-                // residual.
-                if let Some(old) = old.as_ref() {
-                    let hwm = mesh.version_hwm.entry(authority.0.clone()).or_default();
-                    if old.version > *hwm {
-                        *hwm = old.version;
-                    }
-                }
                 routes.remove(&key.0);
+                if let Some(old) = old.as_ref() {
+                    mesh.version_floors
+                        .entry(authority.0.clone())
+                        .or_default()
+                        .insert(key.0.clone(), old.version);
+                }
             }
         }
     }
@@ -1667,11 +1689,7 @@ struct ClusterRouteMesh {
     scope_index: BTreeMap<String, BTreeMap<NamespaceScope, BTreeSet<String>>>,
     reuse_index: BTreeMap<String, BTreeMap<ReuseIdentity, BTreeSet<String>>>,
     authority_services: BTreeMap<String, Arc<dyn AuthorityService>>,
-    /// Per-authority version high-water mark.  When a route is removed
-    /// (CAS to `None`), we record `max(hwm, old.version)` so that any
-    /// subsequent put on this authority starts above every version ever
-    /// observed.  One `RouteVersion` per authority — zero per-key residual.
-    version_hwm: BTreeMap<String, RouteVersion>,
+    version_floors: BTreeMap<String, BTreeMap<String, RouteVersion>>,
 }
 
 impl ClusterRouteMesh {
@@ -1707,7 +1725,7 @@ impl ClusterRouteMesh {
                 self.scope_index.remove(&key);
                 self.reuse_index.remove(&key);
                 self.authority_services.remove(&key);
-                self.version_hwm.remove(&key);
+                self.version_floors.remove(&key);
             }
             None => {}
         }
@@ -1898,14 +1916,9 @@ fn record_route_repair_metric(operation: &'static str) {
 fn record_cas_outcome(cas: &CasResult, next: Option<&ObjectRoute>, key: &ObjectKey) {
     if cas.applied {
         registry::record_route_cas("ok");
-        if let Some(route) = next {
-            if route.state == RouteState::Tombstone {
-                registry::remove_route(key);
-            } else {
-                registry::record_route(route);
-            }
-        } else {
-            registry::remove_route(key);
+        match next {
+            Some(route) => registry::record_route(route),
+            None => registry::remove_route(key),
         }
         return;
     }
@@ -1974,12 +1987,12 @@ mod tests {
 
     use super::{
         authority_compare_and_swap, authority_compare_and_swap_many, authority_get,
-        authority_get_many, authority_list_reuse_candidates,
+        authority_get_many, authority_get_version_floor, authority_list_reuse_candidates,
         authority_list_routes_by_replica_owner, authority_list_routes_in_scope, authority_replace,
         authority_replace_many, bind_local_authority_service, build_route_directory,
-        compatibility_matches, ranked_before, route_capable, route_mesh, route_tombstone,
-        route_weight, stable_hash, weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient,
-        EmbeddedWrhRouteDirectory, RouteControlMode,
+        compatibility_matches, ranked_before, route_capable, route_mesh, route_weight, stable_hash,
+        weighted_rendezvous_score, ClusterRouteMesh, ControlPlaneClient, EmbeddedWrhRouteDirectory,
+        RouteControlMode,
     };
     use crate::control_plane::AuthorityService;
 
@@ -2464,11 +2477,11 @@ mod tests {
     }
 
     #[test]
-    fn embedded_directory_tombstone_suppresses_stale_mirror_route() {
+    fn embedded_directory_cas_none_mirrors_deletion_to_all_authorities() {
         let metadata = Arc::new(InMemoryMetadataBackend::new());
-        let observer = lease("observer-tombstone", 1, false, Some("scope-a"));
-        let authority_a = lease("authority-tombstone-a", 2, true, Some("scope-a"));
-        let authority_b = lease("authority-tombstone-b", 3, true, Some("scope-a"));
+        let observer = lease("observer-cas-none", 1, false, Some("scope-a"));
+        let authority_a = lease("authority-cas-none-a", 2, true, Some("scope-a"));
+        let authority_b = lease("authority-cas-none-b", 3, true, Some("scope-a"));
         for lease in [observer.clone(), authority_a.clone(), authority_b.clone()] {
             metadata
                 .upsert_client_lease(&lease)
@@ -2481,7 +2494,7 @@ mod tests {
         crate::client::refresh_live_client_cache(
             metadata.as_ref(),
             &live_client_cache,
-            "route_directory_tombstone_test_prewarm",
+            "route_directory_cas_none_test_prewarm",
         )
         .expect("route directory test should prewarm membership");
         let directory = EmbeddedWrhRouteDirectory::new(
@@ -2502,35 +2515,56 @@ mod tests {
             .lock()
             .register_local(&authority_b.runtime.stable_id);
 
-        let key = ObjectKey::new("tenant-a::tombstone-key");
+        let key = ObjectKey::new("tenant-a::cas-none-key");
         let active = route_for(&key.0, &authority_b.runtime);
-        let tombstone = route_tombstone(&active);
+
+        // Seed the active route on both authorities (simulates a successful put with mirroring).
         authority_replace(
             &namespace,
             &authority_a.runtime.stable_id,
             &key,
-            Some(&tombstone),
+            Some(&active),
         )
-        .expect("tombstone authority should seed");
+        .expect("primary authority should seed");
         authority_replace(
             &namespace,
             &authority_b.runtime.stable_id,
             &key,
             Some(&active),
         )
-        .expect("stale authority should seed");
+        .expect("secondary authority should seed");
 
+        // Verify the route is readable.
         let resolved = directory
             .get_object_route(&observer, &key)
-            .expect("route read should succeed")
-            .expect("tombstone should resolve as authoritative route state");
-        assert_eq!(resolved, tombstone);
+            .expect("route read should succeed");
+        assert_eq!(resolved, Some(active.clone()));
+
+        // CAS→None (delete) — mirrors to all authorities in the top-k set.
+        let cas = directory
+            .compare_and_swap_object_route(&observer, &key, Some(active.version), None)
+            .expect("cas to none should succeed");
+        assert!(cas.applied, "cas to none should be applied");
+
+        // After CAS→None + mirroring, the route should be gone from all authorities.
+        assert_eq!(
+            authority_get(&namespace, &authority_a.runtime.stable_id, &key)
+                .expect("primary should be readable"),
+            None,
+            "primary authority must have route deleted after CAS→None"
+        );
         assert_eq!(
             authority_get(&namespace, &authority_b.runtime.stable_id, &key)
-                .expect("stale authority should be readable"),
-            Some(tombstone.clone()),
-            "read repair must not resurrect an evicted key from a stale mirror"
+                .expect("secondary should be readable"),
+            None,
+            "secondary authority must have route deleted via mirroring"
         );
+
+        // get_object_route should return None (not found).
+        let after_delete = directory
+            .get_object_route(&observer, &key)
+            .expect("route read after delete should succeed");
+        assert_eq!(after_delete, None, "deleted route must not be resurrected");
 
         route_mesh(&namespace)
             .lock()
@@ -2538,6 +2572,115 @@ mod tests {
         route_mesh(&namespace)
             .lock()
             .unregister_local(&authority_b.runtime.stable_id);
+    }
+
+    #[test]
+    fn version_floor_saved_on_delete_and_cleared_on_reinsert() {
+        let namespace = "version-floor-lifecycle";
+        let authority = ClientStableId::new("authority-floor");
+        let owner = ClientRuntimeId::new("owner-floor", ClientEpoch(1));
+        route_mesh(namespace).lock().register_local(&authority);
+
+        let key = ObjectKey::new("floor-key");
+        let route = route_for(&key.0, &owner);
+
+        // Insert a route at version 1.
+        authority_replace(namespace, &authority, &key, Some(&route))
+            .expect("insert should succeed");
+        assert_eq!(
+            authority_get_version_floor(namespace, &authority, &key),
+            None,
+            "no floor when route is present"
+        );
+
+        // Delete the route — floor should be saved.
+        authority_replace(namespace, &authority, &key, None).expect("delete should succeed");
+        assert_eq!(
+            authority_get_version_floor(namespace, &authority, &key),
+            Some(route.version),
+            "floor must equal deleted route version"
+        );
+        assert_eq!(
+            authority_get(namespace, &authority, &key).expect("get should succeed"),
+            None,
+            "route must be gone after delete"
+        );
+
+        // Re-insert with a higher version — floor should be cleared.
+        let mut route_v2 = route.clone();
+        route_v2.version = RouteVersion(2);
+        authority_replace(namespace, &authority, &key, Some(&route_v2))
+            .expect("reinsert should succeed");
+        assert_eq!(
+            authority_get_version_floor(namespace, &authority, &key),
+            None,
+            "floor must be cleared after reinsert"
+        );
+
+        route_mesh(namespace).lock().unregister_local(&authority);
+    }
+
+    #[test]
+    fn version_floor_blocks_stale_backfill_resurrection() {
+        let namespace = "version-floor-anti-resurrect";
+        let authority = ClientStableId::new("authority-resurrect");
+        let owner = ClientRuntimeId::new("owner-resurrect", ClientEpoch(1));
+        route_mesh(namespace).lock().register_local(&authority);
+
+        let key = ObjectKey::new("resurrect-key");
+        let route = route_for(&key.0, &owner);
+
+        // Insert then delete to create a floor.
+        authority_replace(namespace, &authority, &key, Some(&route))
+            .expect("insert should succeed");
+        let cas_delete =
+            authority_compare_and_swap(namespace, &authority, &key, Some(route.version), None)
+                .expect("cas delete should succeed");
+        assert!(cas_delete.applied);
+
+        // Attempt to backfill with a stale route (version <= floor) — must be rejected.
+        let cas_resurrect =
+            authority_compare_and_swap(namespace, &authority, &key, None, Some(&route))
+                .expect("stale backfill should not error");
+        assert!(
+            !cas_resurrect.applied,
+            "backfill with version <= floor must be rejected"
+        );
+
+        // A legitimate put with version > floor must succeed.
+        let mut route_v2 = route.clone();
+        route_v2.version = RouteVersion(route.version.0 + 1);
+        let cas_put =
+            authority_compare_and_swap(namespace, &authority, &key, None, Some(&route_v2))
+                .expect("legitimate put should succeed");
+        assert!(cas_put.applied, "put with version > floor must succeed");
+
+        route_mesh(namespace).lock().unregister_local(&authority);
+    }
+
+    #[test]
+    fn version_floor_cleaned_on_authority_unregister() {
+        let namespace = "version-floor-unregister";
+        let authority = ClientStableId::new("authority-unreg");
+        let owner = ClientRuntimeId::new("owner-unreg", ClientEpoch(1));
+        route_mesh(namespace).lock().register_local(&authority);
+
+        let key = ObjectKey::new("unreg-key");
+        let route = route_for(&key.0, &owner);
+
+        authority_replace(namespace, &authority, &key, Some(&route))
+            .expect("insert should succeed");
+        authority_replace(namespace, &authority, &key, None).expect("delete should succeed");
+        assert!(authority_get_version_floor(namespace, &authority, &key).is_some());
+
+        route_mesh(namespace).lock().unregister_local(&authority);
+
+        // After unregister, the floor map for this authority should be gone.
+        assert_eq!(
+            authority_get_version_floor(namespace, &authority, &key),
+            None,
+            "floor must be cleaned after authority unregister"
+        );
     }
 
     #[test]

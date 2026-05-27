@@ -76,6 +76,8 @@ impl RouteVersion {
 pub enum RouteState {
     Active,
     Deleting,
+    /// Legacy: no longer produced by local remove/eviction paths.
+    /// Retained for wire compatibility with older peers and handoff protocol.
     Tombstone,
 }
 

@@ -20,6 +20,22 @@ fn record_success_metric(operation: &'static str, bytes_in: u64, bytes_out: u64)
         .finish(&result, bytes_out);
 }
 
+fn next_route_version(
+    current: Option<&ObjectRoute>,
+    route_directory: &dyn RouteDirectory,
+    lease: &ClientLease,
+    key: &ObjectKey,
+) -> RouteVersion {
+    current
+        .map(|route| route.version.next())
+        .unwrap_or_else(|| {
+            route_directory
+                .get_version_floor(lease, key)
+                .map(|v| v.next())
+                .unwrap_or(RouteVersion(1))
+        })
+}
+
 fn payload_checksum(payload: &[u8]) -> u64 {
     // Keep checksum validation on the hot read/write path cheap enough for
     // large restore batches. The stored route field remains a stable u64.

@@ -528,7 +528,6 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
-        let _ = self.flush_due_reclaims();
         let result = self.prepare_heartbeat(expires_at_ms).publish();
         match result {
             Ok(()) => {
@@ -1044,12 +1043,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
             return result;
         }
         let quota_reservation = self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-        let tombstone = route_tombstone(&route);
         let cas = self.route_directory.compare_and_swap_object_route(
             &self.lease,
             &object_key,
             Some(route.version),
-            Some(&tombstone),
+            None,
         )?;
         let result = if cas.applied {
             match self.finalize_tenant_quota_delete(quota_reservation.as_ref()) {
@@ -1063,28 +1061,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
                             "route delete reclaim scheduling failed after authoritative delete"
                         );
                     }
-                    // Best-effort tombstone cleanup: remove the route entry
-                    // now that mirroring has propagated the tombstone.  The
-                    // per-authority version high-water mark ensures that
-                    // subsequent puts maintain monotonic versioning.
-                    //
-                    // Only safe for EmbeddedWrh where the in-memory mesh is
-                    // separate from the metadata backend.  In MetadataOnly
-                    // mode the backend IS the authoritative store; deleting
-                    // the tombstone would erase the route for readers.
-                    if self.route_control == RouteControlMode::EmbeddedWrh {
-                        let _ = self.route_directory.compare_and_swap_object_route(
-                            &self.lease,
-                            &object_key,
-                            Some(tombstone.version),
-                            None,
-                        );
-                    }
-                    // Opportunistic drain: flush any segment reclaims that
-                    // have passed their grace period.  Without this, a
-                    // remove-only workload would never trigger physical
-                    // segment byte release.
-                    let _ = self.flush_due_reclaims();
                     Ok(())
                 }
                 Err(error) => Err(error),
@@ -1139,12 +1115,11 @@ impl MooncakeCompatibilityFacade for StoreClient {
             }
             let quota_reservation =
                 self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-            let tombstone = route_tombstone(&route);
             let cas = self.route_directory.compare_and_swap_object_route(
                 &self.lease,
                 &object_key,
                 Some(route.version),
-                Some(&tombstone),
+                None,
             )?;
             if cas.applied {
                 self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
@@ -1155,15 +1130,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
                         key = object.key,
                         error = %error,
                         "batch route delete reclaim scheduling failed after authoritative delete"
-                    );
-                }
-                // Best-effort tombstone cleanup (see remove_in_tenant).
-                if self.route_control == RouteControlMode::EmbeddedWrh {
-                    let _ = self.route_directory.compare_and_swap_object_route(
-                        &self.lease,
-                        &object_key,
-                        Some(tombstone.version),
-                        None,
                     );
                 }
             } else {
@@ -1179,8 +1145,6 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 return result;
             }
         }
-        // Opportunistic drain: flush segment reclaims past their grace period.
-        let _ = self.flush_due_reclaims();
         let result = Ok(());
         tracker.finish(&result, 0);
         result
@@ -1658,7 +1622,6 @@ impl StoreClient {
 impl Drop for StoreClient {
     fn drop(&mut self) {
         self.membership_sync.shutdown();
-        let _ = self.flush_all_reclaims();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {
