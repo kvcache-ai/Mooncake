@@ -323,6 +323,130 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
 
 PyClient::~PyClient() {}
 
+tl::expected<size_t, ErrorCode> RealClient::get_registered_buffer_size(
+    void *buffer, const char *api_name) const {
+    if (buffer == nullptr) {
+        LOG(ERROR) << api_name << ": buffer is null";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+    auto it = registered_buffer_sizes_.find(buffer);
+    if (it == registered_buffer_sizes_.end()) {
+        LOG(ERROR) << api_name << ": buffer is not registered";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return it->second;
+}
+
+tl::expected<RealClient::PreparedBatchRangeReadRequest, ErrorCode>
+RealClient::prepare_batch_range_read_request(
+    const std::vector<std::string> &keys, void *dest_buffer,
+    const std::vector<size_t> &dest_offsets,
+    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes,
+    const char *api_name, std::vector<int64_t> *results) {
+    const size_t n = keys.size();
+    PreparedBatchRangeReadRequest prepared;
+    prepared.participated.assign(n, false);
+
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (n != dest_offsets.size() || n != src_offsets.size() ||
+        n != sizes.size()) {
+        LOG(ERROR) << api_name << ": size mismatch";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (n == 0) {
+        LOG(ERROR) << api_name << ": empty input";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto buffer_size_result = get_registered_buffer_size(dest_buffer, api_name);
+    if (!buffer_size_result) {
+        return tl::unexpected(buffer_size_result.error());
+    }
+    const size_t buffer_size = *buffer_size_result;
+
+    std::vector<std::string> unique_keys;
+    unique_keys.reserve(n);
+    std::unordered_map<std::string, size_t> key_to_query_idx;
+    key_to_query_idx.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const auto &key = keys[i];
+        auto [it, inserted] = key_to_query_idx.emplace(key, unique_keys.size());
+        if (inserted) {
+            unique_keys.push_back(key);
+        }
+    }
+
+    auto query_results = client_->BatchQuery(unique_keys);
+
+    std::unordered_map<std::string, BatchRangeGroup> key_ranges_map;
+    for (size_t i = 0; i < n; ++i) {
+        const auto &key = keys[i];
+        const size_t dest_off = dest_offsets[i];
+        const size_t src_off = src_offsets[i];
+        const size_t sz = sizes[i];
+        if (sz == 0) {
+            if (results != nullptr) {
+                (*results)[i] = 0;
+            }
+            continue;
+        }
+        if (dest_off > buffer_size || sz > buffer_size - dest_off) {
+            LOG(ERROR) << "Destination overflow: dst_offset=" << dest_off
+                       << " size=" << sz << " buffer_size=" << buffer_size;
+            continue;
+        }
+
+        auto qit = key_to_query_idx.find(key);
+        if (qit == key_to_query_idx.end()) {
+            continue;
+        }
+        const size_t qidx = qit->second;
+        if (qidx >= query_results.size() || !query_results[qidx]) {
+            continue;
+        }
+        const auto &qr = query_results[qidx].value();
+        if (qr.replicas.empty()) {
+            continue;
+        }
+
+        const auto &replica_res = client_->GetPreferredReplica(qr.replicas);
+        if (!replica_res) {
+            continue;
+        }
+        const auto &replica = replica_res.value();
+        if (!replica.is_memory_replica()) {
+            LOG(ERROR) << api_name << ": disk replicas not supported";
+            continue;
+        }
+
+        auto &entry = key_ranges_map[key];
+        if (entry.second.empty()) {
+            entry.first = replica;
+        }
+        entry.second.emplace_back(dest_off, src_off, sz);
+        prepared.participated[i] = true;
+    }
+
+    if (key_ranges_map.empty()) {
+        LOG(ERROR) << api_name << ": no valid ranges";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    prepared.key_ranges.reserve(key_ranges_map.size());
+    for (const auto &key : unique_keys) {
+        auto it = key_ranges_map.find(key);
+        if (it != key_ranges_map.end()) {
+            prepared.key_ranges.emplace_back(std::move(it->second));
+        }
+    }
+    return prepared;
+}
+
 bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
                                         uint64_t dummy_addr, size_t offset,
                                         size_t size, void *&out_real) const {
@@ -1902,6 +2026,39 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     return {};
 }
 
+std::optional<ProgressiveGetHandle> RealClient::progressive_get(
+    const std::string &key, void *buffer, size_t size, size_t chunk_size) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::nullopt;
+    }
+    return client_->ProgressiveGet(key, buffer, size, chunk_size);
+}
+
+std::optional<ProgressivePutHandle> RealClient::progressive_put(
+    const std::string &key, size_t total_size, size_t num_chunks,
+    const ReplicateConfig &config) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::nullopt;
+    }
+    return client_->ProgressivePut(key, total_size, num_chunks, config);
+}
+
+std::optional<ScatterReadHandle> RealClient::streaming_batch_get_buffer_ranges(
+    const std::vector<std::string> &keys, void *dest_buffer,
+    const std::vector<size_t> &dest_offsets,
+    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes) {
+    auto prepared = prepare_batch_range_read_request(
+        keys, dest_buffer, dest_offsets, src_offsets, sizes,
+        "streaming_batch_get_buffer_ranges");
+    if (!prepared) {
+        return std::nullopt;
+    }
+    return client_->StreamingBatchTransferReadRanges(dest_buffer,
+                                                     prepared->key_ranges);
+}
+
 int RealClient::remove(const std::string &key, bool force) {
     return to_py_ret(remove_internal(key, force));
 }
@@ -2991,6 +3148,40 @@ std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
         });
 }
 
+std::vector<int64_t> RealClient::batch_get_buffer_ranges(
+    const std::vector<std::string> &keys, void *dest_buffer,
+    const std::vector<size_t> &dest_offsets,
+    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes) {
+    const size_t n = keys.size();
+    std::vector<int64_t> results(
+        n, -static_cast<int64_t>(ErrorCode::INVALID_PARAMS));
+
+    auto prepared = prepare_batch_range_read_request(
+        keys, dest_buffer, dest_offsets, src_offsets, sizes,
+        "batch_get_buffer_ranges", &results);
+    if (!prepared) {
+        return results;
+    }
+
+    ErrorCode err =
+        client_->BatchTransferReadRanges(dest_buffer, prepared->key_ranges);
+    if (err != ErrorCode::OK) {
+        for (size_t i = 0; i < n; ++i) {
+            if (prepared->participated[i]) {
+                results[i] = -static_cast<int64_t>(err);
+            }
+        }
+        return results;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (prepared->participated[i]) {
+            results[i] = static_cast<int64_t>(sizes[i]);
+        }
+    }
+    return results;
+}
+
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     void *buffer, size_t size) {
     if (!client_) {
@@ -3264,6 +3455,20 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity) {
+    auto buffer_size_result = get_registered_buffer_size(
+        buffer, size_is_buffer_capacity ? "get_into" : "get_into_range");
+    if (!buffer_size_result) {
+        return tl::unexpected(buffer_size_result.error());
+    }
+    const size_t buffer_size = *buffer_size_result;
+
+    if (!size_is_buffer_capacity &&
+        (dst_offset > buffer_size || size > buffer_size - dst_offset)) {
+        LOG(ERROR) << "Destination overflow: dst_offset=" << dst_offset
+                   << " size=" << size << " buffer_size=" << buffer_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -3320,6 +3525,9 @@ RealClient::get_into_ranges_internal(
     if (!prepared.top_level_valid) {
         return std::move(prepared.results);
     }
+    if (!prepared.has_any_valid_fragment) {
+        return std::move(prepared.results);
+    }
 
     std::vector<size_t> resolved_buffer_capacities;
     if (buffer_capacities != nullptr) {
@@ -3356,9 +3564,14 @@ RealClient::get_into_ranges_internal(
         }
 
         for (size_t j = 0; j < key_count; ++j) {
-            auto [metadata_it, inserted] = metadata_cache.try_emplace(
-                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
-            (void)inserted;
+            auto metadata_it = metadata_cache.find(all_keys[i][j]);
+            if (metadata_it == metadata_cache.end()) {
+                metadata_it =
+                    metadata_cache
+                        .emplace(all_keys[i][j],
+                                 resolve_ranged_read_metadata(all_keys[i][j]))
+                        .first;
+            }
             auto &metadata_result = metadata_it->second;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
@@ -3425,6 +3638,13 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     sum_positive_ranges(ret), latency_us);
             });
     return results;
+}
+
+int64_t RealClient::get_into_range(const std::string &key, void *buffer,
+                                   size_t dst_offset, size_t src_offset,
+                                   size_t size) {
+    return to_py_ret(get_into_range_internal(key, buffer, dst_offset,
+                                             src_offset, size, false));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }

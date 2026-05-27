@@ -515,6 +515,7 @@ In the example above:
 **Current limitation:** true ranged items currently require the selected source replica to be memory-backed. Whole-object reads still follow the normal full-read path, but partial reads through `get_into_ranges()` do not support non-memory replicas.
 
 ---
+---
 
 ## ReplicateConfig Configuration
 
@@ -2735,6 +2736,123 @@ store.unregister_buffer(tensor.data_ptr())
 store.unregister_buffer(target_tensor.data_ptr())
 ```
 </details>
+
+---
+
+### Streaming Zero-Copy Reads
+
+Mooncake also exposes streaming read handles for workloads that want to overlap transfer with compute instead of blocking until the full read completes.
+
+#### progressive_get()
+
+Start a chunked sequential read into a registered buffer.
+
+```python
+def progressive_get(self, key: str, buffer_ptr: int, size: int, chunk_size: int) -> Optional[ProgressiveGetHandle]
+```
+
+**Parameters:**
+- `key` (str): Object identifier.
+- `buffer_ptr` (int): Base address of a registered destination buffer.
+- `size` (int): Total number of bytes to read.
+- `chunk_size` (int): Chunk size used for incremental completion.
+
+**Returns:**
+- `ProgressiveGetHandle | None`: A handle on success, or `None` if submission fails.
+
+**Handle methods:**
+- `num_chunks`: Number of logical chunks in the request.
+- `is_chunk_ready(chunk_index) -> bool`: Poll one chunk.
+- `completed_count() -> int`: Number of completed chunks.
+- `wait_chunk(chunk_index) -> int`: Wait for one chunk and return an error code.
+- `wait_all() -> int`: Wait for the full request and return an error code.
+
+#### streaming_batch_get_buffer_ranges()
+
+Start a streaming scatter read from multiple keys into different ranges of a single registered destination buffer.
+
+```python
+def streaming_batch_get_buffer_ranges(
+    self,
+    keys: List[str],
+    buffer: int,
+    dest_offsets: List[int],
+    src_offsets: List[int],
+    sizes: List[int],
+) -> Optional[ScatterReadHandle]
+```
+
+Each element describes one range read:
+- read `[src_offsets[i], src_offsets[i] + sizes[i])` from `keys[i]`
+- write it into `[dest_offsets[i], dest_offsets[i] + sizes[i])` of `buffer`
+
+**Parameters:**
+- `keys` (List[str]): Keys to read from. Keys may repeat.
+- `buffer` (int): Base address of a registered destination buffer.
+- `dest_offsets` (List[int]): Destination offsets into `buffer`.
+- `src_offsets` (List[int]): Source offsets inside each object.
+- `sizes` (List[int]): Number of bytes for each range.
+
+**Returns:**
+- `ScatterReadHandle | None`: A handle on success, or `None` if validation or submission fails.
+
+**Notes:**
+- All four lists must have the same length.
+- The destination buffer must be registered with `register_buffer()` before calling this API.
+- `num_chunks` reports logical streaming chunks managed by the transfer layer. Do not assume it is always equal to the number of requested ranges.
+
+**Handle methods:**
+- `num_chunks`: Number of logical chunks in the request.
+- `is_chunk_ready(chunk_index) -> bool`: Poll one chunk.
+- `completed_count() -> int`: Number of completed chunks.
+- `wait_chunk(chunk_index) -> int`: Wait for one chunk and return an error code.
+- `wait_all() -> int`: Wait for the full scatter read and return an error code.
+
+**Example:**
+
+```python
+import ctypes
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    "localhost",
+    "http://localhost:8080/metadata",
+    512 * 1024 * 1024,
+    128 * 1024 * 1024,
+    "tcp",
+    "",
+    "localhost:50051",
+)
+
+store.put("obj_a", b"A" * 4096)
+store.put("obj_b", b"B" * 4096)
+
+buffer = (ctypes.c_ubyte * 2048)()
+buffer_ptr = ctypes.addressof(buffer)
+store.register_buffer(buffer_ptr, 2048)
+
+handle = store.streaming_batch_get_buffer_ranges(
+    ["obj_a", "obj_b"],
+    buffer_ptr,
+    [0, 1024],
+    [0, 0],
+    [1024, 1024],
+)
+
+if handle is None:
+    raise RuntimeError("scatter streaming submission failed")
+
+rc = handle.wait_all()
+if rc != 0:
+    raise RuntimeError(f"scatter streaming failed: {rc}")
+
+assert bytes(buffer[:1024]) == b"A" * 1024
+assert bytes(buffer[1024:2048]) == b"B" * 1024
+
+store.unregister_buffer(buffer_ptr)
+store.close()
+```
 
 ## MooncakeHostMemAllocator Class
 

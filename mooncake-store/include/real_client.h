@@ -132,6 +132,10 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
         override;
 
+    int64_t get_into_range(const std::string &key, void *buffer,
+                           size_t dst_offset, size_t src_offset,
+                           size_t size) override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys (batch version)
@@ -281,6 +285,36 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
+    /**
+     * @brief Batch get multiple non-contiguous ranges from multiple keys into
+     * a single buffer.
+     * @param keys Keys (may repeat for multiple ranges from same key)
+     * @param dest_buffer Base pointer of destination buffer
+     * @param dest_offsets Dest offset for each range
+     * @param src_offsets Source offset in object for each range
+     * @param sizes Size in bytes for each range
+     * @return Vector of int64_t: bytes read per range, or negative error code
+     */
+    std::vector<int64_t> batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes);
+
+    std::optional<ProgressiveGetHandle> progressive_get(
+        const std::string &key, void *buffer, size_t size,
+        size_t chunk_size) override;
+
+    std::optional<ProgressivePutHandle> progressive_put(
+        const std::string &key, size_t total_size, size_t num_chunks,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+
+    std::optional<ScatterReadHandle> streaming_batch_get_buffer_ranges(
+        const std::vector<std::string> &keys, void *dest_buffer,
+        const std::vector<size_t> &dest_offsets,
+        const std::vector<size_t> &src_offsets,
+        const std::vector<size_t> &sizes) override;
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
@@ -422,6 +456,10 @@ class RealClient : public PyClient {
                                 const std::vector<uint64_t> &buffers,
                                 const std::vector<size_t> &sizes,
                                 int32_t device_id, const UUID &client_id);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_dummy_helper(
+        const std::string &key, uint64_t buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
         const std::vector<std::string> &keys,
@@ -805,6 +843,27 @@ class RealClient : public PyClient {
     };
     mutable std::shared_mutex dummy_client_mutex_;
     std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
+
+    using BatchRangeGroup =
+        std::pair<Replica::Descriptor,
+                  std::vector<std::tuple<size_t, size_t, size_t>>>;
+
+    struct PreparedBatchRangeReadRequest {
+        std::vector<BatchRangeGroup> key_ranges;
+        std::vector<bool> participated;
+    };
+
+    tl::expected<size_t, ErrorCode> get_registered_buffer_size(
+        void *buffer, const char *api_name) const;
+
+    tl::expected<PreparedBatchRangeReadRequest, ErrorCode>
+    prepare_batch_range_read_request(const std::vector<std::string> &keys,
+                                     void *dest_buffer,
+                                     const std::vector<size_t> &dest_offsets,
+                                     const std::vector<size_t> &src_offsets,
+                                     const std::vector<size_t> &sizes,
+                                     const char *api_name,
+                                     std::vector<int64_t> *results = nullptr);
 
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;

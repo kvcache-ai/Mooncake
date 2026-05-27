@@ -188,6 +188,60 @@ class Client {
         bool prefer_same_node = false);
 
     /**
+     * @brief Start a progressive (chunked) get for per-chunk completion
+     * tracking
+     * @param key Object key
+     * @param dest_buffer Destination buffer (must be registered)
+     * @param buffer_size Size of the destination buffer
+     * @param chunk_size Size per chunk; the transfer is split into
+     *        ceil(object_size/chunk_size) independently trackable tasks
+     * @return ProgressiveGetHandle for per-chunk polling, or nullopt on failure
+     */
+    std::optional<ProgressiveGetHandle> ProgressiveGet(const std::string& key,
+                                                       void* dest_buffer,
+                                                       size_t buffer_size,
+                                                       size_t chunk_size);
+
+    std::optional<ScatterReadHandle> StreamingBatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
+     * @brief Batch transfer read of multiple non-contiguous ranges from
+     * multiple keys in a single transfer batch.
+     * @param dest_buffer Base pointer of destination buffer
+     * @param key_ranges For each key: (replica, [(dest_offset, src_offset,
+     * size), ...])
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode BatchTransferReadRanges(
+        void* dest_buffer,
+        const std::vector<
+            std::pair<Replica::Descriptor,
+                      std::vector<std::tuple<size_t, size_t, size_t>>>>&
+            key_ranges);
+
+    /**
+     * @brief Start a progressive (chunked) put for streaming writes.
+     *
+     * Preallocates an object of `total_size` bytes and returns a handle that
+     * allows writing chunks at arbitrary offsets. The object becomes readable
+     * chunk-by-chunk as writes complete (tracked via a sideband progress key).
+     *
+     * @param key Object key
+     * @param total_size Total preallocated size in bytes
+     * @param num_chunks Expected number of chunks (for progress tracking)
+     * @param config Replication configuration
+     * @return ProgressivePutHandle for per-chunk writing, or nullopt on failure
+     */
+    std::optional<ProgressivePutHandle> ProgressivePut(
+        const std::string& key, size_t total_size, size_t num_chunks,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -751,7 +805,7 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
-    std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::shared_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

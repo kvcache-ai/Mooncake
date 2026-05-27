@@ -582,7 +582,7 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
+    transfer_submitter_ = std::make_shared<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 }
@@ -910,6 +910,177 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+std::optional<ProgressiveGetHandle> Client::ProgressiveGet(
+    const std::string& key, void* dest_buffer, size_t buffer_size,
+    size_t chunk_size) {
+    auto query_result = Query(key);
+    if (!query_result) {
+        LOG(ERROR) << "ProgressiveGet: query failed for key=" << key
+                   << " error=" << toString(query_result.error());
+        return std::nullopt;
+    }
+
+    Replica::Descriptor replica;
+    ErrorCode err = FindFirstCompleteReplica(query_result->replicas, replica);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "ProgressiveGet: no complete replica for key=" << key;
+        return std::nullopt;
+    }
+
+    if (!replica.is_memory_replica()) {
+        LOG(ERROR) << "ProgressiveGet: only memory replicas supported, key="
+                   << key;
+        return std::nullopt;
+    }
+
+    uint64_t object_size =
+        replica.get_memory_descriptor().buffer_descriptor.size_;
+    if (buffer_size < object_size) {
+        LOG(ERROR) << "ProgressiveGet: buffer too small (" << buffer_size
+                   << " < " << object_size << ") for key=" << key;
+        return std::nullopt;
+    }
+
+    return transfer_submitter_->submitProgressiveRead(replica, dest_buffer,
+                                                      object_size, chunk_size);
+}
+
+std::optional<ProgressivePutHandle> Client::ProgressivePut(
+    const std::string& key, size_t total_size, size_t num_chunks,
+    const ReplicateConfig& config) {
+    if (total_size == 0 || num_chunks == 0) {
+        LOG(ERROR) << "ProgressivePut: invalid params (total_size="
+                   << total_size << ", num_chunks=" << num_chunks << ")";
+        return std::nullopt;
+    }
+
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "ProgressivePut: TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+
+    // Allocate the full object via PutStart (single slice of total_size)
+    std::vector<size_t> slice_lengths = {total_size};
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        LOG(ERROR) << "ProgressivePut: PutStart failed for key=" << key << ": "
+                   << toString(err);
+        return std::nullopt;
+    }
+
+    // Find the memory replica descriptor
+    Replica::Descriptor memory_replica;
+    bool found = false;
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            memory_replica = replica;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        LOG(ERROR) << "ProgressivePut: no memory replica allocated for key="
+                   << key;
+        master_client_.PutRevoke(key, ReplicaType::MEMORY);
+        return std::nullopt;
+    }
+
+    // Create the sideband progress key with initial value 0.
+    // We use manual PutStart/TransferWrite/PutEnd to capture the replica
+    // descriptor, enabling direct writes in the progress callback without
+    // needing a Client* reference (lifetime safety).
+    // Force local allocation: the progress callback writes from a stack buffer
+    // which is not RDMA-registered, so the key must be on a local segment
+    // (LOCAL_MEMCPY path).
+    std::string progress_key = key + "/__progress__";
+    std::vector<size_t> progress_lengths = {sizeof(uint64_t)};
+    Replica::Descriptor progress_replica;
+    bool has_progress = false;
+
+    ReplicateConfig progress_cfg = client_cfg;
+    progress_cfg.preferred_segment = local_hostname_;
+    auto progress_start =
+        master_client_.PutStart(progress_key, progress_lengths, progress_cfg);
+    if (progress_start) {
+        for (const auto& replica : progress_start.value()) {
+            if (replica.is_memory_replica()) {
+                progress_replica = replica;
+                has_progress = true;
+                break;
+            }
+        }
+        if (has_progress) {
+            uint64_t initial = 0;
+            std::vector<Slice> init_slices{Slice{&initial, sizeof(uint64_t)}};
+            ErrorCode write_err = TransferWrite(progress_replica, init_slices);
+            if (write_err == ErrorCode::OK) {
+                auto pe =
+                    master_client_.PutEnd(progress_key, ReplicaType::MEMORY);
+                if (!pe) {
+                    master_client_.PutRevoke(progress_key, ReplicaType::MEMORY);
+                    has_progress = false;
+                }
+            } else {
+                master_client_.PutRevoke(progress_key, ReplicaType::MEMORY);
+                has_progress = false;
+            }
+        } else {
+            master_client_.PutRevoke(progress_key, ReplicaType::MEMORY);
+        }
+    }
+    if (!has_progress) {
+        LOG(WARNING) << "ProgressivePut: failed to create progress key for "
+                     << key << ", proceeding without progress tracking";
+    }
+
+    // Finalize the main object metadata. This makes it discoverable by
+    // readers. Safety: readers check the progress key (initially 0) to know
+    // which chunks are ready, so they won't read uninitialized data.
+    auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
+    if (!end_result) {
+        LOG(ERROR) << "ProgressivePut: PutEnd failed for key=" << key;
+        master_client_.PutRevoke(key, ReplicaType::MEMORY);
+        return std::nullopt;
+    }
+
+    // Create progress callback. Captures shared_ptr<TransferSubmitter> and
+    // progress replica descriptor by value — no Client* dependency.
+    ProgressivePutSession::ProgressCallback progress_cb = nullptr;
+    if (has_progress) {
+        progress_cb = [submitter = transfer_submitter_,
+                       prog_replica =
+                           progress_replica](uint64_t completed_chunks) {
+            uint64_t val = completed_chunks;
+            std::vector<Slice> slices{Slice{&val, sizeof(uint64_t)}};
+            auto future =
+                submitter->submit(prog_replica, slices, TransferRequest::WRITE);
+            if (!future) {
+                LOG(WARNING)
+                    << "ProgressivePut: failed to submit progress update ("
+                    << completed_chunks << " chunks)";
+                return;
+            }
+            auto result = future->get();
+            if (result != ErrorCode::OK) {
+                LOG(WARNING) << "ProgressivePut: progress write failed ("
+                             << completed_chunks << " chunks)";
+            }
+        };
+    }
+
+    // Create the session and return the handle
+    auto session = std::make_shared<ProgressivePutSession>(
+        transfer_submitter_, std::move(memory_replica), total_size, num_chunks,
+        std::move(progress_cb));
+    return ProgressivePutHandle(std::move(session));
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
@@ -1034,6 +1205,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         }
     }
     return results;
+}
+
+std::optional<ScatterReadHandle> Client::StreamingBatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    auto handle = transfer_submitter_->submitStreamingBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
+    if (!handle) {
+        LOG(ERROR) << "Failed to submit streaming batch read ranges";
+        return std::nullopt;
+    }
+    return handle;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
@@ -1188,6 +1377,24 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
     return results;
+}
+
+ErrorCode Client::BatchTransferReadRanges(
+    void* dest_buffer,
+    const std::vector<std::pair<
+        Replica::Descriptor, std::vector<std::tuple<size_t, size_t, size_t>>>>&
+        key_ranges) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    auto future = transfer_submitter_->submitBatchReadRanges(
+        dest_buffer, key_ranges, protocol_ == "rdma");
+    if (!future) {
+        LOG(ERROR) << "Failed to submit batch read ranges";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+    return future->get();
 }
 
 bool Client::RedirectToHotCache(const std::string& key,
@@ -2593,29 +2800,31 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
-    LOG(INFO) << "action=replica_copy_start" << ", key=" << key
-              << ", targets_count=" << targets.size();
+    LOG(INFO) << "action=replica_copy_start"
+              << ", key=" << key << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result = master_client_.CopyStart(key, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
-        LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                   << ", source=" << source << ", error=copy_start_failed"
+        LOG(ERROR) << "action=replica_copy_failed"
+                   << ", key=" << key << ", source=" << source
+                   << ", error=copy_start_failed"
                    << ", error_code=" << error;
         return tl::unexpected(error);
     }
 
     const auto& response = start_result.value();
     if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
+        LOG(INFO) << "action=replica_copy_skipped"
+                  << ", key=" << key << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
         auto copy_end_result = master_client_.CopyEnd(key);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
-                       << ", error=copy_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_copy_failed"
+                       << ", key=" << key << ", error=copy_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -2627,7 +2836,8 @@ tl::expected<void, ErrorCode> Client::Copy(
         response.targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_copy_success" << ", key=" << key
+        LOG(INFO) << "action=replica_copy_success"
+                  << ", key=" << key
                   << ", target_count=" << response.targets.size();
     }
 
@@ -2637,30 +2847,33 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
-    LOG(INFO) << "action=replica_move_start" << ", key=" << key
-              << ", source_segment=" << source << ", target_segment=" << target;
+    LOG(INFO) << "action=replica_move_start"
+              << ", key=" << key << ", source_segment=" << source
+              << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
     auto move_start_result = master_client_.MoveStart(key, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
-        LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                   << ", error=move_start_failed" << ", error_code=" << error;
+        LOG(ERROR) << "action=replica_move_failed"
+                   << ", key=" << key << ", error=move_start_failed"
+                   << ", error_code=" << error;
         // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
     const auto& response = move_start_result.value();
     if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
-                  << ", info=target_replica_already_exists";
+        LOG(INFO) << "action=replica_move_skipped"
+                  << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
-                       << ", error=move_end_failed" << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_move_failed"
+                       << ", key=" << key << ", error=move_end_failed"
+                       << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -2674,8 +2887,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_move_success" << ", key=" << key
-                  << ", source_segment=" << source
+        LOG(INFO) << "action=replica_move_success"
+                  << ", key=" << key << ", source_segment=" << source
                   << ", target_segment=" << target;
     }
 
@@ -2865,7 +3078,19 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 ErrorCode Client::TransferReadRange(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {
-    return TransferReadInternal(replica_descriptor, slices, src_offset);
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
+                                                       slices, src_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range read operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    return future->get();
 }
 
 void Client::PollAndDispatchTasks() {
@@ -2885,8 +3110,8 @@ void Client::PollAndDispatchTasks() {
             // Only log if it's not an RPC failure (which is expected
             // during connection failures)
             if (error != ErrorCode::RPC_FAIL) {
-                LOG(WARNING)
-                    << "action=task_poll_failed" << ", error_code=" << error;
+                LOG(WARNING) << "action=task_poll_failed"
+                             << ", error_code=" << error;
             }
         }
     }
@@ -2903,7 +3128,8 @@ void Client::TaskPollThreadMain() {
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
     if (!task_running_.load()) {
-        LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
+        LOG(WARNING) << "action=task_rejected"
+                     << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
         return;
     }
