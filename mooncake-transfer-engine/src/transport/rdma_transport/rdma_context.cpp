@@ -68,7 +68,8 @@ bool isKernelDmabufSupported() {
     static const bool supported = []() {
         if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
             if (std::string(env) != "0") {
-                LOG(INFO) << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
+                LOG(INFO)
+                    << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
                 return false;
             }
         }
@@ -447,7 +448,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                         "falling back to ibv_reg_mr";
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
-    } else if (hipAttr.type == hipMemoryTypeDevice && !isKernelDmabufSupported()) {
+    } else if (hipAttr.type == hipMemoryTypeDevice &&
+               !isKernelDmabufSupported()) {
         // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
         // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
         // Fail at registration time instead.
