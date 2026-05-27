@@ -6,23 +6,18 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
-# Get Python interpreter and version from environment variable or argument
-if [ -z "${PYTHON_EXECUTABLE:-}" ] && [ -x "$(pwd)/.venv/bin/python" ]; then
-    PYTHON_EXECUTABLE="$(pwd)/.venv/bin/python"
-else
-    PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python}"
-fi
-PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(${PYTHON_EXECUTABLE} -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
+# Get Python version from environment variable or argument
+PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build).  EP/PG extensions are staged under
 # ${BUILD_DIR}/ep_pg_staging when the project was built with -DWITH_EP=ON.
 BUILD_DIR="${BUILD_DIR:-build}"
-DEPS_PREFIX="${MOONCAKE_DEPS:-/home/inf-daole/.local/mooncake-deps}"
-echo "Building wheel for Python ${PYTHON_VERSION} (${PYTHON_EXECUTABLE}) with output directory ${OUTPUT_DIR}"
+BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
+echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:$(pwd)/${BUILD_DIR}/mooncake-common:${DEPS_PREFIX}/lib:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -35,20 +30,20 @@ echo "Creating directory structure..."
 cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric_allocator_utils.py
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
-cp "${BUILD_DIR}"/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
-cp "${BUILD_DIR}"/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
+cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
 # Copy store.so to mooncake directory
-if ls "${BUILD_DIR}"/mooncake-integration/store.*.so >/dev/null 2>&1; then
+if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     echo "Copying store.so..."
-    cp "${BUILD_DIR}"/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
     echo "Copying master binary..."
     # Copy master binary
-    cp "${BUILD_DIR}"/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+    cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
-    cp "${BUILD_DIR}"/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
     # Copy async_store.py
     cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
@@ -56,36 +51,36 @@ else
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f "${BUILD_DIR}/mooncake-store/src/libmooncake_store.so" ]; then
+if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
-    cp "${BUILD_DIR}"/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+    cp ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
-if [ -f "${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so" ]; then
+if [ -f ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so ]; then
     echo "Copying libetcd_wrapper.so..."
-    cp "${BUILD_DIR}"/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
+    cp ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so" ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     echo "Copying libtransfer_engine.so..."
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so" ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so" ] \
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
    || [ -f /usr/lib64/libaccl_barex.so ]; then
-    if [ -f "${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so" ]; then
+    if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
      echo "Copying CUDA nvlink_allocator.so..."
-     cp "${BUILD_DIR}"/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+     cp ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
     fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
@@ -95,9 +90,9 @@ else
 fi
 
 # Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so" ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
     echo "Copying NPU ubshmem_fabric_allocator.so..."
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
     echo "Copying NPU allocator libraries..."
     # Copy allocator_ascend_npu.py
     cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
@@ -107,14 +102,10 @@ fi
 
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench" ]; then
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
-else
-    echo "Skipping transfer_engine_bench (not built - likely BUILD_EXAMPLES=OFF)"
-fi
+cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
-    cp "${BUILD_DIR}"/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
     echo "Copying ascend_transport_mem libraries..."
 else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
@@ -126,7 +117,7 @@ fi
 # so that patchelf never touches CUDA fatbins (see injection step below).
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
-CUDA_EP_STAGING_DIR="$(pwd)/${BUILD_DIR}/ep_pg_staging"
+CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
@@ -146,11 +137,28 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Stripping shared libraries to reduce wheel size..."
+    find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
+fi
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
-# Handle package name modification for non-CUDA builds
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD"
+BUILD_VARIANT_COUNT=0
+for build_variant in $BUILD_VARIANTS; do
+    if [ "${!build_variant}" = "1" ]; then
+        BUILD_VARIANT_COUNT=$((BUILD_VARIANT_COUNT + 1))
+    fi
+done
+if [ "$BUILD_VARIANT_COUNT" -gt 1 ]; then
+    echo "Error: only one of $BUILD_VARIANTS can be set"
+    exit 1
+fi
+
+# Handle package name modification for release build variants
 if [ "$NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for non-CUDA build"
     # Backup original pyproject.toml
@@ -160,12 +168,7 @@ if [ "$NON_CUDA_BUILD" = "1" ]; then
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
     sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-non-cuda"
-else
-    echo "Using standard package name: mooncake-transfer-engine"
-fi
-
-# Handle package name modification for CU13 builds
-if [ "$CU13_BUILD" = "1" ]; then
+elif [ "$CU13_BUILD" = "1" ]; then
     echo "Modifying package name for CU13 build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
@@ -174,6 +177,15 @@ if [ "$CU13_BUILD" = "1" ]; then
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
     sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cuda13"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-cuda13"
+elif [ "$NPU_BUILD" = "1" ]; then
+    echo "Modifying package name for Ascend NPU build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-npu"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Ascend NPU version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "ascend", "npu"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-npu"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -183,13 +195,20 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-if "${PYTHON_EXECUTABLE}" -m pip --version &>/dev/null; then
-    "${PYTHON_EXECUTABLE}" -m pip install --upgrade pip build setuptools wheel auditwheel
+if [ "$NPU_BUILD" = "1" ]; then
+    PYTHON_CMD="python${PYTHON_VERSION}"
+    if ! command -v "$PYTHON_CMD" &>/dev/null; then
+        echo "Error: $PYTHON_CMD not found for NPU wheel build"
+        exit 1
+    fi
+    "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel
+elif command -v pip &>/dev/null; then
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
-    uv pip install --python "${PYTHON_EXECUTABLE}" --upgrade pip
-    uv pip install --python "${PYTHON_EXECUTABLE}" build setuptools wheel auditwheel
+    uv pip install --upgrade pip
+    uv pip install build setuptools wheel auditwheel
 else
-    echo "Error: ${PYTHON_EXECUTABLE} has no pip, and uv was not found"
+    echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1
 fi
 
@@ -244,17 +263,22 @@ case "$ARCH" in
         ;;
 esac
 
-# Set platform tag if not already set. "auto" lets auditwheel account for
-# bundled libraries from a local dependency prefix.
-PLATFORM_TAG=${PLATFORM_TAG:-"auto"}
+# Set platform tag if not already set
+PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
 
 echo "Detected architecture: $ARCH_SUFFIX"
 echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-"${PYTHON_EXECUTABLE}" -m build --wheel --outdir ${OUTPUT_DIR}
-"${PYTHON_EXECUTABLE}" -m auditwheel repair ${OUTPUT_DIR}/*.whl \
+if [ "$NPU_BUILD" = "1" ]; then
+    python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
+    AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
+else
+    python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
+    AUDITWHEEL_CMD="auditwheel"
+fi
+${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
@@ -349,7 +373,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
     if [ -n "$REPAIRED_WHEEL" ]; then
         echo "Injecting CUDA extension .so files into repaired wheel..."
         WHEEL_UNPACK_DIR=$(mktemp -d)
-        "${PYTHON_EXECUTABLE}" -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
         UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
         for so_file in "$CUDA_EP_STAGING_DIR"/*.so; do
             if [ -f "$so_file" ]; then
@@ -358,7 +382,7 @@ if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; 
             fi
         done
         rm "$REPAIRED_WHEEL"
-        "${PYTHON_EXECUTABLE}" -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
         rm -rf "$WHEEL_UNPACK_DIR"
     fi
 else
@@ -375,5 +399,7 @@ rm -f ${OUTPUT_DIR}/*.whl
 mv ${REPAIRED_DIR}/*.whl ${OUTPUT_DIR}/
 
 cd ..
+
+[[ -f mooncake-wheel/pyproject.toml.backup ]] && mv mooncake-wheel/pyproject.toml.backup mooncake-wheel/pyproject.toml
 
 echo "Wheel package built and repaired successfully!"
