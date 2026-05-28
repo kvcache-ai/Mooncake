@@ -666,18 +666,23 @@ impl PyMooncakeDistributedStore {
         let resolved_buffer_sizes =
             buffer_sizes.unwrap_or_else(|| vec![usize::MAX; buffer_ptrs.len()]);
         match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => run_without_gil(move || {
-                dummy.get_into_ranges(
-                    &buffer_ptrs,
-                    &resolved_buffer_sizes,
-                    &all_keys,
-                    &all_dst_offsets,
-                    &all_src_offsets,
-                    &all_sizes,
-                    tenant,
-                )
-            })
-            .map_err(store_error_to_py),
+            StoreBackend::Dummy(dummy) => {
+                for &ptr in &buffer_ptrs {
+                    pointer_from_usize(ptr)?;
+                }
+                run_without_gil(move || {
+                    dummy.get_into_ranges(
+                        &buffer_ptrs,
+                        &resolved_buffer_sizes,
+                        &all_keys,
+                        &all_dst_offsets,
+                        &all_src_offsets,
+                        &all_sizes,
+                        tenant,
+                    )
+                })
+                .map_err(store_error_to_py)
+            }
             StoreBackend::Real(dispatcher) => {
                 let validated: Vec<(usize, usize)> = buffer_ptrs
                     .iter()
@@ -6306,7 +6311,7 @@ mod tests {
         // Trainer writes 4 shards with recognizable patterns
         for shard_id in 0..TRAINER_TP {
             let data: Vec<u8> = (0..SHARD_SIZE)
-                .map(|i| ((shard_id * SHARD_SIZE + i) & 0xFF) as u8)
+                .map(|i| ((shard_id + i) & 0xFF) as u8)
                 .collect();
             let key = format!("layer.0.weight.tp{}", shard_id);
             store
@@ -6383,7 +6388,7 @@ mod tests {
             let trainer_shard = rank / 2;
             let src_offset = (rank % 2) * RANK_SIZE;
             let expected: Vec<u8> = (0..RANK_SIZE)
-                .map(|i| ((trainer_shard * SHARD_SIZE + src_offset + i) & 0xFF) as u8)
+                .map(|i| ((trainer_shard + src_offset + i) & 0xFF) as u8)
                 .collect();
             let actual =
                 unsafe { slice::from_raw_parts(buffer_ptrs[rank] as *const u8, RANK_SIZE) };
@@ -6417,7 +6422,7 @@ mod tests {
         // Trainer writes 8 shards with recognizable patterns
         for shard_id in 0..TRAINER_TP {
             let data: Vec<u8> = (0..SHARD_SIZE)
-                .map(|i| ((shard_id * SHARD_SIZE + i) & 0xFF) as u8)
+                .map(|i| ((shard_id + i) & 0xFF) as u8)
                 .collect();
             let key = format!("layer.0.weight.tp{}", shard_id);
             store
@@ -6496,10 +6501,10 @@ mod tests {
             let shard_b = 2 * rank + 1;
 
             let expected_a: Vec<u8> = (0..SHARD_SIZE)
-                .map(|i| ((shard_a * SHARD_SIZE + i) & 0xFF) as u8)
+                .map(|i| ((shard_a + i) & 0xFF) as u8)
                 .collect();
             let expected_b: Vec<u8> = (0..SHARD_SIZE)
-                .map(|i| ((shard_b * SHARD_SIZE + i) & 0xFF) as u8)
+                .map(|i| ((shard_b + i) & 0xFF) as u8)
                 .collect();
 
             let actual =

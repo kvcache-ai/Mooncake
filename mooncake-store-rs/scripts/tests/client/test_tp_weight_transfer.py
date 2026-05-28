@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def make_shard_data(shard_id: int, shard_size: int) -> bytes:
-    return bytes((shard_id * shard_size + i) & 0xFF for i in range(shard_size))
+    return bytes((shard_id + i) & 0xFF for i in range(shard_size))
 
 
 def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllocator, tenant: str):
