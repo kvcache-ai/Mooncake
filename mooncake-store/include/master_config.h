@@ -189,6 +189,12 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+
+    // HTTP metadata server configuration
+    bool enable_http_metadata_server = false;
+    uint32_t http_metadata_server_port = 8080;
+    std::string http_metadata_server_host = "0.0.0.0";
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -266,6 +272,12 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        // Set HTTP metadata server configuration
+        enable_http_metadata_server = config.enable_http_metadata_server;
+        http_metadata_server_port = config.http_metadata_server_port;
+        http_metadata_server_host = config.http_metadata_server_host;
+
         validate();
     }
 
