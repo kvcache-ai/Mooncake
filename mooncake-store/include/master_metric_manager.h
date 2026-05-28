@@ -343,6 +343,25 @@ class MasterMetricManager {
     int64_t get_update_task_requests();
     int64_t get_update_task_failures();
 
+    // --- Term-scoped Metrics Reset ---
+    /**
+     * @brief Reset metrics whose lifetime is tied to a single MasterService
+     * instance / leader term. Must be called when a new MasterService is
+     * constructed in HA mode, before state restoration runs.
+     *
+     * Why: MasterMetricManager is a process-level singleton, but in HA mode
+     * MasterService is destroyed and recreated on every etcd reconnect /
+     * leader transition. Without this reset, the new instance's restore path
+     * re-increments gauges that still hold values from the previous instance
+     * (e.g. active_clients doubling after etcd reconnect — issue #2210), and
+     * per-term counters silently accumulate across leader terms (issue #1186).
+     *
+     * Resets both gauges (current-state) and counters (per-term). Histograms
+     * summarize distributions and ylt exposes no reset API for them, so they
+     * are left untouched.
+     */
+    void ResetTermScopedMetrics();
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.

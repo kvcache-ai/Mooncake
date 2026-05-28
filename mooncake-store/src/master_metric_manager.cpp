@@ -532,6 +532,175 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // actual segment names.
 }
 
+void MasterMetricManager::ResetTermScopedMetrics() {
+    // --- Static gauges (current-state) ---
+    // Must reset: otherwise state restore re-inc's on top of stale values
+    // from the previous MasterService instance. This is the root cause of
+    // issue #2210 (active_clients).
+    mem_allocated_size_.reset();
+    mem_total_capacity_.reset();
+    nof_allocated_size_.reset();
+    nof_total_capacity_.reset();
+    file_allocated_size_.reset();
+    file_total_capacity_.reset();
+    key_count_.reset();
+    soft_pin_key_count_.reset();
+    active_clients_.reset();
+    mem_cache_nums_.reset();
+    file_cache_nums_.reset();
+    put_start_discarded_staging_size_.reset();
+
+    // --- Per-segment dynamic gauges ---
+    // Zero out any labels left over from the previous term. State restore
+    // will re-populate via inc_* with the current segment names; labels for
+    // segments that no longer exist remain at 0 (ylt has no public API to
+    // erase label entries from dynamic counters).
+    auto zero_all_labels = [](auto& dyn_gauge) {
+        for (auto& entry : dyn_gauge.copy()) {
+            dyn_gauge.update(entry->label, 0);
+        }
+    };
+    zero_all_labels(mem_allocated_size_per_segment_);
+    zero_all_labels(mem_total_capacity_per_segment_);
+    zero_all_labels(nof_allocated_size_per_segment_);
+    zero_all_labels(nof_total_capacity_per_segment_);
+
+    // --- Counters (per-term) ---
+    // Per the design discussion in issue #1186, treat counters as
+    // per-leader-term so each term's stats stand alone. External aggregation
+    // can sum across instances if a cluster-lifetime view is needed.
+    put_start_requests_.reset();
+    put_start_failures_.reset();
+    put_start_alloc_failures_.reset();
+    put_end_requests_.reset();
+    put_end_failures_.reset();
+    put_revoke_requests_.reset();
+    put_revoke_failures_.reset();
+    get_replica_list_requests_.reset();
+    get_replica_list_failures_.reset();
+    get_replica_list_by_regex_requests_.reset();
+    get_replica_list_by_regex_failures_.reset();
+    exist_key_requests_.reset();
+    exist_key_failures_.reset();
+    remove_requests_.reset();
+    remove_failures_.reset();
+    remove_by_regex_requests_.reset();
+    remove_by_regex_failures_.reset();
+    remove_all_requests_.reset();
+    remove_all_failures_.reset();
+    mount_segment_requests_.reset();
+    mount_segment_failures_.reset();
+    unmount_segment_requests_.reset();
+    unmount_segment_failures_.reset();
+    remount_segment_requests_.reset();
+    remount_segment_failures_.reset();
+    mount_nof_segment_requests_.reset();
+    mount_nof_segment_failures_.reset();
+    unmount_nof_segment_requests_.reset();
+    unmount_nof_segment_failures_.reset();
+    remount_nof_segment_requests_.reset();
+    remount_nof_segment_failures_.reset();
+    ping_requests_.reset();
+    ping_failures_.reset();
+    nof_heartbeat_success_total_.reset();
+    nof_heartbeat_failure_total_.reset();
+    nof_heartbeat_timeout_total_.reset();
+    nof_segments_unmounted_by_heartbeat_total_.reset();
+
+    batch_exist_key_requests_.reset();
+    batch_exist_key_failures_.reset();
+    batch_exist_key_partial_successes_.reset();
+    batch_exist_key_items_.reset();
+    batch_exist_key_failed_items_.reset();
+    batch_query_ip_requests_.reset();
+    batch_query_ip_failures_.reset();
+    batch_query_ip_partial_successes_.reset();
+    batch_query_ip_items_.reset();
+    batch_query_ip_failed_items_.reset();
+    batch_replica_clear_requests_.reset();
+    batch_replica_clear_failures_.reset();
+    batch_replica_clear_partial_successes_.reset();
+    batch_replica_clear_items_.reset();
+    batch_replica_clear_failed_items_.reset();
+    batch_get_replica_list_requests_.reset();
+    batch_get_replica_list_failures_.reset();
+    batch_get_replica_list_partial_successes_.reset();
+    batch_get_replica_list_items_.reset();
+    batch_get_replica_list_failed_items_.reset();
+    batch_put_start_requests_.reset();
+    batch_put_start_failures_.reset();
+    batch_put_start_partial_successes_.reset();
+    batch_put_start_items_.reset();
+    batch_put_start_failed_items_.reset();
+    batch_put_end_requests_.reset();
+    batch_put_end_failures_.reset();
+    batch_put_end_partial_successes_.reset();
+    batch_put_end_items_.reset();
+    batch_put_end_failed_items_.reset();
+    batch_put_revoke_requests_.reset();
+    batch_put_revoke_failures_.reset();
+    batch_put_revoke_partial_successes_.reset();
+    batch_put_revoke_items_.reset();
+    batch_put_revoke_failed_items_.reset();
+
+    mem_cache_hit_nums_.reset();
+    file_cache_hit_nums_.reset();
+    valid_get_nums_.reset();
+    total_get_nums_.reset();
+
+    eviction_success_.reset();
+    eviction_attempts_.reset();
+    evicted_key_count_.reset();
+    evicted_size_.reset();
+    mem_eviction_success_.reset();
+    mem_eviction_attempts_.reset();
+    mem_evicted_key_count_.reset();
+    mem_evicted_size_.reset();
+    nof_eviction_success_.reset();
+    nof_eviction_attempts_.reset();
+    nof_evicted_key_count_.reset();
+    nof_evicted_size_.reset();
+
+    put_start_discard_cnt_.reset();
+    put_start_release_cnt_.reset();
+
+    snapshot_success_.reset();
+    snapshot_fail_.reset();
+
+    copy_start_requests_.reset();
+    copy_start_failures_.reset();
+    copy_end_requests_.reset();
+    copy_end_failures_.reset();
+    copy_revoke_requests_.reset();
+    copy_revoke_failures_.reset();
+    move_start_requests_.reset();
+    move_start_failures_.reset();
+    move_end_requests_.reset();
+    move_end_failures_.reset();
+    move_revoke_requests_.reset();
+    move_revoke_failures_.reset();
+    evict_disk_replica_requests_.reset();
+    evict_disk_replica_failures_.reset();
+
+    create_copy_task_requests_.reset();
+    create_copy_task_failures_.reset();
+    create_move_task_requests_.reset();
+    create_move_task_failures_.reset();
+    query_task_requests_.reset();
+    query_task_failures_.reset();
+    fetch_tasks_requests_.reset();
+    fetch_tasks_failures_.reset();
+    mark_task_to_complete_requests_.reset();
+    mark_task_to_complete_failures_.reset();
+
+    // Drop the cached summary baseline; otherwise rate calculations would
+    // mix the previous term's counter deltas with the new term's zero base.
+    {
+        std::lock_guard<std::mutex> lock(summary_snapshot_mutex_);
+        summary_snapshot_ = SummarySnapshot{};
+    }
+}
+
 // Memory Storage Metrics
 void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
                                                  int64_t val) {

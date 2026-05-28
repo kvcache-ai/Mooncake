@@ -169,6 +169,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl),
       task_manager_(config.task_manager_config) {
+    // HA mode rebuilds MasterService on every etcd reconnect / leader
+    // transition, but MasterMetricManager is a process-level singleton, so
+    // gauges and per-term counters would otherwise carry over from the
+    // previous instance and either double-count (gauges, after the restore
+    // path re-inc's them) or accumulate silently (counters). Reset here so
+    // restore starts from a clean slate. See issues #2210 and #1186.
+    MasterMetricManager::instance().ResetTermScopedMetrics();
+
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
