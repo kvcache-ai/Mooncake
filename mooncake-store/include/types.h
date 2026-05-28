@@ -222,6 +222,10 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 
+inline std::string NormalizeTenantId(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB

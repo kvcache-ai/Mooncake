@@ -1084,6 +1084,83 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
+TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "shared_user_key";
+    const std::string tenant_a = "tenant_a";
+    const std::string tenant_b = "tenant_b";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
+    EXPECT_FALSE(service_->ExistKey(key).value());
+    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value());
+    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 2u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+}
+
+TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "regex_shared_key";
+    const std::string tenant_a = "tenant_regex_a";
+    const std::string tenant_b = "tenant_regex_b";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto default_matches = service_->GetReplicaListByRegex("^regex_shared");
+    ASSERT_TRUE(default_matches.has_value());
+    EXPECT_EQ(default_matches->size(), 1);
+
+    auto remove_default =
+        service_->RemoveByRegex("^regex_shared", /*force=*/true);
+    ASSERT_TRUE(remove_default.has_value());
+    EXPECT_EQ(remove_default.value(), 1);
+    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+
+    auto remove_tenant_a =
+        service_->RemoveByRegex("^regex_shared", tenant_a, /*force=*/true);
+    ASSERT_TRUE(remove_tenant_a.has_value());
+    EXPECT_EQ(remove_tenant_a.value(), 1);
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     // For backward compatibility, test the deprecated single preferred_segment
     std::unique_ptr<MasterService> service_(new MasterService());
