@@ -67,9 +67,10 @@ __device__ __forceinline__ void nvlink_signal(DeviceOps* dops,
                                               const NvLinkDeviceContext& ctx,
                                               int dst_rank,
                                               const void* local_base,
-                                              void* sig, uint64_t action) {
+                                              void* sig, int32_t action) {
     void* peer_sig = peer_ptr(ctx, dst_rank, local_base, sig);
-    dops->atomic_add_release(peer_sig, action);
+    // Release store to peer signal address (matches original st_na_release)
+    dops->store_release_32(peer_sig, static_cast<uint32_t>(action));
 }
 
 __device__ __forceinline__ void nvlink_wait_signal(DeviceOps* dops,
@@ -93,9 +94,11 @@ __device__ __forceinline__ void nvlink_red_add(DeviceOps* dops,
                                                const NvLinkDeviceContext& ctx,
                                                int dst_rank,
                                                const void* local_base,
-                                               void* sym, uint64_t val) {
+                                               void* sym, int32_t val) {
     void* peer_sym = peer_ptr(ctx, dst_rank, local_base, sym);
-    dops->atomic_add_release(peer_sym, val);
+    // P2P path uses release store (matches original st_na_release).
+    // IBGDA path uses atomic add; that's handled separately in ep_red_add.
+    dops->store_release_32(peer_sym, static_cast<uint32_t>(val));
 }
 
 __device__ __forceinline__ void nvlink_flush(DeviceOps* dops) {

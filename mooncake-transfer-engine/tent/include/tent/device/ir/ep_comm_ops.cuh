@@ -31,9 +31,11 @@
 
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <tent/device/mtlink.cuh>
+#include <tent/device/platform/musa/musa_ops.cuh>
 #else
 #include <tent/device/nvlink.cuh>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
+#include <tent/device/platform/cuda/cuda_ops.cuh>
 #endif
 
 namespace mooncake {
@@ -132,13 +134,9 @@ __device__ __forceinline__ void ep_put_ibgda(EpCommCtx& ctx,
 
 __device__ __forceinline__ void ep_signal(EpCommCtx& ctx,
                                            int dst_rank, int channel,
-                                           void* sig_ptr, int64_t action) {
+                                           void* sig_ptr, int32_t action) {
     if (dst_rank == ctx.rank) {
-        // Local signal — use st_na_release from mooncake_ep_utils
-        // (can't call st_na_release here since it's in a different header)
-        // The kernel handles local signals directly.
-        // This branch is kept for completeness; kernels should handle
-        // the local case before calling ep_signal.
+        // Local signal — kernel handles directly via st_na_release
         return;
     }
 
@@ -152,20 +150,22 @@ __device__ __forceinline__ void ep_signal(EpCommCtx& ctx,
 #endif
     } else {
 #ifndef MOONCAKE_EP_USE_MUSA
-        ibgda::ibgda_signal(&ctx.ibgda_ctx, channel, dst_rank, action);
+        ibgda::ibgda_signal(&ctx.ibgda_ctx, channel, dst_rank,
+                            static_cast<int64_t>(action));
 #endif
     }
 }
 
 __device__ __forceinline__ void ep_red_add(EpCommCtx& ctx,
                                             int dst_rank, int channel,
-                                            void* sym_ptr, uint64_t val) {
+                                            void* sym_ptr, int32_t val) {
     if (dst_rank == ctx.rank) {
-        // Local atomic add — kernel handles directly
+        // Local — kernel handles directly via st_na_release
         return;
     }
 
     if (ep_p2p_available(ctx, dst_rank)) {
+        // P2P path: release store (matches original st_na_release behavior)
 #ifdef MOONCAKE_EP_USE_MUSA
         mtlink::mtlink_red_add(ctx.dops, ctx.p2p_ctx, dst_rank,
                                ctx.local_base, sym_ptr, val);
@@ -174,8 +174,10 @@ __device__ __forceinline__ void ep_red_add(EpCommCtx& ctx,
                                ctx.local_base, sym_ptr, val);
 #endif
     } else {
+        // IBGDA path: atomic add (RDMA needs atomic visibility)
 #ifndef MOONCAKE_EP_USE_MUSA
-        ibgda::ibgda_red_add(&ctx.ibgda_ctx, channel, sym_ptr, val, dst_rank);
+        ibgda::ibgda_red_add(&ctx.ibgda_ctx, channel, sym_ptr,
+                             static_cast<uint64_t>(val), dst_rank);
 #endif
     }
 }

@@ -25,6 +25,10 @@ use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "").upper() in {
     "YES",
 }
 
+# MUSA builds must use TENT (mtlink); the raw IBGDA/mlx5gda path requires CUDA
+if use_musa:
+    use_tent = True
+
 sources = [
     "src/ep_py.cpp",
     "src/mooncake_ep_buffer.cpp",
@@ -50,6 +54,9 @@ else:
     BuildClass = BuildExtension
     if not use_tent:
         sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp")
+    else:
+        sources.append("../mooncake-transfer-engine/tent/src/transport/nvlink/nvlink_device.cpp")
+        sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
 
     if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")

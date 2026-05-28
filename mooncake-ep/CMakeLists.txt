@@ -39,6 +39,8 @@ include_directories(../mooncake-transfer-engine/tent/include)
 if(USE_MUSA)
   add_compile_definitions(MOONCAKE_EP_USE_MUSA USE_MUSA)
   include_directories(/usr/local/musa/include)
+  # MUSA builds must use TENT (mtlink); the raw IBGDA/mlx5gda path requires CUDA
+  set(USE_TENT ON)
 endif()
 if(USE_TENT)
   add_compile_definitions(MOONCAKE_EP_USE_TENT)

@@ -26,6 +26,11 @@ inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
 
 #ifdef MOONCAKE_EP_USE_TENT
 using tent::device::EpCommCtx;
+#ifndef MOONCAKE_EP_USE_MUSA
+using tent::device::ibgda::IbGdaCtx;
+using tent::device::ibgda::IbGdaQpDevCtx;
+using tent::device::cuda_platform::cudaDeviceOps;
+#endif
 #else
 using mooncake::tent::device::cuda_platform::cudaDeviceOps;
 using mooncake::tent::device::ibgda::IbGdaCtx;
@@ -317,7 +322,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
 #ifdef MOONCAKE_EP_USE_TENT
             tent::device::ep_red_add(comm_ctx, dst_rank, dst_expert_local_idx,
-                                     signal_ptr, static_cast<uint64_t>(-num_tokens_sent - 1));
+                                     signal_ptr, static_cast<int32_t>(-num_tokens_sent - 1));
 #else
             bool use_nvlink = nvlink_available[dst_rank] != 0;
             if (use_nvlink) {
