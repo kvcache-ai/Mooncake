@@ -1,8 +1,5 @@
-//! Route table operation implementations and their required contracts.
+//! Internal route table operation implementations.
 
 mod directory;
-mod traits;
 
-pub use directory::build_route_directory;
-pub(crate) use traits::RouteAuthorityClient;
-pub use traits::{RouteAuthorityService, RouteMembershipProvider};
+pub(crate) use directory::build_route_table_directory;

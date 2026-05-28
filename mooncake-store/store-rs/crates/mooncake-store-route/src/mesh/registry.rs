@@ -8,7 +8,7 @@ use mooncake_store_core::{
 use parking_lot::Mutex;
 
 use crate::metrics::record_cas_outcome;
-use crate::table::RouteAuthorityService;
+use crate::shim::RouteAuthorityService;
 
 pub(crate) fn bind_local_authority_service(
     namespace: &str,

@@ -17,7 +17,7 @@ use crate::mesh::{
     register_local_authority, unregister_local_authority,
 };
 use crate::metrics::{record_cas_outcome, record_route_repair_metric};
-use crate::table::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
+use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{
     canonical_route_key, compatibility_matches, route_capable, route_read_source, route_weight,
     sampled_per_key_debug_log, weighted_rendezvous_score,
@@ -29,7 +29,7 @@ const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 const SUSPECT_AUTHORITY_TTL: Duration = Duration::from_secs(5);
 
-pub fn build_route_directory(
+pub(crate) fn build_route_table_directory(
     mode: RouteControlMode,
     route_topk: usize,
     metadata: Arc<dyn MetadataBackend>,
