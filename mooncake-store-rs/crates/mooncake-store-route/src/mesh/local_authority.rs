@@ -10,7 +10,7 @@ use super::registry::{
     authority_list_routes, authority_list_routes_by_replica_owner, authority_replace,
     authority_replace_many, bind_local_authority_service,
 };
-use crate::table::RouteAuthorityService;
+use crate::shim::RouteAuthorityService;
 
 #[derive(Clone, Debug)]
 pub struct LocalRouteAuthority {

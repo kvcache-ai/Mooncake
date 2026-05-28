@@ -10,5 +10,7 @@ pub use control::{
 };
 pub use mesh::LocalRouteAuthority;
 pub use metrics::{set_route_metrics_sink, RouteMetricsSink};
-pub use shim::{RouteHitReporter, RouteOperations};
-pub use table::{build_route_directory, RouteAuthorityService, RouteMembershipProvider};
+pub use shim::{
+    build_route_directory, RouteAuthorityService, RouteHitReporter, RouteMembershipProvider,
+    RouteOperations,
+};

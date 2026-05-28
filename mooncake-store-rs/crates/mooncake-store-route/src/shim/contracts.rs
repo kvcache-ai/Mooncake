@@ -1,4 +1,4 @@
-//! Contracts required by route table implementations.
+//! Public integration contracts for the route table shim.
 
 use std::time::Instant;
 
