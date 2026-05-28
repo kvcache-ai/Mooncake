@@ -1063,6 +1063,10 @@ class MasterService {
             GUARDED_BY(mutex);
         std::unordered_map<std::string, PromotionTask> promotion_tasks
             GUARDED_BY(mutex);
+        // Count of objects that have at least one completed LOCAL_DISK replica.
+        // Used to compute eviction_base = metadata.size() - disk_object_count,
+        // excluding disk-only objects from the eviction denominator.
+        long disk_object_count GUARDED_BY(mutex) = 0;
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -1077,6 +1081,28 @@ class MasterService {
         MetadataShard* operator->() { return &shard_; }
 
         const MetadataShard* operator->() const { return &shard_; }
+
+        // Called after adding a LOCAL_DISK replica. Increments
+        // disk_object_count if this is the first LOCAL_DISK replica
+        // for the object (i.e., exactly 1 completed disk replica now).
+        void OnDiskReplicaAdded(const ObjectMetadata& metadata) {
+            size_t disk_count = metadata.CountReplicas(
+                [](const Replica& r) {
+                    return r.is_local_disk_replica() && r.is_completed();
+                });
+            if (disk_count == 1) shard_.disk_object_count++;
+        }
+
+        // Called after removing a LOCAL_DISK replica. Decrements
+        // disk_object_count if the object no longer has any
+        // completed LOCAL_DISK replicas.
+        void OnDiskReplicaRemoved(const ObjectMetadata& metadata) {
+            bool still_has_disk = metadata.HasReplica(
+                [](const Replica& r) {
+                    return r.is_local_disk_replica() && r.is_completed();
+                });
+            if (!still_has_disk) shard_.disk_object_count--;
+        }
 
        private:
         MetadataShard& shard_;
@@ -1107,7 +1133,8 @@ class MasterService {
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
         ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        MetadataShardAccessorRW* shard = nullptr);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
