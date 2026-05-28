@@ -17,6 +17,12 @@
 
 namespace mooncake::test {
 
+std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
+    const std::string& root_fs_dir) {
+    return std::make_unique<MasterService>(
+        MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
+}
+
 class MasterMetricsTest : public ::testing::Test {
    protected:
     struct HttpResponse {
@@ -611,6 +617,113 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+}
+
+TEST_F(MasterMetricsTest, BatchGetReplicaListUpdatesDiskHitMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    constexpr size_t kBuffer = 0x600000000;
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "batch_disk_metrics_segment";
+    segment.base = kBuffer;
+    segment.size = kSegmentSize;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::vector<std::string> keys = {"batch_disk_k1", "batch_disk_k2"};
+    for (const auto& key : keys) {
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, kValueSize, config).has_value());
+        ASSERT_TRUE(
+            service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
+        ASSERT_TRUE(
+            service_->PutEnd(client_id, key, ReplicaType::DISK).has_value());
+    }
+
+    auto before = metrics.calculate_cache_stats();
+    auto batch_get_results = service_->BatchGetReplicaList(keys);
+    ASSERT_EQ(batch_get_results.size(), keys.size());
+    for (const auto& result : batch_get_results) {
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->replicas.size(), 1u);
+        EXPECT_TRUE(result->replicas[0].is_disk_replica());
+    }
+
+    auto after = metrics.calculate_cache_stats();
+    EXPECT_EQ(
+        after[MasterMetricManager::CacheHitStat::SSD_HITS] -
+            before[MasterMetricManager::CacheHitStat::SSD_HITS],
+        static_cast<double>(keys.size()));
+}
+
+TEST_F(MasterMetricsTest, BatchPutEndAndRevokeExerciseDiskMetricPaths) {
+    auto& metrics = MasterMetricManager::instance();
+    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
+
+    constexpr size_t kBuffer = 0x700000000;
+    constexpr size_t kSegmentSize = 64 * 1024 * 1024;
+    constexpr uint64_t kValueSize = 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "batch_disk_put_paths_segment";
+    segment.base = kBuffer;
+    segment.size = kSegmentSize;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::vector<std::string> disk_end_keys = {"batch_end_disk_k1",
+                                                    "batch_end_disk_k2"};
+    for (const auto& key : disk_end_keys) {
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, kValueSize, config).has_value());
+        ASSERT_TRUE(
+            service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+
+    auto before_end = metrics.calculate_cache_stats();
+    auto put_end_results =
+        service_->BatchPutEnd(client_id, disk_end_keys, ReplicaType::DISK);
+    ASSERT_EQ(put_end_results.size(), disk_end_keys.size());
+    for (const auto& result : put_end_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto after_end = metrics.calculate_cache_stats();
+    EXPECT_EQ(
+        after_end[MasterMetricManager::CacheHitStat::SSD_TOTAL] -
+            before_end[MasterMetricManager::CacheHitStat::SSD_TOTAL],
+        static_cast<double>(disk_end_keys.size()));
+
+    const std::vector<std::string> disk_revoke_keys = {"batch_revoke_disk_k1",
+                                                       "batch_revoke_disk_k2"};
+    for (const auto& key : disk_revoke_keys) {
+        ASSERT_TRUE(
+            service_->PutStart(client_id, key, kValueSize, config).has_value());
+        ASSERT_TRUE(
+            service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
+    }
+
+    auto put_revoke_results = service_->BatchPutRevoke(
+        client_id, disk_revoke_keys, ReplicaType::DISK);
+    ASSERT_EQ(put_revoke_results.size(), disk_revoke_keys.size());
+    for (const auto& result : put_revoke_results) {
+        ASSERT_TRUE(result.has_value());
+    }
 }
 
 TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {

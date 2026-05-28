@@ -936,12 +936,12 @@ class MasterService {
             });
         }
 
-        // Grant a lease with timeout as now() + ttl, only update if the new
-        // timeout is larger
-        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) const {
+        // Grant a lease with timeout as now + ttl, only update if the new
+        // timeout is larger.
+        void GrantLeaseAt(
+            const std::chrono::system_clock::time_point& now,
+            const uint64_t ttl, const uint64_t soft_ttl) const {
             SpinLocker locker(&lock);
-            std::chrono::system_clock::time_point now =
-                std::chrono::system_clock::now();
             lease_timeout =
                 std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
             if (soft_pin_timeout) {
@@ -949,6 +949,12 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
+        }
+
+        // Grant a lease with timeout as now() + ttl, only update if the new
+        // timeout is larger
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) const {
+            GrantLeaseAt(std::chrono::system_clock::now(), ttl, soft_ttl);
         }
 
         // Check if the lease has expired

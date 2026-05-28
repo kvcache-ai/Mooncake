@@ -774,17 +774,22 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     std::vector<std::vector<std::pair<size_t, const std::string*>>>
         keys_by_shard(kNumShards);
+    std::vector<size_t> touched_shards;
+    touched_shards.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+        size_t shard_idx = getShardIndex(keys[i]);
+        if (keys_by_shard[shard_idx].empty()) {
+            touched_shards.push_back(shard_idx);
+        }
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+    const auto lease_now = std::chrono::system_clock::now();
+    for (size_t shard_idx : touched_shards) {
         auto& key_group = keys_by_shard[shard_idx];
-        if (key_group.empty()) {
-            continue;
-        }
         MetadataShardAccessorRO shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -797,8 +802,8 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 
             const auto& metadata = it->second;
             if (metadata.HasReplica(&Replica::fn_is_completed)) {
-                metadata.GrantLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
+                metadata.GrantLeaseAt(lease_now, default_kv_lease_ttl_,
+                                      default_kv_soft_pin_ttl_);
                 results[original_idx] = true;
             } else {
                 results[original_idx] = false;
@@ -1169,24 +1174,33 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
         keys.size());
     std::vector<std::vector<std::pair<size_t, const std::string*>>>
         keys_by_shard(kNumShards);
+    std::vector<size_t> touched_shards;
+    touched_shards.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+        size_t shard_idx = getShardIndex(keys[i]);
+        if (keys_by_shard[shard_idx].empty()) {
+            touched_shards.push_back(shard_idx);
+        }
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
     std::vector<std::string> promotion_keys;
     promotion_keys.reserve(keys.size());
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+    const auto lease_now = std::chrono::system_clock::now();
+    int64_t total_get_incs = 0;
+    int64_t valid_get_incs = 0;
+    int64_t mem_cache_hit_incs = 0;
+    int64_t file_cache_hit_incs = 0;
+    for (size_t shard_idx : touched_shards) {
         auto& key_group = keys_by_shard[shard_idx];
-        if (key_group.empty()) {
-            continue;
-        }
         MetadataShardAccessorRO shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
-            MasterMetricManager::instance().inc_total_get_nums();
+            ++total_get_incs;
 
             auto it = shard->metadata.find(key);
             if (it == shard->metadata.end() || !it->second.IsValid()) {
@@ -1212,13 +1226,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
             }
 
             if (replica_list[0].is_memory_replica()) {
-                MasterMetricManager::instance().inc_mem_cache_hit_nums();
+                ++mem_cache_hit_incs;
             } else if (replica_list[0].is_disk_replica()) {
-                MasterMetricManager::instance().inc_file_cache_hit_nums();
+                ++file_cache_hit_incs;
             }
-            MasterMetricManager::instance().inc_valid_get_nums();
-            metadata.GrantLease(default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+            ++valid_get_incs;
+            metadata.GrantLeaseAt(lease_now, default_kv_lease_ttl_,
+                                  default_kv_soft_pin_ttl_);
 
             if (promotion_on_hit_) {
                 const bool any_memory =
@@ -1233,6 +1247,21 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
             results[original_idx] = GetReplicaListResponse(
                 std::move(replica_list), default_kv_lease_ttl_);
         }
+    }
+
+    if (total_get_incs > 0) {
+        MasterMetricManager::instance().inc_total_get_nums(total_get_incs);
+    }
+    if (valid_get_incs > 0) {
+        MasterMetricManager::instance().inc_valid_get_nums(valid_get_incs);
+    }
+    if (mem_cache_hit_incs > 0) {
+        MasterMetricManager::instance().inc_mem_cache_hit_nums(
+            mem_cache_hit_incs);
+    }
+    if (file_cache_hit_incs > 0) {
+        MasterMetricManager::instance().inc_file_cache_hit_nums(
+            file_cache_hit_incs);
     }
 
     shared_lock.unlock();
@@ -1640,17 +1669,24 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     std::vector<std::vector<std::pair<size_t, const std::string*>>>
         keys_by_shard(kNumShards);
+    std::vector<size_t> touched_shards;
+    touched_shards.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+        size_t shard_idx = getShardIndex(keys[i]);
+        if (keys_by_shard[shard_idx].empty()) {
+            touched_shards.push_back(shard_idx);
+        }
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+    const auto lease_now = std::chrono::system_clock::now();
+    int64_t mem_cache_incs = 0;
+    int64_t file_cache_incs = 0;
+    for (size_t shard_idx : touched_shards) {
         auto& key_group = keys_by_shard[shard_idx];
-        if (key_group.empty()) {
-            continue;
-        }
         MetadataShardAccessorRW shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -1718,13 +1754,19 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
             if (replica_type == ReplicaType::MEMORY ||
                 (replica_type == ReplicaType::ALL &&
                  metadata.HasMemReplica())) {
-                MasterMetricManager::instance().inc_mem_cache_nums();
+                ++mem_cache_incs;
             } else if (replica_type == ReplicaType::DISK) {
-                MasterMetricManager::instance().inc_file_cache_nums();
+                ++file_cache_incs;
             }
-            metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+            metadata.GrantLeaseAt(lease_now, 0, default_kv_soft_pin_ttl_);
             results[original_idx] = {};
         }
+    }
+    if (mem_cache_incs > 0) {
+        MasterMetricManager::instance().inc_mem_cache_nums(mem_cache_incs);
+    }
+    if (file_cache_incs > 0) {
+        MasterMetricManager::instance().inc_file_cache_nums(file_cache_incs);
     }
     return results;
 }
@@ -1735,17 +1777,23 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     std::vector<tl::expected<void, ErrorCode>> results(keys.size());
     std::vector<std::vector<std::pair<size_t, const std::string*>>>
         keys_by_shard(kNumShards);
+    std::vector<size_t> touched_shards;
+    touched_shards.reserve(
+        std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+        size_t shard_idx = getShardIndex(keys[i]);
+        if (keys_by_shard[shard_idx].empty()) {
+            touched_shards.push_back(shard_idx);
+        }
+        keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+    int64_t mem_cache_decs = 0;
+    int64_t file_cache_decs = 0;
+    for (size_t shard_idx : touched_shards) {
         auto& key_group = keys_by_shard[shard_idx];
-        if (key_group.empty()) {
-            continue;
-        }
         MetadataShardAccessorRW shard(this, shard_idx);
         for (const auto& [original_idx, key_ptr] : key_group) {
             const std::string& key = *key_ptr;
@@ -1789,9 +1837,9 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
             if (replica_type == ReplicaType::MEMORY ||
                 (replica_type == ReplicaType::ALL &&
                  metadata.HasMemReplica())) {
-                MasterMetricManager::instance().dec_mem_cache_nums();
+                ++mem_cache_decs;
             } else if (replica_type == ReplicaType::DISK) {
-                MasterMetricManager::instance().dec_file_cache_nums();
+                ++file_cache_decs;
             }
 
             metadata.EraseReplicas([replica_type](const Replica& replica) {
@@ -1812,6 +1860,12 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
             }
             results[original_idx] = {};
         }
+    }
+    if (mem_cache_decs > 0) {
+        MasterMetricManager::instance().dec_mem_cache_nums(mem_cache_decs);
+    }
+    if (file_cache_decs > 0) {
+        MasterMetricManager::instance().dec_file_cache_nums(file_cache_decs);
     }
     return results;
 }
