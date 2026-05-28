@@ -4540,6 +4540,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto now = std::chrono::system_clock::now();
     long evicted_count = 0;
     long object_count = 0;
+    long shards_skipped = 0;
     uint64_t total_freed_size = 0;
 
     // Candidates for second pass eviction
@@ -4655,6 +4656,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Single pass: per-shard scan + immediate eviction, stop early when enough
     // bytes are freed. Uses per-shard eviction_base = metadata.size() - disk_object_count
     // for quota calculation, excluding disk-only objects from the denominator.
+    // Skips shards that are entirely disk-only (eviction_base == 0) to avoid
+    // costly iteration over objects that can never be evicted.
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
 
@@ -4663,6 +4666,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         object_count += shard->metadata.size();
         long eviction_base = shard->metadata.size() - shard->disk_object_count;
         total_eviction_base += eviction_base;
+
+        // Skip shards with no evictable objects
+        if (eviction_base <= 0) {
+            shards_skipped++;
+            continue;
+        }
 
         // Per-shard eviction quota based on this shard's eviction base
         const long ideal_evict_num =
@@ -4736,6 +4745,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
               << (object_count > 0
                       ? (double)(object_count - total_eviction_base) / object_count
                       : 0.0)
+              << " shards_skipped=" << shards_skipped << "/" << kNumShards
               << " ideal_evict_num_inflated="
               << (long)std::ceil(object_count * evict_ratio_target)
               << " ideal_evict_num_correct="
@@ -4903,6 +4913,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   << (object_count > 0
                           ? (double)(object_count - total_eviction_base) / object_count
                           : 0.0)
+                  << " shards_skipped=" << shards_skipped << "/" << kNumShards
                   << " ideal_evict_num_inflated="
                   << (long)std::ceil(object_count * evict_ratio_target)
                   << " ideal_evict_num_correct="
