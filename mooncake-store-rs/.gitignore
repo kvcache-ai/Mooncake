@@ -6,7 +6,3 @@
 !/scripts/build/
 !/scripts/build/*.sh
 *.egg-info/
-__pycache__/
-*.pyc
-*.so
-dockerfiles/Dockerfile.local-test
