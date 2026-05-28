@@ -4656,22 +4656,28 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Single pass: per-shard scan + immediate eviction, stop early when enough
     // bytes are freed. Uses per-shard eviction_base = metadata.size() - disk_object_count
     // for quota calculation, excluding disk-only objects from the denominator.
-    // Skips shards that are entirely disk-only (eviction_base == 0) to avoid
-    // costly iteration over objects that can never be evicted.
+    // Skips shards that are entirely disk-only to avoid holding write locks
+    // and iterating over large shard maps unnecessarily.
     for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
+        size_t shard_idx = (start_idx + i) % kNumShards;
+        long eviction_base = 0;
+
+        // Quick read-only check: skip disk-only shards without taking write lock
+        {
+            MetadataShardAccessorRO ro_shard(this, shard_idx);
+            size_t meta_size = ro_shard->metadata.size();
+            eviction_base = meta_size - ro_shard->disk_object_count;
+            object_count += meta_size;
+            total_eviction_base += eviction_base;
+            if (eviction_base <= 0) {
+                shards_skipped++;
+                continue;
+            }
+        }
+
+        MetadataShardAccessorRW shard(this, shard_idx);
 
         DiscardExpiredProcessingReplicas(shard, now);
-
-        object_count += shard->metadata.size();
-        long eviction_base = shard->metadata.size() - shard->disk_object_count;
-        total_eviction_base += eviction_base;
-
-        // Skip shards with no evictable objects
-        if (eviction_base <= 0) {
-            shards_skipped++;
-            continue;
-        }
 
         // Per-shard eviction quota based on this shard's eviction base
         const long ideal_evict_num =
