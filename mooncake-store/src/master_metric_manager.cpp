@@ -269,18 +269,23 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
-      // Initialize cache hit rate metrics
+      // Initialize Store-observed cache reuse metrics. These are not
+      // end-to-end request/token-level cache hit ratio metrics.
       mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
+                          "Total number of GetReplicaList results served from "
+                          "the memory pool"),
       file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
+                           "Total number of GetReplicaList results served from "
+                           "the SSD cache"),
       mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
+                      "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
+                       "Current number of cached values in the SSD cache"),
       valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
+                      "Total number of GetReplicaList operations that returned "
+                      "at least one completed replica"),
+      total_get_nums_("total_get_nums_",
+                      "Total number of GetReplicaList operations"),
 
       // Initialize Eviction Counters
       // total eviction
@@ -506,7 +511,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_items_.inc(0);
     batch_put_revoke_failed_items_.inc(0);
 
-    // Update cache hit rate metrics
+    // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
     valid_get_nums_.inc(0);
@@ -762,7 +767,7 @@ int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
 }
 
-// cache hit rate metrics
+// Store-observed cache reuse metrics
 void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
     mem_cache_hit_nums_.inc(val);
 }
@@ -1665,25 +1670,33 @@ MasterMetricManager::calculate_cache_stats() {
     int64_t valid_get_nums = valid_get_nums_.value();
     int64_t total_get_nums = total_get_nums_.value();
 
-    double mem_hit_rate = 0.0;
+    // These values divide cumulative Store-observed hits by the current cached
+    // object count. They are not bounded request/token-level hit ratios; that
+    // end-to-end metric belongs to Conductor or the inference engine.
+    double mem_hits_per_current_cached_object = 0.0;
     if (mem_total_cache > 0) {
-        mem_hit_rate = static_cast<double>(mem_cache_hits) /
-                       static_cast<double>(mem_total_cache);
-        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+        mem_hits_per_current_cached_object =
+            static_cast<double>(mem_cache_hits) /
+            static_cast<double>(mem_total_cache);
+        mem_hits_per_current_cached_object =
+            std::round(mem_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double ssd_hit_rate = 0.0;
+    double ssd_hits_per_current_cached_object = 0.0;
     if (ssd_total_cache > 0) {
-        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
-                       static_cast<double>(ssd_total_cache);
-        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+        ssd_hits_per_current_cached_object =
+            static_cast<double>(ssd_cache_hits) /
+            static_cast<double>(ssd_total_cache);
+        ssd_hits_per_current_cached_object =
+            std::round(ssd_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double total_hit_rate = 0.0;
+    double overall_hits_per_current_cached_object = 0.0;
     if (total_cache > 0) {
-        total_hit_rate =
+        overall_hits_per_current_cached_object =
             static_cast<double>(total_hits) / static_cast<double>(total_cache);
-        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+        overall_hits_per_current_cached_object =
+            std::round(overall_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
     double valid_get_rate = 0.0;
@@ -1697,10 +1710,12 @@ MasterMetricManager::calculate_cache_stats() {
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
     add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE,
+                     mem_hits_per_current_cached_object);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE,
+                     ssd_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
-                     total_hit_rate);
+                     overall_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
     return stats_dict;
 }

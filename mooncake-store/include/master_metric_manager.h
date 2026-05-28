@@ -58,7 +58,16 @@ class MasterMetricManager {
         MEMORY_HIT_RATE,
         SSD_HIT_RATE,
         OVERALL_HIT_RATE,
-        VALID_GET_RATE
+        VALID_GET_RATE,
+        // Clearer aliases for Store-observed counters. The legacy names above
+        // are kept to preserve RPC/API enum values.
+        MEMORY_CURRENT_CACHED_OBJECTS = MEMORY_TOTAL,
+        SSD_CURRENT_CACHED_OBJECTS = SSD_TOTAL,
+        // These values may exceed 1.0 because the numerator is cumulative
+        // while the denominator is the current cached object count.
+        MEMORY_HITS_PER_CURRENT_CACHED_OBJECT = MEMORY_HIT_RATE,
+        SSD_HITS_PER_CURRENT_CACHED_OBJECT = SSD_HIT_RATE,
+        OVERALL_HITS_PER_CURRENT_CACHED_OBJECT = OVERALL_HIT_RATE
     };
     using CacheHitStatDict = std::unordered_map<CacheHitStat, double>;
     void add_stat_to_dict(CacheHitStatDict&, CacheHitStat, double);
@@ -581,7 +590,8 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
 
-    // cache hit Statistics
+    // Store-observed cache reuse statistics. These counters do not represent
+    // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
     ylt::metric::gauge_t mem_cache_nums_;
