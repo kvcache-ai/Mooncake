@@ -44,24 +44,6 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
-struct WriteConfigExt {
-    WriteRouteRequestConfig route_config{};
-    RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
-
-    WriteConfigExt() = default;
-    /** Promotes legacy write-route-only config for variant overload resolution.
-     */
-    WriteConfigExt(WriteRouteRequestConfig r) : route_config(std::move(r)) {}
-};
-YLT_REFL(WriteConfigExt, route_config, rdma_direction_mode);
-
-inline std::ostream& operator<<(std::ostream& os,
-                                const WriteConfigExt& config) {
-    os << "WriteConfigExt: { route_config: [" << config.route_config
-       << "], rdma_direction_mode: " << config.rdma_direction_mode << " }";
-    return os;
-}
-
 /**
  * @brief Request structure for getting write route.
  */

@@ -90,7 +90,7 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
         const std::string& object_key,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -99,7 +99,7 @@ class P2PClientService final : public ClientService {
      */
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadConfigExt& config = {}) override;
+               const ReadRouteConfig& config = {}) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -113,23 +113,23 @@ class P2PClientService final : public ClientService {
     tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
     BatchGet(const std::vector<std::string>& keys,
              std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadConfigExt& config = {}) override;
+             const ReadRouteConfig& config = {}) override;
 
     tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
         const std::vector<size_t>& sizes,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadConfigExt& config = {},
+        const ReadRouteConfig& config = {},
         bool aggregate_same_segment_task = false) override;
 
     /**
@@ -384,10 +384,10 @@ class P2PClientService final : public ClientService {
         const std::vector<Replica::Descriptor>& replicas);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
-        std::string_view key, const ReadConfigExt& config);
+        std::string_view key, const ReadRouteConfig& config);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
-        std::string_view key, const ReadConfigExt& config,
+        std::string_view key, const ReadRouteConfig& config,
         std::vector<ResolvedRoute> pre_fetched);
 
    private:
@@ -399,30 +399,30 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadConfigExt& config);
+        const ReadRouteConfig& config);
 
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::vector<std::vector<Slice>>& all_slices,
-        const ReadConfigExt& config);
+        const ReadRouteConfig& config);
 
     template <typename LocalGetFn, typename RemoteGetFn>
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
     BatchCreateGetHandlesImpl(const std::vector<std::string>& keys,
-                              const ReadConfigExt& config,
+                              const ReadRouteConfig& config,
                               LocalGetFn&& local_get, RemoteGetFn&& remote_get);
 
     std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
     BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
-                         const ReadConfigExt& config);
+                         const ReadRouteConfig& config);
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadConfigExt& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::vector<Slice>& slices,
-        const ReadConfigExt& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
 
     /**
      * @brief Launch async reads driven by a RouteIterator.
@@ -468,7 +468,7 @@ class P2PClientService final : public ClientService {
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
-                                 const ReadConfigExt& config);
+                                 const ReadRouteConfig& config);
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.
@@ -501,6 +501,9 @@ class P2PClientService final : public ClientService {
 
     // HA recovery manager
     std::unique_ptr<HARecoveryManager> ha_manager_;
+
+    // Cross-node RDMA direction from P2PClientConfig at Init().
+    RdmaDirectionMode rdma_direction_mode_ = RdmaDirectionMode::REVERSE;
 };
 
 }  // namespace mooncake

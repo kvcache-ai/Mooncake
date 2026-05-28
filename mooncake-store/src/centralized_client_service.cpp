@@ -255,7 +255,7 @@ void CentralizedClientService::InitTransferSubmitter() {
 
 tl::expected<std::unique_ptr<QueryResult>, ErrorCode>
 CentralizedClientService::Query(const std::string& object_key,
-                                const ReadConfigExt& config) {
+                                const ReadRouteConfig& config) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -264,7 +264,7 @@ CentralizedClientService::Query(const std::string& object_key,
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
     auto result =
-        master_client_.GetReplicaList(object_key, config.route_config);
+        master_client_.GetReplicaList(object_key, config);
     if (!result) {
         LOG(ERROR) << "Failed to get replica list: " << result.error();
         return tl::unexpected(result.error());
@@ -284,7 +284,7 @@ CentralizedClientService::Query(const std::string& object_key,
 
 std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
 CentralizedClientService::BatchQuery(
-    const std::vector<std::string>& object_keys, const ReadConfigExt& config) {
+    const std::vector<std::string>& object_keys, const ReadRouteConfig& config) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -301,7 +301,7 @@ CentralizedClientService::BatchQuery(
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
     auto response =
-        master_client_.BatchGetReplicaList(key_views, config.route_config);
+        master_client_.BatchGetReplicaList(key_views, config);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -392,7 +392,7 @@ CentralizedClientService::BatchReplicaClear(
 tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>
 CentralizedClientService::Get(const std::string& key,
                               std::shared_ptr<ClientBufferAllocator> allocator,
-                              const ReadConfigExt& config) {
+                              const ReadRouteConfig& config) {
     if (!allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -447,7 +447,7 @@ std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
 CentralizedClientService::BatchGet(
     const std::vector<std::string>& keys,
     std::shared_ptr<ClientBufferAllocator> allocator,
-    const ReadConfigExt& config) {
+    const ReadRouteConfig& config) {
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
 
@@ -549,7 +549,7 @@ CentralizedClientService::BatchGet(
 
 tl::expected<int64_t, ErrorCode> CentralizedClientService::Get(
     const std::string& key, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, const ReadConfigExt& config) {
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
     // Step 1: Query metadata from master
     auto query_result = Query(key, config);
     if (!query_result) {
@@ -594,7 +594,7 @@ CentralizedClientService::BatchGet(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
-    const ReadConfigExt& config, bool aggregate_same_segment_task) {
+    const ReadRouteConfig& config, bool aggregate_same_segment_task) {
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
         return std::vector<tl::expected<int64_t, ErrorCode>>(

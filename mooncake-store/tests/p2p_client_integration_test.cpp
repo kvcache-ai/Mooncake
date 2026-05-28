@@ -35,7 +35,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
 
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port = 0,
-        const std::string& local_transfer_mode = "te") {
+        const std::string& local_transfer_mode = "te",
+        RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -47,6 +48,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
         } else {
             config.local_transfer_mode = LocalTransferMode::MEMCPY;
         }
+        config.rdma_direction_mode = rdma_direction_mode;
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.metrics_port,
@@ -628,7 +630,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         SCOPED_TRACE("local_transfer_mode=" + mode);
 
         std::string host = "localhost:" + std::to_string(getFreeTcpPort());
-        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode);
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode,
+                                             RdmaDirectionMode::FORWARD);
         ASSERT_NE(remote_writer, nullptr);
 
         const std::string key = "p2p_fwd_put_get_" + mode + "_" + host;
@@ -639,21 +642,16 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
         route.prefer_local = false;
         route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 
-        WriteConfigExt wcfg(route);
-        wcfg.rdma_direction_mode = RdmaDirectionMode::FORWARD;
-
         std::vector<Slice> slices;
         slices.emplace_back(
             Slice{const_cast<char*>(payload.data()), payload.size()});
-        auto put_res = remote_writer->Put(key, slices, wcfg);
+        auto put_res = remote_writer->Put(key, slices, route);
         ASSERT_TRUE(put_res.has_value())
             << "Forward Put failed mode=" << mode
             << " err=" << static_cast<int>(put_res.error());
 
-        ReadConfigExt rcfg;
-        rcfg.route_config.max_candidates =
-            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
-        rcfg.rdma_direction_mode = RdmaDirectionMode::FORWARD;
+        ReadRouteConfig rcfg;
+        rcfg.max_candidates = GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<char> buf(payload.size(), 0);
         auto get_res =

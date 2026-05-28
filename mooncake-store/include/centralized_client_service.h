@@ -53,11 +53,11 @@ class CentralizedClientService
 
     tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
         const std::string& object_key,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadConfigExt& config = {}) override;
+               const ReadRouteConfig& config = {}) override;
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
@@ -75,24 +75,24 @@ class CentralizedClientService
     tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
         const std::vector<size_t>& sizes,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<int64_t, ErrorCode>> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadConfigExt& config = {},
+        const ReadRouteConfig& config = {},
         bool aggregate_same_segment_task = false) override;
 
     tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadConfigExt& config = {}) override;
+        const ReadRouteConfig& config = {}) override;
 
     std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
     BatchGet(const std::vector<std::string>& keys,
              std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadConfigExt& config = {}) override;
+             const ReadRouteConfig& config = {}) override;
 
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                       std::vector<Slice>& slices,

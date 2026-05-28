@@ -29,7 +29,7 @@
 namespace mooncake {
 
 using WriteConfig =
-    std::variant<ReplicateConfig, WriteRouteRequestConfig, WriteConfigExt>;
+    std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
 /**
  * @brief Result of a query operation containing replica information
@@ -119,7 +119,7 @@ class ClientService {
      * indicating failure
      */
     virtual tl::expected<std::unique_ptr<QueryResult>, ErrorCode> Query(
-        const std::string& object_key, const ReadConfigExt& config = {}) = 0;
+        const std::string& object_key, const ReadRouteConfig& config = {}) = 0;
 
     /**
      * @brief Batch query object metadata without transferring data
@@ -128,7 +128,7 @@ class ClientService {
      */
     virtual std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
     BatchQuery(const std::vector<std::string>& object_keys,
-               const ReadConfigExt& config = {}) = 0;
+               const ReadRouteConfig& config = {}) = 0;
 
     /**
      * @brief Gets data with memory allocation
@@ -141,12 +141,12 @@ class ClientService {
     virtual tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> Get(
         const std::string& key,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadConfigExt& config = {}) = 0;
+        const ReadRouteConfig& config = {}) = 0;
 
     virtual std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
     BatchGet(const std::vector<std::string>& keys,
              std::shared_ptr<ClientBufferAllocator> allocator,
-             const ReadConfigExt& config = {}) = 0;
+             const ReadRouteConfig& config = {}) = 0;
 
     /**
      * @brief Gets data into user-provided buffers without memory allocation
@@ -158,7 +158,7 @@ class ClientService {
      */
     virtual tl::expected<int64_t, ErrorCode> Get(
         const std::string& key, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes, const ReadConfigExt& config = {}) = 0;
+        const std::vector<size_t>& sizes, const ReadRouteConfig& config = {}) = 0;
 
     /**
      * @brief Batch get data into user-provided buffers
@@ -176,7 +176,7 @@ class ClientService {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& all_buffers,
         const std::vector<std::vector<size_t>>& all_sizes,
-        const ReadConfigExt& config = {},
+        const ReadRouteConfig& config = {},
         bool aggregate_same_segment_task = false) = 0;
 
     /**
