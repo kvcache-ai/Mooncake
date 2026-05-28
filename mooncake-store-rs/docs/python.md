@@ -176,6 +176,7 @@ By default the script:
 - installs `maturin`
 - installs `build` for the Pro metapackage
 - embeds the standalone `mooncake-store-client` and `mooncake-store-admin` binaries into the runtime wheel package
+- embeds the build Python `libpython*.so` needed by those standalone binaries and restores that dependency after `auditwheel repair`, because the binaries run as subprocesses from a wheel install rather than as Python extension modules
 - builds both wheels into `dist/wheels/`
 - copies the standalone `mooncake-store-client` and `mooncake-store-admin` artifacts into `dist/bin/`
 
