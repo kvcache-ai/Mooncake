@@ -86,8 +86,8 @@ not write directly to selected route authorities.
 The route crate is split into three route-specific layers:
 
 - `shim`: public object route operation and integration shim, including `RouteOperations`, `build_route_directory`, hit reporting, and authority/membership contracts
-- `table`: internal route table operation implementations
-- `mesh`: route authority mesh internals, including local authority binding and per-authority indexes
+- `table`: single-authority local route table storage, CAS, and indexes
+- `mesh`: distributed route-authority protocol, including Embedded WRH selection, primary CAS, mirror/repair/fallback, local authority binding, and per-authority table registration
 
 Route authority policy is bootstrap-validated through metadata:
 
@@ -492,7 +492,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-route` | object route table component split into `shim` for public operation/integration facade, `table` for internal route table implementations, `mesh` for route authority internals, plus `control`, `metrics`, and `util` |
+| `crates/mooncake-store-route` | object route table component split into `shim` for public operation/integration facade and metadata adapter, `table` for single-authority local route tables, `mesh` for distributed route-authority protocol, plus `control`, `metrics`, and `util` |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
 | `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |
