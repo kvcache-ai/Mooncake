@@ -28,8 +28,8 @@ size_t remove_store_memory_range(void* ptr) {
         return 0;
     }
 
-    size_t sz = it->size;             // 先保存 size
-    g_ub_store_mem_ranges.erase(it);  // 再删除
+    size_t sz = it->size;
+    g_ub_store_mem_ranges.erase(it);
     return sz;
 }
 

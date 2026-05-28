@@ -2,6 +2,7 @@
 #include "mmap_arena.h"
 #include "config.h"
 #include "common.h"
+#include "ub_allocator.h"
 
 #include <Slab.h>
 #include <gflags/gflags.h>
