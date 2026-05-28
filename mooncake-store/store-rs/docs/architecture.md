@@ -159,11 +159,11 @@ envelope: transient `no placement candidates` / `not enough writable owners` win
 briefly, refresh membership again, and wait for a standby successor to become active before the
 batch gives up.
 
-Delete follows a rollout-era convergence rule now. If a route tombstone CAS loses to a fresher
-still-active route version during cleanup or handoff, the client only retries when that returned
-current route still matches the same rollout successor lineage and published payload identity.
-Ordinary delete-versus-rewrite races still surface a conflict instead of deleting the fresher
-rewrite.
+Delete follows a rollout-era convergence rule now. If a route delete CAS loses to a fresher
+still-active route version during cleanup or handoff, the client only retries when metadata can
+prove that the fresher route is a targeted hot-upgrade or standby-promotion successor for the same
+replica lineage. Ordinary delete-versus-rewrite races, including same-payload rewrites, still
+surface a conflict instead of deleting the fresher rewrite.
 
 Segment-announcement metadata faults such as missing or non-contiguous published storage target
 chunks are treated as stale segment state first. The client invalidates cached segment state and

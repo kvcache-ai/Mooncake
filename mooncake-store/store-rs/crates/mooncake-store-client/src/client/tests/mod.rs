@@ -2730,7 +2730,21 @@ fn remove_retries_after_route_delete_conflict_with_fresher_current() {
     );
 
     let mut route_v2 = route_v1.clone();
+    let successor_runtime = ClientRuntimeId::new("delete-conflict-writer", ClientEpoch(2));
+    metadata
+        .put_handoff(&HandoffPlan {
+            stable_id: route_v1.replicas[0].owner.stable_id.clone(),
+            from: route_v1.replicas[0].owner.clone(),
+            to: successor_runtime.clone(),
+            kind: HandoffKind::HotUpgrade,
+            barrier_version: route_v1.version.0,
+            created_at_ms: now_ms(),
+            deadline_ms: None,
+        })
+        .expect("handoff plan should publish");
     route_v2.version = route_v1.version.next();
+    route_v2.replicas[0].owner = successor_runtime;
+    route_v2.replicas[0].segment_name = SegmentName::new("delete-conflict-writer-successor");
     let cas = inner
         .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
         .expect("concurrent route update should succeed");
@@ -2807,7 +2821,21 @@ fn batch_remove_retries_after_route_delete_conflict_with_fresher_current() {
     );
 
     let mut route_v2 = route_v1.clone();
+    let successor_runtime = ClientRuntimeId::new("batch-delete-conflict-writer", ClientEpoch(2));
+    metadata
+        .put_handoff(&HandoffPlan {
+            stable_id: route_v1.replicas[0].owner.stable_id.clone(),
+            from: route_v1.replicas[0].owner.clone(),
+            to: successor_runtime.clone(),
+            kind: HandoffKind::HotUpgrade,
+            barrier_version: route_v1.version.0,
+            created_at_ms: now_ms(),
+            deadline_ms: None,
+        })
+        .expect("handoff plan should publish");
     route_v2.version = route_v1.version.next();
+    route_v2.replicas[0].owner = successor_runtime;
+    route_v2.replicas[0].segment_name = SegmentName::new("batch-delete-conflict-writer-successor");
     let cas = inner
         .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
         .expect("concurrent route update should succeed");
@@ -2878,23 +2906,20 @@ fn remove_force_true_keeps_conflict_for_fresher_rewrite_route() {
     };
     assert!(
         metadata.wait_until_blocked(Duration::from_secs(1)),
-        "delete CAS should block before the rewrite route is injected"
+        "delete CAS should block before the same-payload rewrite route is injected"
     );
 
     let mut route_v2 = route_v1.clone();
     route_v2.version = route_v1.version.next();
-    route_v2.replicas[0].checksum = Some(
-        route_v1.replicas[0]
-            .checksum
-            .expect("seed route should publish checksum")
-            .saturating_add(1),
-    );
+    route_v2.replicas[0].segment_name = SegmentName::new("rewrite-conflict-alt-segment");
+    route_v2.replicas[0].offset = Some(route_v1.replicas[0].offset.unwrap_or_default() + 4096);
+    route_v2.replicas[0].segment_offset = route_v1.replicas[0].segment_offset + 4096;
     let cas = inner
         .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
-        .expect("concurrent rewrite route update should succeed");
+        .expect("concurrent same-payload rewrite route update should succeed");
     assert!(
         cas.applied,
-        "concurrent rewrite route update should become authoritative"
+        "concurrent same-payload rewrite route update should become authoritative"
     );
 
     metadata.release_blocked_cas();
@@ -2911,7 +2936,7 @@ fn remove_force_true_keeps_conflict_for_fresher_rewrite_route() {
             .query_route("rewrite-conflict-key")
             .expect("route query should succeed"),
         Some(route_v2),
-        "fresher rewrite route should stay authoritative after delete conflict"
+        "same-payload rewrite route should stay authoritative after delete conflict"
     );
 }
 

@@ -440,6 +440,10 @@ impl StoreClient {
 
             if let Some(error) = remote_errors.get(&request.storage_runtime) {
                 if Self::reclaim_release_is_skippable(error) {
+                    crate::observability::registry::record_reclaim_release(
+                        context,
+                        "skipped_unavailable_runtime",
+                    );
                     warn!(
                         runtime = %self.lease.runtime,
                         reclaim_runtime = %request.storage_runtime,
@@ -456,6 +460,10 @@ impl StoreClient {
             }
 
             let Some(lease) = remote_leases.get(&request.storage_runtime).cloned() else {
+                crate::observability::registry::record_reclaim_release(
+                    context,
+                    "skipped_missing_runtime_lease",
+                );
                 warn!(
                     runtime = %self.lease.runtime,
                     reclaim_runtime = %request.storage_runtime,
@@ -491,6 +499,10 @@ impl StoreClient {
                     for (index, result) in indices.iter().copied().zip(results) {
                         if let Err(error) = result {
                             if Self::reclaim_release_is_skippable(&error) {
+                                crate::observability::registry::record_reclaim_release(
+                                    context,
+                                    "skipped_unavailable_runtime",
+                                );
                                 warn!(
                                     runtime = %self.lease.runtime,
                                     reclaim_runtime = %storage_runtime,
@@ -518,12 +530,20 @@ impl StoreClient {
                                 context,
                                 "allocator batch reclaim release rpc failed"
                             );
+                            crate::observability::registry::record_reclaim_release(
+                                context,
+                                "error",
+                            );
                             return Err(error);
                         }
                     }
                 }
                 Err(error) => {
                     if Self::reclaim_release_is_skippable(&error) {
+                        crate::observability::registry::record_reclaim_release(
+                            context,
+                            "skipped_unavailable_runtime",
+                        );
                         warn!(
                             runtime = %self.lease.runtime,
                             reclaim_runtime = %storage_runtime,
@@ -547,6 +567,7 @@ impl StoreClient {
                         context,
                         "allocator batch reclaim release rpc failed"
                     );
+                    crate::observability::registry::record_reclaim_release(context, "error");
                     return Err(error);
                 }
             }

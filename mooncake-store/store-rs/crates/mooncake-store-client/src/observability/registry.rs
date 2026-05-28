@@ -47,6 +47,7 @@ pub(crate) const PREFERRED_SEGMENT_SKIP_TOTAL: &str = "mooncake_store_preferred_
 pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes_total";
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
+pub(crate) const RECLAIM_RELEASE_TOTAL: &str = "mooncake_store_reclaim_release_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
 pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
@@ -97,6 +98,7 @@ pub struct MetricsSnapshot {
     pub rebalance_routes: Vec<CounterSample<PhaseResultKey>>,
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
+    pub reclaim_release: Vec<CounterSample<ActionResultKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
     pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
@@ -416,6 +418,7 @@ struct MetricsRegistry {
     rebalance_routes: CounterFamily<PhaseResultKey>,
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
+    reclaim_release: CounterFamily<ActionResultKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
     transport_operations: CounterFamily<TransportOperationKey>,
@@ -576,6 +579,9 @@ impl MetricsRegistry {
             segment_lifecycle: self
                 .segment_lifecycle
                 .snapshot_with_defaults(segment_lifecycle_keys()),
+            reclaim_release: self
+                .reclaim_release
+                .snapshot_with_defaults(reclaim_release_keys()),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
             transport_operations: self.transport_operations.snapshot(),
@@ -670,6 +676,12 @@ const SEGMENT_LIFECYCLE_ACTIONS: &[&str] = &[
     "drain_segment",
     "retire_segment",
 ];
+const RECLAIM_RELEASE_ACTIONS: &[&str] = &["flush_due_reclaims", "flush_all_reclaims"];
+const RECLAIM_RELEASE_RESULTS: &[&str] = &[
+    "skipped_unavailable_runtime",
+    "skipped_missing_runtime_lease",
+    "error",
+];
 
 fn result_keys(results: &'static [&'static str]) -> impl Iterator<Item = ResultKey> {
     results.iter().copied().map(|result| ResultKey { result })
@@ -708,6 +720,15 @@ fn segment_lifecycle_keys() -> impl Iterator<Item = ActionResultKey> {
                 .into_iter()
                 .map(move |result| ActionResultKey { action, result })
         })
+}
+
+fn reclaim_release_keys() -> impl Iterator<Item = ActionResultKey> {
+    RECLAIM_RELEASE_ACTIONS.iter().copied().flat_map(|action| {
+        RECLAIM_RELEASE_RESULTS
+            .iter()
+            .copied()
+            .map(move |result| ActionResultKey { action, result })
+    })
 }
 
 static METRICS: OnceLock<SharedMetricsRegistry> = OnceLock::new();
@@ -1061,6 +1082,13 @@ pub(crate) fn record_segment_lifecycle(action: &'static str, result: &'static st
     global_metrics_registry()
         .lock()
         .segment_lifecycle
+        .add(ActionResultKey { action, result }, 1);
+}
+
+pub(crate) fn record_reclaim_release(action: &'static str, result: &'static str) {
+    global_metrics_registry()
+        .lock()
+        .reclaim_release
         .add(ActionResultKey { action, result }, 1);
 }
 

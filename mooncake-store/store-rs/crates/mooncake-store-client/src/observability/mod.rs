@@ -1316,6 +1316,7 @@ mod tests {
 
         registry::record_replication_publish("error", std::time::Duration::from_millis(7));
         registry::record_transport_operation("write", "storage", "error");
+        registry::record_reclaim_release("flush_due_reclaims", "skipped_unavailable_runtime");
 
         let metrics = render_prometheus_metrics();
         assert!(metrics.contains(
@@ -1323,6 +1324,9 @@ mod tests {
         ));
         assert!(metrics.contains(
             "mooncake_store_transport_operation_total{tenant=\"default\",direction=\"write\",peer_kind=\"storage\",result=\"error\"} 1"
+        ));
+        assert!(metrics.contains(
+            "mooncake_store_reclaim_release_total{tenant=\"default\",action=\"flush_due_reclaims\",result=\"skipped_unavailable_runtime\"} 1"
         ));
     }
 

@@ -158,6 +158,7 @@ impl StoreClient {
     }
 
     fn route_delete_can_follow_rollout_handoff(
+        &self,
         previous: &ObjectRoute,
         current: &ObjectRoute,
     ) -> bool {
@@ -168,19 +169,55 @@ impl StoreClient {
             return false;
         }
 
-        previous
-            .replicas
-            .iter()
-            .zip(current.replicas.iter())
-            .all(|(before, after)| {
-                before.owner.stable_id == after.owner.stable_id
-                    && after.owner.epoch >= before.owner.epoch
-                    && before.length == after.length
-                    && before.checksum.is_some()
-                    && before.checksum == after.checksum
-                    && before.tier == after.tier
-                    && before.priority == after.priority
-            })
+        let mut changed_replica = false;
+        let mut handoffs =
+            std::collections::BTreeMap::<String, Option<mooncake_store_core::HandoffPlan>>::new();
+        for (before, after) in previous.replicas.iter().zip(current.replicas.iter()) {
+            if before.owner.stable_id != after.owner.stable_id
+                || before.length != after.length
+                || before.checksum.is_none()
+                || before.checksum != after.checksum
+                || before.tier != after.tier
+                || before.priority != after.priority
+            {
+                return false;
+            }
+            if before.owner == after.owner {
+                continue;
+            }
+            if after.owner.epoch <= before.owner.epoch {
+                return false;
+            }
+
+            changed_replica = true;
+            let handoff = handoffs
+                .entry(before.owner.stable_id.0.clone())
+                .or_insert_with(|| match self.metadata.get_handoff(&before.owner.stable_id) {
+                    Ok(handoff) => handoff,
+                    Err(error) => {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            stable_id = %before.owner.stable_id,
+                            error = %error,
+                            "failed to load handoff plan while validating rollout delete follow"
+                        );
+                        None
+                    }
+                });
+            let Some(handoff) = handoff.as_ref() else {
+                return false;
+            };
+            if !matches!(
+                handoff.kind,
+                HandoffKind::HotUpgrade | HandoffKind::HotStandbyPromotion
+            ) || handoff.from != before.owner
+                || handoff.to != after.owner
+            {
+                return false;
+            }
+        }
+
+        changed_replica
     }
 
     fn remove_object_route_with_retry(
@@ -236,7 +273,7 @@ impl StoreClient {
             match cas.current {
                 Some(current_route)
                     if force
-                        && Self::route_delete_can_follow_rollout_handoff(&route, &current_route)
+                        && self.route_delete_can_follow_rollout_handoff(&route, &current_route)
                         && attempt < max_attempts =>
                 {
                     debug!(
