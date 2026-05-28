@@ -98,7 +98,7 @@ func (m *EventManager) Start() error {
 		wg.Add(1)
 		go func(service common.ServiceConfig) {
 			defer wg.Done()
-			if err := m.subscribeToService(service); err != nil {
+			if _, err := m.subscribeToService(service); err != nil {
 				slog.Error("Failed to initiate subscription",
 					"service_type", service.Type,
 					"instance_id", service.InstanceID,
@@ -151,7 +151,7 @@ func makeServiceKey(instanceID string, tenantID string, dpRank int) string {
 	return fmt.Sprintf("%s|%s|%d", instanceID, tenantID, dpRank)
 }
 
-func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
+func (m *EventManager) subscribeToService(svc common.ServiceConfig) (bool, error) {
 	// Use (instance_id, tenant_id) as composite key to support multi-tenant replicas
 	svcKey := makeServiceKey(svc.InstanceID, svc.TenantID, svc.DPRank)
 	if svc.InstanceID == "" {
@@ -159,12 +159,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	}
 
 	if _, exists := m.subscribers.Load(svcKey); exists {
-		return nil
+		return false, nil
 	}
 
 	// Validate endpoint
 	if svc.Endpoint == "" {
-		return fmt.Errorf("endpoint is required")
+		return false, fmt.Errorf("endpoint is required")
 	}
 
 	// Use ReplayEndpoint directly, fallback to empty if not provided
@@ -192,12 +192,12 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 	}
 
 	if err := zmq.ValidateConfig(zmqConfig); err != nil {
-		return fmt.Errorf("invalid ZMQ config: %w", err)
+		return false, fmt.Errorf("invalid ZMQ config: %w", err)
 	}
 
 	client := zmq.NewZMQClient(zmqConfig, handler)
 	if err := client.Start(); err != nil {
-		return fmt.Errorf("failed to start ZMQ client: %w", err)
+		return false, fmt.Errorf("failed to start ZMQ client: %w", err)
 	}
 
 	m.subscribers.Store(svcKey, client)
@@ -221,7 +221,7 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 		"replay_endpoint", replayEndpoint,
 	)
 
-	return nil
+	return true, nil
 }
 
 func (m *EventManager) unsubscribeFromService(instanceID string, tenantID string, dpRank int) {
@@ -388,22 +388,27 @@ func (m *EventManager) StartHTTPServer() error {
 			AdditionalSalt: additionalSalt,
 		}
 
-		if err := m.subscribeToService(svc); err != nil {
+		m.mu.Lock()
+		isNew, err := m.subscribeToService(svc)
+		if err != nil {
+			m.mu.Unlock()
 			slog.Error("Dynamic register failed", "instance_id", req.InstanceID, "err", err)
 			http.Error(w, fmt.Sprintf("Failed to subscribe: %v", err), http.StatusInternalServerError)
 			return
 		}
-		m.services = append(m.services, svc)
-		modelContext := &prefixindex.ModelContext{
-			TenantID:       tenantID,
-			ModelName:      req.ModelName,
-			LoraName:       loraName,
-			BlockSize:      req.BlockSize,
-			AdditionalSalt: additionalSalt,
-			InstanceID:     svc.InstanceID,
+		if isNew {
+			m.services = append(m.services, svc)
+			modelContext := &prefixindex.ModelContext{
+				TenantID:       tenantID,
+				ModelName:      req.ModelName,
+				LoraName:       loraName,
+				BlockSize:      req.BlockSize,
+				AdditionalSalt: additionalSalt,
+				InstanceID:     svc.InstanceID,
+			}
+			m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
 		}
-
-		m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
+		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -434,12 +439,15 @@ func (m *EventManager) StartHTTPServer() error {
 		targetKey := makeServiceKey(req.InstanceID, targetTenant, req.DPRank)
 
 		// Direct lookup and removal
+		m.mu.Lock()
 		if _, exists := m.activeConfigs.Load(targetKey); !exists {
+			m.mu.Unlock()
 			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
 			return
 		}
 
 		m.unsubscribeFromService(req.InstanceID, targetTenant, req.DPRank)
+		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
