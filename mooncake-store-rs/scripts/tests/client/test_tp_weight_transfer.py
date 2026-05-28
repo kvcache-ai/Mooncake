@@ -109,12 +109,24 @@ def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
         src_offset = (rank % 2) * rank_size
         expected = make_shard_data(trainer_shard, shard_size)[src_offset:src_offset + rank_size]
         actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
-        assert bytes(actual) == expected, f"rank {rank} content mismatch"
-
-    finally:
-        # Cleanup
-        for ptr in buffer_ptrs:
-            store.unregister_buffer(ptr, rank_size)
+        try:
+            # Verify results
+            for rank, buf_results in enumerate(results):
+                for key_idx, key_results in enumerate(buf_results):
+                    for frag_idx, val in enumerate(key_results):
+                        assert val > 0, f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+    
+            # Verify buffer contents
+            for rank in range(rollouter_tp):
+                trainer_shard = rank // 2
+                src_offset = (rank % 2) * rank_size
+                expected = make_shard_data(trainer_shard, shard_size)[src_offset:src_offset + rank_size]
+                actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
+                assert bytes(actual) == expected, f"rank {rank} content mismatch"
+        finally:
+            # Cleanup
+            for ptr in buffer_ptrs:
+                store.unregister_buffer(ptr, rank_size)
 
     print("PASS")
 
