@@ -26,7 +26,8 @@ DEFINE_string(deployment_mode, "Centralization",
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
 DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
 DEFINE_uint64(lock_shard_count, 1024,
-              "Number of key lock shards for DataManager");
+              "Number of metadata shards in TieredBackend (and matching "
+              "pending-write/pinned-key lease shards in DataManager)");
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
@@ -45,6 +46,14 @@ DEFINE_uint64(local_memcpy_async_worker_num, 32,
               "local memcpy executor (P2P), 0 means forbid async memcpy");
 DEFINE_uint32(metrics_port, 9003, "Port for HTTP metrics server");
 DEFINE_bool(enable_metrics_http, true, "Enable HTTP metrics endpoint");
+DEFINE_uint32(
+    p2p_key_lease_duration_ms, 0,
+    "Maximum time (ms) a key may remain in PreWrite or PinKey "
+    "lease-protected intermediate state. 0 uses the built-in default (5000).");
+DEFINE_uint32(
+    p2p_key_lease_scan_interval_ms, 0,
+    "Interval (ms) for background scanning of expired key leases (PreWrite / "
+    "PinKey). 0 uses the built-in default (1000).");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -113,7 +122,8 @@ int main(int argc, char* argv[]) {
                 static_cast<uint16_t>(FLAGS_metrics_port),
                 FLAGS_enable_metrics_http, {},  // labels
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
-                FLAGS_async_route_queue_size);
+                FLAGS_async_route_queue_size, FLAGS_p2p_key_lease_duration_ms,
+                FLAGS_p2p_key_lease_scan_interval_ms);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)

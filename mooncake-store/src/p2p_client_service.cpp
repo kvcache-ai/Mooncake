@@ -232,7 +232,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 }
 
 ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
-    auto tiered_backend = std::make_unique<TieredBackend>();
+    auto tiered_backend =
+        std::make_unique<TieredBackend>(config.lock_shard_count);
 
     auto add_replica_callback = BuildAddReplicaCallback();
     auto remove_replica_callback = BuildRemoveReplicaCallback();
@@ -254,9 +255,13 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         local_transfer_config.local_memcpy_async_worker_num =
             config.local_memcpy_async_worker_num;
     }
+    KeyLeaseConfig key_lease_config;
+    key_lease_config.duration_ms = config.p2p_key_lease_duration_ms;
+    key_lease_config.scan_interval_ms = config.p2p_key_lease_scan_interval_ms;
 
-    data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
-                                config.lock_shard_count, local_transfer_config);
+    data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
+                          config.lock_shard_count, local_transfer_config,
+                          key_lease_config);
     // Set rectify callback on DataManager to remove stale replicas from master
     data_manager_->SetRectifyCallback([this](std::string_view key,
                                              std::optional<UUID> tier_id) {

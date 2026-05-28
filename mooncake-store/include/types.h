@@ -133,7 +133,7 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
 
-    // Engine operation errors (Range: -700 to -710)
+    // Engine operation errors (Range: -700 to -711)
     INVALID_WRITE = -700,    ///< Invalid write operation.
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
@@ -152,6 +152,8 @@ enum class ErrorCode : int32_t {
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
     REPLICA_NUM_EXCEEDED = -713,    ///< Replica number exceeded.
+    REPLICA_IS_PROCESSING =
+        -714,  ///< Replica is processing an in-flight write.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

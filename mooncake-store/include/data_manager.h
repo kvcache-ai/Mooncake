@@ -1,11 +1,19 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <shared_mutex>
-#include <vector>
 #include <string>
 #include <string_view>
-#include <memory>
-#include <optional>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+#include <functional>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -14,6 +22,7 @@
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "utils.h"
 #include "client_rpc_types.h"
 
 namespace mooncake {
@@ -47,6 +56,18 @@ struct LocalTransferConfig {
 };
 
 /**
+ * @struct KeyLeaseConfig
+ * @brief PreWrite / PinKey key lease timing (independent of local transfer).
+ */
+struct KeyLeaseConfig {
+    // Max lifetime (ms) of intermediate lease state on a key. 0 = built-in
+    // default.
+    uint32_t duration_ms = 0;
+    // Background scan interval (ms) for expired leases. 0 = built-in default.
+    uint32_t scan_interval_ms = 0;
+};
+
+/**
  * @class DataManager
  * @brief Manages data access operations using TieredBackend and TransferEngine
  *
@@ -58,6 +79,22 @@ class DataManager {
     friend class DataManagerTest;
 
    public:
+    using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+
+    struct PreWriteResult {
+        RemoteBufferDesc remote_buffer;
+        UUID write_operation_id{0, 0};
+        // Filled by PreWriteInternal for in-process callers
+        // (Put/WriteRemoteData). Public PreWrite omits this field for RPC
+        // responses.
+        AllocationHandle handle;
+    };
+
+    struct PinKeyResult {
+        RemoteBufferDesc remote_buffer;
+        UUID read_operation_id{0, 0};
+    };
+
     /**
      * @brief Constructor
      * @param tiered_backend Unique pointer to TieredBackend instance (takes
@@ -68,16 +105,12 @@ class DataManager {
     DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                 std::shared_ptr<TransferEngine> transfer_engine,
                 size_t lock_shard_count = 1024,
-                const LocalTransferConfig& local_transfer_config = {});
+                const LocalTransferConfig& local_transfer_config = {},
+                const KeyLeaseConfig& key_lease_config = {});
 
-    void Stop() {
-        if (async_memcpy_executor_) {
-            async_memcpy_executor_->Shutdown();
-        }
-        if (tiered_backend_) {
-            tiered_backend_->Stop();
-        }
-    }
+    ~DataManager();
+
+    void Stop();
 
     /**
      * @brief Cleanup: delegates to TieredBackend::Destroy().
@@ -187,13 +220,26 @@ class DataManager {
         std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
+    tl::expected<PreWriteResult, ErrorCode> PreWrite(
+        std::string_view key, size_t size_bytes,
+        std::optional<UUID> tier_id = std::nullopt);
+
+    tl::expected<void, ErrorCode> WriteCommit(std::string_view key,
+                                              const UUID& write_operation_id);
+
+    tl::expected<PinKeyResult, ErrorCode> PinKey(
+        std::string_view key, std::optional<UUID> tier_id = std::nullopt);
+
+    tl::expected<void, ErrorCode> UnPinKey(std::string_view key,
+                                           const UUID& read_operation_id);
+
     // ================================================================
     // Utilities
     // ================================================================
 
     /**
-     * @brief Rectify stale read route by checking local key existence
-     * and removing replica from master if key is not found locally.
+     * @brief Rectify stale read route via TieredBackend::conditionalExecute:
+     *        if the key is not found locally, remove the replica from master.
      *
      * @param key Object key to rectify
      * @param tier_id Optional tier ID. If specified, only checks the given
@@ -213,10 +259,83 @@ class DataManager {
                std::optional<UUID> tier_id = std::nullopt) const;
 
    private:
-    std::shared_mutex& GetKeyLock(std::string_view key) {
-        size_t hash = std::hash<std::string_view>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
-    }
+    void ClearLeaseRecords();
+
+    struct KeyCtx {
+        // Non-owning view; valid only while caller storage (e.g. RPC/coro
+        // request buffers) remains alive. KeyCtx is stack-scoped within
+        // DataManager and must not be stored. Maps copy keys on insert.
+        std::string_view key;
+        size_t hash = 0;
+        size_t pending_write_shard_idx = 0;
+        size_t pinned_key_shard_idx = 0;
+    };
+
+    using OrderedDeadlineList = std::list<std::pair<std::string, TimePoint>>;
+    using OrderedDeadlineListIt = OrderedDeadlineList::iterator;
+
+    struct PendingWriteRecord {
+        UUID write_operation_id{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        OrderedDeadlineListIt list_it;
+    };
+
+    struct PinnedKeyRecord {
+        UUID read_operation_id{0, 0};
+        TimePoint deadline{};
+        AllocationHandle handle;
+        uint32_t ref_count = 1;
+        OrderedDeadlineListIt list_it;
+    };
+
+    template <typename Record>
+    struct RecordShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, Record, StringHash, std::equal_to<>>
+            existed_operation_key_map;
+        OrderedDeadlineList ordered_list;
+    };
+
+    using PendingWriteShard = RecordShard<PendingWriteRecord>;
+    using PinnedKeyShard = RecordShard<PinnedKeyRecord>;
+
+    // `key` must point at storage that outlives the returned KeyCtx and any
+    // synchronous use on the current call stack (typically RPC/coro buffers).
+    KeyCtx BuildKeyCtx(std::string_view key) const;
+    PendingWriteShard& GetPendingWriteShard(const KeyCtx& ctx);
+    PinnedKeyShard& GetPinnedKeyShard(const KeyCtx& ctx);
+
+    tl::expected<PreWriteResult, ErrorCode> PreWriteInternal(
+        const KeyCtx& ctx, size_t size_bytes, std::optional<UUID> tier_id);
+    tl::expected<void, ErrorCode> WriteCommitInternal(
+        const KeyCtx& ctx, const UUID& write_operation_id);
+    tl::expected<PinKeyResult, ErrorCode> PinKeyInternal(
+        const KeyCtx& ctx, std::optional<UUID> tier_id);
+    tl::expected<void, ErrorCode> UnPinKeyInternal(
+        const KeyCtx& ctx, const UUID& read_operation_id);
+
+    void AbortPendingWriteInternal(const KeyCtx& ctx,
+                                   const UUID& write_operation_id);
+
+    enum class PendingWriteEraseResult {
+        Erased,
+        NotFound,
+        WriteOperationIdMismatch,
+    };
+
+    PendingWriteEraseResult ErasePendingWriteRecord(
+        PendingWriteShard& shard, std::string_view key,
+        const UUID& write_operation_id);
+    tl::expected<void, ErrorCode> ReservePendingWriteSlot(
+        PendingWriteShard& shard, std::string_view key, TimePoint now,
+        TimePoint deadline, const UUID& write_operation_id);
+    tl::expected<void, ErrorCode> AttachPendingWriteHandle(
+        PendingWriteShard& shard, std::string_view key,
+        const UUID& write_operation_id, const AllocationHandle& handle);
+    tl::expected<AllocationHandle, ErrorCode> ValidatePendingWriteForCommit(
+        PendingWriteShard& shard, std::string_view key, TimePoint now,
+        const UUID& write_operation_id);
 
     /**
      * @brief Transfer data from local source to remote destination buffers
@@ -361,15 +480,24 @@ class DataManager {
     // Wait for all tasks to reach a terminal state, then free the batch.
     void CancelBatchTETask(Transport::BatchID batch_id, size_t num_tasks);
 
-   private:
+    const std::chrono::milliseconds& lease_duration() const {
+        return lease_duration_;
+    }
+    tl::expected<RemoteBufferDesc, ErrorCode> BuildRemoteBufferDesc(
+        const AllocationHandle& handle) const;
+    void LeaseScannerMain();
+    void ShutdownLeaseScanner();
+    template <typename Record>
+    size_t ScanExpiredRecordShard(RecordShard<Record>& shard, TimePoint now);
+
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 
-    // Sharded locks for concurrent access
-    // Configurable via MOONCAKE_DM_LOCK_SHARD_COUNT environment variable
-    // (default: 1024)
+    // Shard count for pending-write and pinned-key lease tables (same value as
+    // TieredBackend metadata shard count when set via lock_shard_count).
     size_t lock_shard_count_;
-    std::vector<std::shared_mutex> lock_shards_;
+    std::vector<PendingWriteShard> pending_write_shards_;
+    std::vector<PinnedKeyShard> pinned_key_shards_;
 
     // Callback for rectifying stale read routes
     std::function<void(std::string_view, std::optional<UUID>)>
@@ -377,6 +505,12 @@ class DataManager {
 
     LocalTransferConfig local_transfer_config_;
     std::unique_ptr<AsyncMemcpyExecutor> async_memcpy_executor_;
+    std::chrono::milliseconds lease_duration_;
+    std::chrono::milliseconds lease_scan_interval_;
+    std::atomic<bool> lease_scanner_stop_requested_{false};
+    std::condition_variable lease_scanner_cv_;
+    std::mutex lease_scanner_mutex_;
+    std::thread lease_scanner_thread_;
 };
 
 }  // namespace mooncake
