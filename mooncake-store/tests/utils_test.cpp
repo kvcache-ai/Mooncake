@@ -8,6 +8,12 @@
 
 using namespace mooncake;
 
+TEST(UtilsTest, IsZeroUUID) {
+    EXPECT_TRUE(IsZeroUUID(UUID{0, 0}));
+    EXPECT_FALSE(IsZeroUUID(UUID{0, 1}));
+    EXPECT_FALSE(IsZeroUUID(UUID{1, 0}));
+}
+
 TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(999), "999 B");
     EXPECT_EQ(byte_size_to_string(2048), "2.00 KB");

@@ -4,15 +4,12 @@
 
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
 
 namespace {
-
-bool IsZeroUuid(const UUID& uuid) {
-    return uuid.first == 0 && uuid.second == 0;
-}
 
 size_t CalculateBufferSize(const std::vector<RemoteBufferDesc>& buffers) {
     size_t total = 0;
@@ -67,7 +64,7 @@ bool IsValidRequest(const PreWriteRequest& request) {
 }
 
 bool IsValidRequest(const WriteCommitRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.write_operation_id)) {
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
         LOG(ERROR) << "WriteCommitRequest: invalid key or token";
         return false;
     }
@@ -75,7 +72,7 @@ bool IsValidRequest(const WriteCommitRequest& request) {
 }
 
 bool IsValidRequest(const WriteRevokeRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.write_operation_id)) {
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
         LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
         return false;
     }
@@ -91,7 +88,7 @@ bool IsValidRequest(const PinKeyRequest& request) {
 }
 
 bool IsValidRequest(const UnPinKeyRequest& request) {
-    if (request.key.empty() || IsZeroUuid(request.read_operation_id)) {
+    if (request.key.empty() || IsZeroUUID(request.read_operation_id)) {
         LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
         return false;
     }

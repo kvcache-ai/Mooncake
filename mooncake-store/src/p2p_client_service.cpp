@@ -19,32 +19,14 @@ namespace mooncake {
 
 namespace {
 
-// UnPin after forward read (or cleanup after TE failure): retry only for
-// "other" errors. INVALID_READ = token mismatch (treat as released for flow).
-// RPC_FAIL = transport/timeout-like (no repeat; owner may TTL-clean).
-// LEASE_EXPIRED = server already expired the pin record. Same max-attempt count
-// is used for WriteRevoke after forward write TE failure.
+// UnPin / WriteRevoke after forward TE failure: retry on RPC_FAIL, token mismatch,
+// etc. LEASE_EXPIRED means the owner removed the expired record on this RPC.
+// A missing record already returns OK (idempotent), including after background
+// lease scanning. Same max-attempt count for both cleanup RPCs.
 constexpr int kForwardReadUnpinMaxAttempts = 3;
 
-bool UnPinErrorTreatAsEffectiveOk(ErrorCode e) {
-    switch (e) {
-        case ErrorCode::INVALID_READ:
-        case ErrorCode::RPC_FAIL:
-        case ErrorCode::LEASE_EXPIRED:
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool WriteRevokeErrorTreatAsEffectiveOk(ErrorCode e) {
-    switch (e) {
-        case ErrorCode::INVALID_WRITE:
-        case ErrorCode::RPC_FAIL:
-            return true;
-        default:
-            return false;
-    }
+bool LeaseCleanupErrorTreatAsEffectiveOk(ErrorCode e) {
+    return e == ErrorCode::LEASE_EXPIRED;
 }
 
 bool SlicesAreContiguous(const std::vector<Slice>& slices) {
@@ -1121,7 +1103,7 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
             if (revoke_res) {
                 break;
             }
-            if (WriteRevokeErrorTreatAsEffectiveOk(revoke_res.error())) {
+            if (LeaseCleanupErrorTreatAsEffectiveOk(revoke_res.error())) {
                 revoke_res = tl::expected<void, ErrorCode>{};
                 break;
             }
@@ -1694,7 +1676,7 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
             if (cleanup_unpin) {
                 break;
             }
-            if (UnPinErrorTreatAsEffectiveOk(cleanup_unpin.error())) {
+            if (LeaseCleanupErrorTreatAsEffectiveOk(cleanup_unpin.error())) {
                 cleanup_unpin = tl::expected<void, ErrorCode>{};
                 break;
             }
@@ -1721,7 +1703,7 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
         if (unpin_res) {
             break;
         }
-        if (UnPinErrorTreatAsEffectiveOk(unpin_res.error())) {
+        if (LeaseCleanupErrorTreatAsEffectiveOk(unpin_res.error())) {
             unpin_res = tl::expected<void, ErrorCode>{};
             break;
         }

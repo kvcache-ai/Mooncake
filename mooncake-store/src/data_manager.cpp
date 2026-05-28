@@ -115,10 +115,6 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
     return ErrorCode::OK;
 }
 
-bool IsZeroUUID(const UUID& uuid) {
-    return uuid.first == 0 && uuid.second == 0;
-}
-
 }  // namespace
 
 // ================================================================
@@ -278,10 +274,16 @@ DataManager::ScanExpiredRecordShard<DataManager::PinnedKeyRecord>(
 DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id) {
+    const auto now = std::chrono::steady_clock::now();
     std::unique_lock lock(shard.mutex);
     auto it = shard.existed_operation_key_map.find(key);
     if (it == shard.existed_operation_key_map.end()) {
         return PendingWriteEraseResult::NotFound;
+    }
+    if (it->second.deadline <= now) {
+        shard.ordered_list.erase(it->second.list_it);
+        shard.existed_operation_key_map.erase(it);
+        return PendingWriteEraseResult::LeaseExpired;
     }
     if (it->second.write_operation_id != write_operation_id) {
         return PendingWriteEraseResult::WriteOperationIdMismatch;
@@ -406,6 +408,9 @@ tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
             timer.LogResponse("error_code=", ErrorCode::OK,
                               "idempotent=", true);
             return {};
+        case PendingWriteEraseResult::LeaseExpired:
+            timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
+            return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
         case PendingWriteEraseResult::WriteOperationIdMismatch:
             timer.LogResponse("error_code=", ErrorCode::INVALID_WRITE);
             return tl::make_unexpected(ErrorCode::INVALID_WRITE);
@@ -915,6 +920,12 @@ tl::expected<DataManager::PreWriteResult, ErrorCode>
 DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
                               std::optional<UUID> tier_id,
                               bool enforce_dram_allocation) {
+    // TODO(tiered_backend): `enforce_dram_allocation` is temporary. Today
+    // `tiered_backend_->Allocate()` does not yet allocate from a caller-selected
+    // tier in a way that guarantees DRAM for the cross-node forward TE path.
+    // Public PreWrite passes true to reject non-DRAM handles; local Put and
+    // WriteRemoteData pass false. Remove this parameter once TieredBackend is
+    // refactored to allocate from the intended tier explicitly.
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -965,9 +976,6 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
 
     auto handle = std::move(handle_result.value());
 
-    // Cross-node PreWrite (enforce_dram_allocation): data-owner forward TE path
-    // requires DRAM today. Local Put / WriteRemoteData pass false.
-    // TODO: Data-owner forward path currently supports DRAM tier only.
     if (enforce_dram_allocation && handle->loc.data.type != MemoryType::DRAM) {
         LOG(ERROR) << "PreWrite: DRAM allocation failed"
                    << ", key=" << ctx.key << ", error="
@@ -1032,7 +1040,8 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
         if (err == ErrorCode::LEASE_EXPIRED) {
             const auto erased = ErasePendingWriteRecord(
                 pending_write_shard, ctx.key, write_operation_id);
-            if (erased == PendingWriteEraseResult::Erased) {
+            if (erased == PendingWriteEraseResult::Erased ||
+                erased == PendingWriteEraseResult::LeaseExpired) {
                 LOG(ERROR)
                     << "WriteCommit: removed expired pending write record"
                     << ", key=" << ctx.key;
@@ -1351,6 +1360,9 @@ DataManager::SubmitTeTransferInternal(
     auto batches_result = SubmitTeTransferBatches(transfer_ptr, total_data_size,
                                                   remote_buffers, opcode);
     if (!batches_result) {
+        LOG(ERROR) << "SubmitTeTransferInternal: SubmitTeTransferBatches "
+                      "failed: "
+                   << toString(batches_result.error());
         return tl::unexpected(batches_result.error());
     }
 
@@ -1453,6 +1465,8 @@ tl::expected<void, ErrorCode> DataManager::TransferData(
     Transport::TransferRequest::OpCode opcode) {
     auto validate_result = ValidateRemoteBuffers(peer_buffers);
     if (!validate_result) {
+        LOG(ERROR) << "TransferData: ValidateRemoteBuffers failed: "
+                   << toString(validate_result.error());
         return tl::make_unexpected(validate_result.error());
     }
     size_t total_remote_size = 0;
@@ -1469,6 +1483,8 @@ tl::expected<void, ErrorCode> DataManager::TransferData(
     auto batches = SubmitTeTransferBatches(local_transfer_base, total_size,
                                            peer_buffers, opcode);
     if (!batches) {
+        LOG(ERROR) << "TransferData: SubmitTeTransferBatches failed: "
+                   << toString(batches.error());
         return tl::unexpected(batches.error());
     }
     auto wait_result = WaitAllTransferBatches(batches.value());

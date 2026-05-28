@@ -341,6 +341,7 @@ class DataManager {
     enum class PendingWriteEraseResult {
         Erased,
         NotFound,
+        LeaseExpired,
         WriteOperationIdMismatch,
     };
 
