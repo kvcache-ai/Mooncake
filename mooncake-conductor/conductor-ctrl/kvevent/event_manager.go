@@ -388,8 +388,10 @@ func (m *EventManager) StartHTTPServer() error {
 			AdditionalSalt: additionalSalt,
 		}
 
+		m.mu.Lock()
 		isNew, err := m.subscribeToService(svc)
 		if err != nil {
+			m.mu.Unlock()
 			slog.Error("Dynamic register failed", "instance_id", req.InstanceID, "err", err)
 			http.Error(w, fmt.Sprintf("Failed to subscribe: %v", err), http.StatusInternalServerError)
 			return
@@ -406,6 +408,7 @@ func (m *EventManager) StartHTTPServer() error {
 			}
 			m.indexer.AddDpSize(modelContext, int64(svc.DPRank))
 		}
+		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
@@ -436,12 +439,15 @@ func (m *EventManager) StartHTTPServer() error {
 		targetKey := makeServiceKey(req.InstanceID, targetTenant, req.DPRank)
 
 		// Direct lookup and removal
+		m.mu.Lock()
 		if _, exists := m.activeConfigs.Load(targetKey); !exists {
+			m.mu.Unlock()
 			http.Error(w, fmt.Sprintf("service not found: %s", targetKey), http.StatusNotFound)
 			return
 		}
 
 		m.unsubscribeFromService(req.InstanceID, targetTenant, req.DPRank)
+		m.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
