@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use crate::metrics::record_cas_outcome;
 use crate::traits::RouteAuthorityService;
 
-pub fn bind_local_authority_service(
+pub(crate) fn bind_local_authority_service(
     namespace: &str,
     authority: &ClientStableId,
     service: Arc<dyn RouteAuthorityService>,
@@ -20,7 +20,7 @@ pub fn bind_local_authority_service(
         .bind_local_service(authority, service);
 }
 
-pub fn authority_get(
+pub(crate) fn authority_get(
     namespace: &str,
     authority: &ClientStableId,
     key: &ObjectKey,
@@ -40,7 +40,7 @@ pub fn authority_get(
         .cloned())
 }
 
-pub fn authority_get_many(
+pub(crate) fn authority_get_many(
     namespace: &str,
     authority: &ClientStableId,
     keys: &[ObjectKey],
@@ -60,7 +60,7 @@ pub fn authority_get_many(
         .collect())
 }
 
-pub fn authority_get_version_floor(
+pub(crate) fn authority_get_version_floor(
     namespace: &str,
     authority: &ClientStableId,
     key: &ObjectKey,
@@ -74,7 +74,7 @@ pub fn authority_get_version_floor(
         .copied()
 }
 
-pub fn authority_list_routes_by_replica_owner(
+pub(crate) fn authority_list_routes_by_replica_owner(
     namespace: &str,
     authority: &ClientStableId,
     owner: &ClientRuntimeId,
@@ -97,7 +97,7 @@ pub fn authority_list_routes_by_replica_owner(
         .collect())
 }
 
-pub fn authority_list_routes(
+pub(crate) fn authority_list_routes(
     namespace: &str,
     authority: &ClientStableId,
 ) -> Result<Vec<ObjectRoute>> {
@@ -118,7 +118,7 @@ pub fn authority_list_routes(
         .collect())
 }
 
-pub fn authority_list_routes_in_scope(
+pub(crate) fn authority_list_routes_in_scope(
     namespace: &str,
     authority: &ClientStableId,
     scope: &NamespaceScope,
@@ -142,7 +142,7 @@ pub fn authority_list_routes_in_scope(
         .collect())
 }
 
-pub fn authority_list_reuse_candidates(
+pub(crate) fn authority_list_reuse_candidates(
     namespace: &str,
     authority: &ClientStableId,
     reuse: &ReuseIdentity,
@@ -187,7 +187,7 @@ fn version_floor_blocks_insert(
         .is_some_and(|floor| route.version <= *floor)
 }
 
-pub fn authority_compare_and_swap(
+pub(crate) fn authority_compare_and_swap(
     namespace: &str,
     authority: &ClientStableId,
     key: &ObjectKey,
@@ -230,7 +230,7 @@ pub fn authority_compare_and_swap(
     Ok(result)
 }
 
-pub fn authority_compare_and_swap_many(
+pub(crate) fn authority_compare_and_swap_many(
     namespace: &str,
     authority: &ClientStableId,
     requests: &[RouteCasRequest],
@@ -284,7 +284,7 @@ pub fn authority_compare_and_swap_many(
     Ok(results)
 }
 
-pub fn authority_replace(
+pub(crate) fn authority_replace(
     namespace: &str,
     authority: &ClientStableId,
     key: &ObjectKey,
@@ -302,7 +302,7 @@ pub fn authority_replace(
     Ok(())
 }
 
-pub fn authority_replace_many(
+pub(crate) fn authority_replace_many(
     namespace: &str,
     authority: &ClientStableId,
     requests: &[RouteCasRequest],

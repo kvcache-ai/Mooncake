@@ -3,15 +3,11 @@ use std::time::Instant;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RouteCasRequest, RouteControlMode, RouteDirectory,
-};
-pub(crate) use mooncake_store_route::{
-    authority_compare_and_swap, authority_compare_and_swap_many, authority_get, authority_get_many,
-    authority_list_routes_by_replica_owner, authority_replace, authority_replace_many,
-    bind_local_authority_service,
+    ObjectRoute, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
-    set_route_metrics_sink, RouteAuthorityClient, RouteMembershipProvider, RouteMetricsSink,
+    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityClient, RouteAuthorityService,
+    RouteMembershipProvider, RouteMetricsSink,
 };
 
 use crate::client::{
@@ -44,6 +40,74 @@ pub(crate) fn build_route_directory(
         control_plane,
         membership,
     )
+}
+
+pub(crate) fn bind_local_authority_service(
+    namespace: &str,
+    authority: &ClientStableId,
+    service: Arc<dyn RouteAuthorityService>,
+) {
+    LocalRouteAuthority::new(namespace, authority.clone()).bind_service(service);
+}
+
+pub(crate) fn authority_get(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> Result<Option<ObjectRoute>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_route(key)
+}
+
+pub(crate) fn authority_get_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<Option<ObjectRoute>>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).get_routes(keys)
+}
+
+pub(crate) fn authority_list_routes_by_replica_owner(
+    namespace: &str,
+    authority: &ClientStableId,
+    owner: &ClientRuntimeId,
+) -> Result<Vec<ObjectRoute>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).list_routes_by_replica_owner(owner)
+}
+
+pub(crate) fn authority_compare_and_swap(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+    expected: Option<RouteVersion>,
+    next: Option<&ObjectRoute>,
+) -> Result<CasResult> {
+    LocalRouteAuthority::new(namespace, authority.clone())
+        .compare_and_swap_route(key, expected, next)
+}
+
+pub(crate) fn authority_compare_and_swap_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    requests: &[RouteCasRequest],
+) -> Result<Vec<CasResult>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).compare_and_swap_routes(requests)
+}
+
+pub(crate) fn authority_replace(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+    next: Option<&ObjectRoute>,
+) -> Result<()> {
+    LocalRouteAuthority::new(namespace, authority.clone()).replace_route(key, next)
+}
+
+pub(crate) fn authority_replace_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    requests: &[RouteCasRequest],
+) -> Result<()> {
+    LocalRouteAuthority::new(namespace, authority.clone()).replace_routes(requests)
 }
 
 struct ClientRouteMembership {

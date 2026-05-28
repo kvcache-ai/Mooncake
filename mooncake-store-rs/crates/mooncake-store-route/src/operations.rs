@@ -5,7 +5,7 @@ use mooncake_store_core::{
     ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
 };
 
-use crate::mesh::{authority_get, authority_list_routes, authority_replace};
+use crate::local_authority::LocalRouteAuthority;
 
 pub trait RouteHitReporter {
     fn report_route_hits(&self, routes: &[&ObjectRoute]);
@@ -148,7 +148,7 @@ impl RouteOperations {
         authority: &ClientStableId,
         key: &ObjectKey,
     ) -> Result<Option<ObjectRoute>> {
-        authority_get(namespace, authority, key)
+        LocalRouteAuthority::new(namespace, authority.clone()).get_route(key)
     }
 
     pub fn replace_authority_route(
@@ -158,7 +158,7 @@ impl RouteOperations {
         key: &ObjectKey,
         route: Option<&ObjectRoute>,
     ) -> Result<()> {
-        authority_replace(namespace, authority, key, route)
+        LocalRouteAuthority::new(namespace, authority.clone()).replace_route(key, route)
     }
 
     pub fn list_authority_routes(
@@ -166,7 +166,7 @@ impl RouteOperations {
         namespace: &str,
         authority: &ClientStableId,
     ) -> Result<Vec<ObjectRoute>> {
-        authority_list_routes(namespace, authority)
+        LocalRouteAuthority::new(namespace, authority.clone()).list_routes()
     }
 
     pub fn next_route_version(
