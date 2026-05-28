@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use mooncake_metadata::InMemoryMetadataBackend;
 use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, LogicalObjectId, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest, RoutePolicy,
-    RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
-    SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy,
-    TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy,
-    TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
+    ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
+    MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest,
+    RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+    SegmentName, SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy,
+    TenantExecutionFairnessPolicy, TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy,
+    TenantPolicyScope, TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    TenantQuotaPolicy, TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState,
+    TenantRoutePolicy,
 };
 use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
@@ -2859,6 +2860,95 @@ fn batch_remove_retries_after_route_delete_conflict_with_fresher_current() {
 }
 
 #[test]
+fn remove_retries_after_route_delete_conflict_with_standby_promotion_successor_current() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let block_key = ObjectKey::from_scope(
+        &NamespaceScope::with_defaults(Some("default"), None, None),
+        "standby-promotion-conflict-key",
+    );
+    let metadata = Arc::new(BlockingCasMetadataBackend::new(
+        inner.clone(),
+        block_key.0.as_str(),
+    ));
+    let writer_transport = Arc::new(TestTransport::new("standby-promotion-writer"));
+    let remover_transport = Arc::new(TestTransport::new("standby-promotion-remover"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "standby-promotion-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let remover = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), "standby-promotion-remover")
+            .state(ClientLifecycleState::Active)
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(remover_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("remover build should succeed"),
+    );
+
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    remover
+        .register_local_memory()
+        .expect("remover memory should register");
+
+    let route_v1 = writer
+        .put("standby-promotion-conflict-key", b"payload")
+        .expect("seed put should succeed");
+
+    metadata.arm_blocked_cas();
+    let remover_task = {
+        let remover = Arc::clone(&remover);
+        std::thread::spawn(move || remover.remove("standby-promotion-conflict-key", true))
+    };
+    assert!(
+        metadata.wait_until_blocked(Duration::from_secs(1)),
+        "delete CAS should block before the standby-promotion route update is injected"
+    );
+
+    let mut route_v2 = route_v1.clone();
+    let successor_runtime = ClientRuntimeId::new("standby-promotion-writer", ClientEpoch(2));
+    metadata
+        .put_handoff(&HandoffPlan {
+            stable_id: route_v1.replicas[0].owner.stable_id.clone(),
+            from: route_v1.replicas[0].owner.clone(),
+            to: successor_runtime.clone(),
+            kind: HandoffKind::HotStandbyPromotion,
+            barrier_version: route_v1.version.0,
+            created_at_ms: now_ms(),
+            deadline_ms: None,
+        })
+        .expect("handoff plan should publish");
+    route_v2.version = route_v1.version.next();
+    route_v2.replicas[0].owner = successor_runtime;
+    route_v2.replicas[0].segment_name = SegmentName::new("standby-promotion-writer-successor");
+    let cas = inner
+        .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
+        .expect("concurrent route update should succeed");
+    assert!(
+        cas.applied,
+        "concurrent route update should become authoritative"
+    );
+
+    metadata.release_blocked_cas();
+    remover_task
+        .join()
+        .expect("remove worker should join")
+        .expect("remove should retry with the standby-promotion successor route");
+    assert!(
+        writer
+            .query_route("standby-promotion-conflict-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "route should be deleted after retrying with the standby-promotion successor route"
+    );
+}
+
+#[test]
 fn remove_force_true_keeps_conflict_for_fresher_rewrite_route() {
     let inner = Arc::new(InMemoryMetadataBackend::new());
     let block_key = ObjectKey::from_scope(
@@ -2937,6 +3027,138 @@ fn remove_force_true_keeps_conflict_for_fresher_rewrite_route() {
             .expect("route query should succeed"),
         Some(route_v2),
         "same-payload rewrite route should stay authoritative after delete conflict"
+    );
+}
+
+#[test]
+fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let block_key = ObjectKey::from_scope(
+        &NamespaceScope::with_defaults(Some("default"), None, None),
+        "multi-replica-conflict-key",
+    );
+    let metadata = Arc::new(BlockingCasMetadataBackend::new(
+        inner.clone(),
+        block_key.0.as_str(),
+    ));
+    let writer_transport = Arc::new(TestTransport::new("multi-replica-conflict-writer"));
+    let remover_transport = Arc::new(TestTransport::new("multi-replica-conflict-remover"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "multi-replica-conflict-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let remover = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), "multi-replica-conflict-remover")
+            .state(ClientLifecycleState::Active)
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(remover_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("remover build should succeed"),
+    );
+
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    remover
+        .register_local_memory()
+        .expect("remover memory should register");
+
+    let object_id =
+        mooncake_store_core::scoped_logical_object_id("default", "multi-replica-conflict-key");
+    let checksum = payload_checksum(b"payload");
+    let owner_a_v1 = ClientRuntimeId::new("multi-replica-store-a", ClientEpoch(1));
+    let owner_a_v2 = ClientRuntimeId::new("multi-replica-store-a", ClientEpoch(2));
+    let owner_b_v1 = ClientRuntimeId::new("multi-replica-store-b", ClientEpoch(1));
+    let mut route_v1 = ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: writer.lease().compatibility.clone(),
+        replicas: vec![
+            ReplicaRoute {
+                owner: owner_a_v1.clone(),
+                segment_name: SegmentName::new("multi-replica-store-a-segment-v1"),
+                offset: Some(1024),
+                segment_offset: 0,
+                length: 7,
+                checksum: Some(checksum),
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 0,
+            },
+            ReplicaRoute {
+                owner: owner_b_v1.clone(),
+                segment_name: SegmentName::new("multi-replica-store-b-segment-v1"),
+                offset: Some(2048),
+                segment_offset: 0,
+                length: 7,
+                checksum: Some(checksum),
+                tier: mooncake_store_core::ReplicaTier::Dram,
+                priority: 1,
+            },
+        ],
+    };
+    mooncake_store_core::apply_route_identity(&mut route_v1, &object_id);
+    let published = inner
+        .compare_and_swap_object_route(&route_v1.key, None, Some(&route_v1))
+        .expect("seed route publish should succeed");
+    assert!(published.applied, "seed route should publish");
+
+    metadata
+        .put_handoff(&HandoffPlan {
+            stable_id: owner_a_v1.stable_id.clone(),
+            from: owner_a_v1.clone(),
+            to: owner_a_v2.clone(),
+            kind: HandoffKind::HotUpgrade,
+            barrier_version: route_v1.version.0,
+            created_at_ms: now_ms(),
+            deadline_ms: None,
+        })
+        .expect("handoff plan should publish");
+
+    metadata.arm_blocked_cas();
+    let remover_task = {
+        let remover = Arc::clone(&remover);
+        std::thread::spawn(move || remover.remove("multi-replica-conflict-key", true))
+    };
+    assert!(
+        metadata.wait_until_blocked(Duration::from_secs(1)),
+        "delete CAS should block before the partial multi-replica route update is injected"
+    );
+
+    let mut route_v2 = route_v1.clone();
+    route_v2.version = route_v1.version.next();
+    route_v2.replicas[0].owner = owner_a_v2;
+    route_v2.replicas[0].segment_name = SegmentName::new("multi-replica-store-a-segment-v2");
+    route_v2.replicas[0].offset = Some(4096);
+    route_v2.replicas[0].segment_offset = 512;
+    let cas = inner
+        .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
+        .expect("concurrent partial multi-replica route update should succeed");
+    assert!(
+        cas.applied,
+        "concurrent partial multi-replica route update should become authoritative"
+    );
+
+    metadata.release_blocked_cas();
+    remover_task
+        .join()
+        .expect("remove worker should join")
+        .expect("remove should retry with the partial multi-replica successor route");
+    assert!(
+        writer
+            .query_route("multi-replica-conflict-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "route should be deleted after retrying with the partial multi-replica successor route"
     );
 }
 
