@@ -78,6 +78,10 @@ back into route lookup/CAS/list results. `mooncake-store-client` owns the
 control-plane transport implementation: tonic channels, control streams,
 unary fallback, timeouts, and protobuf encoding. Non-route control services
 such as allocator, eviction, and migration remain in `mooncake-store-client`.
+Client maintenance flows that already know the affected object key, including
+drain, migration, and shrink, update object routes through the same
+`RouteOperations` CRUD/CAS facade as put, get, delete, and exist paths. They do
+not write directly to selected route authorities.
 
 Route authority policy is bootstrap-validated through metadata:
 
@@ -394,7 +398,9 @@ Phase 4 extends the same model to routed `batch_put`: the client sorts entries b
 
 These APIs are what the e2e suite uses to validate dynamic membership, elastic expansion, true client shrink, and hot-upgrade handoff.
 
-During full client shrink, a draining route authority mirrors any locally held route records to active route authorities before shutdown. That final durability pass refreshes the live-client snapshot if the cached membership view cannot protect a route, so graceful exit does not depend on a stale local membership cache.
+During full client shrink, route changes for known keys are published through
+the same object route CRUD/CAS facade as normal client operations. The client
+does not perform a separate route-authority mirror pass before shutdown.
 
 ## Observability
 
@@ -480,7 +486,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-route` | route table operation facade and implementation modules: `operations`, `control`, `local_authority`, `directory`, `mesh`, `traits`, `metrics`, and `util`; `mesh` remains crate-internal |
+| `crates/mooncake-store-route` | object route table operation facade and implementation modules: `operations`, `control`, `local_authority`, `directory`, `mesh`, `traits`, `metrics`, and `util`; authority helpers remain internal to route control and `mesh` remains crate-internal |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
 | `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |

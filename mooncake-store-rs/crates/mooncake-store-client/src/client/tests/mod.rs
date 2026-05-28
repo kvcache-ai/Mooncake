@@ -3329,7 +3329,7 @@ fn embedded_wrh_route_directory_reuses_authority_snapshot() {
 }
 
 #[test]
-fn embedded_wrh_evacuation_reuses_live_authority_snapshot() {
+fn embedded_wrh_evacuation_route_facade_reuses_live_snapshot() {
     let metadata = Arc::new(CountingMetadataBackend::new(Arc::new(
         InMemoryMetadataBackend::new(),
     )));
@@ -3415,17 +3415,13 @@ fn embedded_wrh_evacuation_reuses_live_authority_snapshot() {
         "migration policy should reuse the shared live snapshot"
     );
 
-    let protected = router
-        .sync_route_to_live_authorities_excluding(&route, None)
-        .expect("authority sync should succeed");
+    router
+        .ensure_object_route_at_least(&route)
+        .expect("route facade update should succeed");
     let after_sync = metadata.list_live_clients_calls();
-    assert!(
-        protected > 0,
-        "authority sync should protect at least one authority"
-    );
     assert_eq!(
         after_sync, after_seed,
-        "authority sync should reuse the shared live-authority snapshot"
+        "route facade update should not refresh live-authority snapshots"
     );
 }
 
@@ -12390,7 +12386,7 @@ fn stale_route_transport_failure_refreshes_to_republished_route() {
 }
 
 #[test]
-fn draining_route_authority_mirrors_local_routes_before_restart() {
+fn draining_route_authority_does_not_special_mirror_local_routes_before_restart() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let store_transport = Arc::new(TestTransport::new("authority-drain-store-segment"));
     let authority_transport = Arc::new(store_transport.peer("authority-drain-victim-segment"));
@@ -12487,7 +12483,7 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
 
     let migrated = authority
         .evacuate_owned_replicas()
-        .expect("authority drain should mirror local routes");
+        .expect("authority drain should not special-mirror local routes");
     assert_eq!(migrated, 0);
     authority_replace(
         &namespace,
@@ -12497,16 +12493,11 @@ fn draining_route_authority_mirrors_local_routes_before_restart() {
     )
     .expect("test should simulate authority process restart");
 
-    assert_eq!(
-        reader
-            .get(key)
-            .expect("reader should find route after authority restart"),
-        value
-    );
+    assert!(matches!(reader.get(key), Err(StoreError::NotFound(_))));
 }
 
 #[test]
-fn drain_migration_refreshes_the_draining_route_authority() {
+fn drain_migration_updates_object_route_without_refreshing_draining_authority() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let victim_transport = Arc::new(TestTransport::new("drain-sync-victim-segment"));
     let survivor_transport = Arc::new(victim_transport.peer("drain-sync-survivor-segment"));
@@ -12588,15 +12579,16 @@ fn drain_migration_refreshes_the_draining_route_authority() {
         .expect("victim drain should migrate owned route");
     assert_eq!(migrated, 1);
 
-    let refreshed = authority_get(&namespace, &victim.runtime_id().stable_id, &scoped_key)
-        .expect("victim authority should remain readable during drain")
-        .expect("victim authority should retain the refreshed route");
+    let refreshed = writer
+        .query_route(key)
+        .expect("object route lookup should succeed")
+        .expect("migrated object route should exist");
     assert!(
         refreshed
             .replicas
             .iter()
             .all(|replica| replica.owner != *victim.runtime_id()),
-        "draining authority must not keep advertising the evacuated replica"
+        "object route facade must stop advertising the evacuated replica"
     );
     assert_eq!(writer.get(key).expect("migrated value should read"), value);
 }

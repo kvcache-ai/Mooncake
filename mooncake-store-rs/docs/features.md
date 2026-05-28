@@ -106,6 +106,7 @@ What it provides:
 - authority reads and compare-and-swap through the control plane
 - replica removal through route-owner compare-and-swap
 - mirrored-authority publication plus ranked authority reads for repair and convergence
+- drain, migration, and shrink route updates through the object route CRUD/CAS facade once the affected key is known
 
 ### Metadata-only routing
 
@@ -353,11 +354,11 @@ The client can publish handoff plans and participate in successor upgrade flows.
 
 ### Elastic capacity
 
-The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client. Full client shrink also refreshes membership before the final local route-authority mirror retry, so route handoff is not blocked by a stale cached live-client snapshot.
+The client can expand local storage, drain segments, retire empty segments, and evacuate all replicas owned by a draining client.
 
 This allows segment-level shrink, full client shrink, and dynamic storage growth without changing the public API.
 
-During full-client drain, replacement routes are also written back to the draining route authority while it still serves reads. The draining authority is not counted as a protected live mirror, but stale readers that still include it in their membership snapshot no longer see routes pointing at evacuated allocations. Explicit drain migration reads the selected source replica through an exact readable lease lookup instead of the suspect-runtime placement cache, so allocator quarantine for new writes does not block copying the source bytes that are being evacuated. Migration placement excludes the draining source owner even when a separate writer performs the copy, and the source owner releases its old allocations after publication. Read selection also prefers a local readable replica before remote replicas with lower route priority, so replica-protected reads avoid a dead remote primary when the survivor already has the data locally.
+During full-client drain, replacement routes are published through the same object route CRUD/CAS facade used by normal writes. The client does not perform a separate route-authority fanout for the draining authority. Explicit drain migration reads the selected source replica through an exact readable lease lookup instead of the suspect-runtime placement cache, so allocator quarantine for new writes does not block copying the source bytes that are being evacuated. Migration placement excludes the draining source owner even when a separate writer performs the copy, and the source owner releases its old allocations after publication. Read selection also prefers a local readable replica before remote replicas with lower route priority, so replica-protected reads avoid a dead remote primary when the survivor already has the data locally.
 
 ## Control Plane
 
