@@ -36,11 +36,14 @@ const static std::string GPU_PREFIX = "maca:";
 #define CUmemFabricHandle mcMemFabricHandle_t
 #define CUmemGenericAllocationHandle mcMemGenericAllocationHandle
 #define CUmemAllocationProp mcMemAllocationProp
+#define CUmemAllocationHandleType mcMemAllocationHandleType
 #define CUmemAccessDesc mcMemAccessDesc
 #define CUmemAllocationType mcMemAllocationType
 #define CU_MEM_ALLOCATION_TYPE_PINNED mcMemAllocationTypePinned
 #define CU_MEM_LOCATION_TYPE_DEVICE mcMemLocationTypeDevice
 #define CU_MEM_HANDLE_TYPE_FABRIC mcMemHandleTypeFabric
+#define CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR \
+    mcMemHandleTypePosixFileDescriptor
 #define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED \
     mcDeviceAttributeHandleTypeFabricSupported
 #define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED \
@@ -51,6 +54,7 @@ const static std::string GPU_PREFIX = "maca:";
 #define CU_MEMORYTYPE_HOST mcMemoryTypeHost
 #define CU_MEMORYTYPE_DEVICE mcMemoryTypeDevice
 #define CU_POINTER_ATTRIBUTE_MEMORY_TYPE mcPointerAttributeMemoryType
+#define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL mcPointerAttributeDevice
 #define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR mcPointerAttributeRangeStartAddr
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE mcPointerAttributeRangeSize
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD mcMemHandleTypePosixFileDescriptor

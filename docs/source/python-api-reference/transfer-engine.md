@@ -624,6 +624,7 @@ The Transfer Engine respects the following environment variables:
 ### Basic Setup and Data Transfer
 
 ```python
+import numpy as np
 from mooncake.engine import TransferEngine
 import os
 
@@ -650,7 +651,7 @@ data_len = len(data)
 engine.register_memory(buffer_data, buffer_data_len)
 
 # Get Remote Addr from ZMQ or upper-layer inference framework
-remote_addr = ??
+remote_addr = REMOTE_ADDR
 
 # Transfer data to remote node
 ret = engine.transfer_sync_write(

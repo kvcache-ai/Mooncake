@@ -9,6 +9,8 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 jobs:
   build:
+    # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by pre-release.yaml.
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -69,7 +71,7 @@ jobs:
 
       - name: Build project
         run: |
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           cd build
           make -j
           sudo -E make install

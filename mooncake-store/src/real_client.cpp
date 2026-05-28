@@ -33,6 +33,9 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -288,6 +291,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
+    const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -297,9 +301,17 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local MEMORY — best case
             }
             if (!first_memory) first_memory = &r;
+        } else if (r.is_nof_replica()) {
+            if (local_endpoints.count(
+                    r.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                return &r;  // local NOF_SSD — also good
+            }
+            if (!first_nof) first_nof = &r;
         }
     }
     if (first_memory) return first_memory;
+    if (first_nof) return first_nof;
 
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {
@@ -637,6 +649,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
+#ifdef USE_NOF
+    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
+        LOG(ERROR) << "spdk env init fail";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+#endif
+
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
@@ -723,8 +742,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    bool use_spdk_dma_for_client_buffer = false;
+#ifdef USE_NOF
+    use_spdk_dma_for_client_buffer = true;
+#endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
+        local_buffer_size, this->protocol, should_use_hugepage,
+        use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -4558,10 +4582,10 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
-    LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
-              << "us, read store: " << read_store_time
-              << "us, with memory key count: " << valid_operations.size()
-              << ", offload key count: " << offload_object_count;
+    // LOG(INFO) << "Time taken for batch_get_into: " << elapsed_time
+    //           << "us, read store: " << read_store_time
+    //           << "us, with memory key count: " << valid_operations.size()
+    //           << ", offload key count: " << offload_object_count;
 
     return results;
 }

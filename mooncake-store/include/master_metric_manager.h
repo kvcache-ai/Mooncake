@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -57,7 +58,16 @@ class MasterMetricManager {
         MEMORY_HIT_RATE,
         SSD_HIT_RATE,
         OVERALL_HIT_RATE,
-        VALID_GET_RATE
+        VALID_GET_RATE,
+        // Clearer aliases for Store-observed counters. The legacy names above
+        // are kept to preserve RPC/API enum values.
+        MEMORY_CURRENT_CACHED_OBJECTS = MEMORY_TOTAL,
+        SSD_CURRENT_CACHED_OBJECTS = SSD_TOTAL,
+        // These values may exceed 1.0 because the numerator is cumulative
+        // while the denominator is the current cached object count.
+        MEMORY_HITS_PER_CURRENT_CACHED_OBJECT = MEMORY_HIT_RATE,
+        SSD_HITS_PER_CURRENT_CACHED_OBJECT = SSD_HIT_RATE,
+        OVERALL_HITS_PER_CURRENT_CACHED_OBJECT = OVERALL_HIT_RATE
     };
     using CacheHitStatDict = std::unordered_map<CacheHitStat, double>;
     void add_stat_to_dict(CacheHitStatDict&, CacheHitStat, double);
@@ -95,6 +105,10 @@ class MasterMetricManager {
     int64_t get_allocated_file_size();
     int64_t get_total_file_capacity();
     double get_global_file_used_ratio(void);
+    // When true, get_total_file_capacity() returns INT64_MAX to indicate
+    // unlimited DFS capacity instead of relying on the gauge value.
+    void set_dfs_capacity_unlimited(bool unlimited);
+    bool is_dfs_capacity_unlimited() const;
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -489,6 +503,7 @@ class MasterMetricManager {
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
+    std::atomic<bool> dfs_capacity_unlimited_{false};
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
@@ -575,7 +590,8 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
 
-    // cache hit Statistics
+    // Store-observed cache reuse statistics. These counters do not represent
+    // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
     ylt::metric::gauge_t mem_cache_nums_;

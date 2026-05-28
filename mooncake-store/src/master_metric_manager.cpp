@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
+#include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
@@ -268,18 +269,23 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
-      // Initialize cache hit rate metrics
+      // Initialize Store-observed cache reuse metrics. These are not
+      // end-to-end request/token-level cache hit ratio metrics.
       mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
+                          "Total number of GetReplicaList results served from "
+                          "the memory pool"),
       file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
+                           "Total number of GetReplicaList results served from "
+                           "the SSD cache"),
       mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
+                      "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
+                       "Current number of cached values in the SSD cache"),
       valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
+                      "Total number of GetReplicaList operations that returned "
+                      "at least one completed replica"),
+      total_get_nums_("total_get_nums_",
+                      "Total number of GetReplicaList operations"),
 
       // Initialize Eviction Counters
       // total eviction
@@ -505,7 +511,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_items_.inc(0);
     batch_put_revoke_failed_items_.inc(0);
 
-    // Update cache hit rate metrics
+    // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
     valid_get_nums_.inc(0);
@@ -696,15 +702,29 @@ void MasterMetricManager::dec_total_file_capacity(int64_t val) {
     file_total_capacity_.dec(val);
 }
 
+void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
+    dfs_capacity_unlimited_ = unlimited;
+}
+
+bool MasterMetricManager::is_dfs_capacity_unlimited() const {
+    return dfs_capacity_unlimited_;
+}
+
 int64_t MasterMetricManager::get_allocated_file_size() {
     return file_allocated_size_.value();
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
+    if (dfs_capacity_unlimited_) {
+        return std::numeric_limits<int64_t>::max();
+    }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
+    if (dfs_capacity_unlimited_) {
+        return 0.0;
+    }
     double allocated = file_allocated_size_.value();
     double capacity = file_total_capacity_.value();
     if (capacity == 0) {
@@ -747,7 +767,7 @@ int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
 }
 
-// cache hit rate metrics
+// Store-observed cache reuse metrics
 void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
     mem_cache_hit_nums_.inc(val);
 }
@@ -1650,25 +1670,33 @@ MasterMetricManager::calculate_cache_stats() {
     int64_t valid_get_nums = valid_get_nums_.value();
     int64_t total_get_nums = total_get_nums_.value();
 
-    double mem_hit_rate = 0.0;
+    // These values divide cumulative Store-observed hits by the current cached
+    // object count. They are not bounded request/token-level hit ratios; that
+    // end-to-end metric belongs to Conductor or the inference engine.
+    double mem_hits_per_current_cached_object = 0.0;
     if (mem_total_cache > 0) {
-        mem_hit_rate = static_cast<double>(mem_cache_hits) /
-                       static_cast<double>(mem_total_cache);
-        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+        mem_hits_per_current_cached_object =
+            static_cast<double>(mem_cache_hits) /
+            static_cast<double>(mem_total_cache);
+        mem_hits_per_current_cached_object =
+            std::round(mem_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double ssd_hit_rate = 0.0;
+    double ssd_hits_per_current_cached_object = 0.0;
     if (ssd_total_cache > 0) {
-        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
-                       static_cast<double>(ssd_total_cache);
-        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+        ssd_hits_per_current_cached_object =
+            static_cast<double>(ssd_cache_hits) /
+            static_cast<double>(ssd_total_cache);
+        ssd_hits_per_current_cached_object =
+            std::round(ssd_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double total_hit_rate = 0.0;
+    double overall_hits_per_current_cached_object = 0.0;
     if (total_cache > 0) {
-        total_hit_rate =
+        overall_hits_per_current_cached_object =
             static_cast<double>(total_hits) / static_cast<double>(total_cache);
-        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+        overall_hits_per_current_cached_object =
+            std::round(overall_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
     double valid_get_rate = 0.0;
@@ -1682,10 +1710,12 @@ MasterMetricManager::calculate_cache_stats() {
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
     add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE,
+                     mem_hits_per_current_cached_object);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE,
+                     ssd_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
-                     total_hit_rate);
+                     overall_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
     return stats_dict;
 }
@@ -2007,6 +2037,9 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
+    int64_t file_display_capacity = dfs_capacity_unlimited_
+                                        ? std::numeric_limits<int64_t>::max()
+                                        : file_capacity;
     ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
        << byte_size_to_string(nof_capacity);
     if (nof_capacity > 0) {
@@ -2014,7 +2047,7 @@ std::string MasterMetricManager::get_summary_string(
            << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
-       << byte_size_to_string(file_capacity);
+       << byte_size_to_string(file_display_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
@@ -2220,27 +2253,27 @@ std::string MasterMetricManager::get_summary_string(
                   delta(&SummaryCounters::mark_task_to_complete_fails),
               delta(&SummaryCounters::mark_task_to_complete_requests))
        << ")";
-    // Eviction summary
+    // Eviction counters are cumulative. Request counters above are reported as
+    // window rates, but eviction totals are used to track long-running pressure
+    // and should not reset after each admin metrics snapshot.
     ss << " | Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::eviction_success)
-       << "/" << delta(&SummaryCounters::eviction_attempts) << ", "
+       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
+       << ", "
        << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
-       << "keys=" << delta(&SummaryCounters::evicted_key_count) << ", "
-       << "size=" << byte_size_to_string(delta(&SummaryCounters::evicted_size));
+       << "keys=" << evicted_key_count << ", "
+       << "size=" << byte_size_to_string(evicted_size);
     // mem eviction
     ss << " | Mem Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::mem_eviction_success)
-       << "/" << delta(&SummaryCounters::mem_eviction_attempts) << ", "
-       << "keys=" << delta(&SummaryCounters::mem_evicted_key_count) << ", "
-       << "size="
-       << byte_size_to_string(delta(&SummaryCounters::mem_evicted_size));
+       << "Success/Attempts=" << mem_eviction_success << "/"
+       << mem_eviction_attempts << ", "
+       << "keys=" << mem_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(mem_evicted_size);
     // nof eviction
     ss << " | NoF Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::nof_eviction_success)
-       << "/" << delta(&SummaryCounters::nof_eviction_attempts) << ", "
-       << "keys=" << delta(&SummaryCounters::nof_evicted_key_count) << ", "
-       << "size="
-       << byte_size_to_string(delta(&SummaryCounters::nof_evicted_size));
+       << "Success/Attempts=" << nof_eviction_success << "/"
+       << nof_eviction_attempts << ", "
+       << "keys=" << nof_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(nof_evicted_size);
 
     // Discard summary
     ss << " | Discard: "

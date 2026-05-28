@@ -804,6 +804,8 @@ class Client {
     std::thread task_poll_thread_;
     std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
+    std::atomic<bool> segment_desc_publish_pending_{false};
+    std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();

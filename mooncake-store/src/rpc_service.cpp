@@ -75,6 +75,7 @@ void SetServiceUnavailable(coro_http::coro_http_response& resp,
     resp.set_status_and_content(coro_http::status_type::service_unavailable,
                                 payload);
 }
+
 struct HttpErrorResponse {
     bool success{false};
     int32_t error_code{0};
@@ -1005,11 +1006,24 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         results;
     results.reserve(keys.size());
 
-    if (config.prefer_alloc_in_same_node) {
+    if (keys.size() != slice_lengths.size()) {
+        LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
+                   << " != slice_lengths.size()=" << slice_lengths.size();
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (config.group_ids.has_value() &&
+               config.group_ids->size() != keys.size()) {
+        LOG(ERROR) << "BatchPutStart: group_ids.size()="
+                   << config.group_ids->size()
+                   << " != keys.size()=" << keys.size();
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
+            auto key_config = new_config.ForSingleKey(i);
             auto result = master_service_.PutStart(
-                client_id, keys[i], slice_lengths[i], new_config);
+                client_id, keys[i], slice_lengths[i], key_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -1029,8 +1043,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         }
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
+            auto key_config = config.ForSingleKey(i);
             results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], slice_lengths[i], config));
+                client_id, keys[i], slice_lengths[i], key_config));
         }
     }
 

@@ -16,12 +16,18 @@ class TestImportStructure(unittest.TestCase):
         # Verify direct access to TransferOpcode
         self.assertIsNotNone(mooncake.engine.TransferOpcode)
 
-        from mooncake.store import MooncakeDistributedStore
+        from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
         # Just verify we can create instances
         store = MooncakeDistributedStore()
+        config = ReplicateConfig()
+        config.group_ids = ["group-a", ""]
 
         self.assertIsNotNone(store)
+        self.assertEqual(config.group_ids, ["group-a", ""])
+
+        config.group_ids = None
+        self.assertIsNone(config.group_ids)
 
     def test_direct_import(self):
         """Test direct import of specific components."""
