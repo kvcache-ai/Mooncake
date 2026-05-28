@@ -61,8 +61,8 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigParsesTransferDirectionMode) {
     auto forward = ClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
-        12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32, 9003,
-        true, {}, 0, 2000, 0, 0, 0, "forward");
+        12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32, 9003, true,
+        {}, 0, 2000, 0, 0, 0, "forward");
     EXPECT_EQ(forward.transfer_direction_mode, TransferDirectionMode::FORWARD);
 }
 

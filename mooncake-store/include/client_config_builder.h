@@ -181,8 +181,8 @@ struct P2PClientConfig : RealClientConfigBase {
     uint32_t p2p_key_lease_duration_ms = kP2pDefaultKeyLeaseDurationMs;
     uint32_t p2p_key_lease_scan_interval_ms = kP2pDefaultKeyLeaseScanIntervalMs;
 
-    // Cross-node transfer direction (reverse = owner TE, forward = accessor TE).
-    // Configured at client startup only.
+    // Cross-node transfer direction (reverse = owner TE, forward = accessor
+    // TE). Configured at client startup only.
     TransferDirectionMode transfer_direction_mode =
         TransferDirectionMode::REVERSE;
 };

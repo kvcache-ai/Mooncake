@@ -32,17 +32,18 @@ bool LeaseCleanupErrorTreatAsEffectiveOk(ErrorCode e) {
 
 async_simple::coro::Lazy<void>
 P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
-    std::shared_ptr<WritePromise> promise,
-    PeerClient* peer, TeTransferFn te_transfer,
-    std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
+    std::shared_ptr<WritePromise> promise, PeerClient* peer,
+    TeTransferFn te_transfer, std::shared_ptr<RemoteWriteRequest> write_req,
+    std::vector<Slice>* slices) {
     if (!peer || !te_transfer || !write_req || !slices) {
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::INTERNAL_ERROR)));
         co_return;
     }
     if (slices->size() != 1) {
-        LOG(ERROR) << "Forward transfer write supports a single slice only, key="
-                   << write_req->key << ", slice_count=" << slices->size();
+        LOG(ERROR)
+            << "Forward transfer write supports a single slice only, key="
+            << write_req->key << ", slice_count=" << slices->size();
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
         co_return;
@@ -964,9 +965,8 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                     [dm](void* local_base, size_t size,
                          const std::vector<RemoteBufferDesc>& dest_buffers)
                     -> tl::expected<void, ErrorCode> {
-                    return dm->TransferData(
-                        local_base, size, dest_buffers,
-                        Transport::TransferRequest::WRITE);
+                    return dm->TransferData(local_base, size, dest_buffers,
+                                            Transport::TransferRequest::WRITE);
                 };
                 write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
                     peer, write_req, endpoint, &slices,
@@ -1312,7 +1312,8 @@ P2PClientService::BatchCreateGetHandles(
 std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
-    std::vector<std::vector<Slice>>& all_slices, const ReadRouteConfig& config) {
+    std::vector<std::vector<Slice>>& all_slices,
+    const ReadRouteConfig& config) {
     auto local_get = [&](std::string_view key,
                          size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
         if (!data_manager_.has_value()) {
@@ -1415,8 +1416,7 @@ P2PClientService::BatchFetchReadRoutes(
 
     // Single batch RPC to master
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> responses;
-    responses =
-        master_client_.BatchGetReplicaList(miss_keys, config);
+    responses = master_client_.BatchGetReplicaList(miss_keys, config);
     for (size_t k = 0; k < responses.size(); ++k) {
         if (!responses[k]) {
             if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -1586,9 +1586,9 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         co_return ErrorCode::INTERNAL_ERROR;
     }
     if (req->dest_buffers.size() != 1) {
-        LOG(ERROR) << "Forward transfer read supports a single dest buffer only, key="
-                   << req->key
-                   << ", buffer_count=" << req->dest_buffers.size();
+        LOG(ERROR)
+            << "Forward transfer read supports a single dest buffer only, key="
+            << req->key << ", buffer_count=" << req->dest_buffers.size();
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
         co_return ErrorCode::NOT_IMPLEMENTED;
@@ -1606,9 +1606,9 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
     const size_t total = req->dest_buffers[0].size;
-    auto tr = data_manager_->TransferData(
-        base, total, {pin.value().remote_buffer},
-        Transport::TransferRequest::READ);
+    auto tr =
+        data_manager_->TransferData(base, total, {pin.value().remote_buffer},
+                                    Transport::TransferRequest::READ);
     if (!tr) {
         LOG(ERROR) << "Forward TE read failed, key=" << req->key
                    << ", error=" << tr.error();
@@ -1644,7 +1644,8 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     unpin_req.key = req->key;
     unpin_req.read_operation_id = pin.value().read_operation_id;
     tl::expected<void, ErrorCode> unpin_res;
-    for (int attempt = 0; attempt < kUnpinOrWriteRevokeRetryMaxAttempts; ++attempt) {
+    for (int attempt = 0; attempt < kUnpinOrWriteRevokeRetryMaxAttempts;
+         ++attempt) {
         unpin_res = co_await route.peer->AsyncUnPinKey(unpin_req);
         if (unpin_res) {
             break;
@@ -1681,19 +1682,21 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
             try {
                 if (transfer_direction_mode_ ==
                     TransferDirectionMode::FORWARD) {
-                    const ErrorCode route_result = co_await RunForwardReadOnRoute(
-                        *route, req, promise, iter);
+                    const ErrorCode route_result =
+                        co_await RunForwardReadOnRoute(*route, req, promise,
+                                                       iter);
                     if (route_result == ErrorCode::OK) {
                         co_return;
                     }
                     if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
-                        LOG(ERROR) << "Forward read failed, key: " << req->key
-                                   << ", error: " << route_result
-                                   << ", route: " << route->proxy.ip_address
-                                   << ":" << route->proxy.rpc_port
-                                   << ", client_id: " << route->proxy.client_id
-                                   << ", segment_id: " << route->proxy.segment_id
-                                   << ", is_cached: " << route->is_cached;
+                        LOG(ERROR)
+                            << "Forward read failed, key: " << req->key
+                            << ", error: " << route_result
+                            << ", route: " << route->proxy.ip_address << ":"
+                            << route->proxy.rpc_port
+                            << ", client_id: " << route->proxy.client_id
+                            << ", segment_id: " << route->proxy.segment_id
+                            << ", is_cached: " << route->is_cached;
                     }
                     if (route_result == ErrorCode::INTERNAL_ERROR ||
                         route_result == ErrorCode::INVALID_PARAMS ||
@@ -1703,7 +1706,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                     final_result = route_result;
                     continue;
                 } else {
-                    auto result = co_await route->peer->AsyncReadRemoteData(*req);
+                    auto result =
+                        co_await route->peer->AsyncReadRemoteData(*req);
                     if (result.has_value()) {
                         tl::expected<void, ErrorCode> ok;
                         promise->setValue(std::move(ok));
@@ -1956,8 +1960,7 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // Query master for replica list
-    auto result =
-        master_client_.GetReplicaList(object_key, config);
+    auto result = master_client_.GetReplicaList(object_key, config);
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
                      << ", key=" << object_key << ", error=" << result.error();
@@ -1983,8 +1986,7 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
     }
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
-    auto responses =
-        master_client_.BatchGetReplicaList(key_views, config);
+    auto responses = master_client_.BatchGetReplicaList(key_views, config);
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>> results;
     results.reserve(responses.size());
     for (size_t i = 0; i < responses.size(); ++i) {

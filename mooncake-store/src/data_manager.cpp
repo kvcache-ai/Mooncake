@@ -812,8 +812,9 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         return tl::make_unexpected(validate_result.error());
     }
 
-    // Reverse transfer read stays on the direct object-handle path. Only forward
-    // transfer read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
+    // Reverse transfer read stays on the direct object-handle path. Only
+    // forward transfer read uses the 3-phase PinKey -> TE Read -> UnPinKey
+    // flow.
     auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
         LOG(ERROR) << "ReadRemoteData: Get failed"
@@ -870,8 +871,9 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     size_t total_size = 0;
     for (const auto& buf : src_buffers) total_size += buf.size;
 
-    // Reverse transfer path: still one RPC, but internally use the 3-phase write
-    // model (PreWrite -> transfer -> WriteCommit). Target tier may be non-DRAM.
+    // Reverse transfer path: still one RPC, but internally use the 3-phase
+    // write model (PreWrite -> transfer -> WriteCommit). Target tier may be
+    // non-DRAM.
     auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id, false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
@@ -921,11 +923,12 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
                               std::optional<UUID> tier_id,
                               bool enforce_dram_allocation) {
     // TODO(tiered_backend): `enforce_dram_allocation` is temporary. Today
-    // `tiered_backend_->Allocate()` does not yet allocate from a caller-selected
-    // tier in a way that guarantees DRAM for the cross-node forward TE path.
-    // Public PreWrite passes true to reject non-DRAM handles; local Put and
-    // WriteRemoteData pass false. Remove this parameter once TieredBackend is
-    // refactored to allocate from the intended tier explicitly.
+    // `tiered_backend_->Allocate()` does not yet allocate from a
+    // caller-selected tier in a way that guarantees DRAM for the cross-node
+    // forward TE path. Public PreWrite passes true to reject non-DRAM handles;
+    // local Put and WriteRemoteData pass false. Remove this parameter once
+    // TieredBackend is refactored to allocate from the intended tier
+    // explicitly.
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 

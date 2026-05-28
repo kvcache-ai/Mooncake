@@ -1145,7 +1145,8 @@ PYBIND11_MODULE(store, m) {
                     metrics_port, enable_metrics_http, {},
                     async_sender_thread_count, async_max_batch_size,
                     async_route_queue_size, p2p_key_lease_duration_ms,
-                    p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode);
+                    p2p_key_lease_scan_interval_ms,
+                    p2p_transfer_direction_mode);
 
                 auto ret = real_client->setup(config);
                 self.store_ = real_client;
@@ -1669,7 +1670,8 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
                const std::vector<std::vector<size_t>>& all_sizes,
                bool aggregate_same_segment_task = false,
-               const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
+               const std::optional<ReadRouteConfig>& config_opt =
+                   std::nullopt) {
                 ReadRouteConfig config = config_opt.value_or(ReadRouteConfig{});
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {

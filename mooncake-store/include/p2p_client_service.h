@@ -321,8 +321,8 @@ class P2PClientService final : public ClientService {
 
        private:
         static async_simple::coro::Lazy<void> RunForwardRemotePut(
-            std::shared_ptr<WritePromise> promise,
-            PeerClient* peer, TeTransferFn te_transfer,
+            std::shared_ptr<WritePromise> promise, PeerClient* peer,
+            TeTransferFn te_transfer,
             std::shared_ptr<RemoteWriteRequest> write_req,
             std::vector<Slice>* slices);
     };
@@ -459,10 +459,9 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise);
 
-    // OK / INTERNAL_ERROR / INVALID_PARAMS / NOT_IMPLEMENTED: promise fulfilled,
-    // caller co_return.
-    // Any other code: try next route; use returned code as final_result if all
-    // routes are exhausted.
+    // OK / INTERNAL_ERROR / INVALID_PARAMS / NOT_IMPLEMENTED: promise
+    // fulfilled, caller co_return. Any other code: try next route; use returned
+    // code as final_result if all routes are exhausted.
     async_simple::coro::Lazy<ErrorCode> RunForwardReadOnRoute(
         const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
@@ -506,7 +505,8 @@ class P2PClientService final : public ClientService {
     std::unique_ptr<HARecoveryManager> ha_manager_;
 
     // Cross-node transfer direction from P2PClientConfig at Init().
-    TransferDirectionMode transfer_direction_mode_ = TransferDirectionMode::REVERSE;
+    TransferDirectionMode transfer_direction_mode_ =
+        TransferDirectionMode::REVERSE;
 };
 
 }  // namespace mooncake

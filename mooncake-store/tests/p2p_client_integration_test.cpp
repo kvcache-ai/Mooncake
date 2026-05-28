@@ -36,7 +36,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port = 0,
         const std::string& local_transfer_mode = "te",
-        TransferDirectionMode transfer_direction_mode = TransferDirectionMode::REVERSE) {
+        TransferDirectionMode transfer_direction_mode =
+            TransferDirectionMode::REVERSE) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -651,7 +652,8 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
             << " err=" << static_cast<int>(put_res.error());
 
         ReadRouteConfig rcfg;
-        rcfg.max_candidates = GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+        rcfg.max_candidates =
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<char> buf(payload.size(), 0);
         auto get_res =
