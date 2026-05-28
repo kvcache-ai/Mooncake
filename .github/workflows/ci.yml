@@ -143,7 +143,7 @@ jobs:
         }
 
         echo "=== Processing coverage data ==="
-        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/tests/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
 
         echo "=== Generating HTML report ==="
         genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
