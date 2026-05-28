@@ -2679,6 +2679,243 @@ fn batch_remove_force_true_skips_missing_keys() {
 }
 
 #[test]
+fn remove_retries_after_route_delete_conflict_with_fresher_current() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let block_key = ObjectKey::from_scope(
+        &NamespaceScope::with_defaults(Some("default"), None, None),
+        "conflict-key",
+    );
+    let metadata = Arc::new(BlockingCasMetadataBackend::new(
+        inner.clone(),
+        block_key.0.as_str(),
+    ));
+    let writer_transport = Arc::new(TestTransport::new("delete-conflict-writer"));
+    let remover_transport = Arc::new(TestTransport::new("delete-conflict-remover"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "delete-conflict-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let remover = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), "delete-conflict-remover")
+            .state(ClientLifecycleState::Active)
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(remover_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("remover build should succeed"),
+    );
+
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    remover
+        .register_local_memory()
+        .expect("remover memory should register");
+
+    let route_v1 = writer
+        .put("conflict-key", b"payload")
+        .expect("seed put should succeed");
+
+    metadata.arm_blocked_cas();
+    let remover_task = {
+        let remover = Arc::clone(&remover);
+        std::thread::spawn(move || remover.remove("conflict-key", true))
+    };
+    assert!(
+        metadata.wait_until_blocked(Duration::from_secs(1)),
+        "delete CAS should block before the route update race is injected"
+    );
+
+    let mut route_v2 = route_v1.clone();
+    route_v2.version = route_v1.version.next();
+    let cas = inner
+        .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
+        .expect("concurrent route update should succeed");
+    assert!(
+        cas.applied,
+        "concurrent route update should become authoritative"
+    );
+
+    metadata.release_blocked_cas();
+    remover_task
+        .join()
+        .expect("remove worker should join")
+        .expect("remove should retry with the fresher current route");
+    assert!(
+        writer
+            .query_route("conflict-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "route should be deleted after retrying with the fresher current route"
+    );
+}
+
+#[test]
+fn batch_remove_retries_after_route_delete_conflict_with_fresher_current() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let block_key = ObjectKey::from_scope(
+        &NamespaceScope::with_defaults(Some("default"), None, None),
+        "batch-conflict-key",
+    );
+    let metadata = Arc::new(BlockingCasMetadataBackend::new(
+        inner.clone(),
+        block_key.0.as_str(),
+    ));
+    let writer_transport = Arc::new(TestTransport::new("batch-delete-conflict-writer"));
+    let remover_transport = Arc::new(TestTransport::new("batch-delete-conflict-remover"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-delete-conflict-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let remover = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), "batch-delete-conflict-remover")
+            .state(ClientLifecycleState::Active)
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(remover_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("remover build should succeed"),
+    );
+
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    remover
+        .register_local_memory()
+        .expect("remover memory should register");
+
+    let route_v1 = writer
+        .put("batch-conflict-key", b"payload")
+        .expect("seed put should succeed");
+
+    metadata.arm_blocked_cas();
+    let remover_task = {
+        let remover = Arc::clone(&remover);
+        std::thread::spawn(move || {
+            remover.batch_remove(&[ObjectRef::new("batch-conflict-key")], true)
+        })
+    };
+    assert!(
+        metadata.wait_until_blocked(Duration::from_secs(1)),
+        "batch delete CAS should block before the route update race is injected"
+    );
+
+    let mut route_v2 = route_v1.clone();
+    route_v2.version = route_v1.version.next();
+    let cas = inner
+        .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
+        .expect("concurrent route update should succeed");
+    assert!(
+        cas.applied,
+        "concurrent route update should become authoritative"
+    );
+
+    metadata.release_blocked_cas();
+    remover_task
+        .join()
+        .expect("batch remove worker should join")
+        .expect("batch remove should retry with the fresher current route");
+    assert!(
+        writer
+            .query_route("batch-conflict-key")
+            .expect("route query should succeed")
+            .is_none(),
+        "route should be deleted after batch remove retries with the fresher current route"
+    );
+}
+
+#[test]
+fn remove_force_true_keeps_conflict_for_fresher_rewrite_route() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let block_key = ObjectKey::from_scope(
+        &NamespaceScope::with_defaults(Some("default"), None, None),
+        "rewrite-conflict-key",
+    );
+    let metadata = Arc::new(BlockingCasMetadataBackend::new(
+        inner.clone(),
+        block_key.0.as_str(),
+    ));
+    let writer_transport = Arc::new(TestTransport::new("rewrite-conflict-writer"));
+    let remover_transport = Arc::new(TestTransport::new("rewrite-conflict-remover"));
+    let writer = StoreClientBuilder::new(metadata.clone(), "rewrite-conflict-writer")
+        .state(ClientLifecycleState::Active)
+        .route_control(RouteControlMode::MetadataOnly)
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let remover = Arc::new(
+        StoreClientBuilder::new(metadata.clone(), "rewrite-conflict-remover")
+            .state(ClientLifecycleState::Active)
+            .route_control(RouteControlMode::MetadataOnly)
+            .transport(remover_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("remover build should succeed"),
+    );
+
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    remover
+        .register_local_memory()
+        .expect("remover memory should register");
+
+    let route_v1 = writer
+        .put("rewrite-conflict-key", b"payload")
+        .expect("seed put should succeed");
+
+    metadata.arm_blocked_cas();
+    let remover_task = {
+        let remover = Arc::clone(&remover);
+        std::thread::spawn(move || remover.remove("rewrite-conflict-key", true))
+    };
+    assert!(
+        metadata.wait_until_blocked(Duration::from_secs(1)),
+        "delete CAS should block before the rewrite route is injected"
+    );
+
+    let mut route_v2 = route_v1.clone();
+    route_v2.version = route_v1.version.next();
+    route_v2.replicas[0].checksum = Some(
+        route_v1.replicas[0]
+            .checksum
+            .expect("seed route should publish checksum")
+            .saturating_add(1),
+    );
+    let cas = inner
+        .compare_and_swap_object_route(&route_v1.key, Some(route_v1.version), Some(&route_v2))
+        .expect("concurrent rewrite route update should succeed");
+    assert!(
+        cas.applied,
+        "concurrent rewrite route update should become authoritative"
+    );
+
+    metadata.release_blocked_cas();
+    let error = remover_task
+        .join()
+        .expect("remove worker should join")
+        .expect_err("force remove should keep conflict for a fresher rewrite route");
+    assert!(
+        matches!(error, StoreError::Conflict(_)),
+        "expected conflict, got {error:?}"
+    );
+    assert_eq!(
+        writer
+            .query_route("rewrite-conflict-key")
+            .expect("route query should succeed"),
+        Some(route_v2),
+        "fresher rewrite route should stay authoritative after delete conflict"
+    );
+}
+
+#[test]
 fn batch_get_into_multi_buffers_rejects_insufficient_capacity() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("client-segment"));
@@ -5851,6 +6088,154 @@ fn routed_batch_put_from_replans_after_membership_refresh_and_uses_new_runtime()
             .get("batch-put-replan-key")
             .expect("reader should see replanned write"),
         source
+    );
+}
+
+#[test]
+fn routed_batch_put_from_mixed_batch_keeps_live_targets_when_one_ranked_runtime_is_missing() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata = Arc::new(RecoverableMetadataBackend::new(inner));
+    let stale_transport = Arc::new(TestTransport::new("batch-put-mixed-missing-a-segment"));
+    let live_transport = Arc::new(stale_transport.peer("batch-put-mixed-missing-b-segment"));
+    let writer_transport = Arc::new(stale_transport.peer("batch-put-mixed-missing-writer-segment"));
+    let reader_transport = Arc::new(stale_transport.peer("batch-put-mixed-missing-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let stale_store = StoreClientBuilder::new(metadata.clone(), "batch-put-mixed-missing-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(stale_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("stale store build should succeed");
+    let live_store = StoreClientBuilder::new(metadata.clone(), "batch-put-mixed-missing-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(live_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("live store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "batch-put-mixed-missing-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner.clone(), 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "batch-put-mixed-missing-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    stale_store
+        .register_local_memory()
+        .expect("stale store memory should register");
+    live_store
+        .register_local_memory()
+        .expect("live store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&stale_store, &live_store, &writer, &reader]);
+
+    let cached_membership = vec![
+        stale_store.lease(),
+        live_store.lease(),
+        writer.lease(),
+        reader.lease(),
+    ];
+    metadata.hide_runtime_metadata(stale_store.runtime_id());
+    writer.live_client_cache.lock().store(cached_membership);
+
+    let mut stale_first_key = None;
+    let mut live_first_key = None;
+    for index in 0..512usize {
+        let key = format!("batch-put-mixed-missing-key-{index}");
+        let ranked = planner
+            .ranked_candidates(&writer, &ObjectRef::new(&key))
+            .expect("ranked candidates should resolve from the cached membership");
+        match ranked.first() {
+            Some(runtime) if *runtime == *stale_store.runtime_id() && stale_first_key.is_none() => {
+                stale_first_key = Some(key.clone());
+            }
+            Some(runtime) if *runtime == *live_store.runtime_id() && live_first_key.is_none() => {
+                live_first_key = Some(key.clone());
+            }
+            _ => {}
+        }
+        if stale_first_key.is_some() && live_first_key.is_some() {
+            break;
+        }
+    }
+    let stale_first_key = stale_first_key.expect("one key should rank the hidden runtime first");
+    let live_first_key = live_first_key.expect("one key should rank the surviving runtime first");
+
+    let source_a = b"batch-put-mixed-missing-payload-a".to_vec();
+    let source_b = b"batch-put-mixed-missing-payload-b".to_vec();
+    writer
+        .register_buffer(source_a.as_ptr() as *mut c_void, source_a.len())
+        .expect("source-a buffer should register");
+    writer
+        .register_buffer(source_b.as_ptr() as *mut c_void, source_b.len())
+        .expect("source-b buffer should register");
+
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false);
+    let routes = writer
+        .batch_put_from(&[
+            PutFromRequest::new(
+                stale_first_key.as_str(),
+                source_a.as_ptr().cast(),
+                source_a.len(),
+            )
+            .replication(policy.clone()),
+            PutFromRequest::new(
+                live_first_key.as_str(),
+                source_b.as_ptr().cast(),
+                source_b.len(),
+            )
+            .replication(policy),
+        ])
+        .expect(
+            "batch_put_from should preserve live targets even when one ranked runtime vanished",
+        );
+
+    assert_eq!(routes.len(), 2);
+    for route in &routes {
+        assert_eq!(route.replicas.len(), 1);
+        assert_eq!(route.replicas[0].owner, *live_store.runtime_id());
+    }
+    assert_eq!(
+        reader
+            .get(stale_first_key.as_str())
+            .expect("reader should fetch the first batch payload"),
+        source_a
+    );
+    assert_eq!(
+        reader
+            .get(live_first_key.as_str())
+            .expect("reader should fetch the second batch payload"),
+        source_b
     );
 }
 
@@ -11999,6 +12384,46 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
     client
         .flush_all_reclaims()
         .expect("flush_all_reclaims should accept empty queue");
+
+    let reclaim_reservation = client
+        .reserve_segment_allocation(client.runtime_id(), None, 16, true)
+        .expect("reclaim reservation should succeed");
+    {
+        let mut state = client.state.lock();
+        state.pending_reclaims.push_back(PendingReclaim {
+            due_at_ms: 0,
+            policy_rank: 1,
+            tenant: "tenant-a".to_string(),
+            qos_tier: "default".to_string(),
+            storage_runtime: ClientRuntimeId::new("stale-owner", ClientEpoch(1)),
+            segment_name: SegmentName::new("stale-segment"),
+            offset_bytes: 0,
+            length_bytes: 16,
+        });
+        state.pending_reclaims.push_back(PendingReclaim {
+            due_at_ms: 0,
+            policy_rank: 1,
+            tenant: "tenant-a".to_string(),
+            qos_tier: "default".to_string(),
+            storage_runtime: client.runtime_id().clone(),
+            segment_name: reclaim_reservation.segment_name.clone(),
+            offset_bytes: reclaim_reservation.offset_bytes,
+            length_bytes: reclaim_reservation.length_bytes,
+        });
+    }
+    assert_eq!(client.allocator.lock().usage_bytes().0, 16);
+    client
+        .flush_due_reclaims()
+        .expect("flush_due_reclaims should skip unavailable runtimes");
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "local reclaim should still release reserved bytes"
+    );
+    assert!(
+        client.state.lock().pending_reclaims.is_empty(),
+        "due reclaim queue should be drained after flush"
+    );
 
     let primary = client.segment_name().expect("primary segment should exist");
     let (_target, reservation) = client

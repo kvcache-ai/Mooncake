@@ -204,10 +204,40 @@ pub(crate) fn shared_suspect_runtime_cache(namespace: &str) -> SharedSuspectRunt
 
 pub(crate) fn filter_live_client_leases(leases: &[ClientLease]) -> Vec<ClientLease> {
     let now = current_time_ms();
-    leases
+    let live = leases
         .iter()
         .filter(|lease| lease.expires_at_ms >= now)
         .cloned()
+        .collect::<Vec<_>>();
+
+    let mut newest_active_by_stable = BTreeMap::<String, ClientLease>::new();
+    for lease in &live {
+        if lease.state != ClientLifecycleState::Active {
+            continue;
+        }
+        let stable_id = lease.runtime.stable_id.0.clone();
+        let replace = newest_active_by_stable
+            .get(&stable_id)
+            .map(|current| {
+                lease.runtime.epoch > current.runtime.epoch
+                    || (lease.runtime.epoch == current.runtime.epoch
+                        && lease.expires_at_ms > current.expires_at_ms)
+            })
+            .unwrap_or(true);
+        if replace {
+            newest_active_by_stable.insert(stable_id, lease.clone());
+        }
+    }
+
+    live.into_iter()
+        .filter(|lease| {
+            if lease.state != ClientLifecycleState::Active {
+                return true;
+            }
+            newest_active_by_stable
+                .get(lease.runtime.stable_id.0.as_str())
+                .is_some_and(|current| current.runtime == lease.runtime)
+        })
         .collect()
 }
 
@@ -216,6 +246,60 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time should advance")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod state_core_tests {
+    use super::*;
+    use mooncake_store_core::{ClientEpoch, ClientEndpointSet, CompatibilityDescriptor};
+
+    fn sample_lease(
+        stable_id: &str,
+        epoch: u64,
+        state: ClientLifecycleState,
+        expires_at_ms: u64,
+    ) -> ClientLease {
+        ClientLease {
+            runtime: ClientRuntimeId::new(stable_id, ClientEpoch(epoch)),
+            state,
+            compatibility: CompatibilityDescriptor::default(),
+            endpoints: ClientEndpointSet::default(),
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn filter_live_client_leases_keeps_latest_active_epoch_per_stable_id() {
+        let now = current_time_ms();
+        let leases = vec![
+            sample_lease("node-a", 1, ClientLifecycleState::Active, now + 10_000),
+            sample_lease("node-a", 2, ClientLifecycleState::Active, now + 20_000),
+            sample_lease("node-a", 1, ClientLifecycleState::Draining, now + 30_000),
+            sample_lease("node-b", 1, ClientLifecycleState::Active, now + 40_000),
+            sample_lease("node-c", 9, ClientLifecycleState::Active, now - 1),
+        ];
+
+        let filtered = filter_live_client_leases(&leases);
+        let runtimes = filtered
+            .iter()
+            .map(|lease| {
+                (
+                    lease.runtime.stable_id.0.clone(),
+                    lease.runtime.epoch.0,
+                    lease.state,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            runtimes,
+            vec![
+                ("node-a".to_string(), 2, ClientLifecycleState::Active),
+                ("node-a".to_string(), 1, ClientLifecycleState::Draining),
+                ("node-b".to_string(), 1, ClientLifecycleState::Active),
+            ]
+        );
+    }
 }
 
 #[derive(Default)]
