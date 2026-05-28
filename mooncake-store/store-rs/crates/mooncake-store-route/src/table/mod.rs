@@ -1,5 +1,5 @@
-//! Internal route table operation implementations.
+//! Single-authority local route table implementation.
 
-mod directory;
+mod local;
 
-pub(crate) use directory::build_route_table_directory;
+pub(crate) use local::LocalRouteTable;

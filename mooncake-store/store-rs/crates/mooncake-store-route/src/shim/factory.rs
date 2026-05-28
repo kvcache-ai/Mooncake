@@ -13,12 +13,14 @@ pub fn build_route_directory(
     control_transport: Arc<dyn RouteControlTransport>,
     membership: Arc<dyn RouteMembershipProvider>,
 ) -> Arc<dyn RouteDirectory> {
-    crate::table::build_route_table_directory(
-        mode,
-        route_topk,
-        metadata,
-        lease,
-        control_transport,
-        membership,
-    )
+    match mode {
+        RouteControlMode::MetadataOnly => crate::shim::build_metadata_route_directory(metadata),
+        RouteControlMode::EmbeddedWrh => crate::mesh::build_embedded_wrh_route_directory(
+            route_topk,
+            metadata,
+            lease,
+            control_transport,
+            membership,
+        ),
+    }
 }

@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use mooncake_store_core::{
-    route_reuse_identity, CasResult, ClientRuntimeId, ClientStableId, NamespaceScope, ObjectKey,
-    ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
+    CasResult, ClientRuntimeId, ClientStableId, NamespaceScope, ObjectKey, ObjectRoute, Result,
+    ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
 use parking_lot::Mutex;
 
-use crate::metrics::record_cas_outcome;
 use crate::shim::RouteAuthorityService;
+use crate::table::LocalRouteTable;
 
 pub(crate) fn bind_local_authority_service(
     namespace: &str,
@@ -33,11 +33,7 @@ pub(crate) fn authority_get(
             authority
         )));
     }
-    Ok(guard
-        .routes_by_authority
-        .get(&authority.0)
-        .and_then(|routes| routes.get(&key.0))
-        .cloned())
+    Ok(guard.local_table(authority)?.get(key))
 }
 
 pub(crate) fn authority_get_many(
@@ -53,11 +49,7 @@ pub(crate) fn authority_get_many(
             authority
         )));
     }
-    let routes = guard.routes_by_authority.get(&authority.0);
-    Ok(keys
-        .iter()
-        .map(|key| routes.and_then(|routes| routes.get(&key.0)).cloned())
-        .collect())
+    Ok(guard.local_table(authority)?.get_many(keys))
 }
 
 pub(crate) fn authority_get_version_floor(
@@ -68,10 +60,9 @@ pub(crate) fn authority_get_version_floor(
     let mesh = route_mesh(namespace);
     let guard = mesh.lock();
     guard
-        .version_floors
-        .get(&authority.0)
-        .and_then(|floors| floors.get(&key.0))
-        .copied()
+        .local_table(authority)
+        .ok()
+        .and_then(|table| table.version_floor(key))
 }
 
 pub(crate) fn authority_list_routes_by_replica_owner(
@@ -87,14 +78,7 @@ pub(crate) fn authority_list_routes_by_replica_owner(
             authority
         )));
     }
-    Ok(guard
-        .routes_by_authority
-        .get(&authority.0)
-        .into_iter()
-        .flat_map(|routes| routes.values())
-        .filter(|route| route.replicas.iter().any(|replica| replica.owner == *owner))
-        .cloned()
-        .collect())
+    Ok(guard.local_table(authority)?.list_by_replica_owner(owner))
 }
 
 pub(crate) fn authority_list_routes(
@@ -109,13 +93,7 @@ pub(crate) fn authority_list_routes(
             authority
         )));
     }
-    Ok(guard
-        .routes_by_authority
-        .get(&authority.0)
-        .into_iter()
-        .flat_map(|routes| routes.values())
-        .cloned()
-        .collect())
+    Ok(guard.local_table(authority)?.list_routes())
 }
 
 pub(crate) fn authority_list_routes_in_scope(
@@ -131,15 +109,7 @@ pub(crate) fn authority_list_routes_in_scope(
             authority
         )));
     }
-    let routes = guard.routes_by_authority.get(&authority.0);
-    Ok(guard
-        .scope_index
-        .get(&authority.0)
-        .and_then(|index| index.get(scope))
-        .into_iter()
-        .flat_map(|keys| keys.iter())
-        .filter_map(|key| routes.and_then(|routes| routes.get(key)).cloned())
-        .collect())
+    Ok(guard.local_table(authority)?.list_in_scope(scope))
 }
 
 pub(crate) fn authority_list_reuse_candidates(
@@ -155,36 +125,7 @@ pub(crate) fn authority_list_reuse_candidates(
             authority
         )));
     }
-    let routes = guard.routes_by_authority.get(&authority.0);
-    Ok(guard
-        .reuse_index
-        .get(&authority.0)
-        .and_then(|index| index.get(reuse))
-        .into_iter()
-        .flat_map(|keys| keys.iter())
-        .filter_map(|key| routes.and_then(|routes| routes.get(key)).cloned())
-        .collect())
-}
-
-/// Returns true if a CAS(None→Some(route)) should be rejected because a version
-/// floor exists that is >= the proposed route's version (anti-resurrection guard).
-fn version_floor_blocks_insert(
-    mesh: &ClusterRouteMesh,
-    authority: &ClientStableId,
-    key: &ObjectKey,
-    expected: Option<RouteVersion>,
-    next: Option<&ObjectRoute>,
-) -> bool {
-    if expected.is_some() {
-        return false;
-    }
-    let Some(route) = next else {
-        return false;
-    };
-    mesh.version_floors
-        .get(&authority.0)
-        .and_then(|floors| floors.get(&key.0))
-        .is_some_and(|floor| route.version <= *floor)
+    Ok(guard.local_table(authority)?.list_reuse_candidates(reuse))
 }
 
 pub(crate) fn authority_compare_and_swap(
@@ -202,32 +143,9 @@ pub(crate) fn authority_compare_and_swap(
             authority
         )));
     }
-    let current = guard
-        .routes_by_authority
-        .entry(authority.0.clone())
-        .or_default()
-        .get(&key.0)
-        .cloned();
-    let matches = match (expected, current.as_ref()) {
-        (None, None) => true,
-        (Some(version), Some(route)) => route.version == version,
-        _ => false,
-    };
-    if !matches || version_floor_blocks_insert(&guard, authority, key, expected, next) {
-        let result = CasResult {
-            applied: false,
-            current,
-        };
-        record_cas_outcome(&result, next, key);
-        return Ok(result);
-    }
-    apply_route_update(&mut guard, authority, key, next);
-    let result = CasResult {
-        applied: true,
-        current: next.cloned(),
-    };
-    record_cas_outcome(&result, next, key);
-    Ok(result)
+    Ok(guard
+        .local_table_mut(authority)?
+        .compare_and_swap(key, expected, next))
 }
 
 pub(crate) fn authority_compare_and_swap_many(
@@ -243,45 +161,9 @@ pub(crate) fn authority_compare_and_swap_many(
             authority
         )));
     }
-    let mut results = Vec::with_capacity(requests.len());
-    for request in requests {
-        let current = guard
-            .routes_by_authority
-            .entry(authority.0.clone())
-            .or_default()
-            .get(&request.key.0)
-            .cloned();
-        let matches = match (request.expected, current.as_ref()) {
-            (None, None) => true,
-            (Some(version), Some(route)) => route.version == version,
-            _ => false,
-        };
-        if !matches
-            || version_floor_blocks_insert(
-                &guard,
-                authority,
-                &request.key,
-                request.expected,
-                request.next.as_ref(),
-            )
-        {
-            let result = CasResult {
-                applied: false,
-                current,
-            };
-            record_cas_outcome(&result, request.next.as_ref(), &request.key);
-            results.push(result);
-            continue;
-        }
-        apply_route_update(&mut guard, authority, &request.key, request.next.as_ref());
-        let result = CasResult {
-            applied: true,
-            current: request.next.clone(),
-        };
-        record_cas_outcome(&result, request.next.as_ref(), &request.key);
-        results.push(result);
-    }
-    Ok(results)
+    Ok(guard
+        .local_table_mut(authority)?
+        .compare_and_swap_many(requests))
 }
 
 pub(crate) fn authority_replace(
@@ -298,7 +180,7 @@ pub(crate) fn authority_replace(
             authority
         )));
     }
-    apply_route_update(&mut guard, authority, key, next);
+    guard.local_table_mut(authority)?.replace(key, next);
     Ok(())
 }
 
@@ -315,72 +197,23 @@ pub(crate) fn authority_replace_many(
             authority
         )));
     }
-    for request in requests {
-        apply_route_update(&mut guard, authority, &request.key, request.next.as_ref());
-    }
+    guard.local_table_mut(authority)?.replace_many(requests);
     Ok(())
-}
-
-fn apply_route_update(
-    mesh: &mut ClusterRouteMesh,
-    authority: &ClientStableId,
-    key: &ObjectKey,
-    next: Option<&ObjectRoute>,
-) {
-    let old = mesh
-        .routes_by_authority
-        .get(&authority.0)
-        .and_then(|routes| routes.get(&key.0))
-        .cloned();
-    if let Some(route) = old.as_ref() {
-        mesh.remove_route_indexes(authority, key, route);
-    }
-    {
-        let routes = mesh
-            .routes_by_authority
-            .entry(authority.0.clone())
-            .or_default();
-        match next {
-            Some(route) => {
-                routes.insert(key.0.clone(), route.clone());
-                if let Some(floors) = mesh.version_floors.get_mut(&authority.0) {
-                    floors.remove(&key.0);
-                }
-            }
-            None => {
-                routes.remove(&key.0);
-                if let Some(old) = old.as_ref() {
-                    mesh.version_floors
-                        .entry(authority.0.clone())
-                        .or_default()
-                        .insert(key.0.clone(), old.version);
-                }
-            }
-        }
-    }
-    if let Some(route) = next {
-        mesh.insert_route_indexes(authority, key, route);
-    }
 }
 
 #[derive(Default)]
 struct ClusterRouteMesh {
     attached_locals: BTreeMap<String, usize>,
-    routes_by_authority: BTreeMap<String, BTreeMap<String, ObjectRoute>>,
-    scope_index: BTreeMap<String, BTreeMap<NamespaceScope, BTreeSet<String>>>,
-    reuse_index: BTreeMap<String, BTreeMap<ReuseIdentity, BTreeSet<String>>>,
+    tables_by_authority: BTreeMap<String, LocalRouteTable>,
     authority_services: BTreeMap<String, Arc<dyn RouteAuthorityService>>,
-    version_floors: BTreeMap<String, BTreeMap<String, RouteVersion>>,
 }
 
 impl ClusterRouteMesh {
     fn register_local(&mut self, stable_id: &ClientStableId) {
         *self.attached_locals.entry(stable_id.0.clone()).or_default() += 1;
-        self.routes_by_authority
+        self.tables_by_authority
             .entry(stable_id.0.clone())
             .or_default();
-        self.scope_index.entry(stable_id.0.clone()).or_default();
-        self.reuse_index.entry(stable_id.0.clone()).or_default();
     }
 
     fn bind_local_service(
@@ -388,11 +221,9 @@ impl ClusterRouteMesh {
         stable_id: &ClientStableId,
         service: Arc<dyn RouteAuthorityService>,
     ) {
-        self.routes_by_authority
+        self.tables_by_authority
             .entry(stable_id.0.clone())
             .or_default();
-        self.scope_index.entry(stable_id.0.clone()).or_default();
-        self.reuse_index.entry(stable_id.0.clone()).or_default();
         self.authority_services.insert(stable_id.0.clone(), service);
     }
 
@@ -402,11 +233,8 @@ impl ClusterRouteMesh {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {
                 self.attached_locals.remove(&key);
-                self.routes_by_authority.remove(&key);
-                self.scope_index.remove(&key);
-                self.reuse_index.remove(&key);
+                self.tables_by_authority.remove(&key);
                 self.authority_services.remove(&key);
-                self.version_floors.remove(&key);
             }
             None => {}
         }
@@ -425,67 +253,18 @@ impl ClusterRouteMesh {
         self.authority_services.get(&stable_id.0).cloned()
     }
 
-    fn insert_route_indexes(
-        &mut self,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-        route: &ObjectRoute,
-    ) {
-        if let Some(scope) = route.namespace.clone() {
-            self.scope_index
-                .entry(authority.0.clone())
-                .or_default()
-                .entry(scope)
-                .or_default()
-                .insert(key.0.clone());
-        }
-        if let Ok(reuse) = route_reuse_identity(route) {
-            self.reuse_index
-                .entry(authority.0.clone())
-                .or_default()
-                .entry(reuse)
-                .or_default()
-                .insert(key.0.clone());
-        }
+    fn local_table(&self, authority: &ClientStableId) -> Result<&LocalRouteTable> {
+        self.tables_by_authority.get(&authority.0).ok_or_else(|| {
+            StoreError::NotFound(format!("route authority {} has no local table", authority))
+        })
     }
 
-    fn remove_route_indexes(
-        &mut self,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-        route: &ObjectRoute,
-    ) {
-        if let Some(scope) = route.namespace.as_ref() {
-            remove_index_key(
-                self.scope_index.get_mut(&authority.0),
-                scope,
-                key.0.as_str(),
-            );
-        }
-        if let Ok(reuse) = route_reuse_identity(route) {
-            remove_index_key(
-                self.reuse_index.get_mut(&authority.0),
-                &reuse,
-                key.0.as_str(),
-            );
-        }
-    }
-}
-
-fn remove_index_key<K: Ord>(
-    index: Option<&mut BTreeMap<K, BTreeSet<String>>>,
-    identity: &K,
-    key: &str,
-) {
-    let Some(index) = index else {
-        return;
-    };
-    let Some(keys) = index.get_mut(identity) else {
-        return;
-    };
-    keys.remove(key);
-    if keys.is_empty() {
-        index.remove(identity);
+    fn local_table_mut(&mut self, authority: &ClientStableId) -> Result<&mut LocalRouteTable> {
+        self.tables_by_authority
+            .get_mut(&authority.0)
+            .ok_or_else(|| {
+                StoreError::NotFound(format!("route authority {} has no local table", authority))
+            })
     }
 }
 
