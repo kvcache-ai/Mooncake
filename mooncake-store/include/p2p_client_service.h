@@ -293,28 +293,56 @@ class P2PClientService final : public ClientService {
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
     };
 
-    struct RemoteWriteOp : WriteOp {
-        P2PClientService* owner_service = nullptr;
+    struct RemoteForwardWriteOp : WriteOp {
+        using WritePromise =
+            async_simple::Promise<tl::expected<void, ErrorCode>>;
+        using TeTransferFn = std::function<tl::expected<void, ErrorCode>(
+            void* local_base, size_t size,
+            const std::vector<RemoteBufferDesc>& dest_buffers)>;
+
+        PeerClient* peer_ptr;
+        std::shared_ptr<RemoteWriteRequest> write_req;
+        std::string endpoint;
+        std::vector<Slice>* slices;
+        TeTransferFn te_transfer;
+
+        RemoteForwardWriteOp(PeerClient* p,
+                             std::shared_ptr<RemoteWriteRequest> wr,
+                             std::string ep, std::vector<Slice>* s,
+                             TeTransferFn transfer)
+            : peer_ptr(p),
+              write_req(std::move(wr)),
+              endpoint(std::move(ep)),
+              slices(s),
+              te_transfer(std::move(transfer)) {}
+
+        std::string_view route() const override { return endpoint; }
+        std::unique_ptr<TaskHandle<void>> Dispatch() override;
+
+       private:
+        static async_simple::coro::Lazy<void> RunForwardRemotePut(
+            std::shared_ptr<WritePromise> promise,
+            PeerClient* peer, TeTransferFn te_transfer,
+            std::shared_ptr<RemoteWriteRequest> write_req,
+            std::vector<Slice>* slices);
+    };
+
+    struct RemoteReverseWriteOp : WriteOp {
         PeerClient* peer_ptr;
         std::shared_ptr<RemoteWriteRequest> write_req;
         P2PProxyDescriptor proxy;
         RouteCache* route_cache;
         std::string endpoint;
-        DataManager* forward_dm = nullptr;
-        std::vector<Slice>* forward_slices = nullptr;
 
-        RemoteWriteOp(P2PClientService* owner, PeerClient* p,
-                      std::shared_ptr<RemoteWriteRequest> wr,
-                      P2PProxyDescriptor px, RouteCache* rc, std::string ep,
-                      DataManager* fwd_dm, std::vector<Slice>* fwd_slices)
-            : owner_service(owner),
-              peer_ptr(p),
+        RemoteReverseWriteOp(PeerClient* p,
+                             std::shared_ptr<RemoteWriteRequest> wr,
+                             P2PProxyDescriptor px, RouteCache* rc,
+                             std::string ep)
+            : peer_ptr(p),
               write_req(std::move(wr)),
               proxy(std::move(px)),
               route_cache(rc),
-              endpoint(std::move(ep)),
-              forward_dm(fwd_dm),
-              forward_slices(fwd_slices) {}
+              endpoint(std::move(ep)) {}
 
         std::string_view route() const override { return endpoint; }
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
@@ -440,24 +468,6 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise,
         RouteIterator& iter);
-
-    async_simple::coro::Lazy<void> RunForwardRemotePut(
-        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-            promise,
-        PeerClient* peer, DataManager* dm,
-        std::shared_ptr<RemoteWriteRequest> write_req,
-        std::vector<Slice>* slices);
-
-    // RemoteWriteOp forward path: promise + RunForwardRemotePut coroutine.
-    std::unique_ptr<TaskHandle<void>> StartForwardRemotePut(
-        PeerClient* peer, DataManager* forward_dm,
-        std::vector<Slice>* forward_slices,
-        std::shared_ptr<RemoteWriteRequest> write_req);
-
-    // RemoteWriteOp reverse path: AsyncWriteRemoteData + route cache upsert.
-    std::unique_ptr<TaskHandle<void>> RunReverseRemotePut(
-        PeerClient* peer, std::shared_ptr<RemoteWriteRequest> write_req,
-        const P2PProxyDescriptor& proxy, RouteCache* route_cache);
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
