@@ -643,6 +643,62 @@ impl PyMooncakeDistributedStore {
     }
 
     #[pyo3(signature = (
+        buffer_ptrs,
+        all_keys,
+        all_dst_offsets,
+        all_src_offsets,
+        all_sizes,
+        *,
+        buffer_sizes = None,
+        tenant = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn get_into_ranges(
+        &self,
+        buffer_ptrs: Vec<usize>,
+        all_keys: Vec<Vec<String>>,
+        all_dst_offsets: Vec<Vec<Vec<usize>>>,
+        all_src_offsets: Vec<Vec<Vec<usize>>>,
+        all_sizes: Vec<Vec<Vec<usize>>>,
+        buffer_sizes: Option<Vec<usize>>,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<Vec<Vec<i64>>>> {
+        let resolved_buffer_sizes =
+            buffer_sizes.unwrap_or_else(|| vec![usize::MAX; buffer_ptrs.len()]);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => run_without_gil(move || {
+                dummy.get_into_ranges(
+                    &buffer_ptrs,
+                    &resolved_buffer_sizes,
+                    &all_keys,
+                    &all_dst_offsets,
+                    &all_src_offsets,
+                    &all_sizes,
+                    tenant,
+                )
+            })
+            .map_err(store_error_to_py),
+            StoreBackend::Real(dispatcher) => {
+                for ptr in &buffer_ptrs {
+                    let _ = pointer_from_usize(*ptr)?;
+                }
+                run_without_gil(move || {
+                    dispatcher.get_into_ranges(
+                        buffer_ptrs,
+                        resolved_buffer_sizes,
+                        all_keys,
+                        all_dst_offsets,
+                        all_src_offsets,
+                        all_sizes,
+                        tenant.map(str::to_string),
+                    )
+                })
+                .map_err(store_error_to_py)
+            }
+        }
+    }
+
+    #[pyo3(signature = (
         items,
         *,
         tenant = None,
@@ -3537,6 +3593,16 @@ mod tests {
             self.wait().await;
             Ok(tonic::Response::new(pb::StatusReply { status: 0 }))
         }
+
+        async fn get_into_ranges(
+            &self,
+            _request: tonic::Request<pb::GetIntoRangesRequest>,
+        ) -> std::result::Result<tonic::Response<pb::GetIntoRangesReply>, tonic::Status> {
+            self.wait().await;
+            Ok(tonic::Response::new(pb::GetIntoRangesReply {
+                buffer_results: vec![],
+            }))
+        }
     }
 
     struct BlockingDummyServerHandle {
@@ -6024,5 +6090,417 @@ mod tests {
             sleep(Duration::from_millis(20));
         }
         panic!("state update should recover after the blocked publish is released");
+    }
+
+    #[test]
+    fn dummy_get_into_ranges_basic() {
+        init_python();
+        let (store, _server) = build_dummy_store("py-ranges");
+
+        let data1 = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let data2 = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        store
+            .put(
+                "key1",
+                data1.to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put key1 should succeed");
+        store
+            .put(
+                "key2",
+                data2.to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put key2 should succeed");
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let buf0 = allocator.alloc(32).expect("alloc buf0");
+        let buf1 = allocator.alloc(32).expect("alloc buf1");
+        store.register_buffer(buf0, 32).expect("register buf0");
+        store.register_buffer(buf1, 32).expect("register buf1");
+
+        unsafe {
+            std::ptr::write_bytes(buf0 as *mut u8, b'_', 32);
+            std::ptr::write_bytes(buf1 as *mut u8, b'_', 32);
+        }
+
+        let results = store
+            .get_into_ranges(
+                vec![buf0, buf1],
+                vec![
+                    vec!["key1".to_string(), "key2".to_string()],
+                    vec!["key2".to_string(), "key1".to_string()],
+                ],
+                vec![vec![vec![0, 20], vec![8]], vec![vec![4], vec![16]]],
+                vec![vec![vec![2, 30], vec![10]], vec![vec![0], vec![12]]],
+                vec![vec![vec![4, 3], vec![6]], vec![vec![6], vec![4]]],
+                Some(vec![32, 32]),
+                None,
+            )
+            .expect("get_into_ranges should succeed");
+
+        assert_eq!(
+            results,
+            vec![vec![vec![4, 3], vec![6]], vec![vec![6], vec![4]]]
+        );
+
+        unsafe {
+            assert_eq!(slice::from_raw_parts(buf0 as *const u8, 4), &data1[2..6]);
+            assert_eq!(
+                slice::from_raw_parts((buf0 + 8) as *const u8, 6),
+                &data2[10..16]
+            );
+            assert_eq!(
+                slice::from_raw_parts((buf0 + 20) as *const u8, 3),
+                &data1[30..33]
+            );
+            assert_eq!(
+                slice::from_raw_parts((buf1 + 4) as *const u8, 6),
+                &data2[0..6]
+            );
+            assert_eq!(
+                slice::from_raw_parts((buf1 + 16) as *const u8, 4),
+                &data1[12..16]
+            );
+        }
+
+        store.unregister_buffer(buf0, 32).expect("unregister buf0");
+        store.unregister_buffer(buf1, 32).expect("unregister buf1");
+    }
+
+    #[test]
+    fn dummy_get_into_ranges_shape_mismatch() {
+        init_python();
+        let (store, _server) = build_dummy_store("py-ranges-mismatch");
+
+        store
+            .put(
+                "key1",
+                b"hello world".to_vec(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
+            .expect("put should succeed");
+
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let buf0 = allocator.alloc(32).expect("alloc buf0");
+        store.register_buffer(buf0, 32).expect("register buf0");
+
+        // Fragment count mismatch: dst_offsets has 1 but src_offsets has 2
+        let results = store
+            .get_into_ranges(
+                vec![buf0],
+                vec![vec!["key1".to_string()]],
+                vec![vec![vec![0]]],
+                vec![vec![vec![0, 1]]],
+                vec![vec![vec![4, 4]]],
+                Some(vec![32]),
+                None,
+            )
+            .expect("get_into_ranges should succeed with partial errors");
+        assert!(results[0][0][0] < 0);
+
+        // Source overflow: src_offset + size > object_length
+        let results = store
+            .get_into_ranges(
+                vec![buf0],
+                vec![vec!["key1".to_string()]],
+                vec![vec![vec![0]]],
+                vec![vec![vec![10]]],
+                vec![vec![vec![4]]],
+                Some(vec![32]),
+                None,
+            )
+            .expect("get_into_ranges should return error for source overflow");
+        assert!(results[0][0][0] < 0);
+
+        // Destination overflow: dst_offset + size > buffer_size
+        let results = store
+            .get_into_ranges(
+                vec![buf0],
+                vec![vec!["key1".to_string()]],
+                vec![vec![vec![30]]],
+                vec![vec![vec![0]]],
+                vec![vec![vec![4]]],
+                Some(vec![32]),
+                None,
+            )
+            .expect("get_into_ranges should return error for dest overflow");
+        assert!(results[0][0][0] < 0);
+
+        // Missing key partial failure
+        let results = store
+            .get_into_ranges(
+                vec![buf0],
+                vec![vec!["missing-key".to_string(), "key1".to_string()]],
+                vec![vec![vec![0], vec![8]]],
+                vec![vec![vec![0], vec![0]]],
+                vec![vec![vec![4], vec![4]]],
+                Some(vec![32]),
+                None,
+            )
+            .expect("missing key should return partial failure");
+        assert!(results[0][0][0] < 0);
+        assert_eq!(results[0][1][0], 4);
+
+        store.unregister_buffer(buf0, 32).expect("unregister buf0");
+    }
+
+    /// TP 4→8 split: Trainer produces 4 shards (256 bytes each), Rollouter has 8 ranks
+    /// each reading 128 bytes from one Trainer shard with src_offset = (rank % 2) * 128.
+    #[test]
+    fn dummy_get_into_ranges_tp_split() {
+        init_python();
+        let (store, _server) = build_dummy_store("py-ranges-tp-split");
+
+        const SHARD_SIZE: usize = 256;
+        const TRAINER_TP: usize = 4;
+        const ROLLOUTER_TP: usize = 8;
+        const RANK_SIZE: usize = SHARD_SIZE * TRAINER_TP / ROLLOUTER_TP; // 128
+
+        // Trainer writes 4 shards with recognizable patterns
+        for shard_id in 0..TRAINER_TP {
+            let data: Vec<u8> = (0..SHARD_SIZE)
+                .map(|i| ((shard_id * SHARD_SIZE + i) & 0xFF) as u8)
+                .collect();
+            let key = format!("layer.0.weight.tp{}", shard_id);
+            store
+                .put(
+                    &key, data, None, None, None, None, None, None, true, false, false,
+                )
+                .expect("put trainer shard");
+        }
+
+        // Allocate and register one buffer per Rollouter rank
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let mut buffer_ptrs: Vec<usize> = Vec::new();
+        for _ in 0..ROLLOUTER_TP {
+            let buf = allocator.alloc(RANK_SIZE).expect("alloc buffer");
+            store
+                .register_buffer(buf, RANK_SIZE)
+                .expect("register buffer");
+            unsafe {
+                std::ptr::write_bytes(buf as *mut u8, 0xFF, RANK_SIZE);
+            }
+            buffer_ptrs.push(buf);
+        }
+
+        // Build get_into_ranges parameters
+        // Each Rollouter rank reads from exactly 1 Trainer shard
+        let mut all_keys: Vec<Vec<String>> = Vec::new();
+        let mut all_dst_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut all_src_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut all_sizes: Vec<Vec<Vec<usize>>> = Vec::new();
+
+        for rank in 0..ROLLOUTER_TP {
+            let trainer_shard = rank / 2;
+            let src_offset = (rank % 2) * RANK_SIZE;
+            let key = format!("layer.0.weight.tp{}", trainer_shard);
+
+            all_keys.push(vec![key]);
+            all_dst_offsets.push(vec![vec![0]]);
+            all_src_offsets.push(vec![vec![src_offset]]);
+            all_sizes.push(vec![vec![RANK_SIZE]]);
+        }
+
+        let buffer_sizes: Vec<usize> = vec![RANK_SIZE; ROLLOUTER_TP];
+
+        let results = store
+            .get_into_ranges(
+                buffer_ptrs.clone(),
+                all_keys,
+                all_dst_offsets,
+                all_src_offsets,
+                all_sizes,
+                Some(buffer_sizes),
+                None,
+            )
+            .expect("get_into_ranges should succeed");
+
+        // Verify: all results should be positive (success = bytes read)
+        for (rank, buf_results) in results.iter().enumerate() {
+            for (key_idx, key_results) in buf_results.iter().enumerate() {
+                for (frag_idx, &val) in key_results.iter().enumerate() {
+                    assert!(
+                        val > 0,
+                        "rank {} key {} frag {} failed with {}",
+                        rank,
+                        key_idx,
+                        frag_idx,
+                        val
+                    );
+                }
+            }
+        }
+
+        // Verify buffer contents match expected data
+        for rank in 0..ROLLOUTER_TP {
+            let trainer_shard = rank / 2;
+            let src_offset = (rank % 2) * RANK_SIZE;
+            let expected: Vec<u8> = (0..RANK_SIZE)
+                .map(|i| ((trainer_shard * SHARD_SIZE + src_offset + i) & 0xFF) as u8)
+                .collect();
+            let actual =
+                unsafe { slice::from_raw_parts(buffer_ptrs[rank] as *const u8, RANK_SIZE) };
+            assert_eq!(
+                actual,
+                expected.as_slice(),
+                "rank {} buffer content mismatch",
+                rank
+            );
+        }
+
+        for &buf in &buffer_ptrs {
+            store
+                .unregister_buffer(buf, RANK_SIZE)
+                .expect("unregister buffer");
+        }
+    }
+
+    /// TP 8→4 merge: Trainer produces 8 shards (128 bytes each), Rollouter has 4 ranks
+    /// each reading 2 full Trainer shards concatenated into one 256-byte buffer.
+    #[test]
+    fn dummy_get_into_ranges_tp_merge() {
+        init_python();
+        let (store, _server) = build_dummy_store("py-ranges-tp-merge");
+
+        const SHARD_SIZE: usize = 128;
+        const TRAINER_TP: usize = 8;
+        const ROLLOUTER_TP: usize = 4;
+        const RANK_SIZE: usize = SHARD_SIZE * TRAINER_TP / ROLLOUTER_TP; // 256
+
+        // Trainer writes 8 shards with recognizable patterns
+        for shard_id in 0..TRAINER_TP {
+            let data: Vec<u8> = (0..SHARD_SIZE)
+                .map(|i| ((shard_id * SHARD_SIZE + i) & 0xFF) as u8)
+                .collect();
+            let key = format!("layer.0.weight.tp{}", shard_id);
+            store
+                .put(
+                    &key, data, None, None, None, None, None, None, true, false, false,
+                )
+                .expect("put trainer shard");
+        }
+
+        // Allocate and register one buffer per Rollouter rank
+        let allocator = PyMooncakeHostMemAllocator::new(None, None);
+        let mut buffer_ptrs: Vec<usize> = Vec::new();
+        for _ in 0..ROLLOUTER_TP {
+            let buf = allocator.alloc(RANK_SIZE).expect("alloc buffer");
+            store
+                .register_buffer(buf, RANK_SIZE)
+                .expect("register buffer");
+            unsafe {
+                std::ptr::write_bytes(buf as *mut u8, 0xFF, RANK_SIZE);
+            }
+            buffer_ptrs.push(buf);
+        }
+
+        // Build get_into_ranges parameters
+        // Each Rollouter rank reads from 2 Trainer shards, concatenating them
+        let mut all_keys: Vec<Vec<String>> = Vec::new();
+        let mut all_dst_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut all_src_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut all_sizes: Vec<Vec<Vec<usize>>> = Vec::new();
+
+        for rank in 0..ROLLOUTER_TP {
+            let shard_a = 2 * rank;
+            let shard_b = 2 * rank + 1;
+            let key_a = format!("layer.0.weight.tp{}", shard_a);
+            let key_b = format!("layer.0.weight.tp{}", shard_b);
+
+            all_keys.push(vec![key_a, key_b]);
+            all_dst_offsets.push(vec![vec![0], vec![SHARD_SIZE]]);
+            all_src_offsets.push(vec![vec![0], vec![0]]);
+            all_sizes.push(vec![vec![SHARD_SIZE], vec![SHARD_SIZE]]);
+        }
+
+        let buffer_sizes: Vec<usize> = vec![RANK_SIZE; ROLLOUTER_TP];
+
+        let results = store
+            .get_into_ranges(
+                buffer_ptrs.clone(),
+                all_keys,
+                all_dst_offsets,
+                all_src_offsets,
+                all_sizes,
+                Some(buffer_sizes),
+                None,
+            )
+            .expect("get_into_ranges should succeed");
+
+        // Verify: all results positive
+        for (rank, buf_results) in results.iter().enumerate() {
+            for (key_idx, key_results) in buf_results.iter().enumerate() {
+                for (frag_idx, &val) in key_results.iter().enumerate() {
+                    assert!(
+                        val > 0,
+                        "rank {} key {} frag {} failed with {}",
+                        rank,
+                        key_idx,
+                        frag_idx,
+                        val
+                    );
+                }
+            }
+        }
+
+        // Verify buffer contents: rank buffer = [shard_a data | shard_b data]
+        for rank in 0..ROLLOUTER_TP {
+            let shard_a = 2 * rank;
+            let shard_b = 2 * rank + 1;
+
+            let expected_a: Vec<u8> = (0..SHARD_SIZE)
+                .map(|i| ((shard_a * SHARD_SIZE + i) & 0xFF) as u8)
+                .collect();
+            let expected_b: Vec<u8> = (0..SHARD_SIZE)
+                .map(|i| ((shard_b * SHARD_SIZE + i) & 0xFF) as u8)
+                .collect();
+
+            let actual =
+                unsafe { slice::from_raw_parts(buffer_ptrs[rank] as *const u8, RANK_SIZE) };
+            assert_eq!(
+                &actual[..SHARD_SIZE],
+                expected_a.as_slice(),
+                "rank {} first half mismatch",
+                rank
+            );
+            assert_eq!(
+                &actual[SHARD_SIZE..],
+                expected_b.as_slice(),
+                "rank {} second half mismatch",
+                rank
+            );
+        }
+
+        for &buf in &buffer_ptrs {
+            store
+                .unregister_buffer(buf, RANK_SIZE)
+                .expect("unregister buffer");
+        }
     }
 }

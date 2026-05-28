@@ -111,6 +111,19 @@ pub trait MooncakeCompatibilityFacade {
         &self,
         requests: &mut [MultiBufferGetRequest<'_>],
     ) -> Result<Vec<usize>>;
+    /// # Safety
+    /// `buffer` must point to a valid allocation of at least `buffer_size` bytes.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn get_into_range(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *mut u8,
+        buffer_size: usize,
+        dst_offset: usize,
+        src_offset: usize,
+        size: usize,
+    ) -> Result<usize>;
 }
 
 fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
@@ -1611,6 +1624,56 @@ impl MooncakeCompatibilityFacade for StoreClient {
         }
         let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
         let result = Ok(sizes);
+        tracker.finish(&result, bytes_out);
+        result
+    }
+
+    unsafe fn get_into_range(
+        &self,
+        tenant: &str,
+        key: &str,
+        buffer: *mut u8,
+        buffer_size: usize,
+        dst_offset: usize,
+        src_offset: usize,
+        size: usize,
+    ) -> Result<usize> {
+        let _span = info_span!(
+            "store.get_into_range",
+            runtime = %self.lease.runtime,
+            tenant,
+            key,
+            src_offset,
+            dst_offset,
+            size,
+        )
+        .entered();
+        let tracker = OperationTracker::new("get_into_range")
+            .attribute_str("mooncake.tenant", tenant)
+            .attribute_u64("mooncake.src_offset", src_offset as u64)
+            .attribute_u64("mooncake.size", size as u64);
+        if dst_offset.checked_add(size).is_none_or(|end| end > buffer_size) {
+            let result: Result<usize> = Err(StoreError::InvalidState(format!(
+                "destination overflow: dst_offset={dst_offset} + size={size} > buffer_size={buffer_size}"
+            )));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        let object = ObjectRef::new(key).tenant(tenant);
+        let mut resolved = self.resolve_objects(std::slice::from_ref(&object))?;
+        let entry = &resolved[0];
+        let object_length = entry.replica.length as usize;
+        if src_offset.checked_add(size).is_none_or(|end| end > object_length) {
+            let result: Result<usize> = Err(StoreError::InvalidState(format!(
+                "source overflow: src_offset={src_offset} + size={size} > object_length={object_length}"
+            )));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        let dst_ptr = buffer.add(dst_offset);
+        let target_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
+        let result = self.execute_range_read(&mut resolved[0], target_slice, src_offset);
+        let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
         tracker.finish(&result, bytes_out);
         result
     }

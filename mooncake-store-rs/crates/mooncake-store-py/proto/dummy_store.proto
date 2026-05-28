@@ -15,6 +15,7 @@ service DummyStoreService {
   rpc BatchPutFromMultiBuffers(BatchPutFromMultiBuffersRequest) returns (BatchStatusReply);
   rpc BatchGetInto(BatchGetIntoRequest) returns (BatchGetIntoReply);
   rpc BatchGetIntoMultiBuffers(BatchGetIntoMultiBuffersRequest) returns (BatchGetIntoReply);
+  rpc GetIntoRanges(GetIntoRangesRequest) returns (GetIntoRangesReply);
   rpc Remove(RemoveRequest) returns (StatusReply);
   rpc BatchRemove(BatchRemoveRequest) returns (BatchStatusReply);
   rpc RemoveAll(RemoveAllRequest) returns (RemoveAllReply);
@@ -186,6 +187,41 @@ message BatchGetIntoMultiBuffersRequest {
   uint64 client_id_lo = 2;
   string tenant = 3;
   repeated SharedMultiGetItem items = 4;
+}
+
+message RangeFragment {
+  uint64 dst_offset = 1;
+  uint64 src_offset = 2;
+  uint64 size = 3;
+}
+
+message RangeKeyGroup {
+  string key = 1;
+  repeated RangeFragment fragments = 2;
+}
+
+message RangeBufferGroup {
+  SharedBufferRef buffer = 1;
+  repeated RangeKeyGroup keys = 2;
+}
+
+message GetIntoRangesRequest {
+  uint64 client_id_hi = 1;
+  uint64 client_id_lo = 2;
+  string tenant = 3;
+  repeated RangeBufferGroup buffers = 4;
+}
+
+message KeyFragmentResults {
+  repeated int64 fragment_results = 1;
+}
+
+message BufferKeyResults {
+  repeated KeyFragmentResults key_results = 1;
+}
+
+message GetIntoRangesReply {
+  repeated BufferKeyResults buffer_results = 1;
 }
 
 message UnregisterRegionRequest {

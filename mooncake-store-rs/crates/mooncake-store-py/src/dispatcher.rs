@@ -667,6 +667,31 @@ impl StoreDispatcher {
         })
     }
 
+    pub fn get_into_ranges(
+        &self,
+        buffer_ptrs: Vec<usize>,
+        buffer_sizes: Vec<usize>,
+        all_keys: Vec<Vec<String>>,
+        all_dst_offsets: Vec<Vec<Vec<usize>>>,
+        all_src_offsets: Vec<Vec<Vec<usize>>>,
+        all_sizes: Vec<Vec<Vec<usize>>>,
+        tenant: Option<String>,
+    ) -> Result<Vec<Vec<Vec<i64>>>, StoreError> {
+        let scope = self.object_scope(tenant);
+        self.run(move |client| {
+            Ok(execute_get_into_ranges(
+                client,
+                scope,
+                &buffer_ptrs,
+                &buffer_sizes,
+                &all_keys,
+                &all_dst_offsets,
+                &all_src_offsets,
+                &all_sizes,
+            ))
+        })
+    }
+
     pub fn invalidate_key(&self, key: String, tenant: Option<String>) {
         let Some(cache) = self.hot_cache.as_ref() else {
             return;
@@ -804,6 +829,15 @@ impl StoreDispatcher {
             ))
         })
         .await
+    }
+
+    pub async fn get_into_ranges_rpc(
+        &self,
+        request: pb::GetIntoRangesRequest,
+    ) -> Result<pb::GetIntoRangesReply, StoreError> {
+        let regions = self.regions.clone();
+        self.run_async(move |client| Ok(execute_get_into_ranges_rpc(client, &regions, request)))
+            .await
     }
 
     pub async fn remove(&self, request: pb::RemoveRequest) -> Result<i32, StoreError> {
@@ -1883,6 +1917,203 @@ fn proto_policy(policy: &Option<pb::ReplicationPolicy>) -> Option<ReplicationPol
         resolved = resolved.preferred_storage_owners(policy.preferred_storage_owners.clone());
     }
     Some(resolved)
+}
+
+const RANGE_READ_ERROR: i64 = -1;
+
+fn execute_get_into_ranges(
+    client: &StoreClient,
+    scope: CompatObjectScope,
+    buffer_ptrs: &[usize],
+    buffer_sizes: &[usize],
+    all_keys: &[Vec<String>],
+    all_dst_offsets: &[Vec<Vec<usize>>],
+    all_src_offsets: &[Vec<Vec<usize>>],
+    all_sizes: &[Vec<Vec<usize>>],
+) -> Vec<Vec<Vec<i64>>> {
+    let buffer_count = buffer_ptrs.len();
+    if buffer_count != buffer_sizes.len()
+        || buffer_count != all_keys.len()
+        || buffer_count != all_dst_offsets.len()
+        || buffer_count != all_src_offsets.len()
+        || buffer_count != all_sizes.len()
+    {
+        return build_range_read_error_results(buffer_count, all_keys, all_dst_offsets);
+    }
+
+    let tenant = &scope.tenant;
+
+    let mut results: Vec<Vec<Vec<i64>>> = Vec::with_capacity(buffer_count);
+    for i in 0..buffer_count {
+        let key_count = all_keys[i].len();
+        if key_count != all_dst_offsets[i].len()
+            || key_count != all_src_offsets[i].len()
+            || key_count != all_sizes[i].len()
+        {
+            results.push(
+                (0..key_count)
+                    .map(|j| {
+                        let frag_count = all_dst_offsets[i].get(j).map_or(1, |v| v.len().max(1));
+                        vec![RANGE_READ_ERROR; frag_count]
+                    })
+                    .collect(),
+            );
+            continue;
+        }
+
+        let buffer_ptr = buffer_ptrs[i];
+        let buffer_size = buffer_sizes[i];
+        let mut key_results: Vec<Vec<i64>> = Vec::with_capacity(key_count);
+
+        for j in 0..key_count {
+            let fragment_count = all_dst_offsets[i][j].len();
+            if fragment_count != all_src_offsets[i][j].len()
+                || fragment_count != all_sizes[i][j].len()
+            {
+                key_results.push(vec![RANGE_READ_ERROR; fragment_count.max(1)]);
+                continue;
+            }
+
+            let mut fragment_results: Vec<i64> = Vec::with_capacity(fragment_count);
+            for k in 0..fragment_count {
+                let dst_offset = all_dst_offsets[i][j][k];
+                let src_offset = all_src_offsets[i][j][k];
+                let size = all_sizes[i][j][k];
+
+                if dst_offset
+                    .checked_add(size)
+                    .is_none_or(|end| end > buffer_size)
+                {
+                    fragment_results.push(RANGE_READ_ERROR);
+                    continue;
+                }
+
+                let result = unsafe {
+                    client.get_into_range(
+                        tenant,
+                        &all_keys[i][j],
+                        buffer_ptr as *mut u8,
+                        buffer_size,
+                        dst_offset,
+                        src_offset,
+                        size,
+                    )
+                };
+
+                match result {
+                    Ok(bytes_read) => fragment_results.push(bytes_read as i64),
+                    Err(_) => fragment_results.push(RANGE_READ_ERROR),
+                }
+            }
+            key_results.push(fragment_results);
+        }
+        results.push(key_results);
+    }
+    results
+}
+
+fn execute_get_into_ranges_rpc(
+    client: &StoreClient,
+    regions: &Arc<Mutex<RegionMap>>,
+    request: pb::GetIntoRangesRequest,
+) -> pb::GetIntoRangesReply {
+    let client_id = request_client_id(request.client_id_hi, request.client_id_lo);
+    let tenant = normalized_tenant(client, &request.tenant);
+    let regions = regions.lock();
+
+    let mut buffer_results = Vec::with_capacity(request.buffers.len());
+    for buf_group in &request.buffers {
+        let buffer_ref = match buf_group.buffer.as_ref() {
+            Some(b) => b,
+            None => {
+                buffer_results.push(pb::BufferKeyResults {
+                    key_results: buf_group
+                        .keys
+                        .iter()
+                        .map(|kg| pb::KeyFragmentResults {
+                            fragment_results: vec![RANGE_READ_ERROR; kg.fragments.len().max(1)],
+                        })
+                        .collect(),
+                });
+                continue;
+            }
+        };
+        let buffer_slice = match resolve_shared_slice_mut(&regions, client_id, buffer_ref) {
+            Ok(s) => s,
+            Err(_) => {
+                buffer_results.push(pb::BufferKeyResults {
+                    key_results: buf_group
+                        .keys
+                        .iter()
+                        .map(|kg| pb::KeyFragmentResults {
+                            fragment_results: vec![RANGE_READ_ERROR; kg.fragments.len().max(1)],
+                        })
+                        .collect(),
+                });
+                continue;
+            }
+        };
+        let buffer_ptr = buffer_slice.as_mut_ptr();
+        let buffer_size = buffer_slice.len();
+
+        let mut key_results = Vec::with_capacity(buf_group.keys.len());
+        for key_group in &buf_group.keys {
+            let mut fragment_results = Vec::with_capacity(key_group.fragments.len());
+            for frag in &key_group.fragments {
+                let dst_offset = frag.dst_offset as usize;
+                let src_offset = frag.src_offset as usize;
+                let size = frag.size as usize;
+
+                if dst_offset
+                    .checked_add(size)
+                    .is_none_or(|end| end > buffer_size)
+                {
+                    fragment_results.push(RANGE_READ_ERROR);
+                    continue;
+                }
+
+                let result = unsafe {
+                    client.get_into_range(
+                        &tenant,
+                        &key_group.key,
+                        buffer_ptr,
+                        buffer_size,
+                        dst_offset,
+                        src_offset,
+                        size,
+                    )
+                };
+                match result {
+                    Ok(bytes_read) => fragment_results.push(bytes_read as i64),
+                    Err(_) => fragment_results.push(RANGE_READ_ERROR),
+                }
+            }
+            key_results.push(pb::KeyFragmentResults { fragment_results });
+        }
+        buffer_results.push(pb::BufferKeyResults { key_results });
+    }
+    pb::GetIntoRangesReply { buffer_results }
+}
+
+fn build_range_read_error_results(
+    buffer_count: usize,
+    all_keys: &[Vec<String>],
+    all_dst_offsets: &[Vec<Vec<usize>>],
+) -> Vec<Vec<Vec<i64>>> {
+    let mut results = Vec::with_capacity(buffer_count);
+    for i in 0..buffer_count {
+        let key_count = all_keys.get(i).map_or(1, |v| v.len().max(1));
+        let mut key_results = Vec::with_capacity(key_count);
+        for j in 0..key_count {
+            let frag_count = all_dst_offsets
+                .get(i)
+                .and_then(|v| v.get(j))
+                .map_or(1, |v| v.len().max(1));
+            key_results.push(vec![RANGE_READ_ERROR; frag_count]);
+        }
+        results.push(key_results);
+    }
+    results
 }
 
 #[cfg(test)]

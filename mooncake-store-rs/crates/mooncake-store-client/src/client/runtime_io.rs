@@ -3783,6 +3783,139 @@ impl StoreClient {
         Ok(true)
     }
 
+    fn execute_range_read(
+        &self,
+        resolved: &mut ResolvedObject,
+        buffer: &mut [u8],
+        src_offset: usize,
+    ) -> Result<usize> {
+        self.ensure_local_memory()?;
+        let transport = self.transport()?;
+        let size = buffer.len();
+
+        if self.copy_local_replica_range(transport, &resolved.replica, buffer, src_offset, size)? {
+            return Ok(size);
+        }
+
+        self.execute_remote_range_read(transport, resolved, buffer, src_offset, size)?;
+        Ok(size)
+    }
+
+    fn copy_local_replica_range(
+        &self,
+        transport: &dyn StoreTransport,
+        replica: &ReplicaRoute,
+        buffer: &mut [u8],
+        src_offset: usize,
+        size: usize,
+    ) -> Result<bool> {
+        let local = {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            replica.owner == self.lease.runtime && memory.has_storage_segment(&replica.segment_name)
+        };
+        if !local {
+            return Ok(false);
+        }
+        let open_segment_name = self.local_transport_open_segment_name(&replica.segment_name);
+        let (_, target_info) = {
+            let mut state = self.state.lock();
+            state.open_segment_with_info(transport, &open_segment_name)?
+        };
+        let target_chunks = self.replica_target_chunks(replica)?;
+        let base_target_offset =
+            Self::replica_storage_target_offset(&target_info, &target_chunks, replica)?;
+        let range_target_offset = base_target_offset
+            .checked_add(src_offset as u64)
+            .ok_or_else(|| {
+                StoreError::Transport("range read target offset overflow".to_string())
+            })?;
+        {
+            let state = self.state.lock();
+            let memory = state.memory_ref()?;
+            memory.copy_storage_target_to(
+                &replica.segment_name,
+                &target_info,
+                range_target_offset,
+                buffer.as_mut_ptr(),
+                size,
+                transport.max_registration_bytes(),
+            )?;
+        };
+        Ok(true)
+    }
+
+    fn execute_remote_range_read(
+        &self,
+        transport: &dyn StoreTransport,
+        resolved: &ResolvedObject,
+        buffer: &mut [u8],
+        src_offset: usize,
+        size: usize,
+    ) -> Result<()> {
+        let buffer_ptr = buffer.as_mut_ptr().cast::<c_void>();
+        let buffer_len = buffer.len();
+        let mut registered_here = false;
+        {
+            let mut state = self.state.lock();
+            if !state.buffer_is_registered(buffer_ptr, size) {
+                state.register_external_buffer(transport, buffer_ptr, buffer_len)?;
+                registered_here = true;
+            }
+        }
+        let result = (|| -> Result<()> {
+            let target_chunks = self.replica_target_chunks(&resolved.replica)?;
+            let open_segment_name =
+                self.replica_transport_open_segment_name(&resolved.replica)?;
+            let (segment, info) = {
+                let mut state = self.state.lock();
+                state.open_segment_with_info(transport, &open_segment_name)?
+            };
+            let base_target_offset =
+                Self::replica_storage_target_offset(&info, &target_chunks, &resolved.replica)?;
+            let range_target_offset =
+                base_target_offset.checked_add(src_offset as u64).ok_or_else(|| {
+                    StoreError::Transport("range read remote target offset overflow".to_string())
+                })?;
+            let requests = Self::target_buffer_transfer_requests(
+                Opcode::Read,
+                segment,
+                range_target_offset,
+                buffer_ptr,
+                size as u64,
+                &info,
+                transport.max_registration_bytes(),
+            )?;
+            let batch_id = transport.allocate_batch(requests.len())?;
+            let hints = self.remote_batch_hints(
+                &resolved.tenant,
+                size as u64,
+                TransferPacingMode::LatencySensitive,
+            );
+            if let Err(error) = transport.submit_with_hints(batch_id, &requests, &hints) {
+                let _ = transport.free_batch(batch_id);
+                return Err(error);
+            }
+            let request_deadline = self.request_deadline_for_transfer(size as u64, 1);
+            let wait_result = wait_for_batch_completion_detailed(
+                transport,
+                batch_id,
+                self.transfer_stall_timeout,
+                request_deadline.instant(),
+            )
+            .map_err(StoreError::from);
+            let _ = transport.free_batch(batch_id);
+            wait_result
+        })();
+        if registered_here {
+            let _ = self
+                .state
+                .lock()
+                .unregister_external_buffer(transport, buffer_ptr, buffer_len);
+        }
+        result
+    }
+
     fn read_single_object_with_failover(
         &self,
         transport: &dyn StoreTransport,

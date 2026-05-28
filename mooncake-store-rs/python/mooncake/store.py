@@ -689,6 +689,28 @@ class MooncakeDistributedStore:
     ):
         return self._invoke_cache("get_into", key, buffer_ptr, size, tenant=tenant)
 
+    def get_into_ranges(
+        self,
+        buffer_ptrs: list[int],
+        all_keys: list[list[str]],
+        all_dst_offsets: list[list[list[int]]],
+        all_src_offsets: list[list[list[int]]],
+        all_sizes: list[list[list[int]]],
+        *,
+        buffer_sizes: list[int] | None = None,
+        tenant: str | None = None,
+    ) -> list[list[list[int]]]:
+        return self._invoke(
+            "get_into_ranges",
+            buffer_ptrs,
+            all_keys,
+            all_dst_offsets,
+            all_src_offsets,
+            all_sizes,
+            buffer_sizes=buffer_sizes,
+            tenant=tenant,
+        )
+
     # ─── Tensor API ─────────────────────────────────────────────────────────
 
     def put_tensor(self, key: str, tensor, *, tenant: str | None = None, config=None):

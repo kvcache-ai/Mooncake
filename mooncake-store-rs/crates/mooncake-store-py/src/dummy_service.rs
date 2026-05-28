@@ -553,6 +553,19 @@ impl pb::dummy_store_service_server::DummyStoreService for GrpcDummyStoreService
         Ok(Response::new(pb::BatchGetIntoReply { lengths }))
     }
 
+    async fn get_into_ranges(
+        &self,
+        request: Request<pb::GetIntoRangesRequest>,
+    ) -> Result<Response<pb::GetIntoRangesReply>, Status> {
+        let reply = self
+            .context
+            .client
+            .get_into_ranges_rpc(request.into_inner())
+            .await
+            .map_err(executor_status)?;
+        Ok(Response::new(reply))
+    }
+
     async fn remove(
         &self,
         request: Request<pb::RemoveRequest>,

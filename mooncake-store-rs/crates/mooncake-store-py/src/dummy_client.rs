@@ -474,6 +474,140 @@ impl DummySession {
             .unwrap_or(-1))
     }
 
+    pub fn get_into_ranges(
+        &self,
+        buffer_ptrs: &[usize],
+        buffer_sizes: &[usize],
+        all_keys: &[Vec<String>],
+        all_dst_offsets: &[Vec<Vec<usize>>],
+        all_src_offsets: &[Vec<Vec<usize>>],
+        all_sizes: &[Vec<Vec<usize>>],
+        tenant: Option<&str>,
+    ) -> Result<Vec<Vec<Vec<i64>>>> {
+        const ERROR: i64 = -1;
+        let buffer_count = buffer_ptrs.len();
+        if buffer_count != buffer_sizes.len()
+            || buffer_count != all_keys.len()
+            || buffer_count != all_dst_offsets.len()
+            || buffer_count != all_src_offsets.len()
+            || buffer_count != all_sizes.len()
+        {
+            return Ok(vec![vec![vec![ERROR]]; buffer_count]);
+        }
+
+        let mut buffers = Vec::with_capacity(buffer_count);
+        let mut shape_errors: Vec<Option<Vec<Vec<i64>>>> = Vec::with_capacity(buffer_count);
+
+        for i in 0..buffer_count {
+            let region = resolve_shared_region(buffer_ptrs[i], buffer_sizes[i])?;
+            self.ensure_region_registered(region.base)?;
+            let key_count = all_keys[i].len();
+
+            if key_count != all_dst_offsets[i].len()
+                || key_count != all_src_offsets[i].len()
+                || key_count != all_sizes[i].len()
+            {
+                shape_errors.push(Some(
+                    (0..key_count)
+                        .map(|j| {
+                            let frag_count =
+                                all_dst_offsets[i].get(j).map_or(1, |v| v.len().max(1));
+                            vec![ERROR; frag_count]
+                        })
+                        .collect(),
+                ));
+                buffers.push(pb::RangeBufferGroup {
+                    buffer: None,
+                    keys: vec![],
+                });
+                continue;
+            }
+
+            let mut keys = Vec::with_capacity(key_count);
+            let mut key_errors: Vec<Option<Vec<i64>>> = Vec::new();
+            let mut has_key_error = false;
+
+            for j in 0..key_count {
+                let fragment_count = all_dst_offsets[i][j].len();
+                if fragment_count != all_src_offsets[i][j].len()
+                    || fragment_count != all_sizes[i][j].len()
+                {
+                    key_errors.push(Some(vec![ERROR; fragment_count.max(1)]));
+                    keys.push(pb::RangeKeyGroup {
+                        key: String::new(),
+                        fragments: vec![],
+                    });
+                    has_key_error = true;
+                    continue;
+                }
+                key_errors.push(None);
+                let mut fragments = Vec::with_capacity(fragment_count);
+                for k in 0..fragment_count {
+                    fragments.push(pb::RangeFragment {
+                        dst_offset: all_dst_offsets[i][j][k] as u64,
+                        src_offset: all_src_offsets[i][j][k] as u64,
+                        size: all_sizes[i][j][k] as u64,
+                    });
+                }
+                keys.push(pb::RangeKeyGroup {
+                    key: all_keys[i][j].clone(),
+                    fragments,
+                });
+            }
+
+            if has_key_error {
+                shape_errors.push(Some(
+                    key_errors
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, err)| {
+                            err.unwrap_or_else(|| vec![ERROR; all_dst_offsets[i][j].len().max(1)])
+                        })
+                        .collect(),
+                ));
+                buffers.push(pb::RangeBufferGroup {
+                    buffer: None,
+                    keys: vec![],
+                });
+            } else {
+                shape_errors.push(None);
+                buffers.push(pb::RangeBufferGroup {
+                    buffer: Some(pb::SharedBufferRef {
+                        region_id: region.region_id,
+                        offset: region.offset as u64,
+                        length: region.len as u64,
+                    }),
+                    keys,
+                });
+            }
+        }
+        let request = pb::GetIntoRangesRequest {
+            client_id_hi: self.client_id.high,
+            client_id_lo: self.client_id.low,
+            tenant: tenant.unwrap_or_default().to_string(),
+            buffers,
+        };
+        let reply = self
+            .rpc(|mut client| async move { client.get_into_ranges(request).await })?
+            .into_inner();
+        let results = reply
+            .buffer_results
+            .into_iter()
+            .zip(shape_errors)
+            .map(|(buf_result, shape_err)| {
+                if let Some(error_results) = shape_err {
+                    return error_results;
+                }
+                buf_result
+                    .key_results
+                    .into_iter()
+                    .map(|key_result| key_result.fragment_results)
+                    .collect()
+            })
+            .collect();
+        Ok(results)
+    }
+
     pub fn remove_all(&self, force: bool) -> Result<(i32, i64)> {
         let reply = self
             .rpc(
