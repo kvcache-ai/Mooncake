@@ -58,7 +58,7 @@ curl "http://localhost:8080/query_key?key=my_object"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "transport_endpoint_": "hostname:port",
   "buffer_descriptors": [...]
@@ -79,7 +79,7 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "success": true,
   "data": {

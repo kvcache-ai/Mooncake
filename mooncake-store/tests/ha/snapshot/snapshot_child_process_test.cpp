@@ -2,6 +2,7 @@
 #include "master_metric_manager.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_test_utils.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/oplog/etcd_oplog_store.h"
@@ -159,6 +160,36 @@ class SnapshotChildProcessTest : public ::testing::Test {
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
         return shard.metadata.find(key) != shard.metadata.end();
+    }
+
+    uint32_t GetShardIndexForTest(const std::string& key) {
+        return static_cast<uint32_t>(service_->getShardIndex(key));
+    }
+
+    tl::expected<void, SerializationError> DeserializeMetadataForTest(
+        const std::vector<uint8_t>& data) {
+        MasterService::MetadataSerializer serializer(service_.get());
+        return serializer.Deserialize(data);
+    }
+
+    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
+        auto& shard = service_->metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        auto it = shard.metadata.find(key);
+        EXPECT_NE(it, shard.metadata.end());
+        return it != shard.metadata.end() && it->second.IsGrouped();
+    }
+
+    std::string FindGroupIdOnDifferentShard(MasterService* svc,
+                                            const std::string& key) {
+        const size_t key_shard = svc->getShardIndex(key);
+        for (int i = 0; i < 1024; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (svc->getShardIndex(group_id) != key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_group";
     }
 
    private:
@@ -405,6 +436,109 @@ TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
     EXPECT_EQ(latest->value().producer_view_version,
               descriptor.producer_view_version);
     EXPECT_EQ(latest->value().created_at_ms, descriptor.created_at_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "grouped_snapshot_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "snapshot_grouped_route_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(service_.get(), key)};
+
+    auto put_start = service_->PutStart(client_id, key, 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->ExistKey(key).value_or(false));
+
+    auto persist_result = CallPersistState("20240701_130000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    auto restored_replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(restored_replicas.has_value())
+        << "Grouped key should remain reachable by key after restore";
+    ASSERT_TRUE(service_->Remove(key, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->ExistKey(key).value_or(true));
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
+    CreateDefaultService();
+    const std::string key = "legacy_snapshot_no_group_id_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(8);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{10});
+
+    auto deserialize_result =
+        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
 }
 
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {

@@ -765,6 +765,48 @@ jobs:
       shell: bash
 
 
+  docs-check:
+    name: Check Sphinx docs build
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
+        persist-credentials: false
+
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          docs:
+            - 'docs/**'
+            - 'requirements_docs.txt'
+
+    - name: Set up Python
+      if: steps.filter.outputs.docs == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install documentation dependencies
+      if: steps.filter.outputs.docs == 'true'
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements_docs.txt
+
+    - name: Build docs with strict mode
+      if: steps.filter.outputs.docs == 'true'
+      run: |
+        cd docs
+        make html SPHINXOPTS=-W
+      shell: bash
+
+
   check-paths:
     if: >-
       github.event_name == 'push' ||
@@ -828,6 +870,7 @@ jobs:
     needs:
       - spell-check
       - clang-format
+      - docs-check
       - build
       - build-musa
       - build-flags

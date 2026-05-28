@@ -169,5 +169,10 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
     return impl_->getTransferStatus(batch_id, overall_status);
 }
 
+Status TransferEngine::progressBatch(BatchID batch_id,
+                                     TransferStatus& overall_status) {
+    return impl_->progressBatch(batch_id, overall_status);
+}
+
 }  // namespace tent
 }  // namespace mooncake
