@@ -19,11 +19,16 @@
 #include <cstdint>
 
 #include <tent/runtime/device_resources.h>
+#include <tent/device/ir/device_ops.cuh>
 
 namespace mooncake {
 namespace tent {
 namespace device {
 namespace nvlink {
+
+// ---------------------------------------------------------------------------
+// Availability & address computation
+// ---------------------------------------------------------------------------
 
 __device__ __forceinline__ bool is_available(const NvLinkDeviceContext& ctx,
                                              int dst_rank) {
@@ -38,6 +43,63 @@ __device__ __forceinline__ void* peer_ptr(const NvLinkDeviceContext& ctx,
     const auto offset = reinterpret_cast<const char*>(local_ptr) -
                         reinterpret_cast<const char*>(local_base);
     return reinterpret_cast<char*>(ctx.peer_ptrs[dst_rank]) + offset;
+}
+
+// ---------------------------------------------------------------------------
+// EpCommOps — NVLink P2P communication primitives
+//
+// These use DeviceOps function pointers for memory ordering, which are
+// populated by the platform backend (cuda_ops.cuh for CUDA).  This avoids
+// CUDA PTX inline ASM in the communication layer and keeps the code portable.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void nvlink_put(DeviceOps* dops,
+                                           const NvLinkDeviceContext& ctx,
+                                           int dst_rank,
+                                           const void* local_base,
+                                           void* recv, const void* send,
+                                           size_t n) {
+    void* peer_dst = peer_ptr(ctx, dst_rank, local_base, recv);
+    dops->store_release(peer_dst, send, n);
+}
+
+__device__ __forceinline__ void nvlink_signal(DeviceOps* dops,
+                                              const NvLinkDeviceContext& ctx,
+                                              int dst_rank,
+                                              const void* local_base,
+                                              void* sig, uint64_t action) {
+    void* peer_sig = peer_ptr(ctx, dst_rank, local_base, sig);
+    dops->atomic_add_release(peer_sig, action);
+}
+
+__device__ __forceinline__ void nvlink_wait_signal(DeviceOps* dops,
+                                                   void* sig,
+                                                   uint64_t expected) {
+    dops->spin_wait_ne(sig, static_cast<uint32_t>(0));
+    uint64_t val = 0;
+    do {
+        dops->fence_acq_rel();
+        val = dops->atomic_load_acquire(sig);
+    } while (val != expected);
+}
+
+__device__ __forceinline__ void nvlink_wait_signal_32(DeviceOps* dops,
+                                                      void* sig,
+                                                      uint32_t expected) {
+    dops->spin_wait_eq(sig, expected);
+}
+
+__device__ __forceinline__ void nvlink_red_add(DeviceOps* dops,
+                                               const NvLinkDeviceContext& ctx,
+                                               int dst_rank,
+                                               const void* local_base,
+                                               void* sym, uint64_t val) {
+    void* peer_sym = peer_ptr(ctx, dst_rank, local_base, sym);
+    dops->atomic_add_release(peer_sym, val);
+}
+
+__device__ __forceinline__ void nvlink_flush(DeviceOps* dops) {
+    dops->fence_acq_rel();
 }
 
 }  // namespace nvlink

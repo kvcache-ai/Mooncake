@@ -10,12 +10,7 @@
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
 #ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <tent/device/mtlink_musa.cuh>
-#else
-#include <tent/device/ibgda.cuh>
-#include <tent/device/nvlink.cuh>
-#endif
+#include <tent/device/ir/ep_comm_ops.cuh>
 #else
 #include <tent/transport/ibgda/detail/mlx5gda.h>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
@@ -29,22 +24,18 @@ namespace mooncake {
 inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
 #endif
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_USE_TENT
+using tent::device::EpCommCtx;
+#else
 using mooncake::tent::device::cuda_platform::cudaDeviceOps;
 using mooncake::tent::device::ibgda::IbGdaCtx;
 using mooncake::tent::device::ibgda::IbGdaQpDevCtx;
 using mooncake::tent::device::ibgda::ibgda_put;
 using mooncake::tent::device::ibgda::ibgda_red_add;
-#ifdef MOONCAKE_EP_USE_TENT
-using mooncake::tent::device::nvlink::is_available;
-using mooncake::tent::device::nvlink::peer_ptr;
-#endif
 
-#ifndef MOONCAKE_EP_USE_TENT
 static_assert(sizeof(IbGdaQpDevCtx) == sizeof(mlx5gda_qp_devctx),
               "IbGdaQpDevCtx must stay ABI-compatible with mlx5gda_qp_devctx");
 #endif
-#endif  // MOONCAKE_EP_USE_MUSA
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
@@ -88,7 +79,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-    // IBGDA
+    // Communication context
+#ifdef MOONCAKE_EP_USE_TENT
 #ifndef MOONCAKE_EP_USE_MUSA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
@@ -105,23 +97,39 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
-#endif  // MOONCAKE_EP_USE_MUSA
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-    tent::MtLinkDeviceContext mtlink_ctx = {
-        tent::kMtLinkDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-#else
     tent::NvLinkDeviceContext nvlink_ctx = {
         tent::kNvLinkDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
+    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, nvlink_ctx, ibgda_ctx, rank, num_ranks};
+#else
+    tent::MtLinkDeviceContext mtlink_ctx = {
+        tent::kMtLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, mtlink_ctx, rank, num_ranks};
 #endif
+#else
+    // Non-TENT path: construct IbGdaCtx directly
+    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
+    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
+    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
+                          ctx_array,
+                          rkey_array,
+                          raddr_array,
+                          mxa_buffer,
+                          rdma_send_signal_buffer,
+                          rdma_recv_signal_buffer,
+                          rkey_array[rank],
+                          rank,
+                          static_cast<int>(num_qp_per_rank),
+                          num_ranks};
 #endif
 
     // Sending phase
@@ -201,7 +209,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             asm volatile("bar.sync 1, %0;" :: "r"(num_threads));
 #endif
 
-            // Issue IBGDA sends
+            // Issue sends
             if (dst_expert_idx >= 0) {
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
@@ -212,52 +220,45 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                      dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
+#ifdef MOONCAKE_EP_USE_TENT
+                void* write_dst = tent::device::ep_route_put(
+                    comm_ctx, dst_rank,
+                    reinterpret_cast<void*>(dst_ptr));
+                if (write_dst != nullptr) {
+                    // Local or P2P path — warp-cooperative copy
+                    const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
+                    const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                } else {
+                    // IBGDA path — send directly from source buffer
+                    tent::device::ep_put_ibgda(comm_ctx, dst_expert_local_idx,
+                        reinterpret_cast<void*>(dst_ptr),
+                        reinterpret_cast<const void*>(src_ptr),
+                        num_bytes_per_msg, dst_rank, lane_id);
+                }
+#else
                 if (dst_rank != rank) {
-                    bool use_nvlink =
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                        tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
-#else
-                        is_available(nvlink_ctx, dst_rank);
-#endif
-#else
-                        nvlink_available[dst_rank] != 0;
-#endif
+                    bool use_nvlink = nvlink_available[dst_rank] != 0;
                     if (use_nvlink) {
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                        void* peer_dst_ptr = tent::device::mtlink::peer_ptr(
-                            mtlink_ctx, dst_rank, mxa_buffer,
-                            reinterpret_cast<const void*>(dst_ptr));
-#else
-                        void* peer_dst_ptr = peer_ptr(
-                            nvlink_ctx, dst_rank, mxa_buffer,
-                            reinterpret_cast<const void*>(dst_ptr));
-#endif
-#else
                         size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                         void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
-#endif
-                        // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                     } else {
-#ifndef MOONCAKE_EP_USE_MUSA
                         if (lane_id == 0) {
                             ibgda_put(&ibgda_ctx, dst_expert_local_idx,
                                       reinterpret_cast<void*>(dst_ptr),
                                       reinterpret_cast<const void*>(src_ptr),
                                       num_bytes_per_msg, dst_rank);
                         }
-#endif
                     }
                 } else {
-                    // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 }
+#endif
 
                 // Increase counter after finishing
                 __syncwarp();
@@ -313,41 +314,23 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
-            bool use_nvlink =
+            int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
 #ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+            tent::device::ep_red_add(comm_ctx, dst_rank, dst_expert_local_idx,
+                                     signal_ptr, static_cast<uint64_t>(-num_tokens_sent - 1));
 #else
-                is_available(nvlink_ctx, dst_rank);
-#endif
-#else
-                nvlink_available[dst_rank] != 0;
-#endif
+            bool use_nvlink = nvlink_available[dst_rank] != 0;
             if (use_nvlink) {
-                int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                int* peer_signal_ptr = reinterpret_cast<int*>(
-                    tent::device::mtlink::peer_ptr(mtlink_ctx, dst_rank, mxa_buffer, signal_ptr));
-#else
-                int* peer_signal_ptr = reinterpret_cast<int*>(
-                    peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
-#endif
-#else
                 size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                 int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
-#endif
                 st_na_release(peer_signal_ptr, -num_tokens_sent - 1);
-#ifndef MOONCAKE_EP_USE_MUSA
-                    } else {
-                        ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
-                                      rdma_recv_signal_buffer +
-                                          dst_expert_local_idx * num_ranks + rank,
-                                      static_cast<uint64_t>(-num_tokens_sent - 1),
-                                      dst_rank);
-                    }
-#else
-                    }
+            } else {
+                ibgda_red_add(&ibgda_ctx, dst_expert_local_idx,
+                              rdma_recv_signal_buffer +
+                                  dst_expert_local_idx * num_ranks + rank,
+                              static_cast<uint64_t>(-num_tokens_sent - 1),
+                              dst_rank);
+            }
 #endif
         } else {
             st_na_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
@@ -552,7 +535,8 @@ combine(void* combined_x, int32_t* active_ranks,
     constexpr size_t num_bytes_per_slot = kHidden * sizeof(nv_bfloat16);
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
-    // IBGDA
+    // Communication context
+#ifdef MOONCAKE_EP_USE_TENT
 #ifndef MOONCAKE_EP_USE_MUSA
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
@@ -569,23 +553,39 @@ combine(void* combined_x, int32_t* active_ranks,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
-#endif  // MOONCAKE_EP_USE_MUSA
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-    tent::MtLinkDeviceContext mtlink_ctx = {
-        tent::kMtLinkDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-#else
     tent::NvLinkDeviceContext nvlink_ctx = {
         tent::kNvLinkDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
+    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, nvlink_ctx, ibgda_ctx, rank, num_ranks};
+#else
+    tent::MtLinkDeviceContext mtlink_ctx = {
+        tent::kMtLinkDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, mtlink_ctx, rank, num_ranks};
 #endif
+#else
+    // Non-TENT path: construct IbGdaCtx directly
+    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
+    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
+    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
+                          ctx_array,
+                          rkey_array,
+                          raddr_array,
+                          mxa_buffer,
+                          rdma_send_signal_buffer,
+                          rdma_recv_signal_buffer,
+                          rkey_array[rank],
+                          rank,
+                          static_cast<int>(num_qp_per_rank),
+                          num_ranks};
 #endif
 
     // Sending phase
@@ -604,7 +604,7 @@ combine(void* combined_x, int32_t* active_ranks,
             atomic_add_release_global(atomic_clean_flag, num_experts);
     }
 
-    // Issue IBGDA sends
+    // Issue sends
     if (responsible_expert_idx < num_experts) {
         const auto dst_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
@@ -620,7 +620,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
-        // Issue IBGDA send
+        // Issue sends
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
             const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
             const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
@@ -630,39 +630,37 @@ combine(void* combined_x, int32_t* active_ranks,
             auto src_idx = __ldg(local_src_info + token_idx);
             const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_data_buffer) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
+#ifdef MOONCAKE_EP_USE_TENT
+            void* write_dst = tent::device::ep_route_put(
+                comm_ctx, dst_rank,
+                reinterpret_cast<void*>(dst_ptr));
+            if (write_dst != nullptr) {
+                // Local or P2P path — warp-cooperative copy
+                const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
+                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+            } else {
+                // IBGDA path — copy to staging buffer first, then send
+                const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+                if (not zero_copy)
+                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                __syncwarp();
+                tent::device::ep_put_ibgda(comm_ctx, local_expert_idx,
+                    reinterpret_cast<void*>(dst_ptr),
+                    reinterpret_cast<const void*>(buf_ptr),
+                    num_bytes_per_slot, dst_rank, lane_id);
+            }
+#else
             if (dst_rank == rank) {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             } else {
-                bool use_nvlink =
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                    tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
-#else
-                    is_available(nvlink_ctx, dst_rank);
-#endif
-#else
-                    nvlink_available[dst_rank] != 0;
-#endif
+                bool use_nvlink = nvlink_available[dst_rank] != 0;
                 if (use_nvlink) {
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                    void* peer_dst_ptr = tent::device::mtlink::peer_ptr(
-                        mtlink_ctx, dst_rank, mxa_buffer,
-                        reinterpret_cast<const void*>(dst_ptr));
-#else
-                    void* peer_dst_ptr = peer_ptr(
-                        nvlink_ctx, dst_rank, mxa_buffer,
-                        reinterpret_cast<const void*>(dst_ptr));
-#endif
-#else
                     size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
                     void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
-#endif
                     const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 } else {
-#ifndef MOONCAKE_EP_USE_MUSA
                     const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                     if (not zero_copy)
                         UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
@@ -674,9 +672,9 @@ combine(void* combined_x, int32_t* active_ranks,
                                   reinterpret_cast<const void*>(buf_ptr),
                                   num_bytes_per_slot, dst_rank);
                     }
-#endif
                 }
             }
+#endif
         }
 
         // Put finishing flag
@@ -693,38 +691,22 @@ combine(void* combined_x, int32_t* active_ranks,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
-                bool use_nvlink =
+                int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
 #ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                    tent::device::mtlink::is_available(mtlink_ctx, dst_rank);
+                tent::device::ep_red_add(comm_ctx, dst_rank, local_expert_idx,
+                                         signal_ptr, 1);
 #else
-                    is_available(nvlink_ctx, dst_rank);
-#endif
-#else
-                    nvlink_available[dst_rank] != 0;
-#endif
+                bool use_nvlink = nvlink_available[dst_rank] != 0;
                 if (use_nvlink) {
-                    int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-                    int* peer_signal_ptr = reinterpret_cast<int*>(
-                        tent::device::mtlink::peer_ptr(mtlink_ctx, dst_rank, mxa_buffer, signal_ptr));
-#else
-                    int* peer_signal_ptr = reinterpret_cast<int*>(
-                        peer_ptr(nvlink_ctx, dst_rank, mxa_buffer, signal_ptr));
-#endif
-#else
                     size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
                     int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
-#endif
                     st_na_release(peer_signal_ptr, 1);
                 } else {
-#ifndef MOONCAKE_EP_USE_MUSA
                     ibgda_red_add(&ibgda_ctx, local_expert_idx,
                                   rdma_recv_signal_buffer + global_expert_idx,
                                   1, dst_rank);
-#endif
                 }
+#endif
             } else {
                 st_na_release(rdma_recv_signal_buffer + global_expert_idx, 1);
             }
