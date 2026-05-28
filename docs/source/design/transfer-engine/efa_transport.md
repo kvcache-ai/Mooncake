@@ -344,6 +344,21 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 
 > **Peak: ~64 GB/s** on both write and read — far below the GPU-to-GPU number despite identical NIC count. The bottleneck is DDR4-3200 DRAM bandwidth on the EPYC 7R13 (Milan): `batch=16` consistently wins because larger in-flight queues only deepen DRAM contention without unlocking new NIC capacity. p5.48xlarge CPU-to-CPU runs around **3× slower than p5en** (DDR5 Xeon 8488C, ~213 GB/s) at the same NIC aggregate. For PD KV transfer, the GPU-to-GPU path is the relevant one.
 
+### Single-host loopback
+
+EFA NICs have no hardware loopback short-circuit: even when both endpoints resolve to the same host, `fi_write`/`fi_read` drive a real DMA round-trip through the EFA device. For deployments where the producer and consumer run as **separate processes on the same host** (single-machine development, benchmarks, co-located workers), this is strictly slower than libfabric's emulated RDMA path, which resolves the same-host case to a memcpy and skips the NIC entirely.
+
+Set `FI_EFA_USE_DEVICE_RDMA=0` (a libfabric provider env, [documented by the EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-runtime-tuning.html)) on processes that only do same-host transfers; leave it unset (default `1`) on cross-host or mixed processes. Mooncake does not wrap this knob — it is a provider-level flag resolved at `fi_getinfo` time, and a single `EfaTransport` instance may serve a mix of loopback and cross-host peers, so flipping it disables device RDMA for **every** transfer in the process. Apply it per-process based on that process's traffic pattern.
+
+Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, same-host producer/consumer):
+
+| `FI_EFA_USE_DEVICE_RDMA` | per-write latency |
+|---|---:|
+| `1` (default after #2041, device RDMA) | ~830 ms |
+| `0` (emulated, same-host memcpy fast path) | ~390 ms |
+
+For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC) is ~340 ms — i.e., device RDMA on a same-host loopback is *slower* than going over the wire to another host, because the NIC has no fast-path for loopback. Cross-host benchmarks are unaffected by this env: leave `FI_EFA_USE_DEVICE_RDMA` at its default on any process that also talks to remote peers.
+
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
