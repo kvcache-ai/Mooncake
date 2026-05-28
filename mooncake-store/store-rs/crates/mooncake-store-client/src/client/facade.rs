@@ -157,6 +157,116 @@ impl StoreClient {
         self.filter_routes_to_readable(self.query_routes_by_object_keys_bounded(keys)?)
     }
 
+    fn route_delete_can_follow_rollout_handoff(
+        previous: &ObjectRoute,
+        current: &ObjectRoute,
+    ) -> bool {
+        if current.state != RouteState::Active
+            || previous.compatibility != current.compatibility
+            || previous.replicas.len() != current.replicas.len()
+        {
+            return false;
+        }
+
+        previous
+            .replicas
+            .iter()
+            .zip(current.replicas.iter())
+            .all(|(before, after)| {
+                before.owner.stable_id == after.owner.stable_id
+                    && after.owner.epoch >= before.owner.epoch
+                    && before.length == after.length
+                    && before.checksum.is_some()
+                    && before.checksum == after.checksum
+                    && before.tier == after.tier
+                    && before.priority == after.priority
+            })
+    }
+
+    fn remove_object_route_with_retry(
+        &self,
+        object_id: &LogicalObjectId,
+        object_key: &ObjectKey,
+        force: bool,
+    ) -> Result<()> {
+        let tenant = object_id.scope.tenant.as_str();
+        let key = object_id.logical_key.as_str();
+        let mut current = self.route_ops().load_route(object_key)?;
+        let max_attempts = DEFAULT_PUT_WRITE_RETRY_LIMIT;
+        let mut attempt = 0usize;
+
+        loop {
+            let Some(route) = current.take() else {
+                return if force {
+                    Ok(())
+                } else {
+                    Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
+                };
+            };
+            if route.state != RouteState::Active {
+                return if force {
+                    Ok(())
+                } else {
+                    Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
+                };
+            }
+
+            attempt = attempt.saturating_add(1);
+            let quota_reservation =
+                self.reserve_tenant_quota_for_delete(object_id, object_key, &route)?;
+            let cas = self.route_ops().delete_route(object_key, Some(route.version))?;
+            if cas.applied {
+                self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
+                if let Err(error) = self.schedule_route_reclaim(&route) {
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        tenant,
+                        key,
+                        error = %error,
+                        "route delete reclaim scheduling failed after authoritative delete"
+                    );
+                }
+                return Ok(());
+            }
+
+            let _ = self.abort_tenant_quota_reservation(
+                quota_reservation.as_ref(),
+                "route_delete_compare_and_swap_conflict",
+            );
+            match cas.current {
+                Some(current_route)
+                    if force
+                        && Self::route_delete_can_follow_rollout_handoff(&route, &current_route)
+                        && attempt < max_attempts =>
+                {
+                    debug!(
+                        runtime = %self.lease.runtime,
+                        tenant,
+                        key,
+                        attempt,
+                        max_attempts,
+                        route_version = current_route.version.0,
+                        "retrying remove after route compare-and-swap conflict with rollout successor route"
+                    );
+                    current = Some(current_route);
+                    continue;
+                }
+                Some(current_route) if current_route.state == RouteState::Active => {
+                    return Err(StoreError::Conflict(format!(
+                        "route delete lost race for tenant={tenant} key={key}"
+                    )));
+                }
+                _ => {
+                    return if force {
+                        Ok(())
+                    } else {
+                        Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
+                    };
+                }
+            }
+        }
+    }
+
     pub fn batch_is_readable(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
         let tracker = OperationTracker::new("batch_is_readable")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
@@ -1007,54 +1117,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let tracker = OperationTracker::new("remove");
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
-        let Some(route) = self
-            .route_ops()
-            .load_route(&object_key)?
-        else {
-            let result = if force {
-                Ok(())
-            } else {
-                Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
-            };
-            tracker.finish(&result, 0);
-            return result;
-        };
-        if route.state != RouteState::Active {
-            let result = if force {
-                Ok(())
-            } else {
-                Err(StoreError::NotFound(format!("tenant={tenant} key={key}")))
-            };
-            tracker.finish(&result, 0);
-            return result;
-        }
-        let quota_reservation = self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-        let cas = self.route_ops().delete_route(&object_key, Some(route.version))?;
-        let result = if cas.applied {
-            match self.finalize_tenant_quota_delete(quota_reservation.as_ref()) {
-                Ok(()) => {
-                    if let Err(error) = self.schedule_route_reclaim(&route) {
-                        warn!(
-                            runtime = %self.lease.runtime,
-                            tenant,
-                            key,
-                            error = %error,
-                            "route delete reclaim scheduling failed after authoritative delete"
-                        );
-                    }
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            let _ = self.abort_tenant_quota_reservation(
-                quota_reservation.as_ref(),
-                "route_delete_compare_and_swap_conflict",
-            );
-            Err(StoreError::Conflict(format!(
-                "route delete lost race for tenant={tenant} key={key}"
-            )))
-        };
+        let result = self.remove_object_route_with_retry(&object_id, &object_key, force);
         tracker.finish(&result, 0);
         result
     }
@@ -1075,50 +1138,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 object.key,
             );
             let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
-            let Some(route) = self
-                .route_ops()
-                .load_route(&object_key)?
-            else {
-                if force {
-                    continue;
-                }
-                let result = Err(StoreError::NotFound(format!("tenant={tenant} key={}", object.key)));
+            if let Err(error) = self.remove_object_route_with_retry(&object_id, &object_key, force) {
+                let result: Result<()> = Err(error.clone());
                 tracker.finish(&result, 0);
-                return result;
-            };
-            if route.state != RouteState::Active {
-                if force {
-                    continue;
-                }
-                let result = Err(StoreError::NotFound(format!("tenant={tenant} key={}", object.key)));
-                tracker.finish(&result, 0);
-                return result;
-            }
-            let quota_reservation =
-                self.reserve_tenant_quota_for_delete(&object_id, &object_key, &route)?;
-            let cas = self.route_ops().delete_route(&object_key, Some(route.version))?;
-            if cas.applied {
-                self.finalize_tenant_quota_delete(quota_reservation.as_ref())?;
-                if let Err(error) = self.schedule_route_reclaim(&route) {
-                    warn!(
-                        runtime = %self.lease.runtime,
-                        tenant,
-                        key = object.key,
-                        error = %error,
-                        "batch route delete reclaim scheduling failed after authoritative delete"
-                    );
-                }
-            } else {
-                let _ = self.abort_tenant_quota_reservation(
-                    quota_reservation.as_ref(),
-                    "batch_route_delete_compare_and_swap_conflict",
-                );
-                let result = Err(StoreError::Conflict(format!(
-                    "route delete lost race for tenant={tenant} key={}",
-                    object.key
-                )));
-                tracker.finish(&result, 0);
-                return result;
+                return Err(error);
             }
         }
         let result = Ok(());

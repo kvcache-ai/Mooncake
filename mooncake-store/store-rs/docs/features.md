@@ -20,6 +20,12 @@ prefix probes and metadata-style object checks before later reads arrive.
 
 With tenant quota policy configured, single-object `put` uses metadata-backed reserve/finalize/abort semantics and `remove` applies the matching refund when the delete becomes authoritative. This gives create, overwrite, and delete a tenant-root quota state that survives concurrent writers better than the older best-effort namespace scan.
 
+`remove` and `batch_remove` also retry when route delete CAS observes a fresher still-active
+current route that still matches the same rollout successor lineage and payload identity. Cleanup
+traffic that races with rollout-era route migration therefore converges onto the newer handoff
+route, while ordinary delete-versus-rewrite races still fail with conflict instead of deleting the
+fresher rewrite.
+
 The performance boundary stays the same: backend-owned metadata is not allowed to become a normal steady-state request-path dependency. When quota or policy needs backend truth, the runtime is expected to hide that behind exact local caches, authority indirection, or maintained indexes instead of paying a backend round trip per request.
 
 ### Batch operations

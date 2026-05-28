@@ -94,14 +94,23 @@ impl StoreClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let remote_leases = self
-            .lookup_runtime_leases(
-                requests
-                    .iter()
-                    .filter(|request| request.storage_runtime != self.lease.runtime)
-                    .map(|request| request.storage_runtime.clone()),
-            )
-            .unwrap_or_default();
+        let mut remote_leases = BTreeMap::new();
+        let mut remote_errors = BTreeMap::new();
+        for runtime in requests
+            .iter()
+            .filter(|request| request.storage_runtime != self.lease.runtime)
+            .map(|request| request.storage_runtime.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            match self.lookup_runtime_lease(&runtime) {
+                Ok(lease) => {
+                    remote_leases.insert(runtime, lease);
+                }
+                Err(error) => {
+                    remote_errors.insert(runtime, error);
+                }
+            }
+        }
         let mut resolved = std::iter::repeat_with(|| None)
             .take(requests.len())
             .collect::<Vec<_>>();
@@ -129,6 +138,10 @@ impl StoreClient {
                         Ok((target, reservation))
                     }),
                 );
+                continue;
+            }
+            if let Some(error) = remote_errors.get(&request.storage_runtime) {
+                resolved[index] = Some(Err(error.clone()));
                 continue;
             }
             let Some(lease) = remote_leases.get(&request.storage_runtime).cloned() else {
@@ -378,6 +391,169 @@ impl StoreClient {
         Ok(())
     }
 
+    fn reclaim_release_is_skippable(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::NotFound(message) | StoreError::InvalidState(message)
+                if message.contains("runtime ") && message.contains(" is not available")
+        )
+    }
+
+    fn release_reclaim_allocations_best_effort(
+        &self,
+        requests: &[AllocationReleaseRequest],
+        context: &'static str,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let mut remote_leases = BTreeMap::new();
+        let mut remote_errors = BTreeMap::new();
+        for runtime in requests
+            .iter()
+            .filter(|request| request.storage_runtime != self.lease.runtime)
+            .map(|request| request.storage_runtime.clone())
+            .collect::<BTreeSet<_>>()
+        {
+            match self.lookup_runtime_lease(&runtime) {
+                Ok(lease) => {
+                    remote_leases.insert(runtime, lease);
+                }
+                Err(error) => {
+                    remote_errors.insert(runtime, error);
+                }
+            }
+        }
+
+        let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
+        for (index, request) in requests.iter().enumerate() {
+            if request.storage_runtime == self.lease.runtime {
+                self.allocator.lock().release(
+                    &request.storage_runtime,
+                    &request.segment_name,
+                    request.offset_bytes,
+                    request.length_bytes,
+                )?;
+                continue;
+            }
+
+            if let Some(error) = remote_errors.get(&request.storage_runtime) {
+                if Self::reclaim_release_is_skippable(error) {
+                    warn!(
+                        runtime = %self.lease.runtime,
+                        reclaim_runtime = %request.storage_runtime,
+                        segment = %request.segment_name.0,
+                        offset_bytes = request.offset_bytes,
+                        length_bytes = request.length_bytes,
+                        error = %error,
+                        context,
+                        "skipping reclaim for unavailable runtime"
+                    );
+                    continue;
+                }
+                return Err(error.clone());
+            }
+
+            let Some(lease) = remote_leases.get(&request.storage_runtime).cloned() else {
+                warn!(
+                    runtime = %self.lease.runtime,
+                    reclaim_runtime = %request.storage_runtime,
+                    segment = %request.segment_name.0,
+                    offset_bytes = request.offset_bytes,
+                    length_bytes = request.length_bytes,
+                    context,
+                    "skipping reclaim because runtime lease disappeared during lookup"
+                );
+                continue;
+            };
+            remote_groups
+                .entry(request.storage_runtime.clone())
+                .or_insert_with(|| (lease, Vec::new()))
+                .1
+                .push(index);
+        }
+
+        for (storage_runtime, (lease, indices)) in remote_groups {
+            let ops = indices
+                .iter()
+                .map(|index| ReleaseOp {
+                    segment_name: requests[*index].segment_name.clone(),
+                    offset_bytes: requests[*index].offset_bytes,
+                    length_bytes: requests[*index].length_bytes,
+                })
+                .collect::<Vec<_>>();
+            match self
+                .control_client
+                .batch_release(&lease, &storage_runtime, &ops)
+            {
+                Ok(results) => {
+                    for (index, result) in indices.iter().copied().zip(results) {
+                        if let Err(error) = result {
+                            if Self::reclaim_release_is_skippable(&error) {
+                                warn!(
+                                    runtime = %self.lease.runtime,
+                                    reclaim_runtime = %storage_runtime,
+                                    segment = %requests[index].segment_name.0,
+                                    offset_bytes = requests[index].offset_bytes,
+                                    length_bytes = requests[index].length_bytes,
+                                    error = %error,
+                                    context,
+                                    "skipping reclaim after runtime became unavailable during allocator release"
+                                );
+                                continue;
+                            }
+                            if should_mark_runtime_suspect_after_allocator_error(&error) {
+                                self.mark_runtime_suspect(
+                                    &storage_runtime,
+                                    "allocator_batch_release_failed",
+                                );
+                            }
+                            debug!(
+                                storage_runtime = %storage_runtime,
+                                segment = %requests[index].segment_name.0,
+                                offset_bytes = requests[index].offset_bytes,
+                                length_bytes = requests[index].length_bytes,
+                                error = %error,
+                                context,
+                                "allocator batch reclaim release rpc failed"
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if Self::reclaim_release_is_skippable(&error) {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            reclaim_runtime = %storage_runtime,
+                            items = indices.len(),
+                            error = %error,
+                            context,
+                            "skipping reclaim batch for unavailable runtime"
+                        );
+                        continue;
+                    }
+                    if should_mark_runtime_suspect_after_allocator_error(&error) {
+                        self.mark_runtime_suspect(
+                            &storage_runtime,
+                            "allocator_batch_release_failed",
+                        );
+                    }
+                    debug!(
+                        storage_runtime = %storage_runtime,
+                        error = %error,
+                        items = indices.len(),
+                        context,
+                        "allocator batch reclaim release rpc failed"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn release_reserved_allocations(
         &self,
         targets: &[ReplicaWriteTarget],
@@ -415,7 +591,7 @@ impl StoreClient {
                 length_bytes: reclaim.length_bytes,
             })
             .collect::<Vec<_>>();
-        self.release_segment_allocations_batch(&releases)
+        self.release_reclaim_allocations_best_effort(&releases, "flush_due_reclaims")
     }
 
     fn flush_all_reclaims(&self) -> Result<()> {
@@ -432,7 +608,7 @@ impl StoreClient {
                 length_bytes: reclaim.length_bytes,
             })
             .collect::<Vec<_>>();
-        self.release_segment_allocations_batch(&releases)
+        self.release_reclaim_allocations_best_effort(&releases, "flush_all_reclaims")
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {
