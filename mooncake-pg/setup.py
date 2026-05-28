@@ -43,7 +43,7 @@ if use_musa:
     BuildClass = MUSABuildExtension
 else:
     # Link against the CUDA driver stub library if available.
-    cuda_libraries = ["ibverbs", "mlx5"]
+    cuda_libraries = ["ibverbs", "mlx5", "glog", "jsoncpp"]
     cuda_library_dirs = []
     if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
@@ -54,6 +54,43 @@ else:
     ExtensionClass = CUDAExtension
     BuildClass = BuildExtension
 
+# Build link args: link against libtent_shared.so instead of engine.so
+extra_link_args = ["-Wl,-rpath,$ORIGIN"]
+if not use_musa:
+    tent_build_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
+    )
+    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
+    if not os.path.exists(tent_lib):
+        raise FileNotFoundError(
+            f"TENT shared library not found at {tent_lib}. "
+            "Build the transfer engine first: cmake --build build-phase2"
+        )
+    asio_lib_dir = os.path.join(current_dir, "../build-phase2/mooncake-common")
+    mc_common_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-common/src"
+    )
+    te_build_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/src"
+    )
+    te_common_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/src/common/base"
+    )
+    extra_link_args.extend([
+        "-Wl,-rpath," + tent_build_dir,
+        "-L" + tent_build_dir,
+        "-ltent_shared",
+        "-L" + asio_lib_dir,
+        "-lasio",
+        "-Wl,-rpath," + asio_lib_dir,
+        "-L" + te_build_dir,
+        "-ltransfer_engine",
+        "-L" + te_common_dir,
+        "-lbase",
+        "-L" + mc_common_dir,
+        "-lmooncake_common",
+    ])
+
 setup(
     name=module_name,
     ext_modules=[
@@ -63,6 +100,8 @@ setup(
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
+                os.path.join(current_dir, "../mooncake-common/include"),
+                "/root/ylt-install/include",
             ],
             sources=[
                 "src/pg_py.cpp",
@@ -92,10 +131,7 @@ setup(
             },
             libraries=cuda_libraries,
             library_dirs=cuda_library_dirs,
-            extra_link_args=[
-                "-Wl,-rpath,$ORIGIN",
-                "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
-            ] + ([] if use_musa else ["-l:engine.so"]),
+            extra_link_args=extra_link_args,
         )
     ],
     cmdclass={"build_ext": BuildClass},
