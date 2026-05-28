@@ -29,41 +29,6 @@ bool LeaseCleanupErrorTreatAsEffectiveOk(ErrorCode e) {
     return e == ErrorCode::LEASE_EXPIRED;
 }
 
-bool SlicesAreContiguous(const std::vector<Slice>& slices) {
-    if (slices.empty()) {
-        return false;
-    }
-    for (size_t i = 1; i < slices.size(); ++i) {
-        const char* prev_end =
-            static_cast<const char*>(slices[i - 1].ptr) + slices[i - 1].size;
-        if (prev_end != static_cast<const char*>(slices[i].ptr)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-size_t TotalSliceBytes(const std::vector<Slice>& slices) {
-    size_t t = 0;
-    for (const auto& s : slices) {
-        t += s.size;
-    }
-    return t;
-}
-
-bool RemoteDestBuffersContiguous(const std::vector<RemoteBufferDesc>& bufs) {
-    if (bufs.empty()) {
-        return false;
-    }
-    for (size_t i = 1; i < bufs.size(); ++i) {
-        uintptr_t prev_end = bufs[i - 1].addr + bufs[i - 1].size;
-        if (prev_end != bufs[i].addr) {
-            return false;
-        }
-    }
-    return true;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -634,8 +599,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
     } else {
-        results = InnerBatchPut(keys, batched_slices, *route_cfg_ptr,
-                                transfer_direction_mode_);
+        results = InnerBatchPut(keys, batched_slices, *route_cfg_ptr);
     }
 
     size_t success_count = 0;
@@ -674,13 +638,11 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const WriteRouteRequestConfig& route_config,
-    TransferDirectionMode transfer_direction_mode) {
+    const WriteRouteRequestConfig& route_config) {
     if (ha_manager_ && ha_manager_->IsDegraded()) {
         return InnerBatchPutDegraded(keys, batched_slices);
     }
-    return InnerBatchPutNormal(keys, batched_slices, route_config,
-                               transfer_direction_mode);
+    return InnerBatchPutNormal(keys, batched_slices, route_config);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -755,8 +717,7 @@ std::vector<tl::expected<void, ErrorCode>>
 P2PClientService::InnerBatchPutNormal(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
-    const WriteRouteRequestConfig& route_config,
-    TransferDirectionMode transfer_direction_mode) {
+    const WriteRouteRequestConfig& route_config) {
     // Phase 1: fetch write routes from master.
     auto batch_routes =
         BatchFetchWriteRoutes(keys, batched_slices, route_config);
@@ -769,9 +730,8 @@ P2PClientService::InnerBatchPutNormal(
     // Phase 2:
     // 2.1: async dispatch first-candidate writes for each key
     // 2.2: wrap each key in a retry chain based on rotute
-    auto handles =
-        CreatePutHandlesFromRoute(keys, batched_slices, route_config,
-                                  transfer_direction_mode, batch_routes.value());
+    auto handles = CreatePutHandlesFromRoute(keys, batched_slices, route_config,
+                                             batch_routes.value());
 
     // Phase 3: wait every retry chain and collect results.
     return CollectResults(handles, keys);
@@ -806,7 +766,6 @@ P2PClientService::CreatePutHandlesFromRoute(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteRouteRequestConfig& route_config,
-    TransferDirectionMode transfer_direction_mode,
     BatchGetWriteRouteResponse& batch_resp) {
     struct WriteTask {
         std::unique_ptr<TaskHandle<void>> first_task;
@@ -824,7 +783,6 @@ P2PClientService::CreatePutHandlesFromRoute(
             continue;
         }
         auto ops = BuildWriteOps(keys[i], batched_slices[i], route_config,
-                                 transfer_direction_mode,
                                  std::move(batch_resp.responses[i].candidates));
         if (!ops) {
             LOG(ERROR) << "fail to build write ops"
@@ -880,7 +838,6 @@ P2PClientService::CreatePutHandlesFromRoute(
 auto P2PClientService::BuildWriteOps(std::string_view key,
                                      std::vector<Slice>& slices,
                                      const WriteRouteRequestConfig& config,
-                                     TransferDirectionMode transfer_direction_mode,
                                      std::vector<WriteCandidate> candidates)
     -> tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode> {
     if (candidates.empty()) {
@@ -918,14 +875,14 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
             std::string endpoint =
                 proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
             DataManager* fwd_dm =
-                (transfer_direction_mode == TransferDirectionMode::FORWARD &&
+                (transfer_direction_mode_ == TransferDirectionMode::FORWARD &&
                  data_manager_.has_value())
                     ? &*data_manager_
                     : nullptr;
             write_ops.push_back(std::make_unique<RemoteWriteOp>(
                 this, &GetOrCreatePeerClient(endpoint), write_req,
                 std::move(proxy), route_cache_ ? &*route_cache_ : nullptr,
-                endpoint, fwd_dm, &slices, transfer_direction_mode));
+                endpoint, fwd_dm, &slices));
         }
     }
 
@@ -976,7 +933,8 @@ std::unique_ptr<TaskHandle<void>> P2PClientService::RemoteWriteOp::Dispatch() {
                 return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             });
     }
-    if (transfer_direction_mode == TransferDirectionMode::FORWARD) {
+    if (owner_service->transfer_direction_mode_ ==
+        TransferDirectionMode::FORWARD) {
         return owner_service->StartForwardRemotePut(peer_ptr, forward_dm,
                                                     forward_slices, write_req);
     }
@@ -1060,18 +1018,16 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
             tl::unexpected(ErrorCode::INTERNAL_ERROR)));
         co_return;
     }
-    if (!SlicesAreContiguous(*slices)) {
-        LOG(ERROR)
-            << "Forward transfer write requires contiguous slice buffers, key="
-            << write_req->key;
-        tl::expected<void, ErrorCode> err =
-            tl::make_unexpected(ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED);
-        promise->setValue(std::move(err));
+    if (slices->size() != 1) {
+        LOG(ERROR) << "Forward transfer write supports a single slice only, key="
+                   << write_req->key << ", slice_count=" << slices->size();
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
         co_return;
     }
     PreWriteRequest pre_req;
     pre_req.key = write_req->key;
-    pre_req.size_bytes = TotalSliceBytes(*slices);
+    pre_req.size_bytes = slices->front().size;
     pre_req.target_tier_id = write_req->target_tier_id;
 
     auto pre = co_await peer->AsyncPreWrite(pre_req);
@@ -1087,9 +1043,8 @@ async_simple::coro::Lazy<void> P2PClientService::RunForwardRemotePut(
 
     std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
     void* base = slices->front().ptr;
-    auto te =
-        dm->TransferData(base, TotalSliceBytes(*slices), dest,
-                         Transport::TransferRequest::WRITE);
+    auto te = dm->TransferData(base, slices->front().size, dest,
+                               Transport::TransferRequest::WRITE);
     if (!te) {
         LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
                    << ", error=" << te.error();
@@ -1561,8 +1516,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
     auto read_buf = std::make_shared<BufferHandle>(std::move(*alloc_result));
     std::vector<Slice> slices = {{read_buf->ptr(), object_size}};
 
-    auto result = InnerGetViaRoute(key, slices, std::move(*iter),
-                                   transfer_direction_mode_);
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
     if (!result) {
         LOG(ERROR) << "Failed to get via route, key=" << key
                    << ", error=" << result.error();
@@ -1586,8 +1540,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
         }
         return tl::unexpected(iter.error());
     }
-    auto result = InnerGetViaRoute(key, slices, std::move(*iter),
-                                   transfer_direction_mode_);
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
     if (!result) {
         LOG(ERROR) << "Failed to get via route, key=" << key
                    << ", error=" << result.error();
@@ -1597,8 +1550,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
 }
 
 tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
-    std::string_view key, std::vector<Slice>& slices, RouteIterator iter,
-    TransferDirectionMode transfer_direction_mode) {
+    std::string_view key, std::vector<Slice>& slices, RouteIterator iter) {
     auto req = std::make_shared<RemoteReadRequest>();
     req->key = key;
     for (const auto& s : slices) {
@@ -1614,8 +1566,7 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     auto future = promise->getFuture();
 
     const uint64_t object_size = iter.object_size();
-    RunReadWithRetry(std::move(iter), req, promise, transfer_direction_mode)
-        .start([](auto&&) {});
+    RunReadWithRetry(std::move(iter), req, promise).start([](auto&&) {});
 
     ReadTaskHandle res;
     res.data_size = object_size;
@@ -1624,23 +1575,24 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
     return res;
 }
 
-async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
+async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
         promise,
-    RouteIterator& iter, ErrorCode& final_result) {
+    RouteIterator& iter) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "Forward transfer read requires DataManager";
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::INTERNAL_ERROR)));
-        co_return true;
+        co_return ErrorCode::INTERNAL_ERROR;
     }
-    if (!RemoteDestBuffersContiguous(req->dest_buffers)) {
-        LOG(ERROR) << "Forward transfer read requires contiguous dest buffers, key="
-                   << req->key;
+    if (req->dest_buffers.size() != 1) {
+        LOG(ERROR) << "Forward transfer read supports a single dest buffer only, key="
+                   << req->key
+                   << ", buffer_count=" << req->dest_buffers.size();
         promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::INVALID_PARAMS)));
-        co_return true;
+            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
+        co_return ErrorCode::NOT_IMPLEMENTED;
     }
     PinKeyRequest pin_req;
     pin_req.key = req->key;
@@ -1649,17 +1601,12 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
         if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
                        << ", error=" << pin.error();
-        } else {
-            final_result = pin.error();
         }
         iter.Evict(route);
-        co_return false;
+        co_return pin.error();
     }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
-    size_t total = 0;
-    for (const auto& d : req->dest_buffers) {
-        total += d.size;
-    }
+    const size_t total = req->dest_buffers[0].size;
     auto tr = data_manager_->TransferData(
         base, total, {pin.value().remote_buffer},
         Transport::TransferRequest::READ);
@@ -1692,7 +1639,7 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
                        << req->key << ", error=" << cleanup_unpin.error();
         }
         iter.Evict(route);
-        co_return false;
+        co_return tr.error();
     }
     UnPinKeyRequest unpin_req;
     unpin_req.key = req->key;
@@ -1716,30 +1663,34 @@ async_simple::coro::Lazy<bool> P2PClientService::RunForwardReadOnRoute(
     if (!unpin_res) {
         LOG(ERROR) << "AsyncUnPinKey failed after forward read, key="
                    << req->key << ", error=" << unpin_res.error();
-        final_result = unpin_res.error();
         iter.Evict(route);
-        co_return false;
+        co_return unpin_res.error();
     }
     tl::expected<void, ErrorCode> ok;
     promise->setValue(std::move(ok));
-    co_return true;
+    co_return ErrorCode::OK;
 }
 
 // Coroutine iterates route candidates and retries on failure.
 async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
     RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-        promise,
-    TransferDirectionMode transfer_direction_mode) {
+        promise) {
     ErrorCode final_result = ErrorCode::OBJECT_NOT_FOUND;
     try {
         while (auto route = co_await iter.AsyncNext()) {
             try {
-                if (transfer_direction_mode == TransferDirectionMode::FORWARD) {
-                    if (co_await RunForwardReadOnRoute(*route, req, promise,
-                                                       iter, final_result)) {
+                if (transfer_direction_mode_ ==
+                    TransferDirectionMode::FORWARD) {
+                    const ErrorCode route_result = co_await RunForwardReadOnRoute(
+                        *route, req, promise, iter);
+                    if (route_result == ErrorCode::OK ||
+                        route_result == ErrorCode::INTERNAL_ERROR ||
+                        route_result == ErrorCode::INVALID_PARAMS ||
+                        route_result == ErrorCode::NOT_IMPLEMENTED) {
                         co_return;
                     }
+                    final_result = route_result;
                     continue;
                 }
 

@@ -55,46 +55,6 @@ bool IsValidRequest(const RemoteWriteRequest& request) {
     return true;
 }
 
-bool IsValidRequest(const PreWriteRequest& request) {
-    if (request.key.empty() || request.size_bytes == 0) {
-        LOG(ERROR) << "PreWriteRequest: invalid key or size";
-        return false;
-    }
-    return true;
-}
-
-bool IsValidRequest(const WriteCommitRequest& request) {
-    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
-        LOG(ERROR) << "WriteCommitRequest: invalid key or token";
-        return false;
-    }
-    return true;
-}
-
-bool IsValidRequest(const WriteRevokeRequest& request) {
-    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
-        LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
-        return false;
-    }
-    return true;
-}
-
-bool IsValidRequest(const PinKeyRequest& request) {
-    if (request.key.empty()) {
-        LOG(ERROR) << "PinKeyRequest: empty key";
-        return false;
-    }
-    return true;
-}
-
-bool IsValidRequest(const UnPinKeyRequest& request) {
-    if (request.key.empty() || IsZeroUUID(request.read_operation_id)) {
-        LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
-        return false;
-    }
-    return true;
-}
-
 }  // anonymous namespace
 
 ClientRpcService::ClientRpcService(DataManager& data_manager,
@@ -206,7 +166,8 @@ tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
     ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
     timer.LogRequest("key=", request.key, "size_bytes=", request.size_bytes);
 
-    if (!IsValidRequest(request)) {
+    if (request.key.empty() || request.size_bytes == 0) {
+        LOG(ERROR) << "PreWriteRequest: invalid key or size";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -229,7 +190,8 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteCommit");
     timer.LogRequest("key=", request.key);
 
-    if (!IsValidRequest(request)) {
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
+        LOG(ERROR) << "WriteCommitRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -252,7 +214,8 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
     timer.LogRequest("key=", request.key);
 
-    if (!IsValidRequest(request)) {
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
+        LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -275,7 +238,8 @@ tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
     timer.LogRequest("key=", request.key);
 
-    if (!IsValidRequest(request)) {
+    if (request.key.empty()) {
+        LOG(ERROR) << "PinKeyRequest: empty key";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -297,7 +261,8 @@ tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
     ScopedVLogTimer timer(1, "ClientRpcService::UnPinKey");
     timer.LogRequest("key=", request.key);
 
-    if (!IsValidRequest(request)) {
+    if (request.key.empty() || IsZeroUUID(request.read_operation_id)) {
+        LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }

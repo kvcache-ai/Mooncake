@@ -244,8 +244,7 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& route_config,
-        TransferDirectionMode transfer_direction_mode);
+        const WriteRouteRequestConfig& route_config);
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutDegraded(
         const std::vector<ObjectKey>& keys,
@@ -254,14 +253,12 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutNormal(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
-        const WriteRouteRequestConfig& route_config,
-        TransferDirectionMode transfer_direction_mode);
+        const WriteRouteRequestConfig& route_config);
 
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
     CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
                               std::vector<std::vector<Slice>>& batched_slices,
                               const WriteRouteRequestConfig& route_config,
-                              TransferDirectionMode transfer_direction_mode,
                               BatchGetWriteRouteResponse& batch_resp);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
@@ -305,13 +302,11 @@ class P2PClientService final : public ClientService {
         std::string endpoint;
         DataManager* forward_dm = nullptr;
         std::vector<Slice>* forward_slices = nullptr;
-        TransferDirectionMode transfer_direction_mode = TransferDirectionMode::REVERSE;
 
         RemoteWriteOp(P2PClientService* owner, PeerClient* p,
                       std::shared_ptr<RemoteWriteRequest> wr,
                       P2PProxyDescriptor px, RouteCache* rc, std::string ep,
-                      DataManager* fwd_dm, std::vector<Slice>* fwd_slices,
-                      TransferDirectionMode transfer_mode)
+                      DataManager* fwd_dm, std::vector<Slice>* fwd_slices)
             : owner_service(owner),
               peer_ptr(p),
               write_req(std::move(wr)),
@@ -319,8 +314,7 @@ class P2PClientService final : public ClientService {
               route_cache(rc),
               endpoint(std::move(ep)),
               forward_dm(fwd_dm),
-              forward_slices(fwd_slices),
-              transfer_direction_mode(transfer_mode) {}
+              forward_slices(fwd_slices) {}
 
         std::string_view route() const override { return endpoint; }
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
@@ -329,7 +323,6 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
                   const WriteRouteRequestConfig& config,
-                  TransferDirectionMode transfer_direction_mode,
                   std::vector<WriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(
@@ -431,22 +424,22 @@ class P2PClientService final : public ClientService {
      * and chains subsequent candidates on failure (no stack recursion).
      */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
-        std::string_view key, std::vector<Slice>& slices, RouteIterator iter,
-        TransferDirectionMode transfer_direction_mode);
+        std::string_view key, std::vector<Slice>& slices, RouteIterator iter);
 
     async_simple::coro::Lazy<void> RunReadWithRetry(
         RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-            promise,
-        TransferDirectionMode transfer_direction_mode);
+            promise);
 
-    // true = promise set, caller co_return; false = try next route (incl. hard
-    // UnPin failure after TE success on this replica).
-    async_simple::coro::Lazy<bool> RunForwardReadOnRoute(
+    // OK / INTERNAL_ERROR / INVALID_PARAMS / NOT_IMPLEMENTED: promise fulfilled,
+    // caller co_return.
+    // Any other code: try next route; use returned code as final_result if all
+    // routes are exhausted.
+    async_simple::coro::Lazy<ErrorCode> RunForwardReadOnRoute(
         const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise,
-        RouteIterator& iter, ErrorCode& final_result);
+        RouteIterator& iter);
 
     async_simple::coro::Lazy<void> RunForwardRemotePut(
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
