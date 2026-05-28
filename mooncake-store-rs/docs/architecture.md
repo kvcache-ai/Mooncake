@@ -83,6 +83,12 @@ drain, migration, and shrink, update object routes through the same
 `RouteOperations` CRUD/CAS facade as put, get, delete, and exist paths. They do
 not write directly to selected route authorities.
 
+The route crate is split into three route-specific layers:
+
+- `shim`: public object route operation shim, currently `RouteOperations` and hit reporting
+- `table`: route table operation implementations and their authority/membership contracts
+- `mesh`: route authority mesh internals, including local authority binding and per-authority indexes
+
 Route authority policy is bootstrap-validated through metadata:
 
 - every client starts with a local `route_control` (cluster-level, fixed at startup) and `route_topk` (fallback, overridable via tenant policy)
@@ -486,7 +492,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-route` | object route table operation facade and implementation modules: `operations`, `control`, `local_authority`, `directory`, `mesh`, `traits`, `metrics`, and `util`; authority helpers remain internal to route control and `mesh` remains crate-internal |
+| `crates/mooncake-store-route` | object route table component split into `shim` for public operation facade, `table` for route table operation implementations/contracts, `mesh` for route authority internals, plus `control`, `metrics`, and `util` |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
 | `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |

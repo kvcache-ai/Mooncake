@@ -1,3 +1,5 @@
+//! Contracts required by route table implementations.
+
 use std::time::Instant;
 
 use mooncake_store_core::{

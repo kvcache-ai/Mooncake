@@ -1,3 +1,5 @@
+//! Public shim over the object route table.
+
 use std::sync::Arc;
 
 use mooncake_store_core::{

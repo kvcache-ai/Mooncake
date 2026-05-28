@@ -17,7 +17,7 @@ use crate::mesh::{
     register_local_authority, unregister_local_authority,
 };
 use crate::metrics::{record_cas_outcome, record_route_repair_metric};
-use crate::traits::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
+use crate::table::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
 use crate::util::{
     canonical_route_key, compatibility_matches, route_capable, route_read_source, route_weight,
     sampled_per_key_debug_log, weighted_rendezvous_score,

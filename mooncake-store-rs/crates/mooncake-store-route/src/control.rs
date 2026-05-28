@@ -5,7 +5,7 @@ use mooncake_store_core::{
     RouteCasRequest, StoreError,
 };
 
-use crate::traits::{RouteAuthorityClient, RouteAuthorityService};
+use crate::table::{RouteAuthorityClient, RouteAuthorityService};
 
 #[derive(Clone, Debug)]
 pub enum RouteControlRequest {
