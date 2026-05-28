@@ -26,17 +26,6 @@ impl StoreClient {
         }
     }
 
-    fn expect_exactly_one_control_plane_result<T>(
-        items: Vec<T>,
-        operation: &str,
-    ) -> std::result::Result<T, StoreError> {
-        Self::expect_exactly_one(items, &format!("control plane {operation}"))
-            .map_err(|error| match error {
-                StoreError::InvalidState(message) => StoreError::Transport(message),
-                other => other,
-            })
-    }
-
     fn load_tenant_quota_policies(
         &self,
         tenants: &[String],
@@ -682,84 +671,6 @@ impl StoreClient {
         )
     }
 
-    fn route_scan_authorities(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
-        let route_scope = self.lease.endpoints.labels.get("route_scope").cloned();
-        let mut authorities = self
-            .compatible_live_clients(force_refresh)?
-            .into_iter()
-            .filter(|lease| {
-                lease
-                    .endpoints
-                    .labels
-                    .get("route")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|lease| {
-                route_scope.as_ref().is_none_or(|scope| {
-                    lease
-                        .endpoints
-                        .labels
-                        .get("route_scope")
-                        .is_some_and(|candidate| candidate == scope)
-                })
-            })
-            .filter(|lease| lease.state == ClientLifecycleState::Active)
-            .collect::<Vec<_>>();
-        authorities.sort_by(|left, right| left.runtime.cmp(&right.runtime));
-        Ok(authorities)
-    }
-
-    fn route_sync_authorities(
-        &self,
-        force_refresh: bool,
-        included_readable: Option<&ClientStableId>,
-    ) -> Result<Vec<ClientLease>> {
-        let route_scope = self.lease.endpoints.labels.get("route_scope").cloned();
-        let mut authorities = BTreeMap::<ClientStableId, ClientLease>::new();
-        for authority in self.route_scan_authorities(force_refresh)? {
-            authorities.insert(authority.runtime.stable_id.clone(), authority);
-        }
-
-        if let Some(included) = included_readable {
-            let mut snapshots = vec![self.compatible_live_clients(force_refresh)?];
-            if !force_refresh {
-                snapshots.push(self.compatible_live_clients(true)?);
-            }
-            for lease in snapshots.into_iter().flatten() {
-                if authorities.contains_key(&lease.runtime.stable_id) {
-                    continue;
-                }
-                if lease.runtime.stable_id != *included {
-                    continue;
-                }
-                if lease
-                    .endpoints
-                    .labels
-                    .get("route")
-                    .is_none_or(|value| value != "true")
-                {
-                    continue;
-                }
-                if route_scope.as_ref().is_some_and(|scope| {
-                    lease.endpoints
-                        .labels
-                        .get("route_scope")
-                        .is_none_or(|candidate| candidate != scope)
-                }) {
-                    continue;
-                }
-                if !lease.state.serves_reads() {
-                    continue;
-                }
-                authorities
-                    .entry(lease.runtime.stable_id.clone())
-                    .or_insert(lease);
-            }
-        }
-
-        Ok(authorities.into_values().collect())
-    }
-
     fn active_compatible_runtimes(&self, force_refresh: bool) -> Result<BTreeSet<ClientRuntimeId>> {
         Ok(self
             .available_compatible_live_clients(force_refresh)?
@@ -1330,10 +1241,7 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
-                    writer.sync_route_to_live_authorities_excluding(
-                        &next,
-                        Some(&self.lease.runtime.stable_id),
-                    )?;
+                    writer.ensure_object_route_at_least(&next)?;
                     self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
@@ -1436,10 +1344,7 @@ impl StoreClient {
                 },
             ) {
                 Ok(next) => {
-                    writer.sync_route_to_live_authorities_excluding(
-                        &next,
-                        Some(&self.lease.runtime.stable_id),
-                    )?;
+                    writer.ensure_object_route_at_least(&next)?;
                     self.reclaim_route(&confirmed, ReclaimMode::Immediate)?;
                     registry::record_rebalance_route("migrate", "ok");
                     registry::record_rebalance_bytes(
@@ -1513,210 +1418,39 @@ impl StoreClient {
         Ok(allocations)
     }
 
-    fn replace_route_on_authority(
-        &self,
-        authority: &ClientLease,
-        route: &ObjectRoute,
-    ) -> Result<()> {
-        let namespace = self.metadata.route_namespace();
-        if authority.runtime.stable_id == self.lease.runtime.stable_id {
-            return self.route_ops().replace_authority_route(
-                &namespace,
-                &authority.runtime.stable_id,
-                &route.key,
-                Some(route),
-            );
+    fn ensure_object_route_at_least(&self, route: &ObjectRoute) -> Result<()> {
+        let route_ops = self.route_ops();
+        let Some(current) = route_ops.load_route(&route.key)? else {
+            let result = route_ops.publish_route(&route.key, None, route)?;
+            if result.applied
+                || result
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.version >= route.version)
+            {
+                return Ok(());
+            }
+            return Err(StoreError::Conflict(format!(
+                "route {} update lost to older route version",
+                route.key.0
+            )));
+        };
+        if current.version >= route.version {
+            return Ok(());
         }
-        let request = RouteCasRequest {
-            key: route.key.clone(),
-            expected: None,
-            next: Some(route.clone()),
-        };
-        let response = self.control_client.send_route_control(
-            authority,
-            RouteControlRequest::BatchReplace {
-                namespace,
-                authority: authority.runtime.stable_id.clone(),
-                requests: vec![request],
-            },
-        )?;
-        let RouteControlResponse::BatchReplace(results) = response else {
-            return Err(StoreError::Transport(
-                "replace route control transport returned non-replace reply".to_string(),
-            ));
-        };
-        Self::expect_exactly_one_control_plane_result(results, "replace route")?
-    }
-
-    fn get_route_from_authority(
-        &self,
-        authority: &ClientLease,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectRoute>> {
-        let namespace = self.metadata.route_namespace();
-        if authority.runtime.stable_id == self.lease.runtime.stable_id {
-            return self
-                .route_ops()
-                .load_authority_route(&namespace, &authority.runtime.stable_id, key);
-        }
-        let response = self.control_client.send_route_control(
-            authority,
-            RouteControlRequest::BatchGet {
-                namespace,
-                authority: authority.runtime.stable_id.clone(),
-                keys: vec![key.clone()],
-            },
-        )?;
-        let RouteControlResponse::BatchGet(results) = response else {
-            return Err(StoreError::Transport(
-                "get route control transport returned non-get reply".to_string(),
-            ));
-        };
-        Self::expect_exactly_one_control_plane_result(results, "get route")?
-    }
-
-    fn ensure_authority_route_not_stale(
-        &self,
-        authority: &ClientLease,
-        route: &ObjectRoute,
-    ) -> Result<()> {
-        if self
-            .get_route_from_authority(authority, &route.key)?
-            .is_some_and(|current| current.version >= route.version)
+        let result = route_ops.publish_route(&route.key, Some(current.version), route)?;
+        if result.applied
+            || result
+                .current
+                .as_ref()
+                .is_some_and(|current| current.version >= route.version)
         {
             return Ok(());
         }
-        self.replace_route_on_authority(authority, route)
-    }
-
-    fn sync_route_to_live_authorities_excluding(
-        &self,
-        route: &ObjectRoute,
-        excluded: Option<&ClientStableId>,
-    ) -> Result<usize> {
-        if self.route_control == RouteControlMode::MetadataOnly {
-            return Ok(0);
-        }
-        let mut force_refresh = false;
-        loop {
-            let authorities = self.route_sync_authorities(force_refresh, excluded)?;
-            let mut protected = 0usize;
-            let mut last_error = None;
-
-            for authority in authorities {
-                let is_excluded =
-                    excluded.is_some_and(|stable_id| authority.runtime.stable_id == *stable_id);
-                match self.replace_route_on_authority(&authority, route) {
-                    Ok(()) => {
-                        if !is_excluded {
-                            protected = protected.saturating_add(1);
-                        }
-                    }
-                    Err(error) => {
-                        if authority.runtime != self.lease.runtime {
-                            self.mark_runtime_suspect(
-                                &authority.runtime,
-                                "route_sync_authority_replace_failed",
-                            );
-                        }
-                        warn!(
-                            runtime = %self.lease.runtime,
-                            authority = %authority.runtime,
-                            key = %route.key.0,
-                            error = %error,
-                            "route authority sync failed during migration"
-                        );
-                        if !is_excluded {
-                            last_error = Some(error);
-                        }
-                    }
-                }
-            }
-
-            if protected > 0 || force_refresh {
-                if excluded.is_some() && protected == 0 {
-                    return Err(last_error.unwrap_or_else(|| {
-                        StoreError::InvalidState(format!(
-                            "route {} has no live authority outside the draining runtime",
-                            route.key.0
-                        ))
-                    }));
-                }
-                return Ok(protected);
-            }
-
-            if last_error.is_none() && excluded.is_none() {
-                return Ok(0);
-            }
-            force_refresh = true;
-        }
-    }
-
-    fn sync_local_authority_routes_to_live_authorities(&self) -> Result<usize> {
-        if self.route_control == RouteControlMode::MetadataOnly {
-            return Ok(0);
-        }
-        let routes = self.route_ops().list_authority_routes(
-            &self.metadata.route_namespace(),
-            &self.lease.runtime.stable_id,
-        )?;
-        let mut authorities = self.route_scan_authorities(false)?;
-        let mut refreshed = false;
-        let mut synced = 0usize;
-        for route in routes {
-            loop {
-                let (protected, last_error) =
-                    self.sync_local_authority_route_to_authorities(&route, &authorities);
-                if protected != 0 {
-                    synced = synced.saturating_add(1);
-                    break;
-                }
-                if !refreshed {
-                    authorities = self.route_scan_authorities(true)?;
-                    refreshed = true;
-                    continue;
-                }
-                return Err(last_error.unwrap_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "local authority route {} has no live mirror",
-                        route.key.0
-                    ))
-                }));
-            }
-        }
-        Ok(synced)
-    }
-
-    fn sync_local_authority_route_to_authorities(
-        &self,
-        route: &ObjectRoute,
-        authorities: &[ClientLease],
-    ) -> (usize, Option<StoreError>) {
-        let mut protected = 0usize;
-        let mut last_error = None;
-        for authority in authorities {
-            if authority.runtime.stable_id == self.lease.runtime.stable_id {
-                continue;
-            }
-            match self.ensure_authority_route_not_stale(authority, route) {
-                Ok(()) => protected = protected.saturating_add(1),
-                Err(error) => {
-                    self.mark_runtime_suspect(
-                        &authority.runtime,
-                        "route_authority_shutdown_sync_failed",
-                    );
-                    warn!(
-                        runtime = %self.lease.runtime,
-                        authority = %authority.runtime,
-                        key = %route.key.0,
-                        error = %error,
-                        "route authority shutdown sync failed"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        (protected, last_error)
+        Err(StoreError::Conflict(format!(
+            "route {} update lost to older route version",
+            route.key.0
+        )))
     }
 
     fn release_stale_local_allocations(
@@ -1827,7 +1561,6 @@ impl StoreClient {
 
             let remaining = self.remaining_live_segments()?;
             if remaining.is_empty() {
-                let _ = self.sync_local_authority_routes_to_live_authorities()?;
                 return Ok(migrated);
             }
 

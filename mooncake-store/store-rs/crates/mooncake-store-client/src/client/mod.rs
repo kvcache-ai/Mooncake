@@ -18,10 +18,7 @@ use mooncake_store_core::{
     StoreError, TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope,
     TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
-use mooncake_store_route::{
-    RouteControlRequest, RouteControlResponse, RouteControlTransport, RouteHitReporter,
-    RouteOperations,
-};
+use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_transport::{
     Opcode, SegmentInfo, TentEngine, TransferBatchHints, TransferPacingMode, TransferRequest,
 };

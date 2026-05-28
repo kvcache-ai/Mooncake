@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientRuntimeId, ClientStableId, NamespaceScope, ObjectKey,
-    ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
+    CasResult, ClientLease, ClientRuntimeId, NamespaceScope, ObjectKey, ObjectRoute, Result,
+    ReuseIdentity, RouteCasRequest, RouteDirectory, RouteState, RouteVersion,
 };
-
-use crate::local_authority::LocalRouteAuthority;
 
 pub trait RouteHitReporter {
     fn report_route_hits(&self, routes: &[&ObjectRoute]);
@@ -140,33 +138,6 @@ impl RouteOperations {
 
     pub fn list_reuse_candidates(&self, reuse: &ReuseIdentity) -> Result<Vec<ObjectRoute>> {
         self.directory.list_reuse_candidates(&self.observer, reuse)
-    }
-
-    pub fn load_authority_route(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-    ) -> Result<Option<ObjectRoute>> {
-        LocalRouteAuthority::new(namespace, authority.clone()).get_route(key)
-    }
-
-    pub fn replace_authority_route(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-        key: &ObjectKey,
-        route: Option<&ObjectRoute>,
-    ) -> Result<()> {
-        LocalRouteAuthority::new(namespace, authority.clone()).replace_route(key, route)
-    }
-
-    pub fn list_authority_routes(
-        &self,
-        namespace: &str,
-        authority: &ClientStableId,
-    ) -> Result<Vec<ObjectRoute>> {
-        LocalRouteAuthority::new(namespace, authority.clone()).list_routes()
     }
 
     pub fn next_route_version(
