@@ -1,3 +1,44 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchPutReserveRetryReason {
+    NoPlacementCandidates,
+    NotEnoughWritableOwners,
+    ExhaustedCandidates,
+}
+
+impl BatchPutReserveRetryReason {
+    fn retry_delay(self, attempt: usize) -> Duration {
+        match self {
+            Self::NoPlacementCandidates
+            | Self::NotEnoughWritableOwners
+            | Self::ExhaustedCandidates => {
+                Duration::from_millis(300_u64.saturating_mul(attempt as u64))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BatchPutReserveStageError {
+    error: StoreError,
+    retry_reason: Option<BatchPutReserveRetryReason>,
+}
+
+impl BatchPutReserveStageError {
+    fn retryable(error: StoreError, retry_reason: BatchPutReserveRetryReason) -> Self {
+        Self {
+            error,
+            retry_reason: Some(retry_reason),
+        }
+    }
+
+    fn terminal(error: StoreError) -> Self {
+        Self {
+            error,
+            retry_reason: None,
+        }
+    }
+}
+
 impl StoreClient {
     fn invalidate_remote_write_segments(&self, targets: &[ReplicaWriteTarget]) {
         let mut state = self.state.lock();
@@ -28,17 +69,13 @@ impl StoreClient {
             .ok_or_else(|| StoreError::InvalidState("segment_name is not configured".to_string()))
     }
 
-    fn batch_put_reserve_retry_delay(error: &StoreError, attempt: usize) -> Duration {
-        match error {
-            StoreError::InvalidState(message)
-                if message.contains("no placement candidates available")
-                    || message.contains("not enough writable owners")
-                    || message.contains("batch put exhausted all placement candidates") =>
-            {
-                Duration::from_millis(300_u64.saturating_mul(attempt as u64))
-            }
-            _ => Duration::from_millis(0),
-        }
+    fn batch_put_reserve_retry_delay(
+        retry_reason: Option<BatchPutReserveRetryReason>,
+        attempt: usize,
+    ) -> Duration {
+        retry_reason
+            .map(|reason| reason.retry_delay(attempt))
+            .unwrap_or_else(|| Duration::from_millis(0))
     }
     fn write_reserved_replicas(
         &self,
@@ -391,16 +428,7 @@ impl StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let rank_tracker = OperationTracker::new("batch_put_stage_rank");
-        let rank_result = planner.rank_many(self, &object_refs);
-        rank_tracker.finish(&rank_result, 0);
-        let plans = rank_result?;
-        let ranked_candidate_count = plans
-            .iter()
-            .map(|plan| plan.owners.len())
-            .max()
-            .unwrap_or(0);
-        let max_write_attempts = self.write_retry_limit(&resolved_policy, ranked_candidate_count);
+        let mut max_write_attempts = 1usize;
         let abort_prepared_quota = |entries: &[PreparedObjectWrite<'_>], context: &str| {
             for entry in entries {
                 let _ =
@@ -422,6 +450,12 @@ impl StoreClient {
             let rank_result = planner.rank_many(self, &object_refs);
             rank_tracker.finish(&rank_result, 0);
             let plans = rank_result?;
+            if write_attempt == 1 {
+                let ranked_candidate_count =
+                    plans.iter().map(|plan| plan.owners.len()).max().unwrap_or(0);
+                max_write_attempts =
+                    self.write_retry_limit(&resolved_policy, ranked_candidate_count);
+            }
 
             struct PendingBatchReservation<'a> {
                 tenant: &'a str,
@@ -453,7 +487,10 @@ impl StoreClient {
                     .map(|request| request.value.len())
                     .sum::<usize>() as u64,
             );
-            let reserve_result = (|| {
+        let reserve_result = (|| -> std::result::Result<
+            Vec<PreparedObjectWrite<'_>>,
+            BatchPutReserveStageError,
+        > {
                 let mut shared_candidates = Vec::new();
                 let mut shared_seen = BTreeSet::new();
                 let add_preferred_segments = |
@@ -511,7 +548,8 @@ impl StoreClient {
                 false,
                 &mut shared_seen,
                 &mut shared_candidates,
-            )?;
+            )
+            .map_err(BatchPutReserveStageError::terminal)?;
             add_preferred_segments(
                 self,
                 &resolved_policy.hint_preferred_segments,
@@ -519,7 +557,8 @@ impl StoreClient {
                 true,
                 &mut shared_seen,
                 &mut shared_candidates,
-            )?;
+            )
+            .map_err(BatchPutReserveStageError::terminal)?;
             for storage_runtime in &resolved_policy.preferred_storage_runtimes {
                 if self.runtime_is_suspect(storage_runtime) {
                     debug!(
@@ -563,7 +602,7 @@ impl StoreClient {
                 .collect::<Vec<_>>();
             let current_routes_result = self.route_ops().load_routes(&object_keys);
             route_load_tracker.finish(&current_routes_result, 0);
-            let current_routes = current_routes_result?;
+            let current_routes = current_routes_result.map_err(BatchPutReserveStageError::terminal)?;
 
             let mut pending = Vec::with_capacity(requests.len());
             for (((request, plan), object_ref), current) in requests
@@ -592,10 +631,13 @@ impl StoreClient {
                     }
                 }
                 if candidates.is_empty() {
-                    return Err(StoreError::InvalidState(format!(
-                        "no placement candidates available for tenant={} key={}",
-                        tenant, request.key
-                    )));
+                    return Err(BatchPutReserveStageError::retryable(
+                        StoreError::InvalidState(format!(
+                            "no placement candidates available for tenant={} key={}",
+                            tenant, request.key
+                        )),
+                        BatchPutReserveRetryReason::NoPlacementCandidates,
+                    ));
                 }
                 let object_id = LogicalObjectId::new(
                     NamespaceScope::with_defaults(
@@ -656,7 +698,7 @@ impl StoreClient {
                                 "batch_put_quota_reserve_failed",
                             );
                         }
-                        return Err(error);
+                        return Err(BatchPutReserveStageError::terminal(error));
                     }
                 }
             }
@@ -696,12 +738,17 @@ impl StoreClient {
                 }
                 if let Some(key) = exhausted_key {
                     release_pending(&pending, "batch_put_reserve_failed");
-                    return Err(StoreError::InvalidState(format!(
-                        "not enough writable owners for key {key}"
-                    )));
+                    return Err(BatchPutReserveStageError::retryable(
+                        StoreError::InvalidState(format!(
+                            "not enough writable owners for key {key}"
+                        )),
+                        BatchPutReserveRetryReason::NotEnoughWritableOwners,
+                    ));
                 }
 
-                let round_results = self.reserve_storage_runtime_segments_batch(&round_requests)?;
+                let round_results = self
+                    .reserve_storage_runtime_segments_batch(&round_requests)
+                    .map_err(BatchPutReserveStageError::terminal)?;
                 let mut exhausted_candidates = 0usize;
                 for (((index, request), candidate), result) in round_indices
                     .into_iter()
@@ -730,7 +777,7 @@ impl StoreClient {
                         }
                         Err(error) => {
                             release_pending(&pending, "batch_put_reserve_failed");
-                            return Err(error);
+                            return Err(BatchPutReserveStageError::terminal(error));
                         }
                     }
                 }
@@ -742,8 +789,11 @@ impl StoreClient {
                         || entry.next_candidate >= entry.candidates.len()
                 }) {
                     release_pending(&pending, "batch_put_reserve_failed");
-                    return Err(StoreError::InvalidState(
-                        "batch put exhausted all placement candidates".to_string(),
+                    return Err(BatchPutReserveStageError::retryable(
+                        StoreError::InvalidState(
+                            "batch put exhausted all placement candidates".to_string(),
+                        ),
+                        BatchPutReserveRetryReason::ExhaustedCandidates,
                     ));
                 }
             }
@@ -764,10 +814,15 @@ impl StoreClient {
             }
             Ok(prepared)
         })();
-        reserve_tracker.finish(&reserve_result, 0);
+        let reserve_metrics_result = reserve_result
+            .as_ref()
+            .map(|prepared| prepared.len())
+            .map_err(|error| error.error.clone());
+        reserve_tracker.finish(&reserve_metrics_result, 0);
         let prepared = match reserve_result {
             Ok(prepared) => prepared,
-            Err(error) => {
+            Err(reserve_error) => {
+                let error = reserve_error.error;
                 if write_attempt < max_write_attempts
                     && resolved_policy.required_preferred_segments.is_empty()
                     && matches!(
@@ -777,7 +832,10 @@ impl StoreClient {
                             | StoreError::InvalidState(_)
                     )
                 {
-                    let retry_delay = Self::batch_put_reserve_retry_delay(&error, write_attempt);
+                    let retry_delay = Self::batch_put_reserve_retry_delay(
+                        reserve_error.retry_reason,
+                        write_attempt,
+                    );
                     if !retry_delay.is_zero() {
                         sleep(retry_delay);
                     }
