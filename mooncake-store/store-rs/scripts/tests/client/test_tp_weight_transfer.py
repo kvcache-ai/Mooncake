@@ -111,9 +111,10 @@ def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
         actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
         assert bytes(actual) == expected, f"rank {rank} content mismatch"
 
-    # Cleanup
-    for ptr in buffer_ptrs:
-        store.unregister_buffer(ptr, rank_size)
+    finally:
+        # Cleanup
+        for ptr in buffer_ptrs:
+            store.unregister_buffer(ptr, rank_size)
 
     print("PASS")
 
