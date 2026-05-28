@@ -410,16 +410,17 @@ void DataManager::ShutdownLeaseScanner() {
 }
 
 void DataManager::LeaseScannerMain() {
-    std::unique_lock<std::mutex> wait_lock(lease_scanner_mutex_);
     while (!lease_scanner_stop_requested_.load()) {
-        lease_scanner_cv_.wait_for(wait_lock, lease_scan_interval_, [this]() {
-            return lease_scanner_stop_requested_.load();
-        });
+        {
+            std::unique_lock<std::mutex> wait_lock(lease_scanner_mutex_);
+            lease_scanner_cv_.wait_for(
+                wait_lock, lease_scan_interval_,
+                [this]() { return lease_scanner_stop_requested_.load(); });
+        }
         if (lease_scanner_stop_requested_.load()) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
-        wait_lock.unlock();
         for (auto& shard : pending_write_shards_) {
             std::unique_lock shard_lock(shard.mutex);
             ScanExpiredRecordShard(shard, now);
@@ -428,7 +429,6 @@ void DataManager::LeaseScannerMain() {
             std::unique_lock shard_lock(shard.mutex);
             ScanExpiredRecordShard(shard, now);
         }
-        wait_lock.lock();
     }
 }
 
@@ -501,10 +501,8 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     }
 
     return CallableTaskHandle<void>::Create(
-        [this, ctx = std::move(*submit_result), alloc_handle,
-         key_owned = std::string(key),
+        [this, ctx = std::move(*submit_result), alloc_handle, kctx,
          write_operation_id]() mutable -> tl::expected<void, ErrorCode> {
-            const KeyCtx kctx = BuildKeyCtx(key_owned);
             ScopedVLogTimer timer(1, "DataManager::PutViaTe");
             timer.LogRequest("key=", kctx.key);
 
@@ -566,9 +564,8 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     const UUID write_operation_id = prewrite_result->write_operation_id;
     AllocationHandle alloc_handle = prewrite_result->handle;
 
-    auto write_fn = [this, key_owned = std::string(key), slice, alloc_handle,
+    auto write_fn = [this, kctx, slice, alloc_handle,
                      write_operation_id]() -> tl::expected<void, ErrorCode> {
-        const KeyCtx kctx = BuildKeyCtx(key_owned);
         DataSource source;
         source.buffer = std::make_unique<RefBuffer>(slice.ptr, slice.size);
         source.type = MemoryType::DRAM;
@@ -583,9 +580,8 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         return {};
     };
 
-    auto commit_fn = [this, key_owned = std::string(key),
+    auto commit_fn = [this, kctx,
                       write_operation_id]() -> tl::expected<void, ErrorCode> {
-        const KeyCtx kctx = BuildKeyCtx(key_owned);
         auto commit_result = WriteCommitInternal(kctx, write_operation_id);
         if (!commit_result) {
             LOG(ERROR) << "Failed to commit data for key: " << kctx.key
@@ -595,12 +591,11 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         return {};
     };
 
-    auto write_and_commit =
-        [write_fn = std::move(write_fn), commit_fn = std::move(commit_fn),
-         key_owned =
-             std::string(key)]() mutable -> tl::expected<void, ErrorCode> {
+    auto write_and_commit = [write_fn = std::move(write_fn),
+                             commit_fn = std::move(commit_fn),
+                             kctx]() mutable -> tl::expected<void, ErrorCode> {
         ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
-        timer.LogRequest("key=", key_owned);
+        timer.LogRequest("key=", kctx.key);
         auto write_result = write_fn();
         if (!write_result) {
             LOG(ERROR) << "Failed to write data, error: "
@@ -888,6 +883,9 @@ tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWrite(
     auto internal_result =
         PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
     if (!internal_result) {
+        LOG(WARNING) << "PreWrite failed"
+                     << ", key=" << key
+                     << ", error=" << toString(internal_result.error());
         return tl::make_unexpected(internal_result.error());
     }
     PreWriteResult rpc_result;
@@ -1075,7 +1073,6 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
         it->second.ref_count++;
         it->second.deadline = deadline;
         auto list_it = it->second.list_it;
-        list_it->first.assign(ctx.key.data(), ctx.key.size());
         list_it->second = deadline;
         pin_shard.ordered_list.splice(pin_shard.ordered_list.end(),
                                       pin_shard.ordered_list, list_it);

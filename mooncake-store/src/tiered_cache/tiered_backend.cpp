@@ -29,27 +29,18 @@ AllocationEntry::~AllocationEntry() {
     }
 }
 
-TieredBackend::TieredBackend() {
+TieredBackend::TieredBackend(size_t metadata_shard_count) {
+    metadata_shard_count_ = metadata_shard_count > 0
+                                ? metadata_shard_count
+                                : kDefaultMetadataShardCount;
     metadata_shards_.reserve(metadata_shard_count_);
     for (size_t i = 0; i < metadata_shard_count_; ++i) {
         metadata_shards_.push_back(std::make_unique<MetadataShard>());
     }
 }
 
-void TieredBackend::SetMetadataShardCount(size_t count) {
-    if (!tiers_.empty()) {
-        LOG(FATAL) << "SetMetadataShardCount must be called before Init()";
-    }
-    metadata_shard_count_ = count > 0 ? count : kDefaultMetadataShardCount;
-    metadata_shards_.reserve(metadata_shard_count_);
-    for (size_t i = 0; i < metadata_shard_count_; ++i) {
-        metadata_shards_.push_back(std::make_unique<MetadataShard>());
-    }
-}
-
-bool TieredBackend::KeyExistsInShard(const MetadataShard& shard,
-                                     std::string_view key,
-                                     std::optional<UUID> tier_id) {
+bool TieredBackend::InnerExist(const MetadataShard& shard, std::string_view key,
+                               std::optional<UUID> tier_id) {
     auto it = shard.index.find(key);
     if (it == shard.index.end()) {
         return false;
@@ -73,7 +64,7 @@ ConditionalExecuteResult<void> TieredBackend::conditionalExecute(
     std::function<void()> on_not_exists) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
-    const bool exists = KeyExistsInShard(shard, key, tier_id);
+    const bool exists = InnerExist(shard, key, tier_id);
 
     ConditionalExecuteResult<void> result;
     result.key_exists = exists;
@@ -692,7 +683,7 @@ bool TieredBackend::Exist(std::string_view key,
                           std::optional<UUID> tier_id) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
-    return KeyExistsInShard(shard, key, tier_id);
+    return InnerExist(shard, key, tier_id);
 }
 
 tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,

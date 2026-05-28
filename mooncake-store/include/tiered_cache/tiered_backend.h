@@ -103,6 +103,11 @@ struct ConditionalExecuteResult {
     T callback_result{};
 };
 
+template <>
+struct ConditionalExecuteResult<void> {
+    bool key_exists = false;
+};
+
 /**
  * @brief Callback for segment lifecycle synchronization.
  * Invoked when a tier is created (mount=true) or destroyed (mount=false).
@@ -118,14 +123,15 @@ using SegmentSyncCallback = std::function<tl::expected<void, ErrorCode>(
  */
 class TieredBackend {
    public:
-    TieredBackend();
-    ~TieredBackend();
+    static constexpr size_t kDefaultMetadataShardCount = 64;
 
     /**
-     * @brief Sets the number of metadata index shards.
-     * Must be called before Init(). Default is 64.
+     * @param metadata_shard_count Number of metadata index shards. Values <= 0
+     *        use the default (64).
      */
-    void SetMetadataShardCount(size_t count);
+    explicit TieredBackend(
+        size_t metadata_shard_count = kDefaultMetadataShardCount);
+    ~TieredBackend();
 
     /**
      * @brief 1. stops any backend thread;
@@ -306,8 +312,6 @@ class TieredBackend {
             index;
     };
 
-    static constexpr size_t kDefaultMetadataShardCount = 64;
-
     size_t metadata_shard_count_ = kDefaultMetadataShardCount;
     std::vector<std::unique_ptr<MetadataShard>> metadata_shards_;
 
@@ -320,9 +324,8 @@ class TieredBackend {
                                  metadata_shard_count_];
     }
 
-    static bool KeyExistsInShard(const MetadataShard& shard,
-                                 std::string_view key,
-                                 std::optional<UUID> tier_id);
+    static bool InnerExist(const MetadataShard& shard, std::string_view key,
+                           std::optional<UUID> tier_id);
 
     std::unique_ptr<DataCopier> data_copier_;
     // Callbacks for metadata synchronization with Master
@@ -341,18 +344,13 @@ class TieredBackend {
     std::atomic<bool> is_destroyed_{false};
 };
 
-template <>
-struct ConditionalExecuteResult<void> {
-    bool key_exists = false;
-};
-
 template <typename R>
 ConditionalExecuteResult<R> TieredBackend::conditionalExecute(
     std::string_view key, std::optional<UUID> tier_id,
     std::function<R()> on_exists, std::function<R()> on_not_exists) const {
     auto& shard = GetMetadataShard(key);
     std::shared_lock<std::shared_mutex> read_lock(shard.mutex);
-    const bool exists = KeyExistsInShard(shard, key, tier_id);
+    const bool exists = InnerExist(shard, key, tier_id);
 
     ConditionalExecuteResult<R> result;
     result.key_exists = exists;

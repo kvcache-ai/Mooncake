@@ -63,10 +63,9 @@ class DataManagerTest : public ::testing::Test {
         Json::Value config;
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-        tiered_backend_ = std::make_unique<TieredBackend>();
         const size_t metadata_shard_count =
             GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024);
-        tiered_backend_->SetMetadataShardCount(metadata_shard_count);
+        tiered_backend_ = std::make_unique<TieredBackend>(metadata_shard_count);
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
         auto init_result = InitTieredBackendForTest(*tiered_backend_, config);

@@ -1110,8 +1110,8 @@ PYBIND11_MODULE(store, m) {
                size_t async_sender_thread_count = 0,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
-               uint32_t p2p_key_lease_duration_ms = 2000,
-               uint32_t p2p_key_lease_scan_interval_ms = 500,
+               uint32_t p2p_key_lease_duration_ms = 5000,
+               uint32_t p2p_key_lease_scan_interval_ms = 1000,
                const py::object& engine = py::none()) {
                 auto& resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = false;
@@ -1159,8 +1159,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("async_sender_thread_count") = 0,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
-            py::arg("p2p_key_lease_duration_ms") = 2000,
-            py::arg("p2p_key_lease_scan_interval_ms") = 500,
+            py::arg("p2p_key_lease_duration_ms") = 5000,
+            py::arg("p2p_key_lease_scan_interval_ms") = 1000,
             py::arg("engine") = py::none(),
             "Setup the store in P2P architecture.")
         .def(
