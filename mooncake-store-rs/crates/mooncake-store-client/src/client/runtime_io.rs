@@ -75,19 +75,31 @@ impl StoreClient {
         {
             return Ok(Some(quota));
         }
-        Ok(self.namespace_quota.as_ref().map(|quota| TenantQuotaPolicy {
-            max_bytes: quota.max_bytes,
-            max_objects: quota.max_objects,
-        }))
+        Ok(self
+            .namespace_quota
+            .as_ref()
+            .map(|quota| TenantQuotaPolicy {
+                max_bytes: quota.max_bytes,
+                max_objects: quota.max_objects,
+            }))
     }
 
     fn tenant_quota_scope(&self, object_id: &LogicalObjectId) -> TenantPolicyScope {
-        TenantPolicyScope::new(object_id.scope.tenant.clone(), None::<String>, None::<String>)
+        TenantPolicyScope::new(
+            object_id.scope.tenant.clone(),
+            None::<String>,
+            None::<String>,
+        )
     }
 
     fn route_committed_length(route: Option<&ObjectRoute>) -> u64 {
         route
-            .and_then(|current| current.replicas.iter().min_by_key(|replica| replica.priority))
+            .and_then(|current| {
+                current
+                    .replicas
+                    .iter()
+                    .min_by_key(|replica| replica.priority)
+            })
             .map(|replica| replica.length)
             .unwrap_or(0)
     }
@@ -228,7 +240,11 @@ impl StoreClient {
         };
         while let Some(victim) = candidates.pop_front() {
             if self
-                .remove_in_tenant(victim.scope.tenant.as_str(), victim.logical_key.as_str(), true)
+                .remove_in_tenant(
+                    victim.scope.tenant.as_str(),
+                    victim.logical_key.as_str(),
+                    true,
+                )
                 .is_ok()
             {
                 return Ok(true);
@@ -283,15 +299,17 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        let finalize_result = self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
-            reservation_id: reservation.reservation_id.clone(),
-            expected_object_version: reservation.expected_object_version,
-            committed_length: Some(value_len as u64),
-            route_version: Some(route.version),
-            state: TenantObjectAccountingState::Active,
-            updated_at_ms: now_ms(),
-            updated_by: self.lease.runtime.to_string(),
-        });
+        let finalize_result = self
+            .metadata
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: reservation.reservation_id.clone(),
+                expected_object_version: reservation.expected_object_version,
+                committed_length: Some(value_len as u64),
+                route_version: Some(route.version),
+                state: TenantObjectAccountingState::Active,
+                updated_at_ms: now_ms(),
+                updated_by: self.lease.runtime.to_string(),
+            });
         registry::record_tenant_quota_finalize(match &finalize_result {
             Ok(_) => "ok",
             Err(StoreError::Conflict(_)) => "conflict",
@@ -308,15 +326,17 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        let finalize_result = self.metadata.finalize_tenant_quota(&TenantQuotaFinalizeRequest {
-            reservation_id: reservation.reservation_id.clone(),
-            expected_object_version: reservation.expected_object_version,
-            committed_length: None,
-            route_version: None,
-            state: TenantObjectAccountingState::Deleted,
-            updated_at_ms: now_ms(),
-            updated_by: self.lease.runtime.to_string(),
-        });
+        let finalize_result = self
+            .metadata
+            .finalize_tenant_quota(&TenantQuotaFinalizeRequest {
+                reservation_id: reservation.reservation_id.clone(),
+                expected_object_version: reservation.expected_object_version,
+                committed_length: None,
+                route_version: None,
+                state: TenantObjectAccountingState::Deleted,
+                updated_at_ms: now_ms(),
+                updated_by: self.lease.runtime.to_string(),
+            });
         registry::record_tenant_quota_finalize(match &finalize_result {
             Ok(_) => "ok",
             Err(StoreError::Conflict(_)) => "conflict",
@@ -334,7 +354,9 @@ impl StoreClient {
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        let abort_result = self.metadata.abort_tenant_quota(&reservation.reservation_id);
+        let abort_result = self
+            .metadata
+            .abort_tenant_quota(&reservation.reservation_id);
         registry::record_tenant_quota_abort(match &abort_result {
             Ok(_) => "ok",
             Err(StoreError::Conflict(_)) => "conflict",
@@ -396,12 +418,11 @@ impl StoreClient {
                 current.as_ref(),
                 value.len(),
             )?;
-            let reserve_tracker =
-                OperationTracker::new("put_stage_reserve")
-                    .attribute_str("mooncake.tenant", tenant)
-                    .attribute_u64("mooncake.item_count", 1)
-                    .attribute_u64("mooncake.replica_count", policy.replica_count as u64)
-                    .input_bytes(value.len() as u64);
+            let reserve_tracker = OperationTracker::new("put_stage_reserve")
+                .attribute_str("mooncake.tenant", tenant)
+                .attribute_u64("mooncake.item_count", 1)
+                .attribute_u64("mooncake.replica_count", policy.replica_count as u64)
+                .input_bytes(value.len() as u64);
             let reserve_result = self.reserve_replica_targets(&object_ref, value.len(), &policy);
             reserve_tracker.finish(&reserve_result, 0);
             let (targets, reservations) = match reserve_result {
@@ -419,14 +440,13 @@ impl StoreClient {
                 .filter(|target| target.storage_runtime != self.lease.runtime)
                 .count();
             let local_target_count = targets.len().saturating_sub(remote_target_count);
-            let write_tracker =
-                OperationTracker::new("put_stage_write")
-                    .attribute_str("mooncake.tenant", tenant)
-                    .attribute_u64("mooncake.item_count", 1)
-                    .attribute_u64("mooncake.replica_count", targets.len() as u64)
-                    .attribute_u64("mooncake.local_target_count", local_target_count as u64)
-                    .attribute_u64("mooncake.remote_target_count", remote_target_count as u64)
-                    .input_bytes(value.len() as u64);
+            let write_tracker = OperationTracker::new("put_stage_write")
+                .attribute_str("mooncake.tenant", tenant)
+                .attribute_u64("mooncake.item_count", 1)
+                .attribute_u64("mooncake.replica_count", targets.len() as u64)
+                .attribute_u64("mooncake.local_target_count", local_target_count as u64)
+                .attribute_u64("mooncake.remote_target_count", remote_target_count as u64)
+                .input_bytes(value.len() as u64);
             let write_result =
                 self.write_reserved_replicas(&targets, &reservations, value, registered_source);
             write_tracker.finish(&write_result, value.len() as u64);
@@ -461,15 +481,15 @@ impl StoreClient {
                 }
             };
             let expected_version = current.as_ref().map(|route| route.version);
-            let next_version = next_route_version(
-                current.as_ref(),
-                &self.route_ops(),
-                &scoped_key,
-            );
+            let next_version = next_route_version(current.as_ref(), &self.route_ops(), &scoped_key);
             let checksum = payload_checksum(value);
             let mut route = ObjectRoute {
                 key: scoped_key.clone(),
-                namespace: Some(mooncake_store_core::NamespaceScope::with_defaults(Some(tenant), None, None)),
+                namespace: Some(mooncake_store_core::NamespaceScope::with_defaults(
+                    Some(tenant),
+                    None,
+                    None,
+                )),
                 logical_key: Some(key.to_string()),
                 canonical_key: None,
                 sharing_scope: Some(tenant.to_string()),
@@ -871,16 +891,16 @@ impl StoreClient {
         object_id: &'a LogicalObjectId,
         qos_tier: Option<&'a str>,
     ) -> ObjectRef<'a> {
-        let mut object_ref = ObjectRef::new(object_id.logical_key.as_str())
-            .tenant(object_id.scope.tenant.as_str());
+        let mut object_ref =
+            ObjectRef::new(object_id.logical_key.as_str()).tenant(object_id.scope.tenant.as_str());
         if object_id.scope.domain != mooncake_store_core::DEFAULT_DOMAIN {
             object_ref = object_ref.domain(object_id.scope.domain.as_str());
         }
         if object_id.scope.object_set != mooncake_store_core::DEFAULT_OBJECT_SET {
             object_ref = object_ref.object_set(object_id.scope.object_set.as_str());
         }
-        if let Some(qos_tier) = qos_tier
-            .filter(|tier| *tier != mooncake_store_core::DEFAULT_QOS_TIER)
+        if let Some(qos_tier) =
+            qos_tier.filter(|tier| *tier != mooncake_store_core::DEFAULT_QOS_TIER)
         {
             object_ref = object_ref.qos_tier(qos_tier);
         }
@@ -917,9 +937,8 @@ impl StoreClient {
             Self::explicit_migration_object_ref(object_id, current.qos_tier.as_deref());
         let (targets, reservations) =
             self.reserve_explicit_migration_targets(&object_ref, payload.len(), plan)?;
-        let offsets =
-            match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
-                Ok(offsets) => offsets,
+        let offsets = match self.write_reserved_replicas(&targets, &reservations, &payload, None) {
+            Ok(offsets) => offsets,
             Err(error) => {
                 self.best_effort_release_reserved_allocations(
                     &targets,
@@ -949,36 +968,36 @@ impl StoreClient {
             .collect::<Vec<_>>();
 
         let next_route = match plan.mode {
-            ExplicitMigrationMode::Copy => {
-                Self::build_explicit_copy_route_delta(&current, &source.segment_name, explicit_targets)?
-            }
+            ExplicitMigrationMode::Copy => Self::build_explicit_copy_route_delta(
+                &current,
+                &source.segment_name,
+                explicit_targets,
+            )?,
             ExplicitMigrationMode::Move => {
-                let target = explicit_targets
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        StoreError::InvalidState(
-                            "explicit move requires exactly one written target".to_string(),
-                        )
-                    })?;
+                let target = explicit_targets.into_iter().next().ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "explicit move requires exactly one written target".to_string(),
+                    )
+                })?;
                 Self::build_explicit_move_route_delta(&current, &source.segment_name, target)?
             }
         };
 
-        let cas = match self
-            .route_ops()
-            .repair_route(&current.key, Some(current.version), &next_route)
-        {
-            Ok(cas) => cas,
-            Err(error) => {
-                self.best_effort_release_reserved_allocations(
-                    &targets,
-                    &reservations,
-                    "explicit_migration_route_cas_error",
-                );
-                return Err(error);
-            }
-        };
+        let cas =
+            match self
+                .route_ops()
+                .repair_route(&current.key, Some(current.version), &next_route)
+            {
+                Ok(cas) => cas,
+                Err(error) => {
+                    self.best_effort_release_reserved_allocations(
+                        &targets,
+                        &reservations,
+                        "explicit_migration_route_cas_error",
+                    );
+                    return Err(error);
+                }
+            };
         if !cas.applied {
             self.best_effort_release_reserved_allocations(
                 &targets,
@@ -1026,12 +1045,14 @@ impl StoreClient {
         let mut reservations = Vec::with_capacity(plan.target_segments.len());
 
         for requested_segment in &plan.target_segments {
-            let preferred = self.lookup_preferred_segment(requested_segment).map_err(|error| {
-                StoreError::NotFound(format!(
-                    "explicit migration target segment {} is unavailable: {error}",
-                    requested_segment.0
-                ))
-            })?;
+            let preferred = self
+                .lookup_preferred_segment(requested_segment)
+                .map_err(|error| {
+                    StoreError::NotFound(format!(
+                        "explicit migration target segment {} is unavailable: {error}",
+                        requested_segment.0
+                    ))
+                })?;
             if self.runtime_is_suspect(&preferred.owner) {
                 self.best_effort_release_reserved_allocations(
                     &targets,
@@ -1060,7 +1081,8 @@ impl StoreClient {
                     return Err(error);
                 }
             };
-            if target.storage_runtime != preferred.owner || target.segment_name != preferred.segment_name
+            if target.storage_runtime != preferred.owner
+                || target.segment_name != preferred.segment_name
             {
                 self.best_effort_release_reserved_allocations(
                     &targets,
@@ -1133,7 +1155,12 @@ impl StoreClient {
                     source_segment.0, current.key.0
                 ))
             })?;
-        Self::validate_explicit_route_targets(current, source_segment, std::slice::from_ref(&target), true)?;
+        Self::validate_explicit_route_targets(
+            current,
+            source_segment,
+            std::slice::from_ref(&target),
+            true,
+        )?;
         let mut next = current.clone();
         next.version = current.version.next();
         next.replicas.remove(source_index);
@@ -1227,7 +1254,8 @@ impl StoreClient {
             else {
                 continue;
             };
-            let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
+            let payload =
+                writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
             let policy = writer.migration_policy_for_route(&confirmed, &self.lease.runtime)?;
             match writer.put_object_with_policy_current(
                 &object_id,
@@ -1324,7 +1352,8 @@ impl StoreClient {
             else {
                 continue;
             };
-            let payload = writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
+            let payload =
+                writer.read_payload_from_explicit_source(&object_id, &confirmed, &source)?;
             let policy = writer.migration_policy_for_successor_route(
                 &confirmed,
                 &self.lease.runtime,
@@ -1621,18 +1650,15 @@ impl StoreClient {
         let local_segments = self.local_storage_segments();
         let readable_runtimes = self.readable_runtime_set(false)?;
 
-        let needs_refresh = routes
-            .iter()
-            .filter_map(Option::as_ref)
-            .any(|route| {
-                Self::select_readable_replica(
-                    route,
-                    &self.lease.runtime,
-                    &local_segments,
-                    &readable_runtimes,
-                )
-                .is_none()
-            });
+        let needs_refresh = routes.iter().filter_map(Option::as_ref).any(|route| {
+            Self::select_readable_replica(
+                route,
+                &self.lease.runtime,
+                &local_segments,
+                &readable_runtimes,
+            )
+            .is_none()
+        });
         let readable_runtimes = if needs_refresh {
             self.readable_runtime_set(true)?
         } else {
@@ -1682,9 +1708,12 @@ impl StoreClient {
             }
             let local_segments = self.local_storage_segments();
             let readable_runtimes = self.readable_runtime_set(false)?;
-            if let Some(replica) =
-                Self::select_readable_replica(route, &self.lease.runtime, &local_segments, &readable_runtimes)
-            {
+            if let Some(replica) = Self::select_readable_replica(
+                route,
+                &self.lease.runtime,
+                &local_segments,
+                &readable_runtimes,
+            ) {
                 return Ok(Some(replica));
             }
             let refreshed_readable = self.readable_runtime_set(true)?;
@@ -1928,8 +1957,7 @@ impl StoreClient {
         ) else {
             return Ok(false);
         };
-        let changed =
-            route != entry.route || !Self::has_same_replica(&replica, &entry.replica);
+        let changed = route != entry.route || !Self::has_same_replica(&replica, &entry.replica);
         if !changed {
             return Ok(false);
         }
@@ -1970,10 +1998,17 @@ impl StoreClient {
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
                     let object_id = LogicalObjectId::new(
-                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                        NamespaceScope::with_defaults(
+                            Some(tenant),
+                            object.domain,
+                            object.object_set,
+                        ),
                         object.key,
                     );
-                    (tenant.to_string(), mooncake_store_core::ObjectKey::from_logical_id(&object_id))
+                    (
+                        tenant.to_string(),
+                        mooncake_store_core::ObjectKey::from_logical_id(&object_id),
+                    )
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_ops().load_routes(
@@ -1985,10 +2020,8 @@ impl StoreClient {
             let local_segments = self.local_storage_segments();
             let readable_runtimes = self.readable_runtime_set(false)?;
             let mut resolved = Vec::with_capacity(objects.len());
-            for (((tenant, _scoped), object), route) in scoped
-                .into_iter()
-                .zip(objects.iter())
-                .zip(routes)
+            for (((tenant, _scoped), object), route) in
+                scoped.into_iter().zip(objects.iter()).zip(routes)
             {
                 let route = route.ok_or_else(|| {
                     StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
@@ -2252,8 +2285,7 @@ impl StoreClient {
                 );
                 match (info, chunks) {
                     (Some(info), Some(chunks)) => {
-                        segment_metadata
-                            .insert(entry.replica.segment_name.clone(), (info, chunks));
+                        segment_metadata.insert(entry.replica.segment_name.clone(), (info, chunks));
                     }
                     _ => {
                         cache_miss_segments.push(entry.replica.segment_name.clone());
@@ -2334,14 +2366,17 @@ impl StoreClient {
                 if !*local || !cache_miss_segments.contains(&entry.replica.segment_name) {
                     continue;
                 }
-                let info = miss_segment_infos.get(&entry.replica.segment_name).ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "local segment info for {} is missing",
-                        entry.replica.segment_name.0
-                    ))
-                })?;
-                let chunks =
-                    miss_target_chunks.get(&entry.replica.segment_name).ok_or_else(|| {
+                let info = miss_segment_infos
+                    .get(&entry.replica.segment_name)
+                    .ok_or_else(|| {
+                        StoreError::InvalidState(format!(
+                            "local segment info for {} is missing",
+                            entry.replica.segment_name.0
+                        ))
+                    })?;
+                let chunks = miss_target_chunks
+                    .get(&entry.replica.segment_name)
+                    .ok_or_else(|| {
                         StoreError::InvalidState(format!(
                             "local segment target chunks for {} are missing",
                             entry.replica.segment_name.0
@@ -2569,9 +2604,7 @@ impl StoreClient {
         let chunk_size = resolved.len().div_ceil(workers);
         let error = std::sync::Mutex::new(None);
         std::thread::scope(|scope| {
-            for (entries, payloads) in resolved
-                .chunks(chunk_size)
-                .zip(payloads.chunks(chunk_size))
+            for (entries, payloads) in resolved.chunks(chunk_size).zip(payloads.chunks(chunk_size))
             {
                 let error = &error;
                 scope.spawn(move || {
@@ -2620,10 +2653,7 @@ impl StoreClient {
         self.report_grouped_route_hits_best_effort(local_hits, remote_hits, true);
     }
 
-    fn report_route_hits_best_effort<'a>(
-        &self,
-        routes: impl IntoIterator<Item = &'a ObjectRoute>,
-    ) {
+    fn report_route_hits_best_effort<'a>(&self, routes: impl IntoIterator<Item = &'a ObjectRoute>) {
         let Ok(readable_runtimes) = self.readable_runtime_set(false) else {
             return;
         };
@@ -2944,7 +2974,11 @@ impl StoreClient {
         Err(StoreError::Transport(format!(
             "segment offset {} length {} is outside segment {} \
              (total_capacity={}, num_buffers={})",
-            segment_offset, length, segment_name.0, total_capacity, buffers.len()
+            segment_offset,
+            length,
+            segment_name.0,
+            total_capacity,
+            buffers.len()
         )))
     }
 
@@ -2981,9 +3015,10 @@ impl StoreClient {
         let first_delta = segment_offset
             .checked_sub(first.logical_offset)
             .ok_or_else(|| StoreError::Transport("storage target chunk underflow".to_string()))?;
-        let target_offset = first.target_offset.checked_add(first_delta).ok_or_else(|| {
-            StoreError::Transport("storage target offset overflow".to_string())
-        })?;
+        let target_offset = first
+            .target_offset
+            .checked_add(first_delta)
+            .ok_or_else(|| StoreError::Transport("storage target offset overflow".to_string()))?;
         let mut cursor = segment_offset;
         while cursor < end {
             let chunk = chunks
@@ -3005,10 +3040,15 @@ impl StoreClient {
                 .checked_add(cursor.checked_sub(segment_offset).ok_or_else(|| {
                     StoreError::Transport("storage offset cursor underflow".to_string())
                 })?)
-                .ok_or_else(|| StoreError::Transport("storage target offset overflow".to_string()))?;
-            let actual = chunk.target_offset.checked_add(chunk_delta).ok_or_else(|| {
-                StoreError::Transport("storage target chunk offset overflow".to_string())
-            })?;
+                .ok_or_else(|| {
+                    StoreError::Transport("storage target offset overflow".to_string())
+                })?;
+            let actual = chunk
+                .target_offset
+                .checked_add(chunk_delta)
+                .ok_or_else(|| {
+                    StoreError::Transport("storage target chunk offset overflow".to_string())
+                })?;
             if actual != expected {
                 return Err(StoreError::Transport(format!(
                     "segment {} target chunks are not contiguous at logical offset {}",
@@ -3018,7 +3058,9 @@ impl StoreClient {
             let chunk_end = chunk
                 .logical_offset
                 .checked_add(chunk.length_bytes)
-                .ok_or_else(|| StoreError::Transport("storage target chunk overflow".to_string()))?;
+                .ok_or_else(|| {
+                    StoreError::Transport("storage target chunk overflow".to_string())
+                })?;
             cursor = chunk_end.min(end);
             if chunk.length_bytes == 0 {
                 return Err(StoreError::Transport(format!(
@@ -3165,11 +3207,16 @@ impl StoreClient {
                     current_target
                 )));
             };
-            let buffer_end = target_buffer.base.checked_add(target_buffer.length).ok_or_else(|| {
-                StoreError::Transport("target segment buffer end overflow".to_string())
-            })?;
+            let buffer_end = target_buffer
+                .base
+                .checked_add(target_buffer.length)
+                .ok_or_else(|| {
+                    StoreError::Transport("target segment buffer end overflow".to_string())
+                })?;
             let available = usize::try_from(buffer_end - current_target).map_err(|_| {
-                StoreError::Transport("target segment buffer span does not fit in usize".to_string())
+                StoreError::Transport(
+                    "target segment buffer span does not fit in usize".to_string(),
+                )
             })?;
             let target_chunk_len = available.min(total_len - transferred);
             let chunk_base = local_base.checked_add(transferred).ok_or_else(|| {
@@ -3183,8 +3230,9 @@ impl StoreClient {
                 let chunk_len = u64::try_from(chunk_len).map_err(|_| {
                     StoreError::Transport("transfer chunk length does not fit in u64".to_string())
                 })?;
-                let chunk_target_offset =
-                    current_target.checked_add(chunk_transferred).ok_or_else(|| {
+                let chunk_target_offset = current_target
+                    .checked_add(chunk_transferred)
+                    .ok_or_else(|| {
                         StoreError::Transport("target transfer offset overflow".to_string())
                     })?;
                 requests.push(TransferRequest {
@@ -3199,9 +3247,9 @@ impl StoreClient {
                 })?;
             }
 
-            transferred = transferred.checked_add(target_chunk_len).ok_or_else(|| {
-                StoreError::Transport("transfer accounting overflow".to_string())
-            })?;
+            transferred = transferred
+                .checked_add(target_chunk_len)
+                .ok_or_else(|| StoreError::Transport("transfer accounting overflow".to_string()))?;
             current_target = current_target
                 .checked_add(u64::try_from(target_chunk_len).map_err(|_| {
                     StoreError::Transport("target chunk length does not fit in u64".to_string())
@@ -3301,8 +3349,8 @@ impl StoreClient {
                                 (
                                     error.clone(),
                                     Self::remote_read_failure_marks_runtime_suspect(&error),
-                            )
-                        })?
+                                )
+                            })?
                     };
                     let target_offset = Self::replica_storage_target_offset(
                         &info,
@@ -3310,26 +3358,28 @@ impl StoreClient {
                         &entry.replica,
                     )
                     .map_err(|error| {
-                            (
-                                error.clone(),
-                                Self::remote_read_failure_marks_runtime_suspect(&error),
-                            )
-                        })?;
-                    batch.extend(Self::target_buffer_transfer_requests(
-                        Opcode::Read,
-                        segment,
-                        target_offset,
-                        scratch[position].addr,
-                        entry.replica.length,
-                        &info,
-                        transport.max_registration_bytes(),
-                    )
-                    .map_err(|error| {
                         (
                             error.clone(),
                             Self::remote_read_failure_marks_runtime_suspect(&error),
                         )
-                    })?);
+                    })?;
+                    batch.extend(
+                        Self::target_buffer_transfer_requests(
+                            Opcode::Read,
+                            segment,
+                            target_offset,
+                            scratch[position].addr,
+                            entry.replica.length,
+                            &info,
+                            transport.max_registration_bytes(),
+                        )
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?,
+                    );
                 }
                 batch
             };
@@ -3344,7 +3394,8 @@ impl StoreClient {
             } else {
                 TransferPacingMode::ThroughputOptimized
             };
-            let hints = self.remote_batch_hints(&resolved[remote_indices[0]].tenant, bytes_out, mode);
+            let hints =
+                self.remote_batch_hints(&resolved[remote_indices[0]].tenant, bytes_out, mode);
             let submit_result = transport.submit_with_hints(batch_id, &requests, &hints);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
@@ -3359,7 +3410,12 @@ impl StoreClient {
                 self.transfer_stall_timeout,
                 request_deadline.instant(),
             )
-            .map_err(|error| (StoreError::from(error.clone()), error.marks_runtime_suspect()));
+            .map_err(|error| {
+                (
+                    StoreError::from(error.clone()),
+                    error.marks_runtime_suspect(),
+                )
+            });
             let free_result = transport.free_batch(batch_id);
             wait_result?;
             free_result.map_err(|error| {
@@ -3462,8 +3518,8 @@ impl StoreClient {
                                 (
                                     error.clone(),
                                     Self::remote_read_failure_marks_runtime_suspect(&error),
-                            )
-                        })?
+                                )
+                            })?
                     };
                     let target_offset = Self::replica_storage_target_offset(
                         &info,
@@ -3471,26 +3527,28 @@ impl StoreClient {
                         &entry.replica,
                     )
                     .map_err(|error| {
-                            (
-                                error.clone(),
-                                Self::remote_read_failure_marks_runtime_suspect(&error),
-                            )
-                        })?;
-                    batch.extend(Self::target_buffer_transfer_requests(
-                        Opcode::Read,
-                        segment,
-                        target_offset,
-                        buffer_ptrs[*index],
-                        entry.replica.length,
-                        &info,
-                        transport.max_registration_bytes(),
-                    )
-                    .map_err(|error| {
                         (
                             error.clone(),
                             Self::remote_read_failure_marks_runtime_suspect(&error),
                         )
-                    })?);
+                    })?;
+                    batch.extend(
+                        Self::target_buffer_transfer_requests(
+                            Opcode::Read,
+                            segment,
+                            target_offset,
+                            buffer_ptrs[*index],
+                            entry.replica.length,
+                            &info,
+                            transport.max_registration_bytes(),
+                        )
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?,
+                    );
                 }
                 batch
             };
@@ -3505,7 +3563,8 @@ impl StoreClient {
             } else {
                 TransferPacingMode::ThroughputOptimized
             };
-            let hints = self.remote_batch_hints(&resolved[remote_indices[0]].tenant, bytes_out, mode);
+            let hints =
+                self.remote_batch_hints(&resolved[remote_indices[0]].tenant, bytes_out, mode);
             let submit_result = transport.submit_with_hints(batch_id, &requests, &hints);
             if let Err(error) = submit_result {
                 let _ = transport.free_batch(batch_id);
@@ -3520,7 +3579,12 @@ impl StoreClient {
                 self.transfer_stall_timeout,
                 request_deadline.instant(),
             )
-            .map_err(|error| (StoreError::from(error.clone()), error.marks_runtime_suspect()));
+            .map_err(|error| {
+                (
+                    StoreError::from(error.clone()),
+                    error.marks_runtime_suspect(),
+                )
+            });
             let free_result = transport.free_batch(batch_id);
             wait_result?;
             free_result.map_err(|error| {
@@ -3596,12 +3660,13 @@ impl StoreClient {
             }
             let requests = {
                 let target_chunks =
-                    self.replica_target_chunks(&resolved.replica).map_err(|error| {
-                        (
-                            error.clone(),
-                            Self::remote_read_failure_marks_runtime_suspect(&error),
-                        )
-                    })?;
+                    self.replica_target_chunks(&resolved.replica)
+                        .map_err(|error| {
+                            (
+                                error.clone(),
+                                Self::remote_read_failure_marks_runtime_suspect(&error),
+                            )
+                        })?;
                 let open_segment_name = self
                     .replica_transport_open_segment_name(&resolved.replica)
                     .map_err(|error| {
@@ -3621,14 +3686,12 @@ impl StoreClient {
                     })?;
                 let target_offset =
                     Self::replica_storage_target_offset(&info, &target_chunks, &resolved.replica)
-                        .map_err(
-                        |error| {
-                            (
-                                error.clone(),
-                                Self::remote_read_failure_marks_runtime_suspect(&error),
-                            )
-                        },
-                    )?;
+                        .map_err(|error| {
+                        (
+                            error.clone(),
+                            Self::remote_read_failure_marks_runtime_suspect(&error),
+                        )
+                    })?;
                 Self::target_buffer_transfer_requests(
                     Opcode::Read,
                     segment,
@@ -3676,7 +3739,12 @@ impl StoreClient {
                 self.transfer_stall_timeout,
                 request_deadline.instant(),
             )
-            .map_err(|error| (StoreError::from(error.clone()), error.marks_runtime_suspect()));
+            .map_err(|error| {
+                (
+                    StoreError::from(error.clone()),
+                    error.marks_runtime_suspect(),
+                )
+            });
             let free_result = transport.free_batch(batch_id);
             if registered_here {
                 let _ = self
@@ -3865,16 +3933,16 @@ impl StoreClient {
         }
         let result = (|| -> Result<()> {
             let target_chunks = self.replica_target_chunks(&resolved.replica)?;
-            let open_segment_name =
-                self.replica_transport_open_segment_name(&resolved.replica)?;
+            let open_segment_name = self.replica_transport_open_segment_name(&resolved.replica)?;
             let (segment, info) = {
                 let mut state = self.state.lock();
                 state.open_segment_with_info(transport, &open_segment_name)?
             };
             let base_target_offset =
                 Self::replica_storage_target_offset(&info, &target_chunks, &resolved.replica)?;
-            let range_target_offset =
-                base_target_offset.checked_add(src_offset as u64).ok_or_else(|| {
+            let range_target_offset = base_target_offset
+                .checked_add(src_offset as u64)
+                .ok_or_else(|| {
                     StoreError::Transport("range read remote target offset overflow".to_string())
                 })?;
             let requests = Self::target_buffer_transfer_requests(
@@ -4244,12 +4312,8 @@ mod runtime_io_tests {
         let info = memory_segment(&[(base, buffer_size)]);
         let segment = SegmentName::new("seg-tail-overflow");
 
-        let result = StoreClient::segment_relative_target_offset(
-            &info,
-            &segment,
-            buffer_size - 1,
-            2,
-        );
+        let result =
+            StoreClient::segment_relative_target_offset(&info, &segment, buffer_size - 1, 2);
         assert!(
             result.is_err(),
             "transfer crossing buffer tail must be rejected"
@@ -4288,8 +4352,7 @@ mod runtime_io_tests {
         let offset: u64 = 53_686_206_464;
         let length: u64 = 1_540_096;
 
-        let result =
-            StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
+        let result = StoreClient::segment_relative_target_offset(&info, &segment, offset, length);
         assert!(
             result.is_ok(),
             "50 GB offset into 64 GB (2x32 GB) should succeed, got: {:?}",
@@ -4320,12 +4383,8 @@ mod runtime_io_tests {
         let info = memory_segment(&[(0x1000, buffer_size)]);
         let segment = SegmentName::new("seg-diag");
 
-        let result = StoreClient::segment_relative_target_offset(
-            &info,
-            &segment,
-            buffer_size + 100,
-            64,
-        );
+        let result =
+            StoreClient::segment_relative_target_offset(&info, &segment, buffer_size + 100, 64);
         assert!(result.is_err());
         let error_message = format!("{}", result.unwrap_err());
         assert!(

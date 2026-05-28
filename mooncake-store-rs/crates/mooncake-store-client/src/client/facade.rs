@@ -30,7 +30,10 @@ pub trait MooncakeCompatibilityFacade {
     ) -> Result<Option<ObjectRoute>>;
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>>;
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>>;
-    fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>>;
+    fn list_reuse_candidates(
+        &self,
+        reuse: &mooncake_store_core::ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>>;
     fn cas_route(
         &self,
         key: &str,
@@ -140,7 +143,9 @@ fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
 impl StoreClient {
     fn expect_exactly_one<T>(mut items: Vec<T>, operation: &str) -> Result<T> {
         match items.len() {
-            1 => Ok(items.pop().expect("single-item vector should contain one element")),
+            1 => Ok(items
+                .pop()
+                .expect("single-item vector should contain one element")),
             0 => Err(StoreError::InvalidState(format!(
                 "expected exactly one {operation} result, got 0"
             ))),
@@ -159,7 +164,10 @@ impl StoreClient {
             .attribute_u64("mooncake.item_count", keys.len() as u64);
         let result: Result<Vec<Option<ObjectRoute>>> =
             self.route_ops().load_active_routes_bounded(keys);
-        tracker.finish(&result, result.as_ref().map(|routes| routes.len()).unwrap_or(0) as u64);
+        tracker.finish(
+            &result,
+            result.as_ref().map(|routes| routes.len()).unwrap_or(0) as u64,
+        );
         result
     }
 
@@ -325,8 +333,11 @@ impl StoreClient {
                 .iter()
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    let scope =
-                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                    let scope = NamespaceScope::with_defaults(
+                        Some(tenant),
+                        object.domain,
+                        object.object_set,
+                    );
                     ObjectKey::from_scope(&scope, object.key)
                 })
                 .collect::<Vec<_>>();
@@ -337,7 +348,10 @@ impl StoreClient {
                 .collect();
             Ok(result)
         })();
-        tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
+        tracker.finish(
+            &result,
+            result.as_ref().map(|items| items.len()).unwrap_or(0) as u64,
+        );
         result
     }
 
@@ -402,7 +416,9 @@ impl StoreClient {
                 index,
                 key: request.key,
                 tenant: request.tenant.unwrap_or(self.default_tenant()),
-                domain: request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
+                domain: request
+                    .domain
+                    .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
                 object_set: request
                     .object_set
                     .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET),
@@ -448,7 +464,9 @@ impl StoreClient {
                     index,
                     key: request.key,
                     tenant: request.tenant.unwrap_or(self.default_tenant()),
-                    domain: request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
+                    domain: request
+                        .domain
+                        .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN),
                     object_set: request
                         .object_set
                         .unwrap_or(mooncake_store_core::DEFAULT_OBJECT_SET),
@@ -470,17 +488,20 @@ impl StoreClient {
         });
     }
 
-    fn put_from_batch_namespace(&self, requests: &[PutFromRequest<'_>]) -> (String, String, String) {
+    fn put_from_batch_namespace(
+        &self,
+        requests: &[PutFromRequest<'_>],
+    ) -> (String, String, String) {
         let tenant = common_value(
             requests
                 .iter()
                 .map(|request| request.tenant.unwrap_or(self.default_tenant())),
         );
-        let domain = common_value(
-            requests
-                .iter()
-                .map(|request| request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)),
-        );
+        let domain = common_value(requests.iter().map(|request| {
+            request
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+        }));
         let object_set = common_value(requests.iter().map(|request| {
             request
                 .object_set
@@ -495,11 +516,11 @@ impl StoreClient {
                 .iter()
                 .map(|request| request.tenant.unwrap_or(self.default_tenant())),
         );
-        let domain = common_value(
-            requests
-                .iter()
-                .map(|request| request.domain.unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)),
-        );
+        let domain = common_value(requests.iter().map(|request| {
+            request
+                .domain
+                .unwrap_or(mooncake_store_core::DEFAULT_DOMAIN)
+        }));
         let object_set = common_value(requests.iter().map(|request| {
             request
                 .object_set
@@ -621,42 +642,41 @@ impl StoreClient {
         }
 
         if !routed_requests.is_empty() {
-            let routed_statuses =
-                if let Some(shared_policy) =
-                    Self::shared_batch_put_from_replication_policy(&routed_originals)
-                {
-                    self.batch_put_scoped_routed_accept_existing_statuses(
-                        &routed_requests,
-                        &routed_sources,
-                        shared_policy.as_ref(),
-                    )
-                } else {
-                    routed_requests
-                        .iter()
-                        .zip(routed_sources.iter())
-                        .map(|(request, source)| {
-                            let mut object = ObjectRef::new(request.key);
-                            if let Some(tenant) = request.tenant {
-                                object = object.tenant(tenant);
-                            }
-                            if let Some(domain) = request.domain {
-                                object = object.domain(domain);
-                            }
-                            if let Some(object_set) = request.object_set {
-                                object = object.object_set(object_set);
-                            }
-                            if let Some(qos_tier) = request.qos_tier {
-                                object = object.qos_tier(qos_tier);
-                            }
-                            self.put_object_from_registered(
-                                &object,
-                                *source,
-                                request.value.len(),
-                                request.policy.as_ref(),
-                            )
-                        })
-                        .collect()
-                };
+            let routed_statuses = if let Some(shared_policy) =
+                Self::shared_batch_put_from_replication_policy(&routed_originals)
+            {
+                self.batch_put_scoped_routed_accept_existing_statuses(
+                    &routed_requests,
+                    &routed_sources,
+                    shared_policy.as_ref(),
+                )
+            } else {
+                routed_requests
+                    .iter()
+                    .zip(routed_sources.iter())
+                    .map(|(request, source)| {
+                        let mut object = ObjectRef::new(request.key);
+                        if let Some(tenant) = request.tenant {
+                            object = object.tenant(tenant);
+                        }
+                        if let Some(domain) = request.domain {
+                            object = object.domain(domain);
+                        }
+                        if let Some(object_set) = request.object_set {
+                            object = object.object_set(object_set);
+                        }
+                        if let Some(qos_tier) = request.qos_tier {
+                            object = object.qos_tier(qos_tier);
+                        }
+                        self.put_object_from_registered(
+                            &object,
+                            *source,
+                            request.value.len(),
+                            request.policy.as_ref(),
+                        )
+                    })
+                    .collect()
+            };
 
             for (index, status) in routed_indices.into_iter().zip(routed_statuses) {
                 statuses[index] = Some(status);
@@ -681,8 +701,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let result = self.prepare_heartbeat(expires_at_ms).publish();
         match result {
             Ok(()) => {
-                let previous_failures =
-                    self.heartbeat_repair_pending.swap(0, Ordering::SeqCst);
+                let previous_failures = self.heartbeat_repair_pending.swap(0, Ordering::SeqCst);
                 if previous_failures == 0 {
                     return Ok(());
                 }
@@ -998,7 +1017,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn query_route_in_tenant(&self, tenant: &str, key: &str) -> Result<Option<ObjectRoute>> {
-        self.query_route_in_scope(&NamespaceScope::with_defaults(Some(tenant), None, None), key)
+        self.query_route_in_scope(
+            &NamespaceScope::with_defaults(Some(tenant), None, None),
+            key,
+        )
     }
 
     fn query_route_in_scope(
@@ -1012,7 +1034,13 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>> {
         let tracker = OperationTracker::new("query_route");
         let result = self.query_route_by_object_id_inner(object_id);
-        tracker.finish(&result, result.as_ref().map(|route| route.is_some() as u64).unwrap_or(0));
+        tracker.finish(
+            &result,
+            result
+                .as_ref()
+                .map(|route| route.is_some() as u64)
+                .unwrap_or(0),
+        );
         result
     }
 
@@ -1020,7 +1048,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         self.route_ops().list_routes_in_scope(scope)
     }
 
-    fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>> {
+    fn list_reuse_candidates(
+        &self,
+        reuse: &mooncake_store_core::ReuseIdentity,
+    ) -> Result<Vec<ObjectRoute>> {
         self.route_ops().list_reuse_candidates(reuse)
     }
 
@@ -1135,19 +1166,22 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 .iter()
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    let scope =
-                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                    let scope = NamespaceScope::with_defaults(
+                        Some(tenant),
+                        object.domain,
+                        object.object_set,
+                    );
                     ObjectKey::from_scope(&scope, object.key)
                 })
                 .collect::<Vec<_>>();
             let routes = self.query_routes_by_object_keys_bounded(&keys)?;
             self.route_ops().report_route_hits(&routes, self);
-            Ok(routes
-                .into_iter()
-                .map(|route| route.is_some())
-                .collect())
+            Ok(routes.into_iter().map(|route| route.is_some()).collect())
         })();
-        tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
+        tracker.finish(
+            &result,
+            result.as_ref().map(|items| items.len()).unwrap_or(0) as u64,
+        );
         result
     }
 
@@ -1492,7 +1526,8 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_u64("mooncake.item_count", 1)
             .attribute_u64("mooncake.buffer_capacity", buffer.len() as u64);
         let mut requests = [GetRequest::new(key, buffer).tenant(tenant)];
-        let result = Self::expect_exactly_one(self.batch_get_into(&mut requests)?, "batch_get_into");
+        let result =
+            Self::expect_exactly_one(self.batch_get_into(&mut requests)?, "batch_get_into");
         let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
         tracker.finish(&result, bytes_out);
         result
@@ -1652,7 +1687,28 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .attribute_str("mooncake.tenant", tenant)
             .attribute_u64("mooncake.src_offset", src_offset as u64)
             .attribute_u64("mooncake.size", size as u64);
-        if dst_offset.checked_add(size).is_none_or(|end| end > buffer_size) {
+        if buffer.is_null() {
+            let result: Result<usize> = Err(StoreError::InvalidState(
+                "buffer pointer is null".to_string(),
+            ));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        if size == 0 {
+            tracker.finish(&Ok(0), 0);
+            return Ok(0);
+        }
+        if buffer_size > isize::MAX as usize {
+            let result: Result<usize> = Err(StoreError::InvalidState(format!(
+                "buffer_size={buffer_size} exceeds isize::MAX"
+            )));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        if dst_offset
+            .checked_add(size)
+            .is_none_or(|end| end > buffer_size)
+        {
             let result: Result<usize> = Err(StoreError::InvalidState(format!(
                 "destination overflow: dst_offset={dst_offset} + size={size} > buffer_size={buffer_size}"
             )));
@@ -1663,7 +1719,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let mut resolved = self.resolve_objects(std::slice::from_ref(&object))?;
         let entry = &resolved[0];
         let object_length = entry.replica.length as usize;
-        if src_offset.checked_add(size).is_none_or(|end| end > object_length) {
+        if src_offset
+            .checked_add(size)
+            .is_none_or(|end| end > object_length)
+        {
             let result: Result<usize> = Err(StoreError::InvalidState(format!(
                 "source overflow: src_offset={src_offset} + size={size} > object_length={object_length}"
             )));
@@ -1673,7 +1732,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let dst_ptr = buffer.add(dst_offset);
         let target_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
         let result = self.execute_range_read(&mut resolved[0], target_slice, src_offset);
-        let bytes_out = result.as_ref().copied().unwrap_or(0) as u64;
+        let bytes_out = result.as_ref().map_or(0u64, |&n| n as u64);
         tracker.finish(&result, bytes_out);
         result
     }
