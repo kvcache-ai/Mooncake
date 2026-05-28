@@ -679,20 +679,16 @@ impl PyMooncakeDistributedStore {
             })
             .map_err(store_error_to_py),
             StoreBackend::Real(dispatcher) => {
-                // 验证所有缓冲区指针并转换为借用引用
-                let buffer_refs: Vec<(usize, usize)> = buffer_ptrs.iter()
+                let validated: Vec<(usize, usize)> = buffer_ptrs
+                    .iter()
                     .zip(resolved_buffer_sizes.iter())
                     .map(|(&ptr, &size)| {
                         pointer_from_usize(ptr)?;
-                        // 这里可以添加额外的验证逻辑，比如检查指针是否已注册
                         Ok((ptr, size))
                     })
                     .collect::<PyResult<Vec<_>>>()?;
-                
-                // 在验证后立即使用，避免TOCTOU窗口
-                let ptrs = buffer_refs.iter().map(|(p, _)| *p).collect();
-                let sizes = buffer_refs.iter().map(|(_, s)| *s).collect();
-                
+                let ptrs = validated.iter().map(|(p, _)| *p).collect();
+                let sizes = validated.iter().map(|(_, s)| *s).collect();
                 run_without_gil(move || {
                     dispatcher.get_into_ranges(
                         ptrs,
@@ -6277,6 +6273,20 @@ mod tests {
             .expect("missing key should return partial failure");
         assert!(results[0][0][0] < 0);
         assert_eq!(results[0][1][0], 4);
+
+        // Zero-size read should succeed with 0 bytes
+        let results = store
+            .get_into_ranges(
+                vec![buf0],
+                vec![vec!["key1".to_string()]],
+                vec![vec![vec![0]]],
+                vec![vec![vec![0]]],
+                vec![vec![vec![0]]],
+                Some(vec![32]),
+                None,
+            )
+            .expect("zero-size read should succeed");
+        assert_eq!(results[0][0][0], 0);
 
         store.unregister_buffer(buf0, 32).expect("unregister buf0");
     }
