@@ -1532,12 +1532,19 @@ impl StoreClient {
             expected: None,
             next: Some(route.clone()),
         };
-        let results = self.control_client.batch_replace_routes(
+        let response = self.control_client.send_route_control(
             authority,
-            &namespace,
-            &authority.runtime.stable_id,
-            &[request],
+            RouteControlRequest::BatchReplace {
+                namespace,
+                authority: authority.runtime.stable_id.clone(),
+                requests: vec![request],
+            },
         )?;
+        let RouteControlResponse::BatchReplace(results) = response else {
+            return Err(StoreError::Transport(
+                "replace route control transport returned non-replace reply".to_string(),
+            ));
+        };
         Self::expect_exactly_one_control_plane_result(results, "replace route")?
     }
 
@@ -1552,12 +1559,19 @@ impl StoreClient {
                 .route_ops()
                 .load_authority_route(&namespace, &authority.runtime.stable_id, key);
         }
-        let results = self.control_client.batch_get_routes(
+        let response = self.control_client.send_route_control(
             authority,
-            &namespace,
-            &authority.runtime.stable_id,
-            std::slice::from_ref(key),
+            RouteControlRequest::BatchGet {
+                namespace,
+                authority: authority.runtime.stable_id.clone(),
+                keys: vec![key.clone()],
+            },
         )?;
+        let RouteControlResponse::BatchGet(results) = response else {
+            return Err(StoreError::Transport(
+                "get route control transport returned non-get reply".to_string(),
+            ));
+        };
         Self::expect_exactly_one_control_plane_result(results, "get route")?
     }
 

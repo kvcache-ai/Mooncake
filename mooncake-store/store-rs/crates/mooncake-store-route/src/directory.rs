@@ -9,6 +9,7 @@ use mooncake_store_core::{
 };
 use tracing::{debug, trace, warn};
 
+use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
 use crate::mesh::{
     authority_compare_and_swap_many, authority_get_many, authority_get_version_floor,
     authority_is_local, authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
@@ -33,7 +34,7 @@ pub fn build_route_directory(
     route_topk: usize,
     metadata: Arc<dyn MetadataBackend>,
     lease: &ClientLease,
-    authority_client: Arc<dyn RouteAuthorityClient>,
+    control_transport: Arc<dyn RouteControlTransport>,
     membership: Arc<dyn RouteMembershipProvider>,
 ) -> Arc<dyn RouteDirectory> {
     match mode {
@@ -42,7 +43,7 @@ pub fn build_route_directory(
             route_topk,
             metadata,
             lease,
-            authority_client,
+            Arc::new(RouteControlAuthorityClient::new(control_transport)),
             membership,
         )),
     }
