@@ -1683,22 +1683,32 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                     TransferDirectionMode::FORWARD) {
                     const ErrorCode route_result = co_await RunForwardReadOnRoute(
                         *route, req, promise, iter);
-                    if (route_result == ErrorCode::OK ||
-                        route_result == ErrorCode::INTERNAL_ERROR ||
+                    if (route_result == ErrorCode::OK) {
+                        co_return;
+                    }
+                    if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
+                        LOG(ERROR) << "Forward read failed, key: " << req->key
+                                   << ", error: " << route_result
+                                   << ", route: " << route->proxy.ip_address
+                                   << ":" << route->proxy.rpc_port
+                                   << ", client_id: " << route->proxy.client_id
+                                   << ", segment_id: " << route->proxy.segment_id
+                                   << ", is_cached: " << route->is_cached;
+                    }
+                    if (route_result == ErrorCode::INTERNAL_ERROR ||
                         route_result == ErrorCode::INVALID_PARAMS ||
                         route_result == ErrorCode::NOT_IMPLEMENTED) {
                         co_return;
                     }
                     final_result = route_result;
                     continue;
-                }
-
-                auto result = co_await route->peer->AsyncReadRemoteData(*req);
-                if (result.has_value()) {
-                    tl::expected<void, ErrorCode> ok;
-                    promise->setValue(std::move(ok));
-                    co_return;
                 } else {
+                    auto result = co_await route->peer->AsyncReadRemoteData(*req);
+                    if (result.has_value()) {
+                        tl::expected<void, ErrorCode> ok;
+                        promise->setValue(std::move(ok));
+                        co_return;
+                    }
                     if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
                         LOG(ERROR)
                             << "Failed to get from remote, key: " << req->key
