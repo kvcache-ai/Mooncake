@@ -101,9 +101,11 @@ class MasterClient {
         const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Calculate cache hit rate metrics
+     * @brief Calculate Store-observed cache reuse metrics
      * @param object_keys None
-     * @return Map containing metrics
+     * @return Map containing metrics. Legacy hit-rate keys describe cumulative
+     * Store-side hits normalized by current cached object counts, not
+     * end-to-end request/token hit ratios.
      */
     [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();

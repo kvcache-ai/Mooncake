@@ -586,8 +586,36 @@ config.preferred_segment = self.get_hostname()
 
 ```python
 config = ReplicateConfig()
-config.prefer_alloc_in_same_node = "True
+config.prefer_alloc_in_same_node = "True"
 ```
+
+#### group_ids
+**Type:** `List[str] | None`
+**Default:** `None`
+**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped.
+
+For batch write APIs, the number of group IDs must match the number of keys:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a", "", "session-b"]
+
+store.put_batch(
+    ["key-a", "key-b", "key-c"],
+    [b"value-a", b"value-b", b"value-c"],
+    config,
+)
+```
+
+For a single-object write, provide one group ID:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a"]
+
+store.put("key-a", b"value-a", config)
+```
+
 ---
 
 ## Unified Parallel Tensor IO API
@@ -2820,8 +2848,6 @@ bind_to_numa_node(0)
 
 ---
 
----
-
 ## Error Handling
 
 Most methods return integer status codes:
@@ -2844,5 +2870,3 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 4. **Configure replication** appropriately - more replicas provide better availability but use more storage
 5. **Use soft pinning** for frequently accessed objects to keep them in memory
 6. **Choose RDMA protocol** when available for maximum performance
-
----

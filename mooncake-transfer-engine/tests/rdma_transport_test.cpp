@@ -171,7 +171,7 @@ bool validateTransferSizes() {
     return true;
 }
 
-void setBackendDevice(const std::string &backend) {
+[[maybe_unused]] void setBackendDevice(const std::string &backend) {
     if (!usesDeviceMemory(backend)) {
         return;
     }

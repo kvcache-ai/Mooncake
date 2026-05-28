@@ -126,6 +126,21 @@ curl -s http://<master_host>:9003/metrics
 curl -s http://<master_host>:9003/metrics/summary
 ```
 
+Mooncake Store can report Store-observed cache reuse signals, such as
+completed `GetReplicaList` results served from memory/SSD and current cached
+object counts. These signals help operators understand reuse inside the Store,
+but they are not the final request-level or token-level cache hit ratio for an
+inference system. That end-to-end hit ratio should be calculated by Conductor or
+the inference engine, which can observe the full request path across GPU, CPU,
+and Mooncake tiers.
+
+For `CalcCacheStats()`, prefer the `MEMORY_CURRENT_CACHED_OBJECTS`,
+`SSD_CURRENT_CACHED_OBJECTS`, and `*_HITS_PER_CURRENT_CACHED_OBJECT` enum
+aliases when consuming Store-side values. The older `*_TOTAL` and `*_HIT_RATE`
+names are retained for compatibility. The `*_HIT_RATE` values divide cumulative
+Store-observed hits by current cached object counts, so they are not bounded
+request-level hit ratios and may exceed `1.0`.
+
 ## Client/Engine Tuning (Env Vars, with defaults)
 
 - Topology discovery (Store Client → Transfer Engine)
