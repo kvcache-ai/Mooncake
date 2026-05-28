@@ -51,6 +51,35 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
    public:
     ~MtLinkDeviceTransportImpl() override { release(); }
 
+    // -------------------------------------------------------------------
+    // DeviceTransport — capabilities
+    // -------------------------------------------------------------------
+    const DeviceCommCapabilities deviceCapabilities() const override {
+        DeviceCommCapabilities caps;
+        caps.nvlink_p2p = all_peers_accessible_;
+        caps.signal = true;
+        caps.atomic = true;
+        caps.latency_tier_ns = 500;  // sub-microsecond P2P
+        return caps;
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU buffer allocation
+    // -------------------------------------------------------------------
+    Status allocateBuffer(void** ptr, size_t size,
+                          bool /*allow_fabric*/) override {
+        return musaStatus(musaMalloc(ptr, size),
+                          "musaMalloc in MTLink allocateBuffer failed");
+    }
+
+    Status freeBuffer(void* ptr) override {
+        return musaStatus(musaFree(ptr),
+                          "musaFree in MTLink freeBuffer failed");
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — P2P peer setup
+    // -------------------------------------------------------------------
     Status allocatePeerAccessTables(int rank, int num_ranks) override {
         release();
         rank_ = rank;
@@ -78,7 +107,7 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
 
     // Export the local buffer's IPC handle using musaIpcGetMemHandle.
     Status exportIpcHandle(int device_id, void* local_buffer,
-                           MtLinkIpcHandle& handle) override {
+                           std::vector<int32_t>& handle_words) override {
         // musaIpcGetMemHandle requires the device to be set to the one
         // where the buffer was allocated.
         int current_device = -1;
@@ -98,15 +127,15 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
                        << " local_buffer=" << local_buffer;
         }
         CHECK_STATUS(musaStatus(err, "musaIpcGetMemHandle failed"));
-        handle.words.assign(kIpcHandleWords, 0);
-        std::memcpy(handle.words.data(), &ipc_handle,
+        handle_words.assign(kIpcHandleWords, 0);
+        std::memcpy(handle_words.data(), &ipc_handle,
                     sizeof(musaIpcMemHandle_t));
         return Status::OK();
     }
 
     Status configurePeers(
         int local_device_id, void* local_buffer,
-        const std::vector<MtLinkIpcHandle>& remote_handles,
+        const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask) override {
         if (!available_ || !peer_ptrs_ || !host_peer_ptrs_) {
             return Status::InvalidArgument(
@@ -164,7 +193,7 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
 
             // Decode the peer's IPC handle and open it
             if (dst_rank >= static_cast<int>(remote_handles.size()) ||
-                remote_handles[dst_rank].words.size() < kIpcHandleWords) {
+                remote_handles[dst_rank].size() < kIpcHandleWords) {
                 LOG(WARNING) << "MTLink: rank " << rank_
                              << " missing or invalid IPC handle for rank "
                              << dst_rank;
@@ -172,7 +201,7 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
             }
 
             musaIpcMemHandle_t remote_handle;
-            std::memcpy(&remote_handle, remote_handles[dst_rank].words.data(),
+            std::memcpy(&remote_handle, remote_handles[dst_rank].data(),
                         sizeof(musaIpcMemHandle_t));
 
             void* peer_ptr = nullptr;
@@ -213,17 +242,117 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
             musaMemcpy(peer_ptrs_, host_peer_ptrs_,
                        num_ranks_ * sizeof(void*), musaMemcpyHostToDevice),
             "musaMemcpy mtlink peer pointers failed"));
-        return Status::OK();
-    }
 
-    MtLinkDeviceContext deviceContext() const override {
-        return MtLinkDeviceContext{kMtLinkDeviceContextAbiVersion, rank_,
-                                  num_ranks_, available_, peer_ptrs_};
+        // Update the GPU-visible device context struct.
+        mtlink_device_ctx_.abi_version = kMtLinkDeviceContextAbiVersion;
+        mtlink_device_ctx_.rank = rank_;
+        mtlink_device_ctx_.num_ranks = num_ranks_;
+        mtlink_device_ctx_.available = available_;
+        mtlink_device_ctx_.peer_ptrs = peer_ptrs_;
+        return Status::OK();
     }
 
     bool allPeersAccessible() const override { return all_peers_accessible_; }
 
+    // -------------------------------------------------------------------
+    // DeviceTransport — RDMA setup (not supported by MTLink)
+    // -------------------------------------------------------------------
+    Status initializeRdmaDevice(const std::string& /*device_name*/,
+                                uint8_t /*port_num*/) override {
+        return Status::NotSupported("MTLink does not support RDMA");
+    }
+
+    Status registerMemory(void* /*ptr*/, size_t /*size*/,
+                          uint32_t& lkey, uint32_t& rkey) override {
+        lkey = 0;
+        rkey = 0;
+        return Status::OK();
+    }
+
+    Status unregisterMemory(void* /*ptr*/) override { return Status::OK(); }
+
+    Status allocateControlBuffer(size_t /*size*/) override {
+        return Status::OK();
+    }
+
+    Status releaseControlBuffer() override { return Status::OK(); }
+
+    void* controlBuffer() const override { return nullptr; }
+
+    Status createQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
+                            void* /*qp_devctxs*/) override {
+        return Status::OK();
+    }
+
+    Status recreateQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
+                              void* /*qp_devctxs*/) override {
+        return Status::OK();
+    }
+
+    Status destroyQueuePairs() override { return Status::OK(); }
+
+    Status connectRdmaPeers(
+        const std::vector<int64_t>& /*remote_addrs*/,
+        const std::vector<int32_t>& /*remote_keys*/,
+        const std::vector<std::vector<int32_t>>& /*peer_qpns*/,
+        const std::vector<std::vector<int32_t>>& /*peer_lids*/,
+        const std::vector<int64_t>& /*subnet_prefixes*/,
+        const std::vector<int64_t>& /*interface_ids*/,
+        const std::vector<int>& /*active_ranks_mask*/, int /*rank*/,
+        int /*num_ranks*/, void* /*raddrs*/,
+        void* /*rkeys*/) override {
+        return Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — metadata accessors
+    // -------------------------------------------------------------------
+    IbGdaLocalMetadata localMetadata() const override { return {}; }
+
+    bool isRoce() const override { return false; }
+
+    int gidIndex() const override { return -1; }
+
+    bool ibgdaDisabled() const override { return true; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible context
+    // -------------------------------------------------------------------
+    const void* deviceContextPtr() const override {
+        return &mtlink_device_ctx_;
+    }
+
+    size_t deviceContextSize() const override {
+        return sizeof(MtLinkDeviceContext);
+    }
+
+    DeviceContextAbi deviceContextAbi() const override {
+        return DeviceContextAbi::kMtLink;
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible tables (P2P)
+    // -------------------------------------------------------------------
+    int32_t* availableTablePtr() const override { return available_; }
+
+    void** peerPtrsTablePtr() const override { return peer_ptrs_; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — utility
+    // -------------------------------------------------------------------
     void** hostPeerPtrs() const override { return host_peer_ptrs_; }
+
+    void* getRemotePtr(void* local_ptr, int dst_rank) override {
+        if (!host_peer_ptrs_ || dst_rank < 0 ||
+            dst_rank >= num_ranks_) {
+            return nullptr;
+        }
+        if (!host_peer_ptrs_[dst_rank]) return nullptr;
+        auto offset = reinterpret_cast<uintptr_t>(local_ptr) -
+                      reinterpret_cast<uintptr_t>(host_peer_ptrs_[rank_]);
+        return reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(host_peer_ptrs_[dst_rank]) + offset);
+    }
 
    private:
     void release() {
@@ -250,6 +379,7 @@ class MtLinkDeviceTransportImpl final : public MtLinkDeviceTransport {
     void** host_peer_ptrs_ = nullptr;
     std::vector<void*> opened_peer_ptrs_;
     bool all_peers_accessible_ = false;
+    MtLinkDeviceContext mtlink_device_ctx_{};
 };
 
 }  // namespace

@@ -12,22 +12,11 @@
 #endif
 #include <fstream>
 #include <memory>
-#ifdef MOONCAKE_EP_USE_TENT
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <tent/device/mtlink.h>
-#else
-#include <tent/device/ibgda.h>
-#include <tent/device/nvlink.h>
-#endif
-#else
-#include <tent/transport/ibgda/detail/memheap.h>
-#include <tent/transport/ibgda/detail/mlx5gda.h>
-#endif
+#include <tent/runtime/device_transport.h>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
-#include <tent/runtime/device_resources.h>
 #include <torch/torch.h>
 
 namespace mooncake {
@@ -91,22 +80,12 @@ struct MooncakeEpBuffer {
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
-    // IBGDA (not available on MUSA)
+    // IBGDA control buffer
     static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
-#ifndef MOONCAKE_EP_USE_TENT
-    // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
-    // fails.
-    ibv_mr* mr = nullptr;
-    std::vector<mlx5gda_qp*> qps;
-    ibv_gid gid;
-#endif
     void* raddrs = nullptr;
     void* rkeys = nullptr;
     void* qp_devctxs = nullptr;
-#ifndef MOONCAKE_EP_USE_MUSA
-    tent::IbGdaDeviceContext tent_ibgda_ctx_;
-#endif
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
@@ -117,16 +96,17 @@ struct MooncakeEpBuffer {
     int USE_QP_COUNT = MAX_QP_COUNT;
 #endif
 
-#ifndef MOONCAKE_EP_USE_TENT
-    mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
-    ibv_pd* pd = nullptr;
-    mlx5dv_pd mpd = {};
-    memheap* ctrl_buf_heap = nullptr;
-#endif
-#ifdef MOONCAKE_EP_USE_TENT
+    // Unified device transport — owns all transport state (IBGDA, NVLink, or
+    // MTLink).  EP never directly accesses transport-specific types; all
+    // operations go through the DeviceTransport interface.
+    //
+    // On CUDA: transport_ is the NVLink transport (P2P); ibgda_transport_ is
+    // the IBGDA transport (RDMA).  Both are needed because the kernel uses
+    // both paths simultaneously.
+    // On MUSA: transport_ is the MTLink transport (P2P); no ibgda_transport_.
+    std::unique_ptr<tent::DeviceTransport> transport_;
 #ifndef MOONCAKE_EP_USE_MUSA
-    std::unique_ptr<tent::IbGdaDeviceTransport> tent_ibgda_transport_;
-#endif
+    std::unique_ptr<tent::DeviceTransport> ibgda_transport_;
 #endif
 
     // Fabric memory (MNNVL)
@@ -135,21 +115,6 @@ struct MooncakeEpBuffer {
     CUmemGenericAllocationHandle fabric_mem_handle_{};
 #endif
     size_t fabric_alloc_size_ = 0;
-
-    // NVLink/MTLink P2P
-    int32_t* nvlink_available = nullptr;
-#ifndef MOONCAKE_EP_USE_TENT
-    void** ipc_peer_ptrs_host = nullptr;
-#endif
-    void** ipc_peer_ptrs = nullptr;
-    bool p2p_ipc_all_enabled_ = false;
-#if defined(MOONCAKE_EP_USE_TENT) && defined(MOONCAKE_EP_USE_MUSA)
-    tent::MtLinkDeviceContext tent_mtlink_ctx_;
-    std::unique_ptr<tent::MtLinkDeviceTransport> tent_mtlink_transport_;
-#elif defined(MOONCAKE_EP_USE_TENT)
-    tent::NvLinkDeviceContext tent_nvlink_ctx_;
-    std::unique_ptr<tent::NvLinkDeviceTransport> tent_nvlink_transport_;
-#endif
 
     // Stream for communication
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -195,7 +160,7 @@ struct MooncakeEpBuffer {
 
     bool is_roce() { return is_roce_; }
 
-    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
+    // Decide whether EP can safely run CUDA kernels ("fast-path").
     //
     // There are two independent ways EP kernels can work:
     // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
@@ -203,8 +168,8 @@ struct MooncakeEpBuffer {
     // node.
     //
     // IMPORTANT INVARIANT:
-    // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
-    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA
+    // If `allPeersAccessible() == true`, `sync_nvlink_ipc_handles()` guarantees
+    // `availableTablePtr()[dst_rank] == 1` for every rank pair, so the CUDA
     // kernels will never take the IBGDA branch and therefore do NOT require
     // `qps`.
     bool use_fast_path() {
@@ -213,12 +178,13 @@ struct MooncakeEpBuffer {
         }
         // IBGDA disabled: only allow fast-path if we can rely on NVLink
         // P2P+IPC.
-        if (!p2p_ipc_all_enabled_) {
+        bool p2p_all = transport_ && transport_->allPeersAccessible();
+        if (!p2p_all) {
             LOG(WARNING) << "Failed to initialize IBGDA. "
                          << "Using fallback implementation. "
                          << "Performance will be degraded.";
         }
-        return p2p_ipc_all_enabled_;
+        return p2p_all;
     }
 
     bool update_local_qpns();
@@ -246,51 +212,60 @@ struct MooncakeEpBuffer {
         const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
-#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
-        auto metadata = tent_ibgda_transport_->localMetadata();
-        return {metadata.raddr, metadata.rkey};
-#else
-        return {(int64_t)0, (int32_t)0};
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (ibgda_transport_) {
+            auto metadata = ibgda_transport_->localMetadata();
+            return {metadata.raddr, metadata.rkey};
+        }
 #endif
+        return {(int64_t)0, (int32_t)0};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
-#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
-        auto metadata = tent_ibgda_transport_->localMetadata();
-        return {metadata.subnet_prefix, metadata.interface_id};
-#else
-        return {(int64_t)0, (int64_t)0};
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (ibgda_transport_) {
+            auto metadata = ibgda_transport_->localMetadata();
+            return {metadata.subnet_prefix, metadata.interface_id};
+        }
 #endif
+        return {(int64_t)0, (int64_t)0};
     }
 
     std::vector<int32_t> get_local_qpns() {
-#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
-        return tent_ibgda_transport_->localMetadata().qpns;
-#else
-        return {};
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (ibgda_transport_) {
+            return ibgda_transport_->localMetadata().qpns;
+        }
 #endif
+        return {};
     }
 
     std::vector<int32_t> get_local_lids() {
-#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
-        return tent_ibgda_transport_->localMetadata().lids;
-#else
-        return {};
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (ibgda_transport_) {
+            return ibgda_transport_->localMetadata().lids;
+        }
 #endif
+        return {};
     }
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
     get_tent_ibgda_context_info() {
 #ifndef MOONCAKE_EP_USE_MUSA
-        return {static_cast<int32_t>(tent_ibgda_ctx_.abi_version),
-                static_cast<int32_t>(tent_ibgda_ctx_.num_ranks),
-                static_cast<int32_t>(tent_ibgda_ctx_.num_qps),
-                reinterpret_cast<int64_t>(tent_ibgda_ctx_.raddrs),
-                reinterpret_cast<int64_t>(tent_ibgda_ctx_.rkeys),
-                reinterpret_cast<int64_t>(tent_ibgda_ctx_.qp_devctxs)};
-#else
-        return {0, 0, 0, 0, 0, 0};
+        if (!ibgda_transport_) return {0, 0, 0, 0, 0, 0};
+        auto* ctx = ibgda_transport_->deviceContextPtr();
+        auto abi = ibgda_transport_->deviceContextAbi();
+        if (abi == tent::DeviceTransport::DeviceContextAbi::kIbGda) {
+            auto* ibgda_ctx = static_cast<const tent::IbGdaDeviceContext*>(ctx);
+            return {static_cast<int32_t>(ibgda_ctx->abi_version),
+                    static_cast<int32_t>(ibgda_ctx->num_ranks),
+                    static_cast<int32_t>(ibgda_ctx->num_qps),
+                    reinterpret_cast<int64_t>(ibgda_ctx->raddrs),
+                    reinterpret_cast<int64_t>(ibgda_ctx->rkeys),
+                    reinterpret_cast<int64_t>(ibgda_ctx->qp_devctxs)};
+        }
 #endif
+        return {0, 0, 0, 0, 0, 0};
     }
 
     std::vector<int32_t> get_ipc_handle();

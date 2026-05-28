@@ -15,8 +15,12 @@ if USE_MUSA:
     import torch_musa  # noqa: F401
 
 from mooncake.mooncake_ep_buffer import Buffer
-if not USE_MUSA:
+try:
     import mooncake.pg as pg
+    HAS_PG = True
+except ImportError:
+    pg = None
+    HAS_PG = False
 
 
 def _device_count():
@@ -214,7 +218,7 @@ def run_test_iteration(
 
 def worker(rank, world_size, config_dict):
     # Device filter (MUSA has no Mellanox NICs)
-    if not USE_MUSA:
+    if not USE_MUSA and HAS_PG:
         device_filter = [
             f
             for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
@@ -227,9 +231,9 @@ def worker(rank, world_size, config_dict):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("musa" if USE_MUSA else "cuda")
 
-    # MUSA: use gloo backend (mooncake PG not yet ported)
-    backend = "gloo" if USE_MUSA else "mooncake"
-    cpu_backend = "gloo" if USE_MUSA else "mooncake-cpu"
+    # Use mooncake PG when available, otherwise fall back to gloo
+    backend = "gloo" if (USE_MUSA or not HAS_PG) else "mooncake"
+    cpu_backend = "gloo" if (USE_MUSA or not HAS_PG) else "mooncake-cpu"
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
     cpu_group = dist.new_group(list(range(world_size)), backend=cpu_backend)

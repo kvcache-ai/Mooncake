@@ -70,31 +70,108 @@ class IbGdaTransport : public Transport, public DeviceTransport {
 
     Status removeMemoryBuffer(BufferDesc& desc) override;
 
-    Status symAlloc(void** ptr, size_t size) override;
+    // -------------------------------------------------------------------
+    // DeviceTransport — capabilities
+    // -------------------------------------------------------------------
+    const DeviceCommCapabilities deviceCapabilities() const override;
 
-    Status symFree(void* ptr) override;
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU buffer allocation
+    // -------------------------------------------------------------------
+    Status allocateBuffer(void** ptr, size_t size,
+                          bool allow_fabric = true) override;
 
-    void* getRemotePtr(void* local_ptr, int dst_rank) override;
+    Status freeBuffer(void* ptr) override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — P2P peer setup (not supported by IBGDA)
+    // -------------------------------------------------------------------
+    Status allocatePeerAccessTables(int rank, int num_ranks) override;
+
+    Status exportIpcHandle(int device_id, void* local_buffer,
+                           std::vector<int32_t>& handle_words) override;
+
+    Status configurePeers(
+        int local_device_id, void* local_buffer,
+        const std::vector<std::vector<int32_t>>& remote_handles,
+        const std::vector<int>& active_ranks_mask) override;
+
+    bool allPeersAccessible() const override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — RDMA / IBGDA setup
+    // -------------------------------------------------------------------
+    Status initializeRdmaDevice(const std::string& device_name,
+                                uint8_t port_num = 1) override;
 
     Status registerMemory(void* ptr, size_t size, uint32_t& lkey,
                           uint32_t& rkey) override;
 
     Status unregisterMemory(void* ptr) override;
 
-    Status getChannelResources(int channel_id,
-                               DeviceChannelResources& resources) override;
+    Status allocateControlBuffer(size_t size) override;
 
-    Status getPeerInfo(int rank, DevicePeerInfo& peer) override;
+    Status releaseControlBuffer() override;
 
-    Status connect(int rank) override;
+    void* controlBuffer() const override;
 
-    Status barrier() override;
+    Status createQueuePairs(int num_qps, int wqe, void* stream,
+                            void* qp_devctxs) override;
 
-    const DeviceCommCapabilities deviceCapabilities() const override;
+    Status recreateQueuePairs(int num_qps, int wqe, void* stream,
+                              void* qp_devctxs) override;
+
+    Status destroyQueuePairs() override;
+
+    Status connectRdmaPeers(
+        const std::vector<int64_t>& remote_addrs,
+        const std::vector<int32_t>& remote_keys,
+        const std::vector<std::vector<int32_t>>& peer_qpns,
+        const std::vector<std::vector<int32_t>>& peer_lids,
+        const std::vector<int64_t>& subnet_prefixes,
+        const std::vector<int64_t>& interface_ids,
+        const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
+        void* raddrs, void* rkeys) override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — metadata accessors
+    // -------------------------------------------------------------------
+    IbGdaLocalMetadata localMetadata() const override;
+
+    bool isRoce() const override;
+
+    int gidIndex() const override;
+
+    bool ibgdaDisabled() const override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible context
+    // -------------------------------------------------------------------
+    const void* deviceContextPtr() const override;
+
+    size_t deviceContextSize() const override;
+
+    DeviceContextAbi deviceContextAbi() const override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — P2P tables (IBGDA returns nullptr — no P2P)
+    // -------------------------------------------------------------------
+    int32_t* availableTablePtr() const override;
+    void** peerPtrsTablePtr() const override;
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — utility
+    // -------------------------------------------------------------------
+    void** hostPeerPtrs() const override;
+
+    void* getRemotePtr(void* local_ptr, int dst_rank) override;
+
+    // -------------------------------------------------------------------
+    // IbGdaTransport-specific (not in DeviceTransport)
+    // -------------------------------------------------------------------
 
     // Initialize the verbs resources that are shared by host-side QP setup and
-    // device-side IBGDA resources.  This is the first ownership slice moved out
-    // of mooncake-ep: NIC selection, GID discovery, context open, and PD setup.
+    // device-side IBGDA resources.
     Status initializeDevice(const std::string& device_name,
                             uint8_t port_num = 1);
 
@@ -103,47 +180,24 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     const mlx5dv_pd& mlx5ProtectionDomain() const { return mpd_; }
     ibv_mr* memoryRegion() const { return mr_; }
     const ibv_gid& gid() const { return gid_; }
-    int gidIndex() const { return gid_index_; }
-    bool isRoce() const { return is_roce_; }
+    int gidIndexInternal() const { return gid_index_; }
+    bool isRoceInternal() const { return is_roce_; }
     uint8_t portNum() const { return port_num_; }
 
-    // Return the local metadata payload that must be exchanged before peer QP
-    // connection.  Keeping this projection in TENT avoids leaking the concrete
-    // mlx5/QP ownership details back into EP as resource ownership moves here.
-    IbGdaLocalMetadata localMetadata() const;
-
-    // Allocate the GPU-visible control buffer used by IBGDA DevX queues and
-    // register it as a DevX umem.  The allocation currently uses CUDA, but the
-    // ownership boundary intentionally lives in TENT so this can later dispatch
-    // to other platform backends without changing mooncake-ep.
-    Status allocateControlBuffer(size_t size);
-
-    Status releaseControlBuffer();
-
-    void* controlBuffer() const { return ctrl_buf_; }
     size_t controlBufferSize() const { return ctrl_buf_size_; }
     mlx5dv_devx_umem* controlBufferUmem() const { return ctrl_buf_umem_; }
 
-    // Create/destroy the GPU-initiated RC QPs backed by the TENT-owned control
-    // buffer.  This is still mlx5/CUDA today, but EP only consumes the stable
-    // handles and device-context bytes so future TENT backends can replace the
-    // queue builder behind this boundary.
-    Status createQueuePairs(int num_qps, int wqe, cudaStream_t stream,
-                            void* qp_devctxs);
+    // Create/destroy QPs with typed cudaStream_t (internal use).
+    Status createQueuePairsTyped(int num_qps, int wqe, cudaStream_t stream,
+                                 void* qp_devctxs);
 
-    Status recreateQueuePairs(int num_qps, int wqe, cudaStream_t stream,
-                              void* qp_devctxs);
-
-    Status destroyQueuePairs();
+    Status recreateQueuePairsTyped(int num_qps, int wqe, cudaStream_t stream,
+                                   void* qp_devctxs);
 
     Status connectQueuePair(int qp_index, const ibv_ah_attr& ah_attr,
                             uint32_t remote_qpn, ibv_mtu mtu);
 
-    // Consume exchanged per-rank IBGDA metadata, connect QPs in deterministic
-    // QP-index order, and publish remote addresses/keys into the GPU-visible
-    // device context arrays.  The actual metadata exchange can still be driven
-    // by the caller during the migration window, but the interpretation of that
-    // metadata and the queue bring-up state machine lives in TENT.
+    // Consume exchanged per-rank IBGDA metadata, connect QPs.
     Status connectPeers(const std::vector<int64_t>& remote_addrs,
                         const std::vector<int32_t>& remote_keys,
                         const std::vector<std::vector<int32_t>>& peer_qpns,
@@ -159,8 +213,7 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     uint16_t queuePairLid(int qp_index) const;
 
     // Stage-C bridge: lets an existing IBGDA host setup hand a GPU-visible
-    // backend context to the TENT DeviceTransport interface. The full Stage-D
-    // transport will allocate and populate this context internally.
+    // backend context to the TENT DeviceTransport interface.
     Status adoptDeviceContext(void* network_ctx, int num_channels);
 
     Status adoptDeviceContext(IbGdaDeviceContext* network_ctx,
@@ -178,6 +231,7 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     void* network_ctx_ = nullptr;
     int num_channels_ = 0;
     std::unordered_map<int, DevicePeerInfo> peer_info_;
+    IbGdaDeviceContext ibgda_device_ctx_{};
 
     std::string device_name_;
     uint8_t port_num_ = 1;

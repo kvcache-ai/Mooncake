@@ -48,16 +48,13 @@ endif()
 # setup.py links against -l:engine.so in ../mooncake-wheel/mooncake/.
 # During the make phase only the versioned engine.cpython-XYZ.so exists in
 # the build tree; create a bare engine.so symlink so the linker can find it.
-# MUSA does not link engine.so (no IBGDA), so skip this step.
-if(NOT EP_USE_MUSA)
-  set(_wheel_mooncake_dir "${SOURCE_DIR}/../mooncake-wheel/mooncake")
-  set(_engine_symlink "${_wheel_mooncake_dir}/engine.so")
-  if(ENGINE_SO_PATH AND NOT EXISTS "${_engine_symlink}")
-    message(STATUS "[EP] Creating engine.so symlink -> ${ENGINE_SO_PATH}")
-    execute_process(
-      COMMAND ${CMAKE_COMMAND} -E create_symlink "${ENGINE_SO_PATH}" "${_engine_symlink}"
-    )
-  endif()
+set(_wheel_mooncake_dir "${SOURCE_DIR}/../mooncake-wheel/mooncake")
+set(_engine_symlink "${_wheel_mooncake_dir}/engine.so")
+if(ENGINE_SO_PATH AND NOT EXISTS "${_engine_symlink}")
+  message(STATUS "[EP] Creating engine.so symlink -> ${ENGINE_SO_PATH}")
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${ENGINE_SO_PATH}" "${_engine_symlink}"
+  )
 endif()
 
 # ---------------------------------------------------------------------------

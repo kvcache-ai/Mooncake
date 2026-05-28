@@ -16,6 +16,7 @@
 #define TENT_RUNTIME_DEVICE_RESOURCES_H_
 
 #include <cstdint>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -41,6 +42,20 @@ struct DevicePeerInfo {
     uint64_t raddr = 0;
     uint32_t rkey = 0;
     uint32_t qp_num = 0;
+};
+
+// Host-visible IBGDA metadata that callers exchange before connecting
+// GPU-initiated IBGDA queue pairs.  Moved here from ibgda.h so the
+// DeviceTransport interface can reference it without pulling in
+// IBGDA-specific headers.
+struct IbGdaLocalMetadata {
+    int64_t raddr = 0;
+    int32_t rkey = 0;
+    bool is_roce = false;
+    int64_t subnet_prefix = 0;
+    int64_t interface_id = 0;
+    std::vector<int32_t> qpns;
+    std::vector<int32_t> lids;
 };
 
 inline constexpr uint32_t kIbGdaDeviceContextAbiVersion = 1;

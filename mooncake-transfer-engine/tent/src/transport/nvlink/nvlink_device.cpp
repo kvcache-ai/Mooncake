@@ -38,6 +38,34 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
    public:
     ~NvLinkDeviceTransportImpl() override { release(); }
 
+    // -------------------------------------------------------------------
+    // DeviceTransport — capabilities
+    // -------------------------------------------------------------------
+    const DeviceCommCapabilities deviceCapabilities() const override {
+        DeviceCommCapabilities caps;
+        caps.nvlink_p2p = all_peers_accessible_;
+        caps.signal = true;
+        caps.atomic = true;
+        caps.latency_tier_ns = 500;  // sub-microsecond P2P
+        return caps;
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU buffer allocation
+    // -------------------------------------------------------------------
+    Status allocateBuffer(void** ptr, size_t size,
+                          bool /*allow_fabric*/) override {
+        return cudaStatus(cudaMalloc(ptr, size),
+                          "cudaMalloc in NvLink allocateBuffer failed");
+    }
+
+    Status freeBuffer(void* ptr) override {
+        return cudaStatus(cudaFree(ptr), "cudaFree in NvLink freeBuffer failed");
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — P2P peer setup
+    // -------------------------------------------------------------------
     Status allocatePeerAccessTables(int rank, int num_ranks) override {
         release();
         rank_ = rank;
@@ -61,8 +89,8 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
         return Status::OK();
     }
 
-    Status exportIpcHandle(void* local_buffer,
-                           NvLinkIpcHandle& handle) override {
+    Status exportIpcHandle(int /*device_id*/, void* local_buffer,
+                           std::vector<int32_t>& handle_words) override {
         cudaIpcMemHandle_t cuda_handle;
         CHECK_STATUS(cudaStatus(cudaIpcGetMemHandle(&cuda_handle, local_buffer),
                                 "cudaIpcGetMemHandle failed"));
@@ -70,15 +98,15 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
         constexpr size_t handle_size = sizeof(cudaIpcMemHandle_t);
         const size_t num_words =
             (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
-        handle.words.assign(num_words, 0);
-        std::memcpy(handle.words.data(), &cuda_handle, handle_size);
+        handle_words.assign(num_words, 0);
+        std::memcpy(handle_words.data(), &cuda_handle, handle_size);
         return Status::OK();
     }
 
-    Status configurePeers(int local_device_id, void* local_buffer,
-                          const std::vector<NvLinkIpcHandle>& remote_handles,
-                          const std::vector<int>& active_ranks_mask,
-                          bool use_fabric_memory) override {
+    Status configurePeers(
+        int local_device_id, void* local_buffer,
+        const std::vector<std::vector<int32_t>>& remote_handles,
+        const std::vector<int>& active_ranks_mask) override {
         if (!available_ || !peer_ptrs_ || !host_peer_ptrs_) {
             return Status::InvalidArgument(
                 "NVLink peer tables have not been allocated" LOC_MARK);
@@ -98,13 +126,20 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank_] = 1;
 
+        // Check if fabric memory is in use (no IPC handles needed).
+        bool use_fabric_memory = true;
+        for (int i = 0; i < num_ranks_; ++i) {
+            if (active_ranks_mask[i] == 0) continue;
+            if (i != rank_ && i < static_cast<int>(remote_handles.size()) &&
+                !remote_handles[i].empty()) {
+                use_fabric_memory = false;
+                break;
+            }
+        }
+
         if (use_fabric_memory) {
             for (int i = 0; i < num_ranks_; ++i) {
                 if (active_ranks_mask[i] == 0) continue;
-                // TENT exposes the same ABI for fabric memory, but EP kernels
-                // still need a valid per-rank base pointer.  Until the caller
-                // exchanges fabric virtual addresses explicitly, only the local
-                // rank pointer is usable.
                 host_peer_ptrs_[i] = (i == rank_) ? local_buffer : nullptr;
                 available[i] = host_peer_ptrs_[i] ? 1 : 0;
             }
@@ -139,7 +174,7 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
                 }
 
                 if (dst_rank >= static_cast<int>(remote_handles.size()) ||
-                    remote_handles[dst_rank].words.empty()) {
+                    remote_handles[dst_rank].empty()) {
                     LOG(WARNING) << "NVLink: rank " << rank_
                                  << " missing IPC handle for rank " << dst_rank;
                     continue;
@@ -148,7 +183,7 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
                 constexpr size_t handle_size = sizeof(cudaIpcMemHandle_t);
                 const size_t num_words =
                     (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
-                const auto& words = remote_handles[dst_rank].words;
+                const auto& words = remote_handles[dst_rank];
                 if (words.size() < num_words) {
                     LOG(WARNING) << "NVLink: rank " << rank_
                                  << " invalid IPC handle size for rank "
@@ -196,17 +231,117 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
                                            num_ranks_ * sizeof(void*),
                                            cudaMemcpyHostToDevice),
                                 "cudaMemcpy nvlink peer pointers failed"));
-        return Status::OK();
-    }
 
-    NvLinkDeviceContext deviceContext() const override {
-        return NvLinkDeviceContext{kNvLinkDeviceContextAbiVersion, rank_,
-                                   num_ranks_, available_, peer_ptrs_};
+        // Update the GPU-visible device context struct.
+        nvlink_device_ctx_.abi_version = kNvLinkDeviceContextAbiVersion;
+        nvlink_device_ctx_.rank = rank_;
+        nvlink_device_ctx_.num_ranks = num_ranks_;
+        nvlink_device_ctx_.available = available_;
+        nvlink_device_ctx_.peer_ptrs = peer_ptrs_;
+        return Status::OK();
     }
 
     bool allPeersAccessible() const override { return all_peers_accessible_; }
 
+    // -------------------------------------------------------------------
+    // DeviceTransport — RDMA setup (not supported by NVLink)
+    // -------------------------------------------------------------------
+    Status initializeRdmaDevice(const std::string& /*device_name*/,
+                                uint8_t /*port_num*/) override {
+        return Status::NotSupported("NVLink does not support RDMA");
+    }
+
+    Status registerMemory(void* /*ptr*/, size_t /*size*/,
+                          uint32_t& lkey, uint32_t& rkey) override {
+        lkey = 0;
+        rkey = 0;
+        return Status::OK();
+    }
+
+    Status unregisterMemory(void* /*ptr*/) override { return Status::OK(); }
+
+    Status allocateControlBuffer(size_t /*size*/) override {
+        return Status::OK();
+    }
+
+    Status releaseControlBuffer() override { return Status::OK(); }
+
+    void* controlBuffer() const override { return nullptr; }
+
+    Status createQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
+                            void* /*qp_devctxs*/) override {
+        return Status::OK();
+    }
+
+    Status recreateQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
+                              void* /*qp_devctxs*/) override {
+        return Status::OK();
+    }
+
+    Status destroyQueuePairs() override { return Status::OK(); }
+
+    Status connectRdmaPeers(
+        const std::vector<int64_t>& /*remote_addrs*/,
+        const std::vector<int32_t>& /*remote_keys*/,
+        const std::vector<std::vector<int32_t>>& /*peer_qpns*/,
+        const std::vector<std::vector<int32_t>>& /*peer_lids*/,
+        const std::vector<int64_t>& /*subnet_prefixes*/,
+        const std::vector<int64_t>& /*interface_ids*/,
+        const std::vector<int>& /*active_ranks_mask*/, int /*rank*/,
+        int /*num_ranks*/, void* /*raddrs*/,
+        void* /*rkeys*/) override {
+        return Status::OK();
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — metadata accessors
+    // -------------------------------------------------------------------
+    IbGdaLocalMetadata localMetadata() const override { return {}; }
+
+    bool isRoce() const override { return false; }
+
+    int gidIndex() const override { return -1; }
+
+    bool ibgdaDisabled() const override { return true; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible context
+    // -------------------------------------------------------------------
+    const void* deviceContextPtr() const override {
+        return &nvlink_device_ctx_;
+    }
+
+    size_t deviceContextSize() const override {
+        return sizeof(NvLinkDeviceContext);
+    }
+
+    DeviceContextAbi deviceContextAbi() const override {
+        return DeviceContextAbi::kNvLink;
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible tables (P2P)
+    // -------------------------------------------------------------------
+    int32_t* availableTablePtr() const override { return available_; }
+
+    void** peerPtrsTablePtr() const override { return peer_ptrs_; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — utility
+    // -------------------------------------------------------------------
     void** hostPeerPtrs() const override { return host_peer_ptrs_; }
+
+    void* getRemotePtr(void* local_ptr, int dst_rank) override {
+        if (!host_peer_ptrs_ || dst_rank < 0 ||
+            dst_rank >= num_ranks_) {
+            return nullptr;
+        }
+        if (!host_peer_ptrs_[dst_rank]) return nullptr;
+        auto offset = reinterpret_cast<uintptr_t>(local_ptr) -
+                      reinterpret_cast<uintptr_t>(host_peer_ptrs_[rank_]);
+        return reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(host_peer_ptrs_[dst_rank]) + offset);
+    }
 
    private:
     void release() {
@@ -230,6 +365,7 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
     void** host_peer_ptrs_ = nullptr;
     std::vector<void*> opened_peer_ptrs_;
     bool all_peers_accessible_ = false;
+    NvLinkDeviceContext nvlink_device_ctx_{};
 };
 
 }  // namespace

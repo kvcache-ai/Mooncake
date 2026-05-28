@@ -26,14 +26,51 @@ namespace {
 
 class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
    public:
-    Status symAlloc(void** ptr, size_t size) override {
-        return transport_.symAlloc(ptr, size);
+    // -------------------------------------------------------------------
+    // DeviceTransport — capabilities
+    // -------------------------------------------------------------------
+    const DeviceCommCapabilities deviceCapabilities() const override {
+        return transport_.deviceCapabilities();
     }
 
-    Status symFree(void* ptr) override { return transport_.symFree(ptr); }
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU buffer allocation
+    // -------------------------------------------------------------------
+    Status allocateBuffer(void** ptr, size_t size,
+                          bool allow_fabric) override {
+        return transport_.allocateBuffer(ptr, size);
+    }
 
-    void* getRemotePtr(void* local_ptr, int dst_rank) override {
-        return transport_.getRemotePtr(local_ptr, dst_rank);
+    Status freeBuffer(void* ptr) override { return transport_.freeBuffer(ptr); }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — P2P peer setup (not supported by IBGDA)
+    // -------------------------------------------------------------------
+    Status allocatePeerAccessTables(int /*rank*/,
+                                    int /*num_ranks*/) override {
+        return Status::NotSupported("IBGDA does not support P2P peer tables");
+    }
+
+    Status exportIpcHandle(int /*device_id*/, void* /*local_buffer*/,
+                           std::vector<int32_t>& /*handle_words*/) override {
+        return Status::NotSupported("IBGDA does not use IPC handles");
+    }
+
+    Status configurePeers(
+        int /*local_device_id*/, void* /*local_buffer*/,
+        const std::vector<std::vector<int32_t>>& /*remote_handles*/,
+        const std::vector<int>& /*active_ranks_mask*/) override {
+        return Status::NotSupported("IBGDA does not use IPC-based P2P");
+    }
+
+    bool allPeersAccessible() const override { return false; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — RDMA / IBGDA setup
+    // -------------------------------------------------------------------
+    Status initializeRdmaDevice(const std::string& device_name,
+                                uint8_t port_num) override {
+        return transport_.initializeDevice(device_name, port_num);
     }
 
     Status registerMemory(void* ptr, size_t size, uint32_t& lkey,
@@ -43,28 +80,6 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
 
     Status unregisterMemory(void* ptr) override {
         return transport_.unregisterMemory(ptr);
-    }
-
-    Status getChannelResources(int channel_id,
-                               DeviceChannelResources& resources) override {
-        return transport_.getChannelResources(channel_id, resources);
-    }
-
-    Status getPeerInfo(int rank, DevicePeerInfo& peer) override {
-        return transport_.getPeerInfo(rank, peer);
-    }
-
-    Status connect(int rank) override { return transport_.connect(rank); }
-
-    Status barrier() override { return transport_.barrier(); }
-
-    const DeviceCommCapabilities deviceCapabilities() const override {
-        return transport_.deviceCapabilities();
-    }
-
-    Status initializeDevice(const std::string& device_name,
-                            uint8_t port_num) override {
-        return transport_.initializeDevice(device_name, port_num);
     }
 
     Status allocateControlBuffer(size_t size) override {
@@ -77,27 +92,23 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
 
     void* controlBuffer() const override { return transport_.controlBuffer(); }
 
-    size_t controlBufferSize() const override {
-        return transport_.controlBufferSize();
-    }
-
-    Status createQueuePairs(int num_qps, int wqe, void* cuda_stream,
+    Status createQueuePairs(int num_qps, int wqe, void* stream,
                             void* qp_devctxs) override {
         return transport_.createQueuePairs(
-            num_qps, wqe, reinterpret_cast<cudaStream_t>(cuda_stream),
-            qp_devctxs);
+            num_qps, wqe, reinterpret_cast<cudaStream_t>(stream), qp_devctxs);
     }
 
-    Status recreateQueuePairs(int num_qps, int wqe, void* cuda_stream,
+    Status recreateQueuePairs(int num_qps, int wqe, void* stream,
                               void* qp_devctxs) override {
         return transport_.recreateQueuePairs(
-            num_qps, wqe, reinterpret_cast<cudaStream_t>(cuda_stream),
-            qp_devctxs);
+            num_qps, wqe, reinterpret_cast<cudaStream_t>(stream), qp_devctxs);
     }
 
-    Status destroyQueuePairs() override { return transport_.destroyQueuePairs(); }
+    Status destroyQueuePairs() override {
+        return transport_.destroyQueuePairs();
+    }
 
-    Status connectPeers(
+    Status connectRdmaPeers(
         const std::vector<int64_t>& remote_addrs,
         const std::vector<int32_t>& remote_keys,
         const std::vector<std::vector<int32_t>>& peer_qpns,
@@ -112,6 +123,9 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
                                        num_ranks, raddrs, rkeys);
     }
 
+    // -------------------------------------------------------------------
+    // DeviceTransport — metadata accessors
+    // -------------------------------------------------------------------
     IbGdaLocalMetadata localMetadata() const override {
         return transport_.localMetadata();
     }
@@ -119,6 +133,46 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
     bool isRoce() const override { return transport_.isRoce(); }
 
     int gidIndex() const override { return transport_.gidIndex(); }
+
+    bool ibgdaDisabled() const override { return false; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible context
+    // -------------------------------------------------------------------
+    const void* deviceContextPtr() const override {
+        return transport_.deviceContextPtr();
+    }
+
+    size_t deviceContextSize() const override {
+        return transport_.deviceContextSize();
+    }
+
+    DeviceContextAbi deviceContextAbi() const override {
+        return transport_.deviceContextAbi();
+    }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — GPU-kernel-visible tables (P2P)
+    // -------------------------------------------------------------------
+    int32_t* availableTablePtr() const override { return nullptr; }
+
+    void** peerPtrsTablePtr() const override { return nullptr; }
+
+    // -------------------------------------------------------------------
+    // DeviceTransport — utility
+    // -------------------------------------------------------------------
+    void** hostPeerPtrs() const override { return nullptr; }
+
+    void* getRemotePtr(void* local_ptr, int dst_rank) override {
+        return transport_.getRemotePtr(local_ptr, dst_rank);
+    }
+
+    // -------------------------------------------------------------------
+    // IbGdaDeviceTransport — IBGDA-specific
+    // -------------------------------------------------------------------
+    size_t controlBufferSize() const override {
+        return transport_.controlBufferSize();
+    }
 
    private:
     IbGdaTransport transport_;

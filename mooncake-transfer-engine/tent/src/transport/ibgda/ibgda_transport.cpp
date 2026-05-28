@@ -123,7 +123,8 @@ Status IbGdaTransport::removeMemoryBuffer(BufferDesc&) {
     return notImplemented("removeMemoryBuffer");
 }
 
-Status IbGdaTransport::symAlloc(void** ptr, size_t size) {
+Status IbGdaTransport::allocateBuffer(void** ptr, size_t size,
+                                      bool /*allow_fabric*/) {
     if (!ptr) return Status::InvalidArgument("ptr is null" LOC_MARK);
     auto err = cudaMalloc(ptr, size);
     if (err != cudaSuccess) {
@@ -133,7 +134,7 @@ Status IbGdaTransport::symAlloc(void** ptr, size_t size) {
     return Status::OK();
 }
 
-Status IbGdaTransport::symFree(void* ptr) {
+Status IbGdaTransport::freeBuffer(void* ptr) {
     if (!ptr) return Status::OK();
     auto err = cudaFree(ptr);
     if (err != cudaSuccess) {
@@ -249,7 +250,7 @@ Status IbGdaTransport::releaseControlBuffer() {
     return Status::OK();
 }
 
-Status IbGdaTransport::createQueuePairs(int num_qps, int wqe,
+Status IbGdaTransport::createQueuePairsTyped(int num_qps, int wqe,
                                         cudaStream_t stream,
                                         void* qp_devctxs) {
     if (num_qps <= 0) {
@@ -325,10 +326,16 @@ Status IbGdaTransport::createQueuePairs(int num_qps, int wqe,
         }
         qps_.push_back(qp);
     }
+
+    // Update the GPU-visible device context so deviceContextPtr() is valid.
+    ibgda_device_ctx_.abi_version = kIbGdaDeviceContextAbiVersion;
+    ibgda_device_ctx_.qp_devctxs = qp_devctxs;
+    ibgda_device_ctx_.num_qps = num_qps;
+
     return Status::OK();
 }
 
-Status IbGdaTransport::recreateQueuePairs(int num_qps, int wqe,
+Status IbGdaTransport::recreateQueuePairsTyped(int num_qps, int wqe,
                                           cudaStream_t stream,
                                           void* qp_devctxs) {
     auto status = destroyQueuePairs();
@@ -486,6 +493,12 @@ Status IbGdaTransport::connectPeers(
         }
     }
 
+    // Update the GPU-visible device context so deviceContextPtr() is valid.
+    ibgda_device_ctx_.rank = rank;
+    ibgda_device_ctx_.num_ranks = num_ranks;
+    ibgda_device_ctx_.raddrs = raddrs;
+    ibgda_device_ctx_.rkeys = rkeys;
+
     return Status::OK();
 }
 
@@ -523,33 +536,78 @@ uint16_t IbGdaTransport::queuePairLid(int qp_index) const {
     return qps_[qp_index]->port_attr.lid;
 }
 
-Status IbGdaTransport::getChannelResources(
-    int channel_id, DeviceChannelResources& resources) {
-    if (channel_id < 0 || channel_id >= num_channels_) {
-        return Status::InvalidArgument("invalid IBGDA channel id" LOC_MARK);
-    }
-    if (!network_ctx_) {
-        return Status::InvalidArgument(
-            "IBGDA device context has not been adopted" LOC_MARK);
-    }
-    resources.channel_id = channel_id;
-    resources.num_channels = num_channels_;
-    resources.network_ctx = network_ctx_;
-    return Status::OK();
+Status IbGdaTransport::allocatePeerAccessTables(int, int) {
+    return Status::NotSupported("IBGDA does not support P2P peer tables");
 }
 
-Status IbGdaTransport::getPeerInfo(int rank, DevicePeerInfo& peer) {
-    auto it = peer_info_.find(rank);
-    if (it == peer_info_.end()) {
-        return Status::InvalidArgument("IBGDA peer info not found" LOC_MARK);
-    }
-    peer = it->second;
-    return Status::OK();
+Status IbGdaTransport::exportIpcHandle(int, void*, std::vector<int32_t>&) {
+    return Status::NotSupported("IBGDA does not use IPC handles");
 }
 
-Status IbGdaTransport::connect(int) { return notImplemented("connect"); }
+Status IbGdaTransport::configurePeers(
+    int, void*, const std::vector<std::vector<int32_t>>&,
+    const std::vector<int>&) {
+    return Status::NotSupported("IBGDA does not use IPC-based P2P");
+}
 
-Status IbGdaTransport::barrier() { return notImplemented("barrier"); }
+bool IbGdaTransport::allPeersAccessible() const { return false; }
+
+int32_t* IbGdaTransport::availableTablePtr() const { return nullptr; }
+void** IbGdaTransport::peerPtrsTablePtr() const { return nullptr; }
+
+void* IbGdaTransport::controlBuffer() const { return ctrl_buf_; }
+
+bool IbGdaTransport::isRoce() const { return is_roce_; }
+int IbGdaTransport::gidIndex() const { return gid_index_; }
+
+Status IbGdaTransport::initializeRdmaDevice(const std::string& device_name,
+                                            uint8_t port_num) {
+    return initializeDevice(device_name, port_num);
+}
+
+Status IbGdaTransport::createQueuePairs(int num_qps, int wqe, void* stream,
+                                        void* qp_devctxs) {
+    return createQueuePairsTyped(num_qps, wqe,
+                                 reinterpret_cast<cudaStream_t>(stream),
+                                 qp_devctxs);
+}
+
+Status IbGdaTransport::recreateQueuePairs(int num_qps, int wqe, void* stream,
+                                          void* qp_devctxs) {
+    return recreateQueuePairsTyped(num_qps, wqe,
+                                   reinterpret_cast<cudaStream_t>(stream),
+                                   qp_devctxs);
+}
+
+Status IbGdaTransport::connectRdmaPeers(
+    const std::vector<int64_t>& remote_addrs,
+    const std::vector<int32_t>& remote_keys,
+    const std::vector<std::vector<int32_t>>& peer_qpns,
+    const std::vector<std::vector<int32_t>>& peer_lids,
+    const std::vector<int64_t>& subnet_prefixes,
+    const std::vector<int64_t>& interface_ids,
+    const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
+    void* raddrs, void* rkeys) {
+    return connectPeers(remote_addrs, remote_keys, peer_qpns, peer_lids,
+                        subnet_prefixes, interface_ids, active_ranks_mask,
+                        rank, num_ranks, raddrs, rkeys);
+}
+
+bool IbGdaTransport::ibgdaDisabled() const { return false; }
+
+const void* IbGdaTransport::deviceContextPtr() const {
+    return &ibgda_device_ctx_;
+}
+
+size_t IbGdaTransport::deviceContextSize() const {
+    return sizeof(IbGdaDeviceContext);
+}
+
+DeviceTransport::DeviceContextAbi IbGdaTransport::deviceContextAbi() const {
+    return DeviceContextAbi::kIbGda;
+}
+
+void** IbGdaTransport::hostPeerPtrs() const { return nullptr; }
 
 const DeviceCommCapabilities IbGdaTransport::deviceCapabilities() const {
     DeviceCommCapabilities caps;
@@ -651,6 +709,8 @@ Status IbGdaTransport::adoptDeviceContext(IbGdaDeviceContext* network_ctx,
     if (network_ctx->num_qps <= 0 || network_ctx->num_ranks <= 0) {
         return Status::InvalidArgument("invalid IBGDA device context shape" LOC_MARK);
     }
+    // Copy into internal device context for deviceContextPtr().
+    ibgda_device_ctx_ = *network_ctx;
     return adoptDeviceContext(static_cast<void*>(network_ctx), num_channels);
 }
 

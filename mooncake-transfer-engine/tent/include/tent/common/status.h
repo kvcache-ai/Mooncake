@@ -104,6 +104,7 @@ class Status final {
         kInternalError = 199,
 
         kNotImplemented = 200,
+        kNotSupported = 201,
         kMaxCode
     };
 
@@ -159,6 +160,7 @@ class Status final {
     TYPE_CHECK(InternalError);
 
     TYPE_CHECK(NotImplemented);
+    TYPE_CHECK(NotSupported);
 
     // Return a combination of the error code name and message.
     std::string ToString() const;

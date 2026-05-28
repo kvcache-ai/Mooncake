@@ -105,10 +105,13 @@ class Buffer:
         self._metadata_epoch = 0
         preferred_hca = ""
         if not USE_MUSA:
-            from mooncake import pg
-            preferred_hca = pg.get_preferred_hca(
-                self.group, f"{_device_str(_current_device())}"
-            )
+            try:
+                from mooncake import pg
+                preferred_hca = pg.get_preferred_hca(
+                    self.group, f"{_device_str(_current_device())}"
+                )
+            except ImportError:
+                pass
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca
         )
