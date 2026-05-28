@@ -33,6 +33,28 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+Status setCudaDeviceForLocation(const LocationParser& location,
+                                int& saved_dev) {
+    saved_dev = -1;
+    CHECK_CUDA(cudaGetDevice(&saved_dev));
+    if (location.index() >= 0 && saved_dev != location.index()) {
+        CHECK_CUDA(cudaSetDevice(location.index()));
+    }
+    return Status::OK();
+}
+
+Status restoreCudaDeviceForLocation(const LocationParser& location,
+                                    int saved_dev) {
+    if (saved_dev >= 0 && location.index() >= 0 &&
+        saved_dev != location.index()) {
+        CHECK_CUDA(cudaSetDevice(saved_dev));
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
 
@@ -228,9 +250,24 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
     LocationParser location(desc.location);
     if (location.type() == "cuda") {
-        // If the memory region is allocated using cuMemAlloc,
-        // we cannot use cudaIpcGetMemHandle, so skip it
+        // MNNVL allocations are exported by MnnvlTransport instead of CUDA IPC.
         if (options.type == MNNVL) return Status::OK();
+
+        int saved_dev = -1;
+        CHECK_STATUS(setCudaDeviceForLocation(location, saved_dev));
+
+        // VMM allocations have driver allocation handles, but
+        // cudaIpcGetMemHandle only supports cudaMalloc-backed pointers.
+        CUmemGenericAllocationHandle generic_handle;
+        CUresult retain_result =
+            cuMemRetainAllocationHandle(&generic_handle, (void*)desc.addr);
+        if (retain_result == CUDA_SUCCESS) {
+            cuMemRelease(generic_handle);
+            CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
+            LOG(INFO) << "NVLinkTransport: memory region " << (void*)desc.addr
+                      << " is not cudaMalloc-backed; skip CUDA IPC export.";
+            return Status::OK();
+        }
 
         // Resolve the true cudaMalloc base address. Caching allocators
         // (e.g. PyTorch) sub-allocate tensors within larger cudaMalloc
@@ -244,6 +281,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
             LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
                        << "addr 0x" << std::hex << desc.addr << std::dec
                        << " (error " << cu_err << ")";
+            CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
             return Status::InternalError(
                 "cuMemGetAddressRange failed" LOC_MARK);
         }
@@ -255,12 +293,24 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                 desc.addr = (uint64_t)base_ptr;
                 desc.length = alloc_size;
                 desc.transports.push_back(TransportType::NVLINK);
+                CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
                 return Status::OK();
             }
         }
 
         cudaIpcMemHandle_t handle;
-        CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void*)base_ptr));
+        auto cuda_err = cudaIpcGetMemHandle(&handle, (void*)base_ptr);
+        CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
+        if (cuda_err != cudaSuccess) {
+            LOG(ERROR) << "NVLinkTransport: cudaIpcGetMemHandle failed for "
+                       << "addr 0x" << std::hex << desc.addr << ", base 0x"
+                       << (uint64_t)base_ptr << std::dec << ", device "
+                       << location.index() << ": "
+                       << cudaGetErrorString(cuda_err);
+            return Status::InternalError(
+                std::string("cudaIpcGetMemHandle(&handle, (void*)base_ptr): ") +
+                cudaGetErrorString(cuda_err) + LOC_MARK);
+        }
         desc.addr = (uint64_t)base_ptr;
         desc.length = alloc_size;
         desc.shm_path =
@@ -287,10 +337,14 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
     if (location.type() == "cuda") {
         // Resolve base the same way we did in addMemoryBuffer, so we
         // remove the right entry even for sub-allocated addresses.
+        int saved_dev = -1;
+        CHECK_STATUS(setCudaDeviceForLocation(location, saved_dev));
+
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
         CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
                                                (CUdeviceptr)desc.addr);
+        CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
 
         uint64_t key = desc.addr;
         if (cu_err == CUDA_SUCCESS) {
