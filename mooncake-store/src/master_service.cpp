@@ -910,10 +910,39 @@ auto MasterService::ExistKey(const std::string& key)
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
-    std::vector<tl::expected<bool, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(ExistKey(key));
+    std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto it = shard->metadata.find(key);
+            if (it == shard->metadata.end() || !it->second.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                results[original_idx] = false;
+                continue;
+            }
+
+            const auto& metadata = it->second;
+            if (metadata.HasReplica(&Replica::fn_is_completed)) {
+                metadata.GrantLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
+                results[original_idx] = true;
+            } else {
+                results[original_idx] = false;
+            }
+        }
     }
     return results;
 }
@@ -1270,6 +1299,86 @@ auto MasterService::GetReplicaList(const std::string& key)
         TryPushPromotionQueue(key);
     }
     return resp;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
+        keys.size());
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+    }
+
+    std::vector<std::string> promotion_keys;
+    promotion_keys.reserve(keys.size());
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            MasterMetricManager::instance().inc_total_get_nums();
+
+            auto it = shard->metadata.find(key);
+            if (it == shard->metadata.end() || !it->second.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            const auto& metadata = it->second;
+            std::vector<Replica::Descriptor> replica_list;
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed,
+                [&replica_list](const Replica& replica) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                });
+
+            if (replica_list.empty()) {
+                LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+                continue;
+            }
+
+            if (replica_list[0].is_memory_replica()) {
+                MasterMetricManager::instance().inc_mem_cache_hit_nums();
+            } else if (replica_list[0].is_disk_replica()) {
+                MasterMetricManager::instance().inc_file_cache_hit_nums();
+            }
+            MasterMetricManager::instance().inc_valid_get_nums();
+            metadata.GrantLease(default_kv_lease_ttl_,
+                                default_kv_soft_pin_ttl_);
+
+            if (promotion_on_hit_) {
+                const bool any_memory =
+                    metadata.HasReplica(&Replica::fn_is_memory_replica);
+                const bool any_local_disk =
+                    metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+                if (!any_memory && any_local_disk) {
+                    promotion_keys.push_back(key);
+                }
+            }
+
+            results[original_idx] = GetReplicaListResponse(
+                std::move(replica_list), default_kv_lease_ttl_);
+        }
+    }
+
+    shared_lock.unlock();
+    for (const auto& key : promotion_keys) {
+        TryPushPromotionQueue(key);
+    }
+
+    return results;
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -1737,10 +1846,94 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, replica_type));
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto it = shard->metadata.find(key);
+            if (it == shard->metadata.end() || !it->second.IsValid()) {
+                LOG(ERROR) << "key=" << key << ", error=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& metadata = it->second;
+            if (client_id != metadata.client_id) {
+                LOG(ERROR) << "Illegal client " << client_id
+                           << " to PutEnd key " << key
+                           << ", was PutStart-ed by " << metadata.client_id;
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+                continue;
+            }
+
+            metadata.VisitReplicas(
+                [replica_type](const Replica& replica) {
+                    if (replica_type == ReplicaType::ALL) {
+                        return (replica.is_memory_replica() &&
+                                !replica.has_invalid_mem_handle()) ||
+                               (replica.is_nof_replica() &&
+                                !replica.has_invalid_nof_handle());
+                    }
+                    if (replica_type == ReplicaType::MEMORY) {
+                        return replica.is_memory_replica() &&
+                               !replica.has_invalid_mem_handle();
+                    }
+                    if (replica_type == ReplicaType::NOF_SSD) {
+                        return replica.is_nof_replica() &&
+                               !replica.has_invalid_nof_handle();
+                    }
+                    return replica.type() == replica_type;
+                },
+                [](Replica& replica) { replica.mark_complete(); });
+
+            if (enable_offload_ && !offload_on_evict_) {
+                metadata.VisitReplicas(
+                    [](const Replica& replica) {
+                        return replica.is_completed() &&
+                               replica.is_memory_replica();
+                    },
+                    [this, &key, &shard](Replica& replica) {
+                        auto result = PushOffloadingQueue(key, replica);
+                        if (result) {
+                            replica.inc_refcnt();
+                            shard->offloading_tasks.emplace(
+                                key, OffloadingTask{
+                                         replica.id(),
+                                         std::chrono::system_clock::now()});
+                        }
+                    });
+            }
+
+            if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+                shard->processing_keys.contains(key)) {
+                shard->processing_keys.erase(key);
+            }
+
+            if (replica_type == ReplicaType::MEMORY ||
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
+                MasterMetricManager::instance().inc_mem_cache_nums();
+            } else if (replica_type == ReplicaType::DISK) {
+                MasterMetricManager::instance().inc_file_cache_nums();
+            }
+            metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+            results[original_idx] = {};
+        }
     }
     return results;
 }
@@ -1748,10 +1941,86 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type) {
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(client_id, key, replica_type));
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    std::vector<std::vector<std::pair<size_t, const std::string*>>>
+        keys_by_shard(kNumShards);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        keys_by_shard[getShardIndex(keys[i])].emplace_back(i, &keys[i]);
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t shard_idx = 0; shard_idx < keys_by_shard.size(); ++shard_idx) {
+        auto& key_group = keys_by_shard[shard_idx];
+        if (key_group.empty()) {
+            continue;
+        }
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& [original_idx, key_ptr] : key_group) {
+            const std::string& key = *key_ptr;
+            auto it = shard->metadata.find(key);
+            if (it == shard->metadata.end() || !it->second.IsValid()) {
+                LOG(INFO) << "key=" << key << ", info=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
+
+            auto& metadata = it->second;
+            if (client_id != metadata.client_id) {
+                LOG(ERROR) << "Illegal client " << client_id
+                           << " to PutRevoke key " << key
+                           << ", was PutStart-ed by " << metadata.client_id;
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+                continue;
+            }
+
+            auto processing_rep = metadata.GetFirstReplica(
+                [replica_type](const Replica& replica) {
+                    if (replica_type == ReplicaType::ALL) {
+                        return (replica.is_memory_replica() ||
+                                replica.is_nof_replica()) &&
+                               !replica.is_processing();
+                    }
+                    return replica.type() == replica_type &&
+                           !replica.is_processing();
+                });
+            if (processing_rep != nullptr) {
+                LOG(ERROR) << "key=" << key
+                           << ", status=" << processing_rep->status()
+                           << ", error=invalid_replica_status";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::INVALID_WRITE);
+                continue;
+            }
+
+            if (replica_type == ReplicaType::MEMORY ||
+                (replica_type == ReplicaType::ALL &&
+                 metadata.HasMemReplica())) {
+                MasterMetricManager::instance().dec_mem_cache_nums();
+            } else if (replica_type == ReplicaType::DISK) {
+                MasterMetricManager::instance().dec_file_cache_nums();
+            }
+
+            metadata.EraseReplicas([replica_type](const Replica& replica) {
+                if (replica_type == ReplicaType::ALL) {
+                    return replica.is_memory_replica() ||
+                           replica.is_nof_replica();
+                }
+                return replica.type() == replica_type;
+            });
+
+            if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+                shard->processing_keys.contains(key)) {
+                shard->processing_keys.erase(key);
+            }
+
+            if (!metadata.IsValid()) {
+                shard->metadata.erase(it);
+            }
+            results[original_idx] = {};
+        }
     }
     return results;
 }

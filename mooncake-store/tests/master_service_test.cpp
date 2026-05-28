@@ -3687,6 +3687,180 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+TEST_F(MasterServiceTest, BatchReplicaAndPutStatePreserveRequestOrder) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string ready_key = "batch_ready_key";
+    const std::string processing_key = "batch_processing_key";
+    const std::string missing_key = "batch_missing_key";
+
+    auto ready_put_start =
+        service_->PutStart(client_id, ready_key, 1024, config);
+    ASSERT_TRUE(ready_put_start.has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, ready_key, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto processing_put_start =
+        service_->PutStart(client_id, processing_key, 1024, config);
+    ASSERT_TRUE(processing_put_start.has_value());
+
+    std::vector<std::string> query_keys = {missing_key, ready_key,
+                                           processing_key};
+    auto batch_get_results = service_->BatchGetReplicaList(query_keys);
+    ASSERT_EQ(batch_get_results.size(), query_keys.size());
+
+    ASSERT_FALSE(batch_get_results[0].has_value());
+    EXPECT_EQ(batch_get_results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(batch_get_results[1].has_value());
+    EXPECT_FALSE(batch_get_results[1].value().replicas.empty());
+
+    ASSERT_FALSE(batch_get_results[2].has_value());
+    EXPECT_EQ(batch_get_results[2].error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    auto batch_exist_results = service_->BatchExistKey(query_keys);
+    ASSERT_EQ(batch_exist_results.size(), query_keys.size());
+    ASSERT_FALSE(batch_exist_results[0].value());
+    ASSERT_TRUE(batch_exist_results[1].value());
+    ASSERT_FALSE(batch_exist_results[2].value());
+
+    std::vector<std::string> mixed_put_end_keys = {missing_key, processing_key,
+                                                   ready_key};
+    auto batch_put_end_results =
+        service_->BatchPutEnd(client_id, mixed_put_end_keys);
+    ASSERT_EQ(batch_put_end_results.size(), mixed_put_end_keys.size());
+
+    ASSERT_FALSE(batch_put_end_results[0].has_value());
+    EXPECT_EQ(batch_put_end_results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(batch_put_end_results[1].has_value());
+    ASSERT_TRUE(batch_put_end_results[2].has_value());
+
+    auto processing_get_after_end = service_->GetReplicaList(processing_key);
+    ASSERT_TRUE(processing_get_after_end.has_value());
+    EXPECT_FALSE(processing_get_after_end->replicas.empty());
+}
+
+TEST_F(MasterServiceTest, BatchPutEndHandlesMixedResultsAndQueuesOffload) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    std::unique_ptr<MasterService> service_(new MasterService(config));
+    const auto segment_owner =
+        PrepareSimpleSegment(*service_, "batch_put_end_segment");
+    ASSERT_TRUE(service_->MountLocalDiskSegment(segment_owner.client_id, true)
+                    .has_value());
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+
+    const UUID writer_client = generate_uuid();
+    const UUID other_writer = generate_uuid();
+    const std::string missing_key = "batch_put_end_missing";
+    const std::string wrong_client_key = "batch_put_end_wrong_client";
+    const std::string ok_key = "batch_put_end_ok";
+
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, ok_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutStart(other_writer, wrong_client_key, 1024, replicate_config)
+            .has_value());
+
+    auto results = service_->BatchPutEnd(
+        writer_client, {missing_key, wrong_client_key, ok_key},
+        ReplicaType::MEMORY);
+    ASSERT_EQ(results.size(), 3u);
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::ILLEGAL_CLIENT);
+
+    ASSERT_TRUE(results[2].has_value());
+
+    auto ok_get = service_->GetReplicaList(ok_key);
+    ASSERT_TRUE(ok_get.has_value());
+    ASSERT_EQ(ok_get->replicas.size(), 1u);
+    EXPECT_TRUE(ok_get->replicas[0].is_memory_replica());
+
+    auto wrong_client_get = service_->GetReplicaList(wrong_client_key);
+    ASSERT_FALSE(wrong_client_get.has_value());
+    EXPECT_EQ(wrong_client_get.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    auto offload =
+        service_->OffloadObjectHeartbeat(segment_owner.client_id, true);
+    ASSERT_TRUE(offload.has_value());
+    ASSERT_EQ(offload->count(ok_key), 1u);
+    EXPECT_EQ(offload->at(ok_key), 1024);
+    EXPECT_EQ(offload->count(wrong_client_key), 0u);
+}
+
+TEST_F(MasterServiceTest, BatchPutRevokeHandlesMixedResultsAndErasesMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+
+    const UUID writer_client = generate_uuid();
+    const UUID other_writer = generate_uuid();
+    const std::string missing_key = "batch_put_revoke_missing";
+    const std::string wrong_client_key = "batch_put_revoke_wrong_client";
+    const std::string completed_key = "batch_put_revoke_completed";
+    const std::string revoked_key = "batch_put_revoke_processing";
+
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, revoked_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutStart(other_writer, wrong_client_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(writer_client, completed_key, 1024, replicate_config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(writer_client, completed_key, ReplicaType::MEMORY)
+            .has_value());
+
+    auto results = service_->BatchPutRevoke(
+        writer_client,
+        {missing_key, wrong_client_key, completed_key, revoked_key},
+        ReplicaType::MEMORY);
+    ASSERT_EQ(results.size(), 4u);
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::ILLEGAL_CLIENT);
+
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_WRITE);
+
+    ASSERT_TRUE(results[3].has_value());
+
+    auto revoked_get = service_->GetReplicaList(revoked_key);
+    ASSERT_FALSE(revoked_get.has_value());
+    EXPECT_EQ(revoked_get.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    auto completed_get = service_->GetReplicaList(completed_key);
+    ASSERT_TRUE(completed_get.has_value());
+    ASSERT_EQ(completed_get->replicas.size(), 1u);
+    EXPECT_TRUE(completed_get->replicas[0].is_memory_replica());
+
+    auto wrong_client_get = service_->GetReplicaList(wrong_client_key);
+    ASSERT_FALSE(wrong_client_get.has_value());
+    EXPECT_EQ(wrong_client_get.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
 TEST_F(MasterServiceTest, BatchQueryIpTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();

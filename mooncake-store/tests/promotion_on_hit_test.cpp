@@ -34,6 +34,28 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_admission_threshold_;
     }
 
+    static bool HasPromotionTaskForTesting(MasterService* service,
+                                           const std::string& key) {
+        MasterService::MetadataShardAccessorRO shard(
+            service, service->getShardIndex(key));
+        return shard->promotion_tasks.count(key) > 0;
+    }
+
+    static bool WaitForPromotionTaskReaped(
+        MasterService* service, const std::string& key,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5),
+        std::chrono::milliseconds poll_interval =
+            std::chrono::milliseconds(50)) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (!HasPromotionTaskForTesting(service, key)) {
+                return true;
+            }
+            std::this_thread::sleep_for(poll_interval);
+        }
+        return !HasPromotionTaskForTesting(service, key);
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
@@ -193,6 +215,65 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
+// BatchGetReplicaList should preserve request order while still taking the
+// same promotion-on-hit path as single-key GetReplicaList for LOCAL_DISK-only
+// entries.
+TEST_F(PromotionOnHitTest,
+       BatchGetReplicaListQueuesPromotionForLocalDiskOnlyHits) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+
+    PutObject(*service, ctx.client_id, "k_mem_only");
+    ReplicateConfig processing_config;
+    processing_config.replica_num = 1;
+    ASSERT_TRUE(
+        service
+            ->PutStart(ctx.client_id, "k_processing", 1024, processing_config)
+            .has_value());
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
+                                       ctx.segment_name));
+
+    std::vector<std::string> keys = {"k_missing", "k_mem_only", "k_cold",
+                                     "k_processing"};
+    auto results = service->BatchGetReplicaList(keys);
+    ASSERT_EQ(results.size(), keys.size());
+
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    ASSERT_TRUE(results[1].has_value());
+    ASSERT_EQ(results[1]->replicas.size(), 1u);
+    EXPECT_TRUE(results[1]->replicas[0].is_memory_replica());
+
+    ASSERT_TRUE(results[2].has_value());
+    ASSERT_EQ(results[2]->replicas.size(), 1u);
+    EXPECT_TRUE(results[2]->replicas[0].is_local_disk_replica());
+
+    ASSERT_FALSE(results[3].has_value());
+    EXPECT_EQ(results[3].error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    ASSERT_TRUE(HasPromotionTaskForTesting(service.get(), "k_cold"));
+    EXPECT_FALSE(WaitForPromotionTaskReaped(service.get(), "k_cold",
+                                            std::chrono::milliseconds(0),
+                                            std::chrono::milliseconds(0)));
+
+    auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending->size(), 1u);
+    EXPECT_EQ(pending->count("k_cold"), 1u);
+    EXPECT_EQ(pending->count("k_mem_only"), 0u);
+
+    service->RemoveAll();
+}
+
 // PromotionObjectHeartbeat returns an empty map when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
@@ -328,10 +409,11 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
             << "Dedup gate should block re-enqueue while task is in flight";
     }
 
-    // Wait past the staleness window; the eviction thread reaps the task.
-    // Eviction loop sleeps for kEvictionThreadSleepMs (10 ms), so 2s wall
-    // clock gives ~200 attempts — plenty.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Wait until the reaper actually drops the task. Poll instead of
+    // trusting a fixed sleep; the expiration sweep cadence is gated by
+    // put_start_release_timeout_sec_, not every 10 ms wakeup.
+    ASSERT_TRUE(WaitForPromotionTaskReaped(service.get(), "k_cold"))
+        << "Timed out waiting for the stale promotion task to be reaped";
 
     // Trigger #3: with the task reaped, dedup is unblocked and a fresh
     // GetReplicaList must enqueue again.
@@ -388,12 +470,13 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     ASSERT_FALSE(notify.has_value());
     EXPECT_EQ(notify.error(), ErrorCode::OBJECT_NOT_FOUND);
 
-    // Wait for the reaper; it must tolerate the missing metadata entry
-    // (the source replica it would dec_refcnt is already gone).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Remove(force=true) erases the queued PromotionTask immediately, so wait
+    // until the task is observably gone before re-admitting the same key.
+    ASSERT_TRUE(WaitForPromotionTaskReaped(service.get(), "k_cold"))
+        << "Timed out waiting for the promotion task to be reaped";
 
     // Re-injecting the key and re-triggering must work end-to-end, proving
-    // the per-shard PromotionTask was reaped (not stuck).
+    // the per-shard PromotionTask slot was cleared (not stuck).
     ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "k_cold", 1024,
                                        ctx.segment_name));
     {
@@ -1002,15 +1085,11 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
         ASSERT_TRUE(r.has_value());
     }
 
-    // Wait past the TTL so the reaper sweeps the task. AllocStart has
-    // not yet been called, so alloc_id is 0; the reaper's
-    // EraseReplicaByID branch is a no-op and only the task entry is
-    // removed. We can't easily poll for reap externally (the only
-    // user-facing observable would be re-admitting through the gate,
-    // which would create a fresh task and defeat the test), so use a
-    // fixed sleep with margin. Matches the StalePromotionReaper pattern
-    // (TTL=1s, sleep=2s).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Wait until the reaper actually drops the task. AllocStart has not yet
+    // been called, so alloc_id is 0 and the reaper only clears the task
+    // entry. Poll the task map directly to avoid a fixed-sleep timing race.
+    ASSERT_TRUE(WaitForPromotionTaskReaped(service.get(), "k_cold"))
+        << "Timed out waiting for the promotion task to be reaped";
 
     // AllocStart on a reaped task must reject without allocating.
     // Allocating would leave an orphaned PROCESSING MEMORY replica

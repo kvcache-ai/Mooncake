@@ -1102,7 +1102,13 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
 
 int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
                                       RpcMetaDesc &desc) {
-    local_rpc_meta_ = desc;
+    {
+        // Self-transfers may resolve the local segment through this same
+        // TransferMetadata instance, so keep the local RPC endpoint in cache.
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        local_rpc_meta_ = desc;
+        rpc_meta_map_[server_name] = desc;
+    }
 
     if (p2p_handshake_mode_) {
         handshake_plugin_->registerOnMetadataCallBack(
@@ -1130,6 +1136,8 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(desc.rpc_port);
     if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        rpc_meta_map_.erase(server_name);
         LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
     }
@@ -1137,6 +1145,10 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 }
 
 int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
+    {
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        rpc_meta_map_.erase(server_name);
+    }
     if (p2p_handshake_mode_) {
         return 0;
     }
