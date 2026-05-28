@@ -304,6 +304,92 @@ repair_runtime_wheel() {
   printf '%s\n' "${WHEEL_DIR}/$(basename "${repaired_wheel}")"
 }
 
+restore_cli_libpython_dependency() {
+  local wheel_path=$1
+
+  "${VENV_PYTHON}" - <<'PY' "${wheel_path}"
+import base64
+import csv
+import hashlib
+import pathlib
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+wheel_path = pathlib.Path(sys.argv[1])
+cli_names = [
+    "mooncake-store-client",
+    "mooncake-store-admin",
+    "mooncake-store-bench",
+]
+
+
+def has_needed(path, library_name):
+    result = subprocess.run(
+        ["patchelf", "--print-needed", str(path)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return library_name in result.stdout.splitlines()
+
+
+def rebuild_record(root):
+    dist_info = next(root.glob("*.dist-info"))
+    record_path = dist_info / "RECORD"
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if path == record_path:
+            rows.append((relative, "", ""))
+            continue
+        payload = path.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).decode().rstrip("=")
+        rows.append((relative, f"sha256={digest}", str(len(payload))))
+
+    with record_path.open("w", newline="") as record_file:
+        csv.writer(record_file, lineterminator="\n").writerows(rows)
+
+
+def rewrite_wheel(root):
+    with zipfile.ZipFile(wheel_path, "w", compression=zipfile.ZIP_DEFLATED) as target_wheel:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            info = zipfile.ZipInfo.from_file(path, arcname=relative)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            target_wheel.writestr(info, path.read_bytes())
+
+
+with tempfile.TemporaryDirectory(prefix="mooncake-wheel-libpython-") as temp_dir:
+    root = pathlib.Path(temp_dir)
+    with zipfile.ZipFile(wheel_path) as source_wheel:
+        source_wheel.extractall(root)
+
+    package_root = root / "mooncake"
+    libpython_candidates = sorted(package_root.glob("libpython*.so*"))
+    if not libpython_candidates:
+        raise FileNotFoundError("runtime wheel does not contain libpython*.so")
+
+    libpython_name = libpython_candidates[0].name
+    for name in cli_names:
+        cli_path = package_root / name
+        if not cli_path.exists():
+            continue
+        cli_path.chmod(cli_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        if not has_needed(cli_path, libpython_name):
+            subprocess.run(["patchelf", "--add-needed", libpython_name, str(cli_path)], check=True)
+
+    rebuild_record(root)
+    rewrite_wheel(root)
+PY
+}
+
 require_file() {
   local path=$1
 
@@ -438,6 +524,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import zipfile
 
@@ -490,6 +577,12 @@ library_assets = {
     ],
 }
 
+python_libdir = sysconfig.get_config_var("LIBDIR")
+python_ldlibrary = sysconfig.get_config_var("LDLIBRARY")
+if python_libdir and python_ldlibrary and python_ldlibrary.endswith(".so"):
+    python_library = pathlib.Path(python_libdir) / python_ldlibrary
+    library_assets[python_ldlibrary] = [python_library]
+
 relative_rpath_assets = {
     "engine.so",
     "libtransfer_engine.so",
@@ -537,6 +630,7 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
         target = package_root / name
         shutil.copy2(source, target)
         target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        set_relative_rpath(target)
 
     for name, candidates in library_assets.items():
         source = first_existing(candidates)
@@ -593,6 +687,10 @@ _timer_elapsed $_PY_POST_START "python wheel post-processing"
 _AUDITWHEEL_START=$(_timer_start)
 LATEST_WHEEL=$(repair_runtime_wheel "${LATEST_WHEEL}")
 _timer_elapsed $_AUDITWHEEL_START "auditwheel repair"
+
+_CLI_LIBPYTHON_START=$(_timer_start)
+restore_cli_libpython_dependency "${LATEST_WHEEL}"
+_timer_elapsed $_CLI_LIBPYTHON_START "restore CLI libpython dependency"
 
 readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
 import pathlib
