@@ -6,8 +6,8 @@ use mooncake_store_core::{
     ObjectRoute, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RouteVersion,
 };
 use mooncake_store_route::{
-    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityClient, RouteAuthorityService,
-    RouteMembershipProvider, RouteMetricsSink,
+    set_route_metrics_sink, LocalRouteAuthority, RouteAuthorityService, RouteMembershipProvider,
+    RouteMetricsSink,
 };
 
 use crate::client::{
@@ -151,50 +151,6 @@ impl RouteMembershipProvider for ClientRouteMembership {
         self.suspect_runtime_cache
             .lock()
             .mark(runtime, quarantine_until, observed);
-    }
-}
-
-impl RouteAuthorityClient for ControlPlaneClient {
-    fn batch_get_routes(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        keys: &[ObjectKey],
-    ) -> Result<Vec<Result<Option<ObjectRoute>>>> {
-        ControlPlaneClient::batch_get_routes(self, lease, namespace, authority, keys)
-    }
-
-    fn batch_compare_and_swap_routes(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        requests: &[RouteCasRequest],
-    ) -> Result<Vec<Result<CasResult>>> {
-        ControlPlaneClient::batch_compare_and_swap_routes(
-            self, lease, namespace, authority, requests,
-        )
-    }
-
-    fn batch_replace_routes(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        requests: &[RouteCasRequest],
-    ) -> Result<Vec<Result<()>>> {
-        ControlPlaneClient::batch_replace_routes(self, lease, namespace, authority, requests)
-    }
-
-    fn list_routes_by_replica_owner(
-        &self,
-        lease: &ClientLease,
-        namespace: &str,
-        authority: &ClientStableId,
-        owner: &ClientRuntimeId,
-    ) -> Result<Vec<ObjectRoute>> {
-        ControlPlaneClient::list_routes_by_replica_owner(self, lease, namespace, authority, owner)
     }
 }
 

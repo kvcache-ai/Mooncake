@@ -361,10 +361,13 @@ During full-client drain, replacement routes are also written back to the draini
 
 ## Control Plane
 
-The runtime includes a dedicated control plane for two domains:
+The runtime includes a dedicated control plane for route and non-route control
+traffic:
 
 - route operations
 - allocator operations
+- eviction-specific hit reporting and route tracking
+- migration task submission and status queries
 
 Important properties:
 
@@ -372,7 +375,10 @@ Important properties:
 - tonic RPC implementation
 - batched operations
 - streaming session reuse
-- eviction-specific RPCs for hit reporting and route tracking
+
+Route-control semantics live in `mooncake-store-route`; the client control
+plane remains responsible for transport concerns such as protobuf encoding,
+tonic channels, stream reuse, unary fallback, and request timeouts.
 
 ## Observability
 

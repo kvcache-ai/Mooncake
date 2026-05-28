@@ -25,7 +25,7 @@ Steady-state request hot paths must not depend on backend round trips.
 |-----------|----------------|----------|
 | `StoreClient` | User-facing API, local state, batching, reclaim scheduling | Yes |
 | `RouteOperations` / `RouteDirectory` | Operation-level route table facade plus lookup/CAS implementation | Yes |
-| `ControlPlaneClient` | Peer-to-peer route and allocator RPC | Yes |
+| `ControlPlaneClient` | Peer-to-peer control transport for route, allocator, eviction, and migration RPC | Yes |
 | `StorageOwnerState` | Local replica tracking, CLOCK eviction, route-aware reclaim | Yes on storage nodes |
 | `MetadataBackend` | Leases, segments, route policy, handoff, and `MetadataOnly` route persistence | No for default `EmbeddedWrh` route lookups |
 | `TentEngine` / `TentTransportFactory` | Data transfer and remote segment access | Yes |
@@ -66,10 +66,18 @@ In the default route mode, the client chooses route authorities with embedded we
 - the top `route_topk` authorities are selected per key
 - the highest-ranked authority is the CAS primary
 - the remaining `route_topk - 1` authorities are mirrored authorities
-- route reads and route CAS go to authorities over the control plane
+- route reads and route CAS go to authorities through the client-owned control-plane transport
 - if the mirrored set does not resolve a key, lower-ranked authorities in the same WRH ordering can still be queried
 
 This keeps object route lookups on the authority mesh and off the metadata hot path in normal `EmbeddedWrh` deployments.
+
+`mooncake-store-route` owns the route-control request semantics. It defines the
+route control request/response envelope, dispatches inbound route-authority
+requests to the local authority service, and turns outbound transport replies
+back into route lookup/CAS/list results. `mooncake-store-client` owns the
+control-plane transport implementation: tonic channels, control streams,
+unary fallback, timeouts, and protobuf encoding. Non-route control services
+such as allocator, eviction, and migration remain in `mooncake-store-client`.
 
 Route authority policy is bootstrap-validated through metadata:
 
@@ -472,7 +480,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 |------|------|
 | `crates/mooncake-store-core` | Shared contracts and store model |
 | `crates/mooncake-metadata` | Backend implementations for metadata |
-| `crates/mooncake-store-route` | route table operation facade and implementation modules: `operations`, `local_authority`, `directory`, `mesh`, `traits`, `metrics`, and `util`; `mesh` remains crate-internal |
+| `crates/mooncake-store-route` | route table operation facade and implementation modules: `operations`, `control`, `local_authority`, `directory`, `mesh`, `traits`, `metrics`, and `util`; `mesh` remains crate-internal |
 | `crates/mooncake-store-client/src/client/mod.rs` | `StoreClient` assembly and module composition |
 | `crates/mooncake-store-client/src/client/builder.rs` | builder defaults, lease publication, membership prewarm |
 | `crates/mooncake-store-client/src/client/runtime_core.rs` | runtime lookup, placement, lifecycle, allocator helpers |
@@ -481,7 +489,7 @@ This preserves compatibility for integrations that expect a dummy client / exter
 | `crates/mooncake-store-client/src/client/runtime_alloc.rs` | local and remote allocation helpers |
 | `crates/mooncake-store-client/src/client/membership_sync.rs` | background live-client snapshot refresh |
 | `crates/mooncake-store-client/src/client/facade.rs` | Mooncake-compatible surface methods |
-| `crates/mooncake-store-client/src/route_directory.rs` | route crate adapters for membership snapshots, control-plane RPC, and metrics |
+| `crates/mooncake-store-client/src/route_directory.rs` | route crate adapters for membership snapshots, local authority binding, and metrics |
 | `crates/mooncake-store-client/src/control_plane/mod.rs` | control-plane module entry and exports |
 | `crates/mooncake-store-client/src/control_plane/client.rs` | protobuf RPC client and stream-session reuse |
 | `crates/mooncake-store-client/src/control_plane/server.rs` | protobuf RPC server and dispatch |

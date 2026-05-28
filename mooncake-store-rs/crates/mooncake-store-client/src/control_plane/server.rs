@@ -2,6 +2,9 @@ use super::codec::*;
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
 use crate::observability::registry;
+use mooncake_store_route::{
+    serve_route_control_request, RouteControlRequest, RouteControlResponse,
+};
 use std::time::{Duration, Instant};
 
 const SLOW_CONTROL_REQUEST_LOG_THRESHOLD: Duration = Duration::from_millis(1000);
@@ -273,14 +276,33 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::GetRouteRequest>,
     ) -> std::result::Result<Response<pb::GetRouteReply>, Status> {
         let request = request.into_inner();
-        let reply = match self.authority.get_route(
-            &request.namespace,
-            &ClientStableId::new(request.authority),
-            &ObjectKey::new(request.key),
-        ) {
-            Ok(route) => pb::GetRouteReply {
-                route: route.as_ref().map(pb_object_route),
-                error: None,
+        let route_request = RouteControlRequest::BatchGet {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            keys: vec![ObjectKey::new(request.key)],
+        };
+        let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::BatchGet(mut routes)) => match routes.pop() {
+                Some(Ok(route)) => pb::GetRouteReply {
+                    route: route.as_ref().map(pb_object_route),
+                    error: None,
+                },
+                Some(Err(error)) => pb::GetRouteReply {
+                    route: None,
+                    error: Some(pb_error(error)),
+                },
+                None => pb::GetRouteReply {
+                    route: None,
+                    error: Some(pb_error(StoreError::Transport(
+                        "control plane get_route reply is missing batch item".to_string(),
+                    ))),
+                },
+            },
+            Ok(_) => pb::GetRouteReply {
+                route: None,
+                error: Some(pb_error(StoreError::Transport(
+                    "control plane get_route returned non-get route response".to_string(),
+                ))),
             },
             Err(error) => pb::GetRouteReply {
                 route: None,
@@ -295,27 +317,52 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::BatchGetRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
         let request = request.into_inner();
-        let authority = ClientStableId::new(request.authority);
         let keys = request
             .keys
             .into_iter()
             .map(ObjectKey::new)
             .collect::<Vec<_>>();
-        let replies = self
-            .authority
-            .batch_get_routes(&request.namespace, &authority, &keys)
-            .into_iter()
-            .map(|result| match result {
-                Ok(route) => pb::GetRouteReply {
-                    route: route.as_ref().map(pb_object_route),
-                    error: None,
-                },
-                Err(error) => pb::GetRouteReply {
-                    route: None,
-                    error: Some(pb_error(error)),
-                },
-            })
-            .collect();
+        let item_count = keys.len();
+        let route_request = RouteControlRequest::BatchGet {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            keys,
+        };
+        let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::BatchGet(routes)) => routes
+                .into_iter()
+                .map(|result| match result {
+                    Ok(route) => pb::GetRouteReply {
+                        route: route.as_ref().map(pb_object_route),
+                        error: None,
+                    },
+                    Err(error) => pb::GetRouteReply {
+                        route: None,
+                        error: Some(pb_error(error)),
+                    },
+                })
+                .collect(),
+            Ok(_) => {
+                let detail = pb_error(StoreError::Transport(
+                    "control plane batch_get_routes returned non-get route response".to_string(),
+                ));
+                (0..item_count)
+                    .map(|_| pb::GetRouteReply {
+                        route: None,
+                        error: Some(detail.clone()),
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                let detail = pb_error(error);
+                (0..item_count)
+                    .map(|_| pb::GetRouteReply {
+                        route: None,
+                        error: Some(detail.clone()),
+                    })
+                    .collect()
+            }
+        };
         Ok(Response::new(pb::BatchGetRoutesReply { replies }))
     }
 
@@ -327,13 +374,29 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let next = request.next.as_ref().map(try_object_route_ref).transpose();
         let started = Instant::now();
         let result = next.and_then(|next| {
-            self.authority.compare_and_swap_route(
-                &request.namespace,
-                &ClientStableId::new(request.authority),
-                &ObjectKey::new(request.key),
-                request.expected_version.map(RouteVersion),
-                next.as_ref(),
-            )
+            let route_request = RouteControlRequest::BatchCompareAndSwap {
+                namespace: request.namespace,
+                authority: ClientStableId::new(request.authority),
+                requests: vec![RouteCasRequest {
+                    key: ObjectKey::new(request.key),
+                    expected: request.expected_version.map(RouteVersion),
+                    next,
+                }],
+            };
+            match serve_route_control_request(self.authority.as_ref(), route_request)? {
+                RouteControlResponse::BatchCompareAndSwap(mut results) => {
+                    results.pop().ok_or_else(|| {
+                        StoreError::Transport(
+                            "control plane compare_and_swap_route reply is missing batch item"
+                                .to_string(),
+                        )
+                    })?
+                }
+                _ => Err(StoreError::Transport(
+                    "control plane compare_and_swap_route returned non-cas route response"
+                        .to_string(),
+                )),
+            }
         });
         registry::record_replication_publish(route_cas_result_label(&result), started.elapsed());
         let reply = match result {
@@ -365,14 +428,24 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
                 "control plane list_routes_by_replica_owner request is missing owner",
             )
         })?;
-        let reply = match self.authority.list_routes_by_replica_owner(
-            &request.namespace,
-            &ClientStableId::new(request.authority),
-            &owner,
-        ) {
-            Ok(routes) => pb::ListRoutesByReplicaOwnerReply {
-                routes: routes.iter().map(pb_object_route).collect(),
-                error: None,
+        let route_request = RouteControlRequest::ListByReplicaOwner {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            owner,
+        };
+        let reply = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::ListByReplicaOwner(routes)) => {
+                pb::ListRoutesByReplicaOwnerReply {
+                    routes: routes.iter().map(pb_object_route).collect(),
+                    error: None,
+                }
+            }
+            Ok(_) => pb::ListRoutesByReplicaOwnerReply {
+                routes: Vec::new(),
+                error: Some(pb_error(StoreError::Transport(
+                    "control plane list_routes_by_replica_owner returned non-list route response"
+                        .to_string(),
+                ))),
             },
             Err(error) => pb::ListRoutesByReplicaOwnerReply {
                 routes: Vec::new(),
@@ -481,11 +554,25 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         let replies = match entries {
             Ok(entries) => {
                 let started = Instant::now();
-                let results = self.authority.batch_compare_and_swap_routes(
-                    &request.namespace,
-                    &authority,
-                    &entries,
-                );
+                let route_request = RouteControlRequest::BatchCompareAndSwap {
+                    namespace: request.namespace,
+                    authority,
+                    requests: entries,
+                };
+                let results = match serve_route_control_request(
+                    self.authority.as_ref(),
+                    route_request,
+                ) {
+                    Ok(RouteControlResponse::BatchCompareAndSwap(results)) => results,
+                    Ok(_) => {
+                        let error = StoreError::Transport(
+                            "control plane batch_compare_and_swap_routes returned non-cas route response"
+                                .to_string(),
+                        );
+                        (0..item_count).map(|_| Err(error.clone())).collect()
+                    }
+                    Err(error) => (0..item_count).map(|_| Err(error.clone())).collect(),
+                };
                 registry::record_replication_publish(
                     batch_route_cas_result_label(&results),
                     started.elapsed(),
@@ -531,12 +618,29 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             .map(try_object_route_ref)
             .transpose()
             .and_then(|next| {
-                self.authority.replace_route(
-                    &request.namespace,
-                    &ClientStableId::new(request.authority),
-                    &ObjectKey::new(request.key),
-                    next.as_ref(),
-                )
+                let route_request = RouteControlRequest::BatchReplace {
+                    namespace: request.namespace,
+                    authority: ClientStableId::new(request.authority),
+                    requests: vec![RouteCasRequest {
+                        key: ObjectKey::new(request.key),
+                        expected: None,
+                        next,
+                    }],
+                };
+                match serve_route_control_request(self.authority.as_ref(), route_request)? {
+                    RouteControlResponse::BatchReplace(mut results) => {
+                        results.pop().ok_or_else(|| {
+                            StoreError::Transport(
+                                "control plane replace_route reply is missing batch item"
+                                    .to_string(),
+                            )
+                        })?
+                    }
+                    _ => Err(StoreError::Transport(
+                        "control plane replace_route returned non-replace route response"
+                            .to_string(),
+                    )),
+                }
             }) {
             Ok(()) => pb::ReplaceRouteReply { error: None },
             Err(error) => pb::ReplaceRouteReply {
@@ -570,17 +674,43 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
             })
             .collect::<Result<Vec<_>>>();
         let replies = match entries {
-            Ok(entries) => self
-                .authority
-                .batch_replace_routes(&request.namespace, &authority, &entries)
-                .into_iter()
-                .map(|result| match result {
-                    Ok(()) => pb::ReplaceRouteReply { error: None },
-                    Err(error) => pb::ReplaceRouteReply {
-                        error: Some(pb_error(error)),
-                    },
-                })
-                .collect(),
+            Ok(entries) => {
+                let route_request = RouteControlRequest::BatchReplace {
+                    namespace: request.namespace,
+                    authority,
+                    requests: entries,
+                };
+                match serve_route_control_request(self.authority.as_ref(), route_request) {
+                    Ok(RouteControlResponse::BatchReplace(results)) => results
+                        .into_iter()
+                        .map(|result| match result {
+                            Ok(()) => pb::ReplaceRouteReply { error: None },
+                            Err(error) => pb::ReplaceRouteReply {
+                                error: Some(pb_error(error)),
+                            },
+                        })
+                        .collect(),
+                    Ok(_) => {
+                        let detail = pb_error(StoreError::Transport(
+                            "control plane batch_replace_routes returned non-replace route response"
+                                .to_string(),
+                        ));
+                        (0..item_count)
+                            .map(|_| pb::ReplaceRouteReply {
+                                error: Some(detail.clone()),
+                            })
+                            .collect()
+                    }
+                    Err(error) => {
+                        let detail = pb_error(error);
+                        (0..item_count)
+                            .map(|_| pb::ReplaceRouteReply {
+                                error: Some(detail.clone()),
+                            })
+                            .collect()
+                    }
+                }
+            }
             Err(error) => {
                 let detail = pb_error(error);
                 (0..item_count)

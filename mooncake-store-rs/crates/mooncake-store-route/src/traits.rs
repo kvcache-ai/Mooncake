@@ -5,7 +5,7 @@ use mooncake_store_core::{
     RouteCasRequest, RouteVersion,
 };
 
-pub trait RouteAuthorityClient: Send + Sync {
+pub(crate) trait RouteAuthorityClient: Send + Sync {
     fn batch_get_routes(
         &self,
         lease: &ClientLease,
