@@ -36,7 +36,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port = 0,
         const std::string& local_transfer_mode = "te",
-        RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE) {
+        TransferDirectionMode transfer_direction_mode = TransferDirectionMode::REVERSE) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -48,7 +48,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
         } else {
             config.local_transfer_mode = LocalTransferMode::MEMCPY;
         }
-        config.rdma_direction_mode = rdma_direction_mode;
+        config.transfer_direction_mode = transfer_direction_mode;
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.metrics_port,
@@ -631,7 +631,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
 
         std::string host = "localhost:" + std::to_string(getFreeTcpPort());
         auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode,
-                                             RdmaDirectionMode::FORWARD);
+                                             TransferDirectionMode::FORWARD);
         ASSERT_NE(remote_writer, nullptr);
 
         const std::string key = "p2p_fwd_put_get_" + mode + "_" + host;

@@ -133,7 +133,7 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
     NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED =
-        -602,  ///< Non-contiguous buffer not supported in forward RDMA mode.
+        -602,  ///< Non-contiguous buffer not supported in forward transfer mode.
 
     // Engine operation errors (Range: -700 to -711)
     INVALID_WRITE = -700,    ///< Invalid write operation.
@@ -491,22 +491,22 @@ inline std::ostream& operator<<(
     return os;
 }
 
-// Who initiates TE/RDMA for the data plane: REVERSE matches the historical
-// target-initiated path and is the conventional default when unset optional or
-// client-level config omits an explicit override.
-enum class RdmaDirectionMode : uint8_t {
+// Who initiates the cross-node transfer for the data plane: REVERSE matches the
+// historical target-initiated path and is the conventional default when unset
+// optional or client-level config omits an explicit override.
+enum class TransferDirectionMode : uint8_t {
     REVERSE = 0,
     FORWARD = 1,
 };
 
 // Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
 inline std::ostream& operator<<(std::ostream& os,
-                                const RdmaDirectionMode& mode) noexcept {
+                                const TransferDirectionMode& mode) noexcept {
     switch (mode) {
-        case RdmaDirectionMode::REVERSE:
+        case TransferDirectionMode::REVERSE:
             os << "REVERSE";
             break;
-        case RdmaDirectionMode::FORWARD:
+        case TransferDirectionMode::FORWARD:
             os << "FORWARD";
             break;
         default:

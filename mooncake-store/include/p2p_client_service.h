@@ -245,7 +245,7 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const WriteRouteRequestConfig& route_config,
-        RdmaDirectionMode rdma_direction_mode);
+        TransferDirectionMode transfer_direction_mode);
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutDegraded(
         const std::vector<ObjectKey>& keys,
@@ -255,13 +255,13 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const WriteRouteRequestConfig& route_config,
-        RdmaDirectionMode rdma_direction_mode);
+        TransferDirectionMode transfer_direction_mode);
 
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
     CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
                               std::vector<std::vector<Slice>>& batched_slices,
                               const WriteRouteRequestConfig& route_config,
-                              RdmaDirectionMode rdma_direction_mode,
+                              TransferDirectionMode transfer_direction_mode,
                               BatchGetWriteRouteResponse& batch_resp);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
@@ -305,13 +305,13 @@ class P2PClientService final : public ClientService {
         std::string endpoint;
         DataManager* forward_dm = nullptr;
         std::vector<Slice>* forward_slices = nullptr;
-        RdmaDirectionMode rdma_direction_mode = RdmaDirectionMode::REVERSE;
+        TransferDirectionMode transfer_direction_mode = TransferDirectionMode::REVERSE;
 
         RemoteWriteOp(P2PClientService* owner, PeerClient* p,
                       std::shared_ptr<RemoteWriteRequest> wr,
                       P2PProxyDescriptor px, RouteCache* rc, std::string ep,
                       DataManager* fwd_dm, std::vector<Slice>* fwd_slices,
-                      RdmaDirectionMode rdma_mode)
+                      TransferDirectionMode transfer_mode)
             : owner_service(owner),
               peer_ptr(p),
               write_req(std::move(wr)),
@@ -320,7 +320,7 @@ class P2PClientService final : public ClientService {
               endpoint(std::move(ep)),
               forward_dm(fwd_dm),
               forward_slices(fwd_slices),
-              rdma_direction_mode(rdma_mode) {}
+              transfer_direction_mode(transfer_mode) {}
 
         std::string_view route() const override { return endpoint; }
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
@@ -329,7 +329,7 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
                   const WriteRouteRequestConfig& config,
-                  RdmaDirectionMode rdma_direction_mode,
+                  TransferDirectionMode transfer_direction_mode,
                   std::vector<WriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(
@@ -432,13 +432,13 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<ReadTaskHandle, ErrorCode> InnerGetViaRoute(
         std::string_view key, std::vector<Slice>& slices, RouteIterator iter,
-        RdmaDirectionMode rdma_direction_mode);
+        TransferDirectionMode transfer_direction_mode);
 
     async_simple::coro::Lazy<void> RunReadWithRetry(
         RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise,
-        RdmaDirectionMode rdma_direction_mode);
+        TransferDirectionMode transfer_direction_mode);
 
     // true = promise set, caller co_return; false = try next route (incl. hard
     // UnPin failure after TE success on this replica).
@@ -502,8 +502,8 @@ class P2PClientService final : public ClientService {
     // HA recovery manager
     std::unique_ptr<HARecoveryManager> ha_manager_;
 
-    // Cross-node RDMA direction from P2PClientConfig at Init().
-    RdmaDirectionMode rdma_direction_mode_ = RdmaDirectionMode::REVERSE;
+    // Cross-node transfer direction from P2PClientConfig at Init().
+    TransferDirectionMode transfer_direction_mode_ = TransferDirectionMode::REVERSE;
 };
 
 }  // namespace mooncake

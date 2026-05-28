@@ -32,7 +32,7 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
               P2PClientConfig::kP2pDefaultKeyLeaseDurationMs);
     EXPECT_EQ(config.p2p_key_lease_scan_interval_ms,
               P2PClientConfig::kP2pDefaultKeyLeaseScanIntervalMs);
-    EXPECT_EQ(config.rdma_direction_mode, RdmaDirectionMode::REVERSE);
+    EXPECT_EQ(config.transfer_direction_mode, TransferDirectionMode::REVERSE);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigKeyLeaseOverrides) {
@@ -57,17 +57,17 @@ TEST(ClientConfigBuilderTest,
     EXPECT_EQ(config.local_transfer_mode, LocalTransferMode::MEMCPY);
 }
 
-TEST(ClientConfigBuilderTest, BuildP2PClientConfigParsesRdmaDirectionMode) {
+TEST(ClientConfigBuilderTest, BuildP2PClientConfigParsesTransferDirectionMode) {
     auto forward = ClientConfigBuilder::build_p2p_real_client(
         "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",
         std::nullopt, "127.0.0.1:50051", kTieredConfigJson, 0, nullptr, "",
         12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32, 9003,
         true, {}, 0, 2000, 0, 0, 0, "forward");
-    EXPECT_EQ(forward.rdma_direction_mode, RdmaDirectionMode::FORWARD);
+    EXPECT_EQ(forward.transfer_direction_mode, TransferDirectionMode::FORWARD);
 }
 
 TEST(ClientConfigBuilderTest,
-     BuildP2PClientConfigRejectsInvalidRdmaDirectionMode) {
+     BuildP2PClientConfigRejectsInvalidTransferDirectionMode) {
     EXPECT_THROW(
         ClientConfigBuilder::build_p2p_real_client(
             "127.0.0.1:12345", "http://127.0.0.1:8080/metadata", "tcp",

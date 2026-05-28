@@ -807,8 +807,8 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         return tl::make_unexpected(validate_result.error());
     }
 
-    // Reverse RDMA read stays on the direct object-handle path. Only forward
-    // RDMA read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
+    // Reverse transfer read stays on the direct object-handle path. Only forward
+    // transfer read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
     auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
         LOG(ERROR) << "ReadRemoteData: Get failed"
@@ -865,7 +865,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     size_t total_size = 0;
     for (const auto& buf : src_buffers) total_size += buf.size;
 
-    // Reverse RDMA path: still one RPC, but internally use the 3-phase write
+    // Reverse transfer path: still one RPC, but internally use the 3-phase write
     // model (PreWrite -> transfer -> WriteCommit). Target tier may be non-DRAM.
     auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id, false);
     if (!prewrite_result) {
@@ -1447,7 +1447,7 @@ DataManager::SubmitTeTransferBatches(
     return submitted_batches;
 }
 
-tl::expected<void, ErrorCode> DataManager::TransferWithTeNoTierStaging(
+tl::expected<void, ErrorCode> DataManager::TransferData(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1458,7 +1458,7 @@ tl::expected<void, ErrorCode> DataManager::TransferWithTeNoTierStaging(
     size_t total_remote_size = 0;
     for (const auto& buf : peer_buffers) total_remote_size += buf.size;
     if (total_remote_size != total_size) {
-        LOG(ERROR) << "TransferWithTeNoTierStaging: peer buffer size mismatch ("
+        LOG(ERROR) << "TransferData: peer buffer size mismatch ("
                    << total_remote_size << " vs " << total_size << ")";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1473,7 +1473,7 @@ tl::expected<void, ErrorCode> DataManager::TransferWithTeNoTierStaging(
     }
     auto wait_result = WaitAllTransferBatches(batches.value());
     if (!wait_result) {
-        LOG(ERROR) << "TransferWithTeNoTierStaging: WaitAllTransferBatches "
+        LOG(ERROR) << "TransferData: WaitAllTransferBatches "
                       "failed: "
                    << toString(wait_result.error());
         return wait_result;

@@ -240,15 +240,15 @@ class DataManager {
                                            const UUID& read_operation_id);
 
     /**
-     * @brief TE transfer without tier DRAM staging (PrepareDRAM*).
+     * @brief Transfer data between local TE-ready memory and remote buffers.
      *
      * Caller guarantees `local_transfer_base` covers a contiguous layout of
      * `total_size` bytes that is valid for TransferEngine (typically registered
-     * DRAM). Used by forward RDMA paths where buffers are already TE-ready.
+     * DRAM).
      *
      * @param opcode WRITE: local -> peer_buffers; READ: peer_buffers -> local
      */
-    tl::expected<void, ErrorCode> TransferWithTeNoTierStaging(
+    tl::expected<void, ErrorCode> TransferData(
         void* local_transfer_base, size_t total_size,
         const std::vector<RemoteBufferDesc>& peer_buffers,
         Transport::TransferRequest::OpCode opcode);
