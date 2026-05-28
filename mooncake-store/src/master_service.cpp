@@ -4672,9 +4672,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::vector<std::chrono::system_clock::time_point> candidates;
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();
              it++) {
-            if (it->second.IsEvictionProtected(steady_now)) {
-                continue;
-            }
             if (!it->second.IsLeaseExpired(now) || !can_evict_replicas(it->second)) {
                 continue;
             }
@@ -4699,8 +4696,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second.IsEvictionProtected(steady_now) ||
-                !it->second.IsLeaseExpired(now) ||
+            if (!it->second.IsLeaseExpired(now) ||
                 it->second.IsSoftPinned(now) ||
                 !can_evict_replicas(it->second)) {
                 ++it;
