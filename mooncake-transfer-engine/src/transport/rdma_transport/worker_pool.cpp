@@ -241,18 +241,19 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
-            LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first << ", mark it inactive";
+            // Do NOT mark the endpoint (or the local RNIC) inactive on a
+            // single handshake failure. At N-node x M-engine scale the first
+            // transfer kicks off a synchronized handshake burst where a
+            // handful of TCP round-trips fail transiently (connection refused
+            // during peer startup, partial reads, etc). Marking inactive on
+            // first failure cascades to thousands of failed transfers and a
+            // 0% external-cache hit rate. Instead, log, requeue the slices
+            // via failed_slice_list, and rely on the redispatch path +
+            // retry_cnt (bounded by max_retry_cnt) to eventually succeed once
+            // the peer is ready.
+            LOG(WARNING) << "Worker: transient handshake failure for endpoint: "
+                         << entry.first << ", requeuing slices for retry";
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            endpoint->set_active(false);
-            failed_nr_polls++;
-            if (context_.active() && failed_nr_polls > 32 &&
-                !success_nr_polls) {
-                LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
-                    << context_.nicPath() << ", mark it inactive";
-                context_.set_active(false);
-            }
             entry.second.clear();
             continue;
         }

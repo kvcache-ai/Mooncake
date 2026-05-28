@@ -1650,6 +1650,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    // Cap the total wait at the batch level. The per-future get() has its own
+    // internal timeout (~60s); without a batch-level cap the worst-case wait
+    // compounds linearly in pending_transfers size (e.g. 62 ops × 60s), which
+    // can stall the 2-phase PUT for the whole benchmark window and leave keys
+    // "reserved but never committed" at the master so that batch_is_exist
+    // returns 0 for them indefinitely.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(600);
+
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -1668,6 +1677,19 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         size_t failed_transfer_idx = 0;
 
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
+            // If the batch-level deadline has passed and this future is still
+            // not ready, skip the blocking get() so we don't serialize an
+            // extra 60s timeout per remaining future.
+            if (std::chrono::steady_clock::now() >= deadline &&
+                !op.pending_transfers[i].isReady()) {
+                if (all_transfers_succeeded) {
+                    first_error = ErrorCode::TRANSFER_FAIL;
+                    failed_transfer_idx = i;
+                    all_transfers_succeeded = false;
+                }
+                continue;
+            }
+
             ErrorCode transfer_result = op.pending_transfers[i].get();
             if (transfer_result != ErrorCode::OK) {
                 if (all_transfers_succeeded) {

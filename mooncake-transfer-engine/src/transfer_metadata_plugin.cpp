@@ -22,12 +22,15 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <random>
+#include <vector>
 
 #ifdef USE_REDIS
 #include <hiredis/hiredis.h>
-
-#include <mutex>
 #endif
 
 #ifdef USE_HTTP
@@ -632,6 +635,19 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             listener_running_ = false;
             listener_.join();
         }
+        // Tell the bounded worker pool to drain and exit.
+        {
+            std::lock_guard<std::mutex> lk(queue_mutex_);
+            queue_shutdown_ = true;
+        }
+        queue_cv_.notify_all();
+        for (auto &t : worker_pool_) {
+            if (t.joinable()) t.join();
+        }
+        // Close any fds left in the queue (e.g. shutdown raced with
+        // accept) so we don't leak descriptors to the next run.
+        for (int fd : pending_fds_) close(fd);
+        pending_fds_.clear();
         closeListen();
     }
 
@@ -724,6 +740,23 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
+        // Fixed-size worker pool for handshake processing. We process each
+        // accepted connection on a worker (off the accept loop) so that the
+        // per-connection work — running the callback and waiting for the
+        // client half-close — cannot stall accept() under a thundering-herd
+        // burst (32-peer mesh => ~1000 pair-wise handshakes within ~50ms).
+        // A bounded pool is preferable to thread-per-connection: it
+        // eliminates the worst-case thread-explosion under DoS-shaped
+        // bursts and the std::thread-throws-on-EAGAIN footgun.
+        {
+            std::lock_guard<std::mutex> lk(queue_mutex_);
+            queue_shutdown_ = false;
+        }
+        worker_pool_.reserve(kHandshakeWorkerCount);
+        for (size_t i = 0; i < kHandshakeWorkerCount; ++i) {
+            worker_pool_.emplace_back([this]() { workerLoop(); });
+        }
+
         listener_running_ = true;
         listener_ = std::thread([this]() {
             while (listener_running_) {
@@ -754,79 +787,113 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                auto peer_hostname =
-                    getNetworkAddress((struct sockaddr *)&addr);
-
-                Json::Value local, peer;
-
-                auto [type, json_str] = readString(conn_fd);
-                std::string errs;
-                if (!parseJsonString(json_str, peer, &errs)) {
-                    LOG(ERROR)
-                        << "SocketHandShakePlugin: failed to receive "
-                           "handshake message, "
-                           "malformed json format: "
-                        << errs << ", json string length: " << json_str.size()
-                        << ", json string content: " << json_str;
+                // Hand the fd to a worker. If the queue is at capacity the
+                // listener parks here briefly, but this is much rarer than
+                // the accept-loop stall the bounded pool replaces.
+                std::unique_lock<std::mutex> lk(queue_mutex_);
+                queue_cv_.notify_one();
+                if (pending_fds_.size() >= kHandshakeQueueHighWater) {
+                    // Backpressure: too many already pending. Drop the
+                    // newest accepted fd and let the client retry (Fix B
+                    // on the client side covers this with exponential
+                    // backoff). Far better than blowing past memory.
+                    lk.unlock();
+                    LOG_EVERY_N(WARNING, 100)
+                        << "SocketHandShakePlugin: queue full ("
+                        << kHandshakeQueueHighWater
+                        << "), dropping incoming handshake; client should "
+                           "retry";
                     close(conn_fd);
                     continue;
                 }
-
-                // old protocol equals Connection type
-                if (type == HandShakeRequestType::Connection ||
-                    type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_)
-                        on_connection_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_)
-                        on_metadata_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Notify) {
-                    if (on_notify_callback_) on_notify_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Probe) {
-                    if (on_probe_callback_) on_probe_callback_(peer, local);
-                } else {
-                    LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
-                                  "message type";
-                    close(conn_fd);
-                    continue;
-                }
-
-                int ret =
-                    writeString(conn_fd, type, Json::FastWriter{}.write(local));
-                if (ret) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to send "
-                                  "message: "
-                                  "malformed json format, check tcp connection";
-                    close(conn_fd);
-                    continue;
-                }
-
-                ret = shutdown(conn_fd, SHUT_WR);
-                if (ret) {
-                    PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
-                                   "connection may be incomplete";
-                    close(conn_fd);
-                    continue;
-                }
-
-                // Wait for the client to close the connection
-                char byte;
-                ssize_t rc = read(conn_fd, &byte, sizeof(byte));
-                if (rc > 0) {
-                    LOG(ERROR) << "Unexpected socket read result: " << rc
-                               << ", byte: " << int(byte);
-                } else if (rc < 0) {
-                    PLOG(ERROR)
-                        << "Socket read failed while waiting client to close";
-                }
-                // else rc == 0, client close the connection, safe to close.
-
-                close(conn_fd);
+                pending_fds_.push_back(conn_fd);
             }
             return;
         });
 
         return 0;
+    }
+
+    void workerLoop() {
+        while (true) {
+            int conn_fd = -1;
+            {
+                std::unique_lock<std::mutex> lk(queue_mutex_);
+                queue_cv_.wait(lk, [this] {
+                    return queue_shutdown_ || !pending_fds_.empty();
+                });
+                if (queue_shutdown_ && pending_fds_.empty()) return;
+                conn_fd = pending_fds_.front();
+                pending_fds_.pop_front();
+            }
+            handleConnection(conn_fd);
+        }
+    }
+
+    void handleConnection(int conn_fd) {
+        Json::Value local, peer;
+
+        auto [type, json_str] = readString(conn_fd);
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
+                          "handshake message, "
+                          "malformed json format: "
+                       << errs << ", json string length: " << json_str.size()
+                       << ", json string content: " << json_str;
+            close(conn_fd);
+            return;
+        }
+
+        // old protocol equals Connection type
+        if (type == HandShakeRequestType::Connection ||
+            type == HandShakeRequestType::OldProtocol) {
+            if (on_connection_callback_) on_connection_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Metadata) {
+            if (on_metadata_callback_) on_metadata_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Notify) {
+            if (on_notify_callback_) on_notify_callback_(peer, local);
+        } else if (type == HandShakeRequestType::Probe) {
+            if (on_probe_callback_) on_probe_callback_(peer, local);
+        } else {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: unexpected handshake message type";
+            close(conn_fd);
+            return;
+        }
+
+        int ret = writeString(conn_fd, type, Json::FastWriter{}.write(local));
+        if (ret) {
+            LOG(ERROR) << "SocketHandShakePlugin: failed to send "
+                          "message: "
+                          "malformed json format, check tcp connection";
+            close(conn_fd);
+            return;
+        }
+
+        ret = shutdown(conn_fd, SHUT_WR);
+        if (ret) {
+            PLOG(ERROR) << "SocketHandShakePlugin: shutdown() failed, "
+                           "connection may be incomplete";
+            close(conn_fd);
+            return;
+        }
+
+        // Wait for the client to close the connection so the kernel sends FIN
+        // rather than RST (a stray RST would abort the peer's read side before
+        // it consumed our response). Runs on a worker thread, so it no longer
+        // blocks the accept loop.
+        char byte;
+        ssize_t rc = read(conn_fd, &byte, sizeof(byte));
+        if (rc > 0) {
+            LOG(ERROR) << "Unexpected socket read result: " << rc
+                       << ", byte: " << int(byte);
+        } else if (rc < 0) {
+            PLOG(ERROR) << "Socket read failed while waiting client to close";
+        }
+        // else rc == 0, client close the connection, safe to close.
+
+        close(conn_fd);
     }
 
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
@@ -1169,6 +1236,25 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     std::thread listener_;
     int listen_fd_;
     int listen_backlog_;
+
+    // Bounded handshake worker pool. Sized at construction; defaults to
+    // a small constant but can be tuned via env var (see
+    // kHandshakeWorkerCount).
+    static constexpr size_t kDefaultHandshakeWorkerCount = 8;
+    static constexpr size_t kHandshakeQueueHighWater = 4096;
+    const size_t kHandshakeWorkerCount = []() {
+        const char *env = std::getenv("MC_HANDSHAKE_WORKERS");
+        if (env != nullptr) {
+            size_t v = static_cast<size_t>(std::max(1, atoi(env)));
+            return v > 256 ? size_t{256} : v;
+        }
+        return kDefaultHandshakeWorkerCount;
+    }();
+    std::vector<std::thread> worker_pool_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::deque<int> pending_fds_;
+    bool queue_shutdown_ = false;
 
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
