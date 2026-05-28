@@ -2401,27 +2401,27 @@ std::string MasterMetricManager::get_summary_string(
                   delta(&SummaryCounters::mark_task_to_complete_fails),
               delta(&SummaryCounters::mark_task_to_complete_requests))
        << ")";
-    // Eviction summary
+    // Eviction counters are cumulative. Request counters above are reported as
+    // window rates, but eviction totals are used to track long-running pressure
+    // and should not reset after each admin metrics snapshot.
     ss << " | Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::eviction_success)
-       << "/" << delta(&SummaryCounters::eviction_attempts) << ", "
+       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
+       << ", "
        << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
-       << "keys=" << delta(&SummaryCounters::evicted_key_count) << ", "
-       << "size=" << byte_size_to_string(delta(&SummaryCounters::evicted_size));
+       << "keys=" << evicted_key_count << ", "
+       << "size=" << byte_size_to_string(evicted_size);
     // mem eviction
     ss << " | Mem Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::mem_eviction_success)
-       << "/" << delta(&SummaryCounters::mem_eviction_attempts) << ", "
-       << "keys=" << delta(&SummaryCounters::mem_evicted_key_count) << ", "
-       << "size="
-       << byte_size_to_string(delta(&SummaryCounters::mem_evicted_size));
+       << "Success/Attempts=" << mem_eviction_success << "/"
+       << mem_eviction_attempts << ", "
+       << "keys=" << mem_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(mem_evicted_size);
     // nof eviction
     ss << " | NoF Eviction: "
-       << "Success/Attempts=" << delta(&SummaryCounters::nof_eviction_success)
-       << "/" << delta(&SummaryCounters::nof_eviction_attempts) << ", "
-       << "keys=" << delta(&SummaryCounters::nof_evicted_key_count) << ", "
-       << "size="
-       << byte_size_to_string(delta(&SummaryCounters::nof_evicted_size));
+       << "Success/Attempts=" << nof_eviction_success << "/"
+       << nof_eviction_attempts << ", "
+       << "keys=" << nof_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(nof_evicted_size);
 
     // Discard summary
     ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"

@@ -792,13 +792,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                 static_cast<int8_t>(storage_level) !=
                     static_cast<int8_t>(
                         buffer_result.value()->getStorageLevel())) {
-                LOG(WARNING)
-                    << "Replica storage_level mismatch: serialized="
-                    << static_cast<int>(storage_level) << " allocator="
-                    << static_cast<int>(
-                           buffer_result.value()->getStorageLevel())
-                    << "; restoring serialized value (expected during "
-                       "cross-hardware snapshot restore)";
+                LOG(WARNING) << "Replica storage_level mismatch: serialized="
+                             << static_cast<int>(storage_level) << " allocator="
+                             << static_cast<int>(
+                                    buffer_result.value()->getStorageLevel())
+                             << "; restoring serialized value (expected during "
+                                "cross-hardware snapshot restore)";
             }
             replica = std::make_shared<Replica>(
                 std::move(buffer_result.value()), status);

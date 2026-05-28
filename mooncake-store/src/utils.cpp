@@ -43,6 +43,10 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #include "ascend_allocator.h"
 #endif
 
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
+
 #include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
@@ -101,7 +105,7 @@ AutoPortBinder::~AutoPortBinder() {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment) {
+                                       size_t alignment, bool use_spdk_dma) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -113,7 +117,12 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return ascend_allocate_memory(total_size, protocol);
     }
 #endif
-
+#ifdef USE_NOF
+    if (use_spdk_dma && total_size > 0) {
+        return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
+                                                          -1);
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }

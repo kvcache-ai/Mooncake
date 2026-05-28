@@ -89,6 +89,22 @@ cpp-api
 metrics
 :::
 
+## TENT Quality of Service
+
+:::{toctree}
+:maxdepth: 1
+
+qos
+:::
+
+## TENT Slice Spraying
+
+:::{toctree}
+:maxdepth: 1
+
+slice-spraying
+:::
+
 ## TENT Failover
 
 :::{toctree}

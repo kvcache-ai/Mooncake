@@ -822,6 +822,11 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
+    if (keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
+                   << ", sizes=" << sizes.size();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
@@ -833,7 +838,11 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
-        assert(sizes[i] <= kMaxSliceSize);
+        if (sizes[i] < 0 || sizes[i] > config_.local_buffer_size) {
+            LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
+                       << " (limit: " << config_.local_buffer_size << ")";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         // Allocate oversized buffer for O_DIRECT alignment:
         //   +4096 for aligning the ptr to 4096 boundary

@@ -92,6 +92,19 @@ struct ReplicateConfig {
     bool prefer_alloc_in_same_node{false};
     StorageLevel preferred_storage_level{StorageLevel::RAM};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    // Optional per-key routing group IDs. Empty string keeps that key
+    // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
+    // and memory eviction behavior.
+    std::optional<std::vector<std::string>> group_ids{};
+
+    ReplicateConfig ForSingleKey(size_t key_index) const {
+        ReplicateConfig key_config = *this;
+        if (group_ids.has_value()) {
+            key_config.group_ids =
+                std::vector<std::string>{group_ids->at(key_index)};
+        }
+        return key_config;
+    }
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -119,7 +132,16 @@ struct ReplicateConfig {
            << config.prefer_alloc_in_same_node;
         os << ", preferred_storage_level: "
            << static_cast<int>(config.preferred_storage_level)
-           << ", data_type: " << config.data_type << " }";
+           << ", data_type: " << config.data_type;
+        if (config.group_ids.has_value()) {
+            os << ", group_ids: [";
+            for (size_t i = 0; i < config.group_ids->size(); ++i) {
+                os << config.group_ids->at(i);
+                if (i + 1 < config.group_ids->size()) os << ", ";
+            }
+            os << "]";
+        }
+        os << " }";
         return os;
     }
 };

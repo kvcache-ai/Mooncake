@@ -948,7 +948,8 @@ void TcpTransport::startTransfer(Slice* slice) {
         }
         if (enable_connection_pool_) {
             // Remove the connection from pool if it was pooled
-            ConnectionKey key{meta_entry.ip_or_host_name, desc->tcp_data_port};
+            ConnectionKey key{meta_entry.ip_or_host_name,
+                              static_cast<uint16_t>(desc->tcp_data_port)};
             std::lock_guard<std::mutex> lock(pool_mutex_);
             auto it = connection_pool_.find(key);
             if (it != connection_pool_.end()) {

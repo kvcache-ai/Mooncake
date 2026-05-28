@@ -656,7 +656,7 @@ TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
     ASSERT_EQ(metrics.get_put_start_failures(), put_start_failures_before + 1);
 }
 
-TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
+TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
     auto& metrics = MasterMetricManager::instance();
 
     const std::string baseline_summary =
@@ -671,6 +671,10 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
     metrics.inc_batch_put_start_partial_success(2);
     metrics.inc_eviction_success(3, 4096);
     metrics.inc_eviction_fail();
+    metrics.inc_mem_eviction_success(3, 4096);
+    metrics.inc_mem_eviction_fail();
+    metrics.inc_nof_eviction_success(1, 2048);
+    metrics.inc_nof_eviction_fail();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const std::string window_summary = metrics.get_summary_string();
@@ -685,6 +689,12 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
         window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
                             "keys=3, size=4.00 KB"),
         std::string::npos);
+    EXPECT_NE(window_summary.find("Mem Eviction: Success/Attempts=1/2, "
+                                  "keys=3, size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(window_summary.find("NoF Eviction: Success/Attempts=1/2, "
+                                  "keys=1, size=2.00 KB"),
+              std::string::npos);
 
     const std::string reported_summary =
         metrics.get_summary_string_and_update_snapshot();
@@ -697,8 +707,14 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndEvictionDeltas) {
     const std::string idle_summary =
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
-    EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=0/0, "
-                                "AllocFail=0, keys=0, size=0 B"),
+    EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=1/2, "
+                                "AllocFail=0, keys=3, size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(idle_summary.find("Mem Eviction: Success/Attempts=1/2, "
+                                "keys=3, size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(idle_summary.find("NoF Eviction: Success/Attempts=1/2, "
+                                "keys=1, size=2.00 KB"),
               std::string::npos);
 }
 
