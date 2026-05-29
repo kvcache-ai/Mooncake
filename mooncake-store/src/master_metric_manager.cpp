@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
+#include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
@@ -31,6 +32,18 @@ MasterMetricManager::MasterMetricManager()
       mem_total_capacity_per_segment_(
           "segment_total_capacity_bytes",
           "Total memory capacity of the mounted segment", {"segment"}),
+      nof_allocated_size_(
+          "master_nof_allocated_bytes",
+          "Total nof ssd bytes currently allocated across all segments"),
+      nof_total_capacity_("master_total_nof_capacity_bytes",
+                          "Total nof ssd capacity across all mounted segments"),
+      nof_allocated_size_per_segment_(
+          "nof_segment_allocated_bytes",
+          "Total nof ssd bytes currently allocated of the segment",
+          {"segment"}),
+      nof_total_capacity_per_segment_(
+          "nof_segment_total_capacity_bytes",
+          "Total nof ssd capacity of the mounted segment", {"segment"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
@@ -54,6 +67,10 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of PutStart requests received"),
       put_start_failures_("master_put_start_failures_total",
                           "Total number of failed PutStart requests"),
+      put_start_alloc_failures_(
+          "master_put_start_alloc_failures_total",
+          "Total number of PutStart failures caused by replica allocation "
+          "failure"),
       put_end_requests_("master_put_end_requests_total",
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
@@ -109,10 +126,44 @@ MasterMetricManager::MasterMetricManager()
       remount_segment_failures_(
           "master_remount_segment_failures_total",
           "Total number of failed RemountSegment requests"),
+      mount_nof_segment_requests_(
+          "master_mount_nof_segment_requests_total",
+          "Total number of MountNoFSegment requests received"),
+      mount_nof_segment_failures_(
+          "master_mount_nof_segment_failures_total",
+          "Total number of failed MountNoFSegment requests"),
+      unmount_nof_segment_requests_(
+          "master_unmount_nof_segment_requests_total",
+          "Total number of UnmountNoFSegment requests received"),
+      unmount_nof_segment_failures_(
+          "master_unmount_nof_segment_failures_total",
+          "Total number of failed UnmountNoFSegment requests"),
+      remount_nof_segment_requests_(
+          "master_remount_nof_segment_requests_total",
+          "Total number of RemountNoFSegment requests received"),
+      remount_nof_segment_failures_(
+          "master_remount_nof_segment_failures_total",
+          "Total number of failed RemountNoFSegment requests"),
       ping_requests_("master_ping_requests_total",
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+      nof_heartbeat_success_total_(
+          "master_nof_heartbeat_success_total",
+          "Total number of successful NoF heartbeat probes"),
+      nof_heartbeat_failure_total_(
+          "master_nof_heartbeat_failure_total",
+          "Total number of failed NoF heartbeat probes"),
+      nof_heartbeat_timeout_total_(
+          "master_nof_heartbeat_timeout_total",
+          "Total number of timed out NoF heartbeat probes"),
+      nof_segments_unmounted_by_heartbeat_total_(
+          "master_nof_segments_unmounted_by_heartbeat_total",
+          "Total number of NoF segments unmounted due to heartbeat failures"),
+      nof_heartbeat_probe_latency_ms_(
+          "master_nof_heartbeat_probe_latency_ms",
+          "Latency distribution of NoF heartbeat probes in milliseconds",
+          {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000}),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -218,20 +269,26 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
-      // Initialize cache hit rate metrics
+      // Initialize Store-observed cache reuse metrics. These are not
+      // end-to-end request/token-level cache hit ratio metrics.
       mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
+                          "Total number of GetReplicaList results served from "
+                          "the memory pool"),
       file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
+                           "Total number of GetReplicaList results served from "
+                           "the SSD cache"),
       mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
+                      "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
+                       "Current number of cached values in the SSD cache"),
       valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
+                      "Total number of GetReplicaList operations that returned "
+                      "at least one completed replica"),
+      total_get_nums_("total_get_nums_",
+                      "Total number of GetReplicaList operations"),
 
       // Initialize Eviction Counters
+      // total eviction
       eviction_success_("master_successful_evictions_total",
                         "Total number of successful eviction operations"),
       eviction_attempts_("master_attempted_evictions_total",
@@ -240,6 +297,28 @@ MasterMetricManager::MasterMetricManager()
                          "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
                     "Total bytes of evicted objects"),
+      // mem eviction
+      mem_eviction_success_(
+          "master_successful_evictions_mem",
+          "Total number of successful eviction operations in mem"),
+      mem_eviction_attempts_(
+          "master_attempted_evictions_mem",
+          "Total number of attempted eviction operations in mem"),
+      mem_evicted_key_count_("master_evicted_key_count_mem",
+                             "Total number of keys evicted in mem"),
+      mem_evicted_size_("master_evicted_size_bytes_mem",
+                        "Total bytes of evicted objects in mem"),
+      // nof eviction
+      nof_eviction_success_(
+          "master_successful_evictions_nof",
+          "Total number of successful eviction operations in nof"),
+      nof_eviction_attempts_(
+          "master_attempted_evictions_nof",
+          "Total number of attempted eviction operations in nof"),
+      nof_evicted_key_count_("master_evicted_key_count_nof",
+                             "Total number of keys evicted in nof"),
+      nof_evicted_size_("master_evicted_size_bytes_nof",
+                        "Total bytes of evicted objects in nof"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -342,6 +421,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Counters (use inc(0) to mark as changed)
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
+    put_start_alloc_failures_.inc(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
@@ -431,7 +511,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_items_.inc(0);
     batch_put_revoke_failed_items_.inc(0);
 
-    // Update cache hit rate metrics
+    // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
     valid_get_nums_.inc(0);
@@ -449,6 +529,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
+    nof_heartbeat_probe_latency_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -536,6 +617,76 @@ double MasterMetricManager::get_segment_mem_used_ratio(
     return allocated / capacity;
 }
 
+// NoF segment Metrics
+void MasterMetricManager::inc_allocated_nof_size(const std::string& segment,
+                                                 int64_t val) {
+    nof_allocated_size_.inc(val);
+    if (!segment.empty()) nof_allocated_size_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_nof_size(const std::string& segment,
+                                                 int64_t val) {
+    nof_allocated_size_.dec(val);
+    if (!segment.empty()) nof_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_allocated_nof_size() {
+    nof_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_nof_capacity(const std::string& segment,
+                                                 int64_t val) {
+    nof_total_capacity_.inc(val);
+    if (!segment.empty()) nof_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_nof_capacity(const std::string& segment,
+                                                 int64_t val) {
+    nof_total_capacity_.dec(val);
+    if (!segment.empty()) nof_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_nof_capacity() {
+    nof_total_capacity_.reset();
+}
+
+int64_t MasterMetricManager::get_allocated_nof_size() {
+    return nof_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_nof_capacity() {
+    return nof_total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_nof_used_ratio(void) {
+    double allocated = nof_allocated_size_.value();
+    double capacity = nof_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_nof_size(
+    const std::string& segment) {
+    return nof_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_nof_capacity(
+    const std::string& segment) {
+    return nof_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_nof_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_nof_size(segment);
+    double capacity = get_segment_total_nof_capacity(segment);
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
 // File Storage Metrics
 void MasterMetricManager::inc_allocated_file_size(int64_t val) {
     file_allocated_size_.inc(val);
@@ -551,15 +702,29 @@ void MasterMetricManager::dec_total_file_capacity(int64_t val) {
     file_total_capacity_.dec(val);
 }
 
+void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
+    dfs_capacity_unlimited_ = unlimited;
+}
+
+bool MasterMetricManager::is_dfs_capacity_unlimited() const {
+    return dfs_capacity_unlimited_;
+}
+
 int64_t MasterMetricManager::get_allocated_file_size() {
     return file_allocated_size_.value();
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
+    if (dfs_capacity_unlimited_) {
+        return std::numeric_limits<int64_t>::max();
+    }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
+    if (dfs_capacity_unlimited_) {
+        return 0.0;
+    }
     double allocated = file_allocated_size_.value();
     double capacity = file_total_capacity_.value();
     if (capacity == 0) {
@@ -602,7 +767,7 @@ int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
 }
 
-// cache hit rate metrics
+// Store-observed cache reuse metrics
 void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
     mem_cache_hit_nums_.inc(val);
 }
@@ -640,6 +805,9 @@ void MasterMetricManager::inc_put_start_requests(int64_t val) {
 }
 void MasterMetricManager::inc_put_start_failures(int64_t val) {
     put_start_failures_.inc(val);
+}
+void MasterMetricManager::inc_put_start_alloc_failures(int64_t val) {
+    put_start_alloc_failures_.inc(val);
 }
 void MasterMetricManager::inc_put_end_requests(int64_t val) {
     put_end_requests_.inc(val);
@@ -689,11 +857,23 @@ void MasterMetricManager::inc_mount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_mount_segment_failures(int64_t val) {
     mount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_mount_nof_segment_requests(int64_t val) {
+    mount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_mount_nof_segment_failures(int64_t val) {
+    mount_nof_segment_failures_.inc(val);
+}
 void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
     unmount_segment_requests_.inc(val);
 }
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
+}
+void MasterMetricManager::inc_unmount_nof_segment_requests(int64_t val) {
+    unmount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_unmount_nof_segment_failures(int64_t val) {
+    unmount_nof_segment_failures_.inc(val);
 }
 void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
     remount_segment_requests_.inc(val);
@@ -701,11 +881,39 @@ void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
 void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
     remount_segment_failures_.inc(val);
 }
+void MasterMetricManager::inc_remount_nof_segment_requests(int64_t val) {
+    remount_nof_segment_requests_.inc(val);
+}
+void MasterMetricManager::inc_remount_nof_segment_failures(int64_t val) {
+    remount_nof_segment_failures_.inc(val);
+}
 void MasterMetricManager::inc_ping_requests(int64_t val) {
     ping_requests_.inc(val);
 }
 void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_success_total(int64_t val) {
+    nof_heartbeat_success_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_failure_total(int64_t val) {
+    nof_heartbeat_failure_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_heartbeat_timeout_total(int64_t val) {
+    nof_heartbeat_timeout_total_.inc(val);
+}
+
+void MasterMetricManager::inc_nof_segments_unmounted_by_heartbeat_total(
+    int64_t val) {
+    nof_segments_unmounted_by_heartbeat_total_.inc(val);
+}
+
+void MasterMetricManager::observe_nof_heartbeat_probe_latency_ms(
+    int64_t latency_ms) {
+    nof_heartbeat_probe_latency_ms_.observe(latency_ms);
 }
 
 // Batch Operation Statistics (Counters)
@@ -830,6 +1038,10 @@ int64_t MasterMetricManager::get_put_start_requests() {
 
 int64_t MasterMetricManager::get_put_start_failures() {
     return put_start_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_alloc_failures() {
+    return put_start_alloc_failures_.value();
 }
 
 int64_t MasterMetricManager::get_put_end_requests() {
@@ -1079,6 +1291,30 @@ void MasterMetricManager::inc_eviction_success(int64_t key_count,
 
 void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
 
+void MasterMetricManager::inc_mem_eviction_success(int64_t key_count,
+                                                   int64_t size) {
+    mem_evicted_key_count_.inc(key_count);
+    mem_evicted_size_.inc(size);
+    mem_eviction_success_.inc();
+    mem_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_mem_eviction_fail() {
+    mem_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_nof_eviction_success(int64_t key_count,
+                                                   int64_t size) {
+    nof_evicted_key_count_.inc(key_count);
+    nof_evicted_size_.inc(size);
+    nof_eviction_success_.inc();
+    nof_eviction_attempts_.inc();
+}
+
+void MasterMetricManager::inc_nof_eviction_fail() {
+    nof_eviction_attempts_.inc();
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -1093,6 +1329,38 @@ int64_t MasterMetricManager::get_evicted_key_count() {
 
 int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_mem_eviction_success() {
+    return mem_eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_mem_eviction_attempts() {
+    return mem_eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_mem_evicted_key_count() {
+    return mem_evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_mem_evicted_size() {
+    return mem_evicted_size_.value();
+}
+
+int64_t MasterMetricManager::get_nof_eviction_success() {
+    return nof_eviction_success_.value();
+}
+
+int64_t MasterMetricManager::get_nof_eviction_attempts() {
+    return nof_eviction_attempts_.value();
+}
+
+int64_t MasterMetricManager::get_nof_evicted_key_count() {
+    return nof_evicted_key_count_.value();
+}
+
+int64_t MasterMetricManager::get_nof_evicted_size() {
+    return nof_evicted_size_.value();
 }
 
 // PutStart Discard Metrics Getters
@@ -1294,6 +1562,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(exist_key_failures_);
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
+    serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);
@@ -1316,6 +1585,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(remount_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
+    serialize_metric(nof_heartbeat_success_total_);
+    serialize_metric(nof_heartbeat_failure_total_);
+    serialize_metric(nof_heartbeat_timeout_total_);
+    serialize_metric(nof_segments_unmounted_by_heartbeat_total_);
+    serialize_metric(nof_heartbeat_probe_latency_ms_);
 
     // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // Counters
@@ -1396,25 +1670,33 @@ MasterMetricManager::calculate_cache_stats() {
     int64_t valid_get_nums = valid_get_nums_.value();
     int64_t total_get_nums = total_get_nums_.value();
 
-    double mem_hit_rate = 0.0;
+    // These values divide cumulative Store-observed hits by the current cached
+    // object count. They are not bounded request/token-level hit ratios; that
+    // end-to-end metric belongs to Conductor or the inference engine.
+    double mem_hits_per_current_cached_object = 0.0;
     if (mem_total_cache > 0) {
-        mem_hit_rate = static_cast<double>(mem_cache_hits) /
-                       static_cast<double>(mem_total_cache);
-        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+        mem_hits_per_current_cached_object =
+            static_cast<double>(mem_cache_hits) /
+            static_cast<double>(mem_total_cache);
+        mem_hits_per_current_cached_object =
+            std::round(mem_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double ssd_hit_rate = 0.0;
+    double ssd_hits_per_current_cached_object = 0.0;
     if (ssd_total_cache > 0) {
-        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
-                       static_cast<double>(ssd_total_cache);
-        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+        ssd_hits_per_current_cached_object =
+            static_cast<double>(ssd_cache_hits) /
+            static_cast<double>(ssd_total_cache);
+        ssd_hits_per_current_cached_object =
+            std::round(ssd_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double total_hit_rate = 0.0;
+    double overall_hits_per_current_cached_object = 0.0;
     if (total_cache > 0) {
-        total_hit_rate =
+        overall_hits_per_current_cached_object =
             static_cast<double>(total_hits) / static_cast<double>(total_cache);
-        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+        overall_hits_per_current_cached_object =
+            std::round(overall_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
     double valid_get_rate = 0.0;
@@ -1428,10 +1710,12 @@ MasterMetricManager::calculate_cache_stats() {
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
     add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE,
+                     mem_hits_per_current_cached_object);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE,
+                     ssd_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
-                     total_hit_rate);
+                     overall_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
     return stats_dict;
 }
@@ -1447,11 +1731,22 @@ void MasterMetricManager::add_stat_to_dict(
 
 // --- Human-Readable Summary ---
 std::string MasterMetricManager::get_summary_string() {
+    return get_summary_string(false);
+}
+
+std::string MasterMetricManager::get_summary_string_and_update_snapshot() {
+    return get_summary_string(true);
+}
+
+std::string MasterMetricManager::get_summary_string(
+    bool update_summary_snapshot) {
     std::stringstream ss;
 
     // --- Get current values ---
     int64_t mem_allocated = mem_allocated_size_.value();
     int64_t mem_capacity = mem_total_capacity_.value();
+    int64_t nof_allocated = nof_allocated_size_.value();
+    int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
@@ -1463,6 +1758,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t exist_key_fails = exist_key_failures_.value();
     int64_t put_starts = put_start_requests_.value();
     int64_t put_start_fails = put_start_failures_.value();
+    int64_t put_start_alloc_fails = put_start_alloc_failures_.value();
     int64_t put_ends = put_end_requests_.value();
     int64_t put_end_fails = put_end_failures_.value();
     int64_t put_revoke_requests = put_revoke_requests_.value();
@@ -1552,10 +1848,21 @@ std::string MasterMetricManager::get_summary_string() {
         batch_replica_clear_failed_items_.value();
 
     // Eviction counters
+    // Total counters
     int64_t eviction_success = eviction_success_.value();
     int64_t eviction_attempts = eviction_attempts_.value();
     int64_t evicted_key_count = evicted_key_count_.value();
     int64_t evicted_size = evicted_size_.value();
+    // Mem eviction counters
+    int64_t mem_eviction_success = mem_eviction_success_.value();
+    int64_t mem_eviction_attempts = mem_eviction_attempts_.value();
+    int64_t mem_evicted_key_count = mem_evicted_key_count_.value();
+    int64_t mem_evicted_size = mem_evicted_size_.value();
+    // NoF eviction counters
+    int64_t nof_eviction_success = nof_eviction_success_.value();
+    int64_t nof_eviction_attempts = nof_eviction_attempts_.value();
+    int64_t nof_evicted_key_count = nof_evicted_key_count_.value();
+    int64_t nof_evicted_size = nof_evicted_size_.value();
 
     // Ping counters
     int64_t ping = ping_requests_.value();
@@ -1567,6 +1874,162 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t put_start_discarded_staging_size =
         put_start_discarded_staging_size_.value();
 
+    SummaryCounters current_counters;
+    current_counters.exist_keys = exist_keys;
+    current_counters.exist_key_fails = exist_key_fails;
+    current_counters.put_starts = put_starts;
+    current_counters.put_start_fails = put_start_fails;
+    current_counters.put_start_alloc_fails = put_start_alloc_fails;
+    current_counters.put_ends = put_ends;
+    current_counters.put_end_fails = put_end_fails;
+    current_counters.put_revoke_requests = put_revoke_requests;
+    current_counters.put_revoke_fails = put_revoke_fails;
+    current_counters.get_replicas = get_replicas;
+    current_counters.get_replica_fails = get_replica_fails;
+    current_counters.removes = removes;
+    current_counters.remove_fails = remove_fails;
+    current_counters.remove_all = remove_all;
+    current_counters.remove_all_fails = remove_all_fails;
+    current_counters.create_move_tasks = create_move_tasks;
+    current_counters.create_move_task_fails = create_move_task_fails;
+    current_counters.create_copy_tasks = create_copy_tasks;
+    current_counters.create_copy_task_fails = create_copy_task_fails;
+    current_counters.query_tasks = query_tasks;
+    current_counters.query_task_fails = query_task_fails;
+    current_counters.fetch_tasks = fetch_tasks;
+    current_counters.fetch_task_fails = fetch_task_fails;
+    current_counters.copy_starts = copy_starts;
+    current_counters.copy_start_fails = copy_start_fails;
+    current_counters.copy_ends = copy_ends;
+    current_counters.copy_end_fails = copy_end_fails;
+    current_counters.copy_revokes = copy_revokes;
+    current_counters.copy_revoke_fails = copy_revoke_fails;
+    current_counters.move_starts = move_starts;
+    current_counters.move_start_fails = move_start_fails;
+    current_counters.move_ends = move_ends;
+    current_counters.move_end_fails = move_end_fails;
+    current_counters.move_revokes = move_revokes;
+    current_counters.move_revoke_fails = move_revoke_fails;
+    current_counters.evict_disk_replicas = evict_disk_replicas;
+    current_counters.evict_disk_replica_fails = evict_disk_replica_fails;
+    current_counters.batch_put_start_requests = batch_put_start_requests;
+    current_counters.batch_put_start_fails = batch_put_start_fails;
+    current_counters.batch_put_start_partial_successes =
+        batch_put_start_partial_successes;
+    current_counters.batch_put_start_items = batch_put_start_items;
+    current_counters.batch_put_start_failed_items =
+        batch_put_start_failed_items;
+    current_counters.batch_put_end_requests = batch_put_end_requests;
+    current_counters.batch_put_end_fails = batch_put_end_fails;
+    current_counters.batch_put_end_partial_successes =
+        batch_put_end_partial_successes;
+    current_counters.batch_put_end_items = batch_put_end_items;
+    current_counters.batch_put_end_failed_items = batch_put_end_failed_items;
+    current_counters.batch_put_revoke_requests = batch_put_revoke_requests;
+    current_counters.batch_put_revoke_fails = batch_put_revoke_fails;
+    current_counters.batch_put_revoke_partial_successes =
+        batch_put_revoke_partial_successes;
+    current_counters.batch_put_revoke_items = batch_put_revoke_items;
+    current_counters.batch_put_revoke_failed_items =
+        batch_put_revoke_failed_items;
+    current_counters.batch_get_replica_list_requests =
+        batch_get_replica_list_requests;
+    current_counters.batch_get_replica_list_fails =
+        batch_get_replica_list_fails;
+    current_counters.batch_get_replica_list_partial_successes =
+        batch_get_replica_list_partial_successes;
+    current_counters.batch_get_replica_list_items =
+        batch_get_replica_list_items;
+    current_counters.batch_get_replica_list_failed_items =
+        batch_get_replica_list_failed_items;
+    current_counters.batch_exist_key_requests = batch_exist_key_requests;
+    current_counters.batch_exist_key_fails = batch_exist_key_fails;
+    current_counters.batch_exist_key_partial_successes =
+        batch_exist_key_partial_successes;
+    current_counters.batch_exist_key_items = batch_exist_key_items;
+    current_counters.batch_exist_key_failed_items =
+        batch_exist_key_failed_items;
+    current_counters.batch_query_ip_requests = batch_query_ip_requests;
+    current_counters.batch_query_ip_fails = batch_query_ip_fails;
+    current_counters.batch_query_ip_partial_successes =
+        batch_query_ip_partial_successes;
+    current_counters.batch_query_ip_items = batch_query_ip_items;
+    current_counters.batch_query_ip_failed_items = batch_query_ip_failed_items;
+    current_counters.batch_replica_clear_requests =
+        batch_replica_clear_requests;
+    current_counters.batch_replica_clear_fails = batch_replica_clear_fails;
+    current_counters.batch_replica_clear_partial_successes =
+        batch_replica_clear_partial_successes;
+    current_counters.batch_replica_clear_items = batch_replica_clear_items;
+    current_counters.batch_replica_clear_failed_items =
+        batch_replica_clear_failed_items;
+    current_counters.eviction_success = eviction_success;
+    current_counters.eviction_attempts = eviction_attempts;
+    current_counters.evicted_key_count = evicted_key_count;
+    current_counters.evicted_size = evicted_size;
+    current_counters.mem_eviction_success = mem_eviction_success;
+    current_counters.mem_eviction_attempts = mem_eviction_attempts;
+    current_counters.mem_evicted_key_count = mem_evicted_key_count;
+    current_counters.mem_evicted_size = mem_evicted_size;
+    current_counters.nof_eviction_success = nof_eviction_success;
+    current_counters.nof_eviction_attempts = nof_eviction_attempts;
+    current_counters.nof_evicted_key_count = nof_evicted_key_count;
+    current_counters.nof_evicted_size = nof_evicted_size;
+    current_counters.ping = ping;
+    current_counters.ping_fails = ping_fails;
+    current_counters.mark_task_to_complete_requests =
+        mark_task_to_complete_requests_.value();
+    current_counters.mark_task_to_complete_fails =
+        mark_task_to_complete_failures_.value();
+
+    SummaryCounters previous_counters = current_counters;
+    bool has_previous_summary = false;
+    double elapsed_seconds = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(summary_snapshot_mutex_);
+        has_previous_summary = summary_snapshot_.initialized;
+        if (has_previous_summary) {
+            previous_counters = summary_snapshot_.counters;
+            elapsed_seconds =
+                std::chrono::duration<double>(now - summary_snapshot_.timestamp)
+                    .count();
+        }
+        if (update_summary_snapshot) {
+            summary_snapshot_.initialized = true;
+            summary_snapshot_.timestamp = now;
+            summary_snapshot_.counters = current_counters;
+        }
+    }
+
+    auto delta = [&](int64_t SummaryCounters::* field) {
+        if (!has_previous_summary) {
+            return int64_t{0};
+        }
+        int64_t value = current_counters.*field - previous_counters.*field;
+        return value > 0 ? value : int64_t{0};
+    };
+    auto rate = [&](int64_t value) {
+        if (elapsed_seconds <= 0.0) {
+            return 0.0;
+        }
+        return static_cast<double>(value) / elapsed_seconds;
+    };
+    auto format_rate_value = [&](int64_t value) {
+        std::ostringstream rate_stream;
+        rate_stream << std::fixed << std::setprecision(2) << rate(value);
+        return rate_stream.str();
+    };
+    auto format_rate_pair = [&](int64_t success, int64_t total) {
+        return format_rate_value(success) + "/" + format_rate_value(total);
+    };
+    auto format_rate_triple = [&](int64_t success, int64_t partial_success,
+                                  int64_t total) {
+        return format_rate_value(success) + "/" +
+               format_rate_value(partial_success) + "/" +
+               format_rate_value(total);
+    };
+
     // --- Format the summary string ---
     ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
        << byte_size_to_string(mem_capacity);
@@ -1574,109 +2037,243 @@ std::string MasterMetricManager::get_summary_string() {
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
+    int64_t file_display_capacity = dfs_capacity_unlimited_
+                                        ? std::numeric_limits<int64_t>::max()
+                                        : file_capacity;
+    ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
+       << byte_size_to_string(nof_capacity);
+    if (nof_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
+    }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
-       << byte_size_to_string(file_capacity);
+       << byte_size_to_string(file_display_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 
-    // Request summary - focus on the most important metrics
-    ss << " | Requests (Success/Total): ";
-    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts
+    // Request summary - rate per second of the last window
+    ss << " | Requests (Success/Total per sec): ";
+    ss << "PutStart="
+       << format_rate_pair(delta(&SummaryCounters::put_starts) -
+                               delta(&SummaryCounters::put_start_fails),
+                           delta(&SummaryCounters::put_starts))
        << ", ";
-    ss << "PutEnd=" << put_ends - put_end_fails << "/" << put_ends << ", ";
-    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/"
-       << put_revoke_requests << ", ";
-    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
+    ss << "PutEnd="
+       << format_rate_pair(delta(&SummaryCounters::put_ends) -
+                               delta(&SummaryCounters::put_end_fails),
+                           delta(&SummaryCounters::put_ends))
        << ", ";
-    ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
-    ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
-    ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
+    ss << "PutRevoke="
+       << format_rate_pair(delta(&SummaryCounters::put_revoke_requests) -
+                               delta(&SummaryCounters::put_revoke_fails),
+                           delta(&SummaryCounters::put_revoke_requests))
        << ", ";
-    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
-    ss << "CopyStart=" << copy_starts - copy_start_fails << "/" << copy_starts
+    ss << "Get="
+       << format_rate_pair(delta(&SummaryCounters::get_replicas) -
+                               delta(&SummaryCounters::get_replica_fails),
+                           delta(&SummaryCounters::get_replicas))
        << ", ";
-    ss << "CopyEnd=" << copy_ends - copy_end_fails << "/" << copy_ends << ", ";
-    ss << "CopyRevoke=" << copy_revokes - copy_revoke_fails << "/"
-       << copy_revokes << ", ";
-    ss << "MoveStart=" << move_starts - move_start_fails << "/" << move_starts
+    ss << "Exist="
+       << format_rate_pair(delta(&SummaryCounters::exist_keys) -
+                               delta(&SummaryCounters::exist_key_fails),
+                           delta(&SummaryCounters::exist_keys))
        << ", ";
-    ss << "MoveEnd=" << move_ends - move_end_fails << "/" << move_ends << ", ";
-    ss << "MoveRevoke=" << move_revokes - move_revoke_fails << "/"
-       << move_revokes << ", ";
-    ss << "EvictDiskReplica=" << evict_disk_replicas - evict_disk_replica_fails
-       << "/" << evict_disk_replicas;
+    ss << "Del="
+       << format_rate_pair(delta(&SummaryCounters::removes) -
+                               delta(&SummaryCounters::remove_fails),
+                           delta(&SummaryCounters::removes))
+       << ", ";
+    ss << "DelAll="
+       << format_rate_pair(delta(&SummaryCounters::remove_all) -
+                               delta(&SummaryCounters::remove_all_fails),
+                           delta(&SummaryCounters::remove_all))
+       << ", ";
+    ss << "Ping="
+       << format_rate_pair(delta(&SummaryCounters::ping) -
+                               delta(&SummaryCounters::ping_fails),
+                           delta(&SummaryCounters::ping))
+       << ", ";
+    ss << "CopyStart="
+       << format_rate_pair(delta(&SummaryCounters::copy_starts) -
+                               delta(&SummaryCounters::copy_start_fails),
+                           delta(&SummaryCounters::copy_starts))
+       << ", ";
+    ss << "CopyEnd="
+       << format_rate_pair(delta(&SummaryCounters::copy_ends) -
+                               delta(&SummaryCounters::copy_end_fails),
+                           delta(&SummaryCounters::copy_ends))
+       << ", ";
+    ss << "CopyRevoke="
+       << format_rate_pair(delta(&SummaryCounters::copy_revokes) -
+                               delta(&SummaryCounters::copy_revoke_fails),
+                           delta(&SummaryCounters::copy_revokes))
+       << ", ";
+    ss << "MoveStart="
+       << format_rate_pair(delta(&SummaryCounters::move_starts) -
+                               delta(&SummaryCounters::move_start_fails),
+                           delta(&SummaryCounters::move_starts))
+       << ", ";
+    ss << "MoveEnd="
+       << format_rate_pair(delta(&SummaryCounters::move_ends) -
+                               delta(&SummaryCounters::move_end_fails),
+                           delta(&SummaryCounters::move_ends))
+       << ", ";
+    ss << "MoveRevoke="
+       << format_rate_pair(delta(&SummaryCounters::move_revokes) -
+                               delta(&SummaryCounters::move_revoke_fails),
+                           delta(&SummaryCounters::move_revokes))
+       << ", ";
+    ss << "EvictDiskReplica="
+       << format_rate_pair(
+              delta(&SummaryCounters::evict_disk_replicas) -
+                  delta(&SummaryCounters::evict_disk_replica_fails),
+              delta(&SummaryCounters::evict_disk_replicas));
 
     // Batch request summary
     ss << " | Batch Requests "
-          "(Req=Success/PartialSuccess/Total, Item=Success/Total): ";
+          "(per sec, Req=Success/PartialSuccess/Total, "
+          "Item=Success/Total): ";
     ss << "PutStart:(Req="
-       << batch_put_start_requests - batch_put_start_fails -
-              batch_put_start_partial_successes
-       << "/" << batch_put_start_partial_successes << "/"
-       << batch_put_start_requests
-       << ", Item=" << batch_put_start_items - batch_put_start_failed_items
-       << "/" << batch_put_start_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_start_requests) -
+                  delta(&SummaryCounters::batch_put_start_fails) -
+                  delta(&SummaryCounters::batch_put_start_partial_successes),
+              delta(&SummaryCounters::batch_put_start_partial_successes),
+              delta(&SummaryCounters::batch_put_start_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_start_items) -
+                  delta(&SummaryCounters::batch_put_start_failed_items),
+              delta(&SummaryCounters::batch_put_start_items))
+       << "), ";
     ss << "PutEnd:(Req="
-       << batch_put_end_requests - batch_put_end_fails -
-              batch_put_end_partial_successes
-       << "/" << batch_put_end_partial_successes << "/"
-       << batch_put_end_requests
-       << ", Item=" << batch_put_end_items - batch_put_end_failed_items << "/"
-       << batch_put_end_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_end_requests) -
+                  delta(&SummaryCounters::batch_put_end_fails) -
+                  delta(&SummaryCounters::batch_put_end_partial_successes),
+              delta(&SummaryCounters::batch_put_end_partial_successes),
+              delta(&SummaryCounters::batch_put_end_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_end_items) -
+                  delta(&SummaryCounters::batch_put_end_failed_items),
+              delta(&SummaryCounters::batch_put_end_items))
+       << "), ";
     ss << "PutRevoke:(Req="
-       << batch_put_revoke_requests - batch_put_revoke_fails -
-              batch_put_revoke_partial_successes
-       << "/" << batch_put_revoke_partial_successes << "/"
-       << batch_put_revoke_requests
-       << ", Item=" << batch_put_revoke_items - batch_put_revoke_failed_items
-       << "/" << batch_put_revoke_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_put_revoke_requests) -
+                  delta(&SummaryCounters::batch_put_revoke_fails) -
+                  delta(&SummaryCounters::batch_put_revoke_partial_successes),
+              delta(&SummaryCounters::batch_put_revoke_partial_successes),
+              delta(&SummaryCounters::batch_put_revoke_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_put_revoke_items) -
+                  delta(&SummaryCounters::batch_put_revoke_failed_items),
+              delta(&SummaryCounters::batch_put_revoke_items))
+       << "), ";
     ss << "Get:(Req="
-       << batch_get_replica_list_requests - batch_get_replica_list_fails -
-              batch_get_replica_list_partial_successes
-       << "/" << batch_get_replica_list_partial_successes << "/"
-       << batch_get_replica_list_requests << ", Item="
-       << batch_get_replica_list_items - batch_get_replica_list_failed_items
-       << "/" << batch_get_replica_list_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_get_replica_list_requests) -
+                  delta(&SummaryCounters::batch_get_replica_list_fails) -
+                  delta(&SummaryCounters::
+                            batch_get_replica_list_partial_successes),
+              delta(&SummaryCounters::batch_get_replica_list_partial_successes),
+              delta(&SummaryCounters::batch_get_replica_list_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_get_replica_list_items) -
+                  delta(&SummaryCounters::batch_get_replica_list_failed_items),
+              delta(&SummaryCounters::batch_get_replica_list_items))
+       << "), ";
     ss << "ExistKey:(Req="
-       << batch_exist_key_requests - batch_exist_key_fails -
-              batch_exist_key_partial_successes
-       << "/" << batch_exist_key_partial_successes << "/"
-       << batch_exist_key_requests
-       << ", Item=" << batch_exist_key_items - batch_exist_key_failed_items
-       << "/" << batch_exist_key_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_exist_key_requests) -
+                  delta(&SummaryCounters::batch_exist_key_fails) -
+                  delta(&SummaryCounters::batch_exist_key_partial_successes),
+              delta(&SummaryCounters::batch_exist_key_partial_successes),
+              delta(&SummaryCounters::batch_exist_key_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_exist_key_items) -
+                  delta(&SummaryCounters::batch_exist_key_failed_items),
+              delta(&SummaryCounters::batch_exist_key_items))
+       << "), ";
     ss << "QueryIp:(Req="
-       << batch_query_ip_requests - batch_query_ip_fails -
-              batch_query_ip_partial_successes
-       << "/" << batch_query_ip_partial_successes << "/"
-       << batch_query_ip_requests
-       << ", Item=" << batch_query_ip_items - batch_query_ip_failed_items << "/"
-       << batch_query_ip_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_query_ip_requests) -
+                  delta(&SummaryCounters::batch_query_ip_fails) -
+                  delta(&SummaryCounters::batch_query_ip_partial_successes),
+              delta(&SummaryCounters::batch_query_ip_partial_successes),
+              delta(&SummaryCounters::batch_query_ip_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_query_ip_items) -
+                  delta(&SummaryCounters::batch_query_ip_failed_items),
+              delta(&SummaryCounters::batch_query_ip_items))
+       << "), ";
     ss << "Clear:(Req="
-       << batch_replica_clear_requests - batch_replica_clear_fails -
-              batch_replica_clear_partial_successes
-       << "/" << batch_replica_clear_partial_successes << "/"
-       << batch_replica_clear_requests << ", Item="
-       << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
-       << batch_replica_clear_items << "), ";
+       << format_rate_triple(
+              delta(&SummaryCounters::batch_replica_clear_requests) -
+                  delta(&SummaryCounters::batch_replica_clear_fails) -
+                  delta(
+                      &SummaryCounters::batch_replica_clear_partial_successes),
+              delta(&SummaryCounters::batch_replica_clear_partial_successes),
+              delta(&SummaryCounters::batch_replica_clear_requests))
+       << ", Item="
+       << format_rate_pair(
+              delta(&SummaryCounters::batch_replica_clear_items) -
+                  delta(&SummaryCounters::batch_replica_clear_failed_items),
+              delta(&SummaryCounters::batch_replica_clear_items))
+       << "), ";
 
-    ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
-       << "/" << create_move_tasks << "), ";
-    ss << "CreateCopyTask:(Req=" << create_copy_tasks - create_copy_task_fails
-       << "/" << create_copy_tasks << "), ";
-    ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
-       << query_tasks << "), ";
-    ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
-       << fetch_tasks << "), ";
-    ss << "MarkTaskToComplete= (Req="
-       << mark_task_to_complete_requests_.value() -
-              mark_task_to_complete_failures_.value()
-       << "/" << mark_task_to_complete_requests_.value() << "), ";
-    // Eviction summary
+    ss << "CreateMoveTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::create_move_tasks) -
+                               delta(&SummaryCounters::create_move_task_fails),
+                           delta(&SummaryCounters::create_move_tasks))
+       << "), ";
+    ss << "CreateCopyTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::create_copy_tasks) -
+                               delta(&SummaryCounters::create_copy_task_fails),
+                           delta(&SummaryCounters::create_copy_tasks))
+       << "), ";
+    ss << "QueryTask:(Req="
+       << format_rate_pair(delta(&SummaryCounters::query_tasks) -
+                               delta(&SummaryCounters::query_task_fails),
+                           delta(&SummaryCounters::query_tasks))
+       << "), ";
+    ss << "FetchTasks:(Req="
+       << format_rate_pair(delta(&SummaryCounters::fetch_tasks) -
+                               delta(&SummaryCounters::fetch_task_fails),
+                           delta(&SummaryCounters::fetch_tasks))
+       << "), ";
+    ss << "MarkTaskToComplete:(Req="
+       << format_rate_pair(
+              delta(&SummaryCounters::mark_task_to_complete_requests) -
+                  delta(&SummaryCounters::mark_task_to_complete_fails),
+              delta(&SummaryCounters::mark_task_to_complete_requests))
+       << ")";
+    // Eviction counters are cumulative. Request counters above are reported as
+    // window rates, but eviction totals are used to track long-running pressure
+    // and should not reset after each admin metrics snapshot.
     ss << " | Eviction: "
        << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
        << ", "
+       << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
        << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
+    // mem eviction
+    ss << " | Mem Eviction: "
+       << "Success/Attempts=" << mem_eviction_success << "/"
+       << mem_eviction_attempts << ", "
+       << "keys=" << mem_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(mem_evicted_size);
+    // nof eviction
+    ss << " | NoF Eviction: "
+       << "Success/Attempts=" << nof_eviction_success << "/"
+       << nof_eviction_attempts << ", "
+       << "keys=" << nof_evicted_key_count << ", "
+       << "size=" << byte_size_to_string(nof_evicted_size);
 
     // Discard summary
     ss << " | Discard: "

@@ -588,6 +588,25 @@ Gets the list of pending transfer notifications received from other nodes.
 **Returns:**
 - `List[TransferNotify]`: List of notification objects containing name and message
 
+#### send_probe()
+
+```python
+send_probe(peer_server_name)
+```
+
+Sends a lightweight JSON-RPC probe to a peer to verify reachability. Used to
+test whether a previously-unreachable peer has recovered (e.g. SGLang's
+`MooncakeKVManager` uses this to clear entries from its `failed_sessions`
+blacklist).
+
+**Parameters:**
+- `peer_server_name` (str): Peer hostname in `host:port` form, as registered
+  with the metadata server.
+
+**Returns:**
+- `int`: 0 on success, non-zero on failure (peer unknown, unreachable, or
+  RPC error).
+
 ## Environment Variables
 
 The Transfer Engine respects the following environment variables:
@@ -605,6 +624,7 @@ The Transfer Engine respects the following environment variables:
 ### Basic Setup and Data Transfer
 
 ```python
+import numpy as np
 from mooncake.engine import TransferEngine
 import os
 
@@ -631,7 +651,7 @@ data_len = len(data)
 engine.register_memory(buffer_data, buffer_data_len)
 
 # Get Remote Addr from ZMQ or upper-layer inference framework
-remote_addr = ??
+remote_addr = REMOTE_ADDR
 
 # Transfer data to remote node
 ret = engine.transfer_sync_write(

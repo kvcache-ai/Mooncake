@@ -163,7 +163,8 @@ class AllocationStrategy {
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
-            std::set<std::string>()) = 0;
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) = 0;
 
     /**
      * @brief Allocate one replica from the specified segment.
@@ -208,7 +209,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
-            std::set<std::string>()) {
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
         // Validate input parameters
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -236,7 +238,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
                                          slice_length, generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 return replicas;
             }
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -256,7 +258,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
                                          slice_length, generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 if (replicas.size() == replica_num) {
                     return replicas;
                 }
@@ -289,7 +291,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
                                          slice_length, generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 // Nit: no need to insert names[index] into used_segments here
                 // because we only traverse all names once, thus there is no
                 // chance to try allocating from a segment for the second time.
@@ -345,8 +347,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
         // Randomly select a start point to distribute
         // allocations across all segments
         std::uniform_int_distribution<size_t> dist(0, num_segs - 1);
-        size_t seg_offset = dist(generator);
-        for (size_t i = 0; i < num_segs; i++) {
+        size_t seg_offset =
+            dist(generator);  // select a start segment to place replica
+        for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
             if (auto buffer = allocator->allocate(slice_length)) {
                 return buffer;
@@ -386,7 +389,8 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
-            std::set<std::string>()) override {
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -413,7 +417,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                                          slice_length, generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(preferred_segment);
                 if (replicas.size() == replica_num) {
                     return replicas;
@@ -469,7 +473,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                                          generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(name);
             }
         }
@@ -499,7 +503,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                                          slice_length, generator);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
+                                      ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(names[index]);
             }
         }
@@ -543,7 +547,8 @@ class CxlAllocationStrategy : public AllocationStrategy {
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
-            std::set<std::string>()) {
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -579,7 +584,8 @@ class CxlAllocationStrategy : public AllocationStrategy {
         }
 
         buffer->change_to_cxl(cxl_segment_name);
-        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
+                              replica_type);
 
         VLOG(1) << "Successfully allocated " << replicas.size()
                 << " CXL replica.";

@@ -135,6 +135,8 @@ class Transport {
             } ub;
             struct {
                 void *dest_addr;
+                void *cuda_stream;  // cudaStream_t, used by async NVLink
+                                    // transport
             } local;
             struct {
                 uint64_t dest_addr;
@@ -286,6 +288,12 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+        // Pointer to the transport that handles this task, set by
+        // MultiTransport::submitTransfer(). Used to delegate
+        // transport-specific completion polling (e.g., CUDA stream
+        // query for NVLink async transfers) in getTransferStatus().
+        Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;

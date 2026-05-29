@@ -22,6 +22,10 @@
 #include <thread>
 #include <sstream>
 
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
+
 #include "common.h"
 #include "config.h"
 
@@ -832,6 +836,66 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         PLOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message + ": " + strerror(errno);
         return ERR_ENDPOINT;
+    }
+
+    // Optional: pin QP to a specific LAG port for even traffic distribution
+    // across bonded physical ports. num_lag_ports is queried from hardware at
+    // context construction time; this block is a no-op on non-LAG devices.
+    if (globalConfig().mlx5_qp_lag_port_balance) {
+#ifdef USE_MLX5DV
+        uint8_t n = context_.numLagPorts();
+        if (n > 1) {
+            uint8_t target = (uint8_t)(qp_index % n) + 1;
+            int lag_ret = mlx5dv_modify_qp_lag_port(qp, target);
+            if (lag_ret) {
+                LOG_FIRST_N(WARNING, 4)
+                    << "[RDMA] mlx5dv_modify_qp_lag_port failed"
+                    << " (qp_index=" << qp_index
+                    << ", target_port=" << (int)target
+                    << "): " << strerror(lag_ret);
+            } else {
+                uint8_t cfg = 0, active = 0;
+                if (mlx5dv_query_qp_lag_port(qp, &cfg, &active) == 0) {
+                    VLOG(1)
+                        << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                        << " lag_port cfg=" << (int)cfg
+                        << " active=" << (int)active;
+                } else {
+                    LOG_FIRST_N(WARNING, 4)
+                        << "[RDMA] mlx5dv_query_qp_lag_port failed"
+                        << " (qp_index=" << qp_index << ")";
+                }
+            }
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_LAG_PORT_BALANCE is set but binary was not built "
+               "with USE_MLX5DV; ignoring";
+#endif
+    }
+
+    // Optional: override the RoCEv2 UDP source port to spread QPs across
+    // different ECMP/LAG paths. Empty list = leave whatever the driver
+    // picked. Failure is non-fatal so unsupported devices/firmware degrade
+    // gracefully.
+    const auto &sports = globalConfig().mlx5_qp_udp_sports;
+    if (!sports.empty()) {
+#ifdef USE_MLX5DV
+        uint16_t sport = sports[qp_index % sports.size()];
+        int sp_ret = mlx5dv_modify_qp_udp_sport(qp, sport);
+        if (sp_ret) {
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] mlx5dv_modify_qp_udp_sport failed (qp_index="
+                << qp_index << ", sport=" << sport << "): " << strerror(sp_ret);
+        } else {
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " udp_sport=" << sport;
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_UDP_SPORTS is set but binary was not built with "
+               "USE_MLX5DV; ignoring";
+#endif
     }
 
     return 0;

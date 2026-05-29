@@ -24,6 +24,8 @@ using common::redis::IsStringReply;
 using common::redis::RedisReplyPtr;
 using common::redis::SanitizeHashTagComponent;
 
+#ifdef STORE_USE_REDIS
+
 tl::expected<long long, ErrorCode> ParseSnapshotScore(
     std::string_view snapshot_id) {
     if (!snapshot_catalog_store_detail::IsValidSnapshotId(snapshot_id)) {
@@ -67,8 +69,6 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
     }
     return descriptor.value();
 }
-
-#ifdef STORE_USE_REDIS
 
 constexpr char kPublishSnapshotScript[] = R"LUA(
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])

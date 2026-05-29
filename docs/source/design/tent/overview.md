@@ -89,6 +89,30 @@ cpp-api
 metrics
 :::
 
+## TENT Transport Selection
+
+:::{toctree}
+:maxdepth: 1
+
+transport-selector
+:::
+
+## TENT Quality of Service
+
+:::{toctree}
+:maxdepth: 1
+
+qos
+:::
+
+## TENT Slice Spraying
+
+:::{toctree}
+:maxdepth: 1
+
+slice-spraying
+:::
+
 ## TENT Failover
 
 :::{toctree}

@@ -89,8 +89,13 @@ static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
@@ -217,6 +222,10 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 
+inline std::string NormalizeTenantId(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
@@ -311,6 +320,8 @@ enum class ErrorCode : int32_t {
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
+    K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
@@ -399,6 +410,20 @@ enum class AllocationStrategyType {
     FREE_RATIO_FIRST,  // Free-ratio-first allocation
     CXL,               // CXL-specific allocation
 };
+
+/**
+ * @brief Represents a contiguous NoF ssd region
+ */
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
+    size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    NoFSegment() = default;
+};
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective
