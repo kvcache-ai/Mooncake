@@ -15,37 +15,15 @@
 #ifndef TENT_DEVICE_NVLINK_H_
 #define TENT_DEVICE_NVLINK_H_
 
-#include <cstddef>
-#include <cstdint>
 #include <memory>
-#include <vector>
 
-#include "tent/common/status.h"
-#include "tent/runtime/device_resources.h"
 #include "tent/runtime/device_transport.h"
 
 namespace mooncake {
 namespace tent {
 
-// Opaque CUDA IPC memory handle represented as 32-bit words so callers can
-// exchange it through language bindings without including cuda_runtime.h.
-struct NvLinkIpcHandle {
-    std::vector<int32_t> words;
-};
-
-/// NVLink-specific DeviceTransport implementation.
-///
-/// Inherits the unified DeviceTransport interface.  P2P methods have real
-/// implementations here; RDMA methods (initializeRdmaDevice, registerMemory,
-/// createQueuePairs, connectRdmaPeers) return Status::NotSupported() or
-/// no-op defaults.
-class NvLinkDeviceTransport : public DeviceTransport {
-   public:
-    ~NvLinkDeviceTransport() override = default;
-};
-
 /// Factory: create an NVLink DeviceTransport.
-std::unique_ptr<NvLinkDeviceTransport> createNvLinkDeviceTransport();
+std::unique_ptr<DeviceTransport> createNvLinkDeviceTransport();
 
 /// Runtime probe for CUDA fabric memory handles used by MNNVL-style NVLink
 /// fabrics.  This keeps environment parsing and CUDA attribute checks in TENT

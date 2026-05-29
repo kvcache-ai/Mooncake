@@ -15,37 +15,15 @@
 #ifndef TENT_DEVICE_MTLINK_H_
 #define TENT_DEVICE_MTLINK_H_
 
-#include <cstddef>
-#include <cstdint>
 #include <memory>
-#include <vector>
 
-#include "tent/common/status.h"
-#include "tent/runtime/device_resources.h"
 #include "tent/runtime/device_transport.h"
 
 namespace mooncake {
 namespace tent {
 
-// Opaque MUSA IPC memory handle represented as 32-bit words so callers can
-// exchange it through language bindings without including musa_runtime.h.
-struct MtLinkIpcHandle {
-    std::vector<int32_t> words;
-};
-
-/// MTLink-specific DeviceTransport implementation.
-///
-/// Inherits the unified DeviceTransport interface.  P2P methods have real
-/// implementations here; RDMA methods (initializeRdmaDevice, registerMemory,
-/// createQueuePairs, connectRdmaPeers) return Status::NotSupported() or
-/// no-op defaults.
-class MtLinkDeviceTransport : public DeviceTransport {
-   public:
-    ~MtLinkDeviceTransport() override = default;
-};
-
 /// Factory: create an MTLink DeviceTransport.
-std::unique_ptr<MtLinkDeviceTransport> createMtLinkDeviceTransport();
+std::unique_ptr<DeviceTransport> createMtLinkDeviceTransport();
 
 }  // namespace tent
 }  // namespace mooncake
