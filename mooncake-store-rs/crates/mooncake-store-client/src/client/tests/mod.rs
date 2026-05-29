@@ -9680,7 +9680,7 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
 }
 
 #[test]
-fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
+fn get_marks_remote_replicas_hot_for_eviction() {
     let _guard = metrics_test_lock().lock();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let storage_transport = Arc::new(TestTransport::new("exists-hot-remote-storage-segment"));
@@ -9734,9 +9734,9 @@ fn batch_is_exist_marks_remote_replicas_hot_for_eviction() {
         .expect("cold put should succeed");
     assert_eq!(
         router
-            .batch_is_exist(&[ObjectRef::new("remote-exists-hot")])
-            .expect("batch_is_exist should succeed"),
-        vec![true]
+            .get("remote-exists-hot")
+            .expect("get should succeed"),
+        hot
     );
     wait_for_storage_clock_hot(&storage, &hot_route);
 
