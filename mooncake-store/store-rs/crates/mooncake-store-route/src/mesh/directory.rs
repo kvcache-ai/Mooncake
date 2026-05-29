@@ -1,39 +1,33 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend,
-    NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
-    RouteVersion, StoreError,
+    CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope,
+    ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory, RouteVersion,
+    StoreError,
 };
-use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
-use crate::mesh::{
+use crate::mesh::async_mirror::{maybe_mark_authority_suspect, AsyncRouteMirrorWorker};
+use crate::mesh::read_repair::{
+    compute_backfill_requests, merge_fresher_route, merge_route_listing, set_repair_observation,
+    RouteAuthorityObservation, RouteReadRepairState,
+};
+use crate::mesh::registry::{
     authority_compare_and_swap_many, authority_contains_many, authority_get_many,
     authority_get_version_floor, authority_get_version_floors, authority_is_local,
     authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
-    authority_list_routes_in_scope, authority_replace_many, local_authority_service,
-    register_local_authority, unregister_local_authority,
+    authority_list_routes_in_scope, local_authority_service, register_local_authority,
+    unregister_local_authority,
 };
-use crate::metrics::{record_cas_outcome, record_route_repair_metric};
+use crate::mesh::selection::{
+    authority_candidates, ranked_authorities, ranked_top_authorities,
+    select_authorities_for_requests, RouteAuthoritySelection,
+};
+use crate::metrics::record_cas_outcome;
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
-use crate::util::{
-    canonical_route_key, compatibility_matches, route_capable, route_read_source, route_weight,
-    sampled_per_key_debug_log, weighted_rendezvous_score,
-};
-
-const ROUTE_SCOPE_LABEL: &str = "route_scope";
-const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
-const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
-const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
-const SUSPECT_AUTHORITY_TTL: Duration = Duration::from_secs(5);
-const ASYNC_ROUTE_MIRROR_QUEUE_CAPACITY: usize = 1024;
-const ASYNC_ROUTE_MIRROR_DRAIN_BUDGET: usize = 4096;
-const ASYNC_ROUTE_MIRROR_RECV_TIMEOUT: Duration = Duration::from_millis(100);
-const ASYNC_ROUTE_MIRROR_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+use crate::util::{route_read_source, sampled_per_key_debug_log};
 
 pub(crate) fn build_embedded_wrh_route_directory(
     route_topk: usize,
@@ -60,260 +54,15 @@ struct EmbeddedWrhRouteDirectory {
     async_mirror: AsyncRouteMirrorWorker,
 }
 
-#[derive(Clone)]
-struct RouteAuthoritySelection {
-    authorities: Vec<ClientLease>,
-}
-
-struct RouteMirrorBatch {
-    secondary: ClientLease,
-    requests: Vec<RouteCasRequest>,
-}
-
 struct RouteContainsProbe<'a> {
     should_probe: Option<&'a [bool]>,
     retry_on_error: Option<&'a mut [bool]>,
-}
-
-type RouteReadRepairState = Vec<RouteAuthorityObservation>;
-
-#[derive(Clone, Default)]
-enum RouteAuthorityObservation {
-    #[default]
-    Unobserved,
-    Missing,
-    Present(Box<ObjectRoute>),
 }
 
 struct RouteCasAttempt {
     resolved: Vec<Option<Result<CasResult>>>,
     resolved_authorities: Vec<Option<ClientLease>>,
     last_errors: Vec<Option<StoreError>>,
-}
-
-struct AsyncRouteMirrorWorker {
-    state: Mutex<AsyncRouteMirrorWorkerState>,
-}
-
-struct AsyncRouteMirrorWorkerState {
-    sender: Option<std::sync::mpsc::SyncSender<RouteMirrorBatch>>,
-    shutdown: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl AsyncRouteMirrorWorker {
-    fn disabled() -> Self {
-        Self {
-            state: Mutex::new(AsyncRouteMirrorWorkerState {
-                sender: None,
-                shutdown: None,
-                thread: None,
-            }),
-        }
-    }
-
-    fn spawn(
-        namespace: String,
-        local_stable_id: ClientStableId,
-        authority_client: Arc<dyn RouteAuthorityClient>,
-        membership: Arc<dyn RouteMembershipProvider>,
-    ) -> Self {
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<RouteMirrorBatch>(ASYNC_ROUTE_MIRROR_QUEUE_CAPACITY);
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
-        let thread = match std::thread::Builder::new()
-            .name(format!("mooncake-route-mirror-{}", local_stable_id.0))
-            .spawn(move || loop {
-                if shutdown_rx.try_recv().is_ok() {
-                    break;
-                }
-                let first = match receiver.recv_timeout(ASYNC_ROUTE_MIRROR_RECV_TIMEOUT) {
-                    Ok(batch) => batch,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                let mut groups = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
-                let mut total_items = 0usize;
-                Self::push_batch(&mut groups, first, &mut total_items);
-                let started = Instant::now();
-                while total_items < ASYNC_ROUTE_MIRROR_DRAIN_BUDGET
-                    && started.elapsed() < ASYNC_ROUTE_MIRROR_COALESCE_WINDOW
-                {
-                    match receiver.try_recv() {
-                        Ok(batch) => Self::push_batch(&mut groups, batch, &mut total_items),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                    }
-                }
-                for (_, (secondary, requests)) in groups {
-                    mirror_secondary_batch(
-                        &namespace,
-                        authority_client.as_ref(),
-                        membership.as_ref(),
-                        &secondary,
-                        &requests,
-                    );
-                }
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                warn!(error = %error, "failed to spawn route mirror worker");
-                return Self::disabled();
-            }
-        };
-        Self {
-            state: Mutex::new(AsyncRouteMirrorWorkerState {
-                sender: Some(sender),
-                shutdown: Some(shutdown_tx),
-                thread: Some(thread),
-            }),
-        }
-    }
-
-    fn push_batch(
-        groups: &mut BTreeMap<String, (ClientLease, Vec<RouteCasRequest>)>,
-        batch: RouteMirrorBatch,
-        total_items: &mut usize,
-    ) {
-        *total_items = total_items.saturating_add(batch.requests.len());
-        groups
-            .entry(batch.secondary.runtime.stable_id.0.clone())
-            .or_insert_with(|| (batch.secondary, Vec::new()))
-            .1
-            .extend(batch.requests);
-    }
-
-    fn enqueue(&self, secondary: ClientLease, requests: Vec<RouteCasRequest>) {
-        if requests.is_empty() {
-            return;
-        }
-        let state = self.state.lock();
-        let Some(sender) = state.sender.as_ref() else {
-            return;
-        };
-        match sender.try_send(RouteMirrorBatch {
-            secondary,
-            requests,
-        }) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(batch)) => {
-                warn!(
-                    authority = %batch.secondary.runtime,
-                    items = batch.requests.len(),
-                    "dropping best-effort secondary route mirror after async queue filled"
-                );
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
-        }
-    }
-
-    fn shutdown(&mut self) {
-        let mut state = self.state.lock();
-        state.sender.take();
-        if let Some(shutdown) = state.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = state.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for AsyncRouteMirrorWorker {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn maybe_mark_authority_suspect(
-    namespace: &str,
-    membership: &dyn RouteMembershipProvider,
-    authority: &ClientLease,
-    error: &StoreError,
-    context: &'static str,
-) {
-    if authority_is_local(namespace, &authority.runtime.stable_id)
-        || !matches!(
-            error,
-            StoreError::Transport(_)
-                | StoreError::NotFound(_)
-                | StoreError::InvalidState(_)
-                | StoreError::Unsupported(_)
-        )
-    {
-        return;
-    }
-    membership.mark_suspect(
-        authority.runtime.clone(),
-        Instant::now() + SUSPECT_AUTHORITY_TTL,
-        Some(authority),
-    );
-    warn!(
-        runtime = %authority.runtime,
-        context,
-        quarantine_ms = SUSPECT_AUTHORITY_TTL.as_millis() as u64,
-        "marked route authority as suspect after request failure"
-    );
-}
-
-fn mirror_secondary_batch(
-    namespace: &str,
-    authority_client: &dyn RouteAuthorityClient,
-    membership: &dyn RouteMembershipProvider,
-    secondary: &ClientLease,
-    requests: &[RouteCasRequest],
-) {
-    let result = if authority_is_local(namespace, &secondary.runtime.stable_id) {
-        if let Some(service) = local_authority_service(namespace, &secondary.runtime.stable_id) {
-            Ok(service.batch_replace_routes(namespace, &secondary.runtime.stable_id, requests))
-        } else {
-            authority_replace_many(namespace, &secondary.runtime.stable_id, requests)
-                .map(|_| requests.iter().map(|_| Ok(())).collect())
-        }
-    } else {
-        authority_client.batch_replace_routes(
-            secondary,
-            namespace,
-            &secondary.runtime.stable_id,
-            requests,
-        )
-    };
-    match result {
-        Ok(results) => {
-            for (request, result) in requests.iter().zip(results) {
-                if let Err(error) = result {
-                    maybe_mark_authority_suspect(
-                        namespace,
-                        membership,
-                        secondary,
-                        &error,
-                        "route_secondary_mirror_failed",
-                    );
-                    warn!(
-                        authority = %secondary.runtime,
-                        key = %request.key.0,
-                        error = %error,
-                        "secondary route mirror failed"
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            maybe_mark_authority_suspect(
-                namespace,
-                membership,
-                secondary,
-                &error,
-                "route_secondary_mirror_batch_failed",
-            );
-            warn!(
-                authority = %secondary.runtime,
-                error = %error,
-                items = requests.len(),
-                "secondary route mirror batch failed"
-            );
-        }
-    }
 }
 
 impl EmbeddedWrhRouteDirectory {
@@ -342,22 +91,6 @@ impl EmbeddedWrhRouteDirectory {
         }
     }
 
-    fn active_route_leases(&self, force_refresh: bool) -> Result<Vec<ClientLease>> {
-        let leases = if force_refresh {
-            self.membership
-                .live_clients(true, "live_client_snapshot_force_refresh")?
-        } else {
-            self.membership
-                .live_clients(false, "live_client_snapshot")?
-        };
-        self.membership.reconcile_suspects(&leases);
-        Ok(leases
-            .into_iter()
-            .filter(|lease| lease.state == ClientLifecycleState::Active && route_capable(lease))
-            .filter(|lease| !self.membership.is_suspect(&lease.runtime))
-            .collect())
-    }
-
     fn maybe_mark_authority_suspect(
         &self,
         authority: &ClientLease,
@@ -373,121 +106,15 @@ impl EmbeddedWrhRouteDirectory {
         );
     }
 
-    fn authority_candidates_once(
+    fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
+        authority_candidates(self.membership.as_ref(), observer, false)
+    }
+
+    fn authority_candidates_force_refresh(
         &self,
         observer: &ClientLease,
-        force_refresh: bool,
     ) -> Result<Vec<ClientLease>> {
-        let route_scope = observer.endpoints.labels.get(ROUTE_SCOPE_LABEL).cloned();
-        let mut candidates = BTreeMap::<String, ClientLease>::new();
-        for lease in self.active_route_leases(force_refresh)? {
-            if !compatibility_matches(observer, &lease) {
-                continue;
-            }
-            if route_scope.as_ref().is_some_and(|scope| {
-                lease
-                    .endpoints
-                    .labels
-                    .get(ROUTE_SCOPE_LABEL)
-                    .is_none_or(|candidate| candidate != scope)
-            }) {
-                continue;
-            }
-            let stable_id = lease.runtime.stable_id.0.clone();
-            match candidates.get(&stable_id) {
-                Some(current) if current.runtime.epoch >= lease.runtime.epoch => {}
-                _ => {
-                    candidates.insert(stable_id, lease);
-                }
-            }
-        }
-        Ok(candidates.into_values().collect())
-    }
-
-    fn authority_candidates(&self, observer: &ClientLease) -> Result<Vec<ClientLease>> {
-        self.authority_candidates_once(observer, false)
-    }
-
-    fn select_authorities_for_requests(
-        &self,
-        candidates: &[ClientLease],
-        requests: &[RouteCasRequest],
-    ) -> Vec<RouteAuthoritySelection> {
-        requests
-            .iter()
-            .map(|request| self.select_authorities_from_candidates(candidates, &request.key))
-            .collect()
-    }
-
-    fn select_authorities_from_candidates(
-        &self,
-        candidates: &[ClientLease],
-        key: &ObjectKey,
-    ) -> RouteAuthoritySelection {
-        let ranked = self.ranked_authorities_from_candidates(candidates, key);
-        RouteAuthoritySelection {
-            authorities: ranked.into_iter().take(self.route_topk).collect(),
-        }
-    }
-
-    fn ranked_authorities_from_candidates(
-        &self,
-        candidates: &[ClientLease],
-        key: &ObjectKey,
-    ) -> Vec<ClientLease> {
-        let mut ranked = candidates
-            .iter()
-            .map(|lease| {
-                (
-                    weighted_rendezvous_score(
-                        &self.namespace,
-                        &key.0,
-                        &lease.runtime.stable_id.0,
-                        route_weight(lease),
-                    ),
-                    lease.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.runtime.stable_id.cmp(&right.1.runtime.stable_id))
-        });
-        ranked.into_iter().map(|(_, lease)| lease).collect()
-    }
-
-    fn ranked_top_authorities_from_candidates(
-        &self,
-        candidates: &[ClientLease],
-        key: &ObjectKey,
-        limit: usize,
-    ) -> Vec<ClientLease> {
-        let mut top = Vec::<(f64, ClientLease)>::with_capacity(limit.min(candidates.len()));
-        for lease in candidates {
-            let score = weighted_rendezvous_score(
-                &self.namespace,
-                &key.0,
-                &lease.runtime.stable_id.0,
-                route_weight(lease),
-            );
-            let insert_at = top.partition_point(|(current_score, current_lease)| {
-                current_score
-                    .total_cmp(&score)
-                    .then_with(|| {
-                        current_lease
-                            .runtime
-                            .stable_id
-                            .cmp(&lease.runtime.stable_id)
-                    })
-                    .is_lt()
-            });
-            if insert_at < limit {
-                top.insert(insert_at, (score, lease.clone()));
-                top.truncate(limit);
-            }
-        }
-        top.into_iter().map(|(_, lease)| lease).collect()
+        authority_candidates(self.membership.as_ref(), observer, true)
     }
 
     fn local_authority_service(
@@ -820,13 +447,13 @@ impl EmbeddedWrhRouteDirectory {
                                     );
                                 }
                                 if let Some(states) = repairs.as_mut() {
-                                    Self::set_repair_observation(
+                                    set_repair_observation(
                                         &mut states[index],
                                         rank,
                                         RouteAuthorityObservation::Present(Box::new(route.clone())),
                                     );
                                 }
-                                Self::merge_fresher_route(
+                                merge_fresher_route(
                                     &mut resolved[index],
                                     route,
                                     &authority.runtime.to_string(),
@@ -835,7 +462,7 @@ impl EmbeddedWrhRouteDirectory {
                             }
                             Ok(None) => {
                                 if let Some(states) = repairs.as_mut() {
-                                    Self::set_repair_observation(
+                                    set_repair_observation(
                                         &mut states[index],
                                         rank,
                                         RouteAuthorityObservation::Missing,
@@ -876,33 +503,6 @@ impl EmbeddedWrhRouteDirectory {
         Ok(true)
     }
 
-    fn merge_fresher_route(
-        current: &mut Option<ObjectRoute>,
-        candidate: ObjectRoute,
-        authority: &str,
-        key: &ObjectKey,
-    ) {
-        match current {
-            None => *current = Some(candidate),
-            Some(existing) if candidate.version > existing.version => *current = Some(candidate),
-            Some(existing) if candidate.version == existing.version && *existing != candidate => {
-                let choose_candidate =
-                    canonical_route_key(&candidate) < canonical_route_key(existing);
-                if choose_candidate {
-                    *existing = candidate.clone();
-                }
-                warn!(
-                    key = %key.0,
-                    authority = %authority,
-                    version = candidate.version.0,
-                    canonical = if choose_candidate { "candidate" } else { "existing" },
-                    "route authorities disagree on the same route version; choosing canonical route"
-                );
-            }
-            Some(_) => {}
-        }
-    }
-
     fn query_authorities_with_merge<Q, L>(
         &self,
         observer: &ClientLease,
@@ -924,11 +524,7 @@ impl EmbeddedWrhRouteDirectory {
                 Ok(found) => {
                     successful_queries = successful_queries.saturating_add(1);
                     for route in found {
-                        Self::merge_route_listing(
-                            &mut routes,
-                            route,
-                            &authority.runtime.to_string(),
-                        );
+                        merge_route_listing(&mut routes, route, &authority.runtime.to_string());
                     }
                 }
                 Err(error) => {
@@ -946,82 +542,6 @@ impl EmbeddedWrhRouteDirectory {
         Ok(routes.into_values().collect())
     }
 
-    fn merge_route_listing(
-        routes: &mut BTreeMap<String, ObjectRoute>,
-        candidate: ObjectRoute,
-        authority: &str,
-    ) {
-        match routes.get(&candidate.key.0) {
-            None => {
-                routes.insert(candidate.key.0.clone(), candidate);
-            }
-            Some(current) if candidate.version > current.version => {
-                routes.insert(candidate.key.0.clone(), candidate);
-            }
-            Some(current) if candidate.version == current.version && *current != candidate => {
-                let choose_candidate =
-                    canonical_route_key(&candidate) < canonical_route_key(current);
-                if choose_candidate {
-                    routes.insert(candidate.key.0.clone(), candidate.clone());
-                }
-                warn!(
-                    key = %candidate.key.0,
-                    authority,
-                    version = candidate.version.0,
-                    canonical = if choose_candidate { "candidate" } else { "existing" },
-                    "route authorities disagree on the same route version; choosing canonical route"
-                );
-            }
-            Some(_) => {}
-        }
-    }
-
-    fn set_repair_observation(
-        state: &mut RouteReadRepairState,
-        rank: usize,
-        observation: RouteAuthorityObservation,
-    ) {
-        if let Some(slot) = state.get_mut(rank) {
-            *slot = observation;
-        }
-    }
-
-    fn repair_request(
-        key: &ObjectKey,
-        best: &ObjectRoute,
-        observed: &RouteAuthorityObservation,
-    ) -> Option<RouteCasRequest> {
-        match observed {
-            RouteAuthorityObservation::Missing => {
-                record_route_repair_metric(ROUTE_REPAIR_MISSING_AUTHORITY);
-                Some(RouteCasRequest {
-                    key: key.clone(),
-                    expected: None,
-                    next: Some(best.clone()),
-                })
-            }
-            RouteAuthorityObservation::Present(current) if current.version < best.version => {
-                record_route_repair_metric(ROUTE_REPAIR_STALE_AUTHORITY);
-                Some(RouteCasRequest {
-                    key: key.clone(),
-                    expected: Some(current.version),
-                    next: Some(best.clone()),
-                })
-            }
-            RouteAuthorityObservation::Present(current)
-                if current.version == best.version && current.as_ref() != best =>
-            {
-                record_route_repair_metric(ROUTE_REPAIR_DIVERGENT_AUTHORITY);
-                Some(RouteCasRequest {
-                    key: key.clone(),
-                    expected: Some(current.version),
-                    next: Some(best.clone()),
-                })
-            }
-            _ => None,
-        }
-    }
-
     fn backfill_missing_authorities(
         &self,
         keys: &[ObjectKey],
@@ -1029,25 +549,7 @@ impl EmbeddedWrhRouteDirectory {
         resolved: &[Option<ObjectRoute>],
         repairs: &[RouteReadRepairState],
     ) {
-        let mut backfills = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
-        for (index, route) in resolved.iter().enumerate() {
-            let Some(route) = route.as_ref() else {
-                continue;
-            };
-            for (rank, authority) in selections[index].authorities.iter().cloned().enumerate() {
-                if let Some(request) = repairs[index]
-                    .get(rank)
-                    .and_then(|observed| Self::repair_request(&keys[index], route, observed))
-                {
-                    backfills
-                        .entry(authority.runtime.stable_id.0.clone())
-                        .or_insert_with(|| (authority, Vec::new()))
-                        .1
-                        .push(request);
-                }
-            }
-        }
-
+        let backfills = compute_backfill_requests(keys, selections, resolved, repairs);
         for (_, (authority, requests)) in backfills {
             match self.cas_authority_batch(&authority, &requests) {
                 Ok(results) => {
@@ -1292,7 +794,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let candidates = self.authority_candidates(observer)?;
         let ranked_authorities = keys
             .iter()
-            .map(|key| self.ranked_authorities_from_candidates(&candidates, key))
+            .map(|key| ranked_authorities(&self.namespace, &candidates, key))
             .collect::<Vec<_>>();
         let selections = ranked_authorities
             .iter()
@@ -1346,9 +848,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let candidates = self.authority_candidates(observer)?;
         let ranked_authorities = keys
             .iter()
-            .map(|key| {
-                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
-            })
+            .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
         let mut resolved = vec![None; keys.len()];
         for rank in 0..self.route_topk {
@@ -1385,9 +885,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         let candidates = self.authority_candidates(observer)?;
         let ranked_authorities = keys
             .iter()
-            .map(|key| {
-                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
-            })
+            .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
         let mut resolved = vec![false; keys.len()];
         let mut retry = vec![false; keys.len()];
@@ -1451,7 +949,12 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             return Ok(Vec::new());
         }
         let candidates = self.authority_candidates(observer)?;
-        let mut selections = self.select_authorities_for_requests(&candidates, requests);
+        let mut selections = select_authorities_for_requests(
+            &self.namespace,
+            &candidates,
+            requests,
+            self.route_topk,
+        );
         let mut attempt = self.compare_and_swap_route_selections(&selections, requests);
 
         if Self::should_refresh_route_cas_attempt(&attempt) {
@@ -1467,13 +970,17 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     items = retry_indices.len(),
                     "refreshing live-client snapshot before retrying route authority selection"
                 );
-                let refreshed_candidates = self.authority_candidates_once(observer, true)?;
+                let refreshed_candidates = self.authority_candidates_force_refresh(observer)?;
                 let retry_requests = retry_indices
                     .iter()
                     .map(|index| requests[*index].clone())
                     .collect::<Vec<_>>();
-                let retry_selections =
-                    self.select_authorities_for_requests(&refreshed_candidates, &retry_requests);
+                let retry_selections = select_authorities_for_requests(
+                    &self.namespace,
+                    &refreshed_candidates,
+                    &retry_requests,
+                    self.route_topk,
+                );
                 let retry_attempt =
                     self.compare_and_swap_route_selections(&retry_selections, &retry_requests);
                 for (retry_pos, index) in retry_indices.into_iter().enumerate() {
@@ -1595,7 +1102,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
 
     fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
         let candidates = self.authority_candidates(observer).ok()?;
-        let ranked = self.ranked_authorities_from_candidates(&candidates, key);
+        let ranked = ranked_authorities(&self.namespace, &candidates, key);
         for authority in ranked.iter().take(self.route_topk) {
             if let Some(floor) =
                 authority_get_version_floor(&self.namespace, &authority.runtime.stable_id, key)
@@ -1619,9 +1126,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         };
         let ranked_authorities = keys
             .iter()
-            .map(|key| {
-                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
-            })
+            .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
         let mut floors = vec![None; keys.len()];
         for rank in 0..self.route_topk {
