@@ -513,7 +513,8 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
                FLAGS_protocol == "ubshmem" ||
-               FLAGS_protocol == "sunrise_link") {
+               FLAGS_protocol == "sunrise_link" ||
+               FLAGS_protocol == "flagcx") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;

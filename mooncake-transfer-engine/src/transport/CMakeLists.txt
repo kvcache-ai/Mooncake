@@ -85,3 +85,9 @@ if(USE_CUDA OR USE_MUSA)
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
   target_link_libraries(transport PUBLIC mlx5)
 endif()
+
+if (USE_FLAGCX)
+  add_subdirectory(flagcx_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
+  target_link_libraries(transport PRIVATE flagcx)
+endif()
