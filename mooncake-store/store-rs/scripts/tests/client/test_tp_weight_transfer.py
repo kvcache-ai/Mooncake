@@ -68,7 +68,8 @@ def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
     buffer_ptrs = []
     for _ in range(rollouter_tp):
         ptr = allocator.alloc(rank_size)
-        store.register_buffer(ptr, rank_size)
+        result = store.register_buffer(ptr, rank_size)
+        assert result == 0, f"register_buffer failed for ptr {ptr}: result={result}"
         ctypes.memset(ptr, 0xFF, rank_size)
         buffer_ptrs.append(ptr)
 
