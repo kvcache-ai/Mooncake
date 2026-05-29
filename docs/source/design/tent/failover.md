@@ -95,6 +95,7 @@ All knobs live in the top-level `transfer-engine.json`. Defaults are safe for pr
 
 | Key | Default | Meaning |
 |-----|---------|---------|
+| `enable_auto_failover_on_poll` | `true` | Controls whether `getTransferStatus` automatically resubmits tasks that report a recoverable `FAILED` completion. Set to `false` to make status polling observational only; internal completion paths can still trigger failover/resubmit. |
 | `max_failover_attempts` | `3` | Upper bound on `resubmitTransferTask` calls per task. `0` disables cross-transport failover entirely. `1` allows exactly one switch. |
 | `transports/rdma/rail_error_threshold` | `3` | Number of failures inside `rail_error_window_secs` that trips a rail into the paused state. |
 | `transports/rdma/rail_error_window_secs` | `10` | Sliding window for counting rail errors. A failure older than the window resets `error_count` to 1. |
@@ -104,6 +105,7 @@ The RDMA keys are read by `RailMonitor::load`. Example:
 
 ```json
 {
+  "enable_auto_failover_on_poll": true,
   "max_failover_attempts": 3,
   "transports": {
     "rdma": {
@@ -175,7 +177,8 @@ The TENT tests are **not** in CI today (the upstream workflow builds with `USE_T
 
 ```bash
 cmake -S . -B build-tent -DUSE_TENT=ON -DUSE_CUDA=OFF
-cmake --build build-tent --target tent_engine_failover_e2e_test -j
+cmake --build build-tent --target tent_failover_test tent_engine_failover_e2e_test -j
+./build-tent/mooncake-transfer-engine/tent/tests/tent_failover_test
 ./build-tent/mooncake-transfer-engine/tent/tests/tent_engine_failover_e2e_test
 ```
 

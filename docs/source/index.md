@@ -91,6 +91,7 @@ performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
 performance/allocation-strategy-benchmark-result
 performance/ssd-offload-benchmark-results
+performance/storage-benchmark
 :::
 
 % API Documentation
@@ -117,6 +118,7 @@ design/p2p-store
 design/transfer-engine/index
 design/hicache-design
 design/engram
+design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design

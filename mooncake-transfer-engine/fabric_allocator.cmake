@@ -27,6 +27,7 @@ function(add_fabric_allocator_build_target)
   if(FAB_ENABLE_BUILD)
     add_custom_command(
       TARGET ${FAB_TARGET_NAME}
+      POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
       COMMAND bash ${FAB_BUILD_SCRIPT} ${FAB_BUILD_ARGS}
               ${CMAKE_CURRENT_BINARY_DIR} "${_include_dirs_str}"
