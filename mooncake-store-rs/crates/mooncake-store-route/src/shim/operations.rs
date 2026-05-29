@@ -55,6 +55,15 @@ impl RouteOperations {
             .collect())
     }
 
+    pub fn contains_active_route(&self, key: &ObjectKey) -> Result<bool> {
+        self.directory.contains_object_route(&self.observer, key)
+    }
+
+    pub fn contains_active_routes_bounded(&self, keys: &[ObjectKey]) -> Result<Vec<bool>> {
+        self.directory
+            .contains_object_routes_bounded(&self.observer, keys)
+    }
+
     pub fn load_active_route_and_report<R: RouteHitReporter>(
         &self,
         key: &ObjectKey,

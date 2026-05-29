@@ -11,10 +11,11 @@ use tracing::{debug, trace, warn};
 
 use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
 use crate::mesh::{
-    authority_compare_and_swap_many, authority_get_many, authority_get_version_floor,
-    authority_is_local, authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
-    authority_list_routes_in_scope, authority_replace_many, local_authority_service,
-    register_local_authority, unregister_local_authority,
+    authority_compare_and_swap_many, authority_contains_many, authority_get_many,
+    authority_get_version_floor, authority_is_local, authority_list_reuse_candidates,
+    authority_list_routes_by_replica_owner, authority_list_routes_in_scope,
+    authority_replace_many, local_authority_service, register_local_authority,
+    unregister_local_authority,
 };
 use crate::metrics::{record_cas_outcome, record_route_repair_metric};
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
@@ -294,6 +295,122 @@ impl EmbeddedWrhRouteDirectory {
             &authority.runtime.stable_id,
             keys,
         )
+    }
+
+    fn contains_local_batch(
+        &self,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<bool>> {
+        authority_contains_many(&self.namespace, authority, keys)
+    }
+
+    fn contains_authority_batch(
+        &self,
+        authority: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<bool>>> {
+        if self.authority_is_local(authority) {
+            if let Some(service) = self.local_authority_service(&authority.runtime.stable_id) {
+                return Ok(service.batch_contains_routes(
+                    &self.namespace,
+                    &authority.runtime.stable_id,
+                    keys,
+                ));
+            }
+            return self
+                .contains_local_batch(&authority.runtime.stable_id, keys)
+                .map(|results| results.into_iter().map(Ok).collect());
+        }
+        self.authority_client.batch_contains_routes(
+            authority,
+            &self.namespace,
+            &authority.runtime.stable_id,
+            keys,
+        )
+    }
+
+    fn contains_ranked_authorities(
+        &self,
+        keys: &[ObjectKey],
+        ranked_authorities: &[Vec<ClientLease>],
+        rank: usize,
+        resolved: &mut [bool],
+        failure_message: &'static str,
+    ) -> Result<bool> {
+        let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
+        for (index, authorities) in ranked_authorities.iter().enumerate() {
+            if resolved[index] {
+                continue;
+            }
+            let Some(authority) = authorities.get(rank).cloned() else {
+                continue;
+            };
+            groups
+                .entry(authority.runtime.stable_id.0.clone())
+                .or_insert_with(|| (authority, Vec::new()))
+                .1
+                .push(index);
+        }
+        if groups.is_empty() {
+            return Ok(false);
+        }
+
+        for (_, (authority, indices)) in groups {
+            let batch_keys = indices
+                .iter()
+                .map(|index| keys[*index].clone())
+                .collect::<Vec<_>>();
+            match self.contains_authority_batch(&authority, &batch_keys) {
+                Ok(results) => {
+                    for ((index, key), result) in
+                        indices.into_iter().zip(batch_keys).zip(results)
+                    {
+                        match result {
+                            Ok(true) => {
+                                trace!(
+                                    namespace = %self.namespace,
+                                    key = %key.0,
+                                    authority = %authority.runtime,
+                                    rank,
+                                    source = route_read_source(rank, self.route_topk),
+                                    "route authority contains object route"
+                                );
+                                resolved[index] = true;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                self.maybe_mark_authority_suspect(
+                                    &authority,
+                                    &error,
+                                    "route_batch_contains_failed",
+                                );
+                                warn!(
+                                    runtime = %authority.runtime,
+                                    key = %key.0,
+                                    error = %error,
+                                    "{failure_message}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.maybe_mark_authority_suspect(
+                        &authority,
+                        &error,
+                        "route_batch_contains_transport_failed",
+                    );
+                    warn!(
+                        runtime = %authority.runtime,
+                        error = %error,
+                        items = batch_keys.len(),
+                        "{failure_message}"
+                    );
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn cas_local_batch(
@@ -1063,6 +1180,44 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     "authority bounded route batch read failed; trying mirrored authorities"
                 } else {
                     "mirrored bounded route batch read failed; trying other authorities"
+                },
+            )?;
+        }
+        Ok(resolved)
+    }
+
+    fn contains_object_route(&self, observer: &ClientLease, key: &ObjectKey) -> Result<bool> {
+        let mut results =
+            self.contains_object_routes_bounded(observer, std::slice::from_ref(key))?;
+        Ok(results.pop().unwrap_or(false))
+    }
+
+    fn contains_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<bool>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = self.authority_candidates(observer)?;
+        let ranked_authorities = keys
+            .iter()
+            .map(|key| {
+                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
+            })
+            .collect::<Vec<_>>();
+        let mut resolved = vec![false; keys.len()];
+        for rank in 0..self.route_topk {
+            self.contains_ranked_authorities(
+                keys,
+                &ranked_authorities,
+                rank,
+                &mut resolved,
+                if rank == 0 {
+                    "authority bounded route contains failed; trying mirrored authorities"
+                } else {
+                    "mirrored bounded route contains failed; trying other authorities"
                 },
             )?;
         }
