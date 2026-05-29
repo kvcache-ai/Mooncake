@@ -30,14 +30,14 @@ namespace mtlink {
 // Availability & address computation
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ bool is_available(const MtLinkDeviceContext& ctx,
+__device__ __forceinline__ bool is_available(const P2PDeviceContext& ctx,
                                              int dst_rank) {
     return ctx.available != nullptr && ctx.peer_ptrs != nullptr &&
            dst_rank >= 0 && dst_rank < ctx.num_ranks &&
            ctx.available[dst_rank] != 0 && ctx.peer_ptrs[dst_rank] != nullptr;
 }
 
-__device__ __forceinline__ void* peer_ptr(const MtLinkDeviceContext& ctx,
+__device__ __forceinline__ void* peer_ptr(const P2PDeviceContext& ctx,
                                           int dst_rank, const void* local_base,
                                           const void* local_ptr) {
     const auto offset = reinterpret_cast<const char*>(local_ptr) -
@@ -54,7 +54,7 @@ __device__ __forceinline__ void* peer_ptr(const MtLinkDeviceContext& ctx,
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void mtlink_put(DeviceOps* dops,
-                                           const MtLinkDeviceContext& ctx,
+                                           const P2PDeviceContext& ctx,
                                            int dst_rank,
                                            const void* local_base,
                                            void* recv, const void* send,
@@ -65,7 +65,7 @@ __device__ __forceinline__ void mtlink_put(DeviceOps* dops,
 }
 
 __device__ __forceinline__ void mtlink_signal(DeviceOps* dops,
-                                              const MtLinkDeviceContext& ctx,
+                                              const P2PDeviceContext& ctx,
                                               int dst_rank,
                                               const void* local_base,
                                               void* sig, int32_t action) {
@@ -93,14 +93,14 @@ __device__ __forceinline__ void mtlink_wait_signal_32(DeviceOps* dops,
     dops->spin_wait_eq(sig, expected);
 }
 
-__device__ __forceinline__ void mtlink_red_add(DeviceOps* dops,
-                                               const MtLinkDeviceContext& ctx,
+__device__ __forceinline__ void mtlink_signal_add(DeviceOps* dops,
+                                               const P2PDeviceContext& ctx,
                                                int dst_rank,
                                                const void* local_base,
                                                void* sym, int32_t val) {
     void* peer_sym = peer_ptr(ctx, dst_rank, local_base, sym);
-    // P2P path uses release store (matches original st_na_release).
-    // IBGDA path uses atomic add; that's handled separately in ep_red_add.
+    // Single-writer assumption: uses store_release, not atomic add.
+    // For multi-writer scenarios, use IBGDA path instead.
     dops->store_release_32(peer_sym, static_cast<uint32_t>(val));
 }
 

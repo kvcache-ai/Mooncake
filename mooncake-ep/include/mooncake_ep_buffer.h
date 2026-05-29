@@ -12,7 +12,9 @@
 #endif
 #include <fstream>
 #include <memory>
+#ifdef MOONCAKE_EP_USE_TENT
 #include <tent/runtime/device_transport.h>
+#endif
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
@@ -23,6 +25,8 @@ namespace mooncake {
 
 #ifdef MOONCAKE_EP_USE_TENT
 inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
+#else
+inline constexpr int MAX_QP_COUNT = 256;
 #endif
 
 struct BufferLayout {
@@ -104,9 +108,11 @@ struct MooncakeEpBuffer {
     // the IBGDA transport (RDMA).  Both are needed because the kernel uses
     // both paths simultaneously.
     // On MUSA: transport_ is the MTLink transport (P2P); no ibgda_transport_.
+#ifdef MOONCAKE_EP_USE_TENT
     std::unique_ptr<tent::DeviceTransport> transport_;
 #ifndef MOONCAKE_EP_USE_MUSA
     std::unique_ptr<tent::DeviceTransport> ibgda_transport_;
+#endif
 #endif
 
     // Fabric memory (MNNVL)
@@ -154,8 +160,6 @@ struct MooncakeEpBuffer {
 
     int init_ibgda();
 
-    void refresh_tent_ibgda_context();
-
     bool ibgda_disabled() { return ibgda_disabled_; }
 
     bool is_roce() { return is_roce_; }
@@ -173,6 +177,7 @@ struct MooncakeEpBuffer {
     // kernels will never take the IBGDA branch and therefore do NOT require
     // `qps`.
     bool use_fast_path() {
+#ifdef MOONCAKE_EP_USE_TENT
         if (!ibgda_disabled_) {
             return true;  // IBGDA available
         }
@@ -185,6 +190,9 @@ struct MooncakeEpBuffer {
                          << "Performance will be degraded.";
         }
         return p2p_all;
+#else
+        return !ibgda_disabled_;
+#endif
     }
 
     bool update_local_qpns();
@@ -251,6 +259,7 @@ struct MooncakeEpBuffer {
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
     get_tent_ibgda_context_info() {
+#ifdef MOONCAKE_EP_USE_TENT
 #ifndef MOONCAKE_EP_USE_MUSA
         if (!ibgda_transport_) return {0, 0, 0, 0, 0, 0};
         auto* ctx = ibgda_transport_->deviceContextPtr();
@@ -264,6 +273,7 @@ struct MooncakeEpBuffer {
                     reinterpret_cast<int64_t>(ibgda_ctx->rkeys),
                     reinterpret_cast<int64_t>(ibgda_ctx->qp_devctxs)};
         }
+#endif
 #endif
         return {0, 0, 0, 0, 0, 0};
     }

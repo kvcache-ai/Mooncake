@@ -123,15 +123,7 @@ class IbGdaTransport : public Transport, public DeviceTransport {
 
     Status destroyQueuePairs() override;
 
-    Status connectRdmaPeers(
-        const std::vector<int64_t>& remote_addrs,
-        const std::vector<int32_t>& remote_keys,
-        const std::vector<std::vector<int32_t>>& peer_qpns,
-        const std::vector<std::vector<int32_t>>& peer_lids,
-        const std::vector<int64_t>& subnet_prefixes,
-        const std::vector<int64_t>& interface_ids,
-        const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
-        void* raddrs, void* rkeys) override;
+    Status connectRdmaPeers(const RdmaPeerConnectInfo& info) override;
 
     // -------------------------------------------------------------------
     // DeviceTransport — metadata accessors

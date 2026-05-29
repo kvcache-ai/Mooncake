@@ -28,10 +28,6 @@ static bool supportFabricMem() {
 #endif
 }
 
-void MooncakeEpBuffer::refresh_tent_ibgda_context() {
-    // No-op: the unified transport owns the device context internally.
-    // EP accesses it via transport_->deviceContextPtr().
-}
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
@@ -523,12 +519,13 @@ int MooncakeEpBuffer::init_ibgda() {
         return -1;
     }
     gid_index_ = ibgda->gidIndex();
-    LOG(INFO) << "[EP] GPU " << device_id << " uses TENT IBGDA NIC "
-              << device_name << " with GID index " << gid_index_;
+    LOG(INFO) << "[EP] GPU " << device_id << " TENT IBGDA initialized with GID index " << gid_index_;
 
     // Allocate ctrl_buf without zero-initialization. Individual regions will be
     // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
     // WQ doesn't need initialization as it's zeroed before each use.
+    LOG(INFO) << "[EP] GPU " << device_id << " allocating control buffer ("
+              << CTRL_BUF_SIZE << " bytes)...";
     status = ibgda->allocateControlBuffer(CTRL_BUF_SIZE);
     if (!status.ok()) {
         LOG(ERROR) << "[EP] TENT IBGDA control buffer allocation failed: "
@@ -540,6 +537,7 @@ int MooncakeEpBuffer::init_ibgda() {
         return -1;
     }
     ctrl_buf = ibgda->controlBuffer();
+    LOG(INFO) << "[EP] GPU " << device_id << " control buffer allocated, creating QPs...";
 
     status = ibgda->createQueuePairs(
         USE_QP_COUNT, 16384, reinterpret_cast<void*>(comm_stream.stream()),
@@ -549,6 +547,7 @@ int MooncakeEpBuffer::init_ibgda() {
                    << status.ToString();
         return -1;
     }
+    LOG(INFO) << "[EP] GPU " << device_id << " QPs created successfully";
     is_roce_ = ibgda->isRoce();
 
     // Store the IBGDA transport.  On CUDA, we need both NVLink (for P2P)
@@ -576,20 +575,20 @@ bool MooncakeEpBuffer::update_local_qpns() {
 #endif  // MOONCAKE_EP_USE_MUSA
 }
 
-void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
-                               const std::vector<int32_t>& remote_keys,
-                               const std::vector<int32_t>& remote_qpns,
-                               const std::vector<int32_t>& remote_lids,
-                               const std::vector<int>& active_ranks_mask) {
+void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>&,
+                               const std::vector<int32_t>&,
+                               const std::vector<int32_t>&,
+                               const std::vector<int32_t>&,
+                               const std::vector<int>&) {
     // Legacy path — not used in TENT mode.
 }
 
-void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
-                                 const std::vector<int32_t>& remote_keys,
-                                 const std::vector<int32_t>& remote_qpns,
-                                 const std::vector<int64_t>& subnet_prefixes,
-                                 const std::vector<int64_t>& interface_ids,
-                                 const std::vector<int>& active_ranks_mask) {
+void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>&,
+                                 const std::vector<int32_t>&,
+                                 const std::vector<int32_t>&,
+                                 const std::vector<int64_t>&,
+                                 const std::vector<int64_t>&,
+                                 const std::vector<int>&) {
     // Legacy path — not used in TENT mode.
 }
 
@@ -604,9 +603,19 @@ void MooncakeEpBuffer::sync_ibgda_peers(
 #ifdef MOONCAKE_EP_USE_MUSA
     // MUSA: no IBGDA peer sync
 #else
-    auto status = ibgda_transport_->connectRdmaPeers(
-        remote_addrs, remote_keys, peer_qpns, peer_lids, subnet_prefixes,
-        interface_ids, active_ranks_mask, rank, num_ranks, raddrs, rkeys);
+    tent::RdmaPeerConnectInfo info;
+    info.remote_addrs = remote_addrs;
+    info.remote_keys = remote_keys;
+    info.peer_qpns = peer_qpns;
+    info.peer_lids = peer_lids;
+    info.subnet_prefixes = subnet_prefixes;
+    info.interface_ids = interface_ids;
+    info.active_ranks_mask = active_ranks_mask;
+    info.rank = rank;
+    info.num_ranks = num_ranks;
+    info.raddrs = raddrs;
+    info.rkeys = rkeys;
+    auto status = ibgda_transport_->connectRdmaPeers(info);
     if (!status.ok()) {
         LOG(ERROR) << "[EP] TENT IBGDA peer sync failed: "
                    << status.ToString();

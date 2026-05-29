@@ -58,6 +58,23 @@ struct IbGdaLocalMetadata {
     std::vector<int32_t> lids;
 };
 
+// Aggregates the 11 parameters previously passed to connectRdmaPeers() into a
+// single struct.  Callers populate this from all-gathered peer metadata before
+// calling the transport's connect method.
+struct RdmaPeerConnectInfo {
+    std::vector<int64_t> remote_addrs;
+    std::vector<int32_t> remote_keys;
+    std::vector<std::vector<int32_t>> peer_qpns;
+    std::vector<std::vector<int32_t>> peer_lids;
+    std::vector<int64_t> subnet_prefixes;
+    std::vector<int64_t> interface_ids;
+    std::vector<int> active_ranks_mask;
+    int rank = 0;
+    int num_ranks = 0;
+    void* raddrs = nullptr;   // GPU-visible remote address table
+    void* rkeys = nullptr;    // GPU-visible remote key table
+};
+
 inline constexpr uint32_t kIbGdaDeviceContextAbiVersion = 1;
 
 // GPU-visible IBGDA resources consumed by EP kernels.  TENT owns this ABI so
@@ -74,32 +91,32 @@ struct IbGdaDeviceContext {
     void* qp_devctxs = nullptr;
 };
 
+inline constexpr uint32_t kP2pDeviceContextAbiVersion = 1;
 inline constexpr uint32_t kNvLinkDeviceContextAbiVersion = 1;
+inline constexpr uint32_t kMtLinkDeviceContextAbiVersion = 1;
 
-// GPU-visible NVLink/P2P resources consumed by device kernels.  `available`
+// GPU-visible P2P resources consumed by device kernels.  `available`
 // is a device array of length `num_ranks`; `peer_ptrs` is a device array of
 // peer base pointers indexed by rank.  Kernels can compute a peer address by
 // adding the local-buffer-relative offset to `peer_ptrs[dst_rank]` when
 // `available[dst_rank] != 0`.
-struct NvLinkDeviceContext {
-    uint32_t abi_version = kNvLinkDeviceContextAbiVersion;
+//
+// This unified type replaces the platform-specific NvLinkDeviceContext and
+// MtLinkDeviceContext, which are now deprecated aliases.
+struct P2PDeviceContext {
+    uint32_t abi_version = kP2pDeviceContextAbiVersion;
     int rank = 0;
     int num_ranks = 0;
     int32_t* available = nullptr;
     void** peer_ptrs = nullptr;
 };
 
-inline constexpr uint32_t kMtLinkDeviceContextAbiVersion = 1;
-
-// GPU-visible MTLink/P2P resources for Moore Threads GPUs.  Structurally
-// identical to NvLinkDeviceContext — same IPC-based P2P model with peer base
-// pointers and availability flags.  Separate type for future divergence.
-struct MtLinkDeviceContext {
-    uint32_t abi_version = kMtLinkDeviceContextAbiVersion;
-    int rank = 0;
-    int num_ranks = 0;
-    int32_t* available = nullptr;
-    void** peer_ptrs = nullptr;
+// Deprecated aliases — use P2PDeviceContext instead.
+struct NvLinkDeviceContext : P2PDeviceContext {
+    NvLinkDeviceContext() { abi_version = kNvLinkDeviceContextAbiVersion; }
+};
+struct MtLinkDeviceContext : P2PDeviceContext {
+    MtLinkDeviceContext() { abi_version = kMtLinkDeviceContextAbiVersion; }
 };
 
 }  // namespace tent

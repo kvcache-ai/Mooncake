@@ -16,9 +16,12 @@
 
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
+#include <climits>
+#include <libgen.h>
 
 #include <sstream>
 
+#include <glog/logging.h>
 #include "tent/common/status.h"
 
 namespace mooncake {
@@ -579,18 +582,11 @@ Status IbGdaTransport::recreateQueuePairs(int num_qps, int wqe, void* stream,
                                    qp_devctxs);
 }
 
-Status IbGdaTransport::connectRdmaPeers(
-    const std::vector<int64_t>& remote_addrs,
-    const std::vector<int32_t>& remote_keys,
-    const std::vector<std::vector<int32_t>>& peer_qpns,
-    const std::vector<std::vector<int32_t>>& peer_lids,
-    const std::vector<int64_t>& subnet_prefixes,
-    const std::vector<int64_t>& interface_ids,
-    const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
-    void* raddrs, void* rkeys) {
-    return connectPeers(remote_addrs, remote_keys, peer_qpns, peer_lids,
-                        subnet_prefixes, interface_ids, active_ranks_mask,
-                        rank, num_ranks, raddrs, rkeys);
+Status IbGdaTransport::connectRdmaPeers(const RdmaPeerConnectInfo& info) {
+    return connectPeers(info.remote_addrs, info.remote_keys, info.peer_qpns,
+                        info.peer_lids, info.subnet_prefixes,
+                        info.interface_ids, info.active_ranks_mask,
+                        info.rank, info.num_ranks, info.raddrs, info.rkeys);
 }
 
 bool IbGdaTransport::ibgdaDisabled() const { return false; }
@@ -619,10 +615,102 @@ const DeviceCommCapabilities IbGdaTransport::deviceCapabilities() const {
     return caps;
 }
 
+namespace {
+
+// Compute PCI topology distance between two PCI BDF addresses.
+// Returns the number of hops in the PCI tree between the two devices.
+// Distance 0 means same PCIe switch/root complex.
+// Same algorithm as TENT's CudaPlatform::probe().
+int getPciDistance(const char* bus1, const char* bus2) {
+    char buf[PATH_MAX];
+    char path1[PATH_MAX];
+    char path2[PATH_MAX];
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus1);
+    if (realpath(buf, path1) == NULL) return -1;
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus2);
+    if (realpath(buf, path2) == NULL) return -1;
+
+    char* ptr1 = path1;
+    char* ptr2 = path2;
+    while (*ptr1 && *ptr1 == *ptr2) {
+        ptr1++;
+        ptr2++;
+    }
+    int distance = 0;
+    for (; *ptr1; ptr1++) distance += (*ptr1 == '/');
+    for (; *ptr2; ptr2++) distance += (*ptr2 == '/');
+    return distance;
+}
+
+// Resolve an IB device name (e.g. "mlx5_0") to its PCI BDF address
+// via /sys/class/infiniband/<name>/../../  symlink.
+std::string getIbDevicePciBusId(const char* ib_dev_name) {
+    char path[PATH_MAX + 32];
+    char resolved[PATH_MAX];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/../..",
+             ib_dev_name);
+    if (realpath(path, resolved) == NULL) return "";
+    // basename of the resolved path is the PCI BDF
+    return basename(resolved);
+}
+
+// Auto-detect the best IB device for the current CUDA device.
+// Uses PCI topology distance to find the NIC closest to the GPU.
+// Returns the IB device name, or "" on failure.
+std::string autoDetectBestIbDevice(ibv_device** dev_list, int num_devices) {
+    int current_device = 0;
+    cudaError_t err = cudaGetDevice(&current_device);
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "[IBGDA] cudaGetDevice failed: "
+                     << cudaGetErrorString(err)
+                     << ", falling back to first IB device";
+        if (num_devices > 0)
+            return ibv_get_device_name(dev_list[0]);
+        return "";
+    }
+
+    char gpu_pci_bus_id[20] = {};
+    err = cudaDeviceGetPCIBusId(gpu_pci_bus_id, sizeof(gpu_pci_bus_id),
+                                current_device);
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "[IBGDA] cudaDeviceGetPCIBusId failed: "
+                     << cudaGetErrorString(err)
+                     << ", falling back to first IB device";
+        if (num_devices > 0)
+            return ibv_get_device_name(dev_list[0]);
+        return "";
+    }
+    // Normalize to lowercase
+    for (char* ch = gpu_pci_bus_id; *ch; ch++) *ch = tolower(*ch);
+
+    int best_distance = INT_MAX;
+    std::string best_name;
+    for (int i = 0; i < num_devices; ++i) {
+        const char* name = ibv_get_device_name(dev_list[i]);
+        if (!name) continue;
+        std::string nic_pci = getIbDevicePciBusId(name);
+        if (nic_pci.empty()) continue;
+        int dist = getPciDistance(nic_pci.c_str(), gpu_pci_bus_id);
+        if (dist >= 0 && dist < best_distance) {
+            best_distance = dist;
+            best_name = name;
+        }
+    }
+
+    if (!best_name.empty()) {
+        LOG(INFO) << "[IBGDA] auto-detected best NIC for GPU "
+                  << current_device << " (PCI " << gpu_pci_bus_id
+                  << "): " << best_name << " (distance=" << best_distance
+                  << ")";
+    }
+    return best_name;
+}
+
+}  // namespace
+
 Status IbGdaTransport::initializeDevice(const std::string& device_name,
                                         uint8_t port_num) {
     if (ctx_ || pd_) return Status::OK();
-    device_name_ = device_name;
     port_num_ = port_num;
 
     int num_devices = 0;
@@ -631,10 +719,23 @@ Status IbGdaTransport::initializeDevice(const std::string& device_name,
         return Status::RdmaError("failed to get IB device list" LOC_MARK);
     }
 
+    // If device_name is empty, auto-detect the best NIC for the current GPU
+    // using PCI topology distance (same algorithm as TENT's CudaPlatform::probe).
+    std::string resolved_name = device_name;
+    if (resolved_name.empty()) {
+        resolved_name = autoDetectBestIbDevice(dev_list, num_devices);
+        if (resolved_name.empty()) {
+            ibv_free_device_list(dev_list);
+            return Status::DeviceNotFound(
+                "IBGDA auto-detection failed: no IB devices found" LOC_MARK);
+        }
+    }
+    device_name_ = resolved_name;
+
     ibv_device* selected = nullptr;
     for (int i = 0; i < num_devices; ++i) {
         const char* name = ibv_get_device_name(dev_list[i]);
-        if (name && device_name == name) {
+        if (name && resolved_name == name) {
             selected = dev_list[i];
             break;
         }
@@ -642,7 +743,7 @@ Status IbGdaTransport::initializeDevice(const std::string& device_name,
     if (!selected) {
         ibv_free_device_list(dev_list);
         return Status::DeviceNotFound("IBGDA device not found: " +
-                                      device_name + LOC_MARK);
+                                      resolved_name + LOC_MARK);
     }
 
     ctx_ = ibv_open_device(selected);

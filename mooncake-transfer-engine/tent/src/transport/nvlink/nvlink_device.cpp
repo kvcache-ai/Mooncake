@@ -233,11 +233,11 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
                                 "cudaMemcpy nvlink peer pointers failed"));
 
         // Update the GPU-visible device context struct.
-        nvlink_device_ctx_.abi_version = kNvLinkDeviceContextAbiVersion;
-        nvlink_device_ctx_.rank = rank_;
-        nvlink_device_ctx_.num_ranks = num_ranks_;
-        nvlink_device_ctx_.available = available_;
-        nvlink_device_ctx_.peer_ptrs = peer_ptrs_;
+        p2p_device_ctx_.abi_version = kP2pDeviceContextAbiVersion;
+        p2p_device_ctx_.rank = rank_;
+        p2p_device_ctx_.num_ranks = num_ranks_;
+        p2p_device_ctx_.available = available_;
+        p2p_device_ctx_.peer_ptrs = peer_ptrs_;
         return Status::OK();
     }
 
@@ -252,45 +252,40 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
     }
 
     Status registerMemory(void* /*ptr*/, size_t /*size*/,
-                          uint32_t& lkey, uint32_t& rkey) override {
-        lkey = 0;
-        rkey = 0;
-        return Status::OK();
+                          uint32_t& /*lkey*/, uint32_t& /*rkey*/) override {
+        return Status::NotSupported("NVLink does not support RDMA memory registration");
     }
 
-    Status unregisterMemory(void* /*ptr*/) override { return Status::OK(); }
+    Status unregisterMemory(void* /*ptr*/) override {
+        return Status::NotSupported("NVLink does not support RDMA memory registration");
+    }
 
     Status allocateControlBuffer(size_t /*size*/) override {
-        return Status::OK();
+        return Status::NotSupported("NVLink does not use RDMA control buffers");
     }
 
-    Status releaseControlBuffer() override { return Status::OK(); }
+    Status releaseControlBuffer() override {
+        return Status::NotSupported("NVLink does not use RDMA control buffers");
+    }
 
     void* controlBuffer() const override { return nullptr; }
 
     Status createQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
                             void* /*qp_devctxs*/) override {
-        return Status::OK();
+        return Status::NotSupported("NVLink does not use RDMA queue pairs");
     }
 
     Status recreateQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
                               void* /*qp_devctxs*/) override {
-        return Status::OK();
+        return Status::NotSupported("NVLink does not use RDMA queue pairs");
     }
 
-    Status destroyQueuePairs() override { return Status::OK(); }
+    Status destroyQueuePairs() override {
+        return Status::NotSupported("NVLink does not use RDMA queue pairs");
+    }
 
-    Status connectRdmaPeers(
-        const std::vector<int64_t>& /*remote_addrs*/,
-        const std::vector<int32_t>& /*remote_keys*/,
-        const std::vector<std::vector<int32_t>>& /*peer_qpns*/,
-        const std::vector<std::vector<int32_t>>& /*peer_lids*/,
-        const std::vector<int64_t>& /*subnet_prefixes*/,
-        const std::vector<int64_t>& /*interface_ids*/,
-        const std::vector<int>& /*active_ranks_mask*/, int /*rank*/,
-        int /*num_ranks*/, void* /*raddrs*/,
-        void* /*rkeys*/) override {
-        return Status::OK();
+    Status connectRdmaPeers(const RdmaPeerConnectInfo& /*info*/) override {
+        return Status::NotSupported("NVLink does not support RDMA peer connections");
     }
 
     // -------------------------------------------------------------------
@@ -308,15 +303,15 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
     // DeviceTransport — GPU-kernel-visible context
     // -------------------------------------------------------------------
     const void* deviceContextPtr() const override {
-        return &nvlink_device_ctx_;
+        return &p2p_device_ctx_;
     }
 
     size_t deviceContextSize() const override {
-        return sizeof(NvLinkDeviceContext);
+        return sizeof(P2PDeviceContext);
     }
 
     DeviceContextAbi deviceContextAbi() const override {
-        return DeviceContextAbi::kNvLink;
+        return DeviceContextAbi::kP2P;
     }
 
     // -------------------------------------------------------------------
@@ -365,7 +360,7 @@ class NvLinkDeviceTransportImpl final : public NvLinkDeviceTransport {
     void** host_peer_ptrs_ = nullptr;
     std::vector<void*> opened_peer_ptrs_;
     bool all_peers_accessible_ = false;
-    NvLinkDeviceContext nvlink_device_ctx_{};
+    P2PDeviceContext p2p_device_ctx_{};
 };
 
 }  // namespace

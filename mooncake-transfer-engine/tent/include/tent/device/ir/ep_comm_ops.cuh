@@ -46,10 +46,8 @@ struct EpCommCtx {
     DeviceOps* dops;
     void* local_base;  // symmetric memory base (mxa_buffer)
 
-#ifdef MOONCAKE_EP_USE_MUSA
-    MtLinkDeviceContext p2p_ctx;
-#else
-    NvLinkDeviceContext p2p_ctx;
+    P2PDeviceContext p2p_ctx;
+#ifndef MOONCAKE_EP_USE_MUSA
     ibgda::IbGdaCtx ibgda_ctx;
 #endif
 
@@ -165,12 +163,12 @@ __device__ __forceinline__ void ep_red_add(EpCommCtx& ctx,
     }
 
     if (ep_p2p_available(ctx, dst_rank)) {
-        // P2P path: release store (matches original st_na_release behavior)
+        // P2P path: release store (single-writer assumption)
 #ifdef MOONCAKE_EP_USE_MUSA
-        mtlink::mtlink_red_add(ctx.dops, ctx.p2p_ctx, dst_rank,
+        mtlink::mtlink_signal_add(ctx.dops, ctx.p2p_ctx, dst_rank,
                                ctx.local_base, sym_ptr, val);
 #else
-        nvlink::nvlink_red_add(ctx.dops, ctx.p2p_ctx, dst_rank,
+        nvlink::nvlink_signal_add(ctx.dops, ctx.p2p_ctx, dst_rank,
                                ctx.local_base, sym_ptr, val);
 #endif
     } else {

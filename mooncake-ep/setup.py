@@ -18,7 +18,7 @@ use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
     "TRUE",
     "YES",
 }
-use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "").upper() in {
+use_tent = os.getenv("MOONCAKE_EP_USE_TENT", "1").upper() in {
     "1",
     "ON",
     "TRUE",
@@ -45,9 +45,8 @@ if use_musa:
     BuildClass = MUSABuildExtension
     sources.append("../mooncake-transfer-engine/tent/src/transport/mtlink/mtlink_device.cpp")
     sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
-else:
-    # CUDA: link IB verbs, mlx5, and TENT static lib
-    # All builds now use TENT DeviceTransport — include transport sources.
+elif use_tent:
+    # CUDA + TENT: link IB verbs, mlx5, and TENT shared lib
     cuda_libraries = ["ibverbs", "mlx5", "glog"]
     cuda_library_dirs = []
     ExtensionClass = CUDAExtension
@@ -55,6 +54,13 @@ else:
     sources.append("../mooncake-transfer-engine/tent/src/transport/nvlink/nvlink_device.cpp")
     sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/ibgda_device.cpp")
     sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
+else:
+    # CUDA + TE/legacy: link IB verbs, mlx5, glog, engine.so
+    cuda_libraries = ["ibverbs", "mlx5", "glog"]
+    cuda_library_dirs = []
+    ExtensionClass = CUDAExtension
+    BuildClass = BuildExtension
+    sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp")
 
     if CUDA_HOME is not None:
         cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
@@ -69,35 +75,68 @@ if use_tent:
 if use_musa:
     defines.append("MOONCAKE_EP_USE_MUSA=1")
 
-# Link against the TENT shared library built from source.  This provides
-# IbGdaTransport, NvLinkDeviceTransport, and all their dependencies
-# (RPC, metastore, etc.) without needing the old engine.so Python module.
-tent_build_dir = os.path.join(
-    current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
-)
-tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
-if not os.path.exists(tent_lib):
-    raise FileNotFoundError(
-        f"TENT shared library not found at {tent_lib}. "
-        "Build the transfer engine first: cmake --build build-phase2"
+if use_tent:
+    # Link against the TENT shared library built from source.  This provides
+    # IbGdaTransport, NvLinkDeviceTransport, and all their dependencies
+    # (RPC, metastore, etc.) without needing the old engine.so Python module.
+    tent_build_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
     )
+    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
+    if not os.path.exists(tent_lib):
+        raise FileNotFoundError(
+            f"TENT shared library not found at {tent_lib}. "
+            "Build the transfer engine first: cmake --build build-phase2"
+        )
 
-extra_link_args = [
-    "-Wl,-rpath,$ORIGIN",
-    "-Wl,-rpath," + tent_build_dir,
-    "-L" + tent_build_dir,
-    "-ltent_shared",
-]
-if not use_musa:
-    # CUDA builds also need asio_shared
+    extra_link_args = [
+        "-Wl,-rpath,$ORIGIN",
+        "-Wl,-rpath," + tent_build_dir,
+        "-L" + tent_build_dir,
+        "-ltent_shared",
+    ]
+    if not use_musa:
+        # CUDA builds also need asio_shared
+        asio_lib_dir = os.path.join(
+            current_dir, "../build-phase2/mooncake-common"
+        )
+        extra_link_args.extend([
+            "-L" + asio_lib_dir,
+            "-lasio",
+            "-Wl,-rpath," + asio_lib_dir,
+        ])
+else:
+    # TE/legacy mode: link against engine.so and transfer_engine static libs
+    engine_dir = os.path.join(
+        current_dir, "../mooncake-wheel/mooncake"
+    )
+    te_build_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/src"
+    )
+    te_common_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/src/common/base"
+    )
+    mc_common_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-common/src"
+    )
     asio_lib_dir = os.path.join(
         current_dir, "../build-phase2/mooncake-common"
     )
-    extra_link_args.extend([
+    extra_link_args = [
+        "-Wl,-rpath,$ORIGIN",
+        "-L" + engine_dir,
+        "-l:engine.so",
+        "-Wl,-rpath," + engine_dir,
+        "-L" + te_build_dir,
+        "-ltransfer_engine",
+        "-L" + te_common_dir,
+        "-lbase",
+        "-L" + mc_common_dir,
+        "-lmooncake_common",
         "-L" + asio_lib_dir,
         "-lasio",
         "-Wl,-rpath," + asio_lib_dir,
-    ])
+    ]
 
 setup(
     name=module_name,
@@ -109,8 +148,7 @@ setup(
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
                 os.path.join(current_dir, "../mooncake-common/include"),
-                "/root/ylt-install/include",
-            ],
+            ] + ([p] if (p := os.getenv("MOONCAKE_EP_EXTRA_INCLUDE", "/root/ylt-install/include")) and os.path.isdir(p) else []),
             sources=sources,
             extra_compile_args={
                 "cxx": [

@@ -38,7 +38,7 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
     // -------------------------------------------------------------------
     Status allocateBuffer(void** ptr, size_t size,
                           bool allow_fabric) override {
-        return transport_.allocateBuffer(ptr, size);
+        return transport_.allocateBuffer(ptr, size, allow_fabric);
     }
 
     Status freeBuffer(void* ptr) override { return transport_.freeBuffer(ptr); }
@@ -108,19 +108,12 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
         return transport_.destroyQueuePairs();
     }
 
-    Status connectRdmaPeers(
-        const std::vector<int64_t>& remote_addrs,
-        const std::vector<int32_t>& remote_keys,
-        const std::vector<std::vector<int32_t>>& peer_qpns,
-        const std::vector<std::vector<int32_t>>& peer_lids,
-        const std::vector<int64_t>& subnet_prefixes,
-        const std::vector<int64_t>& interface_ids,
-        const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
-        void* raddrs, void* rkeys) override {
-        return transport_.connectPeers(remote_addrs, remote_keys, peer_qpns,
-                                       peer_lids, subnet_prefixes,
-                                       interface_ids, active_ranks_mask, rank,
-                                       num_ranks, raddrs, rkeys);
+    Status connectRdmaPeers(const RdmaPeerConnectInfo& info) override {
+        return transport_.connectPeers(
+            info.remote_addrs, info.remote_keys, info.peer_qpns,
+            info.peer_lids, info.subnet_prefixes, info.interface_ids,
+            info.active_ranks_mask, info.rank, info.num_ranks,
+            info.raddrs, info.rkeys);
     }
 
     // -------------------------------------------------------------------
@@ -163,8 +156,8 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
     // -------------------------------------------------------------------
     void** hostPeerPtrs() const override { return nullptr; }
 
-    void* getRemotePtr(void* local_ptr, int dst_rank) override {
-        return transport_.getRemotePtr(local_ptr, dst_rank);
+    void* getRemotePtr(void* /*local_ptr*/, int /*dst_rank*/) override {
+        return nullptr;  // RDMA transport has no P2P mapping
     }
 
     // -------------------------------------------------------------------

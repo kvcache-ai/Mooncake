@@ -102,21 +102,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
-    tent::NvLinkDeviceContext nvlink_ctx = {
-        tent::kNvLinkDeviceContextAbiVersion,
+    tent::P2PDeviceContext p2p_ctx = {
+        tent::kP2pDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, nvlink_ctx, ibgda_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, p2p_ctx, ibgda_ctx, rank, num_ranks};
 #else
-    tent::MtLinkDeviceContext mtlink_ctx = {
-        tent::kMtLinkDeviceContextAbiVersion,
+    tent::P2PDeviceContext p2p_ctx = {
+        tent::kP2pDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, mtlink_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, p2p_ctx, rank, num_ranks};
 #endif
 #else
     // Non-TENT path: construct IbGdaCtx directly
@@ -558,21 +558,21 @@ combine(void* combined_x, int32_t* active_ranks,
                           rank,
                           static_cast<int>(num_qp_per_rank),
                           num_ranks};
-    tent::NvLinkDeviceContext nvlink_ctx = {
-        tent::kNvLinkDeviceContextAbiVersion,
+    tent::P2PDeviceContext p2p_ctx = {
+        tent::kP2pDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, nvlink_ctx, ibgda_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, p2p_ctx, ibgda_ctx, rank, num_ranks};
 #else
-    tent::MtLinkDeviceContext mtlink_ctx = {
-        tent::kMtLinkDeviceContextAbiVersion,
+    tent::P2PDeviceContext p2p_ctx = {
+        tent::kP2pDeviceContextAbiVersion,
         rank,
         num_ranks,
         const_cast<int32_t*>(nvlink_available),
         const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, mtlink_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, p2p_ctx, rank, num_ranks};
 #endif
 #else
     // Non-TENT path: construct IbGdaCtx directly

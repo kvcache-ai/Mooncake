@@ -127,15 +127,7 @@ class DeviceTransport {
     virtual Status destroyQueuePairs() = 0;
 
     /// Connect to remote RDMA peers.  No-op for P2P-only transports.
-    virtual Status connectRdmaPeers(
-        const std::vector<int64_t>& remote_addrs,
-        const std::vector<int32_t>& remote_keys,
-        const std::vector<std::vector<int32_t>>& peer_qpns,
-        const std::vector<std::vector<int32_t>>& peer_lids,
-        const std::vector<int64_t>& subnet_prefixes,
-        const std::vector<int64_t>& interface_ids,
-        const std::vector<int>& active_ranks_mask, int rank, int num_ranks,
-        void* raddrs, void* rkeys) = 0;
+    virtual Status connectRdmaPeers(const RdmaPeerConnectInfo& info) = 0;
 
     // -----------------------------------------------------------------------
     // Metadata accessors
@@ -179,6 +171,7 @@ class DeviceTransport {
         kIbGda = 1,
         kNvLink = 2,
         kMtLink = 3,
+        kP2P = 4,
     };
 
     virtual DeviceContextAbi deviceContextAbi() const = 0;
