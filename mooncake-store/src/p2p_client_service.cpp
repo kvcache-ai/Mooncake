@@ -1525,8 +1525,7 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         cleanup.key = req->key;
         cleanup.read_operation_id = pin.value().read_operation_id;
         tl::expected<void, ErrorCode> cleanup_unpin;
-        for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
-             ++attempt) {
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
             if (cleanup_unpin) {
                 break;
@@ -1548,31 +1547,8 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         }
         co_return tr.error();
     }
-    UnPinKeyRequest unpin_req;
-    unpin_req.key = req->key;
-    unpin_req.read_operation_id = pin.value().read_operation_id;
-    tl::expected<void, ErrorCode> unpin_res;
-    for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
-         ++attempt) {
-        unpin_res = co_await route.peer->AsyncUnPinKey(unpin_req);
-        if (unpin_res) {
-            break;
-        }
-        if (unpin_res.error() == ErrorCode::LEASE_EXPIRED) {
-            unpin_res = tl::expected<void, ErrorCode>{};
-            break;
-        }
-        if (attempt + 1 < kRevokeRetryMaxCnt) {
-            LOG(WARNING) << "AsyncUnPinKey retry after forward read, key="
-                         << req->key << ", attempt=" << (attempt + 1)
-                         << ", error=" << unpin_res.error();
-        }
-    }
-    if (!unpin_res) {
-        LOG(ERROR) << "AsyncUnPinKey failed after forward read, key="
-                   << req->key << ", error=" << unpin_res.error();
-        co_return unpin_res.error();
-    }
+    // Success: skip UnPinKey to save RPC latency; owner lease / scanner
+    // releases pin.
     tl::expected<void, ErrorCode> ok;
     promise->setValue(std::move(ok));
     co_return ErrorCode::OK;
@@ -1591,13 +1567,13 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                     transfer_direction_mode_ == TransferDirectionMode::FORWARD;
                 ErrorCode route_result;
                 if (forward_read) {
-                    route_result = co_await RunForwardReadOnRoute(*route, req,
-                                                                  promise);
+                    route_result =
+                        co_await RunForwardReadOnRoute(*route, req, promise);
                 } else {
                     auto result =
                         co_await route->peer->AsyncReadRemoteData(*req);
-                    route_result = result.has_value() ? ErrorCode::OK
-                                                      : result.error();
+                    route_result =
+                        result.has_value() ? ErrorCode::OK : result.error();
                 }
 
                 if (route_result == ErrorCode::OK) {
@@ -1616,11 +1592,12 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                         << ", client_id: " << route->proxy.client_id
                         << ", segment_id: " << route->proxy.segment_id
                         << ", is_cached: " << route->is_cached;
-                    // Request/local constraint errors; another route cannot help.
+                    // Request/local constraint errors; another route cannot
+                    // help.
                     if (route_result == ErrorCode::INVALID_PARAMS ||
                         route_result == ErrorCode::NOT_IMPLEMENTED) {
-                        promise->setValue(
-                            tl::make_unexpected(route_result));
+                        promise->setValue(tl::expected<void, ErrorCode>(
+                            tl::unexpected(route_result)));
                         co_return;
                     }
                 }
@@ -2042,8 +2019,7 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         revoke_req.key = write_req->key;
         revoke_req.write_operation_id = pre.value().write_operation_id;
         tl::expected<void, ErrorCode> revoke_res;
-        for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
-             ++attempt) {
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
             if (revoke_res) {
                 break;
