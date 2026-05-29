@@ -570,14 +570,16 @@ ErrorCode Client::InitTransferEngine(
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "ub") {
-            if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << "ub protocol requires device names when auto "
-                              "discovery is disabled";
-                return ErrorCode::INVALID_PARAMS;
-            }
             auto deviceName = device_names.value_or("bonding_dev_0");
+            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
             auto devices = splitString(deviceName, ',', true);
-            transfer_engine_->getLocalTopology()->discover(devices);
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
             transport = transfer_engine_->installTransport("ub", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install ub transport with specified "
