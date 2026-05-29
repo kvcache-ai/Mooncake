@@ -2716,58 +2716,7 @@ impl StoreClient {
     }
 
     fn track_remote_storage_owners_best_effort(&self, routes: &[ObjectRoute]) {
-        if routes.is_empty() {
-            return;
-        }
-        let mut grouped = BTreeMap::<ClientRuntimeId, BTreeMap<String, ObjectRoute>>::new();
-        for route in routes {
-            let mut owners = BTreeSet::new();
-            for replica in route
-                .replicas
-                .iter()
-                .filter(|replica| replica.owner != self.lease.runtime)
-            {
-                if owners.insert(replica.owner.clone()) {
-                    grouped
-                        .entry(replica.owner.clone())
-                        .or_default()
-                        .insert(route.key.0.clone(), route.clone());
-                }
-            }
-        }
-        if grouped.is_empty() {
-            return;
-        }
-        let leases = match self.lookup_runtime_leases(grouped.keys().cloned()) {
-            Ok(leases) => leases,
-            Err(error) => {
-                debug!(
-                    runtime = %self.lease.runtime,
-                    error = %error,
-                    targets = grouped.len(),
-                    "failed to resolve storage-owner leases for route tracking"
-                );
-                return;
-            }
-        };
-        for (owner, routes) in grouped {
-            let Some(lease) = leases.get(&owner) else {
-                continue;
-            };
-            let routes = routes.into_values().collect::<Vec<_>>();
-            if let Err(error) = self
-                .control_client
-                .batch_track_replica_routes(lease, &routes)
-            {
-                debug!(
-                    runtime = %self.lease.runtime,
-                    storage_owner = %owner,
-                    error = %error,
-                    items = routes.len(),
-                    "storage-owner route tracking failed"
-                );
-            }
-        }
+        self.async_replica_tracking.enqueue(routes);
     }
 
     fn note_remote_read_failure(

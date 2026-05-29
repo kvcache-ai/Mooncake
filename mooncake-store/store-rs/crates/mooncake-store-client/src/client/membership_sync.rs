@@ -150,6 +150,164 @@ impl Drop for AsyncEvictionHandle {
     }
 }
 
+const ASYNC_REPLICA_TRACK_QUEUE_CAPACITY: usize = 1024;
+const ASYNC_REPLICA_TRACK_DRAIN_BUDGET: usize = 4096;
+const ASYNC_REPLICA_TRACK_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const ASYNC_REPLICA_TRACK_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+
+struct AsyncReplicaTrackHandle {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<ObjectRoute>>>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncReplicaTrackHandle {
+    fn spawn(
+        runtime: &ClientRuntimeId,
+        control_client: Arc<ControlPlaneClient>,
+        live_client_cache: SharedLiveClientCache,
+    ) -> Result<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<Vec<ObjectRoute>>(ASYNC_REPLICA_TRACK_QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let local_runtime = runtime.clone();
+        let stable_id = runtime.stable_id.0.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("mooncake-replica-track-{stable_id}"))
+            .spawn(move || {
+                loop {
+                    if shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let mut routes = match receiver.recv_timeout(ASYNC_REPLICA_TRACK_RECV_TIMEOUT)
+                    {
+                        Ok(routes) => routes,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let started = Instant::now();
+                    while routes.len() < ASYNC_REPLICA_TRACK_DRAIN_BUDGET
+                        && started.elapsed() < ASYNC_REPLICA_TRACK_COALESCE_WINDOW
+                    {
+                        match receiver.try_recv() {
+                            Ok(mut more) => routes.append(&mut more),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    flush_async_replica_tracks(
+                        &local_runtime,
+                        control_client.as_ref(),
+                        &live_client_cache,
+                        &routes,
+                    );
+                }
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to spawn async replica tracking worker: {error}"
+                ))
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn enqueue(&self, routes: &[ObjectRoute]) {
+        if routes.is_empty() {
+            return;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        match sender.try_send(routes.to_vec()) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(routes)) => {
+                tracing::debug!(
+                    items = routes.len(),
+                    "dropping best-effort replica tracking after async queue filled"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for AsyncReplicaTrackHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn flush_async_replica_tracks(
+    local_runtime: &ClientRuntimeId,
+    control_client: &ControlPlaneClient,
+    live_client_cache: &SharedLiveClientCache,
+    routes: &[ObjectRoute],
+) {
+    let mut grouped = BTreeMap::<ClientRuntimeId, BTreeMap<String, ObjectRoute>>::new();
+    for route in routes {
+        let mut owners = BTreeSet::new();
+        for replica in route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner != *local_runtime)
+        {
+            if owners.insert(replica.owner.clone()) {
+                grouped
+                    .entry(replica.owner.clone())
+                    .or_default()
+                    .insert(route.key.0.clone(), route.clone());
+            }
+        }
+    }
+    if grouped.is_empty() {
+        return;
+    }
+    let Some(snapshot) = live_client_cache.lock().snapshot() else {
+        tracing::debug!(
+            targets = grouped.len(),
+            "dropping best-effort replica tracking before membership snapshot is ready"
+        );
+        return;
+    };
+    let leases = snapshot
+        .into_iter()
+        .map(|lease| (lease.runtime.clone(), lease))
+        .collect::<BTreeMap<_, _>>();
+    for (owner, routes) in grouped {
+        let Some(lease) = leases.get(&owner) else {
+            tracing::debug!(
+                storage_owner = %owner,
+                items = routes.len(),
+                "dropping best-effort replica tracking for unavailable owner"
+            );
+            continue;
+        };
+        let routes = routes.into_values().collect::<Vec<_>>();
+        if let Err(error) = control_client.batch_track_replica_routes(lease, &routes) {
+            tracing::debug!(
+                storage_owner = %owner,
+                error = %error,
+                items = routes.len(),
+                "async storage-owner route tracking failed"
+            );
+        }
+    }
+}
+
 pub(crate) fn refresh_live_client_cache(
     metadata: &dyn MetadataBackend,
     live_client_cache: &SharedLiveClientCache,

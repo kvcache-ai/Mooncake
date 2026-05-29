@@ -109,6 +109,7 @@ pub struct StoreClient {
     suspect_runtime_cache: SharedSuspectRuntimeCache,
     membership_sync: MembershipSyncHandle,
     _async_eviction: AsyncEvictionHandle,
+    async_replica_tracking: AsyncReplicaTrackHandle,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,
