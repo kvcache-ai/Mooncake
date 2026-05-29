@@ -133,7 +133,7 @@ class P2pDeviceTransportBase : public P2pTransport {
                            std::vector<int32_t>& handle_words) override {
         typename GpuApi::IpcMemHandleType handle;
         // MUSA requires setting the device before IPC export
-        if constexpr (!std::is_same_v<GpuApi, CudaApiTraits>) {
+        if constexpr (!kSupportsFabric) {
             int current_device = 0;
             GpuApi::getDevice(&current_device);
             GpuApi::setDevice(device_id);
@@ -163,7 +163,7 @@ class P2pDeviceTransportBase : public P2pTransport {
         }
 
         // MUSA requires explicit device setting
-        if constexpr (!std::is_same_v<GpuApi, CudaApiTraits>) {
+        if constexpr (!kSupportsFabric) {
             CHECK_STATUS(GpuApi::checkStatus(
                 GpuApi::setDevice(local_device_id),
                 (std::string(GpuApi::kTransportName) +
@@ -174,9 +174,7 @@ class P2pDeviceTransportBase : public P2pTransport {
         int num_devices = 0;
         CHECK_STATUS(GpuApi::checkStatus(
             GpuApi::getDeviceCount(&num_devices),
-            (std::string("No ") +
-             (std::is_same_v<GpuApi, CudaApiTraits> ? "CUDA" : "MUSA") +
-             " devices found")
+            (std::string("No ") + GpuApi::kTransportName + " devices found")
                 .c_str()));
         if (num_devices == 0) {
             return Status::InternalError("No GPU devices found");
