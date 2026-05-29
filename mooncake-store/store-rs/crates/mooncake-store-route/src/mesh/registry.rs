@@ -15,10 +15,7 @@ pub(crate) fn bind_local_authority_service(
     service: Arc<dyn RouteAuthorityService>,
 ) {
     let mesh = route_mesh(namespace);
-    let mut slot = mesh
-        .authorities
-        .entry(authority.0.clone())
-        .or_default();
+    let mut slot = mesh.authorities.entry(authority.0.clone()).or_default();
     slot.service = Some(service);
 }
 
@@ -234,10 +231,7 @@ struct AuthoritySlot {
 
 pub(crate) fn register_local_authority(namespace: &str, authority: &ClientStableId) {
     let mesh = route_mesh(namespace);
-    let mut slot = mesh
-        .authorities
-        .entry(authority.0.clone())
-        .or_default();
+    let mut slot = mesh.authorities.entry(authority.0.clone()).or_default();
     slot.ref_count += 1;
 }
 

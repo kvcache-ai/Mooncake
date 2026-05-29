@@ -147,8 +147,7 @@ impl ControlPlaneClient {
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
     ) -> Result<RouteControlResponse> {
-        let get_response =
-            self.send_route_batch_get(lease, namespace, authority, keys)?;
+        let get_response = self.send_route_batch_get(lease, namespace, authority, keys)?;
         let RouteControlResponse::BatchGet(results) = get_response else {
             return Err(StoreError::Transport(
                 "unexpected response type for batch_contains".to_string(),
