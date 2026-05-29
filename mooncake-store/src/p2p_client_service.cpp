@@ -24,6 +24,12 @@ namespace {
 // success; a missing owner record is already OK (idempotent).
 constexpr int kUnpinOrWriteRevokeRetryMaxAttempts = 3;
 
+inline bool IsAlreadyExistsError(ErrorCode err) {
+    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 bool LeaseCleanupErrorTreatAsEffectiveOk(ErrorCode e) {
     return e == ErrorCode::LEASE_EXPIRED;
 }
@@ -630,12 +636,6 @@ std::string P2PClientService::GetHealthStatus() const {
 // ============================================================================
 // Put Operations
 // ============================================================================
-
-inline bool IsAlreadyExistsError(ErrorCode err) {
-    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
-           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
-           err == ErrorCode::OBJECT_ALREADY_EXISTS;
-}
 
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
