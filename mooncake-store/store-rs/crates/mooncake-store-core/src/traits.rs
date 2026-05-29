@@ -311,6 +311,22 @@ pub trait RouteDirectory: Send + Sync {
         self.get_object_routes(observer, keys)
     }
 
+    fn contains_object_route(&self, observer: &ClientLease, key: &ObjectKey) -> Result<bool> {
+        Ok(self.get_object_route(observer, key)?.is_some())
+    }
+
+    fn contains_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<bool>> {
+        Ok(self
+            .get_object_routes_bounded(observer, keys)?
+            .into_iter()
+            .map(|r| r.is_some())
+            .collect())
+    }
+
     fn compare_and_swap_object_route(
         &self,
         observer: &ClientLease,

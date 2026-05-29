@@ -14,6 +14,11 @@ pub enum RouteControlRequest {
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
     },
+    BatchContains {
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+    },
     BatchCompareAndSwap {
         namespace: String,
         authority: ClientStableId,
@@ -35,6 +40,7 @@ impl RouteControlRequest {
     pub fn operation(&self) -> &'static str {
         match self {
             Self::BatchGet { .. } => "control_route_batch_get",
+            Self::BatchContains { .. } => "control_route_batch_contains",
             Self::BatchCompareAndSwap { .. } => "control_route_batch_cas",
             Self::BatchReplace { .. } => "control_route_batch_replace",
             Self::ListByReplicaOwner { .. } => "control_route_list_by_replica_owner",
@@ -43,7 +49,7 @@ impl RouteControlRequest {
 
     pub fn item_count(&self) -> usize {
         match self {
-            Self::BatchGet { keys, .. } => keys.len(),
+            Self::BatchGet { keys, .. } | Self::BatchContains { keys, .. } => keys.len(),
             Self::BatchCompareAndSwap { requests, .. } | Self::BatchReplace { requests, .. } => {
                 requests.len()
             }
@@ -55,6 +61,9 @@ impl RouteControlRequest {
         match self {
             Self::BatchGet { keys, .. } if keys.is_empty() => {
                 Some(RouteControlResponse::BatchGet(Vec::new()))
+            }
+            Self::BatchContains { keys, .. } if keys.is_empty() => {
+                Some(RouteControlResponse::BatchContains(Vec::new()))
             }
             Self::BatchCompareAndSwap { requests, .. } if requests.is_empty() => {
                 Some(RouteControlResponse::BatchCompareAndSwap(Vec::new()))
@@ -70,6 +79,7 @@ impl RouteControlRequest {
 #[derive(Clone, Debug)]
 pub enum RouteControlResponse {
     BatchGet(Vec<Result<Option<ObjectRoute>>>),
+    BatchContains(Vec<Result<bool>>),
     BatchCompareAndSwap(Vec<Result<CasResult>>),
     BatchReplace(Vec<Result<()>>),
     ListByReplicaOwner(Vec<ObjectRoute>),
@@ -94,6 +104,13 @@ pub fn serve_route_control_request(
             keys,
         } => Ok(RouteControlResponse::BatchGet(
             service.batch_get_routes(&namespace, &authority, &keys),
+        )),
+        RouteControlRequest::BatchContains {
+            namespace,
+            authority,
+            keys,
+        } => Ok(RouteControlResponse::BatchContains(
+            service.batch_contains_routes(&namespace, &authority, &keys),
         )),
         RouteControlRequest::BatchCompareAndSwap {
             namespace,
@@ -130,6 +147,31 @@ impl RouteControlAuthorityClient {
 }
 
 impl RouteAuthorityClient for RouteControlAuthorityClient {
+    fn batch_contains_routes(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<bool>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.transport.send_route_control(
+            lease,
+            RouteControlRequest::BatchContains {
+                namespace: namespace.to_string(),
+                authority: authority.clone(),
+                keys: keys.to_vec(),
+            },
+        )?;
+        let RouteControlResponse::BatchContains(replies) = response else {
+            return unexpected_response("batch_contains_routes");
+        };
+        ensure_batch_len("batch_contains_routes", keys.len(), replies.len())?;
+        Ok(replies)
+    }
+
     fn batch_get_routes(
         &self,
         lease: &ClientLease,

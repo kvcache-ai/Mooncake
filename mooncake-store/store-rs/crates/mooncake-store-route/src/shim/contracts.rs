@@ -16,6 +16,14 @@ pub(crate) trait RouteAuthorityClient: Send + Sync {
         keys: &[ObjectKey],
     ) -> Result<Vec<Result<Option<ObjectRoute>>>>;
 
+    fn batch_contains_routes(
+        &self,
+        lease: &ClientLease,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Result<Vec<Result<bool>>>;
+
     fn batch_compare_and_swap_routes(
         &self,
         lease: &ClientLease,
@@ -72,6 +80,26 @@ pub trait RouteAuthorityService: Send + Sync {
         key: &ObjectKey,
         next: Option<&ObjectRoute>,
     ) -> Result<()>;
+
+    fn contains_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> Result<bool> {
+        Ok(self.get_route(namespace, authority, key)?.is_some())
+    }
+
+    fn batch_contains_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<bool>> {
+        keys.iter()
+            .map(|key| self.contains_route(namespace, authority, key))
+            .collect()
+    }
 
     fn batch_get_routes(
         &self,

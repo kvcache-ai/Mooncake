@@ -1143,7 +1143,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
     }
 
     fn is_exist_in_tenant(&self, tenant: &str, key: &str) -> Result<bool> {
-        Ok(self.query_route_in_tenant(tenant, key)?.is_some())
+        let scope = NamespaceScope::with_defaults(Some(tenant), None, None);
+        let object_key = ObjectKey::from_scope(&scope, key);
+        self.route_ops().contains_active_route(&object_key)
     }
 
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
@@ -1159,12 +1161,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     ObjectKey::from_scope(&scope, object.key)
                 })
                 .collect::<Vec<_>>();
-            let routes = self.query_routes_by_object_keys_bounded(&keys)?;
-            self.route_ops().report_route_hits(&routes, self);
-            Ok(routes
-                .into_iter()
-                .map(|route| route.is_some())
-                .collect())
+            self.route_ops().contains_active_routes_bounded(&keys)
         })();
         tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
         result

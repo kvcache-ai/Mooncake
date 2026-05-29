@@ -54,6 +54,22 @@ pub(crate) fn authority_get_many(
     Ok(slot.table.get_many(keys))
 }
 
+pub(crate) fn authority_contains_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<bool>> {
+    let mesh = route_mesh(namespace);
+    let slot = mesh
+        .authorities
+        .get(&authority.0)
+        .ok_or_else(|| not_attached(authority))?;
+    if slot.ref_count == 0 {
+        return Err(not_attached(authority));
+    }
+    Ok(slot.table.contains_many(keys))
+}
+
 pub(crate) fn authority_get_version_floor(
     namespace: &str,
     authority: &ClientStableId,

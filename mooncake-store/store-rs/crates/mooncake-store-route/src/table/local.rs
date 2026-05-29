@@ -25,6 +25,12 @@ impl LocalRouteTable {
         keys.iter().map(|key| self.get(key)).collect()
     }
 
+    pub(crate) fn contains_many(&self, keys: &[ObjectKey]) -> Vec<bool> {
+        keys.iter()
+            .map(|key| self.routes.contains_key(&key.0))
+            .collect()
+    }
+
     pub(crate) fn version_floor(&self, key: &ObjectKey) -> Option<RouteVersion> {
         self.version_floors.get(&key.0).copied()
     }
