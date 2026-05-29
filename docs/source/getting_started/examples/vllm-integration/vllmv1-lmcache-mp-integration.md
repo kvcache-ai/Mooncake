@@ -183,6 +183,6 @@ together:
 
 ## Additional Resources
 
-* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../../../getting_started/examples/lmcache-integration.md)
+* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../lmcache-integration.md)
 * [LMCache MP `mooncake_store` L2 adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector)
 * [LMCache multiprocess disaggregated prefill example](https://github.com/LMCache/LMCache/tree/dev/examples/disagg_prefill_mp)
