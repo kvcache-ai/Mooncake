@@ -61,7 +61,12 @@ impl PoolState {
         Ok(())
     }
 
-    fn has_capacity_for(&self, size_class: usize, max_bytes: usize, max_regions: Option<usize>) -> bool {
+    fn has_capacity_for(
+        &self,
+        size_class: usize,
+        max_bytes: usize,
+        max_regions: Option<usize>,
+    ) -> bool {
         let remaining = max_bytes
             .saturating_sub(self.reserved_bytes)
             .saturating_sub(self.total_bytes);
@@ -129,24 +134,28 @@ impl PoolShared {
             p as *mut u8
         };
 
-        let ret: i32 = match self.config.store.call_method1(
-            py,
-            "register_buffer",
-            (ptr as usize, size_class),
-        ) {
-            Ok(val) => val.extract(py)?,
-            Err(e) => {
-                unsafe { libc::free(ptr as *mut libc::c_void) };
-                return Err(e);
-            }
-        };
+        let ret: i32 =
+            match self
+                .config
+                .store
+                .call_method1(py, "register_buffer", (ptr as usize, size_class))
+            {
+                Ok(val) => val.extract(py)?,
+                Err(e) => {
+                    unsafe { libc::free(ptr as *mut libc::c_void) };
+                    return Err(e);
+                }
+            };
 
         if ret != 0 {
             unsafe { libc::free(ptr as *mut libc::c_void) };
             return Err(PyRuntimeError::new_err("register_buffer failed"));
         }
 
-        Ok(Region { ptr, size: size_class })
+        Ok(Region {
+            ptr,
+            size: size_class,
+        })
     }
 
     /// Unregister a region with the store. Only frees memory if unregister succeeds.
@@ -317,13 +326,19 @@ impl RegisteredBufferLease {
                 .free
                 .entry(self.region_size)
                 .or_default()
-                .push_back(Region { ptr: self.ptr as *mut u8, size: self.region_size });
+                .push_back(Region {
+                    ptr: self.ptr as *mut u8,
+                    size: self.region_size,
+                });
             pool.cvar.notify_one();
             return Ok(());
         }
 
         // Must unregister — drop lock first (Python call ahead).
-        let region = Region { ptr: self.ptr as *mut u8, size: self.region_size };
+        let region = Region {
+            ptr: self.ptr as *mut u8,
+            size: self.region_size,
+        };
         drop(state);
 
         let unregister_result = pool.unregister_region(py, &region);
@@ -457,13 +472,17 @@ impl RegisteredBufferPool {
         prewarm_count: usize,
     ) -> PyResult<Self> {
         if store.is_none(py) {
-            return Err(PyRuntimeError::new_err("MooncakeDistributedStore is not initialized"));
+            return Err(PyRuntimeError::new_err(
+                "MooncakeDistributedStore is not initialized",
+            ));
         }
         if max_bytes == 0 {
             return Err(PyRuntimeError::new_err("max_bytes must be positive"));
         }
         if min_size_class == 0 || alignment == 0 {
-            return Err(PyRuntimeError::new_err("min_size_class and alignment must be positive"));
+            return Err(PyRuntimeError::new_err(
+                "min_size_class and alignment must be positive",
+            ));
         }
         if alignment < std::mem::size_of::<*const ()>() || !alignment.is_power_of_two() {
             return Err(PyRuntimeError::new_err(
@@ -523,7 +542,9 @@ impl RegisteredBufferPool {
             compute_size_class(size, cfg.min_size_class, cfg.max_size_class, cfg.alignment)?;
 
         if size_class > cfg.max_bytes {
-            return Err(PyRuntimeError::new_err("requested buffer size exceeds pool capacity"));
+            return Err(PyRuntimeError::new_err(
+                "requested buffer size exceeds pool capacity",
+            ));
         }
 
         let should_block = block.unwrap_or(cfg.block_on_exhaustion);
@@ -575,7 +596,9 @@ impl RegisteredBufferPool {
 
             // No capacity — block or fail.
             if !should_block {
-                return Err(PyRuntimeError::new_err("registered buffer pool is exhausted"));
+                return Err(PyRuntimeError::new_err(
+                    "registered buffer pool is exhausted",
+                ));
             }
 
             // Wait (release GIL during condvar wait).
@@ -587,7 +610,12 @@ impl RegisteredBufferPool {
                             "timed out waiting for registered buffer",
                         ));
                     }
-                    drop(self.shared.cvar.wait_timeout(state, dl - Instant::now()).unwrap());
+                    drop(
+                        self.shared
+                            .cvar
+                            .wait_timeout(state, dl - Instant::now())
+                            .unwrap(),
+                    );
                 } else {
                     drop(self.shared.cvar.wait(state).unwrap());
                 }
@@ -704,7 +732,10 @@ impl RegisteredBufferPool {
                         .free
                         .entry(remaining.size)
                         .or_default()
-                        .push_back(Region { ptr: remaining.ptr, size: remaining.size });
+                        .push_back(Region {
+                            ptr: remaining.ptr,
+                            size: remaining.size,
+                        });
                 }
                 state.closing = false;
                 shared.cvar.notify_one();
