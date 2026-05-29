@@ -124,6 +124,25 @@ pub trait MooncakeCompatibilityFacade {
         src_offset: usize,
         size: usize,
     ) -> Result<usize>;
+    /// Batch scatter-gather range read with metadata cache.
+    ///
+    /// Each unique key is resolved at most once; subsequent references reuse
+    /// the cached route metadata (analogous to the C++ `metadata_cache` pattern).
+    ///
+    /// # Safety
+    /// Each pointer in `buffer_ptrs` must be valid for `buffer_sizes[i]` bytes
+    /// and the underlying memory must be registered for RDMA transfer.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn get_into_ranges(
+        &self,
+        tenant: &str,
+        buffer_ptrs: &[*mut u8],
+        buffer_sizes: &[usize],
+        all_keys: &[&[&str]],
+        all_dst_offsets: &[&[&[usize]]],
+        all_src_offsets: &[&[&[usize]]],
+        all_sizes: &[&[&[usize]]],
+    ) -> Vec<Vec<Vec<i64>>>;
 }
 
 fn common_value<'a>(mut values: impl Iterator<Item = &'a str>) -> String {
@@ -1694,6 +1713,99 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let bytes_out = result.as_ref().map_or(0u64, |&n| n as u64);
         tracker.finish(&result, bytes_out);
         result
+    }
+
+    unsafe fn get_into_ranges(
+        &self,
+        tenant: &str,
+        buffer_ptrs: &[*mut u8],
+        buffer_sizes: &[usize],
+        all_keys: &[&[&str]],
+        all_dst_offsets: &[&[&[usize]]],
+        all_src_offsets: &[&[&[usize]]],
+        all_sizes: &[&[&[usize]]],
+    ) -> Vec<Vec<Vec<i64>>> {
+        const RANGE_READ_ERROR: i64 = -1;
+
+        let buffer_count = buffer_ptrs.len();
+        let _span = info_span!(
+            "store.get_into_ranges",
+            runtime = %self.lease.runtime,
+            tenant,
+            buffers = buffer_count,
+        )
+        .entered();
+
+        let mut metadata_cache: HashMap<&str, Result<ResolvedObject>> = HashMap::new();
+        let mut results: Vec<Vec<Vec<i64>>> = Vec::with_capacity(buffer_count);
+
+        for i in 0..buffer_count {
+            let buffer_ptr = buffer_ptrs[i];
+            let buffer_size = buffer_sizes[i];
+            let key_count = all_keys[i].len();
+            let mut key_results: Vec<Vec<i64>> = Vec::with_capacity(key_count);
+
+            for j in 0..key_count {
+                let key = all_keys[i][j];
+                let fragment_count = all_dst_offsets[i][j].len();
+                if fragment_count != all_src_offsets[i][j].len()
+                    || fragment_count != all_sizes[i][j].len()
+                {
+                    key_results.push(vec![RANGE_READ_ERROR; fragment_count.max(1)]);
+                    continue;
+                }
+
+                let resolved = metadata_cache.entry(key).or_insert_with(|| {
+                    let object = ObjectRef::new(key).tenant(tenant);
+                    self.resolve_objects(std::slice::from_ref(&object))
+                        .map(|mut v| v.pop().expect("resolve_objects returned empty vec"))
+                });
+
+                let resolved_obj = match resolved {
+                    Err(_) => {
+                        key_results.push(vec![RANGE_READ_ERROR; fragment_count.max(1)]);
+                        continue;
+                    }
+                    Ok(obj) => obj,
+                };
+
+                let mut fragment_results: Vec<i64> = Vec::with_capacity(fragment_count);
+                for k in 0..fragment_count {
+                    let dst_offset = all_dst_offsets[i][j][k];
+                    let src_offset = all_src_offsets[i][j][k];
+                    let size = all_sizes[i][j][k];
+
+                    if size == 0 {
+                        fragment_results.push(0);
+                        continue;
+                    }
+                    if buffer_ptr.is_null() {
+                        fragment_results.push(RANGE_READ_ERROR);
+                        continue;
+                    }
+                    if dst_offset.checked_add(size).is_none_or(|end| end > buffer_size) {
+                        fragment_results.push(RANGE_READ_ERROR);
+                        continue;
+                    }
+                    let object_length = resolved_obj.replica.length as usize;
+                    if src_offset.checked_add(size).is_none_or(|end| end > object_length) {
+                        fragment_results.push(RANGE_READ_ERROR);
+                        continue;
+                    }
+
+                    let dst_ptr = buffer_ptr.add(dst_offset);
+                    let target_slice = std::slice::from_raw_parts_mut(dst_ptr, size);
+                    let mut obj_clone = resolved_obj.clone();
+                    match self.execute_range_read(&mut obj_clone, target_slice, src_offset) {
+                        Ok(n) => fragment_results.push(n as i64),
+                        Err(_) => fragment_results.push(RANGE_READ_ERROR),
+                    }
+                }
+                key_results.push(fragment_results);
+            }
+            results.push(key_results);
+        }
+        results
     }
 }
 
