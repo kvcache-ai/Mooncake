@@ -196,12 +196,14 @@ def main():
     args = parse_args()
 
     store = MooncakeDistributedStore()
-    store.setup_dummy(
+    result = store.setup_dummy(
         64 * 1024 * 1024,
         16 * 1024 * 1024,
         args.daemon_addr,
         keyspace=args.keyspace,
     )
+    if result != 0:
+        raise RuntimeError(f"setup_dummy failed: result={result}")
     allocator = MooncakeHostMemAllocator()
 
     print("RL weight transfer TP mismatch tests:")
