@@ -2100,6 +2100,7 @@ fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
         .scratch_bytes(4096)
         .alignment(1)
         .reclaim_grace_ms(0)
+        .eviction_poll_interval(Duration::ZERO)
 }
 
 fn storage_config_with_background_eviction(
@@ -2394,6 +2395,17 @@ fn wait_for_storage_clock_route(storage: &StoreClient, route: &ObjectRoute, requ
             storage.runtime_id()
         );
     }
+}
+
+fn prometheus_counter_value(metrics: &str, series: &str) -> Option<f64> {
+    metrics.lines().find_map(|line| {
+        let (line_series, value) = line.rsplit_once(' ')?;
+        if line_series == series {
+            value.parse::<f64>().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn wait_for_authority_route(
@@ -3414,9 +3426,13 @@ fn observability_metrics_render_fast_batch_put_stages() {
     assert!(metrics.contains("operation=\"batch_put_stage_rank\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_reserve\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
-    assert!(metrics.contains(
-        "mooncake_store_operation_total{tenant=\"default\",operation=\"batch_put_stage_load_routes\",status=\"ok\"} 1"
-    ));
+    assert_eq!(
+        prometheus_counter_value(
+            &metrics,
+            "mooncake_store_operation_total{tenant=\"default\",operation=\"batch_put_stage_load_routes\",status=\"ok\"}"
+        ),
+        Some(1.0)
+    );
     assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
 }
@@ -10074,6 +10090,7 @@ fn get_marks_route_hot_before_payload_validation() {
         error.to_string().contains("checksum"),
         "expected checksum failure, got {error}"
     );
+    wait_for_storage_clock_hot(&storage, &bad_route);
 
     router
         .put("early-fresh", b"abcdefghijklmnop")
