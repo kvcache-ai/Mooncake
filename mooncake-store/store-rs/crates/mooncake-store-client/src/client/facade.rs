@@ -1151,18 +1151,16 @@ impl MooncakeCompatibilityFacade for StoreClient {
     fn batch_is_exist(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<bool>> {
         let tracker = OperationTracker::new("batch_is_exist")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
-        let result: Result<Vec<bool>> = (|| {
-            let keys = objects
-                .iter()
-                .map(|object| {
-                    let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    let scope =
-                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
-                    ObjectKey::from_scope(&scope, object.key)
-                })
-                .collect::<Vec<_>>();
-            self.route_ops().contains_active_routes_bounded(&keys)
-        })();
+        let keys = objects
+            .iter()
+            .map(|object| {
+                let tenant = object.tenant.unwrap_or(self.default_tenant());
+                let scope =
+                    NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set);
+                ObjectKey::from_scope(&scope, object.key)
+            })
+            .collect::<Vec<_>>();
+        let result = self.route_ops().contains_active_routes_bounded(&keys);
         tracker.finish(&result, result.as_ref().map(|items| items.len()).unwrap_or(0) as u64);
         result
     }
