@@ -9395,7 +9395,12 @@ fn local_only_batch_put_from_uses_registered_batch_write_path() {
     assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Write));
 
     let metrics = render_prometheus_metrics();
-    assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
+    assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
+    assert!(
+        !metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""),
+        "accept-existing batch_put_from should skip the publish-stage route preload"
+    );
 }
 
 #[test]
