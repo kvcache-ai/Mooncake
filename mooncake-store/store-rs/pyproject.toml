@@ -21,6 +21,7 @@ classifiers = [
 keywords = ["mooncake", "store", "rust", "distributed-cache"]
 dependencies = [
     "aiohttp",
+    "numpy",
     "requests",
 ]
 
