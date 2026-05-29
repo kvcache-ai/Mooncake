@@ -386,6 +386,16 @@ pub trait RouteDirectory: Send + Sync {
     fn get_version_floor(&self, _observer: &ClientLease, _key: &ObjectKey) -> Option<RouteVersion> {
         None
     }
+
+    fn get_version_floors(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        keys.iter()
+            .map(|key| self.get_version_floor(observer, key))
+            .collect()
+    }
 }
 
 pub trait PlacementStrategy: Send + Sync {

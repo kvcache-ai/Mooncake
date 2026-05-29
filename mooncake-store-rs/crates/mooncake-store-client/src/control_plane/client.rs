@@ -32,6 +32,21 @@ fn decode_route_batch_get_reply(reply: pb::BatchGetRoutesReply) -> Result<RouteC
     ))
 }
 
+fn decode_route_batch_contains_reply(
+    reply: pb::BatchContainsRoutesReply,
+) -> Result<RouteControlResponse> {
+    Ok(RouteControlResponse::BatchContains(
+        reply
+            .replies
+            .into_iter()
+            .map(|entry| {
+                decode_error(entry.error)?;
+                Ok(entry.exists)
+            })
+            .collect(),
+    ))
+}
+
 fn decode_route_batch_cas_reply(
     reply: pb::BatchCompareAndSwapRoutesReply,
     context: &str,
@@ -147,18 +162,48 @@ impl ControlPlaneClient {
         authority: ClientStableId,
         keys: Vec<ObjectKey>,
     ) -> Result<RouteControlResponse> {
-        let get_response = self.send_route_batch_get(lease, namespace, authority, keys)?;
-        let RouteControlResponse::BatchGet(results) = get_response else {
-            return Err(StoreError::Transport(
-                "unexpected response type for batch_contains".to_string(),
-            ));
+        let request = pb::BatchContainsRoutesRequest {
+            namespace,
+            authority: authority.0.clone(),
+            keys: keys.iter().map(|key| key.0.clone()).collect(),
         };
-        Ok(RouteControlResponse::BatchContains(
-            results
-                .into_iter()
-                .map(|r| r.map(|opt| opt.is_some()))
-                .collect(),
-        ))
+        match self.stream_request(lease, |request_id| pb::ControlStreamRequest {
+            request_id,
+            body: Some(pb::control_stream_request::Body::RouteContains(
+                request.clone(),
+            )),
+        }) {
+            Ok(reply) => {
+                decode_error(reply.error)?;
+                let pb::control_stream_reply::Body::RouteContains(reply) =
+                    reply.body.ok_or_else(|| {
+                        StoreError::Transport(
+                            "control stream batch_contains_routes reply is missing body"
+                                .to_string(),
+                        )
+                    })?
+                else {
+                    return Err(StoreError::Transport(
+                        "control stream batch_contains_routes reply type mismatch".to_string(),
+                    ));
+                };
+                return decode_route_batch_contains_reply(reply);
+            }
+            Err(error) => {
+                warn!(
+                    authority = %authority,
+                    items = keys.len(),
+                    error = %error,
+                    "control stream batch_contains_routes failed; falling back to unary batch rpc"
+                );
+            }
+        }
+        let channel = self.channel_for(lease)?;
+        let reply = self.rpc(
+            |mut client| async move { client.batch_contains_routes(Request::new(request)).await },
+            channel,
+        )?;
+        decode_route_batch_contains_reply(reply)
     }
 
     fn send_route_batch_get(

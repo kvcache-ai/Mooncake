@@ -461,11 +461,10 @@ impl StoreClient {
                 }
             };
             let expected_version = current.as_ref().map(|route| route.version);
-            let next_version = next_route_version(
-                current.as_ref(),
-                &self.route_ops(),
-                &scoped_key,
-            );
+            let next_version = current
+                .as_ref()
+                .map(|route| route.version.next())
+                .unwrap_or(RouteVersion(1));
             let checksum = payload_checksum(value);
             let mut route = ObjectRoute {
                 key: scoped_key.clone(),
@@ -511,7 +510,26 @@ impl StoreClient {
                 publish_started.elapsed(),
             );
             cas_tracker.finish(&cas_result, 0);
-            let cas = cas_result?;
+            let mut cas = cas_result?;
+            if !cas.applied && expected_version.is_none() && cas.current.is_none() {
+                let retry_version = next_route_version(None, &self.route_ops(), &scoped_key);
+                if retry_version > route.version {
+                    route.version = retry_version;
+                    let retry_result =
+                        self.route_ops()
+                            .publish_route(&route.key, expected_version, &route);
+                    registry::record_replication_publish(
+                        match &retry_result {
+                            Ok(cas) if cas.applied => "ok",
+                            Ok(_) => "conflict",
+                            Err(StoreError::Conflict(_)) => "conflict",
+                            Err(_) => "error",
+                        },
+                        publish_started.elapsed(),
+                    );
+                    cas = retry_result?;
+                }
+            }
             if !cas.applied {
                 self.best_effort_release_reserved_allocations(
                     &targets,
@@ -1666,6 +1684,7 @@ impl StoreClient {
             routes.iter().filter_map(Option::as_ref),
             &local_segments,
             &readable_runtimes,
+            false,
         );
         Ok(routes)
     }
@@ -2628,7 +2647,12 @@ impl StoreClient {
             return;
         };
         let local_segments = self.local_storage_segments();
-        self.report_readable_route_hits_best_effort(routes, &local_segments, &readable_runtimes);
+        self.report_readable_route_hits_best_effort(
+            routes,
+            &local_segments,
+            &readable_runtimes,
+            false,
+        );
     }
 
     fn report_readable_route_hits_best_effort<'a>(
@@ -2636,6 +2660,7 @@ impl StoreClient {
         routes: impl IntoIterator<Item = &'a ObjectRoute>,
         local_segments: &BTreeSet<SegmentName>,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
+        force_membership_refresh_on_miss: bool,
     ) {
         let mut local_hits = BTreeSet::new();
         let mut remote_hits = BTreeMap::<ClientRuntimeId, BTreeSet<ObjectKey>>::new();
@@ -2662,7 +2687,11 @@ impl StoreClient {
                 }
             }
         }
-        self.report_grouped_route_hits_best_effort(local_hits, remote_hits, false);
+        self.report_grouped_route_hits_best_effort(
+            local_hits,
+            remote_hits,
+            force_membership_refresh_on_miss,
+        );
     }
 
     fn report_grouped_route_hits_best_effort(

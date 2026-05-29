@@ -296,7 +296,7 @@ impl RouteDirectory for RecordingRouteDirectory {
 }
 
 #[test]
-fn batch_is_exist_uses_batched_route_lookup() {
+fn batch_is_exist_uses_single_batched_route_contains_lookup() {
     let meta = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("bie-batch-route-seg"));
     let mut client = make_writer(&meta, &transport);

@@ -165,4 +165,37 @@ impl RouteOperations {
                     .unwrap_or(RouteVersion(1))
             })
     }
+
+    pub fn next_route_versions(
+        &self,
+        current: &[Option<ObjectRoute>],
+        keys: &[ObjectKey],
+    ) -> Vec<RouteVersion> {
+        debug_assert_eq!(current.len(), keys.len());
+        let mut versions = vec![None; current.len()];
+        let mut missing_indices = Vec::new();
+        let mut missing_keys = Vec::new();
+        for (index, (route, key)) in current.iter().zip(keys.iter()).enumerate() {
+            if let Some(route) = route.as_ref() {
+                versions[index] = Some(route.version.next());
+            } else {
+                missing_indices.push(index);
+                missing_keys.push(key.clone());
+            }
+        }
+        let floors = self
+            .directory
+            .get_version_floors(&self.observer, &missing_keys);
+        for (index, floor) in missing_indices.into_iter().zip(floors) {
+            versions[index] = Some(
+                floor
+                    .map(|version| version.next())
+                    .unwrap_or(RouteVersion(1)),
+            );
+        }
+        versions
+            .into_iter()
+            .map(|version| version.unwrap_or(RouteVersion(1)))
+            .collect()
+    }
 }

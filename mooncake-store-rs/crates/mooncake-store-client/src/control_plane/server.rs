@@ -366,6 +366,61 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         Ok(Response::new(pb::BatchGetRoutesReply { replies }))
     }
 
+    async fn batch_contains_routes(
+        &self,
+        request: Request<pb::BatchContainsRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
+        let request = request.into_inner();
+        let keys = request
+            .keys
+            .into_iter()
+            .map(ObjectKey::new)
+            .collect::<Vec<_>>();
+        let item_count = keys.len();
+        let route_request = RouteControlRequest::BatchContains {
+            namespace: request.namespace,
+            authority: ClientStableId::new(request.authority),
+            keys,
+        };
+        let replies = match serve_route_control_request(self.authority.as_ref(), route_request) {
+            Ok(RouteControlResponse::BatchContains(results)) => results
+                .into_iter()
+                .map(|result| match result {
+                    Ok(exists) => pb::ContainsRouteReply {
+                        exists,
+                        error: None,
+                    },
+                    Err(error) => pb::ContainsRouteReply {
+                        exists: false,
+                        error: Some(pb_error(error)),
+                    },
+                })
+                .collect(),
+            Ok(_) => {
+                let detail = pb_error(StoreError::Transport(
+                    "control plane batch_contains_routes returned non-contains route response"
+                        .to_string(),
+                ));
+                (0..item_count)
+                    .map(|_| pb::ContainsRouteReply {
+                        exists: false,
+                        error: Some(detail.clone()),
+                    })
+                    .collect()
+            }
+            Err(error) => {
+                let detail = pb_error(error);
+                (0..item_count)
+                    .map(|_| pb::ContainsRouteReply {
+                        exists: false,
+                        error: Some(detail.clone()),
+                    })
+                    .collect()
+            }
+        };
+        Ok(Response::new(pb::BatchContainsRoutesReply { replies }))
+    }
+
     async fn compare_and_swap_route(
         &self,
         request: Request<pb::CompareAndSwapRouteRequest>,
@@ -989,6 +1044,7 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
 fn control_stream_request_operation(request: &pb::ControlStreamRequest) -> &'static str {
     match request.body.as_ref() {
         Some(pb::control_stream_request::Body::RouteGet(_)) => "batch_get_routes",
+        Some(pb::control_stream_request::Body::RouteContains(_)) => "batch_contains_routes",
         Some(pb::control_stream_request::Body::RouteCas(_)) => "batch_compare_and_swap_routes",
         Some(pb::control_stream_request::Body::RouteListByReplicaOwner(_)) => {
             "list_routes_by_replica_owner"
@@ -1127,6 +1183,11 @@ pub(super) async fn handle_control_stream_request(
             .await
             .map(Response::into_inner)
             .map(pb::control_stream_reply::Body::RouteGet),
+        Some(pb::control_stream_request::Body::RouteContains(batch)) => service
+            .batch_contains_routes(Request::new(batch))
+            .await
+            .map(Response::into_inner)
+            .map(pb::control_stream_reply::Body::RouteContains),
         Some(pb::control_stream_request::Body::RouteCas(batch)) => service
             .batch_compare_and_swap_routes(Request::new(batch))
             .await
