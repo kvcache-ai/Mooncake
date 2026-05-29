@@ -1528,6 +1528,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .iter_mut()
             .map(Vec::as_mut_slice)
             .collect::<Vec<_>>();
+        self.report_get_hits_best_effort(&resolved);
         self.execute_batch_get_into(&mut resolved, &mut slices)?;
         let bytes_out = buffers
             .iter()
@@ -1575,6 +1576,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             .iter_mut()
             .map(|request| &mut *request.buffer)
             .collect::<Vec<_>>();
+        self.report_get_hits_best_effort(&resolved);
         let sizes = self.execute_batch_get_into(&mut resolved, &mut buffers)?;
         drop(buffers);
         let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
