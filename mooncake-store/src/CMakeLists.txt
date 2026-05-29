@@ -58,6 +58,7 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     memory_alloc.cpp
+    ssd_register_client.cpp
     engram/engram_store.cpp
 )
 

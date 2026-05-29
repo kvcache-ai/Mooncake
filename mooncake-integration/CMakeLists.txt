@@ -161,6 +161,15 @@ if(WITH_STORE)
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+
+  if(USE_NOF)
+    install(
+      FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_register.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_ssd_unregister.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/spdk_tgt_create.py"
+      DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+  endif()
 endif()
 
 install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
