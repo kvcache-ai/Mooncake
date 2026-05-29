@@ -200,6 +200,10 @@ class DeviceTransport {
     /// Compute the remote pointer for a local pointer + destination rank.
     /// Used by P2P transports.  Returns nullptr for RDMA transports.
     virtual void* getRemotePtr(void* local_ptr, int dst_rank) = 0;
+
+    /// Whether the last allocateBuffer call used fabric memory (MNNVL).
+    /// Returns false for transports that don't support fabric memory.
+    virtual bool usesFabricMemory() const { return false; }
 };
 
 /// Auto-detect factory: create the P2P DeviceTransport for the current

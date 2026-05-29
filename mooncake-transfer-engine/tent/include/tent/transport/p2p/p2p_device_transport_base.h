@@ -23,6 +23,11 @@
 #include "tent/runtime/device_transport.h"
 #include "tent/transport/p2p/gpu_api_traits.h"
 
+// Fabric memory (MNNVL) uses CUDA Driver API
+#if defined(MOONCAKE_EP_USE_TENT) && !defined(MOONCAKE_EP_USE_MUSA)
+#include <cuda.h>
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -46,7 +51,16 @@ class P2pDeviceTransportBase : public DeviceTransport {
     // DeviceTransport — GPU buffer allocation
     // -------------------------------------------------------------------
     Status allocateBuffer(void** ptr, size_t size,
-                          bool /*allow_fabric*/) override {
+                          bool allow_fabric) override {
+        // Fabric memory path (MNNVL): only for CUDA with kSupportsFabric
+        if constexpr (kSupportsFabric) {
+            if (allow_fabric && tryFabricAlloc(ptr, size)) {
+                use_fabric_mem_ = true;
+                return Status::OK();
+            }
+        }
+        // Fallback: plain GPU malloc
+        use_fabric_mem_ = false;
         auto err = GpuApi::malloc(ptr, size);
         if (GpuApi::isError(err)) {
             return Status::InternalError(
@@ -58,6 +72,11 @@ class P2pDeviceTransportBase : public DeviceTransport {
     }
 
     Status freeBuffer(void* ptr) override {
+        if (use_fabric_mem_) {
+            freeFabric(ptr);
+            use_fabric_mem_ = false;
+            return Status::OK();
+        }
         auto err = GpuApi::free(ptr);
         if (GpuApi::isError(err)) {
             return Status::InternalError(
@@ -66,6 +85,8 @@ class P2pDeviceTransportBase : public DeviceTransport {
         }
         return Status::OK();
     }
+
+    bool usesFabricMemory() const { return use_fabric_mem_; }
 
     // -------------------------------------------------------------------
     // DeviceTransport — P2P peer setup
@@ -399,6 +420,99 @@ class P2pDeviceTransportBase : public DeviceTransport {
     }
 
    protected:
+    // --- Fabric memory helpers (only compiled for CUDA + kSupportsFabric) ---
+
+    /// Try to allocate using CUDA VMM / fabric memory. Returns true on success.
+    bool tryFabricAlloc(void** ptr, size_t size) {
+#if !defined(MOONCAKE_EP_USE_MUSA)
+        if (!nvLinkSupportsFabricMemory()) return false;
+
+        int device_id = 0;
+        GpuApi::getDevice(&device_id);
+
+        CUdevice cu_dev;
+        CUresult res = cuDeviceGet(&cu_dev, device_id);
+        if (res != CUDA_SUCCESS) return false;
+
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = cu_dev;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+        int rdma_flag = 0;
+        cuDeviceGetAttribute(
+            &rdma_flag,
+            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
+            cu_dev);
+        if (rdma_flag) prop.allocFlags.gpuDirectRDMACapable = 1;
+
+        size_t granularity = 0;
+        res = cuMemGetAllocationGranularity(&granularity, &prop,
+                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (res != CUDA_SUCCESS) return false;
+
+        fabric_alloc_size_ =
+            (size + granularity - 1) & ~(granularity - 1);
+        if (fabric_alloc_size_ == 0) fabric_alloc_size_ = granularity;
+
+        res = cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
+        if (res != CUDA_SUCCESS) return false;
+
+        CUdeviceptr dptr = 0;
+        res = cuMemAddressReserve(&dptr, fabric_alloc_size_, granularity, 0, 0);
+        if (res != CUDA_SUCCESS) {
+            cuMemRelease(fabric_mem_handle_);
+            return false;
+        }
+
+        res = cuMemMap(dptr, fabric_alloc_size_, 0, fabric_mem_handle_, 0);
+        if (res != CUDA_SUCCESS) {
+            cuMemAddressFree(dptr, fabric_alloc_size_);
+            cuMemRelease(fabric_mem_handle_);
+            return false;
+        }
+
+        int device_count = 0;
+        cudaGetDeviceCount(&device_count);
+        std::vector<CUmemAccessDesc> access(device_count);
+        for (int i = 0; i < device_count; ++i) {
+            access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access[i].location.id = i;
+            access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        }
+        res = cuMemSetAccess(dptr, fabric_alloc_size_, access.data(),
+                             device_count);
+        if (res != CUDA_SUCCESS) {
+            cuMemUnmap(dptr, fabric_alloc_size_);
+            cuMemAddressFree(dptr, fabric_alloc_size_);
+            cuMemRelease(fabric_mem_handle_);
+            return false;
+        }
+
+        *ptr = reinterpret_cast<void*>(dptr);
+        LOG(INFO) << GpuApi::kTransportName << ": Allocated "
+                  << fabric_alloc_size_ << " bytes with fabric handle on GPU "
+                  << device_id;
+        return true;
+#else
+        (void)ptr;
+        (void)size;
+        return false;
+#endif
+    }
+
+    /// Free a fabric-allocated buffer.
+    void freeFabric(void* ptr) {
+#if !defined(MOONCAKE_EP_USE_MUSA)
+        CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(ptr);
+        cuMemUnmap(dptr, fabric_alloc_size_);
+        cuMemAddressFree(dptr, fabric_alloc_size_);
+        cuMemRelease(fabric_mem_handle_);
+        fabric_alloc_size_ = 0;
+#endif
+    }
+
     void release() {
         for (auto* ptr : opened_peer_ptrs_) {
             GpuApi::ipcCloseMemHandle(ptr);
@@ -423,6 +537,13 @@ class P2pDeviceTransportBase : public DeviceTransport {
     std::vector<void*> opened_peer_ptrs_;
     bool all_peers_accessible_ = false;
     P2PDeviceContext p2p_device_ctx_{};
+
+    // Fabric memory state (only used when kSupportsFabric && CUDA)
+    bool use_fabric_mem_ = false;
+#if !defined(MOONCAKE_EP_USE_MUSA)
+    CUmemGenericAllocationHandle fabric_mem_handle_{};
+#endif
+    size_t fabric_alloc_size_ = 0;
 };
 
 }  // namespace tent

@@ -115,12 +115,8 @@ struct MooncakeEpBuffer {
 #endif
 #endif
 
-    // Fabric memory (MNNVL)
+    // Fabric memory (MNNVL) — state now tracked by transport
     bool use_fabric_mem_ = false;
-#ifndef MOONCAKE_EP_USE_MUSA
-    CUmemGenericAllocationHandle fabric_mem_handle_{};
-#endif
-    size_t fabric_alloc_size_ = 0;
 
     // Stream for communication
 #ifdef MOONCAKE_EP_USE_MUSA

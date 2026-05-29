@@ -2,31 +2,16 @@
 #include <arpa/inet.h>
 #include <glog/logging.h>
 
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <tent/device/mtlink.h>
-#else
-#include <tent/device/ibgda.h>
-#include <tent/device/nvlink.h>
-#endif
+#include <tent/runtime/device_transport.h>
 
 #ifdef MOONCAKE_EP_USE_MUSA
 // MUSA: no InfiniBand headers available
 #else
+#include <tent/device/ibgda.h>
 #include <infiniband/mlx5dv.h>
 #endif
 
 namespace mooncake {
-
-// Check if all GPUs support fabric memory handles (MNNVL).
-// Mirrors the check in nvlink_transport.cpp.
-static bool supportFabricMem() {
-#ifdef MOONCAKE_EP_USE_MUSA
-    // MUSA: no fabric memory support yet
-    return false;
-#else
-    return tent::nvLinkSupportsFabricMemory();
-#endif
-}
 
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
@@ -47,95 +32,19 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
 
-    // Allocate gdr_buffer. On MNNVL clusters, use cuMemCreate with a fabric
-    // handle so the buffer is accessible cross-node via NVLink fabric.
-    // On IB clusters or single-node setups, fall back to cudaMalloc.
-    use_fabric_mem_ = supportFabricMem();
-#ifndef MOONCAKE_EP_USE_MUSA
-    if (use_fabric_mem_) {
-        CUdevice cu_dev;
-        CUresult res = cuDeviceGet(&cu_dev, device_id);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuDeviceGet failed: " << res;
-            throw std::runtime_error("cuDeviceGet failed");
-        }
+    // Create the P2P device transport (auto-detects NVLink/MTLink).
+    // Must be created before allocateBuffer since it handles fabric memory.
+    transport_ = tent::createP2pDeviceTransport();
 
-        CUmemAllocationProp prop = {};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = cu_dev;
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-
-        int rdma_flag = 0;
-        cuDeviceGetAttribute(
-            &rdma_flag,
-            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
-            cu_dev);
-        if (rdma_flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-
-        size_t granularity = 0;
-        res = cuMemGetAllocationGranularity(&granularity, &prop,
-                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuMemGetAllocationGranularity failed: " << res;
-            throw std::runtime_error("cuMemGetAllocationGranularity failed");
-        }
-
-        fabric_alloc_size_ =
-            (num_ep_buffer_bytes + granularity - 1) & ~(granularity - 1);
-        if (fabric_alloc_size_ == 0) fabric_alloc_size_ = granularity;
-
-        res = cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuMemCreate(FABRIC) failed: " << res;
-            throw std::runtime_error("cuMemCreate failed");
-        }
-
-        CUdeviceptr dptr = 0;
-        res = cuMemAddressReserve(&dptr, fabric_alloc_size_, granularity, 0, 0);
-        if (res != CUDA_SUCCESS) {
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemAddressReserve failed: " << res;
-            throw std::runtime_error("cuMemAddressReserve failed");
-        }
-
-        res = cuMemMap(dptr, fabric_alloc_size_, 0, fabric_mem_handle_, 0);
-        if (res != CUDA_SUCCESS) {
-            cuMemAddressFree(dptr, fabric_alloc_size_);
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemMap failed: " << res;
-            throw std::runtime_error("cuMemMap failed");
-        }
-
-        // Grant read/write access to all devices in the fabric clique
-        int device_count = 0;
-        cudaGetDeviceCount(&device_count);
-        std::vector<CUmemAccessDesc> access(device_count);
-        for (int i = 0; i < device_count; ++i) {
-            access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            access[i].location.id = i;
-            access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        }
-        res = cuMemSetAccess(dptr, fabric_alloc_size_, access.data(),
-                             device_count);
-        if (res != CUDA_SUCCESS) {
-            cuMemUnmap(dptr, fabric_alloc_size_);
-            cuMemAddressFree(dptr, fabric_alloc_size_);
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemSetAccess failed: " << res;
-            throw std::runtime_error("cuMemSetAccess failed");
-        }
-
-        gdr_buffer = reinterpret_cast<void*>(dptr);
-        LOG(INFO) << "[EP] Allocated " << fabric_alloc_size_
-                  << " bytes with fabric handle on GPU " << device_id;
-    } else {
-        CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
+    // Allocate gdr_buffer via the P2P transport (handles fabric memory on
+    // MNNVL clusters, plain malloc otherwise).
+    auto alloc_status = transport_->allocateBuffer(&gdr_buffer, num_ep_buffer_bytes, true);
+    if (!alloc_status.ok()) {
+        LOG(ERROR) << "[EP] allocateBuffer failed: "
+                   << std::string(alloc_status.message());
+        throw std::runtime_error("allocateBuffer failed");
     }
-#else  // MOONCAKE_EP_USE_MUSA
-    // MUSA: no fabric memory, simple musaMalloc
-    CUDA_CHECK(musaMalloc(&gdr_buffer, num_ep_buffer_bytes));
-#endif  // MOONCAKE_EP_USE_MUSA
+    use_fabric_mem_ = transport_->usesFabricMemory();
     CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
 #ifndef MOONCAKE_EP_USE_MUSA
@@ -143,8 +52,6 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         &qp_devctxs, USE_QP_COUNT * tent::ibGdaQueuePairDeviceContextSize()));
 #endif
 
-    // Create the P2P device transport (auto-detects NVLink/MTLink).
-    transport_ = tent::createP2pDeviceTransport();
     auto p2p_status = transport_->allocatePeerAccessTables(rank, num_ranks);
     if (!p2p_status.ok()) {
         LOG(ERROR) << "[EP] Failed to allocate P2P peer tables: "
@@ -173,20 +80,13 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ibgda_transport_) ibgda_transport_.reset();
 #endif
-    transport_.reset();
 
-#ifndef MOONCAKE_EP_USE_MUSA
-    if (use_fabric_mem_) {
-        CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
-        cuMemUnmap(dptr, fabric_alloc_size_);
-        cuMemAddressFree(dptr, fabric_alloc_size_);
-        cuMemRelease(fabric_mem_handle_);
-    } else {
-        cudaFree(gdr_buffer);
+    // Free gdr_buffer via the transport (handles fabric vs plain free)
+    if (transport_ && gdr_buffer) {
+        transport_->freeBuffer(gdr_buffer);
+        gdr_buffer = nullptr;
     }
-#else
-    musaFree(gdr_buffer);
-#endif
+    transport_.reset();
     cudaFree(raddrs);
     cudaFree(rkeys);
 #ifndef MOONCAKE_EP_USE_MUSA
