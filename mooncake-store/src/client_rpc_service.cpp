@@ -161,6 +161,11 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     return result;
 }
 
+// TODO(metrics): Add peer_request metrics for forward TE control-plane RPCs
+// below (PreWrite, WriteCommit, WriteRevoke, PinKey, UnPinKey), following the
+// same pattern as WriteRemoteData/ReadRemoteData (Stopwatch, requests/failures/
+// bytes, latency histograms). Follow-up PR.
+
 tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
     const PreWriteRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
