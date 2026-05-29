@@ -1,0 +1,396 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mooncakeclusters.mooncake.io
+spec:
+  group: mooncake.io
+  names:
+    kind: MooncakeCluster
+    listKind: MooncakeClusterList
+    plural: mooncakeclusters
+    shortNames:
+    - mc
+    singular: mooncakecluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.masterReady
+      name: Master
+      type: integer
+    - jsonPath: .status.workerReady
+      name: Worker
+      type: integer
+    - jsonPath: .status.leaderNode
+      name: Leader
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: MooncakeCluster is the Schema for the mooncakeclusters API.
+        properties:
+          apiVersion:
+            description: 'APIVersion defines the versioned schema of this representation
+              of an object. Servers should convert recognized schemas to the latest
+              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            type: string
+          kind:
+            description: 'Kind is a string value representing the REST resource this
+              object represents. Servers may infer this from the endpoint the client
+              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: MooncakeClusterSpec defines the desired state of MooncakeCluster.
+            properties:
+              eviction:
+                description: Eviction defines the eviction policy configuration.
+                properties:
+                  allowEvictSoftPinnedObjects:
+                    default: true
+                    description: AllowEvictSoftPinnedObjects allows eviction of soft
+                      pinned objects.
+                    type: boolean
+                  enableDiskEviction:
+                    default: true
+                    description: EnableDiskEviction enables disk eviction feature.
+                    type: boolean
+                  highWatermarkRatio:
+                    default: 0.95
+                    description: HighWatermarkRatio is the ratio that triggers eviction.
+                    maximum: 1
+                    minimum: 0
+                    type: number
+                  ratio:
+                    default: 0.05
+                    description: Ratio is the ratio of objects to evict when memory
+                      is full.
+                    maximum: 1
+                    minimum: 0
+                    type: number
+                type: object
+              ha:
+                description: HA defines the high-availability backend configuration.
+                properties:
+                  connectionString:
+                    description: ConnectionString is the connection string for etcd/redis
+                      backends.
+                    type: string
+                  etcdEndpoints:
+                    description: EtcdEndpoints is the etcd endpoints (semicolon-separated).
+                      Used when Type=etcd.
+                    type: string
+                  type:
+                    default: k8s
+                    description: 'Type is the HA backend type: k8s (default), etcd, redis.'
+                    enum:
+                    - k8s
+                    - etcd
+                    - redis
+                    type: string
+                type: object
+              image:
+                default: mooncake/mooncake-store:latest
+                description: Image is the Mooncake store Docker image to deploy.
+                type: string
+              master:
+                description: Master defines the master node configuration.
+                properties:
+                  configOverrides:
+                    additionalProperties:
+                      type: string
+                    description: ConfigOverrides allows setting raw master.json configuration
+                      overrides.
+                    type: object
+                  enableHTTPMetadataServer:
+                    description: EnableHTTPMetadataServer enables the HTTP metadata
+                      server.
+                    type: boolean
+                  httpMetadataServerPort:
+                    default: 8080
+                    description: HTTPMetadataServerPort is the port for the HTTP metadata
+                      server.
+                    format: int32
+                    type: integer
+                  metricsPort:
+                    default: 9003
+                    description: MetricsPort is the port for the metrics HTTP server.
+                    format: int32
+                    type: integer
+                  replicas:
+                    default: 1
+                    description: Replicas is the number of master replicas. Use 1
+                      for non-HA, 3 for HA.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: Resources defines the resource requirements for master
+                      pods.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?[0-9]+))?$
+                          x-kubernetes-int-or-string: true
+                        description: 'Limits describes the maximum amount of compute
+                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?[0-9]+))?$
+                          x-kubernetes-int-or-string: true
+                        description: 'Requests describes the minimum amount of compute
+                          resources required. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                    type: object
+                  rpcAddress:
+                    default: 0.0.0.0
+                    description: RPCAddress is the address for the RPC server to bind
+                      to.
+                    type: string
+                  rpcInterface:
+                    description: RPCInterface is the network interface name for RPC.
+                      Overrides RPCAddress.
+                    type: string
+                  rpcPort:
+                    default: 50051
+                    description: RPCPort is the port for the RPC server.
+                    format: int32
+                    type: integer
+                  rpcThreadNum:
+                    default: 4
+                    description: RPCThreadNum is the number of RPC server threads.
+                    format: int32
+                    type: integer
+                required:
+                - replicas
+                type: object
+              offload:
+                description: Offload defines the offload/promotion configuration.
+                properties:
+                  enabled:
+                    description: Enabled enables offload availability.
+                    type: boolean
+                  forceEvict:
+                    description: ForceEvict force-evicts objects exceeding offload
+                      cap.
+                    type: boolean
+                  onEvict:
+                    description: OnEvict defers offload to eviction time instead of
+                      PutEnd.
+                    type: boolean
+                  promotionAdmissionThreshold:
+                    default: 2
+                    description: PromotionAdmissionThreshold is the min count before
+                      promotion fires.
+                    format: int32
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  promotionOnHit:
+                    description: PromotionOnHit promotes disk-only keys to memory on
+                      read access.
+                    type: boolean
+                  promotionQueueLimit:
+                    default: 50000
+                    description: PromotionQueueLimit is the max in-flight promotion
+                      tasks.
+                    format: int32
+                    type: integer
+                type: object
+              snapshot:
+                description: Snapshot defines the snapshot/restore configuration.
+                properties:
+                  backupDir:
+                    description: BackupDir is the local directory for snapshot backup.
+                    type: string
+                  enableRestore:
+                    description: EnableRestore enables restore from snapshot on startup.
+                    type: boolean
+                  enabled:
+                    default: false
+                    description: Enabled enables periodic snapshot of master data.
+                    type: boolean
+                  intervalSeconds:
+                    default: 600
+                    description: IntervalSeconds is the interval between snapshots.
+                    format: int64
+                    type: integer
+                  objectStoreType:
+                    description: 'ObjectStoreType is the snapshot store type: local or s3.'
+                    enum:
+                    - local
+                    - s3
+                    type: string
+                  retentionCount:
+                    default: 2
+                    description: RetentionCount is the number of snapshots to keep.
+                    format: int32
+                    type: integer
+                  s3Bucket:
+                    description: S3Bucket is the S3 bucket for snapshot storage.
+                    type: string
+                  s3Region:
+                    description: S3Region is the S3 region for snapshot storage.
+                    type: string
+                type: object
+              workers:
+                description: Workers defines the worker node configuration.
+                properties:
+                  allocationStrategy:
+                    default: random
+                    description: AllocationStrategy is the allocation strategy for
+                      segments.
+                    enum:
+                    - random
+                    - free_ratio_first
+                    - cxl
+                    type: string
+                  configOverrides:
+                    additionalProperties:
+                      type: string
+                    description: ConfigOverrides allows setting raw configuration
+                      overrides.
+                    type: object
+                  gpuEnabled:
+                    default: false
+                    description: GPUEnabled enables GPU device access for workers.
+                    type: boolean
+                  hugepagesEnabled:
+                    default: false
+                    description: HugepagesEnabled enables hugepages memory allocation.
+                    type: boolean
+                  memoryAllocator:
+                    default: offset
+                    description: MemoryAllocator is the memory allocator for global
+                      segments.
+                    enum:
+                    - cachelib
+                    - offset
+                    type: string
+                  rdmaEnabled:
+                    default: true
+                    description: RDMAEnabled enables RDMA device access for workers.
+                    type: boolean
+                  rdmaPortRange:
+                    default: 12300-14300
+                    description: RDMPortRange is the port range for RDMA connections.
+                    type: string
+                  replicas:
+                    default: 1
+                    description: Replicas is the number of worker replicas.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: Resources defines the resource requirements for worker
+                      pods.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?[0-9]+))?$
+                          x-kubernetes-int-or-string: true
+                        description: 'Limits describes the maximum amount of compute
+                          resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?[0-9]+))?$
+                          x-kubernetes-int-or-string: true
+                        description: 'Requests describes the minimum amount of compute
+                          resources required. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        type: object
+                    type: object
+                  segmentSize:
+                    default: 4Gi
+                    description: SegmentSize is the memory segment size per worker
+                      (e.g. "4Gi").
+                    type: string
+                required:
+                - replicas
+                type: object
+            required:
+            - master
+            - workers
+            type: object
+          status:
+            description: MooncakeClusterStatus defines the observed state of MooncakeCluster.
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the cluster's state.
+                items:
+                  description: ClusterCondition describes the state of a MooncakeCluster
+                    at a certain point.
+                  properties:
+                    lastTransitionTime:
+                      description: LastTransitionTime is the last time the condition
+                        transitioned.
+                      format: date-time
+                      type: string
+                    message:
+                      description: Message is a human-readable description.
+                      type: string
+                    reason:
+                      description: Reason for the condition's last transition.
+                      type: string
+                    status:
+                      description: Status of the condition.
+                      type: string
+                    type:
+                      description: Type of the condition.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - status
+                  - type
+                  type: object
+                type: array
+              leaderNode:
+                description: LeaderNode is the pod name of the current master leader.
+                type: string
+              masterReady:
+                description: MasterReady is the number of ready master replicas.
+                format: int32
+                type: integer
+              observedGeneration:
+                description: ObservedGeneration is the most recent generation observed.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current lifecycle phase of the cluster.
+                enum:
+                - Creating
+                - Running
+                - Updating
+                - Failed
+                - Deleting
+                type: string
+              workerReady:
+                description: WorkerReady is the number of ready worker replicas.
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

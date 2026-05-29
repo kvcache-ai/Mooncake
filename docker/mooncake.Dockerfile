@@ -56,14 +56,13 @@ RUN mkdir -p build && \
     cmake -G Ninja .. \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
-        -DUSE_ETCD=ON \
         -DUSE_CUDA=ON \
         -DWITH_EP=ON \
-        -DSTORE_USE_ETCD=ON \
+        -DSTORE_USE_K8S_LEASE=ON \
         -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
     export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    cmake --build .
+    cmake --build . --parallel 2
 
 # Build nvlink allocator to make wheel self-contained for CUDA paths
 RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \

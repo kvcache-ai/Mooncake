@@ -214,11 +214,15 @@ if [ -f "${REPO_ROOT}/.gitmodules" ]; then
     cd "${REPO_ROOT}"
     check_success "Failed to change to repository root directory"
 
-    echo "Initializing git submodules..."
-    git submodule sync --recursive
-    check_success "Failed to sync git submodules"
-    git submodule update --init --recursive
-    check_success "Failed to initialize git submodules"
+    if [ -d "${REPO_ROOT}/.git" ]; then
+        echo "Initializing git submodules..."
+        git submodule sync --recursive
+        check_success "Failed to sync git submodules"
+        git submodule update --init --recursive
+        check_success "Failed to initialize git submodules"
+    else
+        echo -e "${YELLOW}No .git directory found, skipping git submodule operations (submodules expected to be pre-populated).${NC}"
+    fi
 
     print_success "Git submodules initialized and updated successfully"
 else

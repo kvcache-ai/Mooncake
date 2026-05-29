@@ -228,7 +228,7 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR} ${ASIO_INCLUDE_DIR} /usr/local/include/ylt/standalone)
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})

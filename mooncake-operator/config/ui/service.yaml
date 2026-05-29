@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-operator-ui
+  namespace: mooncake-operator-system
+  labels:
+    app.kubernetes.io/name: mooncake-operator-ui
+    app.kubernetes.io/component: webui
+spec:
+  selector:
+    app.kubernetes.io/name: mooncake-operator-ui
+  ports:
+  - port: 3000
+    targetPort: http
+    name: http
+  type: LoadBalancer

@@ -206,3 +206,15 @@ _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# K8s local cache (auto-generated)
+mooncake-operator/.kube/
+
+# Mooncake operator build artifacts
+mooncake-operator/bin/
+mooncake-operator/mooncake-operator
+
+# Next.js build artifacts
+mooncake-operator/ui/.next/
+mooncake-operator/ui/node_modules/
+mooncake-operator/ui/out/
