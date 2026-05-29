@@ -1941,75 +1941,43 @@ fn execute_get_into_ranges(
         return build_range_read_error_results(buffer_count, all_keys, all_dst_offsets);
     }
 
-    let tenant = &scope.tenant;
+    let ptrs: Vec<*mut u8> = buffer_ptrs.iter().map(|&p| p as *mut u8).collect();
 
-    let mut results: Vec<Vec<Vec<i64>>> = Vec::with_capacity(buffer_count);
-    for i in 0..buffer_count {
-        let key_count = all_keys[i].len();
-        if key_count != all_dst_offsets[i].len()
-            || key_count != all_src_offsets[i].len()
-            || key_count != all_sizes[i].len()
-        {
-            results.push(
-                (0..key_count)
-                    .map(|j| {
-                        let frag_count = all_dst_offsets[i].get(j).map_or(1, |v| v.len().max(1));
-                        vec![RANGE_READ_ERROR; frag_count]
-                    })
-                    .collect(),
-            );
-            continue;
-        }
+    let keys_as_str: Vec<Vec<&str>> = all_keys
+        .iter()
+        .map(|keys| keys.iter().map(|s| s.as_str()).collect())
+        .collect();
+    let keys_slices: Vec<&[&str]> = keys_as_str.iter().map(|v| v.as_slice()).collect();
 
-        let buffer_ptr = buffer_ptrs[i];
-        let buffer_size = buffer_sizes[i];
-        let mut key_results: Vec<Vec<i64>> = Vec::with_capacity(key_count);
+    let dst_slices: Vec<Vec<&[usize]>> = all_dst_offsets
+        .iter()
+        .map(|keys| keys.iter().map(|v| v.as_slice()).collect())
+        .collect();
+    let dst_refs: Vec<&[&[usize]]> = dst_slices.iter().map(|v| v.as_slice()).collect();
 
-        for j in 0..key_count {
-            let fragment_count = all_dst_offsets[i][j].len();
-            if fragment_count != all_src_offsets[i][j].len()
-                || fragment_count != all_sizes[i][j].len()
-            {
-                key_results.push(vec![RANGE_READ_ERROR; fragment_count.max(1)]);
-                continue;
-            }
+    let src_slices: Vec<Vec<&[usize]>> = all_src_offsets
+        .iter()
+        .map(|keys| keys.iter().map(|v| v.as_slice()).collect())
+        .collect();
+    let src_refs: Vec<&[&[usize]]> = src_slices.iter().map(|v| v.as_slice()).collect();
 
-            let mut fragment_results: Vec<i64> = Vec::with_capacity(fragment_count);
-            for k in 0..fragment_count {
-                let dst_offset = all_dst_offsets[i][j][k];
-                let src_offset = all_src_offsets[i][j][k];
-                let size = all_sizes[i][j][k];
+    let size_slices: Vec<Vec<&[usize]>> = all_sizes
+        .iter()
+        .map(|keys| keys.iter().map(|v| v.as_slice()).collect())
+        .collect();
+    let size_refs: Vec<&[&[usize]]> = size_slices.iter().map(|v| v.as_slice()).collect();
 
-                if dst_offset
-                    .checked_add(size)
-                    .is_none_or(|end| end > buffer_size)
-                {
-                    fragment_results.push(RANGE_READ_ERROR);
-                    continue;
-                }
-
-                let result = unsafe {
-                    client.get_into_range(
-                        tenant,
-                        &all_keys[i][j],
-                        buffer_ptr as *mut u8,
-                        buffer_size,
-                        dst_offset,
-                        src_offset,
-                        size,
-                    )
-                };
-
-                match result {
-                    Ok(bytes_read) => fragment_results.push(bytes_read as i64),
-                    Err(_) => fragment_results.push(RANGE_READ_ERROR),
-                }
-            }
-            key_results.push(fragment_results);
-        }
-        results.push(key_results);
+    unsafe {
+        client.get_into_ranges(
+            &scope.tenant,
+            &ptrs,
+            buffer_sizes,
+            &keys_slices,
+            &dst_refs,
+            &src_refs,
+            &size_refs,
+        )
     }
-    results
 }
 
 fn execute_get_into_ranges_rpc(
