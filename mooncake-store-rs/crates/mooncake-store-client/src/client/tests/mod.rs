@@ -9884,6 +9884,90 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
 }
 
 #[test]
+fn remote_get_marks_all_readable_replicas_hot_for_eviction() {
+    let _guard = metrics_test_lock().lock();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("clock-replicated-store-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("clock-replicated-store-b-segment"));
+    let router_transport = Arc::new(store_a_transport.peer("clock-replicated-router-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "clock-replicated-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "clock-replicated-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "clock-replicated-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 2)
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+
+    wait_for_membership_convergence(&[&store_a, &store_b, &router]);
+
+    let payload = b"replicated-hot-payload";
+    let route = router
+        .put_with_policy(
+            "replicated-hot",
+            payload,
+            &ReplicationPolicy::new()
+                .replica_count(2)
+                .prefer_local(false)
+                .preferred_storage_owners([
+                    store_a.runtime_id().storage_key(),
+                    store_b.runtime_id().storage_key(),
+                ]),
+        )
+        .expect("replicated put should succeed");
+    assert_eq!(route.replicas.len(), 2);
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *store_a.runtime_id()));
+    assert!(route
+        .replicas
+        .iter()
+        .any(|replica| replica.owner == *store_b.runtime_id()));
+
+    assert_eq!(
+        router
+            .get("replicated-hot")
+            .expect("remote get should succeed"),
+        payload
+    );
+
+    wait_for_storage_clock_hot(&store_a, &route);
+    wait_for_storage_clock_hot(&store_b, &route);
+}
+
+#[test]
 fn background_watermark_eviction_reclaims_without_front_path_pressure() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
