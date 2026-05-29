@@ -116,6 +116,11 @@ store.setup_dummy(
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS` | `1` | Interval for reclaiming expired offload buffers; defaults to the heartbeat interval in the current implementation |
 | `MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS` | `5000` | Lease time for buffers returned by `batch_get_offload_object` before GC reclaims them |
 | `MOONCAKE_OFFLOAD_USE_URING` | `false` | Enable io_uring for async file I/O |
+| `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | `true` | Enable proactive local-disk eviction from the FileStorage heartbeat |
+| `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO` | `0.90` | Trigger proactive disk eviction when backend usage exceeds this ratio of its quota |
+| `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
+
+The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
 ### Bucket backend settings
 
@@ -135,7 +140,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=file_per_key_storage_b
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name created under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` |
-| `ENABLE_EVICTION` | `true` | Enables local-storage eviction logic for this backend |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enables local-storage eviction logic for this backend. Short alias: `ENABLE_EVICTION` |
 
 ---
 
@@ -163,7 +168,7 @@ Stores each object in an individual file. Simple and easy to inspect, but genera
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FSDIR` | `file_per_key_dir` | Subdirectory name under `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` where objects are stored |
-| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction when the total size exceeds the quota |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | `true` | Enable disk eviction for this backend. Short alias: `ENABLE_EVICTION` |
 
 Best for: debugging or small-scale deployments.
 
@@ -179,7 +184,9 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ---
 
-## Eviction (Bucket Backend Only)
+## Eviction
+
+### Write-time eviction
 
 When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
 
@@ -190,6 +197,20 @@ When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically 
 | `lru` | Evict the least recently read bucket first |
 
 Eviction is two-phase: the bucket is removed from metadata and master is notified first, then in-flight reads are drained before files are deleted.
+
+### Proactive watermark eviction
+
+When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the backend evicts toward `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO`.
+
+| Backend | Behavior |
+|---------|----------|
+| `bucket_storage_backend` | Reuses `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY`; set it to `fifo` or `lru` because the default policy `none` makes watermark eviction a no-op |
+| `file_per_key_storage_backend` | Requires `MOONCAKE_OFFLOAD_ENABLE_EVICTION=true`; reuses the FIFO file eviction queue and recovered keys from startup metadata scan |
+| `offset_allocator_storage_backend` | No-op in this version |
+
+The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, the quota is `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`; when that value is `0`, the backend defaults it to 90% of the physical disk capacity. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
+
+For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
 
 ---
 
