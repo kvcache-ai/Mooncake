@@ -1534,51 +1534,60 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
     const std::string group_id = group_id_result.value();
 
-    auto alive_clients = getAliveClientsSnapshot();
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    // Lock the shard and check if object already exists.
-    // For new grouped objects, route to the group's target shard directly
-    // since the routing table hasn't been populated yet.
-    const size_t target_shard_idx =
-        group_id.empty()
-            ? getMetadataShardIndex(object_id.tenant_id, object_id.user_key)
-            : getShardIndex(group_id);
-    MetadataShardAccessorRW shard(this, target_shard_idx);
-    auto& tenant_state = shard->tenants[object_id.tenant_id];
-
     const auto now = std::chrono::system_clock::now();
-    auto it = tenant_state.metadata.find(key);
-    if (it != tenant_state.metadata.end() &&
-        !CleanupStaleHandles(it->second, alive_clients)) {
-        auto& metadata = it->second;
-        if (!metadata.HasReplica(&Replica::fn_is_completed) &&
-            metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
-            auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
-            if (!replicas.empty()) {
-                std::lock_guard lock(discarded_replicas_mutex_);
-                discarded_replicas_.emplace_back(
-                    std::move(replicas),
-                    metadata.put_start_time + put_start_release_timeout_sec_);
-            }
-            tenant_state.processing_keys.erase(key);
-            EraseMetadata(tenant_state, it, object_id.tenant_id);
-            if (group_id.empty()) {
-                const size_t ungrouped_shard_idx =
-                    getShardIndex(object_id.tenant_id, object_id.user_key);
-                if (ungrouped_shard_idx != target_shard_idx) {
-                    MetadataShardAccessorRW ungrouped_shard(
-                        this, ungrouped_shard_idx);
-                    return AllocateAndInsertMetadata(
-                        ungrouped_shard, client_id, key, slice_length, config,
-                        group_id, object_id.tenant_id, now);
+    std::optional<size_t> retry_shard_idx;
+    {
+        auto alive_clients = getAliveClientsSnapshot();
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        // Lock the shard and check if object already exists.
+        // For new grouped objects, route to the group's target shard directly
+        // since the routing table hasn't been populated yet.
+        const size_t target_shard_idx =
+            group_id.empty()
+                ? getMetadataShardIndex(object_id.tenant_id, object_id.user_key)
+                : getShardIndex(group_id);
+        MetadataShardAccessorRW shard(this, target_shard_idx);
+        auto& tenant_state = shard->tenants[object_id.tenant_id];
+
+        auto it = tenant_state.metadata.find(key);
+        if (it != tenant_state.metadata.end() &&
+            !CleanupStaleHandles(it->second, alive_clients)) {
+            auto& metadata = it->second;
+            if (!metadata.HasReplica(&Replica::fn_is_completed) &&
+                metadata.put_start_time + put_start_discard_timeout_sec_ <
+                    now) {
+                auto replicas =
+                    metadata.PopReplicas(&Replica::fn_is_processing);
+                if (!replicas.empty()) {
+                    std::lock_guard lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(
+                        std::move(replicas),
+                        metadata.put_start_time +
+                            put_start_release_timeout_sec_);
                 }
+                tenant_state.processing_keys.erase(key);
+                EraseMetadata(tenant_state, it, object_id.tenant_id);
+                if (group_id.empty()) {
+                    const size_t ungrouped_shard_idx =
+                        getShardIndex(object_id.tenant_id, object_id.user_key);
+                    if (ungrouped_shard_idx != target_shard_idx) {
+                        retry_shard_idx = ungrouped_shard_idx;
+                    }
+                }
+            } else {
+                LOG(INFO) << "key=" << key << ", info=object_already_exists";
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
-        } else {
-            LOG(INFO) << "key=" << key << ", info=object_already_exists";
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+
+        if (!retry_shard_idx.has_value()) {
+            return AllocateAndInsertMetadata(shard, client_id, key,
+                                             slice_length, config, group_id,
+                                             object_id.tenant_id, now);
         }
     }
-
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRW shard(this, retry_shard_idx.value());
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                      config, group_id, object_id.tenant_id,
                                      now);
@@ -1860,176 +1869,197 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const std::string group_id = group_id_result.value();
 
-    // --- Lock acquisition ---
-    auto alive_clients = getAliveClientsSnapshot();
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    // Use getMetadataShardIndex to find the object at its current shard
-    // (handles both grouped and ungrouped routing).
-    const size_t lookup_shard_idx =
-        getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
-    MetadataShardAccessorRW shard(this, lookup_shard_idx);
-    auto& tenant_state = shard->tenants[object_id.tenant_id];
-
     const auto now = std::chrono::system_clock::now();
-    auto it = tenant_state.metadata.find(key);
+    std::optional<size_t> case_a_retry_shard_idx;
+    {
+        // --- Lock acquisition ---
+        auto alive_clients = getAliveClientsSnapshot();
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        // Use getMetadataShardIndex to find the object at its current shard
+        // (handles both grouped and ungrouped routing).
+        const size_t lookup_shard_idx =
+            getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
+        MetadataShardAccessorRW shard(this, lookup_shard_idx);
+        auto& tenant_state = shard->tenants[object_id.tenant_id];
 
-    // --- Step 0: stale handle cleanup ---
-    if (it != tenant_state.metadata.end() &&
-        CleanupStaleHandles(it->second, alive_clients)) {
-        tenant_state.processing_keys.erase(key);
-        ErasePromotionTaskIfPresent(tenant_state, key);
-        EraseMetadata(tenant_state, it, object_id.tenant_id);
-        it = tenant_state.metadata.end();
-    }
+        auto it = tenant_state.metadata.find(key);
 
-    // --- Step 1: safety checks and preemption (only if key exists) ---
-    if (it != tenant_state.metadata.end()) {
-        auto& metadata = it->second;
-
-        // Reject if the caller tries to change group membership.
-        // Group membership is immutable while an object exists.
-        if (config.group_ids.has_value() && metadata.group_id != group_id) {
-            LOG(ERROR) << "key=" << key
-                       << ", error=group_membership_is_immutable";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        // --- Step 0: stale handle cleanup ---
+        if (it != tenant_state.metadata.end() &&
+            CleanupStaleHandles(it->second, alive_clients)) {
+            tenant_state.processing_keys.erase(key);
+            ErasePromotionTaskIfPresent(tenant_state, key);
+            EraseMetadata(tenant_state, it, object_id.tenant_id);
+            it = tenant_state.metadata.end();
         }
 
-        // Reject if a Copy/Move task is actively reading this key's replicas.
-        if (tenant_state.replication_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key << ", error=object_has_replication_task";
-            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        // --- Step 1: safety checks and preemption (only if key exists) ---
+        if (it != tenant_state.metadata.end()) {
+            auto& metadata = it->second;
+
+            // Reject if the caller tries to change group membership.
+            // Group membership is immutable while an object exists.
+            if (config.group_ids.has_value() && metadata.group_id != group_id) {
+                LOG(ERROR) << "key=" << key
+                           << ", error=group_membership_is_immutable";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Reject if a Copy/Move task is actively reading this key's
+            // replicas.
+            if (tenant_state.replication_tasks.count(key) > 0) {
+                LOG(INFO) << "key=" << key
+                          << ", error=object_has_replication_task";
+                return tl::make_unexpected(
+                    ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+            }
+
+            // Reject if an offload-to-disk task is in progress (same reason).
+            if (tenant_state.offloading_tasks.count(key) > 0) {
+                LOG(INFO) << "key=" << key
+                          << ", error=object_has_offloading_task";
+                return tl::make_unexpected(
+                    ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+            }
+
+            // Preempt an in-progress Put/Upsert on the same key.  The previous
+            // writer's PROCESSING replicas are moved to discarded_replicas_
+            // with a TTL so they are not freed while the old writer may still
+            // be doing RDMA writes.  Unlike PutStart (which only preempts after
+            // a timeout), UpsertStart preempts immediately.
+            if (tenant_state.processing_keys.count(key) > 0) {
+                auto processing_replicas =
+                    metadata.PopReplicas(&Replica::fn_is_processing);
+                if (!processing_replicas.empty()) {
+                    std::lock_guard lock(discarded_replicas_mutex_);
+                    discarded_replicas_.emplace_back(
+                        std::move(processing_replicas),
+                        now + put_start_release_timeout_sec_);
+                }
+                tenant_state.processing_keys.erase(key);
+
+                // If no COMPLETE replicas survive the preemption, this key
+                // effectively does not exist — fall through to Case A.
+                if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                    ErasePromotionTaskIfPresent(tenant_state, key);
+                    EraseMetadata(tenant_state, it, object_id.tenant_id);
+                    it = tenant_state.metadata.end();
+                }
+            }
         }
 
-        // Reject if an offload-to-disk task is in progress (same reason).
-        if (tenant_state.offloading_tasks.count(key) > 0) {
-            LOG(INFO) << "key=" << key << ", error=object_has_offloading_task";
-            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-        }
+        // --- Case A: key does not exist (or was erased above) ---
+        // Allocate fresh buffers, identical to PutStart.
+        if (it == tenant_state.metadata.end()) {
+            VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
+            const size_t case_a_shard_idx =
+                group_id.empty()
+                    ? getShardIndex(object_id.tenant_id, object_id.user_key)
+                    : getShardIndex(group_id);
+            if (case_a_shard_idx != lookup_shard_idx) {
+                case_a_retry_shard_idx = case_a_shard_idx;
+            } else {
+                return AllocateAndInsertMetadata(shard, client_id, key,
+                                                 slice_length, config, group_id,
+                                                 object_id.tenant_id, now);
+            }
+        } else {
+            // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
+            auto& metadata = it->second;
 
-        // Preempt an in-progress Put/Upsert on the same key.  The previous
-        // writer's PROCESSING replicas are moved to discarded_replicas_ with a
-        // TTL so they are not freed while the old writer may still be doing
-        // RDMA writes.  Unlike PutStart (which only preempts after a timeout),
-        // UpsertStart preempts immediately.
-        if (tenant_state.processing_keys.count(key) > 0) {
-            auto processing_replicas =
-                metadata.PopReplicas(&Replica::fn_is_processing);
-            if (!processing_replicas.empty()) {
+            // Reject if any reader holds a reference (refcnt > 0).  Overwriting
+            // a buffer that an RDMA read is streaming from would cause data
+            // corruption. The client should retry after readers finish.
+            if (metadata.HasReplica(&Replica::fn_is_busy)) {
+                LOG(INFO) << "key=" << key << ", error=object_replica_busy";
+                return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
+            }
+
+            if (metadata.size == slice_length) {
+                // --- Case B: same size — in-place update ---
+                // Reuse existing buffer addresses.  No allocation or
+                // deallocation. The client will RDMA-write new data to the same
+                // addresses.
+                //
+                // hard_pinned is const and preserved automatically — upsert
+                // does not change the eviction protection level of an existing
+                // object.
+                metadata.client_id = client_id;
+                metadata.put_start_time = now;
+
+                // Reconcile soft_pin state with the incoming config.
+                {
+                    SpinLocker locker(&metadata.lock);
+                    if (config.with_soft_pin && !metadata.soft_pin_timeout) {
+                        metadata.soft_pin_timeout.emplace();
+                        MasterMetricManager::instance().inc_soft_pin_key_count(
+                            1);
+                    } else if (!config.with_soft_pin &&
+                               metadata.soft_pin_timeout) {
+                        metadata.soft_pin_timeout.reset();
+                        MasterMetricManager::instance().dec_soft_pin_key_count(
+                            1);
+                    }
+                }
+
+                // Mark COMPLETE → PROCESSING so readers won't see stale data
+                // mid-transfer.  The key becomes unreadable until UpsertEnd.
+                metadata.VisitReplicas(
+                    &Replica::fn_is_completed,
+                    [](Replica& replica) { replica.mark_processing(); });
+
+                tenant_state.processing_keys.insert(key);
+
+                // Return the existing descriptors — same buffer addresses as
+                // before.
+                std::vector<Replica::Descriptor> replica_list;
+                const auto& all_replicas = metadata.GetAllReplicas();
+                replica_list.reserve(all_replicas.size());
+                for (const auto& replica : all_replicas) {
+                    replica_list.emplace_back(replica.get_descriptor());
+                }
+
+                VLOG(1) << "key=" << key
+                        << ", action=upsert_start_case_b_inplace";
+                return replica_list;
+            }
+
+            // --- Case C: different size — discard old replicas and reallocate
+            // --- Old buffers cannot be reused.  Move them to
+            // discarded_replicas_ for delayed release (readers may still hold
+            // descriptors without refcnt), then allocate fresh buffers at the
+            // new size.
+            //
+            // Preserve hard_pin and soft_pin from the old metadata so that
+            // eviction protection survives a size-changing upsert (RFC §2.2.2).
+            ReplicateConfig merged_config = config;
+            merged_config.with_hard_pin =
+                merged_config.with_hard_pin || metadata.IsHardPinned();
+            merged_config.with_soft_pin =
+                merged_config.with_soft_pin || metadata.IsSoftPinned();
+
+            const std::string existing_group_id = metadata.group_id;
+            auto old_replicas = metadata.PopReplicas();
+            if (!old_replicas.empty()) {
                 std::lock_guard lock(discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
-                    std::move(processing_replicas),
+                    std::move(old_replicas),
                     now + put_start_release_timeout_sec_);
             }
-            tenant_state.processing_keys.erase(key);
+            EraseMetadata(tenant_state, it, object_id.tenant_id);
 
-            // If no COMPLETE replicas survive the preemption, this key
-            // effectively does not exist — fall through to Case A.
-            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
-                ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadata(tenant_state, it, object_id.tenant_id);
-                it = tenant_state.metadata.end();
-            }
+            VLOG(1) << "key=" << key
+                    << ", action=upsert_start_case_c_reallocate";
+            return AllocateAndInsertMetadata(
+                shard, client_id, key, slice_length, merged_config,
+                existing_group_id, object_id.tenant_id, now);
         }
     }
-
-    // --- Case A: key does not exist (or was erased above) ---
-    // Allocate fresh buffers, identical to PutStart.
-    if (it == tenant_state.metadata.end()) {
-        VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
-        const size_t case_a_shard_idx =
-            group_id.empty()
-                ? getShardIndex(object_id.tenant_id, object_id.user_key)
-                : getShardIndex(group_id);
-        if (case_a_shard_idx != lookup_shard_idx) {
-            MetadataShardAccessorRW target_shard(this, case_a_shard_idx);
-            return AllocateAndInsertMetadata(target_shard, client_id, key,
-                                             slice_length, config, group_id,
-                                             object_id.tenant_id, now);
-        }
-        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         config, group_id, object_id.tenant_id,
-                                         now);
-    }
-
-    // --- Step 2: key exists with COMPLETE replicas → Case B or C ---
-    auto& metadata = it->second;
-
-    // Reject if any reader holds a reference (refcnt > 0).  Overwriting a
-    // buffer that an RDMA read is streaming from would cause data corruption.
-    // The client should retry after readers finish.
-    if (metadata.HasReplica(&Replica::fn_is_busy)) {
-        LOG(INFO) << "key=" << key << ", error=object_replica_busy";
-        return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
-    }
-
-    if (metadata.size == slice_length) {
-        // --- Case B: same size — in-place update ---
-        // Reuse existing buffer addresses.  No allocation or deallocation.
-        // The client will RDMA-write new data to the same addresses.
-        //
-        // hard_pinned is const and preserved automatically — upsert does not
-        // change the eviction protection level of an existing object.
-        metadata.client_id = client_id;
-        metadata.put_start_time = now;
-
-        // Reconcile soft_pin state with the incoming config.
-        {
-            SpinLocker locker(&metadata.lock);
-            if (config.with_soft_pin && !metadata.soft_pin_timeout) {
-                metadata.soft_pin_timeout.emplace();
-                MasterMetricManager::instance().inc_soft_pin_key_count(1);
-            } else if (!config.with_soft_pin && metadata.soft_pin_timeout) {
-                metadata.soft_pin_timeout.reset();
-                MasterMetricManager::instance().dec_soft_pin_key_count(1);
-            }
-        }
-
-        // Mark COMPLETE → PROCESSING so readers won't see stale data
-        // mid-transfer.  The key becomes unreadable until UpsertEnd.
-        metadata.VisitReplicas(&Replica::fn_is_completed, [](Replica& replica) {
-            replica.mark_processing();
-        });
-
-        tenant_state.processing_keys.insert(key);
-
-        // Return the existing descriptors — same buffer addresses as before.
-        std::vector<Replica::Descriptor> replica_list;
-        const auto& all_replicas = metadata.GetAllReplicas();
-        replica_list.reserve(all_replicas.size());
-        for (const auto& replica : all_replicas) {
-            replica_list.emplace_back(replica.get_descriptor());
-        }
-
-        VLOG(1) << "key=" << key << ", action=upsert_start_case_b_inplace";
-        return replica_list;
-    }
-
-    // --- Case C: different size — discard old replicas and reallocate ---
-    // Old buffers cannot be reused.  Move them to discarded_replicas_ for
-    // delayed release (readers may still hold descriptors without refcnt),
-    // then allocate fresh buffers at the new size.
-    //
-    // Preserve hard_pin and soft_pin from the old metadata so that eviction
-    // protection survives a size-changing upsert (RFC §2.2.2).
-    ReplicateConfig merged_config = config;
-    merged_config.with_hard_pin =
-        merged_config.with_hard_pin || metadata.IsHardPinned();
-    merged_config.with_soft_pin =
-        merged_config.with_soft_pin || metadata.IsSoftPinned();
-
-    const std::string existing_group_id = metadata.group_id;
-    auto old_replicas = metadata.PopReplicas();
-    if (!old_replicas.empty()) {
-        std::lock_guard lock(discarded_replicas_mutex_);
-        discarded_replicas_.emplace_back(std::move(old_replicas),
-                                         now + put_start_release_timeout_sec_);
-    }
-    EraseMetadata(tenant_state, it, object_id.tenant_id);
-
-    VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataShardAccessorRW shard(this, case_a_retry_shard_idx.value());
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     merged_config, existing_group_id,
-                                     object_id.tenant_id, now);
+                                     config, group_id, object_id.tenant_id,
+                                     now);
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
