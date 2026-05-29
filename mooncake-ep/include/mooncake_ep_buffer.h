@@ -12,9 +12,7 @@
 #endif
 #include <fstream>
 #include <memory>
-#ifdef MOONCAKE_EP_USE_TENT
 #include <tent/runtime/device_transport.h>
-#endif
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
@@ -23,11 +21,7 @@
 
 namespace mooncake {
 
-#ifdef MOONCAKE_EP_USE_TENT
 inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
-#else
-inline constexpr int MAX_QP_COUNT = 256;
-#endif
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
@@ -108,10 +102,8 @@ struct MooncakeEpBuffer {
     // the IBGDA transport (RDMA).  Both are needed because the kernel uses
     // both paths simultaneously.
     // On MUSA: transport_ is the MTLink transport (P2P); no ibgda_transport_.
-#ifdef MOONCAKE_EP_USE_TENT
     std::unique_ptr<tent::P2pTransport> transport_;
     std::unique_ptr<tent::DeviceRdmaTransport> ibgda_transport_;
-#endif
 
     // Fabric memory (MNNVL) — state now tracked by transport
     bool use_fabric_mem_ = false;
@@ -127,8 +119,14 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
+    // p2p_transport and rdma_transport are optional injected transports.
+    // When null, EP creates its own transports via the auto-detect factories.
+    // When provided, EP takes ownership and uses them directly, allowing the
+    // caller (e.g. a TransferEngine instance) to share device selection logic.
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     std::string device_name);
+                     std::string device_name,
+                     std::unique_ptr<tent::P2pTransport> p2p_transport = nullptr,
+                     std::unique_ptr<tent::DeviceRdmaTransport> rdma_transport = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -171,12 +169,10 @@ struct MooncakeEpBuffer {
     // kernels will never take the IBGDA branch and therefore do NOT require
     // `qps`.
     bool use_fast_path() {
-#ifdef MOONCAKE_EP_USE_TENT
         if (!ibgda_disabled_) {
             return true;  // IBGDA available
         }
-        // IBGDA disabled: only allow fast-path if we can rely on NVLink
-        // P2P+IPC.
+        // IBGDA disabled: only allow fast-path if we can rely on NVLink P2P+IPC.
         bool p2p_all = transport_ && transport_->allPeersAccessible();
         if (!p2p_all) {
             LOG(WARNING) << "Failed to initialize IBGDA. "
@@ -184,9 +180,6 @@ struct MooncakeEpBuffer {
                          << "Performance will be degraded.";
         }
         return p2p_all;
-#else
-        return !ibgda_disabled_;
-#endif
     }
 
     bool update_local_qpns();
@@ -245,7 +238,6 @@ struct MooncakeEpBuffer {
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
     get_tent_ibgda_context_info() {
-#ifdef MOONCAKE_EP_USE_TENT
         if (!ibgda_transport_) return {0, 0, 0, 0, 0, 0};
         auto* ctx = ibgda_transport_->deviceContextPtr();
         auto abi = ibgda_transport_->deviceContextAbi();
@@ -258,7 +250,6 @@ struct MooncakeEpBuffer {
                     reinterpret_cast<int64_t>(ibgda_ctx->rkeys),
                     reinterpret_cast<int64_t>(ibgda_ctx->qp_devctxs)};
         }
-#endif
         return {0, 0, 0, 0, 0, 0};
     }
 

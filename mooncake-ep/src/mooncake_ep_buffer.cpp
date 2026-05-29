@@ -13,7 +13,9 @@ namespace mooncake {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
-                                   std::string device_name)
+                                   std::string device_name,
+                                   std::unique_ptr<tent::P2pTransport> p2p_transport,
+                                   std::unique_ptr<tent::DeviceRdmaTransport> rdma_transport)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
@@ -29,9 +31,12 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
 
-    // Create the P2P device transport (auto-detects NVLink/MTLink).
-    // Must be created before allocateBuffer since it handles fabric memory.
-    transport_ = tent::createP2pDeviceTransport();
+    // Use injected P2P transport if provided, otherwise auto-detect.
+    if (p2p_transport) {
+        transport_ = std::move(p2p_transport);
+    } else {
+        transport_ = tent::createP2pDeviceTransport();
+    }
 
     // Allocate gdr_buffer via the P2P transport (handles fabric memory on
     // MNNVL clusters, plain malloc otherwise).
@@ -57,11 +62,19 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     }
 
     // Initialize IBGDA if available (CUDA only; MUSA has no RDMA).
-    // ibgda_transport_ is created inside init_ibgda().
+    // Use injected RDMA transport if provided, otherwise create one.
 #ifndef MOONCAKE_EP_USE_MUSA
-    int ret = init_ibgda();
-    if (ret != 0) {
-        ibgda_disabled_ = true;
+    if (rdma_transport) {
+        ibgda_transport_ = std::move(rdma_transport);
+        // Injected transport is assumed already initialized by the caller.
+        gid_index_ = ibgda_transport_->gidIndex();
+        is_roce_ = ibgda_transport_->isRoce();
+        ibgda_disabled_ = ibgda_transport_->ibgdaDisabled();
+    } else {
+        int ret = init_ibgda();
+        if (ret != 0) {
+            ibgda_disabled_ = true;
+        }
     }
 #else
     ibgda_disabled_ = true;

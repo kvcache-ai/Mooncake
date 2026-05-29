@@ -55,19 +55,15 @@ elif use_tent:
     sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/ibgda_device.cpp")
     sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
 else:
-    # CUDA + TE/legacy: link IB verbs, mlx5, glog, engine.so
+    # CUDA + TE/legacy: link IB verbs, mlx5, glog — same DeviceTransport
+    # sources as TENT mode (NVLink + IBGDA device transports are standalone).
     cuda_libraries = ["ibverbs", "mlx5", "glog"]
     cuda_library_dirs = []
     ExtensionClass = CUDAExtension
     BuildClass = BuildExtension
-    sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/detail/mlx5gda.cpp")
-
-    if CUDA_HOME is not None:
-        cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
-        cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
-        if os.path.exists(cuda_stub_lib):
-            cuda_libraries.insert(0, "cuda")
-            cuda_library_dirs.append(cuda_stub_dir)
+    sources.append("../mooncake-transfer-engine/tent/src/transport/nvlink/nvlink_device.cpp")
+    sources.append("../mooncake-transfer-engine/tent/src/transport/ibgda/ibgda_device.cpp")
+    sources.append("../mooncake-transfer-engine/tent/src/common/status.cpp")
 
 defines = []
 if use_tent:
@@ -106,33 +102,27 @@ if use_tent:
             "-Wl,-rpath," + asio_lib_dir,
         ])
 else:
-    # TE/legacy mode: link against engine.so and transfer_engine static libs
-    engine_dir = os.path.join(
-        current_dir, "../mooncake-wheel/mooncake"
+    # TE/legacy mode: same libtent_shared link as TENT mode.
+    # DeviceTransport sources are compiled directly (no MOONCAKE_EP_USE_TENT
+    # macro), so the kernel uses the direct IbGdaCtx path while the host side
+    # still uses the unified DeviceTransport interface.
+    tent_build_dir = os.path.join(
+        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
     )
-    te_build_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/src"
-    )
-    te_common_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/src/common/base"
-    )
-    mc_common_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-common/src"
-    )
+    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
+    if not os.path.exists(tent_lib):
+        raise FileNotFoundError(
+            f"TENT shared library not found at {tent_lib}. "
+            "Build the transfer engine first: cmake --build build-phase2"
+        )
     asio_lib_dir = os.path.join(
         current_dir, "../build-phase2/mooncake-common"
     )
     extra_link_args = [
         "-Wl,-rpath,$ORIGIN",
-        "-L" + engine_dir,
-        "-l:engine.so",
-        "-Wl,-rpath," + engine_dir,
-        "-L" + te_build_dir,
-        "-ltransfer_engine",
-        "-L" + te_common_dir,
-        "-lbase",
-        "-L" + mc_common_dir,
-        "-lmooncake_common",
+        "-Wl,-rpath," + tent_build_dir,
+        "-L" + tent_build_dir,
+        "-ltent_shared",
         "-L" + asio_lib_dir,
         "-lasio",
         "-Wl,-rpath," + asio_lib_dir,

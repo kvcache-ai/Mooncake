@@ -12,6 +12,7 @@
 #ifdef MOONCAKE_EP_USE_TENT
 #include <tent/device/ir/ep_comm_ops.cuh>
 #else
+#include <tent/runtime/device_resources.h>
 #include <tent/transport/ibgda/detail/mlx5gda.h>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>
@@ -20,9 +21,9 @@
 
 namespace mooncake {
 
-#ifdef MOONCAKE_EP_USE_TENT
+// MAX_QP_COUNT is always sourced from the TENT IBGDA constant, regardless of
+// whether MOONCAKE_EP_USE_TENT is defined.  The value is the same in both paths.
 inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
-#endif
 
 #ifdef MOONCAKE_EP_USE_TENT
 using tent::device::EpCommCtx;
