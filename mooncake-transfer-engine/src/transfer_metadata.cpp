@@ -368,7 +368,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         }
         segmentJSON["buffers"] = buffersJSON;
         segmentJSON["priority_matrix"] = desc.topology.toJson();
-    } else if (segmentJSON["protocol"] == "tcp") {
+    } else if (segmentJSON["protocol"] == "tcp" || segmentJSON["protocol"] == "flagcx") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -731,7 +731,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             LOG(WARNING) << "Corrupted segment descriptor, name "
                          << segment_name << " protocol " << desc->protocol;
         }
-    } else if (desc->protocol == "tcp") {
+    } else if (desc->protocol == "tcp" || desc->protocol == "flagcx") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

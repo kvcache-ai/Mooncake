@@ -162,6 +162,9 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } ubshmem;
+            struct {
+                uint64_t dest_offset;
+            } flagcx;
         };
 
        public:

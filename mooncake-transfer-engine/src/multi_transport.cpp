@@ -56,6 +56,9 @@
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
+#ifdef USE_FLAGCX
+#include "transport/flagcx_transport/flagcx_transport.h"
+#endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
@@ -373,6 +376,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_UBSHMEM
     else if (std::string(proto) == "ubshmem") {
         transport = new UBShmemTransport();
+    }
+#endif
+#ifdef USE_FLAGCX
+    else if (std::string(proto) == "flagcx") {
+        transport = new FlagCxTransport();
     }
 #endif
 #ifdef USE_EFA

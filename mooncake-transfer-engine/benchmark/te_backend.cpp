@@ -167,14 +167,23 @@ int TEBenchRunner::freeBuffers() {
 TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
-    engine_ = std::make_unique<mooncake::TransferEngine>(true);
+    // Disable auto-discovery when an explicit non-RDMA xport is requested
+    // (e.g. flagcx) so we can installTransport() ourselves below.
+    bool auto_disc = XferBenchConfig::xport_type != "flagcx";
+    engine_ = std::make_unique<mooncake::TransferEngine>(auto_disc);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"
                         : XferBenchConfig::metadata_url_list;
-    auto seg_name = XferBenchConfig::metadata_type == "p2p"
+    auto seg_name = (XferBenchConfig::metadata_type == "p2p" &&
+                     XferBenchConfig::seg_name.empty())
                         ? mooncake::getHostname()
                         : XferBenchConfig::seg_name;
     engine_->init(conn_str, seg_name);
+    if (XferBenchConfig::xport_type == "flagcx") {
+        auto *xp = engine_->installTransport("flagcx", nullptr);
+        LOG_ASSERT(xp) << "installTransport(flagcx) failed";
+        LOG(INFO) << "tebench: FlagCX transport installed";
+    }
     allocateBuffers();
 }
 
