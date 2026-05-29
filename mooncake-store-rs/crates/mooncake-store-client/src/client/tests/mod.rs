@@ -3402,6 +3402,9 @@ fn observability_metrics_render_fast_batch_put_stages() {
     assert!(metrics.contains("operation=\"batch_put_stage_rank\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_reserve\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
+    assert!(metrics.contains(
+        "mooncake_store_operation_total{tenant=\"default\",operation=\"batch_put_stage_load_routes\",status=\"ok\"} 1"
+    ));
     assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
 }

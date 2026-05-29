@@ -40,6 +40,22 @@ impl BatchPutReserveStageError {
 }
 
 impl StoreClient {
+    fn batch_put_reserve_needs_current_routes(&self, requests: &[PutRequest<'_>]) -> Result<bool> {
+        if self.namespace_quota.is_some() {
+            return Ok(true);
+        }
+        let tenants = requests
+            .iter()
+            .map(|request| request.tenant.unwrap_or(self.default_tenant()).to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        Ok(self
+            .load_tenant_quota_policies(&tenants)?
+            .values()
+            .any(Option::is_some))
+    }
+
     fn invalidate_remote_write_segments(&self, targets: &[ReplicaWriteTarget]) {
         let mut state = self.state.lock();
         for target in targets {
@@ -577,24 +593,31 @@ impl StoreClient {
                 });
             }
 
-            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
-            let object_keys = object_refs
-                .iter()
-                .map(|object_ref| {
-                    let object_id = LogicalObjectId::new(
-                        NamespaceScope::with_defaults(
-                            object_ref.tenant,
-                            object_ref.domain,
-                            object_ref.object_set,
-                        ),
-                        object_ref.key,
-                    );
-                    mooncake_store_core::ObjectKey::from_logical_id(&object_id)
-                })
-                .collect::<Vec<_>>();
-            let current_routes_result = self.route_ops().load_routes(&object_keys);
-            route_load_tracker.finish(&current_routes_result, 0);
-            let current_routes = current_routes_result.map_err(BatchPutReserveStageError::terminal)?;
+            let current_routes = if self
+                .batch_put_reserve_needs_current_routes(requests)
+                .map_err(BatchPutReserveStageError::terminal)?
+            {
+                let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
+                let object_keys = object_refs
+                    .iter()
+                    .map(|object_ref| {
+                        let object_id = LogicalObjectId::new(
+                            NamespaceScope::with_defaults(
+                                object_ref.tenant,
+                                object_ref.domain,
+                                object_ref.object_set,
+                            ),
+                            object_ref.key,
+                        );
+                        mooncake_store_core::ObjectKey::from_logical_id(&object_id)
+                    })
+                    .collect::<Vec<_>>();
+                let current_routes_result = self.route_ops().load_routes(&object_keys);
+                route_load_tracker.finish(&current_routes_result, 0);
+                current_routes_result.map_err(BatchPutReserveStageError::terminal)?
+            } else {
+                vec![None; requests.len()]
+            };
 
             let mut pending = Vec::with_capacity(requests.len());
             for (((request, plan), object_ref), current) in requests
