@@ -4538,14 +4538,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
               << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
 
     auto now = std::chrono::system_clock::now();
-    long evicted_count = 0;
-    long object_count = 0;
-    long shards_skipped = 0;
-    uint64_t total_freed_size = 0;
-
-    // Candidates for second pass eviction
-    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
-    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
     auto can_evict_replicas = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica([](const Replica& replica) {
@@ -4561,8 +4553,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
-    using MetadataIter =
-        std::unordered_map<std::string, ObjectMetadata>::iterator;
+    // Candidate carries key for safe lookup after releasing shard lock.
+    // MetadataIter would be invalid if the shard is modified between
+    // Phase 1 (collection) and Phase 2 (eviction).
+    struct Candidate {
+        size_t shard_idx;
+        std::string key;
+        std::chrono::system_clock::time_point lease_timeout;
+    };
 
     // --- Offload-on-evict support ---
     long offload_queued_this_cycle = 0;
@@ -4644,9 +4642,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
-    // Randomly select a starting shard to avoid imbalance eviction between
-    // shards.
-    size_t start_idx = RandomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // Byte-level target: stop scanning as soon as we free this much.
@@ -4654,79 +4649,147 @@ void MasterService::BatchEvict(double evict_ratio_target,
     uint64_t byte_target =
         static_cast<uint64_t>(std::ceil(mem_capacity * evict_ratio_target));
 
+    // ================================================================
+    // Phase 1: Parallel candidate collection + eviction_base counting
+    // ================================================================
+    int num_threads = std::min((int)kNumShards, 16);
+    size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
+
+    // Per-thread local results
+    std::vector<std::vector<Candidate>> local_candidates(num_threads);
+    std::vector<long> local_eviction_base(num_threads, 0);
+    std::vector<long> local_object_count(num_threads, 0);
+    std::vector<long> local_shards_skipped(num_threads, 0);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_no_pin(num_threads);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_soft_pin(num_threads);
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (int t = 0; t < num_threads; t++) {
+        threads.emplace_back([&, t] {
+            size_t start = t * shards_per_thread;
+            size_t end = std::min(start + shards_per_thread, kNumShards);
+            for (size_t s = start; s < end; s++) {
+                MetadataShardAccessorRW shard(this, s);
+                size_t meta_size = shard->metadata.size();
+                long eviction_base = meta_size - shard->disk_object_count;
+                local_object_count[t] += meta_size;
+                local_eviction_base[t] += eviction_base;
+                if (eviction_base <= 0) {
+                    local_shards_skipped[t]++;
+                    continue;
+                }
+
+                DiscardExpiredProcessingReplicas(shard, now);
+
+                for (auto it = shard->metadata.begin();
+                     it != shard->metadata.end(); ++it) {
+                    if (!it->second.IsLeaseExpired(now) ||
+                        !can_evict_replicas(it->second)) {
+                        continue;
+                    }
+                    if (!it->second.IsSoftPinned(now)) {
+                        local_candidates[t].push_back(
+                            {s, it->first, it->second.lease_timeout});
+                    } else if (allow_evict_soft_pinned_objects_) {
+                        local_soft_pin[t].push_back(it->second.lease_timeout);
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // Merge results
     long total_eviction_base = 0;
+    long object_count = 0;
+    long shards_skipped = 0;
+    for (int t = 0; t < num_threads; t++) {
+        total_eviction_base += local_eviction_base[t];
+        object_count += local_object_count[t];
+        shards_skipped += local_shards_skipped[t];
+    }
 
-    // Per-shard single-traversal eviction: collect iterators to eligible
-    // entries, use nth_element for timeout-ordered fairness, then evict
-    // directly through iterators (no second shard traversal needed).
-    for (size_t i = 0; i < kNumShards; i++) {
-        size_t shard_idx = (start_idx + i) % kNumShards;
+    std::vector<Candidate> candidates;
+    size_t total_candidates = 0;
+    for (auto& v : local_candidates) total_candidates += v.size();
+    candidates.reserve(total_candidates);
+    for (auto& v : local_candidates) {
+        candidates.insert(candidates.end(),
+                          std::make_move_iterator(v.begin()),
+                          std::make_move_iterator(v.end()));
+    }
 
-        MetadataShardAccessorRW shard(this, shard_idx);
-        size_t meta_size = shard->metadata.size();
-        long eviction_base = meta_size - shard->disk_object_count;
-        object_count += meta_size;
-        total_eviction_base += eviction_base;
-        if (eviction_base <= 0) {
-            shards_skipped++;
-            continue;
-        }
+    std::vector<std::chrono::system_clock::time_point> no_pin_objects;
+    std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
+    size_t total_no_pin = 0, total_soft_pin = 0;
+    for (int t = 0; t < num_threads; t++) {
+        total_no_pin += local_no_pin[t].size();
+        total_soft_pin += local_soft_pin[t].size();
+    }
+    no_pin_objects.reserve(total_no_pin);
+    soft_pin_objects.reserve(total_soft_pin);
+    for (int t = 0; t < num_threads; t++) {
+        no_pin_objects.insert(no_pin_objects.end(),
+                              std::make_move_iterator(local_no_pin[t].begin()),
+                              std::make_move_iterator(local_no_pin[t].end()));
+        soft_pin_objects.insert(soft_pin_objects.end(),
+                                std::make_move_iterator(
+                                    local_soft_pin[t].begin()),
+                                std::make_move_iterator(
+                                    local_soft_pin[t].end()));
+    }
 
-        DiscardExpiredProcessingReplicas(shard, now);
+    // ================================================================
+    // Phase 2: Global nth_element + eviction via key lookup
+    // ================================================================
+    long evicted_count = 0;
+    uint64_t total_freed_size = 0;
 
-        // Per-shard eviction quota based on this shard's eviction base
-        const long ideal_evict_num =
-            std::ceil(eviction_base * evict_ratio_target);
+    // Global eviction quota
+    const long ideal_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target);
 
-        // Collect iterators to eligible entries (single traversal)
-        std::vector<MetadataIter> candidates;
-        for (auto it = shard->metadata.begin(); it != shard->metadata.end();
-             ++it) {
-            if (!it->second.IsLeaseExpired(now) ||
-                !can_evict_replicas(it->second)) {
-                continue;
-            }
-            if (!it->second.IsSoftPinned(now)) {
-                candidates.push_back(it);
-            } else if (allow_evict_soft_pinned_objects_) {
-                soft_pin_objects.push_back(it->second.lease_timeout);
-            }
-        }
-
-        if (candidates.empty() || ideal_evict_num <= 0) {
-            for (auto& it : candidates)
-                no_pin_objects.push_back(it->second.lease_timeout);
-            continue;
-        }
-
+    if (!candidates.empty() && ideal_evict_num > 0) {
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
         std::nth_element(
             candidates.begin(), candidates.begin() + (evict_num - 1),
             candidates.end(),
-            [](const MetadataIter& a, const MetadataIter& b) {
-                return a->second.lease_timeout < b->second.lease_timeout;
+            [](const Candidate& a, const Candidate& b) {
+                return a.lease_timeout < b.lease_timeout;
             });
-        auto target_timeout = candidates[evict_num - 1]->second.lease_timeout;
+        auto target_timeout = candidates[evict_num - 1].lease_timeout;
 
-        // Evict via iterators — no second shard traversal
-        for (auto& it : candidates) {
-            if (it->second.lease_timeout <= target_timeout) {
-                uint64_t freed =
-                    try_evict_or_offload(it->first, it->second, shard);
-                total_freed_size += freed;
-                if (it->second.IsValid() == false) {
-                    shard->metadata.erase(it);
-                }
-                if (freed > 0) {
-                    evicted_count++;
+        for (auto& c : candidates) {
+            if (c.lease_timeout <= target_timeout) {
+                MetadataShardAccessorRW shard(this, c.shard_idx);
+                auto it = shard->metadata.find(c.key);
+                if (it != shard->metadata.end() &&
+                    it->second.IsLeaseExpired(now) &&
+                    !it->second.IsSoftPinned(now) &&
+                    can_evict_replicas(it->second)) {
+                    uint64_t freed =
+                        try_evict_or_offload(c.key, it->second, shard);
+                    total_freed_size += freed;
+                    if (it->second.IsValid() == false) {
+                        shard->metadata.erase(it);
+                    }
+                    if (freed > 0) {
+                        evicted_count++;
+                    }
                 }
             } else {
-                no_pin_objects.push_back(it->second.lease_timeout);
+                no_pin_objects.push_back(c.lease_timeout);
             }
-        }
 
-        // Early termination: freed enough bytes, skip remaining shards
-        if (total_freed_size >= byte_target) break;
+            if (total_freed_size >= byte_target) break;
+        }
+    } else if (ideal_evict_num <= 0) {
+        // All candidates overflow to second pass
+        for (auto& c : candidates)
+            no_pin_objects.push_back(c.lease_timeout);
     }
 
     VLOG(1) << "[EVICT-FIRST-PASS] evicted_count=" << evicted_count
@@ -4776,19 +4839,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              no_pin_objects.end());
             auto target_timeout = no_pin_objects[target_evict_num - 1];
 
-            // Evict objects with lease timeout less than or equal to target.
-            // Stop when the target is reached.
+            // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
+                MetadataShardAccessorRW shard(this, i);
+                for (auto it = shard->metadata.begin();
+                     it != shard->metadata.end() && target_evict_num > 0;) {
                     if (!it->second.IsHardPinned() &&
                         it->second.IsLeaseExpired(now) &&
                         it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
-                        // Evict this object (or defer for offload)
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
@@ -4823,13 +4883,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.end());
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
-            // Stop when the target is reached.
+            // Evict via key lookup — avoid full metadata traversal
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
+                MetadataShardAccessorRW shard(this, i);
+                for (auto it = shard->metadata.begin();
+                     it != shard->metadata.end() && target_evict_num > 0;) {
                     // Skip hard-pinned or not-yet-expired objects
                     if (it->second.IsHardPinned() ||
                         !it->second.IsLeaseExpired(now) ||
@@ -4841,7 +4899,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     // and lease timeout less than or equal to target.
                     if (!it->second.IsSoftPinned(now) ||
                         it->second.lease_timeout <= soft_target_timeout) {
-                        // Evict this object (or defer for offload)
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
