@@ -55,6 +55,50 @@ struct EpCommCtx {
 };
 
 // ---------------------------------------------------------------------------
+// Factory: construct EpCommCtx from kernel arguments
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ EpCommCtx makeEpCommCtx(
+    DeviceOps* dops, void* mxa_buffer,
+    const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
+    void* raddrs, void* rkeys, void* qp_devctxs,
+    int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+    int rank, int num_ranks) {
+    EpCommCtx ctx;
+    ctx.dops = dops;
+    ctx.local_base = mxa_buffer;
+    ctx.rank = rank;
+    ctx.num_ranks = num_ranks;
+
+    ctx.p2p_ctx = {
+        kP2pDeviceContextAbiVersion,
+        rank,
+        num_ranks,
+        const_cast<int32_t*>(nvlink_available),
+        const_cast<void**>(ipc_peer_ptrs)};
+
+#ifndef MOONCAKE_EP_USE_MUSA
+    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
+    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
+    auto ctx_array = reinterpret_cast<ibgda::IbGdaQpDevCtx*>(qp_devctxs);
+    const int num_qp_per_rank = kIbGdaMaxQueuePairs / num_ranks;
+    ctx.ibgda_ctx = {dops,
+                     ctx_array,
+                     rkey_array,
+                     raddr_array,
+                     mxa_buffer,
+                     rdma_send_signal_buffer,
+                     rdma_recv_signal_buffer,
+                     rkey_array[rank],
+                     rank,
+                     num_qp_per_rank,
+                     num_ranks};
+#endif
+
+    return ctx;
+}
+
+// ---------------------------------------------------------------------------
 // Routing helpers
 // ---------------------------------------------------------------------------
 

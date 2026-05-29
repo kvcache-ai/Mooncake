@@ -87,36 +87,17 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     // Communication context
 #ifdef MOONCAKE_EP_USE_TENT
 #ifndef MOONCAKE_EP_USE_MUSA
-    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
-    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
-    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
-    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
-                          ctx_array,
-                          rkey_array,
-                          raddr_array,
-                          mxa_buffer,
-                          rdma_send_signal_buffer,
-                          rdma_recv_signal_buffer,
-                          rkey_array[rank],
-                          rank,
-                          static_cast<int>(num_qp_per_rank),
-                          num_ranks};
-    tent::P2PDeviceContext p2p_ctx = {
-        tent::kP2pDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, p2p_ctx, ibgda_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = makeEpCommCtx(
+        cudaDeviceOps(), mxa_buffer, nvlink_available, ipc_peer_ptrs,
+        raddrs, rkeys, qp_devctxs,
+        rdma_send_signal_buffer, rdma_recv_signal_buffer,
+        rank, num_ranks);
 #else
-    tent::P2PDeviceContext p2p_ctx = {
-        tent::kP2pDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, p2p_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = makeEpCommCtx(
+        tent::device::musa_platform::musaDeviceOps(), mxa_buffer,
+        nvlink_available, ipc_peer_ptrs,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        rank, num_ranks);
 #endif
 #else
     // Non-TENT path: construct IbGdaCtx directly
@@ -543,36 +524,17 @@ combine(void* combined_x, int32_t* active_ranks,
     // Communication context
 #ifdef MOONCAKE_EP_USE_TENT
 #ifndef MOONCAKE_EP_USE_MUSA
-    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
-    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
-    auto ctx_array = reinterpret_cast<IbGdaQpDevCtx*>(qp_devctxs);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
-    IbGdaCtx ibgda_ctx = {cudaDeviceOps(),
-                          ctx_array,
-                          rkey_array,
-                          raddr_array,
-                          mxa_buffer,
-                          rdma_send_signal_buffer,
-                          rdma_recv_signal_buffer,
-                          rkey_array[rank],
-                          rank,
-                          static_cast<int>(num_qp_per_rank),
-                          num_ranks};
-    tent::P2PDeviceContext p2p_ctx = {
-        tent::kP2pDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {cudaDeviceOps(), mxa_buffer, p2p_ctx, ibgda_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = makeEpCommCtx(
+        cudaDeviceOps(), mxa_buffer, nvlink_available, ipc_peer_ptrs,
+        raddrs, rkeys, qp_devctxs,
+        rdma_send_signal_buffer, rdma_recv_signal_buffer,
+        rank, num_ranks);
 #else
-    tent::P2PDeviceContext p2p_ctx = {
-        tent::kP2pDeviceContextAbiVersion,
-        rank,
-        num_ranks,
-        const_cast<int32_t*>(nvlink_available),
-        const_cast<void**>(ipc_peer_ptrs)};
-    EpCommCtx comm_ctx = {tent::device::musa_platform::musaDeviceOps(), mxa_buffer, p2p_ctx, rank, num_ranks};
+    EpCommCtx comm_ctx = makeEpCommCtx(
+        tent::device::musa_platform::musaDeviceOps(), mxa_buffer,
+        nvlink_available, ipc_peer_ptrs,
+        nullptr, nullptr, nullptr, nullptr, nullptr,
+        rank, num_ranks);
 #endif
 #else
     // Non-TENT path: construct IbGdaCtx directly
