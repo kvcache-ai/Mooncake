@@ -1,43 +1,43 @@
 # SGLang Disaggregated Serving with MooncakeTransferEngine
 
 ## Overview
-This is the latest version of the MooncakeTransferEngine integration doc with the SGLang project based on [PR 4654](https://github.com/sgl-project/sglang/pull/4654) and [PR 4880](https://github.com/sgl-project/sglang/pull/4880) to support KVCache transfer for intra-node and inter-node disaggregated serving scenarios.
 
+SGLang uses Mooncake's Transfer Engine to enable disaggregated prefill-decode (PD) serving across nodes via RDMA, with support for EP and EPD backends. This integration is based on [PR 4654](https://github.com/sgl-project/sglang/pull/4654) and [PR 4880](https://github.com/sgl-project/sglang/pull/4880).
 
-**_Please note that this is still an experimental version and will be modified anytime based on feedback from the SGLang community._**
+In benchmarks, PD disaggregation with Mooncake achieves **~30% lower ITL** while maintaining comparable throughput ([details](../../performance/sglang-benchmark-results-v1)).
 
-## Installation
-### Prerequisite
+```
+  +-----------+   Transfer Engine (RDMA)    +-----------+
+  | SGLang    | ◄━━━━━━━━━━━━━━━━━━━━━━► | SGLang     |
+  | Prefill   |     KV cache blocks        | Decode     |
+  +-----------+                            +-----------+
+```
+
+## Prerequisites
+
 ```bash
 pip3 install mooncake-transfer-engine
 ```
 
-Note: If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../build.md).
+If you encounter missing `lib*.so` errors, uninstall and build from source instead:
 
-### Install the latest version of SGLang
-#### 1. Clone SGLang from official repo
+```bash
+pip3 uninstall mooncake-transfer-engine
+# Build from source — see build instructions
+```
+
+### Install SGLang
+
 ```bash
 git clone git@github.com:sgl-project/sglang.git
-```
-#### 2. Build
-##### 2.1 Build from source
-```bash
 cd sglang
 pip install --upgrade pip
 pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
 ```
 
-#####  If running on AMD GPU, tried below steps to install sglang for rocm or just run in rocm docker from https://hub.docker.com/r/rocm/sgl-dev directly
+For AMD GPUs, use the ROCm docker image:
+
 ```bash
-
-pip install --upgrade pip
-cd sgl-kernel
-python setup_rocm.py install
-cd ..
-pip install -e "python[all_hip]"
-
-or
-
 docker run -it --rm --network=host \
     --device=/dev/kfd --device=/dev/dri \
     --ipc=host --shm-size 16G \
@@ -48,128 +48,168 @@ docker run -it --rm --network=host \
    rocm/sgl-dev:20250707
 
 pip3 install mooncake-transfer-engine
-sudo apt update
-sudo apt install libibverbs1 libibverbs-dev -y
+sudo apt update && sudo apt install libibverbs1 libibverbs-dev -y
 sudo apt-get install lsof net-tools iputils-ping -y
-
 ```
 
- - If you encounter any problems that you cannot solve, please refer to the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html).
+See the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html) if you encounter issues.
 
 ## Configuration
 
- - **Update(Apr 10, 2025)** Good news: The configuration file requirement has been removed since [PR 5460](https://github.com/sgl-project/sglang/pull/5460). There is no need to prepare the _mooncake.json_ file anymore.
+Since [PR 5460](https://github.com/sgl-project/sglang/pull/5460), no `mooncake.json` configuration file is needed — Mooncake auto-detects RDMA devices.
 
+Key arguments:
 
+| Argument | Description |
+|----------|-------------|
+| `--disaggregation-mode` | `prefill` or `decode` — node role |
+| `--disaggregation-ib-device` | RDMA device(s). Auto-detected, comma-separated for multi-NIC |
+| `--tp-size` | Tensor parallelism size (optional) |
+| `--base-gpu-id` | Starting GPU index for same-node deployments |
+| `--host` / `--port` | SGLang service address |
 
-### To run prefill instance and decode instance on different node
+## Run PD Disaggregation
 
-Prefill: 
+### Cross-Node
+
 ```bash
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --disaggregation-mode prefill --port 30000 --host 192.168.0.137 --tp-size 2
-```
- - The `--model-path` parameter specifies the model to use.
- - The `--host` parameter specifies the SGLang service host.
- - The `--port` parameter specifies the SGLang service port on which to listen.
- - The `--disaggregation-mode` is the node's role, either 'prefill' or 'decode'.
- - The `--disaggregation-ib-device` is the device to be used for data transmission, it is optional since we will detect this config automatically. Or you can still explicitly specify devices if needed. If multiple NIC devices are used, they can be separated by commas, such as "erdma_0,erdma_1". Please note that there are no spaces between them.
- - Option `--tp-size` is supported. Example: append `--tp-size 2` to the run command to run SGLang with multiple GPUs.
+# Prefill node (192.168.0.137)
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --disaggregation-mode prefill \
+  --port 30000 --host 192.168.0.137 --tp-size 2
 
-Decode:
-```bash
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --disaggregation-mode decode --port 30001 --host 192.168.0.140 --tp-size 2
-```
+# Decode node (192.168.0.140)
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --disaggregation-mode decode \
+  --port 30001 --host 192.168.0.140 --tp-size 2
 
-Proxy:
-```bash
-python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000 --decode http://192.168.0.140:30001 --host 0.0.0.0 --port 8000
+# Router
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "http://192.168.0.137:30000" 8998 \
+  --decode  "http://192.168.0.140:30001" \
+  --policy round_robin \
+  --host 0.0.0.0 --port 8000
 ```
 
 Test:
+
 ```bash
-curl -X POST http://127.0.0.1:8000/generate -H "Content-Type: application/json" -d '{
-  "text": "Let me tell you a long story ",
-  "sampling_params": {
-    "temperature": 0
-  }
-}'
+curl -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Tell me a long story", "sampling_params": {"temperature": 0}}'
 ```
 
-### To run prefill instance and decode instance on the same node
+### Same-Node
 
-Prefill: 
 ```bash
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --disaggregation-mode prefill --port 30000 --host 192.168.0.137 --tp-size 2
-```
-
-Decode:
-```bash
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --disaggregation-mode decode --port 30001 --base-gpu-id 2 --host 192.168.0.137 --tp-size 2
-```
- - The function of `--base-gpu-id` is similar to env var`CUDA_VISIBLE_DEVICES`, which is used to avoid reusing the 0th GPU card. The difference is that it is used to specify the starting number of the GPU. If it is set to 2, the first and second cards will be skipped, and the third card will be used directly.
-
-Proxy:
-```bash
-python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000 --decode http://192.168.0.137:30001 --host 0.0.0.0 --port 8000
-```
-
-Test:
-```bash
-curl -X POST http://127.0.0.1:8000/generate -H "Content-Type: application/json" -d '{
-  "text": "Let me tell you a long story ",
-  "sampling_params": {
-    "temperature": 0
-  }
-}'
-```
-
-Note:
- - TP is supported but not required, you can remove `--tp-size 2` if you want.
- - The `--disaggregation-ib-device` is the device to be used for data transmission, it is optional since we will detect this config automatically. Or you can still explicitly specify devices if needed. If multiple NIC devices are used, they can be separated by commas, such as "erdma_0,erdma_1". Please note that there are no spaces between them.
- - XpYd is supported. It is ok to run one prefill and multiple decode instances on the same node, however, multiple prefill instances on the same node are not supported due to the port conflict of bootstrap server.
-   - e.g., `python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000,http://192.168.0.140:30000 --decode http://192.168.0.137:30001,http://192.168.0.140:30001 --host 0.0.0.0 --port 8000`
- - HuggingFace timeout can be addressed by `export SGLANG_USE_MODELSCOPE=true`
-
-### To enable Mooncake EP Backend
-
-
-Prefill:
-```bash
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-mode prefill --port 30000 --host 192.168.0.137 --tp-size 8 --dp-size 8 --elastic-ep-backend mooncake --mooncake-ib-device <mooncake-ib-device> --moe-a2a-backend mooncake
-```
-
-Decode:
-```bash
-python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-mode decode --port 30001 --host 192.168.0.140 --tp-size 8 --dp-size 8 --elastic-ep-backend mooncake --mooncake-ib-device <mooncake-ib-device> --moe-a2a-backend mooncake
-```
-- Set `--elastic-ep-backend` and `--moe-a2a-backend` to "mooncake" to enable Mooncake EP Backend.
-- The value of `--mooncake-ib-device` should be the same as `--disaggregation-ib-device`.
-
-
-### To enable Mooncake EPD Backend
-
-Encoder:
-```bash
+# Prefill
 python -m sglang.launch_server \
-    --model-path $MODEL \
-    --encoder-only \
-    --encoder-transfer-backend mooncake \
-    --port $PORT
-```
+  --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --disaggregation-mode prefill \
+  --port 30000 --host 192.168.0.137 --tp-size 2
 
-Prefill:
-```bash
+# Decode (skip first 2 GPUs, use cards 2+)
 python -m sglang.launch_server \
-    --model-path $MODEL \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend mooncake \
-    --encoder-transfer-backend mooncake \
-    --tp $TP \
-    --mem-fraction-static $MEM_FRACTION \
-    --chunked-prefill-size $CHUNK_SIZE \
-    --language-only \
-    --encoder-urls http://127.0.0.1:30002 http://127.0.0.1:30003 http://127.0.0.1:30004 http://127.0.0.1:30005 http://127.0.0.1:30006 http://127.0.0.1:30007 \
-    --port $PORT
+  --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --disaggregation-mode decode \
+  --port 30001 --base-gpu-id 2 --host 192.168.0.137 --tp-size 2
+
+# Router
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "http://192.168.0.137:30000" 8998 \
+  --decode  "http://192.168.0.137:30001" \
+  --policy round_robin \
+  --host 0.0.0.0 --port 8000
 ```
 
-- Set `--encoder-transfer-backend` to "mooncake" to enable Mooncake Backend.
+TP is supported but not required — omit `--tp-size 2` for single-GPU setups.
+
+### XpYd Topology
+
+Multiple decode instances per prefill are supported. Multiple prefills on the same node are not supported due to bootstrap server port conflicts.
+
+```bash
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "http://192.168.0.137:30000" 8998 \
+  --decode "http://192.168.0.137:30001,http://192.168.0.140:30001" \
+  --policy round_robin \
+  --host 0.0.0.0 --port 8000
+```
+
+```{tip}
+If you encounter HuggingFace timeouts, set `export SGLANG_USE_MODELSCOPE=true`.
+```
+
+## Advanced Backends
+
+### EP Backend — Expert Parallelism for MoE Models
+
+For Mixture-of-Experts models (e.g., DeepSeek-V3), different nodes hold different expert weights. During inference, Mooncake transfers expert activations between prefill and decode nodes via RDMA, replacing the NCCL-based all-to-all with a faster, disaggregation-aware transfer path.
+
+```bash
+# Prefill
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-mode prefill \
+  --port 30000 --host 192.168.0.137 \
+  --tp-size 8 --dp-size 8 \
+  --elastic-ep-backend mooncake \
+  --moe-a2a-backend mooncake
+
+# Decode
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3-0324 \
+  --disaggregation-mode decode \
+  --port 30001 --host 192.168.0.140 \
+  --tp-size 8 --dp-size 8 \
+  --elastic-ep-backend mooncake \
+  --moe-a2a-backend mooncake
+```
+
+Set `--mooncake-ib-device` to the same value as `--disaggregation-ib-device` if explicit device specification is needed.
+
+### EPD Backend — Encoder-Prefill-Decode for Multimodal Models
+
+For multimodal models (e.g., LLaVA, InternVL), the **encoder** (Vision Transformer) processes images, the **prefill** node handles text + encoded visual tokens, and the **decode** node generates output. Mooncake transfers encoder outputs (visual embeddings) between these nodes via RDMA.
+
+The three node roles are:
+
+| Role | Flag | Responsibility |
+|------|------|----------------|
+| Encoder | `--encoder-only` | Processes images, produces visual embeddings. Mooncake sends embeddings to prefill via `--encoder-transfer-backend mooncake` |
+| Prefill | `--disaggregation-mode prefill` | Receives encoder embeddings, runs prefill with text + visual context. Mooncake transfers KV cache to decode |
+| Decode | `--disaggregation-mode decode` | Receives KV cache from prefill, generates output tokens |
+
+```bash
+# Encoder-only node
+python -m sglang.launch_server \
+  --model-path $MODEL \
+  --encoder-only \
+  --encoder-transfer-backend mooncake \
+  --port 30002
+
+# Prefill node
+python -m sglang.launch_server \
+  --model-path $MODEL \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --encoder-transfer-backend mooncake \
+  --tp $TP \
+  --mem-fraction-static $MEM_FRACTION \
+  --chunked-prefill-size $CHUNK_SIZE \
+  --language-only \
+  --encoder-urls http://127.0.0.1:30002 http://127.0.0.1:30003 \
+  --port $PORT
+
+# Decode node
+python -m sglang.launch_server \
+  --model-path $MODEL \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --port $PORT
+```
