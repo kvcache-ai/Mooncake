@@ -2,7 +2,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -174,6 +176,26 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     // hard_pinned). Regression test for the live snapshot restore failure.
     PublishSnapshotPayload(SnapshotMetadataFormat::kCurrent);
     ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, RejectsOverflowingReplicaCount) {
+    // A near-UINT32_MAX replica_count must not wrap the format-detection
+    // arithmetic into a valid-looking total and slip an out-of-bounds index
+    // past the size check. The entry packs zero replicas (array size 7) but
+    // declares UINT32_MAX, so every format must be rejected, not parsed.
+    auto published = mooncake::test::PublishSnapshotPayloadBytes(
+        *object_store_, *catalog_store_, descriptor_,
+        BuildMetadataPayloadWithDeclaredReplicaCount(
+            std::numeric_limits<uint32_t>::max()));
+    ASSERT_TRUE(published.has_value()) << published.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_FALSE(snapshot.has_value());
+    EXPECT_EQ(snapshot.error(), ErrorCode::DESERIALIZE_FAIL);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsClusterMismatch) {

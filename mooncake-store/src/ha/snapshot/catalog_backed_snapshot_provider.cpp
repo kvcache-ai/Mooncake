@@ -136,10 +136,13 @@ DeserializeStandbyObjectMetadata(
         //   v1: 7 + replica_count, no data_type or trailing hard_pinned
         //   v2: 8 + replica_count, either data_type or trailing hard_pinned
         //   v3: 9 + replica_count, data_type plus trailing hard_pinned
-        constexpr uint32_t kOldFieldCount = 7;
-        constexpr uint32_t kOneExtraFieldCount = 8;
-        constexpr uint32_t kCurrentFieldCount = 9;
-        const uint32_t total_elements = object.via.array.size;
+        // Use 64-bit arithmetic: replica_count is attacker-controlled and a
+        // near-UINT32_MAX value would otherwise wrap the additions back into a
+        // valid-looking total and let an out-of-bounds index through.
+        constexpr uint64_t kOldFieldCount = 7;
+        constexpr uint64_t kOneExtraFieldCount = 8;
+        constexpr uint64_t kCurrentFieldCount = 9;
+        const uint64_t total_elements = object.via.array.size;
         const bool is_old_format =
             (total_elements == kOldFieldCount + replica_count);
         const bool is_one_extra_format =

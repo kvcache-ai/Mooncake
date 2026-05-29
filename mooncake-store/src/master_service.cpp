@@ -5711,10 +5711,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v1: 7 + replicas_count, no data_type or hard_pinned
     //   v2: 8 + replicas_count, either data_type or trailing hard_pinned
     //   v3: 9 + replicas_count, data_type plus trailing hard_pinned
-    constexpr uint32_t kOldFieldCount = 7;
-    constexpr uint32_t kOneExtraFieldCount = 8;
-    constexpr uint32_t kCurrentFieldCount = 9;
-    const uint32_t total_elements = obj.via.array.size;
+    // Use 64-bit arithmetic so a near-UINT32_MAX replicas_count cannot wrap the
+    // additions back into a valid-looking total and let an OOB index through.
+    constexpr uint64_t kOldFieldCount = 7;
+    constexpr uint64_t kOneExtraFieldCount = 8;
+    constexpr uint64_t kCurrentFieldCount = 9;
+    const uint64_t total_elements = obj.via.array.size;
     const bool is_old_format =
         (total_elements == kOldFieldCount + replicas_count);
     const bool is_one_extra_format =
