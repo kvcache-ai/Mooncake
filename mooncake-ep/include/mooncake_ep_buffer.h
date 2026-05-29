@@ -110,7 +110,7 @@ struct MooncakeEpBuffer {
     // On MUSA: transport_ is the MTLink transport (P2P); no ibgda_transport_.
 #ifdef MOONCAKE_EP_USE_TENT
     std::unique_ptr<tent::P2pTransport> transport_;
-    std::unique_ptr<tent::RdmaTransport> ibgda_transport_;
+    std::unique_ptr<tent::DeviceRdmaTransport> ibgda_transport_;
 #endif
 
     // Fabric memory (MNNVL) — state now tracked by transport

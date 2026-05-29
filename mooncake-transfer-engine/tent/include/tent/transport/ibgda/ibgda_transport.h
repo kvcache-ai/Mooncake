@@ -39,7 +39,7 @@ class Config;
 class ControlService;
 class Topology;
 
-class IbGdaTransport : public Transport, public RdmaTransport {
+class IbGdaTransport : public Transport, public DeviceRdmaTransport {
    public:
     IbGdaTransport();
     ~IbGdaTransport() override;
@@ -84,7 +84,7 @@ class IbGdaTransport : public Transport, public RdmaTransport {
     Status freeBuffer(void* ptr) override;
 
     // -------------------------------------------------------------------
-    // RdmaTransport — RDMA / IBGDA setup
+    // DeviceRdmaTransport — RDMA / IBGDA setup
     // -------------------------------------------------------------------
     Status initializeRdmaDevice(const std::string& device_name,
                                 uint8_t port_num = 1) override;
@@ -131,7 +131,7 @@ class IbGdaTransport : public Transport, public RdmaTransport {
     DeviceContextAbi deviceContextAbi() const override;
 
     // -------------------------------------------------------------------
-    // IbGdaTransport-specific (not in RdmaTransport)
+    // IbGdaTransport-specific (not in DeviceRdmaTransport)
     // -------------------------------------------------------------------
 
     // Initialize the verbs resources that are shared by host-side QP setup and

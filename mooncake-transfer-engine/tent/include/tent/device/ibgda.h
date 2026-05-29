@@ -35,11 +35,11 @@ using IbGdaLocalMetadata [[deprecated("Use tent::IbGdaLocalMetadata from "
                                      "tent/runtime/device_resources.h")]] =
     IbGdaLocalMetadata;
 
-/// IBGDA-specific RdmaTransport implementation.
+/// IBGDA-specific DeviceRdmaTransport implementation.
 ///
-/// Inherits the RdmaTransport interface for RDMA operations.
+/// Inherits the DeviceRdmaTransport interface for GPU-initiated RDMA operations.
 /// Also exposes IBGDA-specific convenience methods.
-class IbGdaDeviceTransport : public RdmaTransport {
+class IbGdaDeviceTransport : public DeviceRdmaTransport {
    public:
     ~IbGdaDeviceTransport() override = default;
 

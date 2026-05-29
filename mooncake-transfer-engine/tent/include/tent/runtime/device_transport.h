@@ -105,9 +105,12 @@ class P2pTransport : public DeviceTransport {
     virtual void* getRemotePtr(void* local_ptr, int dst_rank) = 0;
 };
 
-/// RDMA transport interface — MR, QP, control buffer, RDMA peers.
-/// Implemented by IBGDA and similar RDMA-based transports.
-class RdmaTransport : public DeviceTransport {
+/// Device-side RDMA transport interface — MR, QP, control buffer, RDMA peers.
+/// Implemented by IBGDA and similar GPU-initiated RDMA transports.
+///
+/// Named DeviceRdmaTransport to distinguish from the host-side
+/// RdmaTransport : Transport (CPU-initiated RDMA bulk transfers).
+class DeviceRdmaTransport : public DeviceTransport {
    public:
     // -----------------------------------------------------------------------
     // RDMA device setup

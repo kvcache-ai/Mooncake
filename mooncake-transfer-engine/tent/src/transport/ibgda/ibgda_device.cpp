@@ -44,7 +44,7 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
     Status freeBuffer(void* ptr) override { return transport_.freeBuffer(ptr); }
 
     // -------------------------------------------------------------------
-    // RdmaTransport — RDMA / IBGDA setup
+    // DeviceRdmaTransport — RDMA / IBGDA setup
     // -------------------------------------------------------------------
     Status initializeRdmaDevice(const std::string& device_name,
                                 uint8_t port_num) override {
