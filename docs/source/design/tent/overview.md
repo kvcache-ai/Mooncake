@@ -109,14 +109,6 @@ qos
 slice-spraying
 :::
 
-## TENT Transport Selector
-
-:::{toctree}
-:maxdepth: 1
-
-transport-selector
-:::
-
 ## TENT Failover
 
 :::{toctree}
