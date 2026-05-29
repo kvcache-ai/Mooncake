@@ -36,11 +36,13 @@ namespace mooncake {
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
+class RdmaTransportTestPeer;
 class WorkerPool;
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
     friend class WorkerPool;
 
    public:
@@ -100,6 +102,9 @@ class RdmaTransport : public Transport {
 
    private:
     int allocateLocalSegmentID();
+
+    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+                               const std::string &gid);
 
     int preTouchMemory(void *addr, size_t length);
 

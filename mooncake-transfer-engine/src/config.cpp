@@ -224,6 +224,18 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
+    const char* auto_gid_max_retries_env =
+        std::getenv("MC_AUTO_GID_MAX_RETRIES");
+    if (auto_gid_max_retries_env) {
+        int val = atoi(auto_gid_max_retries_env);
+        if (val >= 0 && val <= 16) {
+            config.auto_gid_max_retries = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_AUTO_GID_MAX_RETRIES";
+        }
+    }
+
     const char* disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
