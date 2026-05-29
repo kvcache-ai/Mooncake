@@ -492,6 +492,11 @@ impl StoreClientBuilder {
             &self.local_memory,
             storage_owner.clone(),
         )?;
+        let async_replica_tracking = AsyncReplicaTrackHandle::spawn(
+            &runtime,
+            control_client.clone(),
+            live_client_cache.clone(),
+        )?;
         Ok(StoreClient {
             metadata: runtime_metadata,
             route_directory,
@@ -505,6 +510,7 @@ impl StoreClientBuilder {
             suspect_runtime_cache,
             membership_sync,
             _async_eviction: async_eviction,
+            async_replica_tracking,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,
