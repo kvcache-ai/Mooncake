@@ -20,6 +20,12 @@ target_link_libraries(
   storage_backend_bench PRIVATE mooncake_store cachelib_memory_allocator
                                 gflags::gflags glog::glog pthread)
 
+# Add prefix query benchmark executable
+add_executable(prefix_query_bench prefix_query_bench.cpp)
+target_link_libraries(
+  prefix_query_bench PRIVATE mooncake_store cachelib_memory_allocator
+                             gflags::gflags glog::glog pthread)
+
 # Add allocation strategy benchmark executable
 # This benchmark tests AllocationStrategy performance with configurable
 # segment counts, allocation sizes, replica counts, and workload patterns

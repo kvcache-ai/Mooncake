@@ -1,6 +1,7 @@
 #include "master_service.h"
 
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -116,6 +117,136 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return config.group_ids->at(key_index);
+}
+
+enum class RegexQueryMode {
+    kRegex,
+    kPrefix,
+    kExact,
+    kSubstring,
+};
+
+struct RegexQueryPlan {
+    RegexQueryMode mode{RegexQueryMode::kRegex};
+    std::string literal;
+    std::optional<std::regex> regex;
+
+    bool Matches(const std::string& key) const {
+        switch (mode) {
+            case RegexQueryMode::kPrefix:
+                return key.size() >= literal.size() &&
+                       key.compare(0, literal.size(), literal) == 0;
+            case RegexQueryMode::kExact:
+                return key == literal;
+            case RegexQueryMode::kSubstring:
+                return key.find(literal) != std::string::npos;
+            case RegexQueryMode::kRegex:
+                return std::regex_search(key, *regex);
+        }
+        return false;
+    }
+};
+
+bool IsRegexMetaChar(char c) {
+    switch (c) {
+        case '.':
+        case '^':
+        case '$':
+        case '|':
+        case '(':
+        case ')':
+        case '[':
+        case ']':
+        case '{':
+        case '}':
+        case '*':
+        case '+':
+        case '?':
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::optional<RegexQueryPlan> TryBuildLiteralRegexPlan(
+    const std::string& pattern) {
+    if (pattern.empty()) {
+        return RegexQueryPlan{RegexQueryMode::kSubstring, "", std::nullopt};
+    }
+
+    const bool anchored_start = pattern.front() == '^';
+    size_t i = anchored_start ? 1 : 0;
+    std::string literal;
+
+    while (i < pattern.size()) {
+        const char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 >= pattern.size()) {
+                return std::nullopt;
+            }
+            const unsigned char escaped =
+                static_cast<unsigned char>(pattern[i + 1]);
+            if (std::isalnum(escaped)) {
+                // Alphanumeric ECMAScript escapes such as \d, \w, \s, \b, or
+                // backreferences like \1 carry regex semantics and must fall
+                // back to the full regex engine.
+                return std::nullopt;
+            }
+            literal.push_back(static_cast<char>(escaped));
+            i += 2;
+            continue;
+        }
+
+        if (anchored_start && c == '$' && i + 1 == pattern.size()) {
+            return RegexQueryPlan{RegexQueryMode::kExact, std::move(literal),
+                                  std::nullopt};
+        }
+
+        if (anchored_start && c == '.' && i + 1 < pattern.size() &&
+            pattern[i + 1] == '*') {
+            const size_t tail = i + 2;
+            if (tail == pattern.size() ||
+                (tail + 1 == pattern.size() && pattern[tail] == '$')) {
+                return RegexQueryPlan{RegexQueryMode::kPrefix,
+                                      std::move(literal), std::nullopt};
+            }
+            return std::nullopt;
+        }
+
+        if (IsRegexMetaChar(c)) {
+            return std::nullopt;
+        }
+
+        literal.push_back(c);
+        ++i;
+    }
+
+    if (anchored_start) {
+        return RegexQueryPlan{RegexQueryMode::kPrefix, std::move(literal),
+                              std::nullopt};
+    }
+    return RegexQueryPlan{RegexQueryMode::kSubstring, std::move(literal),
+                          std::nullopt};
+}
+
+tl::expected<RegexQueryPlan, ErrorCode> BuildRegexQueryPlan(
+    const std::string& pattern) {
+    if (!GetEnvOr<bool>("MOONCAKE_STORE_DISABLE_PREFIX_FASTPATH", false)) {
+        if (auto plan = TryBuildLiteralRegexPlan(pattern)) {
+            return std::move(*plan);
+        }
+    }
+
+    try {
+        RegexQueryPlan plan;
+        plan.mode = RegexQueryMode::kRegex;
+        plan.regex.emplace(pattern, std::regex::ECMAScript);
+        return plan;
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern: " << pattern
+                   << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
 }
 
 }  // namespace
@@ -1172,14 +1303,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode> {
     std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
-    std::regex pattern;
-
-    try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
-    } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
-                   << ", error: " << e.what();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto query_plan = BuildRegexQueryPlan(regex_pattern);
+    if (!query_plan) {
+        return tl::make_unexpected(query_plan.error());
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -1187,7 +1313,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         MetadataShardAccessorRO shard(this, i);
 
         for (const auto& [key, metadata] : shard->metadata) {
-            if (std::regex_search(key, pattern)) {
+            if (query_plan->Matches(key)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     &Replica::fn_is_completed,
@@ -2640,14 +2766,9 @@ auto MasterService::Remove(const std::string& key, bool force)
 auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
-    std::regex pattern;
-
-    try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
-    } catch (const std::regex_error& e) {
-        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
-                   << ", error: " << e.what();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto query_plan = BuildRegexQueryPlan(regex_pattern);
+    if (!query_plan) {
+        return tl::make_unexpected(query_plan.error());
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2655,7 +2776,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
         MetadataShardAccessorRW shard(this, i);
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
-            if (std::regex_search(it->first, pattern)) {
+            if (query_plan->Matches(it->first)) {
                 if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
