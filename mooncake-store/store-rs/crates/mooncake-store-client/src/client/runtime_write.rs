@@ -859,12 +859,11 @@ impl StoreClient {
         };
         let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
             .attribute_u64("mooncake.item_count", prepared.len() as u64);
-        let current_routes_result = self.route_ops().load_routes(
-            &prepared
-                .iter()
-                .map(|entry| entry.scoped_key.clone())
-                .collect::<Vec<_>>(),
-        );
+        let route_keys = prepared
+            .iter()
+            .map(|entry| entry.scoped_key.clone())
+            .collect::<Vec<_>>();
+        let current_routes_result = self.route_ops().load_routes(&route_keys);
         route_load_tracker.finish(&current_routes_result, 0);
         let current_routes = match current_routes_result {
             Ok(routes) => routes,
@@ -922,7 +921,10 @@ impl StoreClient {
                     let mut routes = Vec::with_capacity(prepared.len());
                     let mut remote_writes = Vec::new();
                     let mut checked_runtimes = BTreeSet::new();
-                    for (entry, current) in prepared.iter().zip(current_routes.iter().cloned()) {
+                    for (entry, current) in prepared
+                        .iter()
+                        .zip(current_routes.iter().cloned())
+                    {
                 let checksum = payload_checksum(entry.value);
                 let mut replicas = Vec::with_capacity(entry.targets.len());
                 let mut remote_requests = Vec::new();
@@ -1011,11 +1013,10 @@ impl StoreClient {
                 }
 
                 let expected_version = current.as_ref().map(|route| route.version);
-                let next_version = next_route_version(
-                    current.as_ref(),
-                    &self.route_ops(),
-                    &entry.scoped_key,
-                );
+                let next_version = current
+                    .as_ref()
+                    .map(|route| route.version.next())
+                    .unwrap_or(RouteVersion(1));
                 let mut route = ObjectRoute {
                     key: entry.scoped_key.clone(),
                     namespace: None,
@@ -1282,6 +1283,7 @@ impl StoreClient {
             };
         };
 
+        let (mut routes, prepared) = (routes, prepared);
         let cas_requests = routes
             .iter()
             .map(|pending| RouteCasRequest {
@@ -1312,13 +1314,67 @@ impl StoreClient {
             publish_started.elapsed(),
         );
         cas_tracker.finish(&cas_results_result, 0);
-        let cas_results = match cas_results_result {
+        let mut cas_results = match cas_results_result {
             Ok(results) => results,
             Err(error) => {
                 release_prepared(&prepared, "batch_put_failed_before_publish");
                 return Err(error);
             }
         };
+        let floor_retry_indices = cas_results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                let pending = &routes[index];
+                match result {
+                    Ok(cas)
+                        if !cas.applied
+                            && pending.expected_version.is_none()
+                            && cas.current.is_none() =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !floor_retry_indices.is_empty() {
+            let floor_keys = floor_retry_indices
+                .iter()
+                .map(|index| routes[*index].key.clone())
+                .collect::<Vec<_>>();
+            let floor_current = vec![None; floor_keys.len()];
+            let retry_versions = next_route_versions(&floor_current, &self.route_ops(), &floor_keys);
+            let mut retry_requests = Vec::new();
+            let mut retry_indices = Vec::new();
+            for (index, retry_version) in floor_retry_indices.into_iter().zip(retry_versions) {
+                if retry_version > routes[index].route.version {
+                    routes[index].route.version = retry_version;
+                    retry_indices.push(index);
+                    retry_requests.push(RouteCasRequest {
+                        key: routes[index].key.clone(),
+                        expected: None,
+                        next: Some(routes[index].route.clone()),
+                    });
+                }
+            }
+            if !retry_requests.is_empty() {
+                let retry_tracker =
+                    OperationTracker::new("batch_put_stage_route_cas_floor_retry");
+                let retry_result = self.route_ops().publish_routes(&retry_requests);
+                retry_tracker.finish(&retry_result, 0);
+                let retry_results = match retry_result {
+                    Ok(results) => results,
+                    Err(error) => {
+                        release_prepared(&prepared, "batch_put_floor_retry_failed");
+                        return Err(error);
+                    }
+                };
+                for (index, result) in retry_indices.into_iter().zip(retry_results) {
+                    cas_results[index] = result;
+                }
+            }
+        }
 
         let mut published = Vec::with_capacity(routes.len());
         let mut first_error = None;

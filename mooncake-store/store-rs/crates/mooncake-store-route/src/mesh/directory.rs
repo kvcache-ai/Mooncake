@@ -13,9 +13,10 @@ use tracing::{debug, trace, warn};
 use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
 use crate::mesh::{
     authority_compare_and_swap_many, authority_contains_many, authority_get_many,
-    authority_get_version_floor, authority_is_local, authority_list_reuse_candidates,
-    authority_list_routes_by_replica_owner, authority_list_routes_in_scope, authority_replace_many,
-    local_authority_service, register_local_authority, unregister_local_authority,
+    authority_get_version_floor, authority_get_version_floors, authority_is_local,
+    authority_list_reuse_candidates, authority_list_routes_by_replica_owner,
+    authority_list_routes_in_scope, authority_replace_many, local_authority_service,
+    register_local_authority, unregister_local_authority,
 };
 use crate::metrics::{record_cas_outcome, record_route_repair_metric};
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
@@ -67,6 +68,11 @@ struct RouteAuthoritySelection {
 struct RouteMirrorBatch {
     secondary: ClientLease,
     requests: Vec<RouteCasRequest>,
+}
+
+struct RouteContainsProbe<'a> {
+    should_probe: Option<&'a [bool]>,
+    retry_on_error: Option<&'a mut [bool]>,
 }
 
 type RouteReadRepairState = Vec<RouteAuthorityObservation>;
@@ -563,11 +569,15 @@ impl EmbeddedWrhRouteDirectory {
         ranked_authorities: &[Vec<ClientLease>],
         rank: usize,
         resolved: &mut [bool],
+        mut probe: RouteContainsProbe<'_>,
         failure_message: &'static str,
     ) -> Result<bool> {
         let mut groups = BTreeMap::<String, (ClientLease, Vec<usize>)>::new();
         for (index, authorities) in ranked_authorities.iter().enumerate() {
             if resolved[index] {
+                continue;
+            }
+            if probe.should_probe.is_some_and(|probe| !probe[index]) {
                 continue;
             }
             let Some(authority) = authorities.get(rank).cloned() else {
@@ -605,6 +615,9 @@ impl EmbeddedWrhRouteDirectory {
                             }
                             Ok(false) => {}
                             Err(error) => {
+                                if let Some(retry) = probe.retry_on_error.as_deref_mut() {
+                                    retry[index] = true;
+                                }
                                 self.maybe_mark_authority_suspect(
                                     &authority,
                                     &error,
@@ -621,6 +634,11 @@ impl EmbeddedWrhRouteDirectory {
                     }
                 }
                 Err(error) => {
+                    if let Some(retry) = probe.retry_on_error.as_deref_mut() {
+                        for index in &indices {
+                            retry[*index] = true;
+                        }
+                    }
                     self.maybe_mark_authority_suspect(
                         &authority,
                         &error,
@@ -1372,18 +1390,35 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             })
             .collect::<Vec<_>>();
         let mut resolved = vec![false; keys.len()];
-        for rank in 0..self.route_topk {
+        let mut retry = vec![false; keys.len()];
+        self.contains_ranked_authorities(
+            keys,
+            &ranked_authorities,
+            0,
+            &mut resolved,
+            RouteContainsProbe {
+                should_probe: None,
+                retry_on_error: Some(&mut retry),
+            },
+            "authority bounded route contains failed; trying mirrored authorities",
+        )?;
+        for rank in 1..self.route_topk {
+            if !retry.iter().any(|value| *value) {
+                break;
+            }
+            let mut next_retry = vec![false; keys.len()];
             self.contains_ranked_authorities(
                 keys,
                 &ranked_authorities,
                 rank,
                 &mut resolved,
-                if rank == 0 {
-                    "authority bounded route contains failed; trying mirrored authorities"
-                } else {
-                    "mirrored bounded route contains failed; trying other authorities"
+                RouteContainsProbe {
+                    should_probe: Some(&retry),
+                    retry_on_error: Some(&mut next_retry),
                 },
+                "mirrored bounded route contains failed; trying other authorities",
             )?;
+            retry = next_retry;
         }
         Ok(resolved)
     }
@@ -1569,5 +1604,59 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             }
         }
         None
+    }
+
+    fn get_version_floors(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let Ok(candidates) = self.authority_candidates(observer) else {
+            return vec![None; keys.len()];
+        };
+        let ranked_authorities = keys
+            .iter()
+            .map(|key| {
+                self.ranked_top_authorities_from_candidates(&candidates, key, self.route_topk)
+            })
+            .collect::<Vec<_>>();
+        let mut floors = vec![None; keys.len()];
+        for rank in 0..self.route_topk {
+            let mut by_authority = BTreeMap::<ClientStableId, Vec<(usize, ObjectKey)>>::new();
+            for (index, authorities) in ranked_authorities.iter().enumerate() {
+                if floors[index].is_some() {
+                    continue;
+                }
+                let Some(authority) = authorities.get(rank) else {
+                    continue;
+                };
+                by_authority
+                    .entry(authority.runtime.stable_id.clone())
+                    .or_default()
+                    .push((index, keys[index].clone()));
+            }
+            if by_authority.is_empty() {
+                break;
+            }
+            for (authority, entries) in by_authority {
+                let lookup_keys = entries
+                    .iter()
+                    .map(|(_, key)| key.clone())
+                    .collect::<Vec<_>>();
+                for ((index, _), floor) in entries.into_iter().zip(authority_get_version_floors(
+                    &self.namespace,
+                    &authority,
+                    &lookup_keys,
+                )) {
+                    if floor.is_some() {
+                        floors[index] = floor;
+                    }
+                }
+            }
+        }
+        floors
     }
 }

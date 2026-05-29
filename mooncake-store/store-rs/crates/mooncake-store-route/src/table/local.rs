@@ -35,6 +35,10 @@ impl LocalRouteTable {
         self.version_floors.get(&key.0).copied()
     }
 
+    pub(crate) fn version_floors(&self, keys: &[ObjectKey]) -> Vec<Option<RouteVersion>> {
+        keys.iter().map(|key| self.version_floor(key)).collect()
+    }
+
     pub(crate) fn list_routes(&self) -> Vec<ObjectRoute> {
         self.routes.values().cloned().collect()
     }

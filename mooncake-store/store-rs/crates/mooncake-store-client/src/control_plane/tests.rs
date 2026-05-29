@@ -218,6 +218,13 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_get_routes(request).await
     }
 
+    async fn batch_contains_routes(
+        &self,
+        request: Request<pb::BatchContainsRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
+        self.inner.batch_contains_routes(request).await
+    }
+
     async fn compare_and_swap_route(
         &self,
         request: Request<pb::CompareAndSwapRouteRequest>,
@@ -438,6 +445,13 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
     ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
         tokio::time::sleep(self.batch_get_delay).await;
         self.inner.batch_get_routes(request).await
+    }
+
+    async fn batch_contains_routes(
+        &self,
+        request: Request<pb::BatchContainsRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
+        self.inner.batch_contains_routes(request).await
     }
 
     async fn compare_and_swap_route(
@@ -661,6 +675,13 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::BatchGetRoutesRequest>,
     ) -> std::result::Result<Response<pb::BatchGetRoutesReply>, Status> {
         self.inner.batch_get_routes(request).await
+    }
+
+    async fn batch_contains_routes(
+        &self,
+        request: Request<pb::BatchContainsRoutesRequest>,
+    ) -> std::result::Result<Response<pb::BatchContainsRoutesReply>, Status> {
+        self.inner.batch_contains_routes(request).await
     }
 
     async fn compare_and_swap_route(

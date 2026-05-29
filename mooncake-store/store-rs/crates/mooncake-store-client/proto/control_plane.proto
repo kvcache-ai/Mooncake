@@ -5,6 +5,7 @@ package mooncake.store.control;
 service ControlPlaneService {
   rpc GetRoute(GetRouteRequest) returns (GetRouteReply);
   rpc BatchGetRoutes(BatchGetRoutesRequest) returns (BatchGetRoutesReply);
+  rpc BatchContainsRoutes(BatchContainsRoutesRequest) returns (BatchContainsRoutesReply);
   rpc CompareAndSwapRoute(CompareAndSwapRouteRequest) returns (CompareAndSwapRouteReply);
   rpc BatchCompareAndSwapRoutes(BatchCompareAndSwapRoutesRequest) returns (BatchCompareAndSwapRoutesReply);
   rpc ReplaceRoute(ReplaceRouteRequest) returns (ReplaceRouteReply);
@@ -147,6 +148,21 @@ message BatchGetRoutesRequest {
 
 message BatchGetRoutesReply {
   repeated GetRouteReply replies = 1;
+}
+
+message ContainsRouteReply {
+  bool exists = 1;
+  ErrorDetail error = 2;
+}
+
+message BatchContainsRoutesRequest {
+  string namespace = 1;
+  string authority = 2;
+  repeated string keys = 3;
+}
+
+message BatchContainsRoutesReply {
+  repeated ContainsRouteReply replies = 1;
 }
 
 message CompareAndSwapRouteRequest {
@@ -352,6 +368,7 @@ message ControlStreamRequest {
     ListRoutesByReplicaOwnerRequest route_list_by_replica_owner = 8;
     BatchReportRouteHitsRequest eviction_report_route_hits = 9;
     BatchTrackReplicaRoutesRequest eviction_track_replica_routes = 10;
+    BatchContainsRoutesRequest route_contains = 11;
   }
 }
 
@@ -367,6 +384,7 @@ message ControlStreamReply {
     ListRoutesByReplicaOwnerReply route_list_by_replica_owner = 8;
     BatchReportRouteHitsReply eviction_report_route_hits = 9;
     BatchTrackReplicaRoutesReply eviction_track_replica_routes = 10;
+    BatchContainsRoutesReply route_contains = 12;
   }
   ErrorDetail error = 11;
 }

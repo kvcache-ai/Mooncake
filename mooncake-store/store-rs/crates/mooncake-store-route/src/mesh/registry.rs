@@ -78,6 +78,18 @@ pub(crate) fn authority_get_version_floor(
         .and_then(|slot| slot.table.version_floor(key))
 }
 
+pub(crate) fn authority_get_version_floors(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Vec<Option<RouteVersion>> {
+    let mesh = route_mesh(namespace);
+    mesh.authorities
+        .get(&authority.0)
+        .map(|slot| slot.table.version_floors(keys))
+        .unwrap_or_else(|| vec![None; keys.len()])
+}
+
 pub(crate) fn authority_list_routes_by_replica_owner(
     namespace: &str,
     authority: &ClientStableId,

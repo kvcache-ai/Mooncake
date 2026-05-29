@@ -28,6 +28,14 @@ fn next_route_version(
     route_ops.next_route_version(current, key)
 }
 
+fn next_route_versions(
+    current: &[Option<ObjectRoute>],
+    route_ops: &RouteOperations,
+    keys: &[ObjectKey],
+) -> Vec<RouteVersion> {
+    route_ops.next_route_versions(current, keys)
+}
+
 fn payload_checksum(payload: &[u8]) -> u64 {
     // Keep checksum validation on the hot read/write path cheap enough for
     // large restore batches. The stored route field remains a stable u64.
