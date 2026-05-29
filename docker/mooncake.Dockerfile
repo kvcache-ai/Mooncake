@@ -3,10 +3,9 @@
 ###############################################################################
 # Stage 1: build Mooncake from source and produce a Python wheel
 ###############################################################################
-ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=22.04
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+FROM ubuntu:${UBUNTU_VERSION} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
@@ -14,16 +13,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
-ARG EP_TORCH_VERSIONS="2.9.1"
-ARG TORCH_CUDA_ARCH_LIST="8.0;9.0"
 
 ENV PYTHON_VERSION=${PYTHON_VERSION} \
-    BUILD_WITH_EP=1 \
-    EP_TORCH_VERSIONS=${EP_TORCH_VERSIONS} \
-    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
-    PATH="/usr/local/go/bin:${PATH}"
+    PATH="/usr/local/go/bin:${PATH}" \
+    GOPROXY="https://goproxy.cn,https://goproxy.io,direct"
 
-# Install base build utilities and the requested Python version via deadsnakes PPA
+# Install base build utilities and Python (Ubuntu 22.04 has Python 3.10 built-in)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -31,16 +26,23 @@ RUN apt-get update && \
         git \
         ninja-build \
         software-properties-common \
-        pkg-config && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv && \
-    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+        pkg-config \
+        build-essential \
+        cmake \
+        liburing-dev \
+        libnuma-dev \
+        libzstd-dev \
+        libxxhash-dev \
+        libcurl4-openssl-dev \
+        libyaml-cpp-dev \
+        libssl-dev \
+        uuid-dev \
+        libre2-dev \
+        python3 \
+        python3-dev \
+        python3-venv \
+        python3-pip && \
+    update-alternatives --install /usr/bin/python  python  /usr/bin/python3 1 && \
     apt-get purge -y --auto-remove software-properties-common && \
     rm -rf /var/lib/apt/lists/*
 
@@ -50,27 +52,20 @@ COPY . /workspace
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash dependencies.sh -y
 
-# Configure & build Mooncake
+# Configure & build Mooncake (no CUDA, no RDMA)
+# Build Go K8s lease wrapper first to generate the header, then build everything else
 RUN mkdir -p build && \
     cd build && \
     cmake -G Ninja .. \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
-        -DUSE_CUDA=ON \
-        -DWITH_EP=ON \
+        -DUSE_CUDA=OFF \
+        -DWITH_EP=OFF \
         -DSTORE_USE_K8S_LEASE=ON \
-        -DPython3_EXECUTABLE=/usr/bin/python${PYTHON_VERSION} \
+        -DPython3_EXECUTABLE=/usr/bin/python3 \
         -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
+    cmake --build . --parallel 2 --target build_k8s_lease_wrapper && \
     cmake --build . --parallel 2
-
-# Build nvlink allocator to make wheel self-contained for CUDA paths
-RUN export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH && \
-    export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH && \
-    export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH && \
-    mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
-    cd mooncake-transfer-engine/nvlink-allocator && \
-    bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
 # Build the Python wheel from local sources
 RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
@@ -78,7 +73,7 @@ RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image
 ###############################################################################
-FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+FROM ubuntu:${UBUNTU_VERSION} AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -86,36 +81,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Inherit build-args so the runtime stage installs the matching interpreter
 ARG PYTHON_VERSION=3.10
-ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ENV PYTHON_VERSION=${PYTHON_VERSION}
 
-# Install runtime dependencies and the requested Python version
+# Install runtime dependencies (Ubuntu 22.04 has Python 3.10 built-in)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        software-properties-common \
-        ibverbs-providers \
-        rdma-core \
-        libibverbs1 \
-        librdmacm1 \
         libnuma1 \
         liburing2 \
         libyaml-0-2 \
-        libcurl4 && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} && \
-    curl -sS ${PYPA_INDEX_URL}/get-pip.py | python${PYTHON_VERSION} && \
-    update-alternatives --install /usr/bin/python  python  /usr/bin/python${PYTHON_VERSION} 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
-    apt-get purge -y --auto-remove software-properties-common curl && \
+        libcurl4 \
+        libibverbs1 \
+        python3 \
+        python3-pip && \
+    apt-get purge -y --auto-remove curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
-COPY --chmod=755 scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
-RUN python${PYTHON_VERSION} -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
+COPY scripts/check_hicache_hugepage_requirements.py /usr/local/bin/mooncake-hicache-sizing
+RUN chmod 755 /usr/local/bin/mooncake-hicache-sizing
+RUN python3 -m pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel /root/.cache/pip
 
 CMD ["/bin/bash"]
