@@ -131,12 +131,38 @@ DeserializeStandbyObjectMetadata(
         const auto soft_pin_timestamp_ms = array[index++].as<uint64_t>();
         const auto replica_count = array[index++].as<uint32_t>();
 
-        if (object.via.array.size != 7 + replica_count &&
-            object.via.array.size != 8 + replica_count) {
+        // Format detection (mirror MasterService::MetadataSerializer so the
+        // standby restore path tolerates every shape the writer emits):
+        //   v1: 7 + replica_count, no data_type or trailing hard_pinned
+        //   v2: 8 + replica_count, either data_type or trailing hard_pinned
+        //   v3: 9 + replica_count, data_type plus trailing hard_pinned
+        constexpr uint32_t kOldFieldCount = 7;
+        constexpr uint32_t kOneExtraFieldCount = 8;
+        constexpr uint32_t kCurrentFieldCount = 9;
+        const uint32_t total_elements = object.via.array.size;
+        const bool is_old_format =
+            (total_elements == kOldFieldCount + replica_count);
+        const bool is_one_extra_format =
+            (total_elements == kOneExtraFieldCount + replica_count);
+        const bool is_current_format =
+            (total_elements == kCurrentFieldCount + replica_count);
+
+        if (!is_old_format && !is_one_extra_format && !is_current_format) {
             LOG(ERROR) << "Snapshot metadata entry replica count mismatch, "
                        << "replicas=" << replica_count
-                       << ", total_fields=" << object.via.array.size;
+                       << ", total_fields=" << total_elements;
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+
+        // Skip data_type when present; the standby restore path does not use
+        // it. In the ambiguous 8 + replica_count case, a leading
+        // POSITIVE_INTEGER is data_type while anything else is the first
+        // replica (and the extra field is the trailing hard_pinned).
+        if (is_current_format) {
+            ++index;  // data_type
+        } else if (is_one_extra_format &&
+                   array[index].type == msgpack::type::POSITIVE_INTEGER) {
+            ++index;  // data_type
         }
 
         const auto lease_timeout = std::chrono::system_clock::time_point(

@@ -44,6 +44,20 @@ struct CatalogBackendParam {
     bool requires_redis{false};
 };
 
+// On-wire shapes the master snapshot writer has emitted over time. The standby
+// restore reader must tolerate all of them. See
+// MasterService::MetadataSerializer in master_service.cpp.
+//   kLegacy:         7 + replica_count, no data_type, no trailing hard_pinned
+//   kDataTypeOnly:   8 + replica_count, data_type after replica_count
+//   kHardPinnedOnly: 8 + replica_count, trailing hard_pinned, no data_type
+//   kCurrent:        9 + replica_count, data_type plus trailing hard_pinned
+enum class SnapshotMetadataFormat {
+    kLegacy,
+    kDataTypeOnly,
+    kHardPinnedOnly,
+    kCurrent,
+};
+
 class ScopedEnvVar {
    public:
     ScopedEnvVar(std::string name, std::string value) : name_(std::move(name)) {
@@ -133,7 +147,20 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
-    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs) {
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    const bool include_data_type =
+        format == SnapshotMetadataFormat::kDataTypeOnly ||
+        format == SnapshotMetadataFormat::kCurrent;
+    const bool include_hard_pinned =
+        format == SnapshotMetadataFormat::kHardPinnedOnly ||
+        format == SnapshotMetadataFormat::kCurrent;
+    constexpr uint32_t kReplicaCount = 1;
+    // 7 leading fields + replicas + optional data_type + optional hard_pinned.
+    const size_t array_size = 7 + kReplicaCount +
+                              (include_data_type ? 1 : 0) +
+                              (include_hard_pinned ? 1 : 0);
+
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
     shard_packer.pack_map(1);
@@ -142,15 +169,21 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack_array(2);
     shard_packer.pack(std::string(object_key));
 
-    shard_packer.pack_array(8);
+    shard_packer.pack_array(array_size);
     shard_packer.pack(UuidToString(client_id));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
     shard_packer.pack(false);
     shard_packer.pack(uint64_t{0});
-    shard_packer.pack(uint32_t{1});
+    shard_packer.pack(kReplicaCount);
+    if (include_data_type) {
+        shard_packer.pack(static_cast<uint8_t>(ObjectDataType::TENSOR));
+    }
     PackDiskReplica(shard_packer, disk_file_path, object_size);
+    if (include_hard_pinned) {
+        shard_packer.pack(true);
+    }
 
     auto compressed_shard =
         zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
@@ -222,7 +255,8 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
     const UUID& client_id = UUID{1, 2},
     std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
-    uint64_t object_size = kDefaultTestObjectSize) {
+    uint64_t object_size = kDefaultTestObjectSize,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
     auto manifest = object_store.UploadString(descriptor.manifest_key,
                                               "messagepack|1.0.0|standby-test");
     if (!manifest) {
@@ -237,8 +271,9 @@ inline tl::expected<void, std::string> PublishSnapshotPayload(
 
     auto metadata = object_store.UploadBuffer(
         descriptor.object_prefix + "metadata",
-        BuildMetadataPayload(client_id, object_key, disk_file_path,
-                             object_size));
+        BuildMetadataPayload(client_id, object_key, disk_file_path, object_size,
+                             kDefaultTestPutStartTimeMs,
+                             kDefaultTestLeaseTimeoutMs, format));
     if (!metadata) {
         return tl::make_unexpected(metadata.error());
     }
