@@ -32,6 +32,10 @@ type MooncakeClusterSpec struct {
 	// Eviction defines the eviction policy configuration.
 	// +optional
 	Eviction EvictionSpec `json:"eviction,omitempty"`
+
+	// VLLM defines the vLLM PD-disaggregated inference configuration.
+	// +optional
+	VLLM *VLLMSpec `json:"vllm,omitempty"`
 }
 
 // MasterSpec defines the master node configuration.
@@ -228,6 +232,104 @@ type EvictionSpec struct {
 	EnableDiskEviction bool `json:"enableDiskEviction,omitempty"`
 }
 
+// VLLMSpec defines the vLLM PD-disaggregated inference configuration.
+type VLLMSpec struct {
+	// Image is the vLLM Docker image to deploy.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Proxy defines the vLLM proxy server configuration.
+	Proxy ProxySpec `json:"proxy"`
+
+	// Prefill defines the vLLM prefill (kv_producer) configuration.
+	Prefill PrefillSpec `json:"prefill"`
+
+	// Decode defines the vLLM decode (kv_consumer) configuration.
+	Decode DecodeSpec `json:"decode"`
+
+	// Migration defines the KVCache live migration configuration.
+	// +optional
+	Migration MigrationConfig `json:"migration,omitempty"`
+}
+
+// ProxySpec defines the vLLM proxy server configuration.
+type ProxySpec struct {
+	// Replicas is the number of proxy replicas.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Port is the HTTP port for the proxy server.
+	// +kubebuilder:default=8000
+	Port int32 `json:"port,omitempty"`
+
+	// Resources defines the resource requirements for proxy pods.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// PrefillSpec defines the vLLM prefill (kv_producer) configuration.
+type PrefillSpec struct {
+	// Replicas is the number of prefill replicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Model is the model name to load (e.g. "Qwen/Qwen2.5-7B-Instruct").
+	// +kubebuilder:default="Qwen/Qwen2.5-7B-Instruct"
+	Model string `json:"model,omitempty"`
+
+	// TPSize is the tensor parallelism size for model sharding.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	TPSize int32 `json:"tpSize,omitempty"`
+
+	// Resources defines the resource requirements for prefill pods.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// DecodeSpec defines the vLLM decode (kv_consumer) configuration.
+type DecodeSpec struct {
+	// Replicas is the number of decode replicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Model is the model name to load (e.g. "Qwen/Qwen2.5-7B-Instruct").
+	// +kubebuilder:default="Qwen/Qwen2.5-7B-Instruct"
+	Model string `json:"model,omitempty"`
+
+	// TPSize is the tensor parallelism size for model sharding.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	TPSize int32 `json:"tpSize,omitempty"`
+
+	// Resources defines the resource requirements for decode pods.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// MigrationConfig defines the KVCache live migration configuration.
+type MigrationConfig struct {
+	// BandwidthMBPS is the migration bandwidth limit in MB/s. 0 = unlimited.
+	// +kubebuilder:default=0
+	BandwidthMBPS int32 `json:"bandwidthMBPS,omitempty"`
+
+	// TimeoutSeconds is the per-migration timeout in seconds.
+	// +kubebuilder:default=300
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// BlockPoolSize is the number of pre-allocated migration block IDs per node.
+	// +kubebuilder:default=4096
+	BlockPoolSize int32 `json:"blockPoolSize,omitempty"`
+
+	// MaxRemigrationHops is the maximum cascade re-migration hops.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=3
+	MaxRemigrationHops int32 `json:"maxRemigrationHops,omitempty"`
+}
+
 // MooncakeClusterStatus defines the observed state of MooncakeCluster.
 type MooncakeClusterStatus struct {
 	// Phase is the current lifecycle phase of the cluster.
@@ -242,6 +344,18 @@ type MooncakeClusterStatus struct {
 
 	// LeaderNode is the pod name of the current master leader.
 	LeaderNode string `json:"leaderNode,omitempty"`
+
+	// ProxyReady is the number of ready proxy replicas.
+	// +optional
+	ProxyReady int32 `json:"proxyReady,omitempty"`
+
+	// PrefillReady is the number of ready prefill replicas.
+	// +optional
+	PrefillReady int32 `json:"prefillReady,omitempty"`
+
+	// DecodeReady is the number of ready decode replicas.
+	// +optional
+	DecodeReady int32 `json:"decodeReady,omitempty"`
 
 	// Conditions represent the latest available observations of the cluster's state.
 	// +optional
@@ -274,6 +388,9 @@ type ClusterCondition struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Master",type=integer,JSONPath=`.status.masterReady`
 // +kubebuilder:printcolumn:name="Worker",type=integer,JSONPath=`.status.workerReady`
+// +kubebuilder:printcolumn:name="Proxy",type=integer,JSONPath=`.status.proxyReady`
+// +kubebuilder:printcolumn:name="Prefill",type=integer,JSONPath=`.status.prefillReady`
+// +kubebuilder:printcolumn:name="Decode",type=integer,JSONPath=`.status.decodeReady`
 // +kubebuilder:printcolumn:name="Leader",type=string,JSONPath=`.status.leaderNode`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:resource:shortName=mc,scope=Namespaced

@@ -1,10 +1,14 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"time"
 
@@ -43,7 +47,7 @@ type MooncakeClusterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
@@ -108,7 +112,14 @@ func (r *MooncakeClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return r.setFailed(ctx, &mc, "WorkerDeploymentError", err)
 	}
 
-	// 6. Update status
+	// 6. Reconcile vLLM components (proxy, prefill, decode)
+	if mc.Spec.VLLM != nil {
+		if result, err := r.reconcileVLLM(ctx, &mc); err != nil {
+			return result, err
+		}
+	}
+
+	// 7. Update status
 	if err := r.reconcileStatus(ctx, &mc); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -512,6 +523,19 @@ func envVarsEqual(a, b []corev1.EnvVar) bool {
 	return true
 }
 
+func (r *MooncakeClusterReconciler) patchDeploymentSpec(ctx context.Context, existing *appsv1.Deployment, desired *appsv1.Deployment) error {
+	patchBase := client.MergeFrom(existing.DeepCopy())
+	existing.Spec.Replicas = desired.Spec.Replicas
+	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
+	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.Spec.Template.Spec.Containers[0].ImagePullPolicy
+	existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
+	existing.Spec.Template.Spec.Containers[0].Args = desired.Spec.Template.Spec.Containers[0].Args
+	existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+	existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+	existing.Spec.Template.Spec.Containers[0].Ports = desired.Spec.Template.Spec.Containers[0].Ports
+	return r.Patch(ctx, existing, patchBase)
+}
+
 func (r *MooncakeClusterReconciler) reconcileStatus(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
 	// Snapshot current status for patch diff
 	patchBase := client.MergeFrom(mc.DeepCopy())
@@ -548,8 +572,44 @@ func (r *MooncakeClusterReconciler) reconcileStatus(ctx context.Context, mc *moo
 		}
 	}
 
+	// Count ready vLLM pods (only if VLLM is configured)
+	readyProxies := int32(0)
+	readyPrefills := int32(0)
+	readyDecodes := int32(0)
+	vllmConfigured := mc.Spec.VLLM != nil
+	if vllmConfigured {
+		var vllmPods corev1.PodList
+		if err := r.List(ctx, &vllmPods,
+			client.InNamespace(mc.Namespace),
+			client.MatchingLabels{"cluster": mc.Name},
+		); err != nil {
+			return err
+		}
+
+		for _, pod := range vllmPods.Items {
+			if !isPodReady(&pod) {
+				continue
+			}
+			appLabel := pod.Labels["app"]
+			switch appLabel {
+			case "mooncake-proxy":
+				readyProxies++
+			case "mooncake-prefill":
+				readyPrefills++
+			case "mooncake-decode":
+				readyDecodes++
+			}
+		}
+	}
+
 	// Determine desired phase
 	allReady := readyMasters == mc.Spec.Master.Replicas && readyWorkers == mc.Spec.Workers.Replicas
+	if vllmConfigured {
+		allReady = allReady &&
+			readyProxies == mc.Spec.VLLM.Proxy.Replicas &&
+			readyPrefills == mc.Spec.VLLM.Prefill.Replicas &&
+			readyDecodes == mc.Spec.VLLM.Decode.Replicas
+	}
 	var desiredPhase string
 	if allReady {
 		desiredPhase = "Running"
@@ -563,21 +623,414 @@ func (r *MooncakeClusterReconciler) reconcileStatus(ctx context.Context, mc *moo
 	if mc.Status.Phase == desiredPhase &&
 		mc.Status.MasterReady == readyMasters &&
 		mc.Status.WorkerReady == readyWorkers &&
+		(!vllmConfigured ||
+			(mc.Status.ProxyReady == readyProxies &&
+				mc.Status.PrefillReady == readyPrefills &&
+				mc.Status.DecodeReady == readyDecodes)) &&
 		mc.Status.ObservedGeneration == mc.Generation {
 		return nil
 	}
 
 	mc.Status.MasterReady = readyMasters
 	mc.Status.WorkerReady = readyWorkers
+	if vllmConfigured {
+		mc.Status.ProxyReady = readyProxies
+		mc.Status.PrefillReady = readyPrefills
+		mc.Status.DecodeReady = readyDecodes
+	}
 	mc.Status.ObservedGeneration = mc.Generation
 	mc.Status.Phase = desiredPhase
+	statusMsg := fmt.Sprintf("%d/%d masters, %d/%d workers ready",
+		readyMasters, mc.Spec.Master.Replicas,
+		readyWorkers, mc.Spec.Workers.Replicas)
+	if vllmConfigured {
+		statusMsg = fmt.Sprintf("%s, %d/%d proxies, %d/%d prefills, %d/%d decodes ready",
+			statusMsg,
+			readyProxies, mc.Spec.VLLM.Proxy.Replicas,
+			readyPrefills, mc.Spec.VLLM.Prefill.Replicas,
+			readyDecodes, mc.Spec.VLLM.Decode.Replicas)
+	}
 	setCondition(&mc.Status, "Ready", "True",
 		"PodsReady",
-		fmt.Sprintf("%d/%d masters, %d/%d workers ready",
-			readyMasters, mc.Spec.Master.Replicas,
-			readyWorkers, mc.Spec.Workers.Replicas))
+		statusMsg)
 
 	return r.Status().Patch(ctx, mc, patchBase)
+}
+
+func (r *MooncakeClusterReconciler) reconcileVLLM(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) (ctrl.Result, error) {
+	// 1. Proxy Service
+	if err := r.reconcileProxyService(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "ProxyServiceError", err)
+	}
+
+	// 2. Prefill Service
+	if err := r.reconcilePrefillService(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "PrefillServiceError", err)
+	}
+
+	// 3. Decode Service
+	if err := r.reconcileDecodeService(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "DecodeServiceError", err)
+	}
+
+	// 4. Proxy Deployment
+	if err := r.reconcileProxyDeployment(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "ProxyDeploymentError", err)
+	}
+
+	// 5. Prefill Deployment
+	if err := r.reconcilePrefillDeployment(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "PrefillDeploymentError", err)
+	}
+
+	// 6. Decode Deployment (with scale-down migration orchestration)
+	if err := r.reconcileDecodeDeployment(ctx, mc); err != nil {
+		return r.setFailed(ctx, mc, "DecodeDeploymentError", err)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *MooncakeClusterReconciler) reconcileProxyService(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildProxyService(mc)
+	return r.reconcileService(ctx, mc, desired)
+}
+
+func (r *MooncakeClusterReconciler) reconcilePrefillService(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildPrefillService(mc)
+	return r.reconcileService(ctx, mc, desired)
+}
+
+func (r *MooncakeClusterReconciler) reconcileDecodeService(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildDecodeService(mc)
+	return r.reconcileService(ctx, mc, desired)
+}
+
+func (r *MooncakeClusterReconciler) reconcileProxyDeployment(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildProxyDeployment(mc)
+
+	var existing appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: mc.Namespace}, &existing)
+	if errors.IsNotFound(err) {
+		if err := controllerutil.SetControllerReference(mc, desired, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if deploymentSpecsEqual(&existing.Spec, &desired.Spec) {
+		return nil
+	}
+	return r.patchDeploymentSpec(ctx, &existing, desired)
+}
+
+func (r *MooncakeClusterReconciler) reconcilePrefillDeployment(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildPrefillDeployment(mc)
+
+	var existing appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: mc.Namespace}, &existing)
+	if errors.IsNotFound(err) {
+		if err := controllerutil.SetControllerReference(mc, desired, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	if deploymentSpecsEqual(&existing.Spec, &desired.Spec) {
+		return nil
+	}
+	return r.patchDeploymentSpec(ctx, &existing, desired)
+}
+
+func (r *MooncakeClusterReconciler) reconcileDecodeDeployment(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) error {
+	desired := r.buildDecodeDeployment(mc)
+
+	var existing appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: mc.Namespace}, &existing)
+	if errors.IsNotFound(err) {
+		if err := controllerutil.SetControllerReference(mc, desired, r.Scheme); err != nil {
+			return err
+		}
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+
+	desiredReplicas := mc.Spec.VLLM.Decode.Replicas
+	currentReplicas := int32(0)
+	if existing.Spec.Replicas != nil {
+		currentReplicas = *existing.Spec.Replicas
+	}
+
+	// Scale-down detected: orchestrate KVCache migration before reducing replicas
+	if desiredReplicas < currentReplicas {
+		if err := r.orchestrateDecodeScaleDown(ctx, mc, desired.Name, int(currentReplicas-desiredReplicas)); err != nil {
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "MigrationError", err.Error())
+			return err
+		}
+	}
+
+	if deploymentSpecsEqual(&existing.Spec, &desired.Spec) {
+		return nil
+	}
+	return r.patchDeploymentSpec(ctx, &existing, desired)
+}
+
+// orchestrateDecodeScaleDown migrates active requests off terminating decode pods
+// before the Deployment replicas are reduced.
+func (r *MooncakeClusterReconciler) orchestrateDecodeScaleDown(
+	ctx context.Context,
+	mc *mooncakev1alpha1.MooncakeCluster,
+	deployName string,
+	terminateCount int,
+) error {
+	logger := log.FromContext(ctx)
+	logger.Info("decode scale-down detected, orchestrating migration",
+		"terminateCount", terminateCount)
+
+	// List all decode pods, sorted by name (highest index = most recent = terminate first)
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(mc.Namespace),
+		client.MatchingLabels{"app": "mooncake-decode", "cluster": mc.Name},
+	); err != nil {
+		return fmt.Errorf("listing decode pods: %w", err)
+	}
+
+	sort.Slice(pods.Items, func(i, j int) bool {
+		return pods.Items[i].Name > pods.Items[j].Name
+	})
+
+	if len(pods.Items) < terminateCount {
+		return fmt.Errorf("not enough decode pods: need %d, have %d", terminateCount, len(pods.Items))
+	}
+
+	terminatingPods := pods.Items[:terminateCount]
+	alivePods := pods.Items[terminateCount:]
+
+	logger.Info("migrating decode pods",
+		"terminating", len(terminatingPods), "alive", len(alivePods))
+
+	for _, pod := range terminatingPods {
+		logger.Info("migrating pod", "pod", pod.Name, "ip", pod.Status.PodIP)
+
+		if !isPodReady(&pod) {
+			logger.Info("pod not ready, skipping migration", "pod", pod.Name)
+			continue
+		}
+
+		if err := r.migrateDecodePod(ctx, mc, &pod, alivePods); err != nil {
+			logger.Error(err, "migration failed for pod", "pod", pod.Name)
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "PodMigrationFailed",
+				fmt.Sprintf("migration failed for %s: %v", pod.Name, err))
+			continue
+		}
+
+		// Mark migrated pod with annotation
+		patchBase := client.MergeFrom(pod.DeepCopy())
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations["mooncake.io/migrated"] = "true"
+		if err := r.Patch(ctx, &pod, patchBase); err != nil {
+			logger.Error(err, "failed to annotate migrated pod", "pod", pod.Name)
+		}
+
+		r.Recorder.Event(mc, corev1.EventTypeNormal, "PodMigrated",
+			fmt.Sprintf("pod %s migrated successfully", pod.Name))
+	}
+
+	return nil
+}
+
+// migrateDecodePod migrates active requests from a source decode pod to available
+// target decode pods by calling the connector's migration HTTP API directly on
+// each pod's port 18900.
+func (r *MooncakeClusterReconciler) migrateDecodePod(
+	ctx context.Context,
+	mc *mooncakev1alpha1.MooncakeCluster,
+	source *corev1.Pod,
+	alivePods []corev1.Pod,
+) error {
+	sourceIP := source.Status.PodIP
+	if sourceIP == "" {
+		return fmt.Errorf("source pod %s has no IP", source.Name)
+	}
+	if len(alivePods) == 0 {
+		return fmt.Errorf("no alive target decode pods for migration")
+	}
+
+	migrationPort := 18900
+	timeout := mc.Spec.VLLM.Migration.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = 300
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Step 1: Query active requests on the source pod
+	activeReqURL := fmt.Sprintf("http://%s:%d/api/v1/active_requests", sourceIP, migrationPort)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, activeReqURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating active_requests request: %w", err)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("querying active_requests on %s: %w", sourceIP, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading active_requests response: %w", err)
+	}
+
+	var activeResp struct {
+		RequestIDs []string `json:"request_ids"`
+	}
+	if err := json.Unmarshal(body, &activeResp); err != nil {
+		return fmt.Errorf("parsing active_requests response: %w", err)
+	}
+
+	if len(activeResp.RequestIDs) == 0 {
+		return nil // nothing to migrate
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("migrating active requests", "count", len(activeResp.RequestIDs), "source", source.Name)
+
+	// Step 2: For each active request, prepare migration on a target and start migration
+	for _, reqID := range activeResp.RequestIDs {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("migration deadline exceeded for request %s", reqID)
+		}
+
+		// Select target (round-robin based on request ID hash)
+		targetIdx := int(reqID[0]) % len(alivePods)
+		target := &alivePods[targetIdx]
+		targetIP := target.Status.PodIP
+		if targetIP == "" {
+			return fmt.Errorf("target pod %s has no IP", target.Name)
+		}
+
+		// Step 2a: Call prepare_migration on target pod (port 18900)
+		preparePayload := map[string]interface{}{
+			"request_id":  reqID,
+			"num_blocks":  128,
+			"extra_blocks": 16,
+		}
+		prepareBody, _ := json.Marshal(preparePayload)
+
+		prepareURL := fmt.Sprintf("http://%s:%d/api/v1/prepare_migration", targetIP, migrationPort)
+		prepareResp, err := httpClient.Post(prepareURL, "application/json", bytes.NewReader(prepareBody))
+		if err != nil {
+			return fmt.Errorf("prepare_migration for request %s on target %s: %w", reqID, targetIP, err)
+		}
+		prepareRespBody, _ := io.ReadAll(prepareResp.Body)
+		prepareResp.Body.Close()
+
+		var targetInfo struct {
+			RequestID        string   `json:"request_id"`
+			TargetBlockIDs   []int    `json:"target_block_ids"`
+			KVCachesBaseAddr []int    `json:"kv_caches_base_addr"`
+			Error            string   `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(prepareRespBody, &targetInfo); err != nil {
+			return fmt.Errorf("parsing prepare_migration response: %w", err)
+		}
+		if targetInfo.Error != "" {
+			return fmt.Errorf("prepare_migration error: %s", targetInfo.Error)
+		}
+
+		// Step 2b: Build block_id_map (source block_id -> target block_id)
+		blockIDMap := make(map[string]int)
+		for i, bid := range targetInfo.TargetBlockIDs {
+			blockIDMap[strconv.Itoa(i)] = bid
+		}
+
+		// Step 2c: Call start_migration on source pod (port 18900)
+		startPayload := map[string]interface{}{
+			"request_id":          reqID,
+			"target_host":         targetIP,
+			"target_port":         8200,
+			"target_base_addr":    targetInfo.KVCachesBaseAddr,
+			"block_id_map":        blockIDMap,
+			"extra_target_block_ids": targetInfo.TargetBlockIDs[len(targetInfo.TargetBlockIDs)-16:],
+		}
+		startBody, _ := json.Marshal(startPayload)
+
+		startURL := fmt.Sprintf("http://%s:%d/api/v1/start_migration", sourceIP, migrationPort)
+		startResp, err := httpClient.Post(startURL, "application/json", bytes.NewReader(startBody))
+		if err != nil {
+			return fmt.Errorf("start_migration for request %s on source %s: %w", reqID, sourceIP, err)
+		}
+		startRespBody, _ := io.ReadAll(startResp.Body)
+		startResp.Body.Close()
+
+		var startResult struct {
+			Status string `json:"status"`
+			Phase  string `json:"phase"`
+			Error  string `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(startRespBody, &startResult); err != nil {
+			return fmt.Errorf("parsing start_migration response: %w", err)
+		}
+		if startResult.Error != "" {
+			return fmt.Errorf("start_migration error: %s", startResult.Error)
+		}
+
+		logger.Info("migration started for request",
+			"request_id", reqID, "target", target.Name, "phase", startResult.Phase)
+	}
+
+	// Step 3: Poll migration status until all requests complete or timeout
+	for _, reqID := range activeResp.RequestIDs {
+		for {
+			if time.Now().After(deadline) {
+				return fmt.Errorf("migration status polling deadline exceeded for request %s", reqID)
+			}
+
+			statusURL := fmt.Sprintf("http://%s:%d/api/v1/migration/status/%s", sourceIP, migrationPort, reqID)
+			statusResp, err := httpClient.Get(statusURL)
+			if err != nil {
+				// Pod may be shutting down — assume success
+				break
+			}
+
+			statusBody, _ := io.ReadAll(statusResp.Body)
+			statusResp.Body.Close()
+
+			var statusResult struct {
+				Phase string `json:"phase"`
+			}
+			if err := json.Unmarshal(statusBody, &statusResult); err != nil {
+				break
+			}
+
+			if statusResult.Phase == "COMPLETED" || statusResult.Phase == "SWITCH_OVER" {
+				logger.Info("migration completed for request", "request_id", reqID)
+				break
+			}
+
+			// Wait before next poll
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+
+	return nil
 }
 
 func (r *MooncakeClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -653,9 +1106,17 @@ func (r *MooncakeClusterReconciler) buildMasterConfigMap(mc *mooncakev1alpha1.Mo
 		}
 	}
 
-	// Eviction config
-	config["eviction_ratio"] = mc.Spec.Eviction.Ratio
-	config["eviction_high_watermark_ratio"] = mc.Spec.Eviction.HighWatermarkRatio
+	// Eviction config — use safe defaults if values are at Go zero value (unset)
+	evictionRatio := mc.Spec.Eviction.Ratio
+	if evictionRatio <= 0 {
+		evictionRatio = 0.1
+	}
+	evictionHighWatermark := mc.Spec.Eviction.HighWatermarkRatio
+	if evictionHighWatermark <= 0 {
+		evictionHighWatermark = 0.8
+	}
+	config["eviction_ratio"] = evictionRatio
+	config["eviction_high_watermark_ratio"] = evictionHighWatermark
 	config["allow_evict_soft_pinned_objects"] = mc.Spec.Eviction.AllowEvictSoftPinnedObjects
 	config["enable_disk_eviction"] = mc.Spec.Eviction.EnableDiskEviction
 

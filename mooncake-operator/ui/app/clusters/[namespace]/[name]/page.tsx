@@ -69,6 +69,10 @@ interface MasterStat {
   leader: { present: boolean; leader_address?: string; view_version?: number } | null
 }
 
+interface SegmentStat {
+  [ip: string]: { used: number; capacity: number }
+}
+
 function PhaseBadge({ phase }: { phase?: string }) {
   const colors: Record<string, string> = {
     Running: 'bg-green-100 text-green-800',
@@ -209,6 +213,7 @@ export default function ClusterDetailPage({
   const [pods, setPods] = useState<PodInfo[]>([])
   const [masterStats, setMasterStats] = useState<MasterStat[]>([])
   const [podMetrics, setPodMetrics] = useState<PodMetric[]>([])
+  const [segmentStats, setSegmentStats] = useState<SegmentStat>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -220,13 +225,15 @@ export default function ClusterDetailPage({
       fetch(`/api/clusters/${namespace}/${name}/pods`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/master-stats`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/pod-metrics`).then(r => r.json()),
+      fetch(`/api/clusters/${namespace}/${name}/worker-segments`).then(r => r.json()),
     ])
-      .then(([clusterData, podsData, statsData, metricsData]) => {
+      .then(([clusterData, podsData, statsData, metricsData, segmentsData]) => {
         if (clusterData.error) throw new Error(clusterData.error)
         setCluster(clusterData.cluster)
         setPods(podsData.pods || [])
         setMasterStats(statsData.stats || [])
         setPodMetrics(metricsData.metrics || [])
+        setSegmentStats(segmentsData.segments || {})
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
@@ -276,8 +283,7 @@ export default function ClusterDetailPage({
   const leaderPod = masterStats.find(s => s.health?.role === 'leader' || s.health?.role === 'primary')
   const leaderDisplay = leaderPod?.name || status.leaderNode || '-'
 
-  // Separate pods by role
-  const masterPods = pods.filter(p => p.metadata.name.includes('-master-'))
+  // Filter to only worker pods for the pods table
   const workerPods = pods.filter(p => p.metadata.name.includes('-worker-'))
 
   return (
@@ -295,6 +301,12 @@ export default function ClusterDetailPage({
             className="inline-flex items-center px-4 py-2 border border-gray-300 text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
           >
             Edit
+          </a>
+          <a
+            href={`/clusters/${namespace}/${name}/test`}
+            className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700"
+          >
+            Test
           </a>
           <button
             type="button"
@@ -446,19 +458,18 @@ export default function ClusterDetailPage({
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Node</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pod IP</th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">CPU</th>
                 <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Segment</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {pods.length === 0 ? (
+              {workerPods.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="px-6 py-12 text-center text-sm text-gray-500">No pods found.</td>
                 </tr>
               ) : (
-                pods.map(p => {
-                  const isMaster = p.metadata.name.includes('-master-')
+                workerPods.map(p => {
                   const ms = masterStats.find(s => s.name === p.metadata.name)
                   const metric = podMetrics.find(m => m.metadata.name === p.metadata.name)
                   const res = containerResources(p.spec.containers)
@@ -467,11 +478,10 @@ export default function ClusterDetailPage({
                     <tr key={p.metadata.uid} className="hover:bg-gray-50">
                       <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{p.metadata.name}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {isMaster ? <MasterRoleBadge role={ms?.health?.role || null} /> : <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">worker</span>}
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">worker</span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap"><PodStatusBadge phase={p.status.phase} /></td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.spec.nodeName}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.status.podIP}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[120px]">
                         {metric ? (
                           <div className="flex flex-col gap-0.5">
@@ -487,6 +497,16 @@ export default function ClusterDetailPage({
                             <span className="text-[10px] text-gray-400">{formatBytes(res.memLimit || res.memRequest)} limit</span>
                           </div>
                         ) : <span className="text-xs text-gray-400">-</span>}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[140px]">
+                        {(() => {
+                          const seg = segmentStats[p.status.podIP]
+                          return seg ? (
+                            <ResourceBar usage={seg.used} limit={seg.capacity} label={formatBytes(seg.used)} />
+                          ) : (
+                            <span className="text-xs text-gray-400">-</span>
+                          )
+                        })()}
                       </td>
                     </tr>
                   )

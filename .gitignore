@@ -28,6 +28,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!mooncake-operator/ui/lib/
 lib64/
 parts/
 sdist/

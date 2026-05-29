@@ -2,7 +2,7 @@ module github.com/kvcache-ai/Mooncake/mooncake-operator
 
 go 1.22.0
 
-toolchain go1.22.12
+toolchain go1.22.2
 
 require (
 	k8s.io/api v0.31.0

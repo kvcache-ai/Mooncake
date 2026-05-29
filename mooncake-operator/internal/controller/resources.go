@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -160,15 +162,26 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Command: []string{
-			"mooncake_client",
-			"--master_server_address=" + masterAddr,
-			"--global_segment_size=" + convertSegmentSize(mc.Spec.Workers.SegmentSize),
-			"--metadata_server=" + metadataServer,
+			"sh",
+			"-c",
+			"exec mooncake_client " +
+				"--master_server_address=" + masterAddr + " " +
+				"--global_segment_size=" + convertSegmentSize(mc.Spec.Workers.SegmentSize) + " " +
+				"--metadata_server=" + metadataServer + " " +
+				"--host=$POD_IP",
 		},
 		Env: []corev1.EnvVar{
 			{
 				Name:  "LD_LIBRARY_PATH",
 				Value: "/usr/local/lib/mooncake",
+			},
+			{
+				Name: "POD_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "status.podIP",
+					},
+				},
 			},
 		},
 		Resources: mc.Spec.Workers.Resources,
@@ -233,6 +246,405 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 					Volumes:    volumes,
 				},
 			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// vLLM Proxy
+// ---------------------------------------------------------------------------
+
+func (r *MooncakeClusterReconciler) buildProxyService(mc *mooncakev1alpha1.MooncakeCluster) *corev1.Service {
+	labels := labelsForCluster(mc)
+	port := mc.Spec.VLLM.Proxy.Port
+	if port == 0 {
+		port = 8000
+	}
+	selector := map[string]string{"app": "mooncake-proxy", "cluster": mc.Name}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-proxy",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       port,
+					TargetPort: intstr.FromInt(int(port)),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Selector: selector,
+		},
+	}
+}
+
+func (r *MooncakeClusterReconciler) buildProxyDeployment(mc *mooncakev1alpha1.MooncakeCluster) *appsv1.Deployment {
+	labels := labelsForCluster(mc)
+	selector := map[string]string{"app": "mooncake-proxy", "cluster": mc.Name}
+
+	vllmImage := mc.Spec.VLLM.Image
+	if vllmImage == "" {
+		vllmImage = "vllm/vllm-openai:latest"
+	}
+
+	port := mc.Spec.VLLM.Proxy.Port
+	if port == 0 {
+		port = 8000
+	}
+
+	prefillSvc := mc.Name + "-prefill." + mc.Namespace + ".svc"
+	decodeSvc := mc.Name + "-decode." + mc.Namespace + ".svc"
+
+	replicas := mc.Spec.VLLM.Proxy.Replicas
+	if replicas == 0 {
+		replicas = 1
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-proxy",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selector,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: mergeLabels(labels, selector),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: mc.Name,
+					Containers: []corev1.Container{
+						{
+							Name:            "proxy",
+							Image:           vllmImage,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command: []string{
+								"python", "-m", "mooncake.vllm_v1_proxy_server",
+							},
+							Args: []string{
+								"--port", fmt.Sprintf("%d", port),
+								"--host", "0.0.0.0",
+								"--prefiller-hosts", prefillSvc,
+								"--prefiller-ports", "8100",
+								"--decoder-hosts", decodeSvc,
+								"--decoder-ports", "8200",
+							},
+							Ports: []corev1.ContainerPort{
+								{Name: "http", ContainerPort: port, Protocol: corev1.ProtocolTCP},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/health",
+										Port: intstr.FromInt(int(port)),
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/health",
+										Port: intstr.FromInt(int(port)),
+									},
+								},
+								InitialDelaySeconds: 30,
+								PeriodSeconds:       30,
+							},
+							Resources: mc.Spec.VLLM.Proxy.Resources,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// vLLM Prefill (kv_producer)
+// ---------------------------------------------------------------------------
+
+func (r *MooncakeClusterReconciler) buildPrefillDeployment(mc *mooncakev1alpha1.MooncakeCluster) *appsv1.Deployment {
+	labels := labelsForCluster(mc)
+	selector := map[string]string{"app": "mooncake-prefill", "cluster": mc.Name}
+
+	vllmImage := mc.Spec.VLLM.Image
+	if vllmImage == "" {
+		vllmImage = "vllm/vllm-openai:latest"
+	}
+
+	masterAddr := mc.Name + "-master-headless." + mc.Namespace + ":50051"
+
+	model := mc.Spec.VLLM.Prefill.Model
+	if model == "" {
+		model = "Qwen/Qwen2.5-7B-Instruct"
+	}
+
+	tpSize := mc.Spec.VLLM.Prefill.TPSize
+	if tpSize < 1 {
+		tpSize = 1
+	}
+
+	replicas := mc.Spec.VLLM.Prefill.Replicas
+
+	container := corev1.Container{
+		Name:            "prefill",
+		Image:           vllmImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command: []string{
+			"vllm", "serve",
+		},
+		Args: []string{
+			model,
+			"--port", "8100",
+			"--tensor-parallel-size", strconv.Itoa(int(tpSize)),
+			"--kv-transfer-config", `{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_module_path":"mooncake.mooncake_connector_v1"}`,
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "MOONCAKE_MASTER",
+				Value: masterAddr,
+			},
+			{
+				Name: "POD_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "status.podIP",
+					},
+				},
+			},
+			{
+				Name:  "MOONCAKE_LOCAL_HOSTNAME",
+				Value: "$(POD_IP)",
+			},
+		},
+		Ports: []corev1.ContainerPort{
+			{Name: "api", ContainerPort: 8100, Protocol: corev1.ProtocolTCP},
+			{Name: "mig-http", ContainerPort: 18900, Protocol: corev1.ProtocolTCP},
+		},
+		Resources: mc.Spec.VLLM.Prefill.Resources,
+	}
+
+	// GPU resources for prefill
+	container.Resources.Limits = mergeResourceList(container.Resources.Limits, corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	})
+
+	// Migration config env vars
+	if mc.Spec.VLLM.Migration.BandwidthMBPS > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "MOONCAKE_MIGRATION_BANDWIDTH_MBPS",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.BandwidthMBPS)),
+		})
+	}
+	if mc.Spec.VLLM.Migration.BlockPoolSize > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "VLLM_MOONCAKE_MIGRATION_BLOCK_POOL_SIZE",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.BlockPoolSize)),
+		})
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-prefill",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selector,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: mergeLabels(labels, selector),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: mc.Name,
+					Containers:         []corev1.Container{container},
+				},
+			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// vLLM Decode (kv_consumer)
+// ---------------------------------------------------------------------------
+
+func (r *MooncakeClusterReconciler) buildDecodeDeployment(mc *mooncakev1alpha1.MooncakeCluster) *appsv1.Deployment {
+	labels := labelsForCluster(mc)
+	selector := map[string]string{"app": "mooncake-decode", "cluster": mc.Name}
+
+	vllmImage := mc.Spec.VLLM.Image
+	if vllmImage == "" {
+		vllmImage = "vllm/vllm-openai:latest"
+	}
+
+	masterAddr := mc.Name + "-master-headless." + mc.Namespace + ":50051"
+
+	model := mc.Spec.VLLM.Decode.Model
+	if model == "" {
+		model = "Qwen/Qwen2.5-7B-Instruct"
+	}
+
+	tpSize := mc.Spec.VLLM.Decode.TPSize
+	if tpSize < 1 {
+		tpSize = 1
+	}
+
+	replicas := mc.Spec.VLLM.Decode.Replicas
+
+	container := corev1.Container{
+		Name:            "decode",
+		Image:           vllmImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command: []string{
+			"vllm", "serve",
+		},
+		Args: []string{
+			model,
+			"--port", "8200",
+			"--tensor-parallel-size", strconv.Itoa(int(tpSize)),
+			"--kv-transfer-config", `{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_module_path":"mooncake.mooncake_connector_v1"}`,
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "MOONCAKE_MASTER",
+				Value: masterAddr,
+			},
+			{
+				Name: "POD_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "status.podIP",
+					},
+				},
+			},
+			{
+				Name:  "MOONCAKE_LOCAL_HOSTNAME",
+				Value: "$(POD_IP)",
+			},
+		},
+		Ports: []corev1.ContainerPort{
+			{Name: "api", ContainerPort: 8200, Protocol: corev1.ProtocolTCP},
+			{Name: "mig-http", ContainerPort: 18900, Protocol: corev1.ProtocolTCP},
+		},
+		Resources: mc.Spec.VLLM.Decode.Resources,
+	}
+
+	// GPU resources for decode
+	container.Resources.Limits = mergeResourceList(container.Resources.Limits, corev1.ResourceList{
+		"nvidia.com/gpu": resource.MustParse("1"),
+	})
+
+	// Migration config env vars
+	if mc.Spec.VLLM.Migration.BandwidthMBPS > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "MOONCAKE_MIGRATION_BANDWIDTH_MBPS",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.BandwidthMBPS)),
+		})
+	}
+	if mc.Spec.VLLM.Migration.TimeoutSeconds > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "VLLM_MOONCAKE_MIGRATION_TIMEOUT_SECONDS",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.TimeoutSeconds)),
+		})
+	}
+	if mc.Spec.VLLM.Migration.BlockPoolSize > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "VLLM_MOONCAKE_MIGRATION_BLOCK_POOL_SIZE",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.BlockPoolSize)),
+		})
+	}
+	if mc.Spec.VLLM.Migration.MaxRemigrationHops > 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "VLLM_MOONCAKE_MIGRATION_MAX_REMIGRATION_HOPS",
+			Value: strconv.Itoa(int(mc.Spec.VLLM.Migration.MaxRemigrationHops)),
+		})
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-decode",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selector,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: mergeLabels(labels, selector),
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: mc.Name,
+					Containers:         []corev1.Container{container},
+				},
+			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// vLLM Prefill & Decode Services
+// ---------------------------------------------------------------------------
+
+func (r *MooncakeClusterReconciler) buildPrefillService(mc *mooncakev1alpha1.MooncakeCluster) *corev1.Service {
+	labels := labelsForCluster(mc)
+	selector := map[string]string{"app": "mooncake-prefill", "cluster": mc.Name}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-prefill",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "api",
+					Port:       8100,
+					TargetPort: intstr.FromInt(8100),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Selector: selector,
+		},
+	}
+}
+
+func (r *MooncakeClusterReconciler) buildDecodeService(mc *mooncakev1alpha1.MooncakeCluster) *corev1.Service {
+	labels := labelsForCluster(mc)
+	selector := map[string]string{"app": "mooncake-decode", "cluster": mc.Name}
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      mc.Name + "-decode",
+			Namespace: mc.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "api",
+					Port:       8200,
+					TargetPort: intstr.FromInt(8200),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Selector: selector,
 		},
 	}
 }
