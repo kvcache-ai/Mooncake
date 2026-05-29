@@ -619,30 +619,10 @@ std::optional<std::string> MasterService::GetGroupRoute(
 
 MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     const std::string& tenant_id, const std::string& key) {
-    auto object_mutex = std::shared_ptr<std::mutex>();
     const auto scoped_key = MakeTenantScopedKey(tenant_id, key);
-    {
-        std::lock_guard<std::mutex> lock(object_operation_locks_mutex_);
-        auto it = object_operation_locks_.find(scoped_key);
-        if (it != object_operation_locks_.end()) {
-            object_mutex = it->second.lock();
-        }
-        if (object_mutex == nullptr) {
-            object_mutex = std::make_shared<std::mutex>();
-            object_operation_locks_[scoped_key] = object_mutex;
-        }
-        if (object_operation_locks_.size() > kNumShards * 4) {
-            for (auto cleanup_it = object_operation_locks_.begin();
-                 cleanup_it != object_operation_locks_.end();) {
-                if (cleanup_it->second.expired()) {
-                    cleanup_it = object_operation_locks_.erase(cleanup_it);
-                } else {
-                    ++cleanup_it;
-                }
-            }
-        }
-    }
-    return {object_mutex, std::unique_lock<std::mutex>(*object_mutex)};
+    const auto stripe_idx =
+        std::hash<std::string>{}(scoped_key) % kObjectOperationLockStripes;
+    return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
 void MasterService::RegisterGroupMember(TenantState& tenant_state,

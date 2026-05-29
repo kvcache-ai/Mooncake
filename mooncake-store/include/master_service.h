@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
@@ -1134,17 +1135,16 @@ class MasterService {
         GUARDED_BY(group_routing_mutex_);
     mutable std::shared_mutex group_routing_mutex_;
 
+    static constexpr size_t kObjectOperationLockStripes = 4096;
+
     struct ObjectOperationLock {
-        std::shared_ptr<std::mutex> mutex;
         std::unique_lock<std::mutex> lock;
     };
 
     ObjectOperationLock AcquireObjectOperationLock(const std::string& tenant_id,
                                                    const std::string& key);
 
-    std::mutex object_operation_locks_mutex_;
-    std::unordered_map<std::string, std::weak_ptr<std::mutex>>
-        object_operation_locks_;
+    std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
 
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
