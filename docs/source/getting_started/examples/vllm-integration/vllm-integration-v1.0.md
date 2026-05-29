@@ -1,5 +1,10 @@
 # vLLM v1 backend Disaggregated Serving with MooncakeConnector
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [Disaggregated Prefill-Decode](disagg-prefill-decode) guide. Please use that guide for up-to-date information.
+```
+
 ## Overview
 
 This guide demonstrates how to use the MooncakeConnector with vLLM v1 backend for disaggregated serving in Prefill-Decode separation architecture. The integration enables efficient cross-node KV cache transfer using RDMA technology.

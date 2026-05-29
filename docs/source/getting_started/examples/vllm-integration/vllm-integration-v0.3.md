@@ -1,5 +1,10 @@
 # vLLM V0 Disaggregated Serving with MooncakeStore
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [KV Cache Storage & Sharing](kv-cache-storage) guide (see the V0 Legacy section). Please use that guide for up-to-date information.
+```
+
 ## Overview
 This is the latest version of the MooncakeStore integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 12957](https://github.com/vllm-project/vllm/pull/12957) to support KVCache transfer for intra-node and inter-node disaggregated serving scenario. Benchmark results will be released soon.
 
@@ -91,22 +96,62 @@ mooncake_master --port 50001
 
 # 3. Run multiple vllm instances
 # kv_producer role
-MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8100 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8100 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
 
-CUDA_VISIBLE_DEVICES=1 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8101 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+CUDA_VISIBLE_DEVICES=1 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8101 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
 
-CUDA_VISIBLE_DEVICES=2 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8102 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+CUDA_VISIBLE_DEVICES=2 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8102 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
 
-CUDA_VISIBLE_DEVICES=3 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8103 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
+CUDA_VISIBLE_DEVICES=3 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8103 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_producer"}'
 
 # kv_consumer role
-CUDA_VISIBLE_DEVICES=4 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8200 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+CUDA_VISIBLE_DEVICES=4 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8200 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
 
-CUDA_VISIBLE_DEVICES=5 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8201 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+CUDA_VISIBLE_DEVICES=5 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8201 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
 
-CUDA_VISIBLE_DEVICES=6 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8202 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+CUDA_VISIBLE_DEVICES=6 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8202 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
 
-CUDA_VISIBLE_DEVICES=7 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8203 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
+CUDA_VISIBLE_DEVICES=7 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8203 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_consumer"}'
 ```
 
 - `MOONCAKE_CONFIG_PATH` is the path to the mooncake.json configuration file.
@@ -127,7 +172,11 @@ CUDA_VISIBLE_DEVICES=7 MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_V1=0 python
 ```bash
 # 4. Start the proxy server
 cd vllm
-python3 examples/online_serving/disagg_examples/disagg_proxy_demo.py --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --prefill localhost:8100 localhost:8101  --decode localhost:8200 localhost:8201  --port 8000
+python3 examples/online_serving/disagg_examples/disagg_proxy_demo.py \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --prefill localhost:8100 localhost:8101 \
+    --decode localhost:8200 localhost:8201 \
+    --port 8000
 ```
 
 - The `--model` parameter specifies the model to use, also specifies the tokenizer used by the proxy server.
@@ -139,7 +188,12 @@ python3 examples/online_serving/disagg_examples/disagg_proxy_demo.py --model Qwe
 # If you want to dynamically adjust the instances of p-nodes and d-nodes during runtime, you need to configure this environment variables.
 export ADMIN_API_KEY="xxxxxxxx"
 # or add it before the command:
-ADMIN_API_KEY="xxxxxxxx" python3 vllm/examples/online_serving/disagg_examples/disagg_demo.py --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --prefill localhost:8100 localhost:8101  --decode localhost:8200 localhost:8201  --port 8000 --scheduling round_robin
+ADMIN_API_KEY="xxxxxxxx" python3 vllm/examples/online_serving/disagg_examples/disagg_demo.py \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --prefill localhost:8100 localhost:8101 \
+    --decode localhost:8200 localhost:8201 \
+    --port 8000 \
+    --scheduling round_robin
 
 # Then use this command to add instances into prefill group or decode group
 curl -X POST "http://localhost:8000/instances/add" -H "Content-Type: application/json" -H "X-API-Key: $ADMIN_API_KEY" -d '{"type": "prefill", "instance": "localhost:8102"}'

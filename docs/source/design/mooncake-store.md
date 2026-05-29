@@ -6,7 +6,7 @@ Mooncake Store is a high-performance **distributed key-value (KV) cache storage 
 
 Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be evicted).
 
-Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
+Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offer high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
@@ -968,7 +968,7 @@ retcode = store.setup(
 The absence of error messages indicates successful data transfer.
 
 ### Starting the Client as Standalone Process and accessing via RPC
-To start a RPC type **real** `Client` as a standalone process, you can use the following command:
+To start an RPC type **real** `Client` as a standalone process, you can use the following command:
 
 ```bash
 ./build/mooncake-store/src/mooncake_client \
