@@ -18,7 +18,9 @@
 #include <cstddef>
 #include <string>
 
+#ifndef MOONCAKE_EP_USE_MUSA
 #include <cuda_runtime.h>
+#endif
 
 #include "tent/common/status.h"
 
@@ -33,6 +35,8 @@ namespace tent {
 ///   - Peer access management
 ///   - Device management
 ///   - A human-readable transport name for log messages
+
+#ifndef MOONCAKE_EP_USE_MUSA
 
 struct CudaApiTraits {
     static constexpr const char* kTransportName = "NVLink";
@@ -113,7 +117,10 @@ struct CudaApiTraits {
     }
 };
 
+#endif  // !MOONCAKE_EP_USE_MUSA
+
 #ifdef MOONCAKE_EP_USE_MUSA
+#include <musa_runtime.h>
 
 struct MusaApiTraits {
     static constexpr const char* kTransportName = "MTLink";
