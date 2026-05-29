@@ -778,6 +778,112 @@ class MooncakeDistributedStore:
         """Read a tensor into a pre-allocated buffer. Returns a TensorReadResult."""
         return self._invoke("get_tensor_into", key, buffer_ptr, size, tenant=tenant)
 
+    # ─── Parallel Tensor API ─────────────────────────────────────────────
+
+    def put_tensor_with_parallelism(
+        self,
+        key: str,
+        tensor,
+        *,
+        parallelism=None,
+        writer_partition=None,
+        tenant: str | None = None,
+        config=None,
+    ):
+        """Store a tensor with parallelism metadata.
+
+        Args:
+            key: Base key name (e.g. "model.layers.0.weight")
+            tensor: A contiguous torch.Tensor.
+            parallelism: A TensorParallelism object describing the parallelism layout.
+            writer_partition: A (rank, size, split_dim) tuple for writer-partition mode.
+            tenant: Optional tenant name.
+            config: Optional ReplicateConfig.
+        """
+        return self._invoke(
+            "put_tensor_with_parallelism",
+            key,
+            tensor,
+            parallelism=parallelism,
+            writer_partition=writer_partition,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def upsert_tensor_with_parallelism(
+        self,
+        key: str,
+        tensor,
+        *,
+        parallelism=None,
+        writer_partition=None,
+        tenant: str | None = None,
+        config=None,
+    ):
+        """Upsert a tensor with parallelism: removes existing then puts."""
+        return self._invoke(
+            "upsert_tensor_with_parallelism",
+            key,
+            tensor,
+            parallelism=parallelism,
+            writer_partition=writer_partition,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def get_tensor_with_parallelism(
+        self,
+        key: str,
+        *,
+        target=None,
+        tensor=None,
+        tenant: str | None = None,
+    ):
+        """Read a tensor with parallelism-aware routing.
+
+        Args:
+            key: Base key name.
+            target: A ReadTarget specifying AsStored/Shard/Full mode.
+            tensor: Optional pre-allocated torch.Tensor to fill.
+            tenant: Optional tenant name.
+        """
+        result = self._invoke(
+            "get_tensor_with_parallelism",
+            key,
+            target=target,
+            tensor=tensor,
+            tenant=tenant,
+        )
+        if hasattr(result, "dtype") and hasattr(result, "shape"):
+            if isinstance(result.dtype, int):
+                return _tensor_from_read_result(result)
+            return result
+        if isinstance(result, (bytes, bytearray)):
+            return _tensor_from_raw_bytes(result)
+        return result
+
+    def get_tensor_with_parallelism_into(
+        self,
+        key: str,
+        buffer_ptr: int,
+        size: int,
+        *,
+        target=None,
+        tenant: str | None = None,
+    ):
+        """Read a parallelism-aware tensor into a pre-registered buffer.
+
+        Returns a TensorReadResult with data_ptr, shape, dtype info.
+        """
+        return self._invoke(
+            "get_tensor_with_parallelism_into",
+            key,
+            buffer_ptr,
+            size,
+            target=target,
+            tenant=tenant,
+        )
+
     # ─── End Tensor API ───────────────────────────────────────────────────
 
     def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
@@ -1396,10 +1502,32 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     return isinstance(sample, (bytes, bytearray, memoryview))
 
 
+# Parallelism types from native module
+ParallelAxis = _native.ParallelAxis
+TensorParallelism = _native.TensorParallelism
+ReadTarget = _native.ReadTarget
+AXIS_DP = _native.AXIS_DP()
+AXIS_TP = _native.AXIS_TP()
+AXIS_EP = _native.AXIS_EP()
+AXIS_PP = _native.AXIS_PP()
+READ_MODE_AS_STORED = _native.READ_MODE_AS_STORED()
+READ_MODE_SHARD = _native.READ_MODE_SHARD()
+READ_MODE_FULL = _native.READ_MODE_FULL()
+
 __all__ = [
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
     "ReplicateConfig",
+    "ParallelAxis",
+    "TensorParallelism",
+    "ReadTarget",
+    "AXIS_DP",
+    "AXIS_TP",
+    "AXIS_EP",
+    "AXIS_PP",
+    "READ_MODE_AS_STORED",
+    "READ_MODE_SHARD",
+    "READ_MODE_FULL",
     "init_tracing",
     "metrics_text",
     "start_metrics_server",

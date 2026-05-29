@@ -7,6 +7,7 @@ mod hot_cache;
 pub mod runtime;
 mod shm;
 pub mod tensor;
+pub mod tensor_parallel;
 #[cfg(test)]
 mod test_support;
 
@@ -1562,6 +1563,16 @@ fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyMooncakeDistributedStore>()?;
     module.add_class::<PyMooncakeHostMemAllocator>()?;
     module.add_class::<tensor::TensorReadResult>()?;
+    module.add_class::<tensor_parallel::PyParallelAxis>()?;
+    module.add_class::<tensor_parallel::PyTensorParallelism>()?;
+    module.add_class::<tensor_parallel::PyReadTarget>()?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::axis_dp, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::axis_tp, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::axis_ep, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::axis_pp, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_as_stored, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_shard, module)?)?;
+    module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_full, module)?)?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_text, module)?)?;
     module.add_function(wrap_pyfunction!(start_metrics_server, module)?)?;
@@ -1581,6 +1592,60 @@ impl PyMooncakeDistributedStore {
         self.backend
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("store is not set up"))
+    }
+
+    pub(crate) fn get_bytes_internal(&self, key: &str, tenant: Option<&str>) -> PyResult<Vec<u8>> {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let (status, value) =
+                    run_without_gil(move || dummy.get(key, tenant)).map_err(store_error_to_py)?;
+                if status != 0 {
+                    return Err(PyKeyError::new_err(format!(
+                        "get_bytes_internal failed for key={key}"
+                    )));
+                }
+                Ok(value)
+            }
+            StoreBackend::Real(dispatcher) => {
+                run_without_gil(move || {
+                    dispatcher.get_value(key.to_string(), tenant.map(str::to_string))
+                })
+                .map_err(store_error_to_py)
+            }
+        }
+    }
+
+    pub(crate) fn get_into_buffer_internal(
+        &self,
+        key: &str,
+        buffer_ptr: usize,
+        size: usize,
+        tenant: Option<&str>,
+    ) -> PyResult<usize> {
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                let result =
+                    run_without_gil(move || dummy.get_into(key, buffer_ptr, size, tenant))
+                        .map_err(store_error_to_py)?;
+                if result < 0 {
+                    return Err(PyKeyError::new_err(format!(
+                        "get_into_buffer_internal failed for key={key}"
+                    )));
+                }
+                Ok(result as usize)
+            }
+            StoreBackend::Real(dispatcher) => {
+                run_without_gil(move || {
+                    dispatcher.get_into_buffer(
+                        key.to_string(),
+                        tenant.map(str::to_string),
+                        buffer_ptr,
+                        size,
+                    )
+                })
+                .map_err(store_error_to_py)
+            }
+        }
     }
 
     fn real_dispatcher(&self) -> PyResult<&StoreDispatcher> {
@@ -1698,7 +1763,7 @@ fn replication_policy(
     has_policy.then_some(policy)
 }
 
-fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
+pub(crate) fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
     if pointer == 0 {
         return Err(PyValueError::new_err("buffer pointer must not be null"));
     }
@@ -1868,7 +1933,7 @@ fn execute_real_batch_put_from(
     result
 }
 
-fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>
+pub(crate) fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>
 where
     T: pyo3::marker::Ungil + Send,
     F: pyo3::marker::Ungil + FnOnce() -> Result<T, StoreError>,
@@ -1884,7 +1949,7 @@ where
     Python::with_gil(|py| py.allow_threads(f))
 }
 
-fn store_error_to_py(error: StoreError) -> PyErr {
+pub(crate) fn store_error_to_py(error: StoreError) -> PyErr {
     match error {
         StoreError::NotFound(message) => PyKeyError::new_err(message),
         StoreError::Conflict(message)
