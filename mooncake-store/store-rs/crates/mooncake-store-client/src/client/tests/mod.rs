@@ -2359,6 +2359,26 @@ fn wait_for_storage_clock_hot(storage: &StoreClient, route: &ObjectRoute) {
     );
 }
 
+fn wait_for_authority_route(
+    namespace: &str,
+    authority: &ClientStableId,
+    key: &ObjectKey,
+) -> ObjectRoute {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match crate::route_directory::authority_get(namespace, authority, key) {
+            Ok(Some(route)) => return route,
+            Ok(None) => {}
+            Err(error) => panic!("authority route query failed: {error}"),
+        }
+        sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "route {} did not become visible on authority {}",
+        key.0, authority
+    );
+}
+
 fn tc_replica2_payload(key: &str) -> Vec<u8> {
     format!("tc-replica2-payload::{key}").into_bytes()
 }
@@ -7012,6 +7032,82 @@ fn embedded_wrh_query_route_ignores_metadata_after_authority_miss() {
         ),
         "embedded WRH get should fail closed when only metadata still has the route"
     );
+}
+
+#[test]
+fn embedded_wrh_route_publish_mirrors_secondaries_asynchronously() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_a_transport = Arc::new(TestTransport::new("async-mirror-a-segment"));
+    let store_b_transport = Arc::new(store_a_transport.peer("async-mirror-b-segment"));
+    let writer_transport = Arc::new(store_a_transport.peer("async-mirror-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store_a = StoreClientBuilder::new(metadata.clone(), "async-mirror-store-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "async-mirror-scope")
+        .route_topk(2)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_a_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-a build should succeed");
+    let store_b = StoreClientBuilder::new(metadata.clone(), "async-mirror-store-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .label("route_scope", "async-mirror-scope")
+        .route_topk(2)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_b_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store-b build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "async-mirror-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .label("route", "false")
+        .label("route_scope", "async-mirror-scope")
+        .route_topk(2)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store_a
+        .register_local_memory()
+        .expect("store-a memory should register");
+    store_b
+        .register_local_memory()
+        .expect("store-b memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store_a, &store_b, &writer]);
+
+    let route = writer
+        .put_with_policy(
+            "async-mirror-key",
+            b"async-mirror-payload",
+            &ReplicationPolicy::new()
+                .replica_count(1)
+                .prefer_local(false)
+                .preferred_storage_owners([store_a.runtime_id().storage_key()]),
+        )
+        .expect("routed put should publish a primary route");
+    let namespace = metadata.route_namespace();
+    let scoped_key = ObjectKey::new("default::async-mirror-key");
+
+    let store_a_route =
+        wait_for_authority_route(&namespace, &store_a.runtime_id().stable_id, &scoped_key);
+    let store_b_route =
+        wait_for_authority_route(&namespace, &store_b.runtime_id().stable_id, &scoped_key);
+    assert_eq!(store_a_route, route);
+    assert_eq!(store_b_route, route);
 }
 
 #[test]

@@ -7,6 +7,7 @@ use mooncake_store_core::{
     NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity, RouteCasRequest, RouteDirectory,
     RouteVersion, StoreError,
 };
+use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
@@ -29,6 +30,10 @@ const ROUTE_REPAIR_MISSING_AUTHORITY: &str = "route_repair_missing_authority";
 const ROUTE_REPAIR_STALE_AUTHORITY: &str = "route_repair_stale_authority";
 const ROUTE_REPAIR_DIVERGENT_AUTHORITY: &str = "route_repair_divergent_authority";
 const SUSPECT_AUTHORITY_TTL: Duration = Duration::from_secs(5);
+const ASYNC_ROUTE_MIRROR_QUEUE_CAPACITY: usize = 1024;
+const ASYNC_ROUTE_MIRROR_DRAIN_BUDGET: usize = 4096;
+const ASYNC_ROUTE_MIRROR_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const ASYNC_ROUTE_MIRROR_COALESCE_WINDOW: Duration = Duration::from_millis(2);
 
 pub(crate) fn build_embedded_wrh_route_directory(
     route_topk: usize,
@@ -52,11 +57,17 @@ struct EmbeddedWrhRouteDirectory {
     local_stable_id: ClientStableId,
     authority_client: Arc<dyn RouteAuthorityClient>,
     membership: Arc<dyn RouteMembershipProvider>,
+    async_mirror: AsyncRouteMirrorWorker,
 }
 
 #[derive(Clone)]
 struct RouteAuthoritySelection {
     authorities: Vec<ClientLease>,
+}
+
+struct RouteMirrorBatch {
+    secondary: ClientLease,
+    requests: Vec<RouteCasRequest>,
 }
 
 type RouteReadRepairState = Vec<RouteAuthorityObservation>;
@@ -75,6 +86,231 @@ struct RouteCasAttempt {
     last_errors: Vec<Option<StoreError>>,
 }
 
+struct AsyncRouteMirrorWorker {
+    state: Mutex<AsyncRouteMirrorWorkerState>,
+}
+
+struct AsyncRouteMirrorWorkerState {
+    sender: Option<std::sync::mpsc::SyncSender<RouteMirrorBatch>>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncRouteMirrorWorker {
+    fn disabled() -> Self {
+        Self {
+            state: Mutex::new(AsyncRouteMirrorWorkerState {
+                sender: None,
+                shutdown: None,
+                thread: None,
+            }),
+        }
+    }
+
+    fn spawn(
+        namespace: String,
+        local_stable_id: ClientStableId,
+        authority_client: Arc<dyn RouteAuthorityClient>,
+        membership: Arc<dyn RouteMembershipProvider>,
+    ) -> Self {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<RouteMirrorBatch>(ASYNC_ROUTE_MIRROR_QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let thread = match std::thread::Builder::new()
+            .name(format!("mooncake-route-mirror-{}", local_stable_id.0))
+            .spawn(move || loop {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                let first = match receiver.recv_timeout(ASYNC_ROUTE_MIRROR_RECV_TIMEOUT) {
+                    Ok(batch) => batch,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let mut groups = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
+                let mut total_items = 0usize;
+                Self::push_batch(&mut groups, first, &mut total_items);
+                let started = Instant::now();
+                while total_items < ASYNC_ROUTE_MIRROR_DRAIN_BUDGET
+                    && started.elapsed() < ASYNC_ROUTE_MIRROR_COALESCE_WINDOW
+                {
+                    match receiver.try_recv() {
+                        Ok(batch) => Self::push_batch(&mut groups, batch, &mut total_items),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                for (_, (secondary, requests)) in groups {
+                    mirror_secondary_batch(
+                        &namespace,
+                        authority_client.as_ref(),
+                        membership.as_ref(),
+                        &secondary,
+                        &requests,
+                    );
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                warn!(error = %error, "failed to spawn route mirror worker");
+                return Self::disabled();
+            }
+        };
+        Self {
+            state: Mutex::new(AsyncRouteMirrorWorkerState {
+                sender: Some(sender),
+                shutdown: Some(shutdown_tx),
+                thread: Some(thread),
+            }),
+        }
+    }
+
+    fn push_batch(
+        groups: &mut BTreeMap<String, (ClientLease, Vec<RouteCasRequest>)>,
+        batch: RouteMirrorBatch,
+        total_items: &mut usize,
+    ) {
+        *total_items = total_items.saturating_add(batch.requests.len());
+        groups
+            .entry(batch.secondary.runtime.stable_id.0.clone())
+            .or_insert_with(|| (batch.secondary, Vec::new()))
+            .1
+            .extend(batch.requests);
+    }
+
+    fn enqueue(&self, secondary: ClientLease, requests: Vec<RouteCasRequest>) {
+        if requests.is_empty() {
+            return;
+        }
+        let state = self.state.lock();
+        let Some(sender) = state.sender.as_ref() else {
+            return;
+        };
+        match sender.try_send(RouteMirrorBatch {
+            secondary,
+            requests,
+        }) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(batch)) => {
+                warn!(
+                    authority = %batch.secondary.runtime,
+                    items = batch.requests.len(),
+                    "dropping best-effort secondary route mirror after async queue filled"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn shutdown(&mut self) {
+        let mut state = self.state.lock();
+        state.sender.take();
+        if let Some(shutdown) = state.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = state.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for AsyncRouteMirrorWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn maybe_mark_authority_suspect(
+    namespace: &str,
+    membership: &dyn RouteMembershipProvider,
+    authority: &ClientLease,
+    error: &StoreError,
+    context: &'static str,
+) {
+    if authority_is_local(namespace, &authority.runtime.stable_id)
+        || !matches!(
+            error,
+            StoreError::Transport(_)
+                | StoreError::NotFound(_)
+                | StoreError::InvalidState(_)
+                | StoreError::Unsupported(_)
+        )
+    {
+        return;
+    }
+    membership.mark_suspect(
+        authority.runtime.clone(),
+        Instant::now() + SUSPECT_AUTHORITY_TTL,
+        Some(authority),
+    );
+    warn!(
+        runtime = %authority.runtime,
+        context,
+        quarantine_ms = SUSPECT_AUTHORITY_TTL.as_millis() as u64,
+        "marked route authority as suspect after request failure"
+    );
+}
+
+fn mirror_secondary_batch(
+    namespace: &str,
+    authority_client: &dyn RouteAuthorityClient,
+    membership: &dyn RouteMembershipProvider,
+    secondary: &ClientLease,
+    requests: &[RouteCasRequest],
+) {
+    let result = if authority_is_local(namespace, &secondary.runtime.stable_id) {
+        if let Some(service) = local_authority_service(namespace, &secondary.runtime.stable_id) {
+            Ok(service.batch_replace_routes(namespace, &secondary.runtime.stable_id, requests))
+        } else {
+            authority_replace_many(namespace, &secondary.runtime.stable_id, requests)
+                .map(|_| requests.iter().map(|_| Ok(())).collect())
+        }
+    } else {
+        authority_client.batch_replace_routes(
+            secondary,
+            namespace,
+            &secondary.runtime.stable_id,
+            requests,
+        )
+    };
+    match result {
+        Ok(results) => {
+            for (request, result) in requests.iter().zip(results) {
+                if let Err(error) = result {
+                    maybe_mark_authority_suspect(
+                        namespace,
+                        membership,
+                        secondary,
+                        &error,
+                        "route_secondary_mirror_failed",
+                    );
+                    warn!(
+                        authority = %secondary.runtime,
+                        key = %request.key.0,
+                        error = %error,
+                        "secondary route mirror failed"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            maybe_mark_authority_suspect(
+                namespace,
+                membership,
+                secondary,
+                &error,
+                "route_secondary_mirror_batch_failed",
+            );
+            warn!(
+                authority = %secondary.runtime,
+                error = %error,
+                items = requests.len(),
+                "secondary route mirror batch failed"
+            );
+        }
+    }
+}
+
 impl EmbeddedWrhRouteDirectory {
     fn new(
         route_topk: usize,
@@ -85,12 +321,19 @@ impl EmbeddedWrhRouteDirectory {
     ) -> Self {
         let namespace = metadata.route_namespace();
         register_local_authority(&namespace, &lease.runtime.stable_id);
+        let async_mirror = AsyncRouteMirrorWorker::spawn(
+            namespace.clone(),
+            lease.runtime.stable_id.clone(),
+            authority_client.clone(),
+            membership.clone(),
+        );
         Self {
             route_topk,
             namespace,
             local_stable_id: lease.runtime.stable_id.clone(),
             authority_client,
             membership,
+            async_mirror,
         }
     }
 
@@ -116,27 +359,12 @@ impl EmbeddedWrhRouteDirectory {
         error: &StoreError,
         context: &'static str,
     ) {
-        if self.authority_is_local(authority)
-            || !matches!(
-                error,
-                StoreError::Transport(_)
-                    | StoreError::NotFound(_)
-                    | StoreError::InvalidState(_)
-                    | StoreError::Unsupported(_)
-            )
-        {
-            return;
-        }
-        self.membership.mark_suspect(
-            authority.runtime.clone(),
-            Instant::now() + SUSPECT_AUTHORITY_TTL,
-            Some(authority),
-        );
-        warn!(
-            runtime = %authority.runtime,
+        maybe_mark_authority_suspect(
+            &self.namespace,
+            self.membership.as_ref(),
+            authority,
+            error,
             context,
-            quarantine_ms = SUSPECT_AUTHORITY_TTL.as_millis() as u64,
-            "marked route authority as suspect after request failure"
         );
     }
 
@@ -444,68 +672,6 @@ impl EmbeddedWrhRouteDirectory {
             &authority.runtime.stable_id,
             requests,
         )
-    }
-
-    fn replace_local_batch(
-        &self,
-        authority: &ClientStableId,
-        requests: &[RouteCasRequest],
-    ) -> Result<()> {
-        authority_replace_many(&self.namespace, authority, requests)
-    }
-
-    fn mirror_secondary_batch(&self, secondary: &ClientLease, requests: &[RouteCasRequest]) {
-        let result = if self.authority_is_local(secondary) {
-            if let Some(service) = self.local_authority_service(&secondary.runtime.stable_id) {
-                Ok(service.batch_replace_routes(
-                    &self.namespace,
-                    &secondary.runtime.stable_id,
-                    requests,
-                ))
-            } else {
-                self.replace_local_batch(&secondary.runtime.stable_id, requests)
-                    .map(|_| requests.iter().map(|_| Ok(())).collect())
-            }
-        } else {
-            self.authority_client.batch_replace_routes(
-                secondary,
-                &self.namespace,
-                &secondary.runtime.stable_id,
-                requests,
-            )
-        };
-        match result {
-            Ok(results) => {
-                for (request, result) in requests.iter().zip(results) {
-                    if let Err(error) = result {
-                        self.maybe_mark_authority_suspect(
-                            secondary,
-                            &error,
-                            "route_secondary_mirror_failed",
-                        );
-                        warn!(
-                            authority = %secondary.runtime,
-                            key = %request.key.0,
-                            error = %error,
-                            "secondary route mirror failed"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                self.maybe_mark_authority_suspect(
-                    secondary,
-                    &error,
-                    "route_secondary_mirror_batch_failed",
-                );
-                warn!(
-                    authority = %secondary.runtime,
-                    error = %error,
-                    items = requests.len(),
-                    "secondary route mirror batch failed"
-                );
-            }
-        }
     }
 
     fn authority_is_local(&self, authority: &ClientLease) -> bool {
@@ -1085,6 +1251,7 @@ impl EmbeddedWrhRouteDirectory {
 
 impl Drop for EmbeddedWrhRouteDirectory {
     fn drop(&mut self) {
+        self.async_mirror.shutdown();
         unregister_local_authority(&self.namespace, &self.local_stable_id);
     }
 }
@@ -1324,7 +1491,7 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
 
         for (_, (secondary, requests)) in mirrors {
-            self.mirror_secondary_batch(&secondary, &requests);
+            self.async_mirror.enqueue(secondary, requests);
         }
         Ok(results)
     }
