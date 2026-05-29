@@ -216,6 +216,7 @@ struct RecoverableMetadataBackend {
 struct BlockingCasGateState {
     armed: bool,
     entered: bool,
+    blocked_count: usize,
     released: bool,
     blocked_once: bool,
 }
@@ -351,6 +352,7 @@ impl BlockingCasMetadataBackend {
                 StdMutex::new(BlockingCasGateState {
                     armed: false,
                     entered: false,
+                    blocked_count: 0,
                     released: false,
                     blocked_once: false,
                 }),
@@ -368,6 +370,7 @@ impl BlockingCasMetadataBackend {
         );
         state.armed = true;
         state.entered = false;
+        state.blocked_count = 0;
         state.released = false;
         state.blocked_once = false;
     }
@@ -387,6 +390,27 @@ impl BlockingCasMetadataBackend {
                 .expect("blocking CAS gate wait should succeed");
             state = next;
             if result.timed_out() && !state.entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn wait_until_blocked_count(&self, count: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (lock, condvar) = &*self.gate;
+        let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
+        while state.blocked_count < count {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let wait_for = deadline.saturating_duration_since(now);
+            let (next, result) = condvar
+                .wait_timeout(state, wait_for)
+                .expect("blocking CAS gate wait should succeed");
+            state = next;
+            if result.timed_out() && state.blocked_count < count {
                 return false;
             }
         }
@@ -1911,6 +1935,7 @@ impl MetadataBackend for BlockingCasMetadataBackend {
             let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
             if state.armed && !state.blocked_once {
                 state.entered = true;
+                state.blocked_count += 1;
                 condvar.notify_all();
                 while !state.released {
                     state = condvar
@@ -7640,7 +7665,10 @@ fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
             )
             .replication(policy.clone())])
         });
-        sleep(Duration::from_millis(50));
+        assert!(
+            blocking.wait_until_blocked_count(2, Duration::from_secs(1)),
+            "both writers should reach the blocked route publish point"
+        );
         blocking.release_blocked_cas();
 
         let routes_a = writer_a_result
@@ -9260,6 +9288,7 @@ fn batch_put_from_uses_registered_remote_sources_without_scratch() {
         ])
         .expect("batch_put_from should use registered remote sources");
     assert_eq!(routes.len(), 2);
+    assert_eq!(writer_transport.submitted_batch_sizes(), vec![4]);
     assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
     assert_eq!(
         writer_transport.submitted_request_sources(),
@@ -9273,6 +9302,85 @@ fn batch_put_from_uses_registered_remote_sources_without_scratch() {
     let opcodes = writer_transport.submitted_request_opcodes();
     assert_eq!(opcodes.len(), 1);
     assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Write));
+}
+
+#[test]
+fn local_only_batch_put_from_uses_registered_batch_write_path() {
+    let _guard = metrics_test_lock().lock();
+    reset_metrics();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let writer_transport = Arc::new(TestTransport::new(
+        "local-only-writer-batch-put-from-segment",
+    ));
+    writer_transport.set_max_registration_bytes(Some(4));
+    let remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &writer_transport,
+        "local-only-storage-batch-put-from",
+        "local-only-seg-batch-put-from",
+        "pool-a",
+        1024,
+        1,
+    );
+    let writer = StoreClientBuilder::new(metadata, "local-only-writer-batch-put-from")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport.clone())
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    wait_for_membership_convergence(&[&writer]);
+
+    let mut source = [0u8; 32];
+    source[..8].copy_from_slice(b"abcdefgh");
+    source[16..24].copy_from_slice(b"ijklmnop");
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("writer register buffer should succeed");
+    {
+        let mut state = writer_transport.state.lock();
+        state.submitted_batch_sizes.clear();
+        state.submitted_batch_bytes.clear();
+        state.submitted_batch_hints.clear();
+        state.submitted_request_sources.clear();
+        state.submitted_request_opcodes.clear();
+    }
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(remote_owner.storage_key());
+    let routes = writer
+        .batch_put_from(&[
+            PutFromRequest::new("local-only-remote-a", source.as_ptr().cast(), 8)
+                .replication(policy.clone()),
+            PutFromRequest::new(
+                "local-only-remote-b",
+                unsafe { source.as_ptr().add(16).cast() },
+                8,
+            )
+            .replication(policy),
+        ])
+        .expect("local-only batch_put_from should use registered remote sources");
+    assert_eq!(routes.len(), 2);
+    assert_eq!(writer_transport.submitted_batch_bytes(), vec![16]);
+    assert_eq!(
+        writer_transport.submitted_request_sources(),
+        vec![vec![
+            source.as_mut_ptr() as usize,
+            unsafe { source.as_mut_ptr().add(4) as usize },
+            unsafe { source.as_mut_ptr().add(16) as usize },
+            unsafe { source.as_mut_ptr().add(20) as usize },
+        ]]
+    );
+    let opcodes = writer_transport.submitted_request_opcodes();
+    assert_eq!(opcodes.len(), 1);
+    assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Write));
+
+    let metrics = render_prometheus_metrics();
+    assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
 }
 
 #[test]

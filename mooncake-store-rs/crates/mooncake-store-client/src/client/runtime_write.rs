@@ -397,15 +397,7 @@ impl StoreClient {
             }
         }
         let transport = self.transport()?;
-        let WriteMode::Routed {
-            planner,
-            replica_count,
-        } = &self.write_mode
-        else {
-            return Err(StoreError::InvalidState(
-                "batch routed put requires routed write mode".to_string(),
-            ));
-        };
+        let planner = self.request_placement_planner();
         let resolved_policy = self.resolve_replication_policy(policy)?;
         let mut write_attempt = 0usize;
 
@@ -664,8 +656,8 @@ impl StoreClient {
                     quota_reservation: None,
                     candidates,
                     next_candidate: 0,
-                    targets: Vec::with_capacity(*replica_count),
-                    reservations: Vec::with_capacity(*replica_count),
+                    targets: Vec::with_capacity(resolved_policy.replica_count),
+                    reservations: Vec::with_capacity(resolved_policy.replica_count),
                 });
             }
 

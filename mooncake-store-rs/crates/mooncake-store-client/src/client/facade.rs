@@ -571,7 +571,8 @@ impl StoreClient {
         let mut routed_indices = Vec::with_capacity(requests.len());
         let mut routed_requests = Vec::with_capacity(requests.len());
         let mut routed_sources = Vec::with_capacity(requests.len());
-        let mut routed_originals = Vec::with_capacity(requests.len());
+        let shared_put_from_policy = Self::shared_batch_put_from_replication_policy(requests);
+        let use_batch_put_from = shared_put_from_policy.is_some();
 
         for (index, request) in requests.iter().enumerate() {
             if request.buffer.is_null() {
@@ -592,7 +593,7 @@ impl StoreClient {
                 }
             }
 
-            if matches!(self.write_mode, WriteMode::Routed { .. }) {
+            if use_batch_put_from {
                 let value =
                     unsafe { slice::from_raw_parts(request.buffer.cast::<u8>(), request.size) };
                 let mut routed = PutRequest::new(request.key, value);
@@ -614,7 +615,6 @@ impl StoreClient {
                 routed_indices.push(index);
                 routed_requests.push(routed);
                 routed_sources.push(request.buffer.cast_mut());
-                routed_originals.push(request.clone());
                 continue;
             }
 
@@ -641,9 +641,7 @@ impl StoreClient {
 
         if !routed_requests.is_empty() {
             let routed_statuses =
-                if let Some(shared_policy) =
-                    Self::shared_batch_put_from_replication_policy(&routed_originals)
-                {
+                if let Some(shared_policy) = shared_put_from_policy {
                     self.batch_put_scoped_routed_accept_existing_statuses(
                         &routed_requests,
                         &routed_sources,
