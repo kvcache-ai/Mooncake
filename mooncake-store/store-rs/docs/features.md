@@ -58,6 +58,7 @@ Remote read behavior:
 - when a `batch_get_into` destination range is already registered, the runtime issues direct remote batch reads into that buffer instead of staging through local scratch first
 - unregistered destination buffers still use the existing scratch-window planner and direct single-object fallback path when needed
 - `put_from` and `batch_put_from` now preserve the same registered-buffer zero-copy contract for remote writes: the transport request sources point at the caller-registered buffer ranges instead of a scratch copy
+- `batch_put_from` uses the same registered-buffer batch writer in both default local-write mode and explicit routed-write mode when the batch has a shared replication policy
 - routed `batch_put_from` refreshes membership and re-ranks placement candidates on retry, so rollout-era write failures can fall forward onto newly visible live storage runtimes instead of reusing only the stale pre-retry ranking
 - routed `batch_put_from` applies the same retry envelope to reserve-stage placement gaps, so brief hot-upgrade windows with no active `storage=true` owner wait for successor promotion instead of failing the batch immediately
 - routed `batch_put_from` handles concurrent cache writers per key by treating route-CAS conflicts as successful cache insert races when an active route is already published, without adding a metadata recheck

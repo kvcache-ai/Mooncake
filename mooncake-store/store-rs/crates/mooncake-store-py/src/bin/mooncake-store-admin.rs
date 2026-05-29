@@ -1346,48 +1346,65 @@ mod tests {
         result
     }
 
+    fn without_admin_server_env<T>(f: impl FnOnce() -> T) -> T {
+        with_env_vars(
+            [
+                ("MC_STORE_ADMIN_BIND_ADDR", None),
+                ("MC_STORE_ADMIN_CLEANUP_INTERVAL_MS", None),
+                ("MC_STORE_ADMIN_CLEANUP_BATCH_SIZE", None),
+                ("MC_STORE_ADMIN_QUOTA_RECONCILE_INTERVAL_MS", None),
+                ("MC_STORE_ADMIN_QUOTA_RECONCILE_TENANTS", None),
+            ],
+            f,
+        )
+    }
+
     #[test]
     fn server_subcommand_parses_bind_addr() {
-        let args = Args::parse_from([
-            "mooncake-store-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "server",
-            "--bind-addr",
-            "127.0.0.1:8080",
-        ]);
-        match args.command {
-            Command::Server(server_args) => {
-                assert_eq!(server_args.bind_addr, "127.0.0.1:8080");
-                assert_eq!(server_args.cleanup_interval_ms, 5_000);
-                assert_eq!(server_args.cleanup_batch_size, 128);
-                assert_eq!(server_args.quota_reconcile_interval_ms, 0);
-                assert!(server_args.quota_reconcile_tenants.is_empty());
+        without_admin_server_env(|| {
+            let args = Args::parse_from([
+                "mooncake-store-admin",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+                "server",
+                "--bind-addr",
+                "127.0.0.1:8080",
+            ]);
+            match args.command {
+                Command::Server(server_args) => {
+                    assert_eq!(server_args.bind_addr, "127.0.0.1:8080");
+                    assert_eq!(server_args.cleanup_interval_ms, 5_000);
+                    assert_eq!(server_args.cleanup_batch_size, 128);
+                    assert_eq!(server_args.quota_reconcile_interval_ms, 0);
+                    assert!(server_args.quota_reconcile_tenants.is_empty());
+                }
+                other => panic!("unexpected command: {other:?}"),
             }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        });
     }
 
     #[test]
     fn serve_alias_parses_bind_addr() {
-        let args = Args::parse_from([
-            "mooncake-store-admin",
-            "--metadata-url",
-            "redis://127.0.0.1:6379/0",
-            "serve",
-            "--bind-addr",
-            "127.0.0.1:0",
-        ]);
-        match args.command {
-            Command::Server(server_args) => {
-                assert_eq!(server_args.bind_addr, "127.0.0.1:0");
-                assert_eq!(server_args.cleanup_interval_ms, 5_000);
-                assert_eq!(server_args.cleanup_batch_size, 128);
-                assert_eq!(server_args.quota_reconcile_interval_ms, 0);
-                assert!(server_args.quota_reconcile_tenants.is_empty());
+        without_admin_server_env(|| {
+            let args = Args::parse_from([
+                "mooncake-store-admin",
+                "--metadata-url",
+                "redis://127.0.0.1:6379/0",
+                "serve",
+                "--bind-addr",
+                "127.0.0.1:0",
+            ]);
+            match args.command {
+                Command::Server(server_args) => {
+                    assert_eq!(server_args.bind_addr, "127.0.0.1:0");
+                    assert_eq!(server_args.cleanup_interval_ms, 5_000);
+                    assert_eq!(server_args.cleanup_batch_size, 128);
+                    assert_eq!(server_args.quota_reconcile_interval_ms, 0);
+                    assert!(server_args.quota_reconcile_tenants.is_empty());
+                }
+                other => panic!("unexpected command: {other:?}"),
             }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        });
     }
 
     #[test]
