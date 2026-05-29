@@ -5,5 +5,7 @@
 //! Python binding layer and from plain Rust clients.
 
 pub mod metadata;
+pub mod parallelism;
 
 pub use metadata::*;
+pub use parallelism::*;
