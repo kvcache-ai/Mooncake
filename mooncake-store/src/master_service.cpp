@@ -598,6 +598,16 @@ size_t MasterService::getMetadataShardIndex(const std::string& key) const {
     return getShardIndex(it->second);
 }
 
+size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
+                                            const std::string& key) const {
+    std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
+    auto it = object_group_ids_.find(key);
+    if (it == object_group_ids_.end()) {
+        return getShardIndex(tenant_id, key);
+    }
+    return getShardIndex(it->second);
+}
+
 void MasterService::RegisterGroupMember(TenantState& tenant_state,
                                         const std::string& key,
                                         const std::string& group_id) {
@@ -616,17 +626,22 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
     if (group_id.empty()) {
         return;
     }
+    bool group_empty = false;
     auto group_it = tenant_state.group_members.find(group_id);
     if (group_it != tenant_state.group_members.end()) {
         group_it->second.erase(key);
         if (group_it->second.empty()) {
             tenant_state.group_members.erase(group_it);
+            group_empty = true;
         }
     }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
     auto route_it = object_group_ids_.find(key);
     if (route_it != object_group_ids_.end() && route_it->second == group_id) {
         object_group_ids_.erase(route_it);
+    }
+    if (group_empty) {
+        groups_needing_lease_refresh_.erase(group_id);
     }
 }
 
@@ -685,6 +700,9 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
             mit->second.GrantLease(default_kv_lease_ttl_,
                                    default_kv_soft_pin_ttl_);
         }
+    }
+    if (group_it->second.find(key) == group_it->second.end()) {
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
@@ -1502,8 +1520,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // For new grouped objects, route to the group's target shard directly
     // since the routing table hasn't been populated yet.
     const size_t target_shard_idx =
-        group_id.empty() ? getMetadataShardIndex(object_id.user_key)
-                         : getShardIndex(group_id);
+        group_id.empty()
+            ? getMetadataShardIndex(object_id.tenant_id, object_id.user_key)
+            : getShardIndex(group_id);
     MetadataShardAccessorRW shard(this, target_shard_idx);
     auto& tenant_state = shard->tenants[object_id.tenant_id];
 
@@ -1512,9 +1531,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     if (it != tenant_state.metadata.end() &&
         !CleanupStaleHandles(it->second, alive_clients)) {
         auto& metadata = it->second;
-        // If the object's PutStart expired and has not completed any
-        // replicas, we can discard it and allow the new PutStart to
-        // go.
         if (!metadata.HasReplica(&Replica::fn_is_completed) &&
             metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
             auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
@@ -1818,7 +1834,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Use getMetadataShardIndex to find the object at its current shard
     // (handles both grouped and ungrouped routing).
-    const size_t lookup_shard_idx = getMetadataShardIndex(object_id.user_key);
+    const size_t lookup_shard_idx =
+        getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
     MetadataShardAccessorRW shard(this, lookup_shard_idx);
     auto& tenant_state = shard->tenants[object_id.tenant_id];
 

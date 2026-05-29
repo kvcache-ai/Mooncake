@@ -1195,6 +1195,8 @@ class MasterService {
     }
 
     size_t getMetadataShardIndex(const std::string& key) const;
+    size_t getMetadataShardIndex(const std::string& tenant_id,
+                                 const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state, const std::string& key,
                              const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
@@ -1349,7 +1351,8 @@ class MasterService {
                            const ObjectIdentity& object_id)
             : service_(service),
               object_id_(object_id),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.user_key)),
+              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
+                                                         object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
@@ -1562,7 +1565,8 @@ class MasterService {
                            const ObjectIdentity& object_id)
             : service_(service),
               object_id_(object_id),
-              shard_idx_(service_->getMetadataShardIndex(object_id_.user_key)),
+              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
+                                                         object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
               tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
               tenant_state_(tenant_it_ == shard_guard_->tenants.end()
