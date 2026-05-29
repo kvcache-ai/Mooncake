@@ -1640,6 +1640,198 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     service->RemoveAll();
 }
 
+// RemoveAll on a key with an in-flight PromotionTask must drop the
+// task entry alongside the metadata. Same shape as
+// RemoveErasesPromotionTask but exercises the bulk-erase loop in
+// MasterService::RemoveAll, which iterates every shard and erases
+// metadata entries directly.
+TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
+                                       1024, holder.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
+    {
+        auto r = service->GetReplicaList("k_first");
+        ASSERT_TRUE(r.has_value());
+    }
+    {
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_EQ(pending->count("k_first"), 1u);
+    }
+
+    auto removed = service->RemoveAll(/*force=*/true);
+    EXPECT_GE(removed, 1) << "RemoveAll should erase k_first";
+
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
+        << "RemoveAll on a key with an in-flight promotion must route "
+        << "through EraseMetadataEntry and bump promotion_cancelled_total.";
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
+                                       1024, holder.segment_name));
+    {
+        auto r = service->GetReplicaList("k_second");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(pending_post.has_value());
+    EXPECT_EQ(pending_post->count("k_second"), 1u)
+        << "k_second must be admittable after RemoveAll of k_first — "
+        << "otherwise queue_limit=1 stays saturated until reaper TTL.";
+
+    service->RemoveAll(/*force=*/true);
+}
+
+// BatchRemove normal-completion path on a key with an in-flight
+// PromotionTask must drop the task entry. ReMountSegment registers the
+// holder in ok_client_ so CleanupStaleHandles returns false and
+// BatchRemove takes the non-stale branch.
+TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    {
+        Segment seg_a = MakeSegment("seg_a", kDefaultSegmentBase, seg_size);
+        seg_a.id = holder.segment_id;
+        std::vector<Segment> segs{seg_a};
+        auto remount = service->ReMountSegment(segs, holder.client_id);
+        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
+    }
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
+                                       1024, holder.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_second",
+                                       1024, holder.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
+    {
+        auto r = service->GetReplicaList("k_first");
+        ASSERT_TRUE(r.has_value());
+    }
+    {
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_EQ(pending->count("k_first"), 1u);
+    }
+
+    auto results = service->BatchRemove({"k_first"}, /*force=*/true);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(results[0].has_value())
+        << "BatchRemove should succeed; error=" << results[0].error();
+
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
+        << "BatchRemove normal path on a key with an in-flight promotion "
+        << "must bump promotion_cancelled_total.";
+
+    {
+        auto r = service->GetReplicaList("k_second");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
+    ASSERT_TRUE(pending_post.has_value());
+    EXPECT_EQ(pending_post->count("k_second"), 1u)
+        << "k_second must be admittable after BatchRemove of k_first — "
+        << "otherwise queue_limit=1 stays saturated until reaper TTL.";
+
+    service->RemoveAll(/*force=*/true);
+}
+
+// BatchRemove stale-handle path on a key with an in-flight
+// PromotionTask must drop the task entry. The holder is mounted via
+// PrepareSegment only (no ReMount), so its client is absent from
+// ok_client_; BatchRemove's CleanupStaleHandles then erases the
+// LOCAL_DISK replica and the stale-handle branch fires.
+TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 1;
+    config.default_kv_lease_ttl = 5000;
+    config.put_start_release_timeout_sec = 300;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder =
+        PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_first",
+                                       1024, holder.segment_name));
+
+    auto& mm = MasterMetricManager::instance();
+    const int64_t cancelled_pre = mm.get_promotion_cancelled();
+
+    {
+        auto r = service->GetReplicaList("k_first");
+        ASSERT_TRUE(r.has_value());
+    }
+    {
+        auto pending = service->PromotionObjectHeartbeat(holder.client_id);
+        ASSERT_TRUE(pending.has_value());
+        EXPECT_EQ(pending->count("k_first"), 1u);
+    }
+
+    auto results = service->BatchRemove({"k_first"}, /*force=*/true);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_FALSE(results[0].has_value())
+        << "stale-handle path should report OBJECT_NOT_FOUND once the "
+        << "LOCAL_DISK replica is wiped.";
+
+    EXPECT_EQ(mm.get_promotion_cancelled() - cancelled_pre, 1)
+        << "BatchRemove stale-handle path must also bump "
+        << "promotion_cancelled_total.";
+
+    auto second_holder = PrepareSegment(
+        *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
+    {
+        Segment seg_b =
+            MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
+        seg_b.id = second_holder.segment_id;
+        std::vector<Segment> segs{seg_b};
+        auto remount = service->ReMountSegment(segs, second_holder.client_id);
+        ASSERT_TRUE(remount.has_value()) << "ReMount failed";
+    }
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, second_holder.client_id,
+                                       "k_second", 1024,
+                                       second_holder.segment_name));
+    {
+        auto r = service->GetReplicaList("k_second");
+        ASSERT_TRUE(r.has_value());
+    }
+    auto pending_post =
+        service->PromotionObjectHeartbeat(second_holder.client_id);
+    ASSERT_TRUE(pending_post.has_value());
+    EXPECT_EQ(pending_post->count("k_second"), 1u)
+        << "k_second must be admittable after the stale-handle "
+        << "BatchRemove — otherwise queue_limit=1 stays saturated until "
+        << "reaper TTL.";
+
+    service->RemoveAll(/*force=*/true);
+}
+
 // The funnel metrics (admitted, completed, completed_bytes, in_flight)
 // track a successful promotion lifecycle end-to-end: a single
 // admission bumps admitted+1 and in_flight+1; NotifyPromotionSuccess
@@ -1843,7 +2035,7 @@ TEST_F(PromotionOnHitTest, MaxPerHeartbeatZeroClampsToOne) {
 // Remove on a key mid-promotion must bump promotion_cancelled so the
 // funnel invariant
 // admitted = completed + failed + expired + cancelled + in_flight
-// holds. Exercises the ErasePromotionTaskIfPresent path.
+// holds. Exercises the EraseMetadataEntry path.
 TEST_F(PromotionOnHitTest, MetricsRemoveMidPromotionCountsAsCancelled) {
     MasterServiceConfig config;
     config.enable_offload = true;
