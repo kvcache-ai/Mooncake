@@ -1570,7 +1570,10 @@ fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(tensor_parallel::axis_tp, module)?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::axis_ep, module)?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::axis_pp, module)?)?;
-    module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_as_stored, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        tensor_parallel::read_mode_as_stored,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_shard, module)?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_full, module)?)?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
@@ -1606,12 +1609,10 @@ impl PyMooncakeDistributedStore {
                 }
                 Ok(value)
             }
-            StoreBackend::Real(dispatcher) => {
-                run_without_gil(move || {
-                    dispatcher.get_value(key.to_string(), tenant.map(str::to_string))
-                })
-                .map_err(store_error_to_py)
-            }
+            StoreBackend::Real(dispatcher) => run_without_gil(move || {
+                dispatcher.get_value(key.to_string(), tenant.map(str::to_string))
+            })
+            .map_err(store_error_to_py),
         }
     }
 
@@ -1624,9 +1625,8 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<usize> {
         match self.backend_ref()? {
             StoreBackend::Dummy(dummy) => {
-                let result =
-                    run_without_gil(move || dummy.get_into(key, buffer_ptr, size, tenant))
-                        .map_err(store_error_to_py)?;
+                let result = run_without_gil(move || dummy.get_into(key, buffer_ptr, size, tenant))
+                    .map_err(store_error_to_py)?;
                 if result < 0 {
                     return Err(PyKeyError::new_err(format!(
                         "get_into_buffer_internal failed for key={key}"
@@ -1634,17 +1634,15 @@ impl PyMooncakeDistributedStore {
                 }
                 Ok(result as usize)
             }
-            StoreBackend::Real(dispatcher) => {
-                run_without_gil(move || {
-                    dispatcher.get_into_buffer(
-                        key.to_string(),
-                        tenant.map(str::to_string),
-                        buffer_ptr,
-                        size,
-                    )
-                })
-                .map_err(store_error_to_py)
-            }
+            StoreBackend::Real(dispatcher) => run_without_gil(move || {
+                dispatcher.get_into_buffer(
+                    key.to_string(),
+                    tenant.map(str::to_string),
+                    buffer_ptr,
+                    size,
+                )
+            })
+            .map_err(store_error_to_py),
         }
     }
 

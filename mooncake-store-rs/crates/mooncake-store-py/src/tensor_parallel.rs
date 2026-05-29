@@ -4,15 +4,16 @@
 //! metadata tagging, and cross-TP scatter-gather reconstruction.
 
 use mooncake_tensor::{
-    ParallelAxisKind, ParallelAxisSpec, ReadTargetMode, ReadTargetSpec, TensorMetadata,
-    TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest, calculate_shard_range,
-    get_parallelism_key_name, get_writer_partition_key_name, parallelism_matches_metadata,
+    calculate_shard_range, get_parallelism_key_name, get_writer_partition_key_name,
+    parallelism_matches_metadata, ParallelAxisKind, ParallelAxisSpec, ReadTargetMode,
+    ReadTargetSpec, TensorMetadata, TensorParallelismSpec, WriterPartitionSpec,
+    WriterShardManifest,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::tensor::{TensorReadResult, parse_dtype_str};
-use crate::{PyMooncakeDistributedStore, pointer_from_usize};
+use crate::tensor::{parse_dtype_str, TensorReadResult};
+use crate::{pointer_from_usize, PyMooncakeDistributedStore};
 
 // ─── Python-exposed parallelism types ──────────────────────────────────────
 
@@ -62,9 +63,8 @@ impl PyParallelAxis {
 
 impl PyParallelAxis {
     fn to_spec(&self) -> PyResult<ParallelAxisSpec> {
-        let kind = ParallelAxisKind::from_i32(self.kind).ok_or_else(|| {
-            PyValueError::new_err(format!("invalid axis kind: {}", self.kind))
-        })?;
+        let kind = ParallelAxisKind::from_i32(self.kind)
+            .ok_or_else(|| PyValueError::new_err(format!("invalid axis kind: {}", self.kind)))?;
         let spec = ParallelAxisSpec {
             kind,
             rank: self.rank,
@@ -136,11 +136,7 @@ impl PyReadTarget {
         let mode = ReadTargetMode::from_i32(self.mode).ok_or_else(|| {
             PyValueError::new_err(format!("invalid read target mode: {}", self.mode))
         })?;
-        let parallelism = self
-            .parallelism
-            .as_ref()
-            .map(|p| p.to_spec())
-            .transpose()?;
+        let parallelism = self.parallelism.as_ref().map(|p| p.to_spec()).transpose()?;
         Ok(ReadTargetSpec { mode, parallelism })
     }
 }
@@ -195,9 +191,9 @@ fn extract_tensor_info(tensor: &Bound<'_, PyAny>) -> PyResult<TensorInfo> {
     let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
     let numel: usize = tensor.call_method0("numel")?.extract()?;
     let element_size: usize = tensor.call_method0("element_size")?.extract()?;
-    let data_bytes = numel.checked_mul(element_size).ok_or_else(|| {
-        PyValueError::new_err("tensor data size overflows usize")
-    })?;
+    let data_bytes = numel
+        .checked_mul(element_size)
+        .ok_or_else(|| PyValueError::new_err("tensor data size overflows usize"))?;
 
     let shape_tuple = tensor.getattr("shape")?;
     let shape_len: usize = shape_tuple.len()?;
@@ -228,10 +224,7 @@ fn extract_tensor_info(tensor: &Bound<'_, PyAny>) -> PyResult<TensorInfo> {
 
 // ─── Shard calculation helpers ─────────────────────────────────────────────
 
-fn compute_global_shape(
-    local_shape: &[i64],
-    spec: &TensorParallelismSpec,
-) -> Vec<i64> {
+fn compute_global_shape(local_shape: &[i64], spec: &TensorParallelismSpec) -> Vec<i64> {
     let mut global = local_shape.to_vec();
     if let Some(tp) = spec.tp_axis() {
         let dim = tp.split_dim as usize;
@@ -328,13 +321,7 @@ impl PyMooncakeDistributedStore {
                     &spec.canonicalize().axes,
                     info.data_bytes as u64,
                 );
-                self.put_tensor_object(
-                    &storage_key,
-                    &metadata,
-                    &info,
-                    tenant,
-                    replica_count,
-                )
+                self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)
             }
             WriteRoute::WriterPartition => {
                 let wp = wp_spec.unwrap();
@@ -397,13 +384,9 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
         replica_count: Option<usize>,
     ) -> PyResult<i32> {
-        let par_spec = parallelism
-            .as_ref()
-            .map(|p| p.to_spec())
-            .transpose()?;
-        let wp_spec = writer_partition.map(|(rank, size, split_dim)| {
-            WriterPartitionSpec::new(rank, size, split_dim)
-        });
+        let par_spec = parallelism.as_ref().map(|p| p.to_spec()).transpose()?;
+        let wp_spec = writer_partition
+            .map(|(rank, size, split_dim)| WriterPartitionSpec::new(rank, size, split_dim));
 
         let storage_key = match (&par_spec, &wp_spec) {
             (Some(spec), _) => get_parallelism_key_name(key, spec),
@@ -462,9 +445,7 @@ impl PyMooncakeDistributedStore {
             ReadTargetMode::Shard => {
                 self.read_shard_into(key, buffer_ptr, size, &target_spec, tenant)
             }
-            ReadTargetMode::Full => {
-                self.read_full_into(key, buffer_ptr, size, tenant)
-            }
+            ReadTargetMode::Full => self.read_full_into(key, buffer_ptr, size, tenant),
         }
     }
 
@@ -625,8 +606,12 @@ impl PyMooncakeDistributedStore {
             .ok_or_else(|| PyValueError::new_err("SHARD mode requires parallelism spec"))?;
 
         let exact_key = get_parallelism_key_name(base_key, par);
-        if let Ok(result) = self.get_tensor_into_internal(&exact_key, buffer_ptr, buffer_size, tenant) {
-            let data = unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, result.total_bytes_read) };
+        if let Ok(result) =
+            self.get_tensor_into_internal(&exact_key, buffer_ptr, buffer_size, tenant)
+        {
+            let data = unsafe {
+                std::slice::from_raw_parts(buffer_ptr as *const u8, result.total_bytes_read)
+            };
             if let Some(parsed) = TensorMetadata::parse(data) {
                 if parallelism_matches_metadata(par, &parsed.metadata) {
                     return Ok(result);
@@ -848,7 +833,8 @@ impl PyMooncakeDistributedStore {
         buffer_size: usize,
         tenant: Option<&str>,
     ) -> PyResult<TensorReadResult> {
-        if let Ok(result) = self.get_tensor_into_internal(base_key, buffer_ptr, buffer_size, tenant) {
+        if let Ok(result) = self.get_tensor_into_internal(base_key, buffer_ptr, buffer_size, tenant)
+        {
             return Ok(result);
         }
 
@@ -866,11 +852,8 @@ impl PyMooncakeDistributedStore {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
         })?;
 
-        let metadata = TensorMetadata::build_full(
-            first.dtype,
-            &first.global_shape,
-            total_data_size as u64,
-        );
+        let metadata =
+            TensorMetadata::build_full(first.dtype, &first.global_shape, total_data_size as u64);
 
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -923,11 +906,7 @@ impl PyMooncakeDistributedStore {
         })
     }
 
-    fn read_full_bytes(
-        &self,
-        base_key: &str,
-        tenant: Option<&str>,
-    ) -> PyResult<Vec<u8>> {
+    fn read_full_bytes(&self, base_key: &str, tenant: Option<&str>) -> PyResult<Vec<u8>> {
         if let Ok(data) = self.get_raw_bytes(base_key, tenant) {
             return Ok(data);
         }
@@ -939,11 +918,8 @@ impl PyMooncakeDistributedStore {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
         })?;
 
-        let metadata = TensorMetadata::build_full(
-            first.dtype,
-            &first.global_shape,
-            total_data_size as u64,
-        );
+        let metadata =
+            TensorMetadata::build_full(first.dtype, &first.global_shape, total_data_size as u64);
 
         let mut output = Vec::with_capacity(TensorMetadata::WIRE_SIZE + total_data_size);
         output.extend_from_slice(metadata.as_bytes());
@@ -981,9 +957,7 @@ impl PyMooncakeDistributedStore {
         manifest: &WriterShardManifest,
         tenant: Option<&str>,
     ) -> PyResult<Vec<ShardSource>> {
-        let global_shape = manifest
-            .global_shape
-            .to_vec(manifest.ndim as usize);
+        let global_shape = manifest.global_shape.to_vec(manifest.ndim as usize);
         let mut sources = Vec::with_capacity(manifest.shard_count as usize);
 
         for rank in 0..manifest.shard_count {

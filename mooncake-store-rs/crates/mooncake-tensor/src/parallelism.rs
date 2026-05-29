@@ -165,9 +165,7 @@ impl TensorParallelismSpec {
 
     /// Find the first TP axis, if any.
     pub fn tp_axis(&self) -> Option<&ParallelAxisSpec> {
-        self.axes
-            .iter()
-            .find(|a| a.kind == ParallelAxisKind::TP)
+        self.axes.iter().find(|a| a.kind == ParallelAxisKind::TP)
     }
 
     /// True if this spec is a single TP axis (legacy-compatible path).
@@ -318,8 +316,7 @@ impl WriterShardManifest {
         if data.len() < Self::WIRE_SIZE {
             return None;
         }
-        let manifest: Self =
-            unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Self) };
+        let manifest: Self = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const Self) };
         if manifest.magic != TENSOR_OBJECT_MAGIC {
             return None;
         }
@@ -511,9 +508,8 @@ mod tests {
 
     #[test]
     fn test_key_name_single_tp() {
-        let spec = TensorParallelismSpec::new(vec![
-            ParallelAxisSpec::new(ParallelAxisKind::TP, 2, 4),
-        ]);
+        let spec =
+            TensorParallelismSpec::new(vec![ParallelAxisSpec::new(ParallelAxisKind::TP, 2, 4)]);
         assert_eq!(
             get_parallelism_key_name("model.weight", &spec),
             "model.weight_tp_2"
@@ -573,9 +569,7 @@ mod tests {
     fn test_build_shard_metadata_roundtrip() {
         let global_shape = [8, 16];
         let local_shape = [4, 16];
-        let axes = [
-            ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 2).with_split_dim(0),
-        ];
+        let axes = [ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 2).with_split_dim(0)];
         let data_bytes = 4 * 16 * 4; // float32
         let meta = TensorMetadata::build_shard(
             TensorDtype::Float32 as i32,
@@ -592,14 +586,8 @@ mod tests {
         assert_eq!(meta.layout.axes[0].shard_rank, 0);
         assert_eq!(meta.layout.axes[0].shard_count, 2);
         assert_eq!(meta.layout.axes[0].split_dim, 0);
-        assert_eq!(
-            meta.layout.global_shape.to_vec(2),
-            vec![8, 16]
-        );
-        assert_eq!(
-            meta.layout.local_shape.to_vec(2),
-            vec![4, 16]
-        );
+        assert_eq!(meta.layout.global_shape.to_vec(2), vec![8, 16]);
+        assert_eq!(meta.layout.local_shape.to_vec(2), vec![4, 16]);
 
         // Roundtrip via bytes
         let total_len = TensorMetadata::WIRE_SIZE + data_bytes;
@@ -611,13 +599,8 @@ mod tests {
 
     #[test]
     fn test_writer_manifest_roundtrip() {
-        let manifest = WriterShardManifest::new(
-            TensorDtype::Bfloat16 as i32,
-            2,
-            0,
-            4,
-            &[1024, 2048],
-        );
+        let manifest =
+            WriterShardManifest::new(TensorDtype::Bfloat16 as i32, 2, 0, 4, &[1024, 2048]);
         let bytes = manifest.as_bytes();
         let parsed = WriterShardManifest::parse(bytes).unwrap();
         assert_eq!(parsed, manifest);
@@ -659,12 +642,24 @@ mod tests {
 
     #[test]
     fn test_axis_validate() {
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 4).validate().is_ok());
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 3, 4).validate().is_ok());
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 4, 4).validate().is_err());
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, -1, 4).validate().is_err());
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 0).validate().is_err());
-        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, -1).validate().is_err());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 4)
+            .validate()
+            .is_ok());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 3, 4)
+            .validate()
+            .is_ok());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 4, 4)
+            .validate()
+            .is_err());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, -1, 4)
+            .validate()
+            .is_err());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 0)
+            .validate()
+            .is_err());
+        assert!(ParallelAxisSpec::new(ParallelAxisKind::TP, 0, -1)
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -694,9 +689,8 @@ mod tests {
 
     #[test]
     fn test_is_single_tp() {
-        let single = TensorParallelismSpec::new(vec![
-            ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 4),
-        ]);
+        let single =
+            TensorParallelismSpec::new(vec![ParallelAxisSpec::new(ParallelAxisKind::TP, 0, 4)]);
         assert!(single.is_single_tp());
 
         let multi = TensorParallelismSpec::new(vec![
@@ -705,9 +699,8 @@ mod tests {
         ]);
         assert!(!multi.is_single_tp());
 
-        let dp_only = TensorParallelismSpec::new(vec![
-            ParallelAxisSpec::new(ParallelAxisKind::DP, 0, 2),
-        ]);
+        let dp_only =
+            TensorParallelismSpec::new(vec![ParallelAxisSpec::new(ParallelAxisKind::DP, 0, 2)]);
         assert!(!dp_only.is_single_tp());
     }
 
