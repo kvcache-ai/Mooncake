@@ -39,7 +39,7 @@ class Config;
 class ControlService;
 class Topology;
 
-class IbGdaTransport : public Transport, public DeviceTransport {
+class IbGdaTransport : public Transport, public RdmaTransport {
    public:
     IbGdaTransport();
     ~IbGdaTransport() override;
@@ -84,22 +84,7 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     Status freeBuffer(void* ptr) override;
 
     // -------------------------------------------------------------------
-    // DeviceTransport — P2P peer setup (not supported by IBGDA)
-    // -------------------------------------------------------------------
-    Status allocatePeerAccessTables(int rank, int num_ranks) override;
-
-    Status exportIpcHandle(int device_id, void* local_buffer,
-                           std::vector<int32_t>& handle_words) override;
-
-    Status configurePeers(
-        int local_device_id, void* local_buffer,
-        const std::vector<std::vector<int32_t>>& remote_handles,
-        const std::vector<int>& active_ranks_mask) override;
-
-    bool allPeersAccessible() const override;
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — RDMA / IBGDA setup
+    // RdmaTransport — RDMA / IBGDA setup
     // -------------------------------------------------------------------
     Status initializeRdmaDevice(const std::string& device_name,
                                 uint8_t port_num = 1) override;
@@ -146,20 +131,7 @@ class IbGdaTransport : public Transport, public DeviceTransport {
     DeviceContextAbi deviceContextAbi() const override;
 
     // -------------------------------------------------------------------
-    // DeviceTransport — P2P tables (IBGDA returns nullptr — no P2P)
-    // -------------------------------------------------------------------
-    int32_t* availableTablePtr() const override;
-    void** peerPtrsTablePtr() const override;
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — utility
-    // -------------------------------------------------------------------
-    void** hostPeerPtrs() const override;
-
-    void* getRemotePtr(void* local_ptr, int dst_rank) override;
-
-    // -------------------------------------------------------------------
-    // IbGdaTransport-specific (not in DeviceTransport)
+    // IbGdaTransport-specific (not in RdmaTransport)
     // -------------------------------------------------------------------
 
     // Initialize the verbs resources that are shared by host-side QP setup and

@@ -4,11 +4,8 @@
 
 #include <tent/runtime/device_transport.h>
 
-#ifdef MOONCAKE_EP_USE_MUSA
-// MUSA: no InfiniBand headers available
-#else
+#ifndef MOONCAKE_EP_USE_MUSA
 #include <tent/device/ibgda.h>
-#include <infiniband/mlx5dv.h>
 #endif
 
 namespace mooncake {
@@ -59,13 +56,14 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         throw std::runtime_error("Failed to allocate P2P peer tables");
     }
 
+    // Initialize IBGDA if available (CUDA only; MUSA has no RDMA).
+    // ibgda_transport_ is created inside init_ibgda().
 #ifndef MOONCAKE_EP_USE_MUSA
     int ret = init_ibgda();
     if (ret != 0) {
         ibgda_disabled_ = true;
     }
 #else
-    // MUSA: no IBGDA, always disabled
     ibgda_disabled_ = true;
 #endif
 
@@ -77,9 +75,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     // Destroy transports first — IBGDA may need to deregister memory while
     // gdr_buffer is still valid.
-#ifndef MOONCAKE_EP_USE_MUSA
-    if (ibgda_transport_) ibgda_transport_.reset();
-#endif
+    ibgda_transport_.reset();
 
     // Free gdr_buffer via the transport (handles fabric vs plain free)
     if (transport_ && gdr_buffer) {
@@ -89,9 +85,7 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     transport_.reset();
     cudaFree(raddrs);
     cudaFree(rkeys);
-#ifndef MOONCAKE_EP_USE_MUSA
-    cudaFree(qp_devctxs);
-#endif
+    cudaFree(qp_devctxs);  // no-op if nullptr (MUSA never allocates)
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
@@ -450,9 +444,7 @@ int MooncakeEpBuffer::init_ibgda() {
 }
 
 bool MooncakeEpBuffer::update_local_qpns() {
-#ifdef MOONCAKE_EP_USE_MUSA
-    return true;
-#else
+    if (!ibgda_transport_) return true;
     auto status = ibgda_transport_->recreateQueuePairs(
         USE_QP_COUNT, 16384, reinterpret_cast<void*>(comm_stream.stream()),
         qp_devctxs);
@@ -464,7 +456,6 @@ bool MooncakeEpBuffer::update_local_qpns() {
     }
     is_roce_ = ibgda_transport_->isRoce();
     return true;
-#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>&,
@@ -492,9 +483,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     const std::vector<int64_t>& subnet_prefixes,
     const std::vector<int64_t>& interface_ids,
     const std::vector<int>& active_ranks_mask) {
-#ifdef MOONCAKE_EP_USE_MUSA
-    // MUSA: no IBGDA peer sync
-#else
+    if (!ibgda_transport_) return;  // MUSA: no IBGDA
     tent::RdmaPeerConnectInfo info;
     info.remote_addrs = remote_addrs;
     info.remote_keys = remote_keys;
@@ -513,7 +502,6 @@ void MooncakeEpBuffer::sync_ibgda_peers(
                    << status.ToString();
         exit(1);
     }
-#endif  // MOONCAKE_EP_USE_MUSA
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {

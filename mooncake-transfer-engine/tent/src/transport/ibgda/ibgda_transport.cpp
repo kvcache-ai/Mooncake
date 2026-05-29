@@ -147,8 +147,6 @@ Status IbGdaTransport::freeBuffer(void* ptr) {
     return Status::OK();
 }
 
-void* IbGdaTransport::getRemotePtr(void* local_ptr, int) { return local_ptr; }
-
 Status IbGdaTransport::registerMemory(void* ptr, size_t size, uint32_t& lkey,
                                       uint32_t& rkey) {
     if (!ptr) return Status::InvalidArgument("ptr is null" LOC_MARK);
@@ -539,25 +537,6 @@ uint16_t IbGdaTransport::queuePairLid(int qp_index) const {
     return qps_[qp_index]->port_attr.lid;
 }
 
-Status IbGdaTransport::allocatePeerAccessTables(int, int) {
-    return Status::NotSupported("IBGDA does not support P2P peer tables");
-}
-
-Status IbGdaTransport::exportIpcHandle(int, void*, std::vector<int32_t>&) {
-    return Status::NotSupported("IBGDA does not use IPC handles");
-}
-
-Status IbGdaTransport::configurePeers(
-    int, void*, const std::vector<std::vector<int32_t>>&,
-    const std::vector<int>&) {
-    return Status::NotSupported("IBGDA does not use IPC-based P2P");
-}
-
-bool IbGdaTransport::allPeersAccessible() const { return false; }
-
-int32_t* IbGdaTransport::availableTablePtr() const { return nullptr; }
-void** IbGdaTransport::peerPtrsTablePtr() const { return nullptr; }
-
 void* IbGdaTransport::controlBuffer() const { return ctrl_buf_; }
 
 bool IbGdaTransport::isRoce() const { return is_roce_; }
@@ -602,8 +581,6 @@ size_t IbGdaTransport::deviceContextSize() const {
 DeviceTransport::DeviceContextAbi IbGdaTransport::deviceContextAbi() const {
     return DeviceContextAbi::kIbGda;
 }
-
-void** IbGdaTransport::hostPeerPtrs() const { return nullptr; }
 
 const DeviceCommCapabilities IbGdaTransport::deviceCapabilities() const {
     DeviceCommCapabilities caps;

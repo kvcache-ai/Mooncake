@@ -35,28 +35,21 @@ using IbGdaLocalMetadata [[deprecated("Use tent::IbGdaLocalMetadata from "
                                      "tent/runtime/device_resources.h")]] =
     IbGdaLocalMetadata;
 
-/// IBGDA-specific DeviceTransport implementation.
+/// IBGDA-specific RdmaTransport implementation.
 ///
-/// Inherits the unified DeviceTransport interface.  The base class methods
-/// that are RDMA-specific have real implementations here; P2P methods
-/// (allocatePeerAccessTables, exportIpcHandle, configurePeers) return
-/// Status::NotSupported().
-///
-/// This class also exposes IBGDA-specific convenience methods that are not
-/// part of the base DeviceTransport interface.
-class IbGdaDeviceTransport : public DeviceTransport {
+/// Inherits the RdmaTransport interface for RDMA operations.
+/// Also exposes IBGDA-specific convenience methods.
+class IbGdaDeviceTransport : public RdmaTransport {
    public:
     ~IbGdaDeviceTransport() override = default;
 
-    // IBGDA-specific convenience methods (not in base DeviceTransport).
-    // These are kept for callers that know they have an IBGDA transport
-    // and want type-safe access.
+    // IBGDA-specific convenience methods (not in RdmaTransport).
 
     /// Size of the control buffer allocation.
     virtual size_t controlBufferSize() const = 0;
 };
 
-/// Factory: create an IBGDA DeviceTransport.
+/// Factory: create an IBGDA RdmaTransport.
 /// Returns nullptr if IBGDA is not available on this platform.
 std::unique_ptr<IbGdaDeviceTransport> createIbGdaDeviceTransport();
 

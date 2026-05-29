@@ -109,10 +109,8 @@ struct MooncakeEpBuffer {
     // both paths simultaneously.
     // On MUSA: transport_ is the MTLink transport (P2P); no ibgda_transport_.
 #ifdef MOONCAKE_EP_USE_TENT
-    std::unique_ptr<tent::DeviceTransport> transport_;
-#ifndef MOONCAKE_EP_USE_MUSA
-    std::unique_ptr<tent::DeviceTransport> ibgda_transport_;
-#endif
+    std::unique_ptr<tent::P2pTransport> transport_;
+    std::unique_ptr<tent::RdmaTransport> ibgda_transport_;
 #endif
 
     // Fabric memory (MNNVL) — state now tracked by transport
@@ -216,47 +214,38 @@ struct MooncakeEpBuffer {
         const std::vector<int>& active_ranks_mask);
 
     std::tuple<int64_t, int32_t> get_mr_info() {
-#ifndef MOONCAKE_EP_USE_MUSA
         if (ibgda_transport_) {
             auto metadata = ibgda_transport_->localMetadata();
             return {metadata.raddr, metadata.rkey};
         }
-#endif
         return {(int64_t)0, (int32_t)0};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
-#ifndef MOONCAKE_EP_USE_MUSA
         if (ibgda_transport_) {
             auto metadata = ibgda_transport_->localMetadata();
             return {metadata.subnet_prefix, metadata.interface_id};
         }
-#endif
         return {(int64_t)0, (int64_t)0};
     }
 
     std::vector<int32_t> get_local_qpns() {
-#ifndef MOONCAKE_EP_USE_MUSA
         if (ibgda_transport_) {
             return ibgda_transport_->localMetadata().qpns;
         }
-#endif
         return {};
     }
 
     std::vector<int32_t> get_local_lids() {
-#ifndef MOONCAKE_EP_USE_MUSA
         if (ibgda_transport_) {
             return ibgda_transport_->localMetadata().lids;
         }
-#endif
         return {};
     }
 
     std::tuple<int32_t, int32_t, int32_t, int64_t, int64_t, int64_t>
     get_tent_ibgda_context_info() {
 #ifdef MOONCAKE_EP_USE_TENT
-#ifndef MOONCAKE_EP_USE_MUSA
         if (!ibgda_transport_) return {0, 0, 0, 0, 0, 0};
         auto* ctx = ibgda_transport_->deviceContextPtr();
         auto abi = ibgda_transport_->deviceContextAbi();
@@ -269,7 +258,6 @@ struct MooncakeEpBuffer {
                     reinterpret_cast<int64_t>(ibgda_ctx->rkeys),
                     reinterpret_cast<int64_t>(ibgda_ctx->qp_devctxs)};
         }
-#endif
 #endif
         return {0, 0, 0, 0, 0, 0};
     }

@@ -35,7 +35,7 @@ namespace tent {
 /// GpuApiTraits provides the GPU runtime API abstraction (CUDA or MUSA).
 /// kSupportsFabric enables the fabric memory (MNNVL) path if true.
 template <typename GpuApi, bool kSupportsFabric = false>
-class P2pDeviceTransportBase : public DeviceTransport {
+class P2pDeviceTransportBase : public P2pTransport {
    public:
     // -------------------------------------------------------------------
     // DeviceTransport — capabilities
@@ -307,80 +307,6 @@ class P2pDeviceTransportBase : public DeviceTransport {
     bool allPeersAccessible() const override { return all_peers_accessible_; }
 
     // -------------------------------------------------------------------
-    // DeviceTransport — RDMA setup (not supported by P2P)
-    // -------------------------------------------------------------------
-    Status initializeRdmaDevice(const std::string& /*device_name*/,
-                                uint8_t /*port_num*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not support RDMA");
-    }
-
-    Status registerMemory(void* /*ptr*/, size_t /*size*/,
-                          uint32_t& /*lkey*/, uint32_t& /*rkey*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not support RDMA memory registration");
-    }
-
-    Status unregisterMemory(void* /*ptr*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not support RDMA memory registration");
-    }
-
-    Status allocateControlBuffer(size_t /*size*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not use RDMA control buffers");
-    }
-
-    Status releaseControlBuffer() override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not use RDMA control buffers");
-    }
-
-    void* controlBuffer() const override { return nullptr; }
-
-    Status createQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
-                            void* /*qp_devctxs*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not use RDMA queue pairs");
-    }
-
-    Status recreateQueuePairs(int /*num_qps*/, int /*wqe*/, void* /*stream*/,
-                              void* /*qp_devctxs*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not use RDMA queue pairs");
-    }
-
-    Status destroyQueuePairs() override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not use RDMA queue pairs");
-    }
-
-    Status connectRdmaPeers(const RdmaPeerConnectInfo& /*info*/) override {
-        return Status::NotSupported(
-            std::string(GpuApi::kTransportName) +
-            " does not support RDMA peer connections");
-    }
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — metadata accessors
-    // -------------------------------------------------------------------
-    IbGdaLocalMetadata localMetadata() const override { return {}; }
-
-    bool isRoce() const override { return false; }
-
-    int gidIndex() const override { return -1; }
-
-    bool ibgdaDisabled() const override { return true; }
-
-    // -------------------------------------------------------------------
     // DeviceTransport — GPU-kernel-visible context
     // -------------------------------------------------------------------
     const void* deviceContextPtr() const override {
@@ -396,14 +322,14 @@ class P2pDeviceTransportBase : public DeviceTransport {
     }
 
     // -------------------------------------------------------------------
-    // DeviceTransport — GPU-kernel-visible tables (P2P)
+    // P2pTransport — GPU-kernel-visible tables
     // -------------------------------------------------------------------
     int32_t* availableTablePtr() const override { return available_; }
 
     void** peerPtrsTablePtr() const override { return peer_ptrs_; }
 
     // -------------------------------------------------------------------
-    // DeviceTransport — utility
+    // P2pTransport — utility
     // -------------------------------------------------------------------
     void** hostPeerPtrs() const override { return host_peer_ptrs_; }
 

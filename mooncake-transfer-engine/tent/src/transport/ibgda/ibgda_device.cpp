@@ -44,29 +44,7 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
     Status freeBuffer(void* ptr) override { return transport_.freeBuffer(ptr); }
 
     // -------------------------------------------------------------------
-    // DeviceTransport — P2P peer setup (not supported by IBGDA)
-    // -------------------------------------------------------------------
-    Status allocatePeerAccessTables(int /*rank*/,
-                                    int /*num_ranks*/) override {
-        return Status::NotSupported("IBGDA does not support P2P peer tables");
-    }
-
-    Status exportIpcHandle(int /*device_id*/, void* /*local_buffer*/,
-                           std::vector<int32_t>& /*handle_words*/) override {
-        return Status::NotSupported("IBGDA does not use IPC handles");
-    }
-
-    Status configurePeers(
-        int /*local_device_id*/, void* /*local_buffer*/,
-        const std::vector<std::vector<int32_t>>& /*remote_handles*/,
-        const std::vector<int>& /*active_ranks_mask*/) override {
-        return Status::NotSupported("IBGDA does not use IPC-based P2P");
-    }
-
-    bool allPeersAccessible() const override { return false; }
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — RDMA / IBGDA setup
+    // RdmaTransport — RDMA / IBGDA setup
     // -------------------------------------------------------------------
     Status initializeRdmaDevice(const std::string& device_name,
                                 uint8_t port_num) override {
@@ -142,22 +120,6 @@ class IbGdaDeviceTransportImpl final : public IbGdaDeviceTransport {
 
     DeviceContextAbi deviceContextAbi() const override {
         return transport_.deviceContextAbi();
-    }
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — GPU-kernel-visible tables (P2P)
-    // -------------------------------------------------------------------
-    int32_t* availableTablePtr() const override { return nullptr; }
-
-    void** peerPtrsTablePtr() const override { return nullptr; }
-
-    // -------------------------------------------------------------------
-    // DeviceTransport — utility
-    // -------------------------------------------------------------------
-    void** hostPeerPtrs() const override { return nullptr; }
-
-    void* getRemotePtr(void* /*local_ptr*/, int /*dst_rank*/) override {
-        return nullptr;  // RDMA transport has no P2P mapping
     }
 
     // -------------------------------------------------------------------
