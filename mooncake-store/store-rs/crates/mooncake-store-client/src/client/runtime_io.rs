@@ -2623,20 +2623,16 @@ impl StoreClient {
         if resolved.is_empty() {
             return;
         }
-        let mut local_hits = BTreeSet::new();
-        let mut remote_hits = BTreeMap::<ClientRuntimeId, BTreeSet<ObjectKey>>::new();
-        for entry in resolved {
-            let key = self.scoped_key(&entry.tenant, &entry.key);
-            if entry.replica.owner == self.lease.runtime {
-                local_hits.insert(key);
-            } else {
-                remote_hits
-                    .entry(entry.replica.owner.clone())
-                    .or_default()
-                    .insert(key);
-            }
-        }
-        self.report_grouped_route_hits_best_effort(local_hits, remote_hits, true);
+        let Ok(readable_runtimes) = self.readable_runtime_set(false) else {
+            return;
+        };
+        let local_segments = self.local_storage_segments();
+        self.report_readable_route_hits_best_effort(
+            resolved.iter().map(|entry| &entry.route),
+            &local_segments,
+            &readable_runtimes,
+            true,
+        );
     }
 
     fn report_route_hits_best_effort<'a>(
