@@ -84,6 +84,10 @@ def _load_native():
 
 _native = _load_native()
 
+# Re-export native buffer pool types so `from mooncake.store import RegisteredBufferPool` works.
+RegisteredBufferPool = _native.RegisteredBufferPool
+RegisteredBufferLease = _native.RegisteredBufferLease
+
 _CACHE_STATUS = "status"
 _CACHE_STATUS_LIST = "status_list"
 _CACHE_BYTES = "bytes"

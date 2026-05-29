@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod build_info;
+pub mod buffer_pool;
 pub mod config;
 pub mod dispatcher;
 mod dummy_client;
@@ -1542,6 +1543,7 @@ fn _store_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_shard, module)?)?;
     module.add_function(wrap_pyfunction!(tensor_parallel::read_mode_full, module)?)?;
+    buffer_pool::register_module(module)?;
     module.add_function(wrap_pyfunction!(init_tracing, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_text, module)?)?;
     module.add_function(wrap_pyfunction!(start_metrics_server, module)?)?;
