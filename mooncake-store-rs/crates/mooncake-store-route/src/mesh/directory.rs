@@ -14,9 +14,8 @@ use crate::control::{RouteControlAuthorityClient, RouteControlTransport};
 use crate::mesh::{
     authority_compare_and_swap_many, authority_contains_many, authority_get_many,
     authority_get_version_floor, authority_is_local, authority_list_reuse_candidates,
-    authority_list_routes_by_replica_owner, authority_list_routes_in_scope,
-    authority_replace_many, local_authority_service, register_local_authority,
-    unregister_local_authority,
+    authority_list_routes_by_replica_owner, authority_list_routes_in_scope, authority_replace_many,
+    local_authority_service, register_local_authority, unregister_local_authority,
 };
 use crate::metrics::{record_cas_outcome, record_route_repair_metric};
 use crate::shim::{RouteAuthorityClient, RouteAuthorityService, RouteMembershipProvider};
@@ -591,9 +590,7 @@ impl EmbeddedWrhRouteDirectory {
                 .collect::<Vec<_>>();
             match self.contains_authority_batch(&authority, &batch_keys) {
                 Ok(results) => {
-                    for ((index, key), result) in
-                        indices.into_iter().zip(batch_keys).zip(results)
-                    {
+                    for ((index, key), result) in indices.into_iter().zip(batch_keys).zip(results) {
                         match result {
                             Ok(true) => {
                                 trace!(

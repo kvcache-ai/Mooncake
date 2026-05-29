@@ -176,7 +176,11 @@ impl LocalRouteTable {
     }
 }
 
-fn remove_index_key<K: Eq + Hash>(index: &mut HashMap<K, HashSet<String>>, identity: &K, key: &str) {
+fn remove_index_key<K: Eq + Hash>(
+    index: &mut HashMap<K, HashSet<String>>,
+    identity: &K,
+    key: &str,
+) {
     let Some(keys) = index.get_mut(identity) else {
         return;
     };

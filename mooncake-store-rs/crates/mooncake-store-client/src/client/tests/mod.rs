@@ -9829,9 +9829,7 @@ fn get_marks_remote_replicas_hot_for_eviction() {
         .put("remote-exists-cold", cold)
         .expect("cold put should succeed");
     assert_eq!(
-        router
-            .get("remote-exists-hot")
-            .expect("get should succeed"),
+        router.get("remote-exists-hot").expect("get should succeed"),
         hot
     );
     wait_for_storage_clock_hot(&storage, &hot_route);
