@@ -117,6 +117,11 @@ impl ControlPlaneClient {
                 authority,
                 keys,
             } => self.send_route_batch_get(lease, namespace, authority, keys),
+            RouteControlRequest::BatchContains {
+                namespace,
+                authority,
+                keys,
+            } => self.send_route_batch_contains(lease, namespace, authority, keys),
             RouteControlRequest::BatchCompareAndSwap {
                 namespace,
                 authority,
@@ -133,6 +138,28 @@ impl ControlPlaneClient {
                 owner,
             } => self.send_route_list_by_replica_owner(lease, namespace, authority, owner),
         }
+    }
+
+    fn send_route_batch_contains(
+        &self,
+        lease: &ClientLease,
+        namespace: String,
+        authority: ClientStableId,
+        keys: Vec<ObjectKey>,
+    ) -> Result<RouteControlResponse> {
+        let get_response =
+            self.send_route_batch_get(lease, namespace, authority, keys)?;
+        let RouteControlResponse::BatchGet(results) = get_response else {
+            return Err(StoreError::Transport(
+                "unexpected response type for batch_contains".to_string(),
+            ));
+        };
+        Ok(RouteControlResponse::BatchContains(
+            results
+                .into_iter()
+                .map(|r| r.map(|opt| opt.is_some()))
+                .collect(),
+        ))
     }
 
     fn send_route_batch_get(
