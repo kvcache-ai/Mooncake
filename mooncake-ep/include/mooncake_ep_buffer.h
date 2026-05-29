@@ -21,7 +21,8 @@
 
 namespace mooncake {
 
-inline constexpr int MAX_QP_COUNT = tent::kIbGdaMaxQueuePairs;
+// Same value as tent::kIbGdaMaxQueuePairs.
+inline constexpr int MAX_QP_COUNT = 256;
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
