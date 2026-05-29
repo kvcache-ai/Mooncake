@@ -1294,6 +1294,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
         "config/user/settings.json", "logs/app-2025-08-13.log",
         // Keys with varying lengths
         "short", "a_very_very_very_long_key_that_tests_length_limits",
+        // Single-character keys to verify regex escape fallback
+        "7", "d",
         // Keys that look similar but should not match certain regex
         "test-key-extra", "another_key"};
 
@@ -1376,6 +1378,23 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(), 1);
         EXPECT_EQ(result.value().begin()->first, "short");
+    }
+
+    // Test 3.8b: Escaped literal exact match
+    {
+        auto result =
+            service_->GetReplicaListByRegex("^config/user/settings\\.json$");
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
+        EXPECT_EQ(result.value().begin()->first, "config/user/settings.json");
+    }
+
+    // Test 3.8c: Alphanumeric escapes must fall back to full regex semantics
+    {
+        auto result = service_->GetReplicaListByRegex("^\\d$");
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value().size(), 1);
+        EXPECT_EQ(result.value().begin()->first, "7");
     }
 
     // Test 3.9: Initial test for non-existent key (as a sanity check)
