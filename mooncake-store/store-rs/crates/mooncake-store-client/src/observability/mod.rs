@@ -1454,28 +1454,28 @@ mod tests {
     #[test]
     fn breakdown_json_exposes_api_phase_metadata_and_transport() {
         let _guard = metrics_test_lock().lock();
-        reset_metrics();
-        registry::set_process_tenant("tenant-breakdown");
+        let registry = registry::new_metrics_registry();
+        registry::set_process_tenant_with_registry(&registry, "tenant-breakdown");
 
         let result = Ok(());
-        OperationTracker::new("batch_put_from")
+        OperationTracker::with_registry("batch_put_from", registry.clone())
             .input_bytes(1024)
             .finish(&result, 512);
-        OperationTracker::new("batch_is_readable").finish(&result, 1);
-        OperationTracker::new("route_lookup_many")
+        OperationTracker::with_registry("batch_is_readable", registry.clone()).finish(&result, 1);
+        OperationTracker::with_registry("route_lookup_many", registry.clone())
             .scope("route_lookup")
             .finish(&result, 0);
         registry::record_metadata_operation_with_registry(
-            registry::global_metrics_registry(),
+            &registry,
             "redis",
             "get_object_route",
             "ok",
             std::time::Duration::from_millis(4),
         );
-        registry::record_transport_operation("write", "storage", "ok");
-        registry::record_transport_bytes("write", "storage", 512);
+        registry::record_transport_operation_with_registry(&registry, "write", "storage", "ok");
+        registry::record_transport_bytes_with_registry(&registry, "write", "storage", 512);
 
-        let body = render_breakdown_json();
+        let body = render_breakdown_json_with_registry(&registry);
         let value: serde_json::Value =
             serde_json::from_str(&body).expect("breakdown endpoint should return valid json");
         assert_eq!(value["tenant"], "tenant-breakdown");
@@ -1520,8 +1520,6 @@ mod tests {
             .as_array()
             .expect("bottlenecks should be an array")
             .is_empty());
-
-        reset_metrics();
     }
 
     #[test]
