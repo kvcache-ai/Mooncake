@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use mooncake_store_core::{
     route_reuse_identity, CasResult, ClientRuntimeId, NamespaceScope, ObjectKey, ObjectRoute,
@@ -9,10 +10,10 @@ use crate::metrics::record_cas_outcome;
 
 #[derive(Default)]
 pub(crate) struct LocalRouteTable {
-    routes: BTreeMap<String, ObjectRoute>,
-    scope_index: BTreeMap<NamespaceScope, BTreeSet<String>>,
-    reuse_index: BTreeMap<ReuseIdentity, BTreeSet<String>>,
-    version_floors: BTreeMap<String, RouteVersion>,
+    routes: HashMap<String, ObjectRoute>,
+    scope_index: HashMap<NamespaceScope, HashSet<String>>,
+    reuse_index: HashMap<ReuseIdentity, HashSet<String>>,
+    version_floors: HashMap<String, RouteVersion>,
 }
 
 impl LocalRouteTable {
@@ -169,7 +170,7 @@ impl LocalRouteTable {
     }
 }
 
-fn remove_index_key<K: Ord>(index: &mut BTreeMap<K, BTreeSet<String>>, identity: &K, key: &str) {
+fn remove_index_key<K: Eq + Hash>(index: &mut HashMap<K, HashSet<String>>, identity: &K, key: &str) {
     let Some(keys) = index.get_mut(identity) else {
         return;
     };
