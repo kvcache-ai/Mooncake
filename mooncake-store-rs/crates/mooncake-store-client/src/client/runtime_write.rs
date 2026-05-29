@@ -415,6 +415,10 @@ impl StoreClient {
         let transport = self.transport()?;
         let planner = self.request_placement_planner();
         let resolved_policy = self.resolve_replication_policy(policy)?;
+        let reserve_needs_current_routes = self.batch_put_reserve_needs_current_routes(requests)?;
+        let skip_publish_route_preload = conflict_policy
+            == BatchPutRouteConflictPolicy::AcceptExistingActiveRoute
+            && !reserve_needs_current_routes;
         let mut write_attempt = 0usize;
 
         let object_refs = requests
@@ -495,10 +499,10 @@ impl StoreClient {
                     .map(|request| request.value.len())
                     .sum::<usize>() as u64,
             );
-        let reserve_result = (|| -> std::result::Result<
-            Vec<PreparedObjectWrite<'_>>,
-            BatchPutReserveStageError,
-        > {
+            let reserve_result = (|| -> std::result::Result<
+                Vec<PreparedObjectWrite<'_>>,
+                BatchPutReserveStageError,
+            > {
                 let mut shared_candidates = Vec::new();
                 let mut shared_seen = BTreeSet::new();
                 let add_preferred_segments = |
@@ -593,10 +597,7 @@ impl StoreClient {
                 });
             }
 
-            let current_routes = if self
-                .batch_put_reserve_needs_current_routes(requests)
-                .map_err(BatchPutReserveStageError::terminal)?
-            {
+            let current_routes = if reserve_needs_current_routes {
                 let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes");
                 let object_keys = object_refs
                     .iter()
@@ -872,19 +873,23 @@ impl StoreClient {
                 return Err(error);
             }
         };
-        let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
-            .attribute_u64("mooncake.item_count", prepared.len() as u64);
-        let route_keys = prepared
-            .iter()
-            .map(|entry| entry.scoped_key.clone())
-            .collect::<Vec<_>>();
-        let current_routes_result = self.route_ops().load_routes(&route_keys);
-        route_load_tracker.finish(&current_routes_result, 0);
-        let current_routes = match current_routes_result {
-            Ok(routes) => routes,
-            Err(error) => {
-                release_prepared(&prepared, "batch_put_failed_before_publish");
-                return Err(error);
+        let current_routes = if skip_publish_route_preload {
+            vec![None; prepared.len()]
+        } else {
+            let route_load_tracker = OperationTracker::new("batch_put_stage_load_routes")
+                .attribute_u64("mooncake.item_count", prepared.len() as u64);
+            let route_keys = prepared
+                .iter()
+                .map(|entry| entry.scoped_key.clone())
+                .collect::<Vec<_>>();
+            let current_routes_result = self.route_ops().load_routes(&route_keys);
+            route_load_tracker.finish(&current_routes_result, 0);
+            match current_routes_result {
+                Ok(routes) => routes,
+                Err(error) => {
+                    release_prepared(&prepared, "batch_put_failed_before_publish");
+                    return Err(error);
+                }
             }
         };
         let write_bytes = prepared
