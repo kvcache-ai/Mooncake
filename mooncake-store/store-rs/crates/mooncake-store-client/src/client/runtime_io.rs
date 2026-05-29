@@ -2411,7 +2411,6 @@ impl StoreClient {
             .unwrap_or(1);
         let request_deadline = self.request_deadline_for_transfer(remote_bytes, remote_attempts);
         if remote_indices.is_empty() {
-            self.report_get_hits_best_effort(resolved);
             debug!(
                 runtime = %self.lease.runtime,
                 total_items = resolved.len(),
@@ -2545,7 +2544,6 @@ impl StoreClient {
             .map(|(buffer, length)| &buffer[..*length])
             .collect::<Vec<_>>();
         Self::validate_batch_replica_checksums(resolved, &payloads)?;
-        self.report_get_hits_best_effort(resolved);
         Ok(lengths)
     }
 

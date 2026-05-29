@@ -9971,6 +9971,97 @@ fn remote_get_marks_all_readable_replicas_hot_for_eviction() {
 }
 
 #[test]
+fn get_marks_route_hot_before_payload_validation() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("get-early-hot-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("get-early-hot-router-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "get-early-hot-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config_with_bytes(32))
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "get-early-hot-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    router
+        .put("early-hot", b"0123456789abcdef")
+        .expect("hot put should succeed");
+    router
+        .put("early-cold", b"fedcba9876543210")
+        .expect("cold put should succeed");
+
+    let current_hot_route = router
+        .query_route("early-hot")
+        .expect("hot route query should succeed")
+        .expect("hot route should exist");
+    assert_eq!(
+        current_hot_route.replicas[0].owner,
+        storage.runtime_id().clone()
+    );
+    let mut bad_route = current_hot_route.clone();
+    bad_route.version = current_hot_route.version.next();
+    bad_route.replicas[0].checksum = Some(payload_checksum(b"wrong-payload"));
+    let cas = router
+        .route_directory
+        .compare_and_swap_object_route(
+            &router.lease,
+            &bad_route.key,
+            Some(current_hot_route.version),
+            Some(&bad_route),
+        )
+        .expect("bad checksum route publish should succeed");
+    assert!(cas.applied, "bad checksum route publish should apply");
+
+    let error = router
+        .get("early-hot")
+        .expect_err("checksum mismatch should fail the get after route resolution");
+    assert!(
+        error.to_string().contains("checksum"),
+        "expected checksum failure, got {error}"
+    );
+
+    router
+        .put("early-fresh", b"abcdefghijklmnop")
+        .expect("fresh put should trigger eviction and succeed");
+    assert!(router
+        .query_route("early-hot")
+        .expect("hot route query should succeed")
+        .is_some());
+    assert!(router
+        .query_route("early-fresh")
+        .expect("fresh route query should succeed")
+        .is_some());
+    assert!(router
+        .query_route("early-cold")
+        .expect("cold route query should succeed")
+        .is_none());
+}
+
+#[test]
 fn background_watermark_eviction_reclaims_without_front_path_pressure() {
     let _guard = metrics_test_lock().lock();
     reset_metrics();
