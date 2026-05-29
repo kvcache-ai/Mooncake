@@ -1997,6 +1997,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     merged_config.with_soft_pin =
         merged_config.with_soft_pin || metadata.IsSoftPinned();
 
+    const std::string effective_group_id =
+        metadata.IsGrouped() ? metadata.group_id : group_id;
+
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
@@ -2006,8 +2009,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     tenant_state.metadata.erase(it);
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
-    const std::string effective_group_id =
-        metadata.IsGrouped() ? metadata.group_id : group_id;
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                      merged_config, effective_group_id,
                                      object_id.tenant_id, now);
@@ -2742,7 +2743,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
         std::min(keys.size(), static_cast<size_t>(kNumShards)));
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        size_t shard_idx = getShardIndex(keys[i]);
+        size_t shard_idx = getMetadataShardIndex(keys[i]);
         keys_by_shard[shard_idx].emplace_back(i, &keys[i]);
     }
 
