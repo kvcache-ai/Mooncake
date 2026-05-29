@@ -2354,9 +2354,13 @@ fn wait_for_membership_convergence(clients: &[&StoreClient]) {
 }
 
 fn wait_for_storage_clock_hot(storage: &StoreClient, route: &ObjectRoute) {
+    wait_for_storage_clock_route(storage, route, true);
+}
+
+fn wait_for_storage_clock_route(storage: &StoreClient, route: &ObjectRoute, require_hot: bool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        let hot = {
+        let found = {
             let clock = storage.storage_owner.clock.lock();
             clock
                 .entries
@@ -2369,19 +2373,27 @@ fn wait_for_storage_clock_hot(storage: &StoreClient, route: &ObjectRoute) {
                                 && replica.segment_name == entry.id.segment_name
                                 && replica.segment_offset == entry.id.segment_offset
                         })
-                        && entry.hot
+                        && (!require_hot || entry.hot)
                 })
         };
-        if hot {
+        if found {
             return;
         }
         sleep(Duration::from_millis(10));
     }
-    panic!(
-        "route {} did not become hot on storage owner {} in time",
-        route.key.0,
-        storage.runtime_id()
-    );
+    if require_hot {
+        panic!(
+            "route {} did not become hot on storage owner {} in time",
+            route.key.0,
+            storage.runtime_id()
+        );
+    } else {
+        panic!(
+            "route {} was not tracked by storage owner {} in time",
+            route.key.0,
+            storage.runtime_id()
+        );
+    }
 }
 
 fn wait_for_authority_route(
@@ -9862,6 +9874,8 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
         .expect("cold put should succeed");
     assert_eq!(hot_route.replicas[0].owner, storage.runtime_id().clone());
     assert_eq!(cold_route.replicas[0].owner, storage.runtime_id().clone());
+    wait_for_storage_clock_route(&storage, &hot_route, false);
+    wait_for_storage_clock_route(&storage, &cold_route, false);
     assert_eq!(
         router
             .get("remote-clock-hot")
@@ -9884,6 +9898,16 @@ fn remote_hit_reports_drive_storage_owner_clock_eviction() {
             .expect("fresh object should be readable"),
         fresh
     );
+    assert_eq!(
+        router
+            .get("remote-clock-hot")
+            .expect("hot object should remain readable"),
+        hot
+    );
+    assert!(matches!(
+        router.get("remote-clock-cold"),
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 #[test]
@@ -10007,12 +10031,14 @@ fn get_marks_route_hot_before_payload_validation() {
         .expect("router memory should register");
     wait_for_membership_convergence(&[&storage, &router]);
 
-    router
+    let hot_route = router
         .put("early-hot", b"0123456789abcdef")
         .expect("hot put should succeed");
-    router
+    let cold_route = router
         .put("early-cold", b"fedcba9876543210")
         .expect("cold put should succeed");
+    wait_for_storage_clock_route(&storage, &hot_route, false);
+    wait_for_storage_clock_route(&storage, &cold_route, false);
 
     let current_hot_route = router
         .query_route("early-hot")
