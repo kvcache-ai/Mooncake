@@ -35,6 +35,10 @@ std::unique_ptr<DeviceTransport> createNvLinkDeviceTransport() {
     return std::make_unique<NvLinkDeviceTransportImpl>();
 }
 
+std::unique_ptr<DeviceTransport> createP2pDeviceTransport() {
+    return createNvLinkDeviceTransport();
+}
+
 bool nvLinkSupportsFabricMemory() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
     const bool fabric_enabled = nvlink_ipc && std::strcmp(nvlink_ipc, "0") == 0;

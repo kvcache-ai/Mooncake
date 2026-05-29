@@ -202,6 +202,11 @@ class DeviceTransport {
     virtual void* getRemotePtr(void* local_ptr, int dst_rank) = 0;
 };
 
+/// Auto-detect factory: create the P2P DeviceTransport for the current
+/// platform (NVLink on CUDA, MTLink on MUSA).  This is the single point
+/// where platform detection happens; callers never need #ifdef.
+std::unique_ptr<DeviceTransport> createP2pDeviceTransport();
+
 }  // namespace tent
 }  // namespace mooncake
 

@@ -143,16 +143,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
         &qp_devctxs, USE_QP_COUNT * tent::ibGdaQueuePairDeviceContextSize()));
 #endif
 
-    // Create the unified device transport.
-    // On CUDA: NVLink for P2P + IBGDA for RDMA (two transports).
-    // On MUSA: MTLink for P2P only (no RDMA).
-    // For now, EP creates the P2P transport here; IBGDA is created in
-    // init_ibgda() if available.
-#ifdef MOONCAKE_EP_USE_MUSA
-    transport_ = tent::createMtLinkDeviceTransport();
-#else
-    transport_ = tent::createNvLinkDeviceTransport();
-#endif
+    // Create the P2P device transport (auto-detects NVLink/MTLink).
+    transport_ = tent::createP2pDeviceTransport();
     auto p2p_status = transport_->allocatePeerAccessTables(rank, num_ranks);
     if (!p2p_status.ok()) {
         LOG(ERROR) << "[EP] Failed to allocate P2P peer tables: "

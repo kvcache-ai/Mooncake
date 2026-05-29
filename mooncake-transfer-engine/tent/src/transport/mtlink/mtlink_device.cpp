@@ -32,5 +32,9 @@ std::unique_ptr<DeviceTransport> createMtLinkDeviceTransport() {
     return std::make_unique<MtLinkDeviceTransportImpl>();
 }
 
+std::unique_ptr<DeviceTransport> createP2pDeviceTransport() {
+    return createMtLinkDeviceTransport();
+}
+
 }  // namespace tent
 }  // namespace mooncake
