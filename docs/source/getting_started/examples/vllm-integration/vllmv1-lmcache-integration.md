@@ -186,6 +186,6 @@ together:
 
 ## Additional Resources
 
-* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../../../getting_started/examples/lmcache-integration.md)
+* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../lmcache-integration.md)
 * [Using Mooncake in LMCache](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html)
 * [Using LMCache in vLLM](https://github.com/vllm-project/vllm/tree/main/examples/others/lmcache)
