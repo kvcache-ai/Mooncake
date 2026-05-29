@@ -126,6 +126,17 @@ design/conductor/conductor-architecture-design
 design/conductor/indexer-api-design
 :::
 
+% API Documentation
+
+:::{toctree}
+:caption: API Reference
+:maxdepth: 2
+
+api-reference/python/index
+api-reference/cpp/index
+api-reference/http/index
+:::
+
 % Q&A for Mooncake
 
 :::{toctree}
