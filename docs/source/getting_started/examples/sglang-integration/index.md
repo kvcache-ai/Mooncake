@@ -74,11 +74,11 @@ export MOONCAKE_MASTER=127.0.0.1:50051
 export MC_STORE_USE_HUGEPAGE="1"
 
 python -m sglang.launch_server \
-  --model-path [model_path] \
-  --page-size 64 \
-  --enable-hierarchical-cache \
-  --hicache-storage-prefetch-policy timeout \
-  --hicache-storage-backend mooncake
+  --model-path Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+  --enable-hicache \
+  --hicache-l3-backend mooncake \
+  --tp-size 4 \
+  --mem-fraction-static 0.6
 ```
 
 **Related:**

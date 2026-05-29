@@ -85,6 +85,7 @@ getting_started/plugin-usage/3FS-USRBIO-Plugin
 
 performance/vllm/index
 performance/sglang/index
+performance/mooncake-store/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
