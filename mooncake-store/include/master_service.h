@@ -1134,6 +1134,18 @@ class MasterService {
         GUARDED_BY(group_routing_mutex_);
     mutable std::shared_mutex group_routing_mutex_;
 
+    struct ObjectOperationLock {
+        std::shared_ptr<std::mutex> mutex;
+        std::unique_lock<std::mutex> lock;
+    };
+
+    ObjectOperationLock AcquireObjectOperationLock(const std::string& tenant_id,
+                                                   const std::string& key);
+
+    std::mutex object_operation_locks_mutex_;
+    std::unordered_map<std::string, std::weak_ptr<std::mutex>>
+        object_operation_locks_;
+
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
        public:
@@ -1208,6 +1220,8 @@ class MasterService {
     size_t getMetadataShardIndex(const std::string& key) const;
     size_t getMetadataShardIndex(const std::string& tenant_id,
                                  const std::string& key) const;
+    std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
+                                             const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state,
                              const std::string& tenant_id,
                              const std::string& key,

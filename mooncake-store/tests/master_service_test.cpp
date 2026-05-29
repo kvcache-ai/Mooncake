@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <ylt/struct_json/json_reader.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -661,6 +662,136 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
     EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentGroupedAndUngroupedFirstCreateDoesNotDuplicateMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "concurrent_grouped_ungrouped_first_create";
+    const std::string tenant_id = "tenant_concurrent_first_create";
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+
+    static constexpr size_t kThreadCount = 16;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<int> put_start_success(kThreadCount, 0);
+    std::vector<int> put_end_success(kThreadCount, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto& config =
+                (i % 2 == 0) ? grouped_config : ungrouped_config;
+            auto put_start =
+                service_->PutStart(client_id, key, tenant_id, 1024, config);
+            put_start_success[i] = put_start.has_value() ? 1 : 0;
+            if (put_start.has_value()) {
+                put_end_success[i] = service_->PutEnd(client_id, key, tenant_id,
+                                                      ReplicaType::MEMORY)
+                                             .has_value()
+                                         ? 1
+                                         : 0;
+            } else {
+                EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, put_start.error());
+            }
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(std::count(put_start_success.begin(), put_start_success.end(), 1),
+              1);
+    EXPECT_EQ(std::count(put_end_success.begin(), put_end_success.end(), 1), 1);
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentDifferentGroupedFirstCreateDoesNotDuplicateMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "concurrent_different_grouped_first_create";
+    const std::string tenant_id = "tenant_concurrent_grouped_first_create";
+    const std::string group_a = FindGroupIdOnDifferentShard(key);
+    std::string group_b;
+    for (int i = 0; i < 10000; ++i) {
+        group_b = key + "_other_group_" + std::to_string(i);
+        if (std::hash<std::string>{}(group_b) % 1024 !=
+            std::hash<std::string>{}(group_a) % 1024) {
+            break;
+        }
+    }
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids = std::vector<std::string>{group_a};
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    config_b.group_ids = std::vector<std::string>{group_b};
+
+    static constexpr size_t kThreadCount = 16;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<int> put_start_success(kThreadCount, 0);
+    std::vector<int> put_end_success(kThreadCount, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto& config = (i % 2 == 0) ? config_a : config_b;
+            auto put_start =
+                service_->PutStart(client_id, key, tenant_id, 1024, config);
+            put_start_success[i] = put_start.has_value() ? 1 : 0;
+            if (put_start.has_value()) {
+                put_end_success[i] = service_->PutEnd(client_id, key, tenant_id,
+                                                      ReplicaType::MEMORY)
+                                             .has_value()
+                                         ? 1
+                                         : 0;
+            } else {
+                EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, put_start.error());
+            }
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(std::count(put_start_success.begin(), put_start_success.end(), 1),
+              1);
+    EXPECT_EQ(std::count(put_end_success.begin(), put_end_success.end(), 1), 1);
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
 }
 
 TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {

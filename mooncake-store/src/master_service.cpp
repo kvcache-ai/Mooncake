@@ -605,6 +605,46 @@ size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
     return getShardIndex(it->second);
 }
 
+std::optional<std::string> MasterService::GetGroupRoute(
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
+    auto it =
+        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
+    if (it == object_group_ids_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
+    const std::string& tenant_id, const std::string& key) {
+    auto object_mutex = std::shared_ptr<std::mutex>();
+    const auto scoped_key = MakeTenantScopedKey(tenant_id, key);
+    {
+        std::lock_guard<std::mutex> lock(object_operation_locks_mutex_);
+        auto it = object_operation_locks_.find(scoped_key);
+        if (it != object_operation_locks_.end()) {
+            object_mutex = it->second.lock();
+        }
+        if (object_mutex == nullptr) {
+            object_mutex = std::make_shared<std::mutex>();
+            object_operation_locks_[scoped_key] = object_mutex;
+        }
+        if (object_operation_locks_.size() > kNumShards * 4) {
+            for (auto cleanup_it = object_operation_locks_.begin();
+                 cleanup_it != object_operation_locks_.end();) {
+                if (cleanup_it->second.expired()) {
+                    cleanup_it = object_operation_locks_.erase(cleanup_it);
+                } else {
+                    ++cleanup_it;
+                }
+            }
+        }
+    }
+    return {object_mutex, std::unique_lock<std::mutex>(*object_mutex)};
+}
+
 void MasterService::RegisterGroupMember(TenantState& tenant_state,
                                         const std::string& tenant_id,
                                         const std::string& key,
@@ -1341,6 +1381,15 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     auto& tenant_state = shard->tenants[tenant_id];
+    if (tenant_state.metadata.contains(key)) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    if (GetGroupRoute(tenant_id, key).has_value()) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
@@ -1467,13 +1516,16 @@ auto MasterService::AllocateAndInsertMetadata(
         }
     }
 
-    // Publish the route before inserting metadata for grouped objects.
-    RegisterGroupMember(tenant_state, tenant_id, key, group_id);
-    tenant_state.metadata.emplace(
+    auto [it, inserted] = tenant_state.metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
                               config.with_soft_pin, config.with_hard_pin,
                               config.data_type, group_id, tenant_id, key));
+    if (!inserted) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
 
     return replica_list;
@@ -1534,28 +1586,37 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
     const std::string group_id = group_id_result.value();
 
+    [[maybe_unused]] auto object_operation_lock =
+        AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
     const auto now = std::chrono::system_clock::now();
     std::optional<size_t> retry_shard_idx;
     {
         auto alive_clients = getAliveClientsSnapshot();
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        // Lock the shard and check if object already exists.
-        // For new grouped objects, route to the group's target shard directly
-        // since the routing table hasn't been populated yet.
-        const size_t target_shard_idx =
-            group_id.empty()
-                ? getMetadataShardIndex(object_id.tenant_id, object_id.user_key)
-                : getShardIndex(group_id);
-        MetadataShardAccessorRW shard(this, target_shard_idx);
+        const size_t lookup_shard_idx =
+            getMetadataShardIndex(object_id.tenant_id, object_id.user_key);
+        MetadataShardAccessorRW shard(this, lookup_shard_idx);
         auto& tenant_state = shard->tenants[object_id.tenant_id];
 
         auto it = tenant_state.metadata.find(key);
-        if (it != tenant_state.metadata.end() &&
-            !CleanupStaleHandles(it->second, alive_clients)) {
-            auto& metadata = it->second;
-            if (!metadata.HasReplica(&Replica::fn_is_completed) &&
-                metadata.put_start_time + put_start_discard_timeout_sec_ <
-                    now) {
+        if (it != tenant_state.metadata.end()) {
+            if (CleanupStaleHandles(it->second, alive_clients)) {
+                tenant_state.processing_keys.erase(key);
+                tenant_state.replication_tasks.erase(key);
+                tenant_state.offloading_tasks.erase(key);
+                ErasePromotionTaskIfPresent(tenant_state, key);
+                EraseMetadata(tenant_state, it, object_id.tenant_id);
+                it = tenant_state.metadata.end();
+            } else {
+                auto& metadata = it->second;
+                if (metadata.HasReplica(&Replica::fn_is_completed) ||
+                    metadata.put_start_time + put_start_discard_timeout_sec_ >=
+                        now) {
+                    LOG(INFO)
+                        << "key=" << key << ", info=object_already_exists";
+                    return tl::make_unexpected(
+                        ErrorCode::OBJECT_ALREADY_EXISTS);
+                }
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
                 if (!replicas.empty()) {
@@ -1567,27 +1628,35 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 }
                 tenant_state.processing_keys.erase(key);
                 EraseMetadata(tenant_state, it, object_id.tenant_id);
-                if (group_id.empty()) {
-                    const size_t ungrouped_shard_idx =
-                        getShardIndex(object_id.tenant_id, object_id.user_key);
-                    if (ungrouped_shard_idx != target_shard_idx) {
-                        retry_shard_idx = ungrouped_shard_idx;
-                    }
-                }
-            } else {
-                LOG(INFO) << "key=" << key << ", info=object_already_exists";
-                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+                it = tenant_state.metadata.end();
             }
         }
 
-        if (!retry_shard_idx.has_value()) {
-            return AllocateAndInsertMetadata(shard, client_id, key,
-                                             slice_length, config, group_id,
-                                             object_id.tenant_id, now);
+        if (it == tenant_state.metadata.end()) {
+            const size_t target_shard_idx =
+                group_id.empty()
+                    ? getShardIndex(object_id.tenant_id, object_id.user_key)
+                    : getShardIndex(group_id);
+            if (target_shard_idx != lookup_shard_idx) {
+                retry_shard_idx = target_shard_idx;
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(object_id.tenant_id);
+                }
+            } else {
+                return AllocateAndInsertMetadata(shard, client_id, key,
+                                                 slice_length, config, group_id,
+                                                 object_id.tenant_id, now);
+            }
         }
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, retry_shard_idx.value());
+    auto& retry_tenant_state = shard->tenants[object_id.tenant_id];
+    if (GetGroupRoute(object_id.tenant_id, object_id.user_key).has_value() ||
+        retry_tenant_state.metadata.contains(key)) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                      config, group_id, object_id.tenant_id,
                                      now);
@@ -1869,6 +1938,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     const std::string group_id = group_id_result.value();
 
+    [[maybe_unused]] auto object_operation_lock =
+        AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
     const auto now = std::chrono::system_clock::now();
     std::optional<size_t> case_a_retry_shard_idx;
     {
@@ -1958,6 +2029,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     : getShardIndex(group_id);
             if (case_a_shard_idx != lookup_shard_idx) {
                 case_a_retry_shard_idx = case_a_shard_idx;
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(object_id.tenant_id);
+                }
             } else {
                 return AllocateAndInsertMetadata(shard, client_id, key,
                                                  slice_length, config, group_id,
@@ -2057,6 +2131,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataShardAccessorRW shard(this, case_a_retry_shard_idx.value());
+    auto& retry_tenant_state = shard->tenants[object_id.tenant_id];
+    const auto current_route =
+        GetGroupRoute(object_id.tenant_id, object_id.user_key);
+    if (current_route.has_value() ||
+        retry_tenant_state.metadata.contains(key)) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                      config, group_id, object_id.tenant_id,
                                      now);
