@@ -1322,6 +1322,33 @@ TEST_F(PeerClientTest, SyncUnPinKeyWithoutConnect) {
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
 
+TEST_F(PeerClientTest, AsyncPreWriteWithoutConnect) {
+    PeerClient unconnected_client;
+
+    PreWriteRequest pre;
+    pre.key = "test_key";
+    pre.size_bytes = 256;
+    pre.target_tier_id = std::nullopt;
+
+    auto result =
+        async_simple::coro::syncAwait(unconnected_client.AsyncPreWrite(pre));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, AsyncWriteCommitWithoutConnect) {
+    PeerClient unconnected_client;
+
+    WriteCommitRequest commit;
+    commit.key = "test_key";
+    commit.write_operation_id = {1, 1};
+
+    auto result = async_simple::coro::syncAwait(
+        unconnected_client.AsyncWriteCommit(commit));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
 TEST_F(PeerClientTest, AsyncWriteRevokeWithoutConnect) {
     PeerClient unconnected_client;
 
@@ -1331,6 +1358,31 @@ TEST_F(PeerClientTest, AsyncWriteRevokeWithoutConnect) {
 
     auto result = async_simple::coro::syncAwait(
         unconnected_client.AsyncWriteRevoke(request));
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, SyncPreWriteWithoutConnect) {
+    PeerClient unconnected_client;
+
+    PreWriteRequest pre;
+    pre.key = "test_key";
+    pre.size_bytes = 256;
+    pre.target_tier_id = std::nullopt;
+
+    auto result = unconnected_client.PreWrite(pre);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
+}
+
+TEST_F(PeerClientTest, SyncWriteCommitWithoutConnect) {
+    PeerClient unconnected_client;
+
+    WriteCommitRequest commit;
+    commit.key = "test_key";
+    commit.write_operation_id = {2, 2};
+
+    auto result = unconnected_client.WriteCommit(commit);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::RPC_FAIL);
 }
