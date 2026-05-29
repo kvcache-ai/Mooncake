@@ -28,12 +28,11 @@
 
 #include <tent/device/ir/device_ops.cuh>
 #include <tent/runtime/device_resources.h>
+#include <tent/device/p2p_ops.cuh>
 
 #ifdef MOONCAKE_EP_USE_MUSA
-#include <tent/device/mtlink.cuh>
 #include <tent/device/platform/musa/musa_ops.cuh>
 #else
-#include <tent/device/nvlink.cuh>
 #include <tent/device/network/ibgda/ibgda_ops.cuh>
 #include <tent/device/platform/cuda/cuda_ops.cuh>
 #endif
@@ -61,21 +60,13 @@ struct EpCommCtx {
 
 __device__ __forceinline__ bool ep_p2p_available(const EpCommCtx& ctx,
                                                   int dst_rank) {
-#ifdef MOONCAKE_EP_USE_MUSA
-    return mtlink::is_available(ctx.p2p_ctx, dst_rank);
-#else
-    return nvlink::is_available(ctx.p2p_ctx, dst_rank);
-#endif
+    return p2p::is_available(ctx.p2p_ctx, dst_rank);
 }
 
 __device__ __forceinline__ void* ep_peer_ptr(const EpCommCtx& ctx,
                                               int dst_rank,
                                               const void* local_ptr) {
-#ifdef MOONCAKE_EP_USE_MUSA
-    return mtlink::peer_ptr(ctx.p2p_ctx, dst_rank, ctx.local_base, local_ptr);
-#else
-    return nvlink::peer_ptr(ctx.p2p_ctx, dst_rank, ctx.local_base, local_ptr);
-#endif
+    return p2p::peer_ptr(ctx.p2p_ctx, dst_rank, ctx.local_base, local_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,13 +130,8 @@ __device__ __forceinline__ void ep_signal(EpCommCtx& ctx,
     }
 
     if (ep_p2p_available(ctx, dst_rank)) {
-#ifdef MOONCAKE_EP_USE_MUSA
-        mtlink::mtlink_signal(ctx.dops, ctx.p2p_ctx, dst_rank,
-                              ctx.local_base, sig_ptr, action);
-#else
-        nvlink::nvlink_signal(ctx.dops, ctx.p2p_ctx, dst_rank,
-                              ctx.local_base, sig_ptr, action);
-#endif
+        p2p::p2p_signal(ctx.dops, ctx.p2p_ctx, dst_rank,
+                        ctx.local_base, sig_ptr, action);
     } else {
 #ifndef MOONCAKE_EP_USE_MUSA
         ibgda::ibgda_signal(&ctx.ibgda_ctx, channel, dst_rank,
@@ -164,13 +150,8 @@ __device__ __forceinline__ void ep_red_add(EpCommCtx& ctx,
 
     if (ep_p2p_available(ctx, dst_rank)) {
         // P2P path: release store (single-writer assumption)
-#ifdef MOONCAKE_EP_USE_MUSA
-        mtlink::mtlink_signal_add(ctx.dops, ctx.p2p_ctx, dst_rank,
-                               ctx.local_base, sym_ptr, val);
-#else
-        nvlink::nvlink_signal_add(ctx.dops, ctx.p2p_ctx, dst_rank,
-                               ctx.local_base, sym_ptr, val);
-#endif
+        p2p::p2p_signal_add(ctx.dops, ctx.p2p_ctx, dst_rank,
+                            ctx.local_base, sym_ptr, val);
     } else {
         // IBGDA path: atomic add (RDMA needs atomic visibility)
 #ifndef MOONCAKE_EP_USE_MUSA

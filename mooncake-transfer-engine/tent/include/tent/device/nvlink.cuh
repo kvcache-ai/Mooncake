@@ -15,43 +15,26 @@
 #ifndef TENT_DEVICE_NVLINK_CUH_
 #define TENT_DEVICE_NVLINK_CUH_
 
-#include <cstddef>
-#include <cstdint>
+// Deprecated: use <tent/device/p2p_ops.cuh> instead.
+// This header provides backward-compatible wrappers.
 
-#include <tent/runtime/device_resources.h>
-#include <tent/device/ir/device_ops.cuh>
+#include <tent/device/p2p_ops.cuh>
 
 namespace mooncake {
 namespace tent {
 namespace device {
 namespace nvlink {
 
-// ---------------------------------------------------------------------------
-// Availability & address computation
-// ---------------------------------------------------------------------------
-
 __device__ __forceinline__ bool is_available(const P2PDeviceContext& ctx,
                                              int dst_rank) {
-    return ctx.available != nullptr && ctx.peer_ptrs != nullptr &&
-           dst_rank >= 0 && dst_rank < ctx.num_ranks &&
-           ctx.available[dst_rank] != 0 && ctx.peer_ptrs[dst_rank] != nullptr;
+    return p2p::is_available(ctx, dst_rank);
 }
 
 __device__ __forceinline__ void* peer_ptr(const P2PDeviceContext& ctx,
                                           int dst_rank, const void* local_base,
                                           const void* local_ptr) {
-    const auto offset = reinterpret_cast<const char*>(local_ptr) -
-                        reinterpret_cast<const char*>(local_base);
-    return reinterpret_cast<char*>(ctx.peer_ptrs[dst_rank]) + offset;
+    return p2p::peer_ptr(ctx, dst_rank, local_base, local_ptr);
 }
-
-// ---------------------------------------------------------------------------
-// EpCommOps — NVLink P2P communication primitives
-//
-// These use DeviceOps function pointers for memory ordering, which are
-// populated by the platform backend (cuda_ops.cuh for CUDA).  This avoids
-// CUDA PTX inline ASM in the communication layer and keeps the code portable.
-// ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void nvlink_put(DeviceOps* dops,
                                            const P2PDeviceContext& ctx,
@@ -59,8 +42,7 @@ __device__ __forceinline__ void nvlink_put(DeviceOps* dops,
                                            const void* local_base,
                                            void* recv, const void* send,
                                            size_t n) {
-    void* peer_dst = peer_ptr(ctx, dst_rank, local_base, recv);
-    dops->store_release(peer_dst, send, n);
+    p2p::p2p_put(dops, ctx, dst_rank, local_base, recv, send, n);
 }
 
 __device__ __forceinline__ void nvlink_signal(DeviceOps* dops,
@@ -68,26 +50,19 @@ __device__ __forceinline__ void nvlink_signal(DeviceOps* dops,
                                               int dst_rank,
                                               const void* local_base,
                                               void* sig, int32_t action) {
-    void* peer_sig = peer_ptr(ctx, dst_rank, local_base, sig);
-    // Release store to peer signal address (matches original st_na_release)
-    dops->store_release_32(peer_sig, static_cast<uint32_t>(action));
+    p2p::p2p_signal(dops, ctx, dst_rank, local_base, sig, action);
 }
 
 __device__ __forceinline__ void nvlink_wait_signal(DeviceOps* dops,
                                                    void* sig,
                                                    uint64_t expected) {
-    dops->spin_wait_ne(sig, static_cast<uint32_t>(0));
-    uint64_t val = 0;
-    do {
-        dops->fence_acq_rel();
-        val = dops->atomic_load_acquire(sig);
-    } while (val != expected);
+    p2p::p2p_wait_signal(dops, sig, expected);
 }
 
 __device__ __forceinline__ void nvlink_wait_signal_32(DeviceOps* dops,
                                                       void* sig,
                                                       uint32_t expected) {
-    dops->spin_wait_eq(sig, expected);
+    p2p::p2p_wait_signal_32(dops, sig, expected);
 }
 
 __device__ __forceinline__ void nvlink_signal_add(DeviceOps* dops,
@@ -95,14 +70,11 @@ __device__ __forceinline__ void nvlink_signal_add(DeviceOps* dops,
                                                int dst_rank,
                                                const void* local_base,
                                                void* sym, int32_t val) {
-    void* peer_sym = peer_ptr(ctx, dst_rank, local_base, sym);
-    // Single-writer assumption: uses store_release, not atomic add.
-    // For multi-writer scenarios, use IBGDA path instead.
-    dops->store_release_32(peer_sym, static_cast<uint32_t>(val));
+    p2p::p2p_signal_add(dops, ctx, dst_rank, local_base, sym, val);
 }
 
 __device__ __forceinline__ void nvlink_flush(DeviceOps* dops) {
-    dops->fence_acq_rel();
+    p2p::p2p_flush(dops);
 }
 
 }  // namespace nvlink
