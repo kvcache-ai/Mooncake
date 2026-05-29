@@ -1,7 +1,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <json/json.h>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -366,6 +369,59 @@ TEST_F(PeerClientTest, AsyncPinKeyTwiceSameTokenThenUnpinTwice) {
         << "second AsyncUnPinKey failed: " << static_cast<int>(u2.error());
 }
 
+// two threads race AsyncPinKey on the same key; both succeed with the
+// same read_operation_id (distinct from sequential double-pin coverage above).
+TEST_F(PeerClientTest, ConcurrentAsyncPinKeySameKey) {
+    const std::string key = "peer_concurrent_async_pin";
+    const std::string blob = "concurrent_pin_data";
+    auto buf = StringToBuffer(blob);
+    std::vector<Slice> slices{{buf.get(), blob.size()}};
+    auto put = data_manager_->Put(key, slices);
+    ASSERT_TRUE(put.has_value());
+    put.value()->Wait();
+
+    PinKeyRequest pin_req;
+    pin_req.key = key;
+    pin_req.target_tier_id = std::nullopt;
+
+    std::promise<void> start_promise;
+    std::shared_future<void> start_future = start_promise.get_future().share();
+
+    std::mutex results_mutex;
+    std::vector<tl::expected<PinKeyResponse, ErrorCode>> results(2);
+
+    auto run_pin = [&](size_t index) {
+        start_future.wait();
+        auto result =
+            async_simple::coro::syncAwait(peer_client_->AsyncPinKey(pin_req));
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results[index] = std::move(result);
+    };
+
+    std::thread first(run_pin, 0);
+    std::thread second(run_pin, 1);
+    start_promise.set_value();
+    first.join();
+    second.join();
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_TRUE(results[i].has_value())
+            << "AsyncPinKey thread " << i
+            << " failed: " << static_cast<int>(results[i].error());
+    }
+    EXPECT_EQ(results[0]->read_operation_id, results[1]->read_operation_id);
+
+    UnPinKeyRequest unpin;
+    unpin.key = key;
+    unpin.read_operation_id = results[0]->read_operation_id;
+    auto u1 = async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    ASSERT_TRUE(u1.has_value())
+        << "first AsyncUnPinKey failed: " << static_cast<int>(u1.error());
+    auto u2 = async_simple::coro::syncAwait(peer_client_->AsyncUnPinKey(unpin));
+    ASSERT_TRUE(u2.has_value())
+        << "second AsyncUnPinKey failed: " << static_cast<int>(u2.error());
+}
+
 TEST_F(PeerClientTest, AsyncPinKeyAfterUnpinNewToken) {
     const std::string key = "peer_async_pin_new_token_after_unpin";
     const std::string blob = "tok";
@@ -623,6 +679,64 @@ TEST_F(PeerClientTest, AsyncPreWriteWhenObjectAlreadyExists) {
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 }
 
+// two threads race AsyncPreWrite on the same key; only one wins the
+// pending write lease (REPLICA_IS_PROCESSING for the loser).
+TEST_F(PeerClientTest, ConcurrentAsyncPreWriteSameKey) {
+    auto tier_id = GetTierId();
+    ASSERT_TRUE(tier_id.has_value()) << "No tier available";
+
+    const std::string key = "peer_concurrent_async_prewrite";
+    PreWriteRequest pre;
+    pre.key = key;
+    pre.size_bytes = 256;
+    pre.target_tier_id = tier_id;
+
+    std::promise<void> start_promise;
+    std::shared_future<void> start_future = start_promise.get_future().share();
+
+    std::mutex results_mutex;
+    std::vector<tl::expected<PreWriteResponse, ErrorCode>> results(2);
+
+    auto run_prewrite = [&](size_t index) {
+        start_future.wait();
+        auto result =
+            async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+        std::lock_guard<std::mutex> lock(results_mutex);
+        results[index] = std::move(result);
+    };
+
+    std::thread first(run_prewrite, 0);
+    std::thread second(run_prewrite, 1);
+    start_promise.set_value();
+    first.join();
+    second.join();
+
+    int ok_count = 0;
+    int replica_processing_count = 0;
+    std::optional<PreWriteResponse> winner;
+    for (const auto& result : results) {
+        if (result.has_value()) {
+            ++ok_count;
+            winner = result.value();
+        } else if (result.error() == ErrorCode::REPLICA_IS_PROCESSING) {
+            ++replica_processing_count;
+        }
+    }
+    ASSERT_EQ(ok_count, 1) << "Exactly one AsyncPreWrite should succeed";
+    ASSERT_EQ(replica_processing_count, 1)
+        << "The other AsyncPreWrite should be REPLICA_IS_PROCESSING";
+    ASSERT_TRUE(winner.has_value());
+
+    WriteCommitRequest winner_commit;
+    winner_commit.key = key;
+    winner_commit.write_operation_id = winner->write_operation_id;
+    auto winner_commit_res = async_simple::coro::syncAwait(
+        peer_client_->AsyncWriteCommit(winner_commit));
+    ASSERT_TRUE(winner_commit_res.has_value())
+        << "Winner WriteCommit failed: "
+        << static_cast<int>(winner_commit_res.error());
+}
+
 TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
     auto tier_id = GetTierId();
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
@@ -648,6 +762,9 @@ TEST_F(PeerClientTest, AsyncWriteCommitAfterPreWrite) {
         async_simple::coro::syncAwait(peer_client_->AsyncWriteCommit(commit));
     ASSERT_TRUE(commit_res.has_value())
         << "AsyncWriteCommit failed: " << static_cast<int>(commit_res.error());
+
+    EXPECT_TRUE(data_manager_->Exist(key))
+        << "Key should exist on owner after WriteCommit";
 }
 
 TEST_F(PeerClientTest, AsyncWriteCommitEmptyKey) {
@@ -729,11 +846,11 @@ TEST_F(PeerClientTest, AsyncWriteRevokeZeroToken) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
+TEST_F(PeerClientTest, AsyncWriteRevokeClearsPending) {
     auto tier_id = GetTierId();
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
 
-    const std::string key = "peer_async_revoke_after_prewrite";
+    const std::string key = "peer_async_revoke_clears_pending";
     PreWriteRequest pre;
     pre.key = key;
     pre.size_bytes = 256;
@@ -742,7 +859,12 @@ TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
     auto pre_res =
         async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
     ASSERT_TRUE(pre_res.has_value())
-        << "AsyncPreWrite failed: " << static_cast<int>(pre_res.error());
+        << "First AsyncPreWrite failed: " << static_cast<int>(pre_res.error());
+
+    auto blocked_pre =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+    ASSERT_FALSE(blocked_pre.has_value());
+    EXPECT_EQ(blocked_pre.error(), ErrorCode::REPLICA_IS_PROCESSING);
 
     WriteRevokeRequest revoke;
     revoke.key = key;
@@ -752,10 +874,19 @@ TEST_F(PeerClientTest, AsyncPreWriteThenWriteRevokeIdempotent) {
     ASSERT_TRUE(rev_res.has_value())
         << "AsyncWriteRevoke failed: " << static_cast<int>(rev_res.error());
 
-    auto idem =
-        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(revoke));
-    ASSERT_TRUE(idem.has_value())
-        << "Second AsyncWriteRevoke should be idempotent OK";
+    auto retry_pre =
+        async_simple::coro::syncAwait(peer_client_->AsyncPreWrite(pre));
+    ASSERT_TRUE(retry_pre.has_value()) << "AsyncPreWrite after revoke failed: "
+                                       << static_cast<int>(retry_pre.error());
+
+    WriteRevokeRequest cleanup;
+    cleanup.key = key;
+    cleanup.write_operation_id = retry_pre->write_operation_id;
+    auto cleanup_res =
+        async_simple::coro::syncAwait(peer_client_->AsyncWriteRevoke(cleanup));
+    ASSERT_TRUE(cleanup_res.has_value())
+        << "Cleanup AsyncWriteRevoke failed: "
+        << static_cast<int>(cleanup_res.error());
 }
 
 // ============================================================================
@@ -1027,6 +1158,9 @@ TEST_F(PeerClientTest, SyncWriteCommitAfterPreWrite) {
     auto commit_res = peer_client_->WriteCommit(commit);
     ASSERT_TRUE(commit_res.has_value())
         << "WriteCommit failed: " << static_cast<int>(commit_res.error());
+
+    EXPECT_TRUE(data_manager_->Exist(key))
+        << "Key should exist on owner after WriteCommit";
 }
 
 TEST_F(PeerClientTest, SyncWriteRevokeEmptyKey) {
@@ -1039,11 +1173,12 @@ TEST_F(PeerClientTest, SyncWriteRevokeEmptyKey) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(PeerClientTest, SyncWriteRevokeAfterPreWrite) {
+// pending write blocks a second PreWrite until WriteRevoke.
+TEST_F(PeerClientTest, SyncWriteRevokeClearsPending) {
     auto tier_id = GetTierId();
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
 
-    const std::string key = "peer_sync_revoke_after_prewrite";
+    const std::string key = "peer_sync_revoke_clears_pending";
     PreWriteRequest pre;
     pre.key = key;
     pre.size_bytes = 128;
@@ -1051,7 +1186,11 @@ TEST_F(PeerClientTest, SyncWriteRevokeAfterPreWrite) {
 
     auto pre_res = peer_client_->PreWrite(pre);
     ASSERT_TRUE(pre_res.has_value())
-        << "PreWrite failed: " << static_cast<int>(pre_res.error());
+        << "First PreWrite failed: " << static_cast<int>(pre_res.error());
+
+    auto blocked_pre = peer_client_->PreWrite(pre);
+    ASSERT_FALSE(blocked_pre.has_value());
+    EXPECT_EQ(blocked_pre.error(), ErrorCode::REPLICA_IS_PROCESSING);
 
     WriteRevokeRequest revoke;
     revoke.key = key;
@@ -1059,6 +1198,18 @@ TEST_F(PeerClientTest, SyncWriteRevokeAfterPreWrite) {
     auto rev_res = peer_client_->WriteRevoke(revoke);
     ASSERT_TRUE(rev_res.has_value())
         << "WriteRevoke failed: " << static_cast<int>(rev_res.error());
+
+    auto retry_pre = peer_client_->PreWrite(pre);
+    ASSERT_TRUE(retry_pre.has_value()) << "PreWrite after revoke failed: "
+                                       << static_cast<int>(retry_pre.error());
+
+    WriteRevokeRequest cleanup;
+    cleanup.key = key;
+    cleanup.write_operation_id = retry_pre->write_operation_id;
+    auto cleanup_res = peer_client_->WriteRevoke(cleanup);
+    ASSERT_TRUE(cleanup_res.has_value())
+        << "Cleanup WriteRevoke failed: "
+        << static_cast<int>(cleanup_res.error());
 }
 
 // ============================================================================
