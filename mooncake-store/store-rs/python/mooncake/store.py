@@ -1502,35 +1502,37 @@ def _items_use_bytes_payloads(items: Sequence[tuple]) -> bool:
     return isinstance(sample, (bytes, bytearray, memoryview))
 
 
-# Parallelism types from native module
-ParallelAxis = _native.ParallelAxis
-TensorParallelism = _native.TensorParallelism
-ReadTarget = _native.ReadTarget
-AXIS_DP = _native.AXIS_DP()
-AXIS_TP = _native.AXIS_TP()
-AXIS_EP = _native.AXIS_EP()
-AXIS_PP = _native.AXIS_PP()
-READ_MODE_AS_STORED = _native.READ_MODE_AS_STORED()
-READ_MODE_SHARD = _native.READ_MODE_SHARD()
-READ_MODE_FULL = _native.READ_MODE_FULL()
+# Parallelism types from native module (optional — absent in older wheels)
+try:
+    ParallelAxis = _native.ParallelAxis
+    TensorParallelism = _native.TensorParallelism
+    ReadTarget = _native.ReadTarget
+    AXIS_DP = _native.AXIS_DP()
+    AXIS_TP = _native.AXIS_TP()
+    AXIS_EP = _native.AXIS_EP()
+    AXIS_PP = _native.AXIS_PP()
+    READ_MODE_AS_STORED = _native.READ_MODE_AS_STORED()
+    READ_MODE_SHARD = _native.READ_MODE_SHARD()
+    READ_MODE_FULL = _native.READ_MODE_FULL()
+except AttributeError:
+    pass
 
 __all__ = [
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
     "ReplicateConfig",
-    "ParallelAxis",
-    "TensorParallelism",
-    "ReadTarget",
-    "AXIS_DP",
-    "AXIS_TP",
-    "AXIS_EP",
-    "AXIS_PP",
-    "READ_MODE_AS_STORED",
-    "READ_MODE_SHARD",
-    "READ_MODE_FULL",
     "init_tracing",
     "metrics_text",
     "start_metrics_server",
     "stop_metrics_server",
     "metrics_server_address",
 ]
+
+_PARALLEL_EXPORTS = [
+    "ParallelAxis", "TensorParallelism", "ReadTarget",
+    "AXIS_DP", "AXIS_TP", "AXIS_EP", "AXIS_PP",
+    "READ_MODE_AS_STORED", "READ_MODE_SHARD", "READ_MODE_FULL",
+]
+for _name in _PARALLEL_EXPORTS:
+    if _name in globals():
+        __all__.append(_name)
