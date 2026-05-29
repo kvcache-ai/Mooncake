@@ -929,10 +929,19 @@ pub(crate) fn record_rebalance_bytes(phase: &'static str, bytes: u64) {
 }
 
 pub(crate) fn record_transport_bytes(direction: &'static str, peer_kind: &'static str, bytes: u64) {
+    record_transport_bytes_with_registry(global_metrics_registry(), direction, peer_kind, bytes);
+}
+
+pub(crate) fn record_transport_bytes_with_registry(
+    registry: &SharedMetricsRegistry,
+    direction: &'static str,
+    peer_kind: &'static str,
+    bytes: u64,
+) {
     if bytes == 0 {
         return;
     }
-    global_metrics_registry().lock().transport_bytes.add(
+    registry.lock().transport_bytes.add(
         TransportBytesKey {
             direction,
             peer_kind,
@@ -946,7 +955,21 @@ pub(crate) fn record_transport_operation(
     peer_kind: &'static str,
     result: &'static str,
 ) {
-    global_metrics_registry().lock().transport_operations.add(
+    record_transport_operation_with_registry(
+        global_metrics_registry(),
+        direction,
+        peer_kind,
+        result,
+    );
+}
+
+pub(crate) fn record_transport_operation_with_registry(
+    registry: &SharedMetricsRegistry,
+    direction: &'static str,
+    peer_kind: &'static str,
+    result: &'static str,
+) {
+    registry.lock().transport_operations.add(
         TransportOperationKey {
             direction,
             peer_kind,
