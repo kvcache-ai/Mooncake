@@ -459,14 +459,13 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise);
 
-    // OK / INTERNAL_ERROR / INVALID_PARAMS / NOT_IMPLEMENTED: promise
-    // fulfilled, caller co_return. Any other code: try next route; use returned
-    // code as final_result if all routes are exhausted.
+    // Returns per-route ErrorCode. On OK, fulfills promise. INVALID_PARAMS /
+    // NOT_IMPLEMENTED are terminal in RunReadWithRetry; other codes retry until
+    // routes are exhausted (final_result set at end).
     async_simple::coro::Lazy<ErrorCode> RunForwardReadOnRoute(
         const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-            promise,
-        RouteIterator& iter);
+            promise);
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,

@@ -22,7 +22,7 @@ namespace {
 // Max retries when AsyncWriteRevoke or AsyncUnPinKey fails on the forward path
 // (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
 // success; a missing owner record is already OK (idempotent).
-constexpr int kUnpinOrWriteRevokeRetryMaxAttempts = 3;
+constexpr int kRevokeRetryMaxCnt = 3;
 
 inline bool IsAlreadyExistsError(ErrorCode err) {
     return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
@@ -30,92 +30,7 @@ inline bool IsAlreadyExistsError(ErrorCode err) {
            err == ErrorCode::OBJECT_ALREADY_EXISTS;
 }
 
-bool LeaseCleanupErrorTreatAsEffectiveOk(ErrorCode e) {
-    return e == ErrorCode::LEASE_EXPIRED;
-}
-
 }  // namespace
-
-async_simple::coro::Lazy<void>
-P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
-    std::shared_ptr<WritePromise> promise, PeerClient* peer,
-    TeTransferFn te_transfer, std::shared_ptr<RemoteWriteRequest> write_req,
-    std::vector<Slice>* slices) {
-    if (!peer || !te_transfer || !write_req || !slices) {
-        promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
-        co_return;
-    }
-    if (slices->size() != 1) {
-        LOG(ERROR)
-            << "Forward transfer write supports a single slice only, key="
-            << write_req->key << ", slice_count=" << slices->size();
-        promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
-        co_return;
-    }
-    PreWriteRequest pre_req;
-    pre_req.key = write_req->key;
-    pre_req.size_bytes = slices->front().size;
-    pre_req.target_tier_id = write_req->target_tier_id;
-
-    auto pre = co_await peer->AsyncPreWrite(pre_req);
-    if (!pre) {
-        if (!IsAlreadyExistsError(pre.error())) {
-            LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
-                       << ", error=" << pre.error();
-        }
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
-        co_return;
-    }
-
-    std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
-    void* base = slices->front().ptr;
-    auto te = te_transfer(base, slices->front().size, dest);
-    if (!te) {
-        LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
-                   << ", error=" << te.error();
-        WriteRevokeRequest revoke_req;
-        revoke_req.key = write_req->key;
-        revoke_req.write_operation_id = pre.value().write_operation_id;
-        tl::expected<void, ErrorCode> revoke_res;
-        for (int attempt = 0; attempt < kUnpinOrWriteRevokeRetryMaxAttempts;
-             ++attempt) {
-            revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
-            if (revoke_res) {
-                break;
-            }
-            if (LeaseCleanupErrorTreatAsEffectiveOk(revoke_res.error())) {
-                revoke_res = tl::expected<void, ErrorCode>{};
-                break;
-            }
-            if (attempt + 1 < kUnpinOrWriteRevokeRetryMaxAttempts) {
-                LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
-                             << write_req->key << ", attempt=" << (attempt + 1)
-                             << ", error=" << revoke_res.error();
-            }
-        }
-        if (!revoke_res) {
-            LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
-                       << write_req->key << ", error=" << revoke_res.error();
-        }
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
-        co_return;
-    }
-
-    WriteCommitRequest commit;
-    commit.key = write_req->key;
-    commit.write_operation_id = pre.value().write_operation_id;
-    auto cm = co_await peer->AsyncWriteCommit(commit);
-    if (!cm) {
-        promise->setValue(
-            tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
-        co_return;
-    }
-    promise->setValue(tl::expected<void, ErrorCode>{});
-}
 
 // ============================================================================
 // Construction / Destruction
@@ -1577,20 +1492,15 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
 async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
-        promise,
-    RouteIterator& iter) {
+        promise) {
     if (!data_manager_.has_value()) {
         LOG(ERROR) << "Forward transfer read requires DataManager";
-        promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
         co_return ErrorCode::INTERNAL_ERROR;
     }
     if (req->dest_buffers.size() != 1) {
         LOG(ERROR)
             << "Forward transfer read supports a single dest buffer only, key="
             << req->key << ", buffer_count=" << req->dest_buffers.size();
-        promise->setValue(tl::expected<void, ErrorCode>(
-            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
         co_return ErrorCode::NOT_IMPLEMENTED;
     }
     PinKeyRequest pin_req;
@@ -1601,7 +1511,6 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
             LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
                        << ", error=" << pin.error();
         }
-        iter.Evict(route);
         co_return pin.error();
     }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
@@ -1616,17 +1525,17 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         cleanup.key = req->key;
         cleanup.read_operation_id = pin.value().read_operation_id;
         tl::expected<void, ErrorCode> cleanup_unpin;
-        for (int attempt = 0; attempt < kUnpinOrWriteRevokeRetryMaxAttempts;
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
              ++attempt) {
             cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
             if (cleanup_unpin) {
                 break;
             }
-            if (LeaseCleanupErrorTreatAsEffectiveOk(cleanup_unpin.error())) {
+            if (cleanup_unpin.error() == ErrorCode::LEASE_EXPIRED) {
                 cleanup_unpin = tl::expected<void, ErrorCode>{};
                 break;
             }
-            if (attempt + 1 < kUnpinOrWriteRevokeRetryMaxAttempts) {
+            if (attempt + 1 < kRevokeRetryMaxCnt) {
                 LOG(WARNING)
                     << "AsyncUnPinKey retry after TE failure, key=" << req->key
                     << ", attempt=" << (attempt + 1)
@@ -1637,24 +1546,23 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
             LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
                        << req->key << ", error=" << cleanup_unpin.error();
         }
-        iter.Evict(route);
         co_return tr.error();
     }
     UnPinKeyRequest unpin_req;
     unpin_req.key = req->key;
     unpin_req.read_operation_id = pin.value().read_operation_id;
     tl::expected<void, ErrorCode> unpin_res;
-    for (int attempt = 0; attempt < kUnpinOrWriteRevokeRetryMaxAttempts;
+    for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
          ++attempt) {
         unpin_res = co_await route.peer->AsyncUnPinKey(unpin_req);
         if (unpin_res) {
             break;
         }
-        if (LeaseCleanupErrorTreatAsEffectiveOk(unpin_res.error())) {
+        if (unpin_res.error() == ErrorCode::LEASE_EXPIRED) {
             unpin_res = tl::expected<void, ErrorCode>{};
             break;
         }
-        if (attempt + 1 < kUnpinOrWriteRevokeRetryMaxAttempts) {
+        if (attempt + 1 < kRevokeRetryMaxCnt) {
             LOG(WARNING) << "AsyncUnPinKey retry after forward read, key="
                          << req->key << ", attempt=" << (attempt + 1)
                          << ", error=" << unpin_res.error();
@@ -1663,7 +1571,6 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     if (!unpin_res) {
         LOG(ERROR) << "AsyncUnPinKey failed after forward read, key="
                    << req->key << ", error=" << unpin_res.error();
-        iter.Evict(route);
         co_return unpin_res.error();
     }
     tl::expected<void, ErrorCode> ok;
@@ -1680,51 +1587,45 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
     try {
         while (auto route = co_await iter.AsyncNext()) {
             try {
-                if (transfer_direction_mode_ ==
-                    TransferDirectionMode::FORWARD) {
-                    const ErrorCode route_result =
-                        co_await RunForwardReadOnRoute(*route, req, promise,
-                                                       iter);
-                    if (route_result == ErrorCode::OK) {
-                        co_return;
-                    }
-                    if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
-                        LOG(ERROR)
-                            << "Forward read failed, key: " << req->key
-                            << ", error: " << route_result
-                            << ", route: " << route->proxy.ip_address << ":"
-                            << route->proxy.rpc_port
-                            << ", client_id: " << route->proxy.client_id
-                            << ", segment_id: " << route->proxy.segment_id
-                            << ", is_cached: " << route->is_cached;
-                    }
-                    if (route_result == ErrorCode::INTERNAL_ERROR ||
-                        route_result == ErrorCode::INVALID_PARAMS ||
-                        route_result == ErrorCode::NOT_IMPLEMENTED) {
-                        co_return;
-                    }
-                    final_result = route_result;
-                    continue;
+                const bool forward_read =
+                    transfer_direction_mode_ == TransferDirectionMode::FORWARD;
+                ErrorCode route_result;
+                if (forward_read) {
+                    route_result = co_await RunForwardReadOnRoute(*route, req,
+                                                                  promise);
                 } else {
                     auto result =
                         co_await route->peer->AsyncReadRemoteData(*req);
-                    if (result.has_value()) {
+                    route_result = result.has_value() ? ErrorCode::OK
+                                                      : result.error();
+                }
+
+                if (route_result == ErrorCode::OK) {
+                    if (!forward_read) {
                         tl::expected<void, ErrorCode> ok;
                         promise->setValue(std::move(ok));
+                    }
+                    co_return;
+                } else if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(ERROR)
+                        << (forward_read ? "Forward read failed, key: "
+                                         : "Failed to get from remote, key: ")
+                        << req->key << ", error: " << route_result
+                        << ", route: " << route->proxy.ip_address << ":"
+                        << route->proxy.rpc_port
+                        << ", client_id: " << route->proxy.client_id
+                        << ", segment_id: " << route->proxy.segment_id
+                        << ", is_cached: " << route->is_cached;
+                    // Request/local constraint errors; another route cannot help.
+                    if (route_result == ErrorCode::INVALID_PARAMS ||
+                        route_result == ErrorCode::NOT_IMPLEMENTED) {
+                        promise->setValue(
+                            tl::make_unexpected(route_result));
                         co_return;
                     }
-                    if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
-                        LOG(ERROR)
-                            << "Failed to get from remote, key: " << req->key
-                            << ", error: " << result.error()
-                            << ", route: " << route->proxy.ip_address << ":"
-                            << route->proxy.rpc_port
-                            << ", client_id: " << route->proxy.client_id
-                            << ", segment_id: " << route->proxy.segment_id
-                            << ", is_cached: " << route->is_cached;
-                    }
-                    final_result = result.error();
                 }
+
+                final_result = route_result;
             } catch (const std::exception& e) {
                 final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
@@ -2095,6 +1996,87 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 
     auto [inserted_it, _] = peer_clients_.emplace(endpoint, std::move(client));
     return *inserted_it->second;
+}
+
+async_simple::coro::Lazy<void>
+P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
+    std::shared_ptr<WritePromise> promise, PeerClient* peer,
+    TeTransferFn te_transfer, std::shared_ptr<RemoteWriteRequest> write_req,
+    std::vector<Slice>* slices) {
+    if (!peer || !te_transfer || !write_req || !slices) {
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+        co_return;
+    }
+    if (slices->size() != 1) {
+        LOG(ERROR)
+            << "Forward transfer write supports a single slice only, key="
+            << write_req->key << ", slice_count=" << slices->size();
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
+        co_return;
+    }
+    PreWriteRequest pre_req;
+    pre_req.key = write_req->key;
+    pre_req.size_bytes = slices->front().size;
+    pre_req.target_tier_id = write_req->target_tier_id;
+
+    auto pre = co_await peer->AsyncPreWrite(pre_req);
+    if (!pre) {
+        if (!IsAlreadyExistsError(pre.error())) {
+            LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
+                       << ", error=" << pre.error();
+        }
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
+        co_return;
+    }
+
+    std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
+    void* base = slices->front().ptr;
+    auto te = te_transfer(base, slices->front().size, dest);
+    if (!te) {
+        LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
+                   << ", error=" << te.error();
+        WriteRevokeRequest revoke_req;
+        revoke_req.key = write_req->key;
+        revoke_req.write_operation_id = pre.value().write_operation_id;
+        tl::expected<void, ErrorCode> revoke_res;
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt;
+             ++attempt) {
+            revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
+            if (revoke_res) {
+                break;
+            }
+            if (revoke_res.error() == ErrorCode::LEASE_EXPIRED) {
+                revoke_res = tl::expected<void, ErrorCode>{};
+                break;
+            }
+            if (attempt + 1 < kRevokeRetryMaxCnt) {
+                LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
+                             << write_req->key << ", attempt=" << (attempt + 1)
+                             << ", error=" << revoke_res.error();
+            }
+        }
+        if (!revoke_res) {
+            LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
+                       << write_req->key << ", error=" << revoke_res.error();
+        }
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
+        co_return;
+    }
+
+    WriteCommitRequest commit;
+    commit.key = write_req->key;
+    commit.write_operation_id = pre.value().write_operation_id;
+    auto cm = co_await peer->AsyncWriteCommit(commit);
+    if (!cm) {
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
+        co_return;
+    }
+    promise->setValue(tl::expected<void, ErrorCode>{});
 }
 
 }  // namespace mooncake
