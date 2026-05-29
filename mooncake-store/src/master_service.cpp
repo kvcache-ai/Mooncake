@@ -910,11 +910,48 @@ auto MasterService::ExistKey(const std::string& key)
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys) {
-    std::vector<tl::expected<bool, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(ExistKey(key));
+    std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
+
+    // Group key indices by their target metadata shard so each shard lock is
+    // acquired once per batch instead of once per key (as repeated ExistKey
+    // calls would do). Keys that hash to the same shard are processed together
+    // under a single shared lock. This only consults the group-routing index
+    // (via getMetadataShardIndex), so it runs before taking snapshot_mutex_ to
+    // keep that critical section limited to the shard reads below.
+    std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        indices_by_shard[getMetadataShardIndex(keys[i])].push_back(i);
     }
+
+    // Take snapshot_mutex_ per shard rather than across the whole batch: exist
+    // results are independent per key, so no cross-shard snapshot consistency
+    // is required, and this lets a pending snapshot (which needs the unique
+    // lock) interleave between shards instead of waiting for the full batch.
+    for (const auto& [shard_idx, key_indices] : indices_by_shard) {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (size_t i : key_indices) {
+            const auto& key = keys[i];
+            auto it = shard->metadata.find(key);
+            if (it == shard->metadata.end() || !it->second.IsValid()) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                results[i] = false;
+                continue;
+            }
+
+            const auto& metadata = it->second;
+            if (metadata.HasReplica(&Replica::fn_is_completed)) {
+                // Grant a lease to the object as it may be further used by the
+                // client.
+                GrantLeaseForGroup(shard.get(), key, metadata);
+                results[i] = true;
+            } else {
+                // If no complete replica is found, the key does not exist.
+                results[i] = false;
+            }
+        }
+    }
+
     return results;
 }
 

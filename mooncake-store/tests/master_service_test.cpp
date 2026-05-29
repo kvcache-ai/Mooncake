@@ -3687,6 +3687,59 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+// Covers the branches BatchExistKey reimplements inline (rather than calling
+// ExistKey per key): group-id routing through getMetadataShardIndex, the
+// grouped-lease path, the started-but-incomplete replica case, and result
+// ordering across a mix of key kinds.
+TEST_F(MasterServiceTest, BatchExistKeyGroupedAndIncomplete) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 128;
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(*service_, "test_segment", buffer, size);
+
+    // Two grouped keys sharing a group id that routes to a shard different from
+    // grouped_key_a's own shard. BatchExistKey must route both via the group id
+    // so they land on the same shard and are processed under a single lock,
+    // exercising getMetadataShardIndex's group path and GrantLeaseForGroup.
+    const std::string grouped_key_a = "batch_grouped_key_a";
+    const std::string grouped_key_b = "batch_grouped_key_b";
+    const std::string group_id = FindGroupIdOnDifferentShard(grouped_key_a);
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids = std::vector<std::string>{group_id};
+    PutCompletedObject(*service_, client_id, grouped_key_a, grouped_config);
+    PutCompletedObject(*service_, client_id, grouped_key_b, grouped_config);
+
+    // An ungrouped, fully-completed key.
+    const std::string completed_key = "batch_completed_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, completed_key, config);
+
+    // A key that started but never completed: it exists in metadata but has no
+    // complete replica, so it must report as not existing.
+    const std::string incomplete_key = "batch_incomplete_key";
+    ASSERT_TRUE(service_->PutStart(client_id, incomplete_key, 1024, config)
+                    .has_value());
+
+    // A key that was never put at all.
+    const std::string missing_key = "batch_missing_key";
+
+    std::vector<std::string> keys = {grouped_key_a, completed_key,
+                                     incomplete_key, missing_key,
+                                     grouped_key_b};
+    auto resp = service_->BatchExistKey(keys);
+    ASSERT_EQ(resp.size(), keys.size());
+    EXPECT_TRUE(resp[0].value());   // grouped_key_a
+    EXPECT_TRUE(resp[1].value());   // completed_key
+    EXPECT_FALSE(resp[2].value());  // incomplete_key: started, not completed
+    EXPECT_FALSE(resp[3].value());  // missing_key: never put
+    EXPECT_TRUE(resp[4].value());   // grouped_key_b
+}
+
 TEST_F(MasterServiceTest, BatchQueryIpTest) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
