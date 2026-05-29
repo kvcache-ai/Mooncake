@@ -32,9 +32,14 @@ deployment and uses:
 Replace these values with the local hostname/IP, RDMA device, and LMCache
 checkout path for your environment.
 
-The `mooncake_store` MP L2 adapter requires LMCache's `lmcache_mooncake` C++
-extension. When building LMCache from source, enable Mooncake support, for
-example:
+LMCache requirement: This example requires LMCache v0.4.5 or later. LMCache
+must also be built from source with Mooncake support enabled, because the
+`mooncake_store` MP L2 adapter depends on the optional
+`lmcache.lmcache_mooncake` C++ extension. 
+
+The standard prebuilt LMCache wheels currently include the Python Mooncake
+adapter files, but do not include the optional `lmcache.lmcache_mooncake`
+native extension.
 
 ```bash
 BUILD_MOONCAKE=1 \
