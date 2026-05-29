@@ -1177,6 +1177,17 @@ class MasterService {
         return {NormalizeTenantId(tenant_id), user_key};
     }
 
+    static std::string MakeTenantScopedKey(const std::string& tenant_id,
+                                           const std::string& key) {
+        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        std::string scoped_key;
+        scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
+        scoped_key.append(normalized_tenant);
+        scoped_key.push_back('\0');
+        scoped_key.append(key);
+        return scoped_key;
+    }
+
     // Helper to get shard index from tenant-scoped object identity.
     size_t getShardIndex(const std::string& tenant_id,
                          const std::string& user_key) const {
@@ -1197,11 +1208,18 @@ class MasterService {
     size_t getMetadataShardIndex(const std::string& key) const;
     size_t getMetadataShardIndex(const std::string& tenant_id,
                                  const std::string& key) const;
-    void RegisterGroupMember(TenantState& tenant_state, const std::string& key,
+    void RegisterGroupMember(TenantState& tenant_state,
+                             const std::string& tenant_id,
+                             const std::string& key,
                              const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
+                               const std::string& tenant_id,
                                const std::string& key,
                                const std::string& group_id);
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const std::string& tenant_id);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1435,11 +1453,8 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            const std::string group_id = it_->second.group_id;
-            tenant_state_->metadata.erase(it_);
+            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id);
             it_ = tenant_state_->metadata.end();
-            service_->UnregisterGroupMember(*tenant_state_, object_id_.user_key,
-                                            group_id);
             MaybeEraseEmptyTenant();
         }
 

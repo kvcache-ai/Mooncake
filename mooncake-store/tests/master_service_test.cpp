@@ -619,6 +619,50 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     EXPECT_FALSE(exists_after_remove.value());
 }
 
+TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "tenant_grouped_shared_user_key";
+    const std::string tenant_a = "tenant_group_route_a";
+    const std::string tenant_b = "tenant_group_route_b";
+    const std::string group_a = FindGroupIdOnDifferentShard(key);
+    std::string group_b;
+    for (int i = 0; i < 10000; ++i) {
+        group_b = key + "_tenant_b_group_" + std::to_string(i);
+        if (std::hash<std::string>{}(group_b) % 1024 !=
+            std::hash<std::string>{}(group_a) % 1024) {
+            break;
+        }
+    }
+
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids = std::vector<std::string>{group_a};
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    config_b.group_ids = std::vector<std::string>{group_b};
+
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value_or(false));
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
 TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
     auto service_config = MasterServiceConfig::builder()
                               .set_put_start_discard_timeout_sec(0)
@@ -645,6 +689,52 @@ TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
     ASSERT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+}
+
+TEST_F(MasterServiceTest, BatchRemoveUnregistersGroupedRoute) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "batch_remove_grouped_route";
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    PutCompletedObject(*service_, client_id, key, grouped_config);
+
+    auto remove_results =
+        service_->BatchRemove(std::vector<std::string>{key}, /*force=*/true);
+    ASSERT_EQ(remove_results.size(), 1u);
+    ASSERT_TRUE(remove_results[0].has_value());
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+}
+
+TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "regex_remove_grouped_route";
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    PutCompletedObject(*service_, client_id, key, grouped_config);
+
+    auto removed = service_->RemoveByRegex("^regex_remove_grouped_route$",
+                                           /*force=*/true);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed.value(), 1);
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
 }
 
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
@@ -811,6 +901,28 @@ TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
     ASSERT_TRUE(
         service_->UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+}
+
+TEST_F(MasterServiceTest, UpsertRejectsExistingUngroupedToGrouped) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "upsert_ungrouped_to_grouped";
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    auto upsert_start =
+        service_->UpsertStart(client_id, key, 2048, grouped_config);
+    ASSERT_FALSE(upsert_start.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_start.error());
+
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
 }
 
 TEST_F(MasterServiceTest,

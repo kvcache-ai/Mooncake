@@ -590,42 +590,44 @@ MasterService::getAliveClientsSnapshot() const {
 }
 
 size_t MasterService::getMetadataShardIndex(const std::string& key) const {
-    std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it = object_group_ids_.find(key);
-    if (it == object_group_ids_.end()) {
-        return getShardIndex(key);
-    }
-    return getShardIndex(it->second);
+    return getMetadataShardIndex("default", key);
 }
 
 size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
                                             const std::string& key) const {
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto it = object_group_ids_.find(key);
+    auto it =
+        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
     if (it == object_group_ids_.end()) {
-        return getShardIndex(tenant_id, key);
+        return getShardIndex(normalized_tenant, key);
     }
     return getShardIndex(it->second);
 }
 
 void MasterService::RegisterGroupMember(TenantState& tenant_state,
+                                        const std::string& tenant_id,
                                         const std::string& key,
                                         const std::string& group_id) {
     if (group_id.empty()) {
         return;
     }
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    object_group_ids_[key] = group_id;
-    groups_needing_lease_refresh_.insert(group_id);
+    object_group_ids_[MakeTenantScopedKey(normalized_tenant, key)] = group_id;
+    groups_needing_lease_refresh_.insert(
+        MakeTenantScopedKey(normalized_tenant, group_id));
     tenant_state.group_members[group_id].insert(key);
 }
 
 void MasterService::UnregisterGroupMember(TenantState& tenant_state,
+                                          const std::string& tenant_id,
                                           const std::string& key,
                                           const std::string& group_id) {
     if (group_id.empty()) {
         return;
     }
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     bool group_empty = false;
     auto group_it = tenant_state.group_members.find(group_id);
     if (group_it != tenant_state.group_members.end()) {
@@ -636,13 +638,27 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
         }
     }
     std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-    auto route_it = object_group_ids_.find(key);
+    auto route_it =
+        object_group_ids_.find(MakeTenantScopedKey(normalized_tenant, key));
     if (route_it != object_group_ids_.end() && route_it->second == group_id) {
         object_group_ids_.erase(route_it);
     }
     if (group_empty) {
-        groups_needing_lease_refresh_.erase(group_id);
+        groups_needing_lease_refresh_.erase(
+            MakeTenantScopedKey(normalized_tenant, group_id));
     }
+}
+
+std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+MasterService::EraseMetadata(
+    TenantState& tenant_state,
+    std::unordered_map<std::string, ObjectMetadata>::iterator it,
+    const std::string& tenant_id) {
+    const std::string key = it->first;
+    const std::string group_id = it->second.group_id;
+    auto next = tenant_state.metadata.erase(it);
+    UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
+    return next;
 }
 
 void MasterService::RebuildGroupRoutingIndex() {
@@ -657,8 +673,10 @@ void MasterService::RebuildGroupRoutingIndex() {
                     continue;
                 }
                 tenant_state.group_members[metadata.group_id].insert(key);
-                rebuilt_group_ids[key] = metadata.group_id;
-                groups_needing_refresh.insert(metadata.group_id);
+                rebuilt_group_ids[MakeTenantScopedKey(tenant_id, key)] =
+                    metadata.group_id;
+                groups_needing_refresh.insert(
+                    MakeTenantScopedKey(tenant_id, metadata.group_id));
             }
         }
     }
@@ -681,7 +699,8 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                                     default_kv_soft_pin_ttl_);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
-        needs_refresh = groups_needing_lease_refresh_.find(metadata.group_id) !=
+        needs_refresh = groups_needing_lease_refresh_.find(MakeTenantScopedKey(
+                            metadata.tenant_id, metadata.group_id)) !=
                         groups_needing_lease_refresh_.end();
     }
     if (!needs_refresh) {
@@ -706,7 +725,8 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
-        groups_needing_lease_refresh_.erase(metadata.group_id);
+        groups_needing_lease_refresh_.erase(
+            MakeTenantScopedKey(metadata.tenant_id, metadata.group_id));
     }
 }
 
@@ -731,7 +751,7 @@ void MasterService::ClearInvalidHandles(
                         promotion_in_flight_.fetch_sub(
                             1, std::memory_order_relaxed);
                     }
-                    it = tenant_state.metadata.erase(it);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
                 }
@@ -1448,7 +1468,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     // Publish the route before inserting metadata for grouped objects.
-    RegisterGroupMember(tenant_state, key, group_id);
+    RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
@@ -1541,7 +1561,18 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
             tenant_state.processing_keys.erase(key);
-            tenant_state.metadata.erase(it);
+            EraseMetadata(tenant_state, it, object_id.tenant_id);
+            if (group_id.empty()) {
+                const size_t ungrouped_shard_idx =
+                    getShardIndex(object_id.tenant_id, object_id.user_key);
+                if (ungrouped_shard_idx != target_shard_idx) {
+                    MetadataShardAccessorRW ungrouped_shard(
+                        this, ungrouped_shard_idx);
+                    return AllocateAndInsertMetadata(
+                        ungrouped_shard, client_id, key, slice_length, config,
+                        group_id, object_id.tenant_id, now);
+                }
+            }
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -1847,7 +1878,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         CleanupStaleHandles(it->second, alive_clients)) {
         tenant_state.processing_keys.erase(key);
         ErasePromotionTaskIfPresent(tenant_state, key);
-        tenant_state.metadata.erase(it);
+        EraseMetadata(tenant_state, it, object_id.tenant_id);
         it = tenant_state.metadata.end();
     }
 
@@ -1857,23 +1888,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
         // Reject if the caller tries to change group membership.
         // Group membership is immutable while an object exists.
-        if (config.group_ids.has_value() && metadata.IsGrouped()) {
-            const bool has_requested_group_id =
-                config.group_ids.has_value() && !group_id.empty();
-            if (has_requested_group_id && metadata.group_id != group_id) {
-                LOG(ERROR) << "key=" << key
-                           << ", error=group_membership_is_immutable";
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            if (!has_requested_group_id && metadata.IsGrouped()) {
-                // Explicitly ungrouping a grouped object is not allowed.
-                if (config.group_ids.has_value() &&
-                    config.group_ids->at(0).empty()) {
-                    LOG(ERROR) << "key=" << key
-                               << ", error=group_membership_is_immutable";
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-            }
+        if (config.group_ids.has_value() && metadata.group_id != group_id) {
+            LOG(ERROR) << "key=" << key
+                       << ", error=group_membership_is_immutable";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         // Reject if a Copy/Move task is actively reading this key's replicas.
@@ -1908,7 +1926,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // effectively does not exist — fall through to Case A.
             if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                tenant_state.metadata.erase(it);
+                EraseMetadata(tenant_state, it, object_id.tenant_id);
                 it = tenant_state.metadata.end();
             }
         }
@@ -1919,7 +1937,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     if (it == tenant_state.metadata.end()) {
         VLOG(1) << "key=" << key << ", action=upsert_start_case_a";
         const size_t case_a_shard_idx =
-            group_id.empty() ? lookup_shard_idx : getShardIndex(group_id);
+            group_id.empty()
+                ? getShardIndex(object_id.tenant_id, object_id.user_key)
+                : getShardIndex(group_id);
         if (case_a_shard_idx != lookup_shard_idx) {
             MetadataShardAccessorRW target_shard(this, case_a_shard_idx);
             return AllocateAndInsertMetadata(target_shard, client_id, key,
@@ -1997,20 +2017,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     merged_config.with_soft_pin =
         merged_config.with_soft_pin || metadata.IsSoftPinned();
 
-    const std::string effective_group_id =
-        metadata.IsGrouped() ? metadata.group_id : group_id;
-
+    const std::string existing_group_id = metadata.group_id;
     auto old_replicas = metadata.PopReplicas();
     if (!old_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(std::move(old_replicas),
                                          now + put_start_release_timeout_sec_);
     }
-    tenant_state.metadata.erase(it);
+    EraseMetadata(tenant_state, it, object_id.tenant_id);
 
     VLOG(1) << "key=" << key << ", action=upsert_start_case_c_reallocate";
     return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                     merged_config, effective_group_id,
+                                     merged_config, existing_group_id,
                                      object_id.tenant_id, now);
 }
 
@@ -2672,7 +2690,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = tenant_state.metadata.erase(it);
+                it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
             } else {
                 ++it;
@@ -2710,7 +2728,7 @@ long MasterService::RemoveAll(bool force) {
                         &Replica::fn_is_memory_replica);
                     total_freed_size += it->second.size * mem_rep_count;
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
-                    it = tenant_state.metadata.erase(it);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                     removed_count++;
                 } else {
                     ++it;
@@ -2781,7 +2799,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                tenant_state.metadata.erase(it);
+                EraseMetadata(tenant_state, it, "default");
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
@@ -2818,7 +2836,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             ErasePromotionTaskIfPresent(tenant_state, key);
-            tenant_state.metadata.erase(it);
+            EraseMetadata(tenant_state, it, "default");
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
@@ -3567,7 +3585,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
-                    tenant_state.metadata.erase(it);
+                    EraseMetadata(tenant_state, it, tenant_it->first);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -3582,7 +3600,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    tenant_state.metadata.erase(it);
+                    EraseMetadata(tenant_state, it, tenant_it->first);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -3624,7 +3642,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                tenant_state.metadata.erase(metadata_it);
+                EraseMetadata(tenant_state, metadata_it, tenant_it->first);
             }
             task_it = tenant_state.replication_tasks.erase(task_it);
         }
@@ -4629,7 +4647,8 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                 (it->second.IsLeaseExpired(cleanup_now) &&
                                  !it->second.IsSoftPinned(cleanup_now))) {
                                 VLOG(1) << "clear metadata key=" << it->first;
-                                it = tenant_state.metadata.erase(it);
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }
@@ -4925,7 +4944,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 result.evicted_objects++;
             }
             if (member_key != key && !member_metadata.IsValid()) {
-                tenant_state.metadata.erase(member_it);
+                EraseMetadata(tenant_state, member_it, tenant_id);
             }
         }
         return result;
@@ -5005,7 +5024,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             tenant_state, /*allow_soft_pinned=*/false);
                         total_freed_size += evict_result.freed_bytes;
                         if (it->second.IsValid() == false) {
-                            it = tenant_state.metadata.erase(it);
+                            it = EraseMetadata(tenant_state, it,
+                                               tenant_it->first);
                         } else {
                             ++it;
                         }
@@ -5076,7 +5096,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 tenant_state, /*allow_soft_pinned=*/false);
                             total_freed_size += evict_result.freed_bytes;
                             if (!it->second.IsValid()) {
-                                it = tenant_state.metadata.erase(it);
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }
@@ -5135,7 +5156,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 tenant_state, /*allow_soft_pinned=*/true);
                             total_freed_size += evict_result.freed_bytes;
                             if (!it->second.IsValid()) {
-                                it = tenant_state.metadata.erase(it);
+                                it = EraseMetadata(tenant_state, it,
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }
@@ -5266,7 +5288,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 total_freed_size += metadata.size * erased;
                 shard_evicted_count++;
                 if (!metadata.IsValid()) {
-                    it = tenant_state.metadata.erase(it);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
                 }
