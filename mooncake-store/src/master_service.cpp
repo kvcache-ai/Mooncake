@@ -1673,13 +1673,6 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const std::string& tenant_id,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, "default", replica_type);
-}
-
-auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           const std::string& tenant_id,
-                           ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentity(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
