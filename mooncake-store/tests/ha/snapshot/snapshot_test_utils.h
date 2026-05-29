@@ -186,9 +186,9 @@ inline std::vector<uint8_t> BuildMetadataPayload(
         format == SnapshotMetadataFormat::kWithGroupId;
     constexpr uint32_t kReplicaCount = 1;
     // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
-    const size_t array_size =
-        7 + kReplicaCount + (include_data_type ? 1 : 0) +
-        (include_hard_pinned ? 1 : 0) + (include_group_id ? 1 : 0);
+    const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
+                              (include_hard_pinned ? 1 : 0) +
+                              (include_group_id ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);

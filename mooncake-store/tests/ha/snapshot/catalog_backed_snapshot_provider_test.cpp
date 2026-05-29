@@ -155,8 +155,7 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
 // restore reader must accept every shape; otherwise it rejects the snapshot and
 // falls back to OpLog-only bootstrap. These tests pin each on-wire format.
 
-TEST_P(CatalogBackedSnapshotProviderTest,
-       LoadLatestSnapshotWithDataTypeField) {
+TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithDataTypeField) {
     // 8 + replica_count: data_type packed right after replica_count.
     PublishSnapshotPayload(SnapshotMetadataFormat::kDataTypeOnly);
     ExpectLoadsDefaultObject();
@@ -177,8 +176,7 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     ExpectLoadsDefaultObject();
 }
 
-TEST_P(CatalogBackedSnapshotProviderTest,
-       LoadLatestSnapshotWithGroupId) {
+TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
     // 10 + replica_count: current writer format (data_type + hard_pinned +
     // trailing group_id). Regression test for the live snapshot restore
     // failure against the latest metadata layout.
