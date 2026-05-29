@@ -46,6 +46,9 @@ add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
 add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
+if(USE_NOF)
+  add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+endif()
 add_store_test(client_integration_test client_integration_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)

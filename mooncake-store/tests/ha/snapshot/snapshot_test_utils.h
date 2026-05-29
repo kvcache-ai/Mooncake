@@ -50,12 +50,16 @@ struct CatalogBackendParam {
 //   kLegacy:         7 + replica_count, no data_type, no trailing hard_pinned
 //   kDataTypeOnly:   8 + replica_count, data_type after replica_count
 //   kHardPinnedOnly: 8 + replica_count, trailing hard_pinned, no data_type
-//   kCurrent:        9 + replica_count, data_type plus trailing hard_pinned
+//   kDataTypeAndHardPinned:
+//                    9 + replica_count, data_type plus trailing hard_pinned
+//   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
+//                    (the current writer format)
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
     kHardPinnedOnly,
-    kCurrent,
+    kDataTypeAndHardPinned,
+    kWithGroupId,
 };
 
 class ScopedEnvVar {
@@ -172,15 +176,19 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
     const bool include_data_type =
         format == SnapshotMetadataFormat::kDataTypeOnly ||
-        format == SnapshotMetadataFormat::kCurrent;
+        format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
+        format == SnapshotMetadataFormat::kWithGroupId;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
-        format == SnapshotMetadataFormat::kCurrent;
+        format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
+        format == SnapshotMetadataFormat::kWithGroupId;
+    const bool include_group_id =
+        format == SnapshotMetadataFormat::kWithGroupId;
     constexpr uint32_t kReplicaCount = 1;
-    // 7 leading fields + replicas + optional data_type + optional hard_pinned.
-    const size_t array_size = 7 + kReplicaCount +
-                              (include_data_type ? 1 : 0) +
-                              (include_hard_pinned ? 1 : 0);
+    // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
+    const size_t array_size =
+        7 + kReplicaCount + (include_data_type ? 1 : 0) +
+        (include_hard_pinned ? 1 : 0) + (include_group_id ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -204,6 +212,9 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     PackDiskReplica(shard_packer, disk_file_path, object_size);
     if (include_hard_pinned) {
         shard_packer.pack(true);
+    }
+    if (include_group_id) {
+        shard_packer.pack(std::string("test-group"));
     }
 
     return WrapShardIntoMetadataRoot(shard_buffer);

@@ -151,9 +151,9 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
 }
 
 // The master snapshot writer evolved its per-object metadata layout over time
-// (data_type field, trailing hard_pinned flag). The standby restore reader must
-// accept every shape; otherwise it rejects the snapshot and falls back to
-// OpLog-only bootstrap. These tests pin each on-wire format.
+// (data_type field, trailing hard_pinned flag, trailing group_id). The standby
+// restore reader must accept every shape; otherwise it rejects the snapshot and
+// falls back to OpLog-only bootstrap. These tests pin each on-wire format.
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotWithDataTypeField) {
@@ -165,16 +165,24 @@ TEST_P(CatalogBackedSnapshotProviderTest,
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotWithHardPinnedField) {
     // 8 + replica_count: trailing hard_pinned flag, no data_type. Exercises the
-    // ambiguous-size disambiguation (first replica is not a positive integer).
+    // type-based disambiguation (first replica is not a positive integer).
     PublishSnapshotPayload(SnapshotMetadataFormat::kHardPinnedOnly);
     ExpectLoadsDefaultObject();
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotWithDataTypeAndHardPinned) {
-    // 9 + replica_count: current writer format (data_type + trailing
-    // hard_pinned). Regression test for the live snapshot restore failure.
-    PublishSnapshotPayload(SnapshotMetadataFormat::kCurrent);
+    // 9 + replica_count: data_type + trailing hard_pinned.
+    PublishSnapshotPayload(SnapshotMetadataFormat::kDataTypeAndHardPinned);
+    ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotWithGroupId) {
+    // 10 + replica_count: current writer format (data_type + hard_pinned +
+    // trailing group_id). Regression test for the live snapshot restore
+    // failure against the latest metadata layout.
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
     ExpectLoadsDefaultObject();
 }
 
