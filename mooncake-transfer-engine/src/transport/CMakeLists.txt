@@ -115,3 +115,9 @@ if(USE_CUDA
     target_link_libraries(transport PUBLIC ${CMAKE_DL_LIBS})
   endif()
 endif()
+
+if (USE_FLAGCX)
+  add_subdirectory(flagcx_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
+  target_link_libraries(transport PRIVATE flagcx)
+endif()
