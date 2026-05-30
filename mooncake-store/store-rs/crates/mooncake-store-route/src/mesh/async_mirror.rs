@@ -135,12 +135,15 @@ impl AsyncRouteMirrorWorker {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        let mut state = self.state.lock();
-        state.sender.take();
-        if let Some(shutdown) = state.shutdown.take() {
+        let (shutdown, thread) = {
+            let mut state = self.state.lock();
+            state.sender.take();
+            (state.shutdown.take(), state.thread.take())
+        };
+        if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
-        if let Some(thread) = state.thread.take() {
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
