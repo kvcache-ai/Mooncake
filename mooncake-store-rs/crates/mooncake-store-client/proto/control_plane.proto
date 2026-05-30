@@ -368,7 +368,7 @@ message ControlStreamRequest {
     ListRoutesByReplicaOwnerRequest route_list_by_replica_owner = 8;
     BatchReportRouteHitsRequest eviction_report_route_hits = 9;
     BatchTrackReplicaRoutesRequest eviction_track_replica_routes = 10;
-    BatchContainsRoutesRequest route_contains = 11;
+    BatchContainsRoutesRequest route_contains = 12;
   }
 }
 
