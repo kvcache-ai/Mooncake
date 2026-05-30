@@ -15,8 +15,10 @@ pub(crate) fn bind_local_authority_service(
     service: Arc<dyn RouteAuthorityService>,
 ) {
     let mesh = route_mesh(namespace);
-    let mut slot = mesh.authorities.entry(authority.0.clone()).or_default();
-    slot.service = Some(service);
+    let mut slot = mesh.authorities.get_mut(&authority.0);
+    if let Some(ref mut entry) = slot {
+        entry.service = Some(service);
+    }
 }
 
 pub(crate) fn authority_get(
