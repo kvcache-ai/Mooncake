@@ -49,7 +49,9 @@ def make_shard_data(shard_id: int, shard_size: int) -> bytes:
     return bytes((shard_id + i) & 0xFF for i in range(shard_size))
 
 
-def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllocator, tenant: str):
+def run_tp_split(
+    store: MooncakeDistributedStore, allocator: MooncakeHostMemAllocator, tenant: str
+):
     """TP 4→8: Trainer produces 4 shards (256B each), Rollouter has 8 ranks (128B each)."""
     print("  [TP 4→8 split] ", end="", flush=True)
 
@@ -103,13 +105,17 @@ def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
         for rank, buf_results in enumerate(results):
             for key_idx, key_results in enumerate(buf_results):
                 for frag_idx, val in enumerate(key_results):
-                    assert val > 0, f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    assert val > 0, (
+                        f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    )
 
         # Verify buffer contents
         for rank in range(rollouter_tp):
             trainer_shard = rank // 2
             src_offset = (rank % 2) * rank_size
-            expected = make_shard_data(trainer_shard, shard_size)[src_offset:src_offset + rank_size]
+            expected = make_shard_data(trainer_shard, shard_size)[
+                src_offset : src_offset + rank_size
+            ]
             actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
             assert bytes(actual) == expected, f"rank {rank} content mismatch"
     finally:
@@ -119,7 +125,9 @@ def run_tp_split(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
     print("PASS")
 
 
-def run_tp_merge(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllocator, tenant: str):
+def run_tp_merge(
+    store: MooncakeDistributedStore, allocator: MooncakeHostMemAllocator, tenant: str
+):
     """TP 8→4: Trainer produces 8 shards (128B each), Rollouter has 4 ranks (256B each)."""
     print("  [TP 8→4 merge] ", end="", flush=True)
 
@@ -174,7 +182,9 @@ def run_tp_merge(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
         for rank, buf_results in enumerate(results):
             for key_idx, key_results in enumerate(buf_results):
                 for frag_idx, val in enumerate(key_results):
-                    assert val > 0, f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    assert val > 0, (
+                        f"rank {rank} key {key_idx} frag {frag_idx} failed: {val}"
+                    )
 
         # Verify buffer contents
         for rank in range(rollouter_tp):
@@ -184,8 +194,12 @@ def run_tp_merge(store: MooncakeDistributedStore, allocator: MooncakeHostMemAllo
             expected_b = make_shard_data(shard_b, shard_size)
             actual = (ctypes.c_ubyte * rank_size).from_address(buffer_ptrs[rank])
             actual_bytes = bytes(actual)
-            assert actual_bytes[:shard_size] == expected_a, f"rank {rank} first half mismatch"
-            assert actual_bytes[shard_size:] == expected_b, f"rank {rank} second half mismatch"
+            assert actual_bytes[:shard_size] == expected_a, (
+                f"rank {rank} first half mismatch"
+            )
+            assert actual_bytes[shard_size:] == expected_b, (
+                f"rank {rank} second half mismatch"
+            )
     finally:
         for ptr in buffer_ptrs:
             store.unregister_buffer(ptr, rank_size)
