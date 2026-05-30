@@ -24,6 +24,8 @@ const HEARTBEAT_TIMEOUT_ENV: &str = "MC_STORE_RS_HEARTBEAT_TIMEOUT_MS";
 const TRANSFER_STALL_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_STALL_TIMEOUT_MS";
 const LEGACY_TRANSFER_TIMEOUT_ENV: &str = "MC_STORE_RS_TRANSFER_TIMEOUT_MS";
 const DUMMY_RPC_TIMEOUT_ENV: &str = "MC_STORE_RS_DUMMY_RPC_TIMEOUT_MS";
+const EVICTION_HIGH_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT";
+const EVICTION_LOW_WATERMARK_ENV: &str = "MC_STORE_RS_EVICTION_LOW_WATERMARK_PERCENT";
 const CLASSIC_GID_INDEX_ENV: &str = "MC_STORE_RS_GID_INDEX";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -290,6 +292,15 @@ impl CompatSetupArgs {
             ),
         };
 
+        let eviction_high_watermark_percent = resolve_optional_u8_env_override(
+            eviction_high_watermark_percent,
+            EVICTION_HIGH_WATERMARK_ENV,
+        )?;
+        let eviction_low_watermark_percent = resolve_optional_u8_env_override(
+            eviction_low_watermark_percent,
+            EVICTION_LOW_WATERMARK_ENV,
+        )?;
+
         Ok(CompatBuildPlan {
             metadata,
             transport_backend,
@@ -313,6 +324,28 @@ impl CompatSetupArgs {
             hugepage_size_bytes,
         })
     }
+}
+
+fn resolve_optional_u8_env_override(explicit: Option<u8>, env_name: &str) -> Result<Option<u8>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    let value = match std::env::var(env_name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(error) => {
+            return Err(StoreError::InvalidState(format!(
+                "{env_name} is not valid UTF-8: {error}"
+            )));
+        }
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed.parse::<u8>().map(Some).map_err(|error| {
+        StoreError::InvalidState(format!("{env_name} must be an integer in 0..=255: {error}"))
+    })
 }
 
 fn resolve_transport_backend(explicit: Option<&str>) -> Result<TransportBackend> {
@@ -679,6 +712,35 @@ mod tests {
         }
     }
 
+    fn sample_compat_setup_args() -> CompatSetupArgs {
+        CompatSetupArgs {
+            local_hostname: "127.0.0.1".to_string(),
+            transport_metadata_url: "P2PHANDSHAKE".to_string(),
+            metadata_url: "redis://127.0.0.1:6379/0".to_string(),
+            global_segment_size: 4096,
+            local_buffer_size: 1024,
+            eviction_high_watermark_percent: None,
+            eviction_low_watermark_percent: None,
+            protocol: "tcp".to_string(),
+            _rdma_devices: String::new(),
+            transport_rpc_port: None,
+            transport_backend: None,
+            stable_id: Some("sample".to_string()),
+            tenant: "default".to_string(),
+            domain: None,
+            object_set: None,
+            labels: BTreeMap::new(),
+            routed_writes: false,
+            replica_count: 1,
+            route_topk: 2,
+            keyspace: None,
+            expires_at_ms: Some(1),
+            use_hugepage: None,
+            hugepage_size_bytes: None,
+            timeouts: None,
+        }
+    }
+
     #[test]
     fn normalize_etcd_endpoint_adds_http_scheme() {
         assert_eq!(
@@ -903,6 +965,53 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, StoreError::Unsupported(_)));
+    }
+
+    #[test]
+    fn compat_setup_reads_eviction_watermarks_from_env() {
+        let _guard = env_test_lock().lock();
+        std::env::set_var(EVICTION_HIGH_WATERMARK_ENV, "95");
+        std::env::set_var(EVICTION_LOW_WATERMARK_ENV, "90");
+        let plan = sample_compat_setup_args()
+            .build()
+            .expect("build plan should read eviction env");
+        std::env::remove_var(EVICTION_HIGH_WATERMARK_ENV);
+        std::env::remove_var(EVICTION_LOW_WATERMARK_ENV);
+
+        assert_eq!(plan.eviction_high_watermark_percent, Some(95));
+        assert_eq!(plan.eviction_low_watermark_percent, Some(90));
+    }
+
+    #[test]
+    fn compat_setup_prefers_explicit_eviction_watermarks_over_env() {
+        let _guard = env_test_lock().lock();
+        std::env::set_var(EVICTION_HIGH_WATERMARK_ENV, "95");
+        std::env::set_var(EVICTION_LOW_WATERMARK_ENV, "90");
+        let mut args = sample_compat_setup_args();
+        args.eviction_high_watermark_percent = Some(88);
+        args.eviction_low_watermark_percent = Some(77);
+        let plan = args
+            .build()
+            .expect("explicit eviction watermarks should override env");
+        std::env::remove_var(EVICTION_HIGH_WATERMARK_ENV);
+        std::env::remove_var(EVICTION_LOW_WATERMARK_ENV);
+
+        assert_eq!(plan.eviction_high_watermark_percent, Some(88));
+        assert_eq!(plan.eviction_low_watermark_percent, Some(77));
+    }
+
+    #[test]
+    fn compat_setup_rejects_invalid_eviction_watermark_env() {
+        let _guard = env_test_lock().lock();
+        std::env::set_var(EVICTION_HIGH_WATERMARK_ENV, "not-a-number");
+        let result = sample_compat_setup_args().build();
+        std::env::remove_var(EVICTION_HIGH_WATERMARK_ENV);
+
+        let error = match result {
+            Ok(_) => panic!("invalid eviction watermark env should fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::InvalidState(_)));
     }
 
     #[test]

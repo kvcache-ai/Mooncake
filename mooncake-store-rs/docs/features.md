@@ -280,8 +280,8 @@ The current behavior is:
 
 Default local-memory settings are:
 
-- high watermark: `90%`
-- low watermark: `80%`
+- high watermark: `95%`
+- low watermark: `90%`
 - poll interval: `100ms`
 
 ### Read-hit reporting
