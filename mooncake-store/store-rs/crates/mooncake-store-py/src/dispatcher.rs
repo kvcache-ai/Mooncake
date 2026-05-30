@@ -667,6 +667,7 @@ impl StoreDispatcher {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn get_into_ranges(
         &self,
         buffer_ptrs: Vec<usize>,
@@ -1924,6 +1925,7 @@ fn proto_policy(policy: &Option<pb::ReplicationPolicy>) -> Option<ReplicationPol
 
 const RANGE_READ_ERROR: i64 = -1;
 
+#[allow(clippy::too_many_arguments)]
 fn execute_get_into_ranges(
     client: &StoreClient,
     scope: CompatObjectScope,
