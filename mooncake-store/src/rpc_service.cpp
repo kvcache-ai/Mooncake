@@ -1444,7 +1444,6 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
-<<<<<<< HEAD
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllSegments() {
     ScopedVLogTimer timer(1, "GetAllSegments");
@@ -1454,7 +1453,8 @@ WrappedMasterService::GetAllSegments() {
 
     timer.LogResponseExpected(result);
     return result;
-=======
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::GracefulUnmountSegment(
     const UUID& segment_id, const UUID& client_id, uint64_t grace_period_ms) {
     return execute_rpc(
@@ -1513,7 +1513,7 @@ WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
         [&] { return master_service_.GetNoFSegmentsByName(segment_name); },
         [&](auto& timer) { timer.LogRequest("segment_name=", segment_name); },
         [] {}, [] {});
->>>>>>> origin/main
+}
 }
 
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(

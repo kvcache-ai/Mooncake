@@ -243,12 +243,11 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
 
-<<<<<<< HEAD
         // Set HTTP metadata server configuration
         enable_http_metadata_server = config.enable_http_metadata_server;
         http_metadata_server_port = config.http_metadata_server_port;
         http_metadata_server_host = config.http_metadata_server_host;
-=======
+
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
@@ -259,7 +258,6 @@ class MasterServiceSupervisorConfig {
         snapshot_catalog_store_type = config.snapshot_catalog_store_type;
         snapshot_catalog_store_connstring =
             config.snapshot_catalog_store_connstring;
->>>>>>> origin/main
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
