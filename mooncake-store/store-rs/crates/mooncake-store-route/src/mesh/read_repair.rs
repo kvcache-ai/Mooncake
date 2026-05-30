@@ -78,16 +78,17 @@ pub(crate) fn merge_fresher_route(
         Some(existing) if candidate.version > existing.version => *current = Some(candidate),
         Some(existing) if candidate.version == existing.version && *existing != candidate => {
             let choose_candidate = canonical_route_key(&candidate) < canonical_route_key(existing);
-            if choose_candidate {
-                *existing = candidate.clone();
-            }
+            let version = candidate.version.0;
             warn!(
                 key = %key.0,
                 authority = %authority,
-                version = candidate.version.0,
+                version,
                 canonical = if choose_candidate { "candidate" } else { "existing" },
                 "route authorities disagree on the same route version; choosing canonical route"
             );
+            if choose_candidate {
+                *existing = candidate;
+            }
         }
         Some(_) => {}
     }
@@ -107,16 +108,18 @@ pub(crate) fn merge_route_listing(
         }
         Some(current) if candidate.version == current.version && *current != candidate => {
             let choose_candidate = canonical_route_key(&candidate) < canonical_route_key(current);
-            if choose_candidate {
-                routes.insert(candidate.key.0.clone(), candidate.clone());
-            }
+            let key_str = candidate.key.0.clone();
+            let version = candidate.version.0;
             warn!(
-                key = %candidate.key.0,
+                key = %key_str,
                 authority,
-                version = candidate.version.0,
+                version,
                 canonical = if choose_candidate { "candidate" } else { "existing" },
                 "route authorities disagree on the same route version; choosing canonical route"
             );
+            if choose_candidate {
+                routes.insert(key_str, candidate);
+            }
         }
         Some(_) => {}
     }
