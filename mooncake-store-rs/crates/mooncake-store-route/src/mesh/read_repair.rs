@@ -128,6 +128,9 @@ pub(crate) fn compute_backfill_requests(
     resolved: &[Option<ObjectRoute>],
     repairs: &[RouteReadRepairState],
 ) -> BTreeMap<String, (ClientLease, Vec<RouteCasRequest>)> {
+    debug_assert_eq!(keys.len(), resolved.len());
+    debug_assert_eq!(keys.len(), selections.len());
+    debug_assert_eq!(keys.len(), repairs.len());
     let mut backfills = BTreeMap::<String, (ClientLease, Vec<RouteCasRequest>)>::new();
     for (index, route) in resolved.iter().enumerate() {
         let Some(route) = route.as_ref() else {
