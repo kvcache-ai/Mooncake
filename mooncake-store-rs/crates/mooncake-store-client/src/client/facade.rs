@@ -1582,9 +1582,9 @@ impl MooncakeCompatibilityFacade for StoreClient {
             })
             .collect::<Vec<_>>();
         let (mut resolved, resolved_indices) = self.resolve_objects(&objects)?;
-        if resolved.is_empty() {
-            let sizes = vec![0; requests.len()];
-            let result = Ok(sizes);
+        if resolved.is_empty() && !requests.is_empty() {
+            let result: Result<Vec<usize>> =
+                Err(StoreError::NotFound("no resolvable objects in batch".into()));
             tracker.finish(&result, 0);
             return result;
         }

@@ -1553,6 +1553,9 @@ fn execute_batch_get_values_into(
                 .zip(buffers.iter())
                 .zip(sizes.into_iter())
             {
+                if copied == 0 {
+                    continue;
+                }
                 insert_hot_cache(
                     hot_cache,
                     HotCacheKey::new(cache_tenant.clone(), key),
