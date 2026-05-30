@@ -5535,8 +5535,10 @@ ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char *value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
+#endif
     }
     // Configure reasonable retry limits for SSD offload RPC connections.
     // - connect_retry_count: Maximum connection retry attempts (default: 3)

@@ -152,8 +152,9 @@ struct CreateDrainJobRequest {
     std::vector<std::string> segments;
     std::vector<std::string> target_segments;
     uint32_t max_concurrency{4};
+    uint32_t bandwidth_mbps{0};  // 0 = unlimited
 };
-YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
+YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency, bandwidth_mbps);
 
 struct QueryJobResponse {
     UUID id;

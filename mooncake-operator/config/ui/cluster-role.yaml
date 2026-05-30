@@ -39,6 +39,22 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - pods/proxy
+  verbs:
+  - get
+  - create
+  - post
+- apiGroups:
+  - ""
+  resources:
   - pods/log
   verbs:
   - get
+- apiGroups:
+  - metrics.k8s.io
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch

@@ -6343,7 +6343,7 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-        if (status != SegmentStatus::OK) {
+        if (status != SegmentStatus::OK && status != SegmentStatus::DRAINED) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
@@ -6587,6 +6587,33 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     };
 
     const size_t slots = max_concurrency - job.active_tasks.size();
+
+    // Bandwidth throttling: check if we've exceeded the bandwidth limit
+    if (job.request.bandwidth_mbps > 0) {
+        auto now = std::chrono::system_clock::now();
+        if (job.last_rate_check_.time_since_epoch().count() == 0) {
+            job.last_rate_check_ = now;
+            job.migrated_bytes_at_last_check_ = job.migrated_bytes;
+        } else {
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - job.last_rate_check_).count();
+            if (elapsed_ms > 0 && elapsed_ms < 1000) {
+                // Calculate current bandwidth in Mbps
+                double bytes_delta = static_cast<double>(
+                    job.migrated_bytes - job.migrated_bytes_at_last_check_);
+                double current_mbps = bytes_delta / (elapsed_ms / 1000.0) / (1024 * 1024) * 8;
+                if (current_mbps >= static_cast<double>(job.request.bandwidth_mbps)) {
+                    job.status = JobStatus::RUNNING;
+                    return;  // Wait for next 500ms tick
+                }
+            }
+            if (elapsed_ms >= 1000) {
+                job.migrated_bytes_at_last_check_ = job.migrated_bytes;
+                job.last_rate_check_ = now;
+            }
+        }
+    }
+
     std::vector<DrainPlan> plans;
     plans.reserve(slots);
     std::unordered_set<std::string> active_unit_keys;

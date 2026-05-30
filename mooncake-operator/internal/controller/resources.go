@@ -157,6 +157,12 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 	masterAddr := mc.Name + "-master-headless." + mc.Namespace + ":50051"
 	metadataServer := "http://" + mc.Name + "-master-headless." + mc.Namespace + ":8080/metadata"
 
+	transferPort := mc.Spec.Workers.TransferPort
+	if transferPort == 0 {
+		transferPort = 13006
+	}
+	portStr := strconv.Itoa(int(transferPort))
+
 	container := corev1.Container{
 		Name:            "worker",
 		Image:           image,
@@ -168,12 +174,20 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 				"--master_server_address=" + masterAddr + " " +
 				"--global_segment_size=" + convertSegmentSize(mc.Spec.Workers.SegmentSize) + " " +
 				"--metadata_server=" + metadataServer + " " +
-				"--host=$POD_IP",
+				"--host=$POD_IP:${MC_STORE_CLIENT_MIN_PORT}",
 		},
 		Env: []corev1.EnvVar{
 			{
 				Name:  "LD_LIBRARY_PATH",
 				Value: "/usr/local/lib/mooncake",
+			},
+			{
+				Name:  "MC_STORE_CLIENT_MIN_PORT",
+				Value: portStr,
+			},
+			{
+				Name:  "MC_STORE_CLIENT_MAX_PORT",
+				Value: portStr,
 			},
 			{
 				Name: "POD_IP",

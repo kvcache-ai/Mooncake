@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -349,6 +350,7 @@ func (r *MooncakeClusterReconciler) reconcileServices(ctx context.Context, mc *m
 			Selector: map[string]string{"app": "mooncake-master", "cluster": mc.Name},
 			Ports: []corev1.ServicePort{
 				{Name: "rpc", Port: mc.Spec.Master.RPCPort, TargetPort: intstr.FromInt(int(mc.Spec.Master.RPCPort)), Protocol: corev1.ProtocolTCP},
+				{Name: "metrics", Port: mc.Spec.Master.MetricsPort, TargetPort: intstr.FromInt(int(mc.Spec.Master.MetricsPort)), Protocol: corev1.ProtocolTCP},
 				{Name: "metadata", Port: 8080, TargetPort: intstr.FromInt(8080), Protocol: corev1.ProtocolTCP},
 			},
 		},
@@ -468,6 +470,16 @@ func (r *MooncakeClusterReconciler) reconcileWorkerDeployment(ctx context.Contex
 	if deploymentSpecsEqual(&existing.Spec, &desired.Spec) {
 		return nil
 	}
+
+	// Scale-down detection: orchestrate data migration before reducing replicas
+	if *desired.Spec.Replicas < *existing.Spec.Replicas {
+		terminateCount := int(*existing.Spec.Replicas - *desired.Spec.Replicas)
+		if err := r.orchestrateWorkerScaleDown(ctx, mc, terminateCount); err != nil {
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "WorkerMigrationError",
+				fmt.Sprintf("Worker data migration failed: %v", err))
+		}
+	}
+
 	patchBase := client.MergeFrom(existing.DeepCopy())
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
@@ -517,6 +529,269 @@ func envVarsEqual(a, b []corev1.EnvVar) bool {
 	}
 	for i := range a {
 		if a[i].Name != b[i].Name || a[i].Value != b[i].Value {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *MooncakeClusterReconciler) orchestrateWorkerScaleDown(
+	ctx context.Context,
+	mc *mooncakev1alpha1.MooncakeCluster,
+	terminateCount int,
+) error {
+	logger := log.FromContext(ctx)
+	logger.Info("worker scale-down detected, draining data before termination",
+		"terminateCount", terminateCount)
+
+	// List all worker pods, sorted by creation timestamp descending (newest first)
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(mc.Namespace),
+		client.MatchingLabels{"app": "mooncake-worker", "cluster": mc.Name},
+	); err != nil {
+		return fmt.Errorf("listing worker pods: %w", err)
+	}
+
+	sort.Slice(pods.Items, func(i, j int) bool {
+		return pods.Items[i].CreationTimestamp.After(pods.Items[j].CreationTimestamp.Time)
+	})
+
+	if len(pods.Items) < terminateCount {
+		return fmt.Errorf("not enough worker pods: need %d, have %d", terminateCount, len(pods.Items))
+	}
+
+	terminatingPods := pods.Items[:terminateCount]
+	logger.Info("terminating worker pods", "count", len(terminatingPods))
+
+	// Build master HTTP address using ClusterIP service (stable DNS)
+	masterAddr := fmt.Sprintf("http://%s-master.%s.svc:%d",
+		mc.Name, mc.Namespace, mc.Spec.Master.MetricsPort)
+
+	// Read migration config from CRD
+	maxConcurrency := int32(4)
+	bandwidthMBPS := int32(0)
+	timeoutSeconds := int32(300)
+	if mc.Spec.Workers.Migration != nil {
+		if mc.Spec.Workers.Migration.MaxConcurrency > 0 {
+			maxConcurrency = mc.Spec.Workers.Migration.MaxConcurrency
+		}
+		if mc.Spec.Workers.Migration.TimeoutSeconds > 0 {
+			timeoutSeconds = mc.Spec.Workers.Migration.TimeoutSeconds
+		}
+		bandwidthMBPS = mc.Spec.Workers.Migration.BandwidthMBPS
+	}
+
+	transferPort := mc.Spec.Workers.TransferPort
+	if transferPort == 0 {
+		transferPort = 13006
+	}
+
+	// Create drain jobs concurrently
+	type jobResult struct {
+		podName string
+		podIP   string
+		jobID   string
+		err     error
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan jobResult, len(terminatingPods))
+
+	for _, pod := range terminatingPods {
+		pod := pod
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jobID, err := r.drainWorker(ctx, masterAddr, pod.Status.PodIP, transferPort, maxConcurrency, bandwidthMBPS)
+			results <- jobResult{podName: pod.Name, podIP: pod.Status.PodIP, jobID: jobID, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	var jobIDs []string
+	for result := range results {
+		if result.err != nil {
+			logger.Error(result.err, "drain job creation failed", "pod", result.podName)
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "DrainJobCreationFailed",
+				fmt.Sprintf("drain job failed for pod %s (IP: %s): %v", result.podName, result.podIP, result.err))
+			continue
+		}
+		jobIDs = append(jobIDs, result.jobID)
+		logger.Info("drain job created", "pod", result.podName, "jobID", result.jobID)
+		r.Recorder.Event(mc, corev1.EventTypeNormal, "DrainJobCreated",
+			fmt.Sprintf("drain job %s created for pod %s", result.jobID, result.podName))
+	}
+
+	if len(jobIDs) == 0 {
+		return fmt.Errorf("all drain job creations failed")
+	}
+
+	// Wait for all drain jobs to complete
+	return r.waitDrainJobs(ctx, masterAddr, jobIDs, time.Duration(timeoutSeconds)*time.Second)
+}
+
+// drainWorker creates a drain job on the master for a single worker.
+// The segment name is POD_IP:TransferPort (e.g., "10.244.2.5:13006").
+func (r *MooncakeClusterReconciler) drainWorker(
+	ctx context.Context,
+	masterAddr string,
+	podIP string,
+	transferPort int32,
+	maxConcurrency int32,
+	bandwidthMBPS int32,
+) (string, error) {
+	segmentName := fmt.Sprintf("%s:%d", podIP, transferPort)
+	reqBody := map[string]interface{}{
+		"segments":        []string{segmentName},
+		"max_concurrency": maxConcurrency,
+		"bandwidth_mbps":  bandwidthMBPS,
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshaling drain request: %w", err)
+	}
+
+	url := masterAddr + "/api/v1/drain_jobs"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("creating drain request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("posting drain job: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("drain job request failed (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var createResp struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
+		// Try reading raw body
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("decoding drain response (body: %s): %w", string(respBody), err)
+	}
+
+	if createResp.ID == "" {
+		return "", fmt.Errorf("drain job response missing id")
+	}
+
+	return createResp.ID, nil
+}
+
+// waitDrainJobs polls drain job statuses until all complete or timeout.
+func (r *MooncakeClusterReconciler) waitDrainJobs(
+	ctx context.Context,
+	masterAddr string,
+	jobIDs []string,
+	timeout time.Duration,
+) error {
+	logger := log.FromContext(ctx)
+	deadline := time.Now().Add(timeout)
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+
+	done := make(map[string]bool)
+	for _, id := range jobIDs {
+		done[id] = false
+	}
+
+	pollInterval := 2 * time.Second
+	for {
+		if time.Now().After(deadline) {
+			var pendingIDs []string
+			for id, completed := range done {
+				if !completed {
+					pendingIDs = append(pendingIDs, id)
+				}
+			}
+			return fmt.Errorf("drain jobs timed out after %v: %v", timeout, pendingIDs)
+		}
+
+		for id, completed := range done {
+			if completed {
+				continue
+			}
+
+			url := fmt.Sprintf("%s/api/v1/drain_jobs/query?job_id=%s", masterAddr, id)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				logger.Error(err, "creating drain query request", "jobID", id)
+				continue
+			}
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				logger.Error(err, "querying drain job", "jobID", id)
+				continue
+			}
+
+			var queryResp struct {
+				ID             string `json:"id"`
+				Status         int    `json:"status"`
+				SucceededUnits uint64 `json:"succeeded_units"`
+				FailedUnits    uint64 `json:"failed_units"`
+				MigratedBytes  uint64 `json:"migrated_bytes"`
+				Message        string `json:"message"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
+				resp.Body.Close()
+				logger.Error(err, "decoding drain query response", "jobID", id)
+				continue
+			}
+			resp.Body.Close()
+
+			// Status values: 0=CREATED, 1=PLANNING, 2=RUNNING, 3=SUCCEEDED, 4=FAILED, 5=CANCELED
+			switch queryResp.Status {
+			case 3: // SUCCEEDED
+				done[id] = true
+				logger.Info("drain job succeeded", "jobID", id,
+					"migratedBytes", queryResp.MigratedBytes,
+					"succeededUnits", queryResp.SucceededUnits)
+			case 4: // FAILED
+				done[id] = true
+				logger.Info("drain job failed", "jobID", id,
+					"message", queryResp.Message,
+					"failedUnits", queryResp.FailedUnits)
+			case 5: // CANCELED
+				done[id] = true
+				logger.Info("drain job canceled", "jobID", id)
+			default:
+				// Still running, log progress
+				if queryResp.MigratedBytes > 0 || queryResp.SucceededUnits > 0 {
+					logger.V(1).Info("drain job in progress", "jobID", id,
+						"status", queryResp.Status,
+						"migratedBytes", queryResp.MigratedBytes,
+						"succeededUnits", queryResp.SucceededUnits)
+				}
+			}
+
+		}
+
+		if allDoneExcept(done) {
+			return nil
+		}
+
+		time.Sleep(pollInterval)
+	}
+}
+
+// allDoneExcept returns true if all tracked items are done
+func allDoneExcept(done map[string]bool) bool {
+	for _, completed := range done {
+		if !completed {
 			return false
 		}
 	}
@@ -924,8 +1199,8 @@ func (r *MooncakeClusterReconciler) migrateDecodePod(
 
 		// Step 2a: Call prepare_migration on target pod (port 18900)
 		preparePayload := map[string]interface{}{
-			"request_id":  reqID,
-			"num_blocks":  128,
+			"request_id":   reqID,
+			"num_blocks":   128,
 			"extra_blocks": 16,
 		}
 		prepareBody, _ := json.Marshal(preparePayload)
@@ -939,10 +1214,10 @@ func (r *MooncakeClusterReconciler) migrateDecodePod(
 		prepareResp.Body.Close()
 
 		var targetInfo struct {
-			RequestID        string   `json:"request_id"`
-			TargetBlockIDs   []int    `json:"target_block_ids"`
-			KVCachesBaseAddr []int    `json:"kv_caches_base_addr"`
-			Error            string   `json:"error,omitempty"`
+			RequestID        string `json:"request_id"`
+			TargetBlockIDs   []int  `json:"target_block_ids"`
+			KVCachesBaseAddr []int  `json:"kv_caches_base_addr"`
+			Error            string `json:"error,omitempty"`
 		}
 		if err := json.Unmarshal(prepareRespBody, &targetInfo); err != nil {
 			return fmt.Errorf("parsing prepare_migration response: %w", err)
@@ -959,11 +1234,11 @@ func (r *MooncakeClusterReconciler) migrateDecodePod(
 
 		// Step 2c: Call start_migration on source pod (port 18900)
 		startPayload := map[string]interface{}{
-			"request_id":          reqID,
-			"target_host":         targetIP,
-			"target_port":         8200,
-			"target_base_addr":    targetInfo.KVCachesBaseAddr,
-			"block_id_map":        blockIDMap,
+			"request_id":             reqID,
+			"target_host":            targetIP,
+			"target_port":            8200,
+			"target_base_addr":       targetInfo.KVCachesBaseAddr,
+			"block_id_map":           blockIDMap,
 			"extra_target_block_ids": targetInfo.TargetBlockIDs[len(targetInfo.TargetBlockIDs)-16:],
 		}
 		startBody, _ := json.Marshal(startPayload)

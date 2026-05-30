@@ -1030,6 +1030,14 @@ class MasterService {
         } type;
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
+
+        ReplicationTask(UUID cid, std::chrono::system_clock::time_point st,
+                        Type t, ReplicaID sid, std::vector<ReplicaID> rids)
+            : client_id(cid),
+              start_time(st),
+              type(t),
+              source_id(sid),
+              replica_ids(std::move(rids)) {}
     };
 
     struct OffloadingTask {
@@ -1637,6 +1645,9 @@ class MasterService {
         uint64_t failed_units{0};
         uint64_t blocked_units{0};
         uint64_t migrated_bytes{0};
+        // bandwidth tracking
+        uint64_t migrated_bytes_at_last_check_{0};
+        std::chrono::system_clock::time_point last_rate_check_;
         std::unordered_map<UUID, ActiveDrainTask, boost::hash<UUID>>
             active_tasks;
         std::unordered_set<std::string> completed_unit_keys;

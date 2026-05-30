@@ -228,7 +228,8 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR} ${ASIO_INCLUDE_DIR} /usr/local/include/ylt/standalone)
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/master_service.cpp PROPERTIES COMPILE_FLAGS "-std=c++20")
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR} ${ASIO_INCLUDE_DIR} /usr/local/include/ylt/standalone /usr/local/include/ylt/thirdparty)
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})

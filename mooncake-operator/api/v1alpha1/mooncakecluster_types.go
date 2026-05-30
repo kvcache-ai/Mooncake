@@ -126,6 +126,36 @@ type WorkerSpec struct {
 	// +kubebuilder:validation:Enum=random;free_ratio_first;cxl
 	// +kubebuilder:default="random"
 	AllocationStrategy string `json:"allocationStrategy,omitempty"`
+
+	// TransferPort is the port for the transfer engine RPC endpoint.
+	// The worker binds to this port for inter-worker data transfer and registers
+	// segments as POD_IP:TransferPort. Must match MC_STORE_CLIENT_MIN/MAX_PORT env.
+	// +kubebuilder:validation:Minimum=1024
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default=13006
+	TransferPort int32 `json:"transferPort,omitempty"`
+
+	// Migration defines the worker data migration configuration (optional).
+	// Used when scaling down workers — data is drained before pod termination.
+	// +optional
+	Migration *WorkerMigrationConfig `json:"migration,omitempty"`
+}
+
+// WorkerMigrationConfig defines the data migration configuration for worker scale-down.
+type WorkerMigrationConfig struct {
+	// MaxConcurrency is the max number of parallel object transfers (default 4).
+	// Higher values increase migration speed.
+	// +kubebuilder:default=4
+	MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
+
+	// BandwidthMBPS is the migration bandwidth limit in Mbps. 0 = unlimited.
+	// If set, the drain job will throttle to this bandwidth.
+	// +kubebuilder:default=0
+	BandwidthMBPS int32 `json:"bandwidthMBPS,omitempty"`
+
+	// TimeoutSeconds is the per-drain-job timeout in seconds (default 300).
+	// +kubebuilder:default=300
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 }
 
 // HABackendSpec defines the HA backend configuration.

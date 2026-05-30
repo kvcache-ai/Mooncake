@@ -346,7 +346,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         const char* protocol = std::getenv("MC_RPC_PROTOCOL");
         if (protocol && std::string_view(protocol) == "rdma") {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#endif
         }
 
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(

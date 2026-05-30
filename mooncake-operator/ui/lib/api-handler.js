@@ -1,4 +1,5 @@
 const https = require('https')
+const http = require('http')
 const fs = require('fs')
 const path = require('path')
 
@@ -93,6 +94,11 @@ function deepMerge(target, src) {
     }
   }
 }
+
+// In-memory drain job tracking (module-level, persists across requests)
+// key: `${namespace}/${name}/${podIP}` -> { jobId, lastStatus, migratedBytes, succeededUnits, failedUnits, createdAt }
+const drainJobs = new Map()
+const drainStatusEnum = ['CREATED', 'PLANNING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED']
 
 async function handleApiRequest(req, res) {
   const url = new URL(req.url, 'http://localhost')
@@ -569,6 +575,193 @@ PYEOF`
       return jsonReply(res, 500, { error: e.message })
     }
   }
+
+// Helper: call master HTTP API directly via ClusterIP service (avoids K8s pod proxy POST body corruption)
+async function callMasterAPI(namespace, name, method, apiPath, body) {
+  let metricsPort = 9003
+  try {
+    const clusterCR = await k8sRequest(
+      `/apis/mooncake.io/v1alpha1/namespaces/${namespace}/mooncakeclusters/${name}`
+    )
+    if (clusterCR.spec?.master?.metricsPort) metricsPort = clusterCR.spec.master.metricsPort
+  } catch (e) {
+    console.warn(`[api-handler] Failed to fetch cluster CR, using metricsPort=${metricsPort}: ${e.message}`)
+  }
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: `${name}-master.${namespace}.svc`,
+      port: metricsPort,
+      path: apiPath,
+      method,
+      headers: { 'Accept': 'application/json' },
+    }
+    if (body) {
+      const bodyStr = typeof body === 'string' ? body : JSON.stringify(body)
+      options.headers['Content-Type'] = 'application/json'
+      options.headers['Content-Length'] = Buffer.byteLength(bodyStr)
+    }
+    const req = http.request(options, (res) => {
+      let data = ''
+      res.on('data', (chunk) => data += chunk)
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data))
+        } catch (e) {
+          resolve(data)
+        }
+      })
+    })
+    req.on('error', reject)
+    if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body))
+    req.end()
+  })
+}
+
+// GET /api/clusters/:namespace/:name/drain-status
+const drainStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/drain-status$/)
+if (drainStatusMatch && req.method === 'GET') {
+  try {
+    const [, namespace, name] = drainStatusMatch
+    const clusterKey = `${namespace}/${name}`
+
+    const podResult = await k8sRequest(
+      `/api/v1/namespaces/${namespace}/pods?labelSelector=cluster=${name}`
+    )
+    const allPods = podResult?.items || []
+    const workerPods = allPods.filter(p => p.metadata.name.includes('-worker-'))
+
+    const statuses = {}
+
+    for (const pod of workerPods) {
+      const podIP = pod.status.podIP
+      if (!podIP) continue
+
+      const entryKey = `${clusterKey}/${podIP}`
+      const tracked = drainJobs.get(entryKey)
+
+      if (tracked) {
+        try {
+          const result = await callMasterAPI(namespace, name, 'GET', `/api/v1/drain_jobs/query?job_id=${tracked.jobId}`)
+          const statusIdx = parseInt(result.status)
+          const statusStr = drainStatusEnum[statusIdx] || 'UNKNOWN'
+          statuses[podIP] = {
+            status: statusStr,
+            jobId: tracked.jobId,
+            migratedBytes: result.migrated_bytes || 0,
+            succeededUnits: result.succeeded_units || 0,
+            failedUnits: result.failed_units || 0,
+            message: result.message || '',
+          }
+          tracked.lastStatus = statusStr
+          tracked.migratedBytes = result.migrated_bytes || 0
+          tracked.succeededUnits = result.succeeded_units || 0
+          tracked.failedUnits = result.failed_units || 0
+        } catch (e) {
+          statuses[podIP] = {
+            status: tracked.lastStatus || 'UNKNOWN',
+            jobId: tracked.jobId,
+            error: e.message,
+          }
+        }
+      } else {
+        statuses[podIP] = { status: 'N/A' }
+      }
+    }
+
+    return jsonReply(res, 200, { statuses })
+  } catch (e) {
+    return jsonReply(res, 500, { error: e.message })
+  }
+}
+
+// POST /api/clusters/:namespace/:name/drain-worker
+const drainWorkerMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/drain-worker$/)
+if (drainWorkerMatch && req.method === 'POST') {
+  let body = ''
+  for await (const chunk of req) body += chunk
+  try {
+    const [, namespace, name] = drainWorkerMatch
+    const { podIP, maxConcurrency, bandwidthMBPS, targetIPs } = JSON.parse(body)
+    if (!podIP) return jsonReply(res, 400, { error: 'podIP is required' })
+
+    const clusterKey = `${namespace}/${name}`
+    const entryKey = `${clusterKey}/${podIP}`
+
+    // Reject if already has an active drain job
+    const existing = drainJobs.get(entryKey)
+    if (existing && ['CREATED', 'PLANNING', 'RUNNING'].includes(existing.lastStatus)) {
+      return jsonReply(res, 409, { error: 'Worker already has an active drain job', jobId: existing.jobId })
+    }
+
+    const mc = Math.min(Math.max(parseInt(maxConcurrency) || 4, 1), 64)
+    const bw = Math.max(parseInt(bandwidthMBPS) || 0, 0)
+
+    // Construct segment name as IP:TransferPort
+    let transferPort = 13006
+    try {
+      const clusterCR = await k8sRequest(
+        `/apis/mooncake.io/v1alpha1/namespaces/${namespace}/mooncakeclusters/${name}`
+      )
+      if (clusterCR.spec?.workers?.transferPort) transferPort = clusterCR.spec.workers.transferPort
+    } catch (e) {
+      console.warn(`[api-handler] Failed to fetch cluster CR, using transferPort=${transferPort}: ${e.message}`)
+    }
+    const segmentName = `${podIP}:${transferPort}`
+
+    // Build target_segments if targetIPs provided
+    const targetSegments = Array.isArray(targetIPs) && targetIPs.length > 0
+      ? targetIPs.map(ip => `${ip}:${transferPort}`)
+      : undefined
+
+    const drainBody = {
+      segments: [segmentName],
+      max_concurrency: mc,
+      bandwidth_mbps: bw,
+    }
+    if (targetSegments) drainBody.target_segments = targetSegments
+
+    const result = await callMasterAPI(namespace, name, 'POST', '/api/v1/drain_jobs', drainBody)
+
+    const jobId = result.id || result.job_id
+    drainJobs.set(entryKey, {
+      jobId,
+      podIP,
+      lastStatus: 'CREATED',
+      migratedBytes: 0,
+      succeededUnits: 0,
+      failedUnits: 0,
+      createdAt: Date.now(),
+    })
+
+    return jsonReply(res, 200, { jobId, status: 'CREATED' })
+  } catch (e) {
+    return jsonReply(res, 500, { error: e.message })
+  }
+}
+
+// POST /api/clusters/:namespace/:name/cancel-drain
+const cancelDrainMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/cancel-drain$/)
+if (cancelDrainMatch && req.method === 'POST') {
+  let body = ''
+  for await (const chunk of req) body += chunk
+  try {
+    const [, namespace, name] = cancelDrainMatch
+    const { jobId } = JSON.parse(body)
+    if (!jobId) return jsonReply(res, 400, { error: 'jobId is required' })
+
+    await callMasterAPI(namespace, name, 'POST', '/api/v1/drain_jobs/cancel', { job_id: jobId })
+
+    // Remove tracking for all entries with this jobId
+    for (const [key, val] of drainJobs) {
+      if (val.jobId === jobId) drainJobs.delete(key)
+    }
+
+    return jsonReply(res, 200, { success: true })
+  } catch (e) {
+    return jsonReply(res, 500, { error: e.message })
+  }
+}
 
   return false // not handled
 }

@@ -1092,7 +1092,9 @@ int main(int argc, char* argv[]) {
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
             server.init_ibv();
+#endif
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(

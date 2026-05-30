@@ -324,6 +324,36 @@ spec:
                     description: SegmentSize is the memory segment size per worker
                       (e.g. "4Gi").
                     type: string
+                  transferPort:
+                    default: 13006
+                    description: TransferPort is the port for the transfer engine RPC
+                      endpoint. Worker registers segments as POD_IP:TransferPort.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1024
+                    type: integer
+                  migration:
+                    description: Migration defines the worker data migration configuration (optional).
+                    properties:
+                      maxConcurrency:
+                        default: 4
+                        description: MaxConcurrency is the max number of parallel object transfers.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      bandwidthMBPS:
+                        default: 0
+                        description: BandwidthMBPS is the migration bandwidth limit in Mbps (0 = unlimited).
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      timeoutSeconds:
+                        default: 300
+                        description: TimeoutSeconds is the per-drain-job timeout in seconds.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                 required:
                 - replicas
                 type: object
