@@ -331,10 +331,13 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
             << "Dedup gate should block re-enqueue while task is in flight";
     }
 
-    // Wait past the staleness window; the eviction thread reaps the task.
-    // Eviction loop sleeps for kEvictionThreadSleepMs (10 ms), so 2s wall
-    // clock gives ~200 attempts — plenty.
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // Wait past the staleness window. The eviction thread reaps every
+    // kEvictionThreadSleepMs (10 ms) but gated by
+    // `now - last_discard_time > put_start_release_timeout_sec_` (strict).
+    // With release=1s a 2s sleep leaves only ~1s margin between reaper
+    // firing and the wake-up, which has flaked under CI load. 3s gives
+    // ~2s of margin and matches the schedule's strict-greater comparison.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Trigger #3: with the task reaped, dedup is unblocked and a fresh
     // GetReplicaList must enqueue again.
@@ -401,8 +404,9 @@ TEST_F(PromotionOnHitTest, RemoveDuringPromotion) {
     EXPECT_EQ(notify.error(), ErrorCode::OBJECT_NOT_FOUND);
 
     // Wait for the reaper; it must tolerate the missing metadata entry
-    // (the source replica it would dec_refcnt is already gone).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // (the source replica it would dec_refcnt is already gone). 3s for
+    // CI-safe margin over the 1s release timeout.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // Re-injecting the key and re-triggering must work end-to-end, proving
     // the per-shard PromotionTask was reaped (not stuck).
@@ -1025,9 +1029,9 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsReapedTask) {
     // removed. We can't easily poll for reap externally (the only
     // user-facing observable would be re-admitting through the gate,
     // which would create a fresh task and defeat the test), so use a
-    // fixed sleep with margin. Matches the StalePromotionReaper pattern
-    // (TTL=1s, sleep=2s).
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    // fixed sleep with margin. 3s sleep over 1s release timeout matches
+    // StalePromotionReaper's CI-safe margin.
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     // AllocStart on a reaped task must reject without allocating.
     // Allocating would leave an orphaned PROCESSING MEMORY replica
