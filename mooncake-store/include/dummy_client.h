@@ -1,53 +1,18 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
+#include <mutex>
+#include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
 #include "real_client.h"
+#include "shm_helper.h"
+#include "client_metric.h"
 #include <memory>
 
 namespace mooncake {
-
-class ShmHelper {
-   public:
-    struct ShmSegment {
-        int fd = -1;
-        void *base_addr = nullptr;
-        size_t size = 0;
-        std::string name;
-        bool registered = false;
-        bool is_local = false;
-    };
-
-    static ShmHelper *getInstance();
-
-    void *allocate(size_t size);
-    int free(void *addr);
-
-    bool cleanup();
-
-    // Get the shm that contains the given address
-    // Returns a shared_ptr to ensure the segment remains valid
-    std::shared_ptr<ShmSegment> get_shm(void *addr);
-
-    const std::vector<std::shared_ptr<ShmSegment>> &get_shms() const {
-        return shms_;
-    }
-
-    bool is_hugepage() const { return use_hugepage_; }
-
-    ShmHelper(const ShmHelper &) = delete;
-    ShmHelper &operator=(const ShmHelper &) = delete;
-
-   private:
-    ShmHelper();
-    ~ShmHelper();
-
-    std::vector<std::shared_ptr<ShmSegment>> shms_;
-    static std::mutex shm_mutex_;
-    bool use_hugepage_ = false;
-};
 
 class DummyClient : public PyClient {
    public:
@@ -62,7 +27,9 @@ class DummyClient : public PyClient {
                    const std::string &protocol, const std::string &rdma_devices,
                    const std::string &master_server_addr,
                    const std::shared_ptr<TransferEngine> &transfer_engine,
-                   const std::string &ipc_socket_path) {
+                   const std::string &ipc_socket_path,
+                   bool enable_ssd_offload = false,
+                   const std::string &ssd_offload_path = "") {
         // Dummy client does not support real setup
         return -1;
     };
@@ -87,6 +54,14 @@ class DummyClient : public PyClient {
     int unregister_buffer(void *buffer);
 
     int64_t get_into(const std::string &key, void *buffer, size_t size);
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes)
+        override;
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
@@ -119,8 +94,6 @@ class DummyClient : public PyClient {
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
-    std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
-
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
@@ -132,13 +105,43 @@ class DummyClient : public PyClient {
                   const std::vector<std::span<const char>> &values,
                   const ReplicateConfig &config = ReplicateConfig{});
 
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
     [[nodiscard]] std::string get_hostname() const;
+
+    // Check if a pointer falls within the hot cache shm region
+    bool is_hot_cache_ptr(const void *ptr) const {
+        if (!hot_cache_base_) return false;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto base = reinterpret_cast<uintptr_t>(hot_cache_base_);
+        return p >= base && p < base + hot_cache_size_;
+    }
 
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
 
     long removeAll(bool force = false);
+
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
 
     int isExist(const std::string &key);
 
@@ -150,7 +153,15 @@ class DummyClient : public PyClient {
     batch_get_replica_desc(const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override {
+        return {};
+    }
+
     int tearDownAll();
+
+    int health_check() override;
 
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
@@ -164,8 +175,20 @@ class DummyClient : public PyClient {
    private:
     ErrorCode connect(const std::string &server_address);
 
+    int register_ascend_shm(const ShmHelper::ShmSegment *shm,
+                            bool is_local = false);
+
     int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
+
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_device_buffers() const;
+#endif
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -191,6 +214,22 @@ class DummyClient : public PyClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args &&...args);
+
+    template <auto ServiceMethod, typename... Args>
+    int invoke_observed_void_rpc(TransferOperationKind kind,
+                                 const char *op_name, size_t bytes, bool batch,
+                                 Args &&...args) {
+        auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+            [&]() {
+                return invoke_rpc<ServiceMethod, void>(
+                    std::forward<Args>(args)...);
+            },
+            [](const auto &ret) { return ret.has_value(); },
+            [&](uint64_t latency_us, const auto &) {
+                ObserveTransferMetric(kind, op_name, bytes, latency_us, batch);
+            });
+        return to_py_ret(result);
+    }
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
@@ -234,11 +273,32 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
 
+    // Hot cache shm mapping (obtained from real client via IPC)
+    void *hot_cache_base_ = nullptr;
+    size_t hot_cache_size_ = 0;
+    int hot_cache_fd_ = -1;
+
+    int request_hot_cache_fd();
+
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
-    volatile bool connected_ = false;
+    std::atomic<bool> connected_{false};
+
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex registered_device_buffers_mutex_;
+    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+#endif
+
+    // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
+    int32_t device_id_ = 0;
+
+    std::unique_ptr<ClientMetric> metrics_;
+
+    void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
+                               size_t bytes, uint64_t latency_us, bool batch);
 };
 
 }  // namespace mooncake

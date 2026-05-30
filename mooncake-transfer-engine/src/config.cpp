@@ -18,21 +18,25 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dirent.h>
+#include <sstream>
 #include <unistd.h>
 
 namespace mooncake {
-void loadGlobalConfig(GlobalConfig &config) {
-    const char *num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
+void loadGlobalConfig(GlobalConfig& config) {
+    const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);
-        if (val > 0 && val < 256)
+        if (val > 0 && val < 256) {
             config.num_cq_per_ctx = val;
-        else
+            // In URMA, JFC and JFCE are bound one-to-one.
+            config.num_jfc_per_ctx = val;
+            config.num_jfce_per_ctx = val;
+        } else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_NUM_CQ_PER_CTX";
     }
 
-    const char *num_comp_channels_per_ctx_env =
+    const char* num_comp_channels_per_ctx_env =
         std::getenv("MC_NUM_COMP_CHANNELS_PER_CTX");
     if (num_comp_channels_per_ctx_env) {
         int val = atoi(num_comp_channels_per_ctx_env);
@@ -43,7 +47,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                             "MC_NUM_COMP_CHANNELS_PER_CTX";
     }
 
-    const char *port_env = std::getenv("MC_IB_PORT");
+    const char* port_env = std::getenv("MC_IB_PORT");
     if (port_env) {
         int val = atoi(port_env);
         if (val >= 0 && val < 256)
@@ -52,7 +56,7 @@ void loadGlobalConfig(GlobalConfig &config) {
             LOG(WARNING) << "Ignore value from environment variable MC_IB_PORT";
     }
 
-    const char *gid_index_env = std::getenv("MC_GID_INDEX");
+    const char* gid_index_env = std::getenv("MC_GID_INDEX");
     if (!gid_index_env) gid_index_env = std::getenv("NCCL_IB_GID_INDEX");
 
     if (gid_index_env) {
@@ -64,7 +68,25 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_GID_INDEX";
     }
 
-    const char *max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
+    const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    if (pkey_index_env) {
+        try {
+            int val = std::stoi(pkey_index_env);
+            if (val >= 0 && val <= UINT16_MAX) {
+                config.pkey_index = static_cast<uint16_t>(val);
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_PKEY_INDEX, "
+                    << "value " << pkey_index_env
+                    << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
+                         << pkey_index_env << ". Error: " << e.what();
+        }
+    }
+
+    const char* max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
     if (max_cqe_per_ctx_env) {
         size_t val = atoi(max_cqe_per_ctx_env);
         if (val > 0 && val <= UINT16_MAX)
@@ -74,7 +96,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_MAX_CQE_PER_CTX";
     }
 
-    const char *max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
+    const char* max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
         size_t val = atoi(max_ep_per_ctx_env);
         if (val > 0 && val <= UINT16_MAX)
@@ -84,7 +106,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";
     }
 
-    const char *num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
+    const char* num_qp_per_ep_env = std::getenv("MC_NUM_QP_PER_EP");
     if (num_qp_per_ep_env) {
         int val = atoi(num_qp_per_ep_env);
         if (val > 0 && val < 256)
@@ -94,7 +116,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_NUM_QP_PER_EP";
     }
 
-    const char *max_sge_env = std::getenv("MC_MAX_SGE");
+    const char* max_sge_env = std::getenv("MC_MAX_SGE");
     if (max_sge_env) {
         size_t val = atoi(max_sge_env);
         if (val > 0 && val <= UINT16_MAX)
@@ -103,7 +125,7 @@ void loadGlobalConfig(GlobalConfig &config) {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_SGE";
     }
 
-    const char *max_wr_env = std::getenv("MC_MAX_WR");
+    const char* max_wr_env = std::getenv("MC_MAX_WR");
     if (max_wr_env) {
         size_t val = atoi(max_wr_env);
         if (val > 0 && val <= UINT16_MAX)
@@ -112,7 +134,7 @@ void loadGlobalConfig(GlobalConfig &config) {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
     }
 
-    const char *max_inline_env = std::getenv("MC_MAX_INLINE");
+    const char* max_inline_env = std::getenv("MC_MAX_INLINE");
     if (max_inline_env) {
         size_t val = atoi(max_inline_env);
         if (val <= UINT16_MAX)
@@ -122,7 +144,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_MAX_INLINE";
     }
 
-    const char *mtu_length_env = std::getenv("MC_MTU");
+    const char* mtu_length_env = std::getenv("MC_MTU");
     if (mtu_length_env) {
         size_t val = atoi(mtu_length_env);
         if (val == 512)
@@ -140,7 +162,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *handshake_port_env = std::getenv("MC_HANDSHAKE_PORT");
+    const char* handshake_port_env = std::getenv("MC_HANDSHAKE_PORT");
     if (handshake_port_env) {
         int val = atoi(handshake_port_env);
         if (val > 0 && val < 65536)
@@ -150,7 +172,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_HANDSHAKE_PORT";
     }
 
-    const char *workers_per_ctx_env = std::getenv("MC_WORKERS_PER_CTX");
+    const char* workers_per_ctx_env = std::getenv("MC_WORKERS_PER_CTX");
     if (workers_per_ctx_env) {
         size_t val = atoi(workers_per_ctx_env);
         if (val > 0 && val <= 8)
@@ -160,7 +182,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_WORKERS_PER_CTX";
     }
 
-    const char *slice_size_env = std::getenv("MC_SLICE_SIZE");
+    const char* slice_size_env = std::getenv("MC_SLICE_SIZE");
     if (slice_size_env) {
         size_t val = atoi(slice_size_env);
         if (val > 0)
@@ -170,7 +192,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_SLICE_SIZE";
     }
 
-    const char *min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
+    const char* min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
     if (min_reg_size_env) {
         size_t val = atoll(min_reg_size_env);
         if (val > 0) {
@@ -181,7 +203,18 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_MIN_REG_SIZE";
     }
 
-    const char *retry_cnt_env = std::getenv("MC_RETRY_CNT");
+    const char* max_mr_size_env = std::getenv("MC_MAX_MR_SIZE");
+    if (max_mr_size_env) {
+        uint64_t val = atoll(max_mr_size_env);
+        if (val > 0) {
+            config.max_mr_size = val;
+        } else {
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MAX_MR_SIZE";
+        }
+    }
+
+    const char* retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);
         if (val > 0 && val < 128)
@@ -191,12 +224,12 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
-    const char *disable_metacache = std::getenv("MC_DISABLE_METACACHE");
+    const char* disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
     }
 
-    const char *handshake_listen_backlog =
+    const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
         int val = std::stoi(handshake_listen_backlog);
@@ -208,7 +241,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *log_level = std::getenv("MC_LOG_LEVEL");
+    const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
         if (strcmp(log_level, "TRACE") == 0) {
@@ -224,7 +257,7 @@ void loadGlobalConfig(GlobalConfig &config) {
     }
     FLAGS_minloglevel = config.log_level;
 
-    const char *slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
+    const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {
         int val = atoi(slice_timeout_env);
         if (val > 0 && val < 65536)
@@ -234,7 +267,7 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
     }
 
-    const char *log_dir_path = std::getenv("MC_LOG_DIR");
+    const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
         if (opendir(log_dir_path) == NULL) {
@@ -253,31 +286,24 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    if (min_port_env) {
-        int val = atoi(min_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_min_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MIN_PORT";
-    }
-
-    const char *max_port_env = std::getenv("MC_MAX_PRC_PORT");
-    if (max_port_env) {
-        int val = atoi(max_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_max_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MAX_PORT";
+    const char* min_port_env = std::getenv("MC_MIN_RPC_PORT");
+    if (!min_port_env) min_port_env = std::getenv("MC_MIN_PRC_PORT");
+    const char* max_port_env = std::getenv("MC_MAX_RPC_PORT");
+    if (!max_port_env) max_port_env = std::getenv("MC_MAX_PRC_PORT");
+    {
+        int raw_min = min_port_env ? atoi(min_port_env) : config.rpc_min_port;
+        int raw_max = max_port_env ? atoi(max_port_env) : config.rpc_max_port;
+        auto [validated_min, validated_max] =
+            ValidatePortRange(raw_min, raw_max, 15000, 17000);
+        config.rpc_min_port = validated_min;
+        config.rpc_max_port = validated_max;
     }
 
     if (std::getenv("MC_USE_IPV6")) {
         config.use_ipv6 = true;
     }
 
-    const char *fragment_ratio = std::getenv("MC_FRAGMENT_RATIO");
+    const char* fragment_ratio = std::getenv("MC_FRAGMENT_RATIO");
     if (fragment_ratio) {
         size_t val = atoi(fragment_ratio);
         if (val > 0 && val < config.slice_size)
@@ -293,7 +319,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.enable_dest_device_affinity = true;
     }
 
-    const char *enable_parallel_reg_mr =
+    const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
         int val = atoi(enable_parallel_reg_mr);
@@ -305,7 +331,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
+    const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
             config.endpoint_store_type = EndpointStoreType::FIFO;
@@ -317,7 +343,7 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
-    const char *traffic_class_env = std::getenv("MC_IB_TC");
+    const char* traffic_class_env = std::getenv("MC_IB_TC");
     if (traffic_class_env) {
         try {
             int val = std::stoi(traffic_class_env);
@@ -329,13 +355,13 @@ void loadGlobalConfig(GlobalConfig &config) {
                     << "value " << traffic_class_env
                     << " out of range (should be 0-255)";
             }
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_IB_TC environment value: "
                          << traffic_class_env << ". Error: " << e.what();
         }
     }
 
-    const char *ib_relaxed_ordering_env =
+    const char* ib_relaxed_ordering_env =
         std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     if (ib_relaxed_ordering_env) {
         int val = atoi(ib_relaxed_ordering_env);
@@ -344,6 +370,62 @@ void loadGlobalConfig(GlobalConfig &config) {
         else
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
+    }
+
+    const char* mlx5_qp_udp_sports_env = std::getenv("MC_MLX5_QP_UDP_SPORTS");
+    if (mlx5_qp_udp_sports_env && *mlx5_qp_udp_sports_env) {
+        std::vector<uint16_t> ports;
+        std::stringstream ss(mlx5_qp_udp_sports_env);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            // Trim leading/trailing whitespace.
+            auto l = item.find_first_not_of(" \t");
+            auto r = item.find_last_not_of(" \t");
+            if (l == std::string::npos) continue;
+            item = item.substr(l, r - l + 1);
+            try {
+                int val = std::stoi(item);
+                if (val < 0 || val > 65535) {
+                    LOG(WARNING)
+                        << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
+                    ok = false;
+                    break;
+                }
+                ports.push_back(static_cast<uint16_t>(val));
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Invalid MC_MLX5_QP_UDP_SPORTS entry: " << item
+                             << ". Error: " << e.what();
+                ok = false;
+                break;
+            }
+        }
+        if (ok && !ports.empty()) {
+            config.mlx5_qp_udp_sports = std::move(ports);
+        } else if (!ok) {
+            LOG(WARNING) << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to "
+                            "parse errors";
+        }
+    }
+
+    const char* mlx5_qp_lag_port_balance_env =
+        std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
+    if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
+        std::string val(mlx5_qp_lag_port_balance_env);
+        // Trim leading/trailing whitespace.
+        auto l = val.find_first_not_of(" \t");
+        auto r = val.find_last_not_of(" \t");
+        if (l != std::string::npos) {
+            val = val.substr(l, r - l + 1);
+            if (val == "1" || val == "true")
+                config.mlx5_qp_lag_port_balance = true;
+            else if (val == "0" || val == "false")
+                config.mlx5_qp_lag_port_balance = false;
+            else
+                LOG(WARNING) << "Ignore MC_MLX5_QP_LAG_PORT_BALANCE: expected "
+                                "0/1/true/false, got: "
+                             << val;
+        }
     }
 }
 
@@ -360,8 +442,8 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "UNKNOWN";
 }
 
-void updateGlobalConfig(ibv_device_attr &device_attr) {
-    auto &config = globalConfig();
+void updateGlobalConfig(ibv_device_attr& device_attr) {
+    auto& config = globalConfig();
     if (config.max_ep_per_ctx * config.num_qp_per_ep >
         (size_t)device_attr.max_qp)
         config.max_ep_per_ctx = device_attr.max_qp / config.num_qp_per_ep;
@@ -378,13 +460,14 @@ void updateGlobalConfig(ibv_device_attr &device_attr) {
 }
 
 void dumpGlobalConfig() {
-    auto &config = globalConfig();
+    auto& config = globalConfig();
     LOG(INFO) << "=== GlobalConfig ===";
     LOG(INFO) << "num_cq_per_ctx = " << config.num_cq_per_ctx;
     LOG(INFO) << "num_comp_channels_per_ctx = "
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
@@ -395,9 +478,21 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
+            if (i) oss << ",";
+            oss << config.mlx5_qp_udp_sports[i];
+        }
+        LOG(INFO) << "mlx5_qp_udp_sports = ["
+                  << (config.mlx5_qp_udp_sports.empty() ? "<unset>" : oss.str())
+                  << "]";
+    }
+    LOG(INFO) << "mlx5_qp_lag_port_balance = "
+              << (config.mlx5_qp_lag_port_balance ? "true" : "false");
 }
 
-GlobalConfig &globalConfig() {
+GlobalConfig& globalConfig() {
     static GlobalConfig config;
     static std::once_flag g_once_flag;
     std::call_once(g_once_flag, []() { loadGlobalConfig(config); });
@@ -405,4 +500,26 @@ GlobalConfig &globalConfig() {
 }
 
 uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
+
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max) {
+    constexpr int kMinAllowed = 1024;
+    constexpr int kEphemeralStart = 32768;
+    constexpr int kEphemeralEnd = 60999;
+    constexpr int kMaxAllowed = 65535;
+
+    auto is_valid_port = [&](int p) {
+        return p >= kMinAllowed && p <= kMaxAllowed &&
+               !(p >= kEphemeralStart && p <= kEphemeralEnd);
+    };
+
+    if (!is_valid_port(min_port) || !is_valid_port(max_port) ||
+        min_port > max_port) {
+        LOG(WARNING) << "Invalid port range [" << min_port << ", " << max_port
+                     << "], falling back to default [" << default_min << ", "
+                     << default_max << "]";
+        return {default_min, default_max};
+    }
+    return {min_port, max_port};
+}
 }  // namespace mooncake

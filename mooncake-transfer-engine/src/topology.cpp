@@ -33,6 +33,10 @@
 #include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
+#ifdef USE_UB
+#include <libgen.h>
+#include <urma_api.h>
+#endif
 
 namespace mooncake {
 
@@ -192,6 +196,110 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
     return devices;
 }
 
+#ifdef USE_UB
+struct UBDevice {
+    std::string name;
+    std::string pci_bus_id;
+    int numa_node;
+};
+
+static std::vector<UBDevice> listUBDevices(
+    const std::vector<std::string> &filter) {
+    int num_devices = 0;
+    std::vector<UBDevice> devices;
+
+    urma_init_attr_t init_attr = {};
+    if (urma_init(&init_attr) != URMA_SUCCESS) {
+        LOG(WARNING) << "Failed to urma init";
+        return {};
+    }
+    LOG(INFO) << "URMA module init success";
+    urma_device_t **device_list = urma_get_device_list(&num_devices);
+    if (!device_list) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_uninit();
+        return {};
+    }
+    if (device_list && num_devices <= 0) {
+        LOG(WARNING) << "No UB devices found, check your device installation";
+        urma_free_device_list(device_list);
+        return {};
+    }
+
+    for (int i = 0; i < num_devices; ++i) {
+        std::string device_name = device_list[i]->name;
+        if (!filter.empty() && std::find(filter.begin(), filter.end(),
+                                         device_name) == filter.end())
+            continue;
+        char path[PATH_MAX + 32];
+        char resolved_path[PATH_MAX];
+        // Get the PCI bus id for the infiniband device. Note that
+        snprintf(path, sizeof(path), "/sys/class/ubcore/%s",
+                 device_list[i]->name);
+        LOG(INFO) << "listUBDevices: path " << path;
+        if (realpath(path, resolved_path) == NULL) {
+            LOG(ERROR) << "listUBDevices: realpath " << resolved_path
+                       << " failed";
+            continue;
+        }
+        LOG(INFO) << "listUBDevices: realpath " << resolved_path;
+        std::string pci_bus_id = basename(resolved_path);
+
+        int numa_node = -1;
+        snprintf(path, sizeof(path), "%s/numa",
+                 dirname(dirname(resolved_path)));
+        LOG(INFO) << "listUBDevices: numanodepath " << path;
+        std::ifstream(path) >> numa_node;
+        LOG(INFO) << "UBDevices : performation node ----"
+                  << device_list[i]->name << " : " << numa_node;
+
+        devices.push_back(UBDevice{.name = std::move(device_name),
+                                   .pci_bus_id = std::move(pci_bus_id),
+                                   .numa_node = numa_node});
+    }
+    urma_free_device_list(device_list);
+    urma_uninit();
+    return devices;
+}
+
+static std::vector<TopologyEntry> discoverCpuTopology(
+    const std::vector<UBDevice> &all_hca) {
+    DIR *dir = opendir("/sys/devices/system/node");
+    struct dirent *entry;
+    std::vector<TopologyEntry> topology;
+
+    if (dir == NULL) {
+        PLOG(WARNING)
+            << "discoverCpuTopology: open /sys/devices/system/node failed";
+        return {};
+    }
+    while ((entry = readdir(dir))) {
+        const char *prefix = "node";
+        if (entry->d_type != DT_DIR ||
+            strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
+            continue;
+        }
+        int node_id = atoi(entry->d_name + strlen(prefix));
+        std::vector<std::string> preferred_hca;
+        std::vector<std::string> avail_hca;
+        // an HCA connected to the same cpu NUMA node is preferred
+        for (const auto &hca : all_hca) {
+            if (hca.numa_node == node_id) {
+                preferred_hca.push_back(hca.name);
+            } else {
+                avail_hca.push_back(hca.name);
+            }
+        }
+        topology.push_back(
+            TopologyEntry{.name = "cpu:" + std::to_string(node_id),
+                          .preferred_hca = std::move(preferred_hca),
+                          .avail_hca = std::move(avail_hca)});
+    }
+    (void)closedir(dir);
+    return topology;
+}
+#endif
+
 static std::vector<TopologyEntry> discoverCpuTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     DIR *dir = opendir("/sys/devices/system/node");
@@ -229,7 +337,9 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -290,18 +400,18 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         std::vector<std::string> preferred_hca;
         std::vector<std::string> avail_hca;
 
-        // Find HCAs with minimum distance in one pass
+        // Find HCAs with minimum distance in one pass.
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
-        std::vector<InfinibandDevice> sameNuma_hca;
+        std::vector<InfinibandDevice> same_numa_hca;
         for (const auto &hca : all_hca) {
             if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
-                sameNuma_hca.push_back(hca);
+                same_numa_hca.push_back(hca);
             }
         }
         const auto &candidate_preferred_hca =
-            sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+            same_numa_hca.empty() ? all_hca : same_numa_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
@@ -332,8 +442,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
     }
     return topology;
 }
-
-#endif  // USE_CUDA
+#endif
 
 Topology::Topology() {
     auto str = getenv("MC_PATH_ROUNDROBIN");
@@ -368,8 +477,16 @@ int Topology::discover(const std::vector<std::string> &filter) {
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
     for (auto &ent : discoverCudaTopology(all_hca)) {
+        matrix_[ent.name] = ent;
+    }
+#endif
+#ifdef USE_UB
+    auto ub_all_hca = listUBDevices(filter);
+    for (auto &ent : discoverCpuTopology(ub_all_hca)) {
         matrix_[ent.name] = ent;
     }
 #endif

@@ -73,7 +73,7 @@ ErrorCode Init(const std::string& local_hostname,
 ### Get 接口
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -116,6 +116,65 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
 
+### CreateCopyTask 接口
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+`CreateCopyTask` 创建一个异步复制任务，将由客户端的任务执行系统执行。当您需要提交多个复制操作而不等待每个操作完成时，这很有用。任务被提交到 master 服务，分配唯一的任务 ID，并由可用的客户端异步执行。可以使用 `QueryTask` 查询任务状态。
+
+**任务执行和结果反馈：**
+1. **任务分配**：master 服务在客户端定期通讯中将任务分配给可用的客户端
+2. **任务执行**：分配的客户端在后台线程池中异步执行复制操作
+3. **结果反馈**：执行完成后（成功或失败），客户端通过 `MarkTaskToComplete` 自动向 master 服务报告结果：
+   - 成功时：`status = SUCCESS`，`message = "Task completed successfully"`
+   - 失败时：`status = FAILED`，`message = <错误描述>`
+4. **状态查询**：您可以随时使用 `QueryTask` 查询任务状态以监控进度
+
+### CreateMoveTask 接口
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+`CreateMoveTask` 创建一个异步移动任务，将由客户端的任务执行系统执行。当您需要提交多个移动操作而不等待每个操作完成时，这很有用。任务被提交到 master 服务，分配唯一的任务 ID，并由可用的客户端异步执行。可以使用 `QueryTask` 查询任务状态。
+
+**任务执行和结果反馈：**
+1. **任务分配**：master 服务在客户端定期通讯中将任务分配给可用的客户端
+2. **任务执行**：分配的客户端在后台线程池中异步执行移动操作
+3. **结果反馈**：执行完成后（成功或失败），客户端通过 `MarkTaskToComplete` 自动向 master 服务报告结果：
+   - 成功时：`status = SUCCESS`，`message = "Task completed successfully"`
+   - 失败时：`status = FAILED`，`message = <错误描述>`
+4. **状态查询**：您可以随时使用 `QueryTask` 查询任务状态以监控进度
+
+### QueryTask 接口
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` 查询异步任务（复制或移动）的状态。这允许您监控基于任务的操作进度。响应包括任务状态、类型、创建时间、最后更新时间、分配的客户端和状态消息。
+
+其中`QueryTaskResponse` 的数据结构细节如下：
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // 任务 UUID
+    TaskType type;                              // 任务类型 (REPLICA_COPY 或 REPLICA_MOVE)
+    TaskStatus status;                          // 任务状态 (PENDING, PROCESSING, SUCCESS, 或 FAILED)
+    int64_t created_at_ms_epoch;                // 任务创建时间戳（毫秒）
+    int64_t last_updated_at_ms_epoch;           // 最后更新时间戳（毫秒）
+    UUID assigned_client;                       // 分配给执行任务的客户端 UUID
+    std::string message;                        // 状态消息或错误描述
+};
+```
+
 ### RemoveByRegex
 
 ```C++
@@ -155,6 +214,22 @@ QueryByRegex(const std::string& str);
 ### Master Service
 
 将集群中所有可用的资源看做一个巨大的资源池，由一个中心化的 Master 进程进行空间分配，并指导实现数据复制（**注意 Master Service 不接管任何的数据流，只是提供对应的元数据信息**）。
+
+#### Snapshot 与 Restore
+
+为减少 master 重启后的缓存预热时间，Master Service 支持对自身元数据进行周期性快照（snapshot），并在启动时从快照中恢复（restore）。
+
+- Snapshot 生成
+  - 后台快照线程会定期在不阻塞正常 RPC 请求的情况下，基于 fork 的写时复制（copy-on-write）机制，获取一份一致性的内存快照，其中包含 KV 元数据、segment 信息以及分配器状态。
+  - 子进程将这些结构序列化为紧凑的二进制格式，并通过 `SerializerBackend` 抽象写入配置的 snapshot 后端。
+- Restore
+  - 在启动阶段，当启用 snapshot restore 时，master 会从后端读取最新的快照，在内存中重建 Master Service 的元数据状态。
+- 提示
+  - 由于快照是周期性生成而不是实时更新，如果 master 在两次快照之间发生故障，自上一次成功快照以来的部分元数据变更可能无法恢复。
+
+> **警告：受管存储**
+>
+> 快照存储位置由 Mooncake 快照系统**完全管理**，过期快照会被自动删除。**请勿在此位置存放其他文件**，请使用独立、隔离的存储用于快照。
 
 #### Master Service 接口
 
@@ -226,7 +301,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -315,7 +390,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Master Service 分配好的副本信息
 };
 ```
@@ -329,7 +404,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -346,7 +421,7 @@ Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master S
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -355,7 +430,7 @@ message RemoveResponse {
 ```
 
 * 请求: RemoveRequest，包含需要删除对象的key
-* 响应: RemoveResponse，包含状态码 status_code 
+* 响应: RemoveResponse，包含状态码 status_code
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
@@ -620,11 +695,14 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 **注意** 当前还没有提供DFS上文件驱逐的能力
 
 #### 数据访问机制
-持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
+持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。
 
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
-#### 3FS USRBIO 插件
+#### 3FS USRBIO 插件（实验性 / 未完成）
+
+> **实验性功能：** HF3FS（3FS USRBIO）相关集成仍在开发中，尚未达到可视为生产就绪的程度；接口与行为可能变更，建议仅用于评估与测试。
+
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
 ### 内置元数据服务器
@@ -647,6 +725,8 @@ HTTP 元数据服务器可通过以下参数进行配置：
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
+- **MC_STORE_CLIENT_MIN_PORT**: 客户端使用的最小端口号, 默认 12300。端口范围必须在 1024–32767 或 61000–65535 之间（排除知名端口和临时端口）。无效值将回退为默认值。
+- **MC_STORE_CLIENT_MAX_PORT**: 客户端使用的最大端口号, 默认 14300。范围约束同上；必须 ≥ MC_STORE_CLIENT_MIN_PORT。
 - **MC_STORE_USE_HUGEPAGE**: 启用 hugepage 优化, 默认禁用, 设置为 1/true 启用
 - **MC_STORE_HUGEPAGE_SIZE**: hugepage 页大小, 默认 2M
 
@@ -704,6 +784,8 @@ Max threads: 4
 Master service listening on 0.0.0.0:50051
 ```
 
+如果 Master 运行在容器中，而容器 IP 可能动态变化，建议使用 `--rpc-interface=<网卡名>`（例如 `--rpc-interface=eth0`）而不是写死 `--rpc-address`。Master 会在启动时解析该网卡当前的 IPv4 地址，并将其作为最终的 `rpc_address` 使用。
+
 **高可用模式**:
 
 高可用模式依赖于 etcd 服务进行协调。如果 Transfer Engine 也使用 etcd 作为其元数据服务，那么 Mooncake Store 使用的 etcd 集群可以与 Transfer Engine 使用的集群共用，也可以是独立的。
@@ -713,6 +795,7 @@ Master service listening on 0.0.0.0:50051
 --enable-ha：启用高可用模式
 --etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
 --rpc-address：该实例的 RPC 地址。注意，这里填写的地址应当是客户端可访问的地址。
+--rpc-interface：按网卡名解析当前实例的 IPv4 地址。设置后会覆盖 --rpc-address，适合容器 IP 会变化的场景。
 ```
 
 例如:
@@ -721,6 +804,14 @@ Master service listening on 0.0.0.0:50051
     --enable-ha=true \
     --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
     --rpc-address=10.0.0.1
+```
+
+容器部署示例：
+```
+./build/mooncake-store/src/mooncake_master \
+    --enable-ha=true \
+    --etcd-endpoints="0.0.0.0:2379;0.0.0.0:2479;0.0.0.0:2579" \
+    --rpc-interface=eth0
 ```
 
 ### 启动验证程序

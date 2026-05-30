@@ -86,6 +86,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -247,6 +250,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

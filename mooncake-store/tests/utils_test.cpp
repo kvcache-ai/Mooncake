@@ -23,6 +23,19 @@ TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(15 * 1024 * 1024 + 44048), "15.04 MB");
 }
 
+TEST(UtilsTest, StringToBool) {
+    EXPECT_EQ(string_to_bool("1"), true);
+    EXPECT_EQ(string_to_bool("true"), true);
+    EXPECT_EQ(string_to_bool("YES"), true);
+    EXPECT_EQ(string_to_bool(" on "), true);
+    EXPECT_EQ(string_to_bool("0"), false);
+    EXPECT_EQ(string_to_bool("false"), false);
+    EXPECT_EQ(string_to_bool("No"), false);
+    EXPECT_EQ(string_to_bool(" off "), false);
+    EXPECT_EQ(string_to_bool("maybe"), std::nullopt);
+    EXPECT_EQ(string_to_bool(""), std::nullopt);
+}
+
 TEST(UtilsTest, IsPortAvailable) {
     // Find an available port
     int test_port = -1;
@@ -130,6 +143,18 @@ TEST(UtilsTest, SplitStringBasic) {
     EXPECT_EQ(tokens[1], "b");
     EXPECT_EQ(tokens[2], "c");
     EXPECT_EQ(tokens[3], "d");
+}
+
+TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {
+    auto address = GetInterfaceIPv4Address("lo");
+    ASSERT_TRUE(address.has_value()) << address.error();
+    EXPECT_EQ(address.value(), "127.0.0.1");
+}
+
+TEST(UtilsTest, GetInterfaceIPv4AddressMissingInterface) {
+    auto address = GetInterfaceIPv4Address("mooncake_missing_if");
+    ASSERT_FALSE(address.has_value());
+    EXPECT_NE(address.error().find("not found"), std::string::npos);
 }
 
 TEST(UtilsTest, AutoPortBinderRAII) {

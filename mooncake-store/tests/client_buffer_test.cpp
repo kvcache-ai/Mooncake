@@ -225,6 +225,30 @@ TEST_F(ClientBufferTest, SplitIntoSlicesSmallBuffer) {
     EXPECT_EQ(slices[0].size, alloc_size);
 }
 
+// Test split_into_slices with ptr and length
+TEST_F(ClientBufferTest, SplitIntoSlicesPtrLength) {
+    const size_t buffer_size = 1024 * 1024;  // 1MB
+    const size_t alloc_size = 300 * 1024;    // 300KB
+    auto allocator = ClientBufferAllocator::create(buffer_size);
+    ASSERT_NE(allocator, nullptr);
+
+    auto handle_opt = allocator->allocate(alloc_size);
+    ASSERT_TRUE(handle_opt.has_value());
+    BufferHandle handle = std::move(handle_opt.value());
+    void* buffer_ptr = handle.ptr();
+    size_t length = handle.size();
+    auto slices = split_into_slices(buffer_ptr, length);
+    // Verify slices cover the entire buffer
+    size_t total_slice_size = 0;
+    for (const auto& slice : slices) {
+        EXPECT_NE(slice.ptr, nullptr);
+        EXPECT_GT(slice.size, 0);
+        EXPECT_LE(slice.size, kMaxSliceSize);
+        total_slice_size += slice.size;
+    }
+    EXPECT_EQ(total_slice_size, alloc_size);
+}
+
 // Test memory exhaustion scenario
 TEST_F(ClientBufferTest, MemoryExhaustion) {
     const size_t buffer_size =

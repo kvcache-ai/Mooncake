@@ -2,11 +2,26 @@
 
 #include <optional>
 #include <stdexcept>
+#include <string_view>
+
+#include <glog/logging.h>
 
 #include "config_helper.h"
 #include "types.h"
 
 namespace mooncake {
+
+inline std::string ResolveConfiguredHABackendConnstring(
+    std::string_view ha_backend_type, std::string_view ha_backend_connstring,
+    std::string_view etcd_endpoints) {
+    if (!ha_backend_connstring.empty()) {
+        return std::string(ha_backend_connstring);
+    }
+    if (ha_backend_type == "etcd") {
+        return std::string(etcd_endpoints);
+    }
+    return {};
+}
 
 // The configuration for the master server
 struct MasterConfig {
@@ -15,6 +30,7 @@ struct MasterConfig {
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
+    std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
@@ -23,16 +39,24 @@ struct MasterConfig {
     bool allow_evict_soft_pinned_objects;
     double eviction_ratio;
     double eviction_high_watermark_ratio;
+    double nof_eviction_ratio;
+    double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
+    int64_t nof_heartbeat_interval_sec;
+    uint32_t nof_heartbeat_probe_timeout_ms;
+    uint32_t nof_heartbeat_failures_threshold;
 
     bool enable_ha;
     bool enable_offload;
+    std::string ha_backend_type;
+    std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
     std::string cluster_id;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
+    std::string allocation_strategy;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -46,15 +70,45 @@ struct MasterConfig {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
 
+    bool enable_snapshot_restore;
+    bool enable_snapshot;
+    std::string snapshot_backup_dir;
+    uint64_t snapshot_interval_seconds;
+    uint64_t snapshot_child_timeout_seconds;
+    uint32_t snapshot_retention_count;
+
+    // Snapshot object store type: "local" or "s3", required when
+    // snapshot or restore is enabled
+    std::string snapshot_object_store_type;
+
+    // Snapshot catalog store type: ""/"embedded" or "redis". Empty keeps the
+    // embedded catalog behavior. "payload" remains a deprecated alias.
+    std::string snapshot_catalog_store_type;
+
+    // Optional connection string for snapshot catalog store. When empty, the
+    // implementation may fall back to a backend-specific default.
+    std::string snapshot_catalog_store_connstring;
+
     // Task manager configuration
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    // Offload-on-evict: defer LOCAL_DISK offload to eviction time
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY so the next Get is fast.
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
 };
 
 class MasterServiceSupervisorConfig {
@@ -69,7 +123,16 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_ratio{"eviction_ratio"};
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
+    RequiredParam<double> nof_eviction_ratio{"nof_eviction_ratio"};
+    RequiredParam<double> nof_eviction_high_watermark_ratio{
+        "nof_eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<int64_t> nof_heartbeat_interval_sec{
+        "nof_heartbeat_interval_sec"};
+    RequiredParam<uint32_t> nof_heartbeat_probe_timeout_ms{
+        "nof_heartbeat_probe_timeout_ms"};
+    RequiredParam<uint32_t> nof_heartbeat_failures_threshold{
+        "nof_heartbeat_failures_threshold"};
     RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
@@ -79,6 +142,8 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -96,6 +161,18 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server = false;
@@ -105,6 +182,11 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -118,8 +200,20 @@ class MasterServiceSupervisorConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -128,7 +222,10 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -146,15 +243,29 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
 
+<<<<<<< HEAD
         // Set HTTP metadata server configuration
         enable_http_metadata_server = config.enable_http_metadata_server;
         http_metadata_server_port = config.http_metadata_server_port;
         http_metadata_server_host = config.http_metadata_server_host;
+=======
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
+>>>>>>> origin/main
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -190,8 +301,26 @@ class MasterServiceSupervisorConfig {
             throw std::runtime_error(
                 "eviction_high_watermark_ratio is not set");
         }
+        if (!nof_eviction_ratio.IsSet()) {
+            throw std::runtime_error("nof_eviction_ratio is not set");
+        }
+        if (!nof_eviction_high_watermark_ratio.IsSet()) {
+            throw std::runtime_error(
+                "nof_eviction_high_watermark_ratio is not set");
+        }
         if (!client_live_ttl_sec.IsSet()) {
             throw std::runtime_error("client_live_ttl_sec is not set");
+        }
+        if (!nof_heartbeat_interval_sec.IsSet()) {
+            throw std::runtime_error("nof_heartbeat_interval_sec is not set");
+        }
+        if (!nof_heartbeat_probe_timeout_ms.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_probe_timeout_ms is not set");
+        }
+        if (!nof_heartbeat_failures_threshold.IsSet()) {
+            throw std::runtime_error(
+                "nof_heartbeat_failures_threshold is not set");
         }
         if (!rpc_port.IsSet()) {
             throw std::runtime_error("rpc_port is not set");
@@ -216,19 +345,46 @@ class WrappedMasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -236,6 +392,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -256,10 +413,26 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -273,14 +446,41 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
 
+        // Convert string allocation_strategy to AllocationStrategyType enum
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "cxl") {
+            allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else {
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl "
+                            "(case-sensitive)";
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        }
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -301,11 +501,23 @@ class WrappedMasterServiceConfig {
         http_port = static_cast<uint16_t>(config.metrics_port);
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = ResolveConfiguredHABackendConnstring(
+            ha_backend_type, config.ha_backend_connstring,
+            config.etcd_endpoints);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -314,11 +526,23 @@ class WrappedMasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot = config.enable_snapshot;
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -339,23 +563,46 @@ class MasterServiceConfigBuilder {
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio_ = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio_ =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms_ =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold_ =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha_ = false;
     bool enable_offload_ = false;
+    std::string ha_backend_type_ = "etcd";
+    std::string ha_backend_connstring_;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type_ =
+        AllocationStrategyType::RANDOM;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_ = false;
+    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds_ =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_object_store_type_;
+    std::string snapshot_catalog_store_type_;
+    std::string snapshot_catalog_store_connstring_;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
     uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
+    uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
@@ -391,6 +638,17 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_nof_eviction_ratio(double ratio) {
+        nof_eviction_ratio_ = ratio;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_eviction_high_watermark_ratio(
+        double ratio) {
+        nof_eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_view_version(ViewVersionId version) {
         view_version_ = version;
         return *this;
@@ -401,6 +659,23 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_nof_heartbeat_interval_sec(int64_t ttl) {
+        nof_heartbeat_interval_sec_ = ttl;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_probe_timeout_ms(
+        uint32_t timeout_ms) {
+        nof_heartbeat_probe_timeout_ms_ = timeout_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_nof_heartbeat_failures_threshold(
+        uint32_t threshold) {
+        nof_heartbeat_failures_threshold_ = threshold;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
         return *this;
@@ -408,6 +683,18 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_offload(bool enable) {
         enable_offload_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_type(
+        const std::string& backend_type) {
+        ha_backend_type_ = backend_type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_ha_backend_connstring(
+        const std::string& connstring) {
+        ha_backend_connstring_ = connstring;
         return *this;
     }
 
@@ -433,6 +720,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_allocation_strategy_type(
+        AllocationStrategyType type) {
+        allocation_strategy_type_ = type;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
         uint64_t put_start_discard_timeout_sec) {
         put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
@@ -443,6 +736,78 @@ class MasterServiceConfigBuilder {
         uint64_t put_start_release_timeout_sec) {
         put_start_release_timeout_sec_ = put_start_release_timeout_sec;
         return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_snapshot_restore(bool enable) {
+        enable_snapshot_restore_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
+        enable_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_backup_dir(
+        const std::string& dir) {
+        snapshot_backup_dir_ = dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_interval_seconds(
+        uint64_t seconds) {
+        snapshot_interval_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
+        uint64_t seconds) {
+        snapshot_child_timeout_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_retention_count(uint32_t count) {
+        snapshot_retention_count_ = count;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_object_store_type(
+        const std::string& type) {
+        snapshot_object_store_type_ = type;
+        return *this;
+    }
+
+    // Deprecated compatibility shims for older tests and call sites.
+    MasterServiceConfigBuilder& set_snapshot_payload_store_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_payload_backend_type(
+        const std::string& type) {
+        return set_snapshot_object_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_type(
+        const std::string& type) {
+        snapshot_catalog_store_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_type(
+        const std::string& type) {
+        return set_snapshot_catalog_store_type(type);
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_store_connstring(
+        const std::string& connstring) {
+        snapshot_catalog_store_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_catalog_backend_connstring(
+        const std::string& connstring) {
+        return set_snapshot_catalog_store_connstring(connstring);
     }
 
     MasterServiceConfigBuilder& set_max_total_finished_tasks(
@@ -473,6 +838,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_retry_attempts(
+        uint32_t max_retry_attempts) {
+        max_retry_attempts_ = max_retry_attempts;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
         cxl_path_ = path;
         return *this;
@@ -498,6 +869,7 @@ struct TaskManagerConfig {
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
 };
 
 class MasterServiceConfig {
@@ -509,25 +881,53 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    double nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    uint32_t nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    uint32_t nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     bool enable_ha = false;
     bool enable_offload = false;
+    bool offload_on_evict = false;
+    bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
+    std::string snapshot_object_store_type;
+    std::string snapshot_catalog_store_type;
+    std::string snapshot_catalog_store_connstring;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
         .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
         .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
+        .max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS,
     };
 
     std::string cxl_path = DEFAULT_CXL_PATH;
@@ -545,19 +945,46 @@ class MasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
+        nof_eviction_ratio = config.nof_eviction_ratio;
+        nof_eviction_high_watermark_ratio =
+            config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
+        offload_on_evict = config.offload_on_evict;
+        offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
+        ha_backend_type = config.ha_backend_type;
+        ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_backup_dir = config.snapshot_backup_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
+        snapshot_object_store_type = config.snapshot_object_store_type;
+        snapshot_catalog_store_type = config.snapshot_catalog_store_type;
+        snapshot_catalog_store_connstring =
+            config.snapshot_catalog_store_connstring;
+
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
         task_manager_config.max_total_pending_tasks =
@@ -568,6 +995,7 @@ class MasterServiceConfig {
             config.pending_task_timeout_sec;
         task_manager_config.processing_task_timeout_sec =
             config.processing_task_timeout_sec;
+        task_manager_config.max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -585,18 +1013,37 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.nof_eviction_ratio = nof_eviction_ratio_;
+    config.nof_eviction_high_watermark_ratio =
+        nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
+    config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
+    config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
+    config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
     config.enable_ha = enable_ha_;
     config.enable_offload = enable_offload_;
+    config.ha_backend_type = ha_backend_type_;
+    config.ha_backend_connstring = ha_backend_connstring_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
+    config.allocation_strategy_type = allocation_strategy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_snapshot_restore = enable_snapshot_restore_;
+    config.enable_snapshot = enable_snapshot_;
+    config.snapshot_backup_dir = snapshot_backup_dir_;
+    config.snapshot_interval_seconds = snapshot_interval_seconds_;
+    config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
+    config.snapshot_retention_count = snapshot_retention_count_;
+    config.snapshot_object_store_type = snapshot_object_store_type_;
+    config.snapshot_catalog_store_type = snapshot_catalog_store_type_;
+    config.snapshot_catalog_store_connstring =
+        snapshot_catalog_store_connstring_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =
@@ -607,6 +1054,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         pending_task_timeout_sec_;
     config.task_manager_config.processing_task_timeout_sec =
         processing_task_timeout_sec_;
+    config.task_manager_config.max_retry_attempts = max_retry_attempts_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
@@ -624,9 +1072,14 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_offload;
     std::optional<bool> enable_cxl;
     std::optional<std::string> cxl_path;
     std::optional<size_t> cxl_size;
+    std::optional<double> eviction_high_watermark_ratio;
+    std::optional<std::string> root_fs_dir;
+    std::optional<bool> enable_disk_eviction;
+    std::optional<uint64_t> quota_bytes;
 };
 
 // Builder class for InProcMasterConfig
@@ -636,9 +1089,14 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_offload_ = std::nullopt;
     std::optional<bool> enable_cxl_ = std::nullopt;
     std::optional<std::string> cxl_path_ = std::nullopt;
     std::optional<size_t> cxl_size_ = std::nullopt;
+    std::optional<double> eviction_high_watermark_ratio_ = std::nullopt;
+    std::optional<std::string> root_fs_dir_ = std::nullopt;
+    std::optional<bool> enable_disk_eviction_ = std::nullopt;
+    std::optional<uint64_t> quota_bytes_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -663,6 +1121,11 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_offload(bool enable) {
+        enable_offload_ = enable;
+        return *this;
+    }
+
     InProcMasterConfigBuilder& set_enable_cxl(bool enable) {
         enable_cxl_ = enable;
         return *this;
@@ -678,6 +1141,30 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_eviction_high_watermark_ratio(double ratio) {
+        if (ratio < 0.0 || ratio > 1.0) {
+            throw std::invalid_argument(
+                "eviction_high_watermark_ratio must be between 0.0 and 1.0");
+        }
+        eviction_high_watermark_ratio_ = ratio;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_root_fs_dir(const std::string& dir) {
+        root_fs_dir_ = dir;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_enable_disk_eviction(bool enable) {
+        enable_disk_eviction_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_quota_bytes(uint64_t bytes) {
+        quota_bytes_ = bytes;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -688,9 +1175,14 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_offload = enable_offload_;
     config.enable_cxl = enable_cxl_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
+    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
+    config.root_fs_dir = root_fs_dir_;
+    config.enable_disk_eviction = enable_disk_eviction_;
+    config.quota_bytes = quota_bytes_;
     return config;
 }
 

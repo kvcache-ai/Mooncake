@@ -45,10 +45,16 @@ RedisMetaStore::RedisMetaStore() {}
 RedisMetaStore::~RedisMetaStore() { disconnect(); }
 
 Status RedisMetaStore::connect(const std::string &endpoint) {
-    return connect(endpoint, "", 0);
+    return connect(endpoint, "", "", 0);
 }
 
 Status RedisMetaStore::connect(const std::string &endpoint,
+                               const std::string &password, uint8_t db_index) {
+    return connect(endpoint, "", password, db_index);
+}
+
+Status RedisMetaStore::connect(const std::string &endpoint,
+                               const std::string &username,
                                const std::string &password, uint8_t db_index) {
     if (connected_) {
         return Status::MetadataError(
@@ -85,9 +91,15 @@ Status RedisMetaStore::connect(const std::string &endpoint,
 
     // Authenticate if password is provided
     if (!password.empty()) {
-        // Use binary-safe authentication to prevent password leakage
-        redisReply *reply = (redisReply *)redisCommand(
-            client_, "AUTH %b", password.data(), password.size());
+        redisReply *reply = nullptr;
+        if (!username.empty()) {
+            reply = (redisReply *)redisCommand(
+                client_, "AUTH %b %b", username.data(), username.size(),
+                password.data(), password.size());
+        } else {
+            reply = (redisReply *)redisCommand(
+                client_, "AUTH %b", password.data(), password.size());
+        }
         RedisReplyGuard reply_guard(reply);
 
         if (!reply || reply->type == REDIS_REPLY_ERROR) {

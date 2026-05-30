@@ -13,9 +13,10 @@
 namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    size_t size, const std::string& protocol, bool use_hugepage) {
+    size_t size, const std::string& protocol, bool use_hugepage,
+    bool use_spdk_dma) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol, use_hugepage));
+        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -26,8 +27,12 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol,
-                                             bool use_hugepage)
-    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+                                             bool use_hugepage,
+                                             bool use_spdk_dma)
+    : buffer_size_(size),
+      use_hugepage_(use_hugepage),
+      protocol(protocol),
+      use_spdk_dma_(use_spdk_dma) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;
@@ -38,7 +43,8 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {
-        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment,
+                                                   use_spdk_dma_);
     }
     if (!buffer_) {
         throw std::bad_alloc();
@@ -50,7 +56,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 
 ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
                                              const std::string& protocol)
-    : protocol(protocol), buffer_size_(size) {
+    : buffer_size_(size), protocol(protocol) {
     buffer_ = addr;
     is_external_memory_ = true;
     allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
@@ -86,23 +92,39 @@ BufferHandle::BufferHandle(
     mooncake::offset_allocator::OffsetAllocationHandle handle)
     : allocator_(std::move(allocator)), handle_(std::move(handle)) {}
 
+BufferHandle::BufferHandle(void* ptr, size_t size,
+                           std::function<void()> release_fn)
+    : view_ptr_(ptr), view_size_(size), release_fn_(std::move(release_fn)) {}
+
 BufferHandle::~BufferHandle() {
-    // The OffsetAllocationHandle destructor will automatically deallocate
-    // No need to manually call deallocate
+    if (release_fn_) {
+        release_fn_();
+    }
+    // Otherwise OffsetAllocationHandle destructor handles deallocation
 }
 
-void* BufferHandle::ptr() const { return handle_.ptr(); }
+void* BufferHandle::ptr() const {
+    return view_ptr_ ? view_ptr_ : handle_.ptr();
+}
 
-size_t BufferHandle::size() const { return handle_.size(); }
+size_t BufferHandle::size() const {
+    return view_ptr_ ? view_size_ : handle_.size();
+}
 
 // Utility functions for buffer and slice management
 std::vector<Slice> split_into_slices(BufferHandle& handle) {
-    std::vector<Slice> slices;
     auto base = static_cast<uint8_t*>(handle.ptr());
+    auto length = handle.size();
+    return split_into_slices(base, length);
+}
+
+std::vector<Slice> split_into_slices(void* buffer, size_t length) {
+    std::vector<Slice> slices;
+    auto base = static_cast<uint8_t*>(buffer);
     size_t offset = 0;
 
-    while (offset < handle.size()) {
-        size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
+    while (offset < length) {
+        size_t chunk_size = std::min(length - offset, kMaxSliceSize);
         slices.push_back({base + offset, chunk_size});
         offset += chunk_size;
     }
@@ -116,6 +138,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
+    } else if (replica.is_nof_replica()) {
+        total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
@@ -137,6 +161,10 @@ int allocateSlices(std::vector<Slice>& slices,
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+    } else if (replica.is_nof_replica()) {
+        auto& handle = replica.get_nof_descriptor().buffer_descriptor;
+        void* chunk_ptr = buffer_ptr;
+        slices.emplace_back(Slice{chunk_ptr, handle.size_});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors

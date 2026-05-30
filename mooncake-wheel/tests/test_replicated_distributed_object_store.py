@@ -174,6 +174,7 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
         config.with_soft_pin = False
+        config.with_hard_pin = False
         
         key2 = "test_put_from_config_key2"
         result = self.store.put_from(key=key2, buffer_ptr=buffer_ptr, size=len(test_data), config=config)
@@ -244,6 +245,7 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
         config.with_soft_pin = False
+        config.with_hard_pin = False
 
         keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]
         results = self.store.batch_put_from(keys=keys2, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes, config=config)

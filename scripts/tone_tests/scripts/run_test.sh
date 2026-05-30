@@ -17,9 +17,13 @@ All_TEST_SCRIPTS_SGLANG=(
     "test_hicache_storage_mooncake_backend.sh"
     "test_disaggregation_different_tp.sh"
     "test_1p1d_erdma.sh"
+    "test_epd_sglang.sh"
+    "test_moe_mooncake.sh"
 )
 
-# All_TEST_SCRIPTS_VLLM=()
+All_TEST_SCRIPTS_VLLM=(
+    "test_vllm_1p1d_erdma.sh"
+)
 
 readonly SSH_CMD="ssh -o StrictHostKeyChecking=no"
 
@@ -242,7 +246,7 @@ run_single_test(){
 }
 
 run_all_tests(){
-    local input_tests=${1:-"All_TEST_SCRIPTS_SGLANG"}
+    local input_tests=$1
     if ! [[ -v "$input_tests" ]]; then
         echo "ERROR: Variable '$input_tests' does not exist"
         return 1
@@ -291,6 +295,7 @@ show_help(){
     echo "Commands:"
     echo "  run-single <test_name>             - Full lifecycle: setup -> run -> parse -> cleanup"
     echo "  run-all [SGLANG|VLLM]              - Run all tests for specific framework"
+    echo "  run-all                            - Run all tests for both SGLANG and VLLM frameworks"
     echo "  run-all SGLANG                     - Run all SGLANG tests (using SGLANG image)"
     echo "  run-all VLLM                       - Run all VLLM tests (using VLLM image)"
 }
@@ -300,15 +305,28 @@ case "$1" in
         shift
         run_single_test "$@"
         ;;
-    "run-all")
-        shift
-        local framework=${1:-"SGLANG"}  # 默认为 SGLANG
-        if [ "$framework" = "VLLM" ]; then
+ "run-all")
+    shift
+    if [ -z "$1" ]; then
+        # No parameter specified, run both SGLANG and VLLM tests
+        echo "No framework specified, running all SGLANG tests..."
+        run_all_tests "All_TEST_SCRIPTS_SGLANG"
+        
+        echo "Running all VLLM tests..."
+        run_all_tests "All_TEST_SCRIPTS_VLLM"
+    else
+        FRAMEWORK=$1
+        if [ "$FRAMEWORK" = "VLLM" ]; then
             run_all_tests "All_TEST_SCRIPTS_VLLM"
-        else
+        elif [ "$FRAMEWORK" = "SGLANG" ]; then
             run_all_tests "All_TEST_SCRIPTS_SGLANG"
+        else
+            echo "ERROR: Unknown framework '$FRAMEWORK'. Use SGLANG or VLLM."
+            show_help
+            return 1
         fi
-        ;;
+    fi
+    ;;
     *)
         show_help
         ;;

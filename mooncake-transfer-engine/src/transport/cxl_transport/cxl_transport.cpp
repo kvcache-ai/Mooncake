@@ -218,10 +218,15 @@ int CxlTransport::install(std::string &local_server_name,
 }
 
 int CxlTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "cxl";
+#else
     desc->protocol = "cxl";
+#endif
     desc->cxl_base_addr = (uint64_t)cxl_base_addr;
     desc->cxl_name = cxl_dev_path;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
@@ -254,6 +259,9 @@ int CxlTransport::registerLocalMemory(void *addr, size_t length,
 
     cxl_buffer_desc.offset = (uint64_t)addr - (uint64_t)cxl_base_addr;
     cxl_buffer_desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    cxl_buffer_desc.protocol = "cxl";
+#endif
     return metadata_->addLocalMemoryBuffer(cxl_buffer_desc, update_metadata);
 }
 

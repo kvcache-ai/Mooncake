@@ -27,8 +27,11 @@ This repository also hosts its technical report and the open-sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **May 7, 2026**: 🚀 [vLLM officially features Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
+- **Apr 29, 2026**: SGLang introduces [RDMA-based P2P weight transfer for large-scale distributed RL](https://lmsys.org/blog/2026-04-29-p2p-update/) using Mooncake TransferEngine, achieving 7x faster weight updates for the 1T-parameter Kimi-K2 model (53s → 7.2s) with zero-copy RDMA transfer across thousands of GPUs.
+ - **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
+ - **Feb 12, 2026**: [Mooncake Joins PyTorch Ecosystem](https://pytorch.org/blog/mooncake-joins-pytorch-ecosystem/) We are thrilled to announce that Mooncake has officially joined the PyTorch Ecosystem!
  - **Jan 28, 2026**: [FlexKV](https://github.com/taco-project/FlexKV), a distributed KV store and cache system from Tencent and NVIDIA in collaboration with the community, now supports [distributed KVCache reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md) with the Mooncake Transfer Engine.
- - **Jan 21, 2026**: Mooncake Project has been approved as a [PyTorch Ecosystem](https://github.com/pytorch-fdn/ecosystem/issues/52) project. See [PyTorch Landscape](https://landscape.pytorch.org/?item=optimizations--general--mooncake) for details.
  - **Dec 23, 2025**: SGLang introduces [Encode-Prefill-Decode (EPD) Disaggregation](https://lmsys.org/blog/2026-01-12-epd/) with Mooncake as a transfer backend. This integration allows decoupling compute-intensive multimodal encoders (e.g., Vision Transformers) from language model nodes, utilizing Mooncake's RDMA engine for zero-copy transfer of large multimodal embeddings.
  - **Dec 19, 2025**: Mooncake Transfer Engine has been [integrated into TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/executor/cache_transmission/mooncake_utils) for KVCache transfer in PD-disaggregated inference.
  - **Dec 19, 2025**: Mooncake Transfer Engine has been directly integrated into vLLM v1 as a [KV Connector](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/) in PD-disaggregated setups.
@@ -65,6 +68,7 @@ This repository also hosts its technical report and the open-sourced traces.
 getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
+getting_started/observability
 getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
@@ -85,6 +89,9 @@ performance/vllm-benchmark-results-v1
 performance/sglang-hicache-benchmark-results-v1
 performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
+performance/allocation-strategy-benchmark-result
+performance/ssd-offload-benchmark-results
+performance/storage-benchmark
 :::
 
 % API Documentation
@@ -110,8 +117,12 @@ design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
 design/hicache-design
+design/engram
+design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
+design/conductor/conductor-architecture-design
+design/conductor/indexer-api-design
 :::
 
 % Q&A for Mooncake
@@ -128,7 +139,7 @@ troubleshooting/troubleshooting
 
 :::{toctree}
 :caption: Deployment
-:maxdepth: 1
+:maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
 :::

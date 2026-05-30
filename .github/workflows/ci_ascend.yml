@@ -1,0 +1,364 @@
+name: 'CI Test on ASCEND Platform'
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git ref to checkout (PR head SHA)'
+        required: false
+        type: string
+
+jobs:
+  build-and-test:
+    if: github.repository == 'kvcache-ai/Mooncake'
+    runs-on: self-hosted
+
+    container:
+      image: localhost:5000/mooncake-hixl-ci:v5
+      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+                    --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
+      env:
+        GITHUB_ACTIONS: "true"
+        LD_PRELOAD: "/usr/lib64/libjemalloc.so.2:"
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi
+        - /usr/local/Ascend/driver/:/usr/local/Ascend/driver/
+        - /etc/ascend_install.info:/etc/ascend_install.info
+        - /etc/hccn.conf:/etc/hccn.conf
+
+    steps:
+    - name: Configure GitHub fetch defaults
+      shell: bash
+      run: |
+        git config --global protocol.version 2
+        git config --global http.version HTTP/1.1
+        git config --global http.lowSpeedLimit 1024
+        git config --global http.lowSpeedTime 30
+
+    - name: Checkout code
+      id: checkout_code
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Retry checkout via GitHub mirror
+      if: steps.checkout_code.outcome == 'failure'
+      shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
+        CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          echo "Checkout from GitHub failed and ASCEND_GITHUB_MIRROR_URLS is not set"
+          exit 1
+        fi
+
+        normalize_base() {
+          local base="$1"
+          base="${base#${base%%[![:space:]]*}}"
+          base="${base%${base##*[![:space:]]}}"
+          [ -n "$base" ] || return 1
+          [ "$base" != "https://github.com/" ] && base="${base%/}/"
+          printf '%s\n' "$base"
+        }
+
+        candidates=()
+        while IFS= read -r raw; do
+          base="$(normalize_base "$raw" || true)"
+          [ -n "$base" ] || continue
+          [ "$base" = "https://github.com/" ] && continue
+          candidates+=("$base")
+        done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
+
+        if [ ${#candidates[@]} -eq 0 ]; then
+          echo "Checkout from GitHub failed and no valid mirror candidates were configured"
+          exit 1
+        fi
+
+        workdir="${GITHUB_WORKSPACE}"
+        git config --global --add safe.directory "$workdir"
+
+        for base in "${candidates[@]}"; do
+          mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
+          echo "Retrying checkout with ${mirror_url}"
+
+          find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          git init "$workdir"
+          git -C "$workdir" remote add origin "$mirror_url"
+
+          if git -C "$workdir" fetch --depth=1 origin "$CHECKOUT_REF" && \
+             git -C "$workdir" checkout --force --detach FETCH_HEAD; then
+            echo "Mirror checkout succeeded via ${base}"
+            exit 0
+          fi
+
+          echo "Mirror checkout failed via ${base}"
+          rm -rf "$workdir/.git"
+        done
+
+        echo "Direct GitHub checkout failed and all mirror retries failed"
+        exit 1
+
+    - name: Configure CMake
+      shell: bash
+      env:
+        ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
+      run: |
+        source /usr/local/Ascend/cann-9.0.0/set_env.sh
+        pwd
+
+        submodule_updated=false
+        if git submodule update --init --recursive; then
+          submodule_updated=true
+        elif [ -n "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+          normalize_base() {
+            local base="$1"
+            base="${base#${base%%[![:space:]]*}}"
+            base="${base%${base##*[![:space:]]}}"
+            [ -n "$base" ] || return 1
+            [ "$base" != "https://github.com/" ] && base="${base%/}/"
+            printf '%s\n' "$base"
+          }
+
+          while IFS= read -r raw; do
+            base="$(normalize_base "$raw" || true)"
+            [ -n "$base" ] || continue
+            [ "$base" = "https://github.com/" ] && continue
+
+            echo "Retrying submodule update with ${base}"
+            if git -c url."${base}https://github.com/".insteadOf=https://github.com/ \
+              submodule update --init --recursive; then
+              submodule_updated=true
+              break
+            fi
+          done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
+        fi
+
+        if [ "$submodule_updated" != true ]; then
+          if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
+            echo "git submodule update failed (mirrors also exhausted), trying to cp pybind11..."
+            if [ -d "../pybind11" ]; then
+              cp -r ../pybind11 extern/
+            else
+              echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
+              exit 1
+            fi
+          else
+            echo "Detected that extern/pybind11 already exists, continuing execution...."
+          fi
+        fi
+
+        bash scripts/ascend/dependencies_ascend_installation.sh
+        echo "Configuring CMake..."
+        rm -rf build
+        mkdir -p build
+        cd build
+
+        cmake .. \
+          -DUSE_ASCEND_DIRECT=ON \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_UNIT_TESTS=OFF
+
+    - name: Build
+      shell: bash
+      run: |
+        source /usr/local/Ascend/cann-9.0.0/set_env.sh
+        echo "Building..."
+        cd build
+        cmake --build . -j$(nproc)
+        cmake --install .
+        echo "Mooncake installed successfully."
+
+    - name: Run Hixl Mooncake Store Test
+      shell: bash
+      run: |
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          set -e
+          export ASCEND_PROCESS_LOG_PATH=/tmp/hixl-test-log/
+          export ASCEND_GLOBAL_LOG_LEVEL=3
+          echo "=== Cloning Hixl repository ==="
+          cd ..
+          rm -rf hixl
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl/examples/third_parties/mooncake_store/python/
+
+          export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+          echo "=== Starting Mooncake Master ==="
+
+          # Find mooncake_master binary
+          MOONCAKE_MASTER=$(find /usr/local/bin /usr/bin -name "mooncake_master" -type f 2>/dev/null | head -1)
+          if [ -z "$MOONCAKE_MASTER" ]; then
+              # Try finding in build directory
+              MOONCAKE_MASTER=$(find $GITHUB_WORKSPACE/build -name "mooncake_master" -type f 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$MOONCAKE_MASTER" ]; then
+              echo "Error: mooncake_master binary not found"
+              exit 1
+          fi
+
+          echo "Found mooncake_master at: $MOONCAKE_MASTER"
+
+          # Start Mooncake master in background
+          $MOONCAKE_MASTER \
+            --enable_http_metadata_server=true \
+            --http_metadata_server_host=0.0.0.0 \
+            --http_metadata_server_port=8080 \
+            > /tmp/mooncake_master.log 2>&1 &
+          MASTER_PID=$!
+          echo "Mooncake Master started with PID: $MASTER_PID"
+
+          # Wait for master to be ready
+          echo "Waiting for Mooncake Master to initialize..."
+          sleep 5
+
+          # Check if master is running
+          if ! kill -0 $MASTER_PID 2>/dev/null; then
+              echo "Error: Mooncake Master failed to start"
+              cat /tmp/mooncake_master.log
+              exit 1
+          fi
+
+          echo "Mooncake Master is running"
+          echo "=== Running Hixl Mooncake Store Tests ==="
+          # List of test cases to run
+          TEST_CASES=(
+              "batch_put_get_sample.py"
+              "batch_put_get_multi_buffers_sample.py"
+          )
+
+          # List of test scenarios (HCCL_INTRA_ROCE_ENABLE settings)
+          TEST_SCENARIOS=(
+              "HCCL_INTRA_ROCE_ENABLE=1"
+              "HCCL_INTRA_ROCE_ENABLE_UNSET"
+          )
+
+          # Track test results
+          FAILED_TESTS=()
+          PASSED_TESTS=()
+
+          # Run each test scenario
+          for scenario in "${TEST_SCENARIOS[@]}"; do
+              echo ""
+              echo "========================================="
+              echo "Running scenario: $scenario"
+              echo "========================================="
+
+              # Configure environment variables for the current scenario
+              if [ "$scenario" = "HCCL_INTRA_ROCE_ENABLE=1" ]; then
+                  export HCCL_INTRA_ROCE_ENABLE=1
+                  unset ASCEND_BUFFER_POOL
+                  echo "HCCL_INTRA_ROCE_ENABLE is set to 1, ASCEND_BUFFER_POOL is unset"
+              else
+                  unset HCCL_INTRA_ROCE_ENABLE
+                  export ASCEND_BUFFER_POOL=4:8
+                  echo "HCCL_INTRA_ROCE_ENABLE is not set, ASCEND_BUFFER_POOL is set to 4:8"
+              fi
+
+              # Run each test case in the current scenario
+              for test_case in "${TEST_CASES[@]}"; do
+                  echo ""
+                  echo "-----------------------------------------"
+                  echo "Test: $test_case"
+                  echo "-----------------------------------------"
+
+                  if [ ! -f "$test_case" ]; then
+                      echo "Warning: Test file $test_case not found, skipping..."
+                      continue
+                  fi
+
+                  # Run the test with 2 devices in distributed mode
+                  # Run rank 0 on device 0
+                  python3 $test_case \
+                      --device_id=0 \
+                      --rank=0 \
+                      --world_size=2 \
+                      --distributed \
+                      2>&1 | tee "/tmp/hixl_test_${scenario//=/}_${test_case%.py}_rank0.log" &
+                  PID0=$!
+
+                  # Run rank 1 on device 1
+                  python3 $test_case \
+                      --device_id=2 \
+                      --rank=1 \
+                      --world_size=2 \
+                      --distributed \
+                      2>&1 | tee "/tmp/hixl_test_${scenario//=/}_${test_case%.py}_rank1.log" &
+                  PID1=$!
+
+                  # Wait for both processes to complete
+                  wait $PID0
+                  TEST_RESULT0=$?
+                  wait $PID1
+                  TEST_RESULT1=$?
+
+                  # Check test results
+                  if [ $TEST_RESULT0 -eq 0 ] && [ $TEST_RESULT1 -eq 0 ]; then
+                      echo "✓ $test_case PASSED (scenario: $scenario)"
+                      PASSED_TESTS+=("$scenario:$test_case")
+                  else
+                      echo "✗ $test_case FAILED (scenario: $scenario)"
+                      if [ $TEST_RESULT0 -ne 0 ]; then
+                          echo "  Rank 0 failed with code: $TEST_RESULT0"
+                      fi
+                      if [ $TEST_RESULT1 -ne 0 ]; then
+                          echo "  Rank 1 failed with code: $TEST_RESULT1"
+                      fi
+                      FAILED_TESTS+=("$scenario:$test_case")
+                  fi
+              done
+          done
+
+          echo ""
+          echo "========================================="
+          echo "Test Summary"
+          echo "========================================="
+          echo "Passed tests: ${#PASSED_TESTS[@]}"
+          for test in "${PASSED_TESTS[@]}"; do
+              echo "  ✓ $test"
+          done
+
+          echo ""
+          echo "Failed tests: ${#FAILED_TESTS[@]}"
+          for test in "${FAILED_TESTS[@]}"; do
+              echo "  ✗ $test"
+          done
+
+          # Cleanup: Stop Mooncake Master
+          echo ""
+          echo "Stopping Mooncake Master..."
+          kill $MASTER_PID 2>/dev/null || true
+          wait $MASTER_PID 2>/dev/null || true
+
+          # Exit with error if any tests failed
+          if [ ${#FAILED_TESTS[@]} -gt 0 ]; then
+              echo ""
+              echo "Some tests failed!"
+              exit 1
+          fi
+
+          echo ""
+          echo "All Hixl Mooncake Store tests completed successfully!"
+
+
+    - name: Test Summary
+      if: always()
+      shell: bash
+      run: |
+        echo "CI Test completed"
+
+    - name: Upload Test Logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-logs-${{ github.run_number }}
+        path: |
+          /tmp/hixl-test-log/*
+        retention-days: 30
+        if-no-files-found: warn

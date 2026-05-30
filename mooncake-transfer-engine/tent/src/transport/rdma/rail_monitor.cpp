@@ -17,10 +17,21 @@
 namespace mooncake {
 namespace tent {
 
-Status RailMonitor::load(const Topology *local, const Topology *remote,
-                         const std::string &rail_topo_json) {
+Status RailMonitor::load(const Topology* local, const Topology* remote,
+                         const std::string& rail_topo_json,
+                         const Config* conf) {
     local_ = local;
     remote_ = remote;
+    if (conf) {
+        error_threshold_ = conf->get(kCfgErrorThreshold, error_threshold_);
+        error_window_ = std::chrono::seconds(
+            conf->get(kCfgErrorWindowSecs, (int)error_window_.count()));
+        cooldown_ = std::chrono::seconds(
+            conf->get(kCfgCooldownSecs, (int)cooldown_.count()));
+        LOG(INFO) << "RailMonitor: error_threshold=" << error_threshold_
+                  << " error_window=" << error_window_.count() << "s"
+                  << " cooldown=" << cooldown_.count() << "s";
+    }
     if (!rail_topo_json.empty()) {
         auto status = loadFromJson(rail_topo_json);
         if (status.ok()) return status;
@@ -32,24 +43,24 @@ Status RailMonitor::load(const Topology *local, const Topology *remote,
 bool RailMonitor::available(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
-    auto &st = it->second;
-    if (st.paused) {
-        auto now = std::chrono::steady_clock::now();
-        if (now >= st.resume_time) {
-            st.paused = false;
-            st.error_count = 0;
-            updateBestMapping();
-            return true;
-        }
-        return false;
-    }
+    auto& st = it->second;
+    if (!st.paused()) return true;
+    if (std::chrono::steady_clock::now() < st.resume_time) return false;
+    // Cooldown expired: clear all exponential-backoff memory so a fresh
+    // failure cycle starts from the initial cooldown_, not a doubled value.
+    st.resume_time = {};
+    st.error_count = 0;
+    st.cooldown = std::chrono::seconds(0);
+    updateBestMapping();
+    LOG(INFO) << "Rail recovered: local_nic=" << local_nic
+              << " remote_nic=" << remote_nic << " (cooldown expired)";
     return true;
 }
 
 void RailMonitor::markFailed(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
-    auto &st = it->second;
+    auto& st = it->second;
     auto now = std::chrono::steady_clock::now();
     if (st.error_count == 0 || now - st.last_error > error_window_) {
         st.error_count = 1;
@@ -61,11 +72,9 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         st.cooldown = cooldown_;
     } else {
         st.cooldown *= 2;
-        if (st.cooldown > std::chrono::seconds(300))
-            st.cooldown = std::chrono::seconds(300);
+        if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
     }
     if (st.error_count >= error_threshold_) {
-        st.paused = true;
         st.resume_time = now + st.cooldown;
         updateBestMapping();
     }
@@ -74,11 +83,23 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
 void RailMonitor::markRecovered(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return;
-    auto &st = it->second;
+    auto& st = it->second;
+    // Fast path: a healthy rail stays healthy. 99%+ of completions land
+    // here, so we must not touch best_mapping_ or write any field.
+    if (!st.paused() && st.error_count == 0 && st.cooldown.count() == 0) return;
+    bool was_paused = st.paused();
+    // Clear all exponential-backoff memory: the next failure cycle must
+    // start from the initial cooldown_, not a doubled value left over
+    // from the previous cycle.
     st.error_count = 0;
-    st.paused = false;
     st.resume_time = {};
-    updateBestMapping();
+    st.cooldown = std::chrono::seconds(0);
+    if (was_paused) {
+        LOG(INFO) << "Rail recovered: local_nic=" << local_nic
+                  << " remote_nic=" << remote_nic
+                  << " (un-paused by successful transfer)";
+        updateBestMapping();
+    }
 }
 
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
@@ -108,7 +129,7 @@ int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {
  *   ]
  * }
  */
-Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
+Status RailMonitor::loadFromJson(const std::string& rail_topo_json) {
     try {
         auto root = json::parse(rail_topo_json);
 
@@ -116,7 +137,7 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
         direct_rails_.clear();
 
         if (root.contains("all")) {
-            for (const auto &path_entry : root["all"]) {
+            for (const auto& path_entry : root["all"]) {
                 std::string local_nic_name = path_entry.value("local", "");
                 std::string remote_nic_name = path_entry.value("remote", "");
                 int local_nic_id = local_->getNicId(local_nic_name);
@@ -132,7 +153,7 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
         }
 
         if (root.contains("direct")) {
-            for (const auto &path_entry : root["direct"]) {
+            for (const auto& path_entry : root["direct"]) {
                 std::string local_nic_name = path_entry.value("local", "");
                 std::string remote_nic_name = path_entry.value("remote", "");
                 int local_nic_id = local_->getNicId(local_nic_name);
@@ -146,7 +167,7 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
                 }
             }
         }
-    } catch (const std::exception &ex) {
+    } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse rail_topo_json: " << ex.what();
         return Status::InvalidArgument("Failed to parse JSON" LOC_MARK);
     }
@@ -156,12 +177,12 @@ Status RailMonitor::loadFromJson(const std::string &rail_topo_json) {
     return Status::OK();
 }
 
-static int matchRemoteNicId(const Topology *local, const Topology *remote,
+static int matchRemoteNicId(const Topology* local, const Topology* remote,
                             int local_nic) {
     std::string mem_name;
     for (size_t i = 0; i < local->getMemCount(); ++i) {
         auto entry = local->getMemEntry(i);
-        auto &prior_devices = entry->device_list[0];
+        auto& prior_devices = entry->device_list[0];
         if (entry->type == Topology::MEM_CUDA && !prior_devices.empty() &&
             prior_devices[0] == local_nic) {
             mem_name = entry->name;
@@ -172,7 +193,7 @@ static int matchRemoteNicId(const Topology *local, const Topology *remote,
     auto mem_id = remote->getMemId(mem_name);
     if (mem_id < 0) return -1;
     auto entry = remote->getMemEntry(mem_id);
-    auto &prior_devices = entry->device_list[0];
+    auto& prior_devices = entry->device_list[0];
     if (entry->type == Topology::MEM_CUDA && !prior_devices.empty())
         return prior_devices[0];
     return -1;
@@ -193,6 +214,23 @@ Status RailMonitor::loadDefault() {
         auto local_entry = local_->getNicEntry(local_nic);
         if (local_entry->type != Topology::NIC_RDMA) continue;
         int numa_id = local_entry->numa_node;
+
+        // Priority 1: Same-name device matching (mlx5_0 -> mlx5_0)
+        bool matched = false;
+        auto local_nic_name = local_entry->name;
+        for (int remote_nic = 0; remote_nic < remote_nic_count; ++remote_nic) {
+            auto remote_entry = remote_->getNicEntry(remote_nic);
+            if (remote_entry && remote_entry->type == Topology::NIC_RDMA &&
+                remote_entry->name == local_nic_name) {
+                remote_load[remote_nic]++;
+                direct_rails_[local_nic] = remote_nic;
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Priority 2: CUDA memory topology matching (GPU-direct NIC)
         int remote_nic = matchRemoteNicId(local_, remote_, local_nic);
         if (remote_nic >= 0) {
             remote_load[remote_nic]++;
@@ -226,6 +264,10 @@ Status RailMonitor::loadDefault() {
                 best_nic = cand;
             }
         }
+        if (best_nic < 0) {
+            direct_rails_[local_nic] = -1;
+            continue;
+        }
         remote_load[best_nic]++;
         direct_rails_[local_nic] = best_nic;
     }
@@ -241,16 +283,24 @@ void RailMonitor::updateBestMapping() {
     std::unordered_set<int> remote_nic_set;
     const int local_nic_count = (int)local_->getNicCount();
     const int remote_nic_count = (int)remote_->getNicCount();
+
+    // Helper: clamp negative numa_node (e.g. -1 for eRDMA devices that lack
+    // NUMA affinity) to 0 so it can be used safely as an array index.
+    auto safeNuma = [](int numa) -> size_t {
+        return (numa >= 0 && numa < (int)kMaxNuma) ? (size_t)numa : 0;
+    };
+
     for (int local_nic = 0; local_nic < local_nic_count; ++local_nic) {
         auto local_entry = local_->getNicEntry(local_nic);
         if (!local_entry || local_entry->type != Topology::NIC_RDMA) continue;
-        local_devices[local_entry->numa_node].push_back(local_nic);
+        local_devices[safeNuma(local_entry->numa_node)].push_back(local_nic);
         auto remote_nic = direct_rails_[local_nic];
         if (!remote_nic_set.count(remote_nic)) {
             auto remote_entry = remote_->getNicEntry(remote_nic);
             if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
                 continue;
-            remote_devices[remote_entry->numa_node].push_back(remote_nic);
+            remote_devices[safeNuma(remote_entry->numa_node)].push_back(
+                remote_nic);
             remote_nic_set.insert(remote_nic);
         }
     }
@@ -259,13 +309,14 @@ void RailMonitor::updateBestMapping() {
             auto remote_entry = remote_->getNicEntry(remote_nic);
             if (!remote_entry || remote_entry->type != Topology::NIC_RDMA)
                 continue;
-            remote_devices[remote_entry->numa_node].push_back(remote_nic);
+            remote_devices[safeNuma(remote_entry->numa_node)].push_back(
+                remote_nic);
         }
     }
 
     for (size_t local_numa = 0; local_numa < kMaxNuma; ++local_numa) {
         for (size_t remote_numa = 0; remote_numa < kMaxNuma; ++remote_numa) {
-            auto &mapping = best_mapping_[remote_numa];
+            auto& mapping = best_mapping_[remote_numa];
             size_t local_cnt = local_devices[local_numa].size();
             size_t remote_cnt = remote_devices[remote_numa].size();
             if (!local_cnt || !remote_cnt) continue;

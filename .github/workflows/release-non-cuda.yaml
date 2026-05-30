@@ -21,9 +21,6 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          filter: tree:0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -87,6 +84,7 @@ jobs:
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     permissions:

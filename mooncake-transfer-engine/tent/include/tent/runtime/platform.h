@@ -20,7 +20,7 @@
 namespace mooncake {
 namespace tent {
 
-enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA };
+enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM };
 
 class Platform {
    public:
@@ -42,8 +42,8 @@ class Platform {
 
     virtual MemoryType getMemoryType(void *addr) = 0;
 
-    virtual const std::vector<RangeLocation> getLocation(void *start,
-                                                         size_t len) = 0;
+    virtual const std::vector<RangeLocation> getLocation(
+        void *start, size_t len, bool skip_prefault = false) = 0;
 
     virtual const std::string type() const = 0;
 };

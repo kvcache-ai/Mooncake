@@ -16,13 +16,123 @@
 namespace mooncake {
 
 #define MOONCAKE_SHM_NAME "mooncake_shm"
-// Protocol structure for IPC registration
+
+// IPC request type discriminator (sent as first 4 bytes on each connection)
+enum IpcRequestType : uint32_t {
+    IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
+    IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
+};
+
+// Segment types for IPC_SHM_FD_REQUEST
+enum ShmSegmentType : uint32_t {
+    SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
+};
+
+constexpr int32_t kInvalidPhysicalDeviceId = -1;
+
+// Return codes for health_check()
+enum HealthCheckStatus : int {
+    HC_HEALTHY = 0,          // Fully connected, all links up
+    HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
+    HC_MASTER_UNREACHABLE =
+        2  // Master (or RealClient for DummyClient) unreachable
+};
+
+template <typename ResultValue, typename ErrorFactory>
+inline std::vector<std::vector<std::vector<ResultValue>>>
+build_ranged_read_results_like(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorFactory &&make_error) {
+    std::vector<std::vector<std::vector<ResultValue>>> results;
+    results.reserve(buffer_count);
+    for (size_t i = 0; i < buffer_count; ++i) {
+        std::vector<std::vector<ResultValue>> key_rows;
+        const size_t key_count = i < all_keys.size() ? all_keys[i].size() : 1;
+        key_rows.reserve(key_count);
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count =
+                (i < all_dst_offsets.size() && j < all_dst_offsets[i].size())
+                    ? all_dst_offsets[i][j].size()
+                    : 1;
+            std::vector<ResultValue> fragments;
+            fragments.reserve(std::max<size_t>(fragment_count, 1));
+            for (size_t k = 0; k < std::max<size_t>(fragment_count, 1); ++k) {
+                fragments.push_back(make_error());
+            }
+            key_rows.emplace_back(std::move(fragments));
+        }
+        results.emplace_back(std::move(key_rows));
+    }
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+convert_ranged_read_results(
+    const std::vector<
+        std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        &internal_results) {
+    std::vector<std::vector<std::vector<int64_t>>> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &key_rows : internal_results) {
+        std::vector<std::vector<int64_t>> converted_rows;
+        converted_rows.reserve(key_rows.size());
+        for (const auto &row : key_rows) {
+            std::vector<int64_t> converted;
+            converted.reserve(row.size());
+            for (const auto &result : row) {
+                converted.push_back(to_py_ret(result));
+            }
+            converted_rows.emplace_back(std::move(converted));
+        }
+        results.emplace_back(std::move(converted_rows));
+    }
+
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+build_ranged_read_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<int64_t>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return static_cast<int64_t>(toInt(error)); });
+}
+
+inline std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+build_ranged_read_internal_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<tl::expected<int64_t, ErrorCode>>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return tl::unexpected(error); });
+}
+
+// Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)
 struct ShmRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
+    int32_t device_id = kInvalidPhysicalDeviceId;
     bool is_local_buffer;
+};
+
+// Payload for IPC_SHM_FD_REQUEST
+struct ShmFdRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    ShmSegmentType segment_type;
+};
+
+// Response for IPC_SHM_FD_REQUEST (fd sent back via SCM_RIGHTS)
+struct ShmFdResponse {
+    int32_t status;     // 0 = success, <0 = error
+    uint64_t shm_size;  // size of the shm region
 };
 
 class ClientRequester {
@@ -38,7 +148,17 @@ class ClientRequester {
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
-                             const std::vector<int64_t> sizes);
+                             const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Notifies remote FileStorage to release buffer after transfer
+     * completion. This is a fire-and-forget call - errors are logged but not
+     * propagated.
+     * @param client_addr Network address of the remote FileStorage service.
+     * @param batch_id The batch_id returned from batch_get_offload_object.
+     */
+    void release_offload_buffer(const std::string &client_addr,
+                                uint64_t batch_id);
 
    private:
     /**
@@ -94,7 +214,8 @@ class PyClient {
         const std::string &protocol, const std::string &rdma_devices,
         const std::string &master_server_addr,
         const std::shared_ptr<TransferEngine> &transfer_engine,
-        const std::string &ipc_socket_path) = 0;
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "") = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -115,6 +236,13 @@ class PyClient {
 
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
+
+    virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
@@ -149,9 +277,6 @@ class PyClient {
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
-    virtual std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string &key) = 0;
-
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys) = 0;
 
@@ -164,6 +289,27 @@ class PyClient {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual int upsert(const std::string &key, std::span<const char> value,
+                       const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_from(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_parts(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_batch(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
     virtual int remove(const std::string &key, bool force = false) = 0;
@@ -171,6 +317,9 @@ class PyClient {
     virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
     virtual long removeAll(bool force = false) = 0;
+
+    virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                         bool force = false) = 0;
 
     virtual int isExist(const std::string &key) = 0;
 
@@ -184,7 +333,13 @@ class PyClient {
     virtual std::vector<Replica::Descriptor> get_replica_desc(
         const std::string &key) = 0;
 
+    virtual std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") = 0;
+
     virtual int tearDownAll() = 0;
+
+    virtual int health_check() = 0;
 
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;

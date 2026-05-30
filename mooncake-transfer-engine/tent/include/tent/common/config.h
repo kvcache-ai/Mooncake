@@ -75,6 +75,33 @@ class Config {
         return get<std::string>(key, std::string(def));
     }
 
+    bool contains(const std::string& key_path) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (key_path.empty()) return false;
+
+        const json* node = &config_data_;
+        std::string::size_type start = 0;
+        bool nested_found = true;
+        while (start < key_path.size()) {
+            auto pos = key_path.find(kDelimiter, start);
+            auto segment = key_path.substr(start, pos - start);
+            start = (pos == std::string::npos) ? key_path.size() : pos + 1;
+            if (segment.empty()) continue;
+            auto it = node->find(segment);
+            if (it == node->end()) {
+                nested_found = false;
+                break;
+            }
+            node = &(*it);
+        }
+        if (nested_found && !node->is_null()) {
+            return true;
+        }
+
+        auto flat_it = config_data_.find(key_path);
+        return flat_it != config_data_.end() && !flat_it->is_null();
+    }
+
     template <typename T>
     std::vector<T> getArray(const std::string& key) const {
         return get<std::vector<T>>(key, {});
@@ -95,6 +122,41 @@ class Config {
             node = &(*node)[segment];
         }
         *node = value;
+    }
+
+    // Set a config value from a string with automatic type inference.
+    // Recognizes "true"/"false" (case-insensitive) as booleans and
+    // pure-integer strings as long long, falling back to std::string.
+    void setFromString(const std::string& key, const std::string& value) {
+        // Boolean detection (case-insensitive)
+        {
+            std::string lower = value;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower == "true") {
+                set(key, true);
+                return;
+            }
+            if (lower == "false") {
+                set(key, false);
+                return;
+            }
+        }
+        // Integer detection
+        if (!value.empty()) {
+            try {
+                size_t pos = 0;
+                long long int_val = std::stoll(value, &pos);
+                if (pos == value.size()) {
+                    set(key, int_val);
+                    return;
+                }
+            } catch (const std::exception&) {
+                // Not an integer, fall through
+            }
+        }
+        // Fallback: store as string
+        set(key, value);
     }
 
     Status load(const std::string& content);

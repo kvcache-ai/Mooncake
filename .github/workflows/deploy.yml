@@ -4,6 +4,10 @@ on:
   # Runs on pushes targeting the default branch
   push:
     branches: ["main"]
+    paths:
+      - 'docs/**'
+      - 'requirements_docs.txt'
+      - '.github/workflows/deploy.yml'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -31,7 +35,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
+        with:
+          persist-credentials: false
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:

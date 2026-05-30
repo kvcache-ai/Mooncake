@@ -58,6 +58,17 @@ struct GetStorageConfigResponse {
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
 
+struct NoFSegmentOwnerInfo {
+    UUID segment_id;
+    UUID client_id;
+
+    NoFSegmentOwnerInfo() = default;
+    NoFSegmentOwnerInfo(const UUID& segment_id_param,
+                        const UUID& client_id_param)
+        : segment_id(segment_id_param), client_id(client_id_param) {}
+};
+YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
+
 /**
  * @brief Response structure for CopyStart operation
  */
@@ -68,6 +79,15 @@ struct CopyStartResponse {
 YLT_REFL(CopyStartResponse, source, targets);
 
 /**
+ * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
+ * Carries the staged PROCESSING MEMORY replica descriptor.
+ */
+struct PromotionAllocStartResponse {
+    Replica::Descriptor memory_descriptor;
+};
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
+
+/**
  * @brief Response structure for MoveStart operation
  */
 struct MoveStartResponse {
@@ -75,6 +95,83 @@ struct MoveStartResponse {
     std::optional<Replica::Descriptor> target;
 };
 YLT_REFL(MoveStartResponse, source, target);
+
+enum class JobType {
+    DRAIN = 0,
+};
+
+inline std::ostream& operator<<(std::ostream& os, const JobType& type) {
+    switch (type) {
+        case JobType::DRAIN:
+            os << "DRAIN";
+            break;
+        default:
+            os << "UNKNOWN_JOB_TYPE";
+            break;
+    }
+    return os;
+}
+
+enum class JobStatus {
+    CREATED = 0,
+    PLANNING,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELED,
+};
+
+inline std::ostream& operator<<(std::ostream& os, const JobStatus& status) {
+    switch (status) {
+        case JobStatus::CREATED:
+            os << "CREATED";
+            break;
+        case JobStatus::PLANNING:
+            os << "PLANNING";
+            break;
+        case JobStatus::RUNNING:
+            os << "RUNNING";
+            break;
+        case JobStatus::SUCCEEDED:
+            os << "SUCCEEDED";
+            break;
+        case JobStatus::FAILED:
+            os << "FAILED";
+            break;
+        case JobStatus::CANCELED:
+            os << "CANCELED";
+            break;
+        default:
+            os << "UNKNOWN_JOB_STATUS";
+            break;
+    }
+    return os;
+}
+
+struct CreateDrainJobRequest {
+    std::vector<std::string> segments;
+    std::vector<std::string> target_segments;
+    uint32_t max_concurrency{4};
+};
+YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
+
+struct QueryJobResponse {
+    UUID id;
+    JobType type;
+    JobStatus status;
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    std::vector<std::string> segments;
+    uint64_t succeeded_units;
+    uint64_t failed_units;
+    uint64_t blocked_units;
+    uint64_t active_units;
+    uint64_t migrated_bytes;
+    std::string message;
+};
+YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
+         blocked_units, active_units, migrated_bytes, message);
 
 /**
  * @brief Response structure for QueryTask operation
@@ -115,6 +212,7 @@ struct TaskAssignment {
     TaskType type;
     std::string payload;
     int64_t created_at_ms_epoch;
+    uint32_t max_retry_attempts;
 
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
@@ -124,9 +222,11 @@ struct TaskAssignment {
           created_at_ms_epoch(static_cast<int64_t>(
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   task.created_at.time_since_epoch())
-                  .count())) {}
+                  .count())),
+          max_retry_attempts(task.max_retry_attempts) {}
 };
-YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
+YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
+         max_retry_attempts);
 
 /**
  * @brief Task update structure
@@ -141,19 +241,22 @@ struct TaskCompleteRequest {
 YLT_REFL(TaskCompleteRequest, id, status, message);
 
 struct BatchGetOffloadObjectResponse {
+    uint64_t batch_id;
     std::vector<uint64_t> pointers;
     std::string transfer_engine_addr;
     uint64_t gc_ttl_ms;
 
-    BatchGetOffloadObjectResponse() = default;
-    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
+    BatchGetOffloadObjectResponse() : batch_id(0), gc_ttl_ms(0) {}
+    BatchGetOffloadObjectResponse(uint64_t batch_id_param,
+                                  std::vector<uint64_t>&& pointers_param,
                                   std::string transfer_engine_addr_param,
                                   uint64_t gc_ttl_ms_param)
-        : pointers(std::move(pointers_param)),
+        : batch_id(batch_id_param),
+          pointers(std::move(pointers_param)),
           transfer_engine_addr(std::move(transfer_engine_addr_param)),
           gc_ttl_ms(gc_ttl_ms_param) {}
 };
-YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
-         gc_ttl_ms);
+YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
+         transfer_engine_addr, gc_ttl_ms);
 
 }  // namespace mooncake

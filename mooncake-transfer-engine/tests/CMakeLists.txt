@@ -9,12 +9,23 @@ if (USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine)
+target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags glog::glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest gtest_main )
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
+
+add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
+target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
+
+# Integration test for the monitorWorker reclaim tick (issue #1845).
+# Self-skips when no RDMA device is present, so safe to register with ctest.
+add_executable(endpoint_store_integration_test ${WORKSPACE}/endpoint_store_integration_test.cpp)
+target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME endpoint_store_integration_test COMMAND endpoint_store_integration_test)
+set_tests_properties(endpoint_store_integration_test PROPERTIES LABELS "rdma")
 
 add_executable(rdma_transport_test2 ${WORKSPACE}/rdma_transport_test2.cpp)
 target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_main )
@@ -23,6 +34,11 @@ target_link_libraries(rdma_transport_test2 PUBLIC transfer_engine gtest gtest_ma
 add_executable(rdma_loopback_test ${WORKSPACE}/rdma_loopback_test.cpp)
 target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
+
+# This test verifies endpoint re-establishment in RDMATransport.
+# Intended for manual testing only.
+add_executable(rdma_endpoint_reestablish_test ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
+target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine gtest gtest_main )
 
 if (USE_CXL)
     add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
@@ -54,6 +70,30 @@ if (USE_UBSHMEM)
     add_test(NAME ubshmem_transport_test COMMAND ubshmem_transport_test)
 endif()
 
+if (USE_EFA)
+    add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
+    target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_transport_test COMMAND efa_transport_test)
+
+    add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
+    target_link_libraries(efa_c_api_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_c_api_test COMMAND efa_c_api_test)
+
+    add_executable(efa_single_nic_large_mr_test ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
+    target_link_libraries(efa_single_nic_large_mr_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
+    target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
+endif()
+
+# UB transport test with URMA endpoint and mock support
+if (USE_UB)
+    add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
+    target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main glog::glog pthread)
+    target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
+    add_test(NAME ub_transport_test COMMAND ub_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
@@ -69,3 +109,30 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+if (USE_ASCEND_DIRECT)
+    # AscendDirectTransport unit test with mock implementations
+    # Mock implementations are included in the test file via anonymous namespace
+    add_executable(ascend_direct_transport_test
+        ${WORKSPACE}/ascend_direct_transport_test.cpp
+    )
+    target_link_libraries(ascend_direct_transport_test PUBLIC
+        transfer_engine
+        gtest
+        gtest_main
+        metadef
+    )
+    # Allow shared library undefined symbols (Ascend libraries have circular deps)
+    set_target_properties(ascend_direct_transport_test PROPERTIES
+        LINK_FLAGS "-Wl,--allow-shlib-undefined"
+    )
+
+    add_test(NAME ascend_direct_transport_test COMMAND ascend_direct_transport_test)
+endif()
+
+# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
+if (ENABLE_MULTI_PROTOCOL)
+    add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
+    target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME mp_transport_test COMMAND mp_transport_test)
+endif()

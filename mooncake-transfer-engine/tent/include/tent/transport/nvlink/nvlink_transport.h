@@ -17,8 +17,10 @@
 
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_set>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -26,6 +28,7 @@
 #include "tent/common/concurrent/ticket_lock.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/platform/cuda.h"
 
 namespace mooncake {
 namespace tent {
@@ -37,12 +40,14 @@ struct NVLinkTask {
     uint64_t target_addr = 0;
     bool is_cuda_ipc;
     int cuda_id = 0;
+    cudaEvent_t completion_event = nullptr;
 };
 
 struct NVLinkSubBatch : public Transport::SubBatch {
     std::vector<NVLinkTask> task_list;
     size_t max_size;
-    cudaStream_t stream;
+    CUDAStreamHandle sync_stream;
+    CUDAStreamHandle async_stream;
     virtual size_t size() const { return task_list.size(); }
 };
 
@@ -77,7 +82,7 @@ class NVLinkTransport : public Transport {
     virtual const char *getName() const { return "nvlink"; }
 
    private:
-    void startTransfer(NVLinkTask *task, NVLinkSubBatch *batch);
+    void startTransfer(std::vector<NVLinkTask *> &tasks, NVLinkSubBatch *batch);
 
     void *createSharedMemory(const std::string &path, size_t size);
 
@@ -91,6 +96,7 @@ class NVLinkTransport : public Transport {
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
+    CudaPlatform *platform_;
 
     struct OpenedShmEntry {
         void *shm_addr;
@@ -109,6 +115,9 @@ class NVLinkTransport : public Transport {
     std::string machine_id_;
     uint64_t async_memcpy_threshold_;
     bool host_register_;
+
+    std::mutex register_mutex_;
+    std::unordered_set<uint64_t> registered_base_addrs_;
 };
 }  // namespace tent
 }  // namespace mooncake

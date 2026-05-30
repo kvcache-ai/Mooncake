@@ -96,7 +96,6 @@ struct MemorySegmentDesc {
     Topology topology;
     std::unordered_map<std::string, std::string> device_attrs;
     std::vector<BufferDesc> buffers;
-    std::string rpc_server_addr;
     std::vector<DeviceDesc> devices;
 
     // Transport-specific attributes (key-value pairs per transport type)
@@ -122,7 +121,6 @@ struct MemorySegmentDesc {
 inline void to_json(json& j, const MemorySegmentDesc& m) {
     j = json{{"device_attrs", m.device_attrs},
              {"buffers", m.buffers},
-             {"rpc_server_addr", m.rpc_server_addr},
              {"devices", m.devices},
              {"topology", m.topology.toString()},
              {"transport_attrs", m.transport_attrs}};
@@ -131,7 +129,6 @@ inline void to_json(json& j, const MemorySegmentDesc& m) {
 inline void from_json(const json& j, MemorySegmentDesc& m) {
     j.at("device_attrs").get_to(m.device_attrs);
     j.at("buffers").get_to(m.buffers);
-    j.at("rpc_server_addr").get_to(m.rpc_server_addr);
     j.at("devices").get_to(m.devices);
     if (j.contains("topology")) {
         auto s = j.at("topology").get<std::string>();
@@ -169,6 +166,7 @@ struct SegmentDesc {
     std::string name;
     SegmentType type;
     std::string machine_id;
+    std::string rpc_server_addr;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
    public:
@@ -180,7 +178,10 @@ struct SegmentDesc {
 };
 
 inline void to_json(json& j, const SegmentDesc& s) {
-    j = json{{"name", s.name}, {"type", s.type}, {"machine_id", s.machine_id}};
+    j = json{{"name", s.name},
+             {"type", s.type},
+             {"machine_id", s.machine_id},
+             {"rpc_server_addr", s.rpc_server_addr}};
     if (s.type == SegmentType::Memory) {
         j["detail"] = std::get<MemorySegmentDesc>(s.detail);
     } else {
@@ -192,6 +193,7 @@ inline void from_json(const json& j, SegmentDesc& s) {
     j.at("name").get_to(s.name);
     j.at("type").get_to(s.type);
     j.at("machine_id").get_to(s.machine_id);
+    j.at("rpc_server_addr").get_to(s.rpc_server_addr);
     if (s.type == SegmentType::Memory) {
         s.detail = j.at("detail").get<MemorySegmentDesc>();
     } else {

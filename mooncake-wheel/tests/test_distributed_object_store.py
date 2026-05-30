@@ -224,6 +224,76 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
 
+    def test_get_into_ranges_operations(self):
+        """Test buffer-major multi-key range reads into registered buffers."""
+        import ctypes
+
+        key1 = "test_get_into_ranges_key_1"
+        key2 = "test_get_into_ranges_key_2"
+        data1 = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        data2 = b"abcdefghijklmnopqrstuvwxyz0123456789"
+        buffer_size = 32
+
+        self.assertEqual(self.store.put(key1, data1), 0)
+        self.assertEqual(self.store.put(key2, data2), 0)
+
+        buffer0 = (ctypes.c_ubyte * buffer_size)()
+        buffer1 = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr0 = ctypes.addressof(buffer0)
+        buffer_ptr1 = ctypes.addressof(buffer1)
+        self.assertEqual(self.store.register_buffer(buffer_ptr0, buffer_size), 0)
+        self.assertEqual(self.store.register_buffer(buffer_ptr1, buffer_size), 0)
+
+        ctypes.memset(buffer0, ord("_"), buffer_size)
+        ctypes.memset(buffer1, ord("_"), buffer_size)
+
+        results = self.store.get_into_ranges(
+            [buffer_ptr0, buffer_ptr1],
+            [[key1, key2], [key2, key1]],
+            [[[0, 20], [8]], [[4], [16]]],
+            [[[1, 30], [2]], [[0], [10]]],
+            [[[4, 3], [5]], [[6], [4]]],
+        )
+
+        self.assertEqual(results, [[[4, 3], [5]], [[6], [4]]])
+        self.assertEqual(bytes(buffer0[0:4]), data1[1:5])
+        self.assertEqual(bytes(buffer0[8:13]), data2[2:7])
+        self.assertEqual(bytes(buffer0[20:23]), data1[30:33])
+        self.assertEqual(bytes(buffer1[4:10]), data2[0:6])
+        self.assertEqual(bytes(buffer1[16:20]), data1[10:14])
+
+        mismatch_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1, key2]], [[[0], []]], [[[0, 1], []]], [[[4, 4], []]]
+        )
+        self.assertEqual(len(mismatch_results), 1)
+        self.assertEqual(len(mismatch_results[0]), 2)
+        self.assertLess(mismatch_results[0][0][0], 0, "mismatched ranges should fail")
+        self.assertEqual(len(mismatch_results[0][1]), 0)
+
+        source_overflow_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1]], [[[0]]], [[[len(data1) - 1]]], [[[4]]]
+        )
+        self.assertEqual(len(source_overflow_results), 1)
+        self.assertLess(source_overflow_results[0][0][0], 0)
+
+        destination_overflow_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1]], [[[buffer_size - 1]]], [[[0]]], [[[4]]]
+        )
+        self.assertEqual(len(destination_overflow_results), 1)
+        self.assertLess(destination_overflow_results[0][0][0], 0)
+
+        missing_key_results = self.store.get_into_ranges(
+            [buffer_ptr0], [["missing-key", key1]], [[[0], [8]]], [[[0], [0]]], [[[4], [4]]]
+        )
+        self.assertLess(missing_key_results[0][0][0], 0)
+        self.assertEqual(missing_key_results[0][1][0], 4)
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr0), 0)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr1), 0)
+        self.assertEqual(self.store.remove(key1), 0)
+        self.assertEqual(self.store.remove(key2), 0)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes

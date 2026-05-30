@@ -150,6 +150,11 @@ class TransferEnginePy {
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
+    // Pre-connect every (local_ctx, peer_nic) pair for `segment_name` so the
+    // first submitTransfer does not stall on handshake RPC + fi_av_insert.
+    // No-op on non-EFA builds or when the EFA transport is not installed.
+    int warmupEfaSegment(const std::string &segment_name);
+
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,
                            size_t length) {
         memcpy((void *)dest_address, (void *)src_ptr, length);
@@ -164,19 +169,23 @@ class TransferEnginePy {
     }
 
     // FOR EXPERIMENT ONLY
-    int registerMemory(uintptr_t buffer_addr, size_t capacity);
+    int registerMemory(uintptr_t buffer_addr, size_t capacity,
+                       const std::string &location = kWildcardLocation);
 
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
     int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
-                            std::vector<size_t> capacities);
+                            std::vector<size_t> capacities,
+                            const std::string &location = kWildcardLocation);
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
     std::string getLocalTopology(const char *device_name);
 
     std::vector<TransferNotify> getNotifies();
+
+    int sendProbe(const std::string &peer_server_name);
 
     std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
 

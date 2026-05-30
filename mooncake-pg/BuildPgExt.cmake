@@ -1,0 +1,94 @@
+# BuildPgExt.cmake - Build the Mooncake PG Python extension.
+#
+# Invoked at build time via cmake -P from the root CMakeLists.txt when
+# WITH_EP=ON.  Variables are passed with -D from the custom target:
+#
+#   SOURCE_DIR          - mooncake-pg source directory
+#   EP_CUDA_MAJOR       - CUDA major version (integer)
+#   EP_CUDA_MINOR       - CUDA minor version (integer)
+#   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
+#                         (empty = use the currently-installed torch)
+#   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
+#   STAGING_DIR         - destination directory for the built .so files
+#   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+
+cmake_minimum_required(VERSION 3.16)
+
+# Include common build utilities.
+include("${SOURCE_DIR}/../mooncake-common/SetupPyTorchEnv.cmake")
+
+# Restore pipe-separated strings back to CMake semicolon-separated lists.
+if(EP_TORCH_VERSIONS)
+  string(REPLACE "|" ";" EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}")
+endif()
+if(TORCH_CUDA_ARCH_LIST)
+  string(REPLACE "|" ";" TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}")
+endif()
+
+# ---------------------------------------------------------------------------
+# 1. Set up the build environment.
+# ---------------------------------------------------------------------------
+# Clear jobserver variables so that sub-processes started by setup.py do not
+# try to connect to the parent ninja's jobserver pipe FDs, which are not
+# inherited and cause: "ninja: error: Could not initialize jobserver: Invalid
+# file descriptors".
+set(ENV{MAKEFLAGS} "")
+set(ENV{MFLAGS} "")
+set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+
+# ---------------------------------------------------------------------------
+# 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.
+# ---------------------------------------------------------------------------
+# setup.py links against -l:engine.so in ../mooncake-wheel/mooncake/.
+# During the make phase only the versioned engine.cpython-XYZ.so exists in
+# the build tree; create a bare engine.so symlink so the linker can find it.
+set(_wheel_mooncake_dir "${SOURCE_DIR}/../mooncake-wheel/mooncake")
+set(_engine_symlink "${_wheel_mooncake_dir}/engine.so")
+if(ENGINE_SO_PATH AND NOT EXISTS "${_engine_symlink}")
+  message(STATUS "[PG] Creating engine.so symlink -> ${ENGINE_SO_PATH}")
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${ENGINE_SO_PATH}" "${_engine_symlink}"
+  )
+endif()
+
+# ---------------------------------------------------------------------------
+# 3. Build the PG Python extension.
+# ---------------------------------------------------------------------------
+if("${EP_TORCH_VERSIONS}" STREQUAL "")
+  message(STATUS "[PG] Building with currently-installed PyTorch")
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
+    WORKING_DIRECTORY "${SOURCE_DIR}"
+    RESULT_VARIABLE _ret
+  )
+  if(NOT _ret EQUAL 0)
+    message(FATAL_ERROR "[PG] Extension build failed (exit code: ${_ret})")
+  endif()
+else()
+  message(STATUS "[PG] Building for PyTorch versions: ${EP_TORCH_VERSIONS}")
+  foreach(_version IN LISTS EP_TORCH_VERSIONS)
+    install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[PG]")
+
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
+      WORKING_DIRECTORY "${SOURCE_DIR}"
+      RESULT_VARIABLE _ret
+    )
+    if(NOT _ret EQUAL 0)
+      message(FATAL_ERROR "[PG] Extension build failed for PyTorch ${_version}")
+    endif()
+  endforeach()
+endif()
+
+# ---------------------------------------------------------------------------
+# 4. Copy the built .so files to the staging directory.
+# ---------------------------------------------------------------------------
+file(MAKE_DIRECTORY "${STAGING_DIR}")
+file(GLOB _so_files "${SOURCE_DIR}/mooncake/*.so")
+foreach(_so IN LISTS _so_files)
+  get_filename_component(_fname "${_so}" NAME)
+  message(STATUS "[PG] Staging ${_fname} -> ${STAGING_DIR}")
+  file(COPY "${_so}" DESTINATION "${STAGING_DIR}" NO_SOURCE_PERMISSIONS)
+endforeach()
+
+message(STATUS "[PG] Mooncake PG extension build complete")

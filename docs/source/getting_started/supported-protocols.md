@@ -8,6 +8,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 |----------|-------------------|----------|-------------------|
 | **tcp** | Standard network | General purpose, works everywhere | ✅ Primary |
 | **rdma** | RDMA-capable NIC | High-performance, low-latency | ✅ Primary |
+| **efa** | AWS EFA-capable instance | High-performance on AWS (libfabric SRD) | ✅ Primary |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
@@ -55,7 +56,7 @@ export MOONCAKE_PROTOCOL="tcp"
 
 ### RDMA (Recommended for Production)
 
-**Description:** Remote Direct Memory Access protocol providing high-performance, low-latency data transfer with minimal CPU overhead. Supports GPUDirect RDMA for zero-copy GPU memory transfers.
+**Description:** Remote Direct Memory Access protocol providing high-performance, low-latency data transfer with minimal CPU overhead. Supports accelerator-aware memory registration, including NVIDIA GPUDirect RDMA for CUDA buffers and Cambricon MLU buffers when built with Neuware.
 
 **Hardware Support:**
 - InfiniBand
@@ -63,6 +64,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - eRDMA (Elastic RDMA)
 - NVIDIA GPUDirect RDMA
 - Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
+- Cambricon MLU memory via Neuware (`-DUSE_MLU=ON`)
 
 **Use When:**
 - High-performance networking is required
@@ -70,6 +72,8 @@ export MOONCAKE_PROTOCOL="tcp"
 - Low latency is critical (e.g., distributed inference, KV cache transfer)
 
 **Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
+
+**MLU Note:** Cambricon MLU support uses the standard `rdma` data path. There is no separate `mlu` protocol string. To enable MLU memory detection, topology discovery, and DMA-BUF based registration, build Transfer Engine with `-DUSE_MLU=ON` and make Neuware available through `NEUWARE_HOME` or `NEUWARE_ROOT`.
 
 **Configuration:**
 ```python
@@ -121,6 +125,45 @@ ibv_devices  # List InfiniBand/RDMA devices
 - Enable GPUDirect RDMA for GPU memory transfers
 - Configure proper NUMA affinity for optimal performance
 - See [Transfer Engine Benchmark Tuning](../design/transfer-engine/transfer-engine-bench-tuning.md) for detailed optimization
+
+### EFA (AWS Elastic Fabric Adapter)
+
+**Description:** AWS EFA transport using libfabric's Scalable Reliable Datagram (SRD) protocol, providing high-bandwidth RDMA-like performance on AWS instances without traditional RDMA support.
+
+**Use When:**
+- Running on AWS EFA-enabled instances (e.g., p5e.48xlarge, p6-b200.48xlarge, p4d.24xlarge)
+- High-performance networking is required on AWS
+- Traditional RDMA (ibverbs QP) is not supported by the hardware
+
+**Configuration:**
+```python
+# Python API
+engine.initialize(
+    hostname="localhost",
+    metadata_server="P2PHANDSHAKE",
+    protocol="efa",
+    device_name=""
+)
+```
+
+**Build Requirements:**
+```bash
+cmake .. -DUSE_EFA=ON -DUSE_CUDA=ON
+```
+
+> **Note:** `-DUSE_CUDA=ON` is required when transferring GPU memory. Without it, fallback to TCP protocol will fail with "Bad address" errors on GPU buffers.
+
+**Advantages:**
+- High throughput (~170 GB/s with 8 EFA devices, tuned)
+- Bypasses kernel network stack
+- Available on all AWS EFA-enabled instances
+
+**Limitations:**
+- AWS-only
+- Software-emulated RDMA writes (higher CPU overhead than true RDMA)
+- ~88% of RoCE RDMA throughput
+
+**Documentation:** See [EFA Transport](../design/transfer-engine/efa_transport.md) for build instructions, benchmarks, and tuning.
 
 ## Advanced Protocols (C++ Transfer Engine)
 
@@ -277,9 +320,11 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 |----------|---------------------|-------|
 | Development/Testing | tcp | Simple setup, no special hardware |
 | Production Inference | rdma | Best performance and latency |
+| AWS Cloud (EFA instances) | efa | High performance on p5e, p6-b200, p4d, etc. |
 | Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
 | Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
 | AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
+| Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 
 ## Troubleshooting

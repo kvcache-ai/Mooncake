@@ -101,6 +101,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
             "CUDA Fabric handle type not supported " LOC_MARK);
     }
 
+    platform_ = dynamic_cast<CudaPlatform *>(&Platform::getLoader());
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
@@ -113,7 +114,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
         128;
 
     caps.dram_to_gpu = true;
-    if (Platform::getLoader().type() == "cuda") caps.gpu_to_gpu = true;
+    if (Platform::getLoader().type() != "cpu") caps.gpu_to_gpu = true;
 
     installed_ = true;
     supported_ = true;
@@ -137,16 +138,6 @@ Status MnnvlTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamMnnvlRAII {
-    cudaStream_t stream_;
-    CudaStreamMnnvlRAII() {
-        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-    }
-    ~CudaStreamMnnvlRAII() { cudaStreamDestroy(stream_); }
-};
-
-thread_local CudaStreamMnnvlRAII tl_stream_mnnvl;
-
 Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto mnnvl_batch = Slab<MnnvlSubBatch>::Get().allocate();
     if (!mnnvl_batch)
@@ -154,9 +145,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    mnnvl_batch->stream = tl_stream_mnnvl.stream_;
-    // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream,
-    // cudaStreamNonBlocking));
+    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->sync_stream));
+    CHECK_STATUS(platform_->getStreamFromPool(mnnvl_batch->async_stream));
     return Status::OK();
 }
 
@@ -178,6 +168,7 @@ Status MnnvlTransport::submitTransferTasks(
     if (request_list.size() + mnnvl_batch->task_list.size() >
         mnnvl_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    std::vector<MnnvlTask *> new_tasks;
     for (auto &request : request_list) {
         mnnvl_batch->task_list.push_back(MnnvlTask{});
         auto &task = mnnvl_batch->task_list[mnnvl_batch->task_list.size() - 1];
@@ -194,63 +185,84 @@ Status MnnvlTransport::submitTransferTasks(
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        startTransfer(&task, mnnvl_batch);
+        new_tasks.push_back(&task);
     }
+    startTransfer(new_tasks, mnnvl_batch);
     return Status::OK();
 }
 
-void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
-    cudaError_t err;
-    void *src = nullptr, *dst = nullptr;
+void MnnvlTransport::startTransfer(std::vector<MnnvlTask *> &tasks,
+                                   MnnvlSubBatch *batch) {
+    if (tasks.empty()) return;
 
-    // Determine direction and addresses
-    if (task->request.opcode == Request::READ) {
-        dst = task->request.source;       // read into source buffer
-        src = (void *)task->target_addr;  // from remote
-    } else {
-        src = task->request.source;       // write from source buffer
-        dst = (void *)task->target_addr;  // to remote
-    }
-
-    bool is_async = (task->request.length >= async_memcpy_threshold_);
-
-    cudaPointerAttributes src_attr_info, dst_attr_info;
-    cudaMemoryType src_type = cudaMemoryTypeHost, dst_type = cudaMemoryTypeHost;
-    if (cudaPointerGetAttributes(&src_attr_info, src) == cudaSuccess) {
-        src_type = src_attr_info.type;
-    }
-    if (cudaPointerGetAttributes(&dst_attr_info, dst) == cudaSuccess) {
-        dst_type = dst_attr_info.type;
-    }
-
-    cudaMemcpyKind kind = cudaMemcpyDefault;
-    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyDeviceToHost;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyHostToDevice;
-    } else if (src_type == cudaMemoryTypeDevice &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyDeviceToDevice;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyHostToHost;
-    }
-
-    if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
-        if (err != cudaSuccess) {
-            task->status_word = TransferStatusEnum::FAILED;
+    std::vector<void *> srcs;
+    std::vector<void *> dsts;
+    std::vector<size_t> sizes;
+    for (auto *task : tasks) {
+        void *src = nullptr, *dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;       // read into source buffer
+            src = (void *)task->target_addr;  // from remote
         } else {
-            task->transferred_bytes = task->request.length;
-            task->status_word = TransferStatusEnum::COMPLETED;
+            src = task->request.source;       // write from source buffer
+            dst = (void *)task->target_addr;  // to remote
+        }
+        srcs.push_back(src);
+        dsts.push_back(dst);
+        sizes.push_back(task->request.length);
+    }
+
+    cudaError_t err;
+
+#if CUDART_VERSION >= 13000
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    err = cudaMemcpyBatchAsync(const_cast<const void **>(dsts.data()),
+                               const_cast<const void **>(srcs.data()),
+                               sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
+                               batch->async_stream.get());
+#elif CUDART_VERSION >= 12080
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    size_t fail_idx = tasks.size();
+    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
+                               batch->async_stream.get());
+    if (err != cudaSuccess && fail_idx < tasks.size()) {
+        LOG(ERROR) << "MnnvlTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed at task index " << fail_idx
+                   << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
+                   << ", size=" << sizes[fail_idx]
+                   << "): " << cudaGetErrorString(err);
+        tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
+    }
+#else
+    err = cudaSuccess;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        auto single_err =
+            cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                            batch->async_stream.get());
+        if (single_err != cudaSuccess) {
+            tasks[i]->status_word = TransferStatusEnum::FAILED;
+            err = single_err;
+        }
+    }
+#endif
+
+    if (err != cudaSuccess) {
+        for (auto *task : tasks) {
+            if (task->status_word == TransferStatusEnum::PENDING)
+                task->status_word = TransferStatusEnum::FAILED;
         }
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
-
-    if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
+    cudaEvent_t event;
+    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEventRecord(event, batch->async_stream.get());
+    for (auto *task : tasks) task->completion_event = event;
 }
 
 Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -262,9 +274,8 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto &task = mnnvl_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
-        auto err = cudaStreamQuery(mnnvl_batch->stream);
+        auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
-            cudaStreamSynchronize(mnnvl_batch->stream);
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {
@@ -314,6 +325,20 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
         desc.mnnvl_handle =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
     }
+
+    void *real_addr;
+    size_t real_size;
+    result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
+                                  (CUdeviceptr)desc.addr);
+    if (result != CUDA_SUCCESS) {
+        LOG(WARNING) << "NvlinkTransport: cuMemGetAddressRange failed: "
+                     << result;
+        const uint64_t granularity = 2 * 1024 * 1024;
+        real_addr = (void *)desc.addr;
+        real_size = (desc.length + granularity - 1) & ~(granularity - 1);
+    }
+    desc.addr = (uint64_t)real_addr;
+    desc.length = real_size;
 
     desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
@@ -458,13 +483,17 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     }
 
     RWSpinlock::WriteGuard guard(relocate_lock_);
-    SegmentDesc *desc = nullptr;
-    CHECK_STATUS(metadata_->segmentManager().getRemoteCached(desc, target_id));
 
-    auto buffer = desc->findBuffer(dest_addr, length);
-    if (!buffer || buffer->mnnvl_handle.empty())
-        return Status::InvalidArgument(
-            "Requested address is not in registered buffer" LOC_MARK);
+    BufferDesc *buffer;
+    auto &segment_manager = metadata_->segmentManager();
+    CHECK_STATUS(
+        segment_manager.withCachedSegment(target_id, [&](SegmentDesc *segment) {
+            buffer = segment->findBuffer(dest_addr, length);
+            if (!buffer || buffer->mnnvl_handle.empty())
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        }));
 
     if (!relocate_map_[target_id].count(buffer->addr)) {
         CUmemGenericAllocationHandle handle;

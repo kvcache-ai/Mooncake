@@ -47,7 +47,7 @@ class LocalBuffers;
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
 struct RdmaSubBatch : public Transport::SubBatch {
-    std::vector<RdmaTask> task_list;
+    std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
     size_t max_size;
     virtual size_t size() const { return task_list.size(); }
@@ -87,6 +87,8 @@ class RdmaTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc& desc);
 
+    bool warmupMemory(void* addr, size_t length) override;
+
     virtual const char* getName() const { return "rdma"; }
 
     virtual bool supportNotification() const override { return true; }
@@ -111,6 +113,8 @@ class RdmaTransport : public Transport {
 
    public:
     Status setupLocalSegment();
+
+    std::shared_ptr<Config> config() const { return conf_; }
 
    private:
     bool installed_;

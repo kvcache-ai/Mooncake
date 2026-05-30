@@ -45,9 +45,10 @@ struct Capabilities {
 class Transport {
    public:
     struct SubBatch {
-        SubBatch() {}
+        SubBatch() : device_mask(~0ULL) {}
         virtual ~SubBatch() {}
         virtual size_t size() const = 0;
+        uint64_t device_mask;  // Device mask for transport selection
     };
 
     using SubBatchRef = SubBatch *;
@@ -97,6 +98,11 @@ class Transport {
     virtual Status freeLocalMemory(void *addr, size_t size) {
         return Platform::getLoader().free(addr, size);
     }
+
+    // Pre-registration warm-up that pins pages before NUMA probing.
+    // Returns true if pages were successfully pinned (caller may skip
+    // prefault). Default: no-op, returns false.
+    virtual bool warmupMemory(void *addr, size_t length) { return false; }
 
     virtual Status addMemoryBuffer(BufferDesc &desc,
                                    const MemoryOptions &options) {

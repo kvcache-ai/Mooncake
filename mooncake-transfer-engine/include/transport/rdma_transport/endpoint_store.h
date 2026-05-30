@@ -38,10 +38,14 @@ class EndpointStore {
    public:
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) = 0;
+    virtual std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
     virtual void evictEndpoint() = 0;
+    // Takes endpoint_map_lock_; caller must not hold it (RWSpinlock is
+    // non-reentrant, so recursive acquisition deadlocks).
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
 
@@ -50,14 +54,25 @@ class EndpointStore {
 
     // Get the total number of QPs across all endpoints
     virtual size_t getTotalQPNumber() = 0;
+
+    // Number of endpoints awaiting reclaim (evicted or explicitly deleted but
+    // not yet destructed). Exposed for tests and for operator observability.
+    virtual size_t waitingListSize() const = 0;
+
+    // Test-only: push a pre-constructed endpoint into waiting_list_ so reclaim
+    // logic can be exercised without standing up an RDMA device.
+    virtual void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) = 0;
 };
 
 // FIFO
 class FIFOEndpointStore : public EndpointStore {
    public:
-    FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
+    FIFOEndpointStore(size_t max_size)
+        : waiting_list_len_(0), max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
@@ -69,6 +84,11 @@ class FIFOEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+    size_t waitingListSize() const override {
+        return waiting_list_len_.load(std::memory_order_relaxed);
+    }
+
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -78,6 +98,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::list<std::string> fifo_list_;
 
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
+    std::atomic<size_t> waiting_list_len_;
 
     size_t max_size_;
 };
@@ -89,6 +110,8 @@ class SIEVEEndpointStore : public EndpointStore {
         : waiting_list_len_(0), max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
         const std::string &peer_nic_path) override;
+    std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
@@ -100,6 +123,11 @@ class SIEVEEndpointStore : public EndpointStore {
     int disconnectQPs() override;
 
     size_t getTotalQPNumber() override;
+    size_t waitingListSize() const override {
+        return waiting_list_len_.load(std::memory_order_relaxed);
+    }
+
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep) override;
 
    private:
     RWSpinlock endpoint_map_lock_;
@@ -113,7 +141,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::optional<std::list<std::string>::iterator> hand_;
 
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
-    std::atomic<int> waiting_list_len_;
+    std::atomic<size_t> waiting_list_len_;
 
     size_t max_size_;
 };

@@ -2,6 +2,8 @@ file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
+# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
+
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(USE_HIP)
@@ -46,6 +48,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         mooncake_common
          ibverbs
          glog::glog
          gflags::gflags
@@ -67,9 +70,27 @@ if(USE_CUDA)
   endif()
 endif()
 
+if(USE_MACA)
+  if(NOT DEFINED MACA_RUNTIME_LIBS)
+    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
+  endif()
+  target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
+endif()
+
 if(USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
+endif()
+
+if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
+if(USE_COREX)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
 if(USE_HIP)
@@ -77,20 +98,26 @@ if(USE_HIP)
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
-if (USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+if(USE_MLU)
+  target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
-if (USE_ASCEND_DIRECT)
+if(USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
+                                               MPI::MPI)
+endif()
+
+if(USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if (USE_UBSHMEM)
+if(USE_UBSHMEM)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if(USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
@@ -98,10 +125,24 @@ endif()
 
 if(USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
-  target_link_libraries(transfer_engine PUBLIC tent)
+  target_link_libraries(transfer_engine PUBLIC tent_link_group)
 endif()
 
 if(USE_INTRA_NVLINK)
   message(STATUS "Enabled USE_INTRA_NVLINK support")
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+endif()
+
+if(USE_MLX5DV)
+  message(STATUS "Enabled USE_MLX5DV support (mlx5 direct verbs)")
+  target_link_libraries(transfer_engine PUBLIC mlx5)
+endif()
+
+if(USE_EFA)
+  message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
+  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
+endif()
+if(USE_UB)
+  message(STATUS "Enabled USE_UB protocol support")
+  target_link_libraries(transfer_engine PUBLIC ub_transport)
 endif()

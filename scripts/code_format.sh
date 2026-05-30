@@ -69,18 +69,21 @@ print_error() {
 find_clang_format() {
     if command -v clang-format-20 &> /dev/null; then
         echo "clang-format-20"
+        return 0
     else
-        print_error "clang-format-20 not found. This project requires clang-format version 20."
-        echo ""
-        print_info "Installation instructions for Ubuntu:"
-        echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
-        echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
-        echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
-        echo ""
-        print_info "Or use the LLVM installation script:"
-        echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
-        echo "  sudo apt-get install -y clang-format-20"
-        exit 1
+        {
+            print_error "clang-format-20 not found. This project requires clang-format version 20."
+            echo ""
+            print_info "Installation instructions for Ubuntu:"
+            echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
+            echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
+            echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
+            echo ""
+            print_info "Or use the LLVM installation script:"
+            echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
+            echo "  sudo apt-get install -y clang-format-20"
+        } >&2
+        return 1
     fi
 }
 
@@ -248,8 +251,10 @@ main() {
     
     # Find clang-format
     local clang_format
-    clang_format=$(find_clang_format)
-    
+    if ! clang_format="$(find_clang_format)"; then
+        exit 1
+    fi
+
     # Get files to format
     local files
     if ${ALL_MODE}; then

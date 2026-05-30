@@ -36,13 +36,14 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 * If `global_segment_size` is set to zero, the instance functions as a **pure client**, issuing requests but not contributing memory to the system.
 * If `local_buffer_size` is set to zero, it acts as a **pure server**, providing memory for storage. In this case, request operations such as `Get` or `Put` are not permitted from this instance.
 
-The `Client` can be used in two modes:
-1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
-2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
+The `Client` can be used in three ways:
+1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library. Embedded clients issue requests directly, and when configured with `global_segment_size > 0` they also contribute memory resources to the cluster.
+2. **Embedded mode with dummy-real clients**: Each LLM inference **rank** holds an embedded **dummy** client (which holds no resources). Each LLM inference **instance** has one resource-owning **real** client (for example, with TP=8 there can be 8 dummy clients and 1 real client). All dummy clients of the same inference instance forward requests to that one real client. The real client owns the global segment (optionally) and is responsible for RPC handling, memory management, and data transfer. Dummy and real clients communicate via RPC, and use shared memory/zero-copy mechanisms for data transfer, so that the data path remains efficient.
+3. **Standalone store service**: A standalone store service (e.g., `python -m mooncake.mooncake_store_service`) wraps a client and provides the global memory/SSD resource pool. With this service, embedded clients can be configured with `global_segment_size = 0` so they contribute network/NIC resources only, while the standalone store service owns memory and storage management. This service can be deployed on the same server as the inference engine or on separate servers.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
-2. **High availability mode (unstable)**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
+2. **High availability mode**: This mode enhances fault tolerance by running the master service as a cluster of multiple master nodes coordinated through an etcd cluster. The master nodes use etcd to elect a leader, which is responsible for handling client requests.
 If the current leader fails or becomes partitioned from the network, the remaining master nodes automatically perform a new leader election, ensuring continuous availability.
 
 In both modes, the leader monitors the health of all client nodes through periodic heartbeats. If a client crashes or becomes unreachable, the leader quickly detects the failure and takes appropriate action. When a client node recovers or reconnects, it can automatically rejoin the cluster without manual intervention.
@@ -69,7 +70,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -100,9 +101,29 @@ The data structure details of `ReplicateConfig` are as follows:
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
+
+### Upsert
+
+```C++
+tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                     std::vector<Slice>& slices,
+                                     const ReplicateConfig& config);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config);
+```
+
+`Upsert` inserts `key` if it does not exist and updates the existing object if
+it does. It uses the same replication configuration model as `Put`, while
+allowing the store to reuse existing placement for in-place updates when the
+current layout permits it. `BatchUpsert` performs the same operation for
+multiple keys using a shared replication configuration.
 
 ### Remove
 
@@ -111,6 +132,69 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
+
+### CreateCopyTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+![mooncake-store-create-copy-task](../image/mooncake-store-client-create-copy-task.png)
+
+`CreateCopyTask` creates an asynchronous copy task that will be executed by the client's task execution system. This is useful when you want to submit multiple copy operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the copy operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### CreateMoveTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+![mooncake-store-create-move-task](../image/mooncake-store-client-create-move-task.png)
+
+`CreateMoveTask` creates an asynchronous move task that will be executed by the client's task execution system. This is useful when you want to submit multiple move operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the move operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### QueryTask
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` queries the status of an asynchronous task (copy or move). This allows you to monitor the progress of task-based operations. The response includes task status, type, creation time, last update time, assigned client, and status message.
+
+The data structure details of `QueryTaskResponse` are as follows:
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // Task UUID
+    TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
+    TaskStatus status;                          // Task status (PENDING, PROCESSING, SUCCESS, or FAILED)
+    int64_t created_at_ms_epoch;                // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;           // Last update timestamp in milliseconds
+    UUID assigned_client;                       // UUID of the client assigned to execute the task
+    std::string message;                        // Status message or error description
+};
+```
 
 ### BatchQueryIp
 
@@ -151,9 +235,25 @@ Used to delete all objects from the store whose keys match the specified regular
 
 ### Master Service
 
-The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
+The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
+
+#### Snapshot & Restore
+
+To reduce cache warm-up time after a master restart, the Master Service supports periodic snapshots of its in-memory metadata and recovery from these snapshots.
+
+- Snapshot generation
+  - A background snapshot thread periodically takes a consistent copy of the in-memory KV metadata, segment information, and allocator state using fork-based copy-on-write, without blocking normal RPC handling.
+  - The child process serializes these structures into a compact binary format and writes them to the configured snapshot backend via the `SerializerBackend` abstraction.
+- Restore
+  - On startup, when snapshot restore is enabled, the master reads the latest snapshot from the backend and reconstructs the Master Service's metadata state in memory.
+- Notes
+  - Because snapshots are taken periodically rather than continuously, metadata changes after the last successful snapshot may be lost if the master fails before the next snapshot completes.
+
+> **Warning: Managed Storage**
+>
+> The snapshot storage location is **exclusively managed** by the Mooncake snapshot system. Old snapshots are automatically deleted during cleanup. **DO NOT store other files in this location.** Use a dedicated, isolated storage for snapshots.
 
 #### Master Service APIs
 
@@ -225,7 +325,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -310,7 +410,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
 };
 ```
@@ -323,7 +423,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -339,7 +439,7 @@ message PutEndResponse {
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -436,6 +536,40 @@ The Master Service handles object-related interfaces as follows:
 
 Before writing an object, the Client calls PutStart to request storage space allocation from the Master Service. After completing data writing, the Client calls PutEnd to notify the Master Service to mark the object write as completed.
 
+- Upsert
+
+```C++
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
+    const std::string& key,
+    const std::vector<size_t>& slice_lengths,
+    const ReplicateConfig& config);
+
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+BatchUpsertStart(const std::vector<std::string>& keys,
+                 const std::vector<std::vector<uint64_t>>& slice_lengths,
+                 const ReplicateConfig& config);
+
+tl::expected<void, ErrorCode> UpsertEnd(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+    const std::vector<std::string>& keys);
+
+tl::expected<void, ErrorCode> UpsertRevoke(
+    const std::string& key, ReplicaType replica_type);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+    const std::vector<std::string>& keys);
+```
+
+`UpsertStart` / `UpsertEnd` / `UpsertRevoke` mirror the existing put lifecycle
+but operate on insert-or-update semantics. If the key does not exist, the flow
+behaves like `PutStart`. If the key already exists, the Master may reuse the
+current allocation for an in-place update or allocate new space when the object
+layout changes. The batch variants provide the same control flow for multiple
+keys and are the lower-level primitives used by the high-level `BatchUpsert`
+path.
+
 - GetReplicaList
 
 ```C++
@@ -518,17 +652,68 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
   - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
   - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
 
-#### Implementation Strategies
+#### Allocation Strategies
 
-`RandomAllocationStrategy` is a subclass implementing `AllocationStrategy` that provides intelligent allocation with the following features:
+Mooncake Store provides multiple built-in allocation strategies to control how storage space is distributed across segments. Users can select a strategy via the `--allocation_strategy` flag when starting the master service:
 
-1. **Preferred Segment Support**: If a preferred segment is specified in the `ReplicateConfig`, the strategy first attempts to allocate from that segment before falling back to random allocation.
+```bash
+./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
+```
 
-2. **Random Allocation with Retry Logic**: When multiple allocators are available, it uses a randomized approach with up to 10 retry attempts to find a suitable allocator.
+Valid values are: `random` (default), `free_ratio_first`, `cxl` (case-sensitive).
 
-3. **Deterministic Randomization**: Uses a Mersenne Twister random number generator with proper seeding for consistent behavior.
+##### How to Choose
 
-The strategy automatically handles cases where the preferred segment is unavailable, full, or doesn't exist by gracefully falling back to random allocation among all available segments.
+| Strategy | Best For | Trade-off |
+|---|---|---|
+| `random` | Maximum throughput, stable clusters | Limited load balancing; slow convergence when new segments join |
+| `free_ratio_first` | Balanced utilization, dynamic scaling | Slightly lower throughput due to sampling and sorting overhead |
+| `cxl` | CXL memory hardware | CXL-specific; single-replica only |
+
+**Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
+
+**Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
+- Segments have different capacities and you want even utilization ratios.
+- New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `cxl`** only when your hardware includes CXL (Compute Express Link) memory devices and you want to allocate data exclusively on CXL segments.
+
+##### Strategy Details
+
+**`random` — RandomAllocationStrategy**
+
+Pure random allocation with preferred segment support. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: If preferred segments are specified in the `ReplicateConfig`, they are tried first in order. Each successful allocation consumes one replica slot. If all replicas are satisfied, the process finishes early.
+2. **Random phase**: For any remaining replicas, a random starting index is chosen among all available segments. The strategy then iterates consecutively from that index, attempting to allocate from each segment. Segments already used for a previous replica of the same slice, as well as explicitly excluded segments, are skipped to guarantee that each replica resides on a different segment.
+3. **Retry limit**: The iteration is capped at `min(100, total_segments)` to avoid excessive scanning when most segments are full.
+4. **Best-effort result**: If fewer than N replicas are allocated but at least one succeeds, the partial result is returned. The call fails only if zero replicas can be allocated.
+
+All random state uses a thread-local Mersenne Twister (`std::mt19937`), so no locks or shared mutable data are involved.
+
+**`free_ratio_first` — FreeRatioFirstAllocationStrategy (Best-of-N)**
+
+An improved strategy built on top of `RandomAllocationStrategy`. Instead of picking segments purely at random, it samples a small pool of candidates and selects the ones with the most free space. The allocation process for N replicas is:
+
+1. **Preferred segment phase**: Same as `random` — preferred segments are tried first in order.
+2. **Sampling phase**: Randomly picks a starting index and takes `min(6*remaining_replicas, total_segments)` consecutive segments as candidates. For each candidate, queries its free space ratio: `free_bytes / total_capacity`.
+3. **Sorting phase**: Sorts the candidates in descending order by free space ratio (most free first).
+4. **Allocation phase**: Iterates through the sorted candidates from top to bottom, attempting to allocate from each. Excluded and already-used segments are skipped.
+5. **Fallback phase**: If insufficient replicas are allocated from the sorted candidates, falls back to the base `RandomAllocationStrategy` random iteration logic for the remaining replicas.
+
+The overhead is minimal: sampling is `O(K)` and sorting is `O(K log K)`, where K is the candidate count (at most `6*N`) — both small since `replica_num` is typically 1–3. The strategy is thread-safe, using `thread_local` random state with no shared mutable data.
+
+The key insight behind Best-of-N is that if a new/empty segment is sampled, it will almost certainly be ranked first due to having the highest free ratio, which naturally accelerates convergence when new segments join the cluster.
+
+**`cxl` — CxlAllocationStrategy**
+
+Specialized for CXL (Compute Express Link) memory hardware. Unlike the other strategies, this one does not perform random or load-balanced selection — it always allocates from a specific CXL segment:
+
+1. Requires `preferred_segments` to be non-empty; the first element is used as the target CXL segment name.
+2. Allocates a single replica from the specified CXL segment's allocator.
+3. Marks the allocated buffer as CXL type via `change_to_cxl()`, so downstream components can distinguish CXL-backed data from regular DRAM.
+
+Limitations: This strategy only supports single-replica allocation (does not distribute across multiple segments) and does not support the `AllocateFrom()` interface.
 
 ### Eviction Policy
 
@@ -558,6 +743,18 @@ There are two startup parameters in `master_service` related to the soft pin mec
 
 Notably, soft pinned objects can still be removed using APIs such as `Remove` or `RemoveAll`.
 
+### Hard Pin
+
+For objects that must never be evicted under any circumstances (e.g., model weights, critical metadata), Mooncake Store provides a hard pin mechanism. Unlike soft pin, hard-pinned objects are permanently protected from eviction — they will never be selected as eviction candidates regardless of memory pressure.
+
+Hard pin is set at object creation time through the `with_hard_pin` field in `ReplicateConfig` and cannot be changed afterward. Hard-pinned objects can only be removed explicitly via `Remove` (with force) or `RemoveAll`.
+
+Key differences from soft pin:
+
+- Hard pin never expires. Soft pin status is removed after a configurable TTL if the object is not accessed.
+- Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
+- Hard pin is immutable once set. Soft pin status is automatically refreshed on access.
+
 ### Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
@@ -582,6 +779,7 @@ The preferred segment allocation feature is implemented through the `AllocationS
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
@@ -608,7 +806,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.  
+Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
 The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
 **Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
 **Notice** The capability for file eviction on DFS has not been provided yet
@@ -622,7 +820,12 @@ After enabling the persistence feature:
 - For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
 - For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
 
-#### 3FS USRBIO Plugin
+#### 3FS USRBIO Plugin (Experimental)
+
+```{note}
+This integration is **experimental** and incomplete; see the plugin page for details before relying on it.
+```
+
 If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
 
 ### Builtin Metadata Server
@@ -637,8 +840,12 @@ The HTTP metadata server can be configured using the following parameters:
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
+- MC_STORE_CLIENT_MIN_PORT: Minimum local port for client connections (default 12300). Must be in range 1024–32767 or 61000–65535; falls back to default on invalid input.
+- MC_STORE_CLIENT_MAX_PORT: Maximum local port for client connections (default 14300). Same range constraints; must be ≥ MC_STORE_CLIENT_MIN_PORT.
 - MC_STORE_USE_HUGEPAGE: Enables huge page support, disabled by default.
 - MC_STORE_HUGEPAGE_SIZE: Specifies the page size of the huge page to use, default 2M.
+- MC_MMAP_ARENA_POOL_SIZE: Size of the pre-allocated arena pool for mmap buffer allocations. Accepts human-readable sizes (e.g., `"8gb"`, `"20gb"`). Providing this variable explicitly enables the arena; when enabled via gflag without an env override, the default pool size is `8gb`. The arena is allocated once at first use and serves subsequent allocations via lock-free atomic bump pointer (~50ns per allocation vs ~1000ns for direct mmap).
+- MC_DISABLE_MMAP_ARENA: Set to `1` to disable the arena allocator and fall back to per-call `mmap()`, even if the arena was explicitly requested. Also accepts `true`, `yes`, or `on`. This must be set before the first Mooncake mmap-buffer allocation in the process. Useful for debugging or memory-constrained environments where pre-allocating a pool is not desirable.
 #### Usage Example
 To start the master service with the HTTP metadata server enabled:
 ```bash
@@ -714,7 +921,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
 **Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example: 
+For example:
 ```python
 import os
 import time
@@ -830,18 +1037,28 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 
 ## Example Code
 
-#### Python Usage Example
+### Python Usage Example
 We provide a reference example `distributed_object_store_provider.py`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) in the background on the same server, and then execute this Python program in the foreground. It should output a successful test result.
 
-#### C++ Usage Example
+### C++ Usage Example
 The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
 
 ## Version Management Policy
 
-The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](gh-file:mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
 
 When to bump the version:
 
 * **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
 * **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
 * **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
+
+
+---
+
+:::{toctree}
+:caption: Related Design Docs
+:maxdepth: 1
+
+ssd-offload
+:::

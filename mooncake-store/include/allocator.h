@@ -15,6 +15,17 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
+/**
+ * @brief Type of buffer allocator used in the system
+ */
+enum class ReplicaType {
+    MEMORY,      // Memory replica
+    DISK,        // Disk replica
+    LOCAL_DISK,  // Local disk replica
+    NOF_SSD,     // Nvme-oF SSD replica
+    ALL,         // All memory and NoF replicas in put finalize path
+};
+
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
@@ -84,6 +95,8 @@ class AllocatedBuffer {
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+
+    friend class Serializer<AllocatedBuffer>;
 };
 
 /**
@@ -140,7 +153,8 @@ class CachelibBufferAllocator
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
-                            std::string transport_endpoint);
+                            std::string transport_endpoint,
+                            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
@@ -171,6 +185,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -191,7 +206,8 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint);
+                          std::string transport_endpoint,
+                          ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
@@ -211,6 +227,12 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    // Public method to get offset_allocator
+    std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
+        const {
+        return offset_allocator_;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -218,9 +240,12 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const ReplicaType replica_type_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend class Serializer<OffsetBufferAllocator>;
 };
 
 // The main difference is that it allocates real memory and returns it, while

@@ -77,6 +77,11 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
+    // Warm up RDMA MR registration by temporarily registering/deregistering.
+    // This targets RDMA driver-side pinning/metadata and differs from CPU
+    // prefault (madvise/mlock/touch) used before NUMA probing.
+    int warmupMrRegistration(void *addr, size_t length);
+
     int unregisterMemReg(MemReg id);
 
     const std::pair<uint32_t, uint32_t> queryMemRegKey(MemReg id) const {
@@ -108,6 +113,9 @@ class RdmaContext {
     int cqCount() const { return params_->device.num_cq_list; }
 
     RdmaParams &params() const { return *params_.get(); }
+
+    // PCIe Relaxed Ordering support
+    bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
     // Notification CQ (dedicated for notification QPs)
     RdmaCQ *notifyCq() { return notify_cq_; }
@@ -143,6 +151,9 @@ class RdmaContext {
 
     // Dedicated CQ for notification QPs (one per device)
     RdmaCQ *notify_cq_ = nullptr;
+
+    // PCIe Relaxed Ordering support
+    bool relaxed_ordering_enabled_ = false;
 
     const IbvSymbols &verbs_;
 };

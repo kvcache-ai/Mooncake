@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <vector>
 #include <string>
@@ -29,7 +30,7 @@ class ClientBufferAllocator
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
-        bool use_hugepage = false);
+        bool use_hugepage = false, bool use_spdk_dma = false);
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
@@ -51,19 +52,23 @@ class ClientBufferAllocator
 
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
-   private:
-    // Private constructors for different memory types
-    ClientBufferAllocator(size_t size, const std::string& protocol,
-                          bool use_hugepage);
+   protected:
+    // Constructors accessible to derived classes
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
+
+    void* buffer_;
+    size_t buffer_size_;
+    bool use_hugepage_ = false;
+
+   private:
+    ClientBufferAllocator(size_t size, const std::string& protocol,
+                          bool use_hugepage, bool use_spdk_dma);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
-    void* buffer_;
-    size_t buffer_size_;
     bool is_external_memory_ = false;
-    bool use_hugepage_ = false;
+    bool use_spdk_dma_ = false;
 };
 
 /**
@@ -76,8 +81,13 @@ class ClientBufferAllocator
  */
 class BufferHandle {
    public:
+    // Owning mode: backed by allocator
     BufferHandle(std::shared_ptr<ClientBufferAllocator> allocator,
                  offset_allocator::OffsetAllocationHandle handle);
+
+    // View mode: non-owning, calls release_fn on destruction
+    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn);
+
     ~BufferHandle();
 
     BufferHandle(BufferHandle&&) = default;  // Allow move operations
@@ -91,8 +101,14 @@ class BufferHandle {
     [[nodiscard]] size_t size() const;
 
    private:
+    // Owning mode members
     std::shared_ptr<ClientBufferAllocator> allocator_;
     offset_allocator::OffsetAllocationHandle handle_;
+
+    // View mode members
+    void* view_ptr_ = nullptr;
+    size_t view_size_ = 0;
+    std::function<void()> release_fn_;
 };
 
 // Utility functions for buffer and slice management
@@ -102,6 +118,14 @@ class BufferHandle {
  * @return Vector of slices covering the entire buffer
  */
 std::vector<Slice> split_into_slices(BufferHandle& handle);
+
+/**
+ * @brief Split a buffer into slices of maximum kMaxSliceSize
+ * @param buffer The buffer buffer to split
+ * @param length The length of the buffer to split
+ * @return Vector of slices covering the entire buffer
+ */
+std::vector<Slice> split_into_slices(void* buffer, size_t length);
 
 /**
  * @brief Calculate the total size of a replica descriptor
@@ -118,7 +142,6 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
 }  // namespace mooncake

@@ -11,7 +11,7 @@ This document lists common errors that may occur when using Mooncake Store and p
 
 ## Metadata and Out-of-Band Communication
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.
-2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method. 
+2. At startup, the current node is registered with the cluster according to the incoming `connectable_name` parameter and `rpc_port` parameter, and the TCP port specified by the `rpc_port` parameter is listened. Before other nodes send the first read/write request to the current node, they will use the above information, resolve DNS, and initiate a connection through socket's `connect()` method.
 
 Errors in this part usually indicate that the error occurred within the `mooncake-transfer-engine/src/transfer_metadata.cpp` file.
 
@@ -63,7 +63,37 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    **Solution:**
    Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
 
-5. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
+5. If you encounter `Failed to register memory 0x...: Resource temporarily unavailable [11]` and kernel logs show `CREATE_MKEY failed, status no resources(0xf)`, this indicates that the RDMA NIC has exhausted its internal Memory Key (MKEY) resources, even though `ulimit -l` and `vm.max_map_count` may appear sufficient.
+
+   This typically happens when:
+   - Applications that use RDMA (e.g., SGLang with HiCache + Mooncake) have crashed or been killed multiple times without cleanly releasing RDMA resources.
+   - The leaked MKEY entries accumulate in the NIC firmware and are not reclaimed by the kernel, eventually hitting the hardware limit.
+   - Large memory regions (e.g., NSA indexer buffers at ~4.68 GB each across multiple TP ranks) amplify the problem since each registration consumes more internal NIC resources.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Check current RDMA resource usage per device
+   rdma resource show
+
+   # Check kernel logs for CREATE_MKEY failures
+   dmesg | grep -i "CREATE_MKEY\|no resources\|mlx5_cmd_out_err"
+   # Example output:
+   # mlx5_core 0000:65:01.0: mlx5_cmd_out_err:829:(pid 3958462): CREATE_MKEY(0x200) op_mod(0x0) failed, status no resources(0xf), syndrome (0x2aac7c), err(-11)
+
+   # Ensure vm.max_map_count is large enough (default 65530 may be too small)
+   sysctl vm.max_map_count
+   ```
+
+   **Solutions:**
+   - **Reboot the node** to fully reset NIC firmware state and reclaim all leaked MKEY resources. This is the most reliable fix.
+   - Increase `vm.max_map_count` if it is at the default value: `sysctl -w vm.max_map_count=16777216`
+   - Ensure applications shut down cleanly (avoid `kill -9` when possible) so RDMA resources are properly deregistered.
+   - If rebooting is not feasible, try unloading and reloading the mlx5 kernel modules (may disrupt other services):
+     ```bash
+     modprobe -r mlx5_ib mlx5_core && modprobe mlx5_core mlx5_ib
+     ```
+
+6. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
 
    **Diagnostic Commands:**
    - Use `ulimit -a` to check current limits, particularly the `max locked memory` value
@@ -80,9 +110,10 @@ Errors in this part usually indicate that the error occurred within the `mooncak
      *    hard    memlock    unlimited
      ```
 
-6. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+7. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. Possible ways to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
+   - If the leak persists under sustained peer failures (many `endpoint evicted` log lines accompanying the QP growth), update to a version that includes the fix for [issue #1845](https://github.com/kvcache-ai/Mooncake/issues/1845). Prior to that fix, the endpoint store's `waiting_list_` only drained when new endpoints were inserted, so evictions under failure load accumulated QPs until the driver limit was hit. The fix adds a periodic reclaim tick to `monitorWorker`.
 
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
@@ -92,6 +123,74 @@ If the network state is unstable, some requests may not be delivered, displaying
 Note: In most cases, the errors output, except for the first occurrence, are `work request flushed error`. This is because when the first error occurs, the RDMA driver sets the connection to an unavailable state, so tasks in the submission queue are blocked from execution and subsequent errors are reported. Therefore, it is recommended to locate the first occurrence of the error and check it.
 
 In addition, if the error `Failed to get description of XXX` is displayed, it indicates that the Segment name input by the user when calling the `openSegment` interface cannot be found in the etcd database. For memory read/write scenarios, the Segment name needs to strictly match the `local_hostname` field filled in by the other node during initialization.
+
+## TCP Transport
+### Recommended Troubleshooting Directions
+
+1. If sustained, high-concurrency TCP traffic (for example, PD-disaggregated KV transfers over the TCP transport) fails with `connect: Cannot assign requested address`, the initiator side has exhausted its ephemeral port range. Each transfer opens a fresh short-lived socket, and ports held in `TIME_WAIT` accumulate faster than the kernel can reclaim them.
+
+   **Diagnostic Commands:**
+   ```bash
+   # Confirm large numbers of TIME_WAIT sockets to the peer
+   ss -tan state time-wait | wc -l
+
+   # Check the local ephemeral port range
+   sysctl net.ipv4.ip_local_port_range
+   ```
+
+   **Solutions:**
+   - Enable the TCP connection pool so that long-lived sockets are reused across transfers instead of being opened per transfer:
+     ```bash
+     export MC_TCP_ENABLE_CONNECTION_POOL=1
+     ```
+   - Widen the ephemeral port range if the workload genuinely needs many distinct connections:
+     ```bash
+     sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+     ```
+   - As a last resort, enable `TIME_WAIT` reuse on the initiator. `tcp_tw_reuse` only affects outbound connections and requires TCP timestamps to be enabled on both sides:
+     ```bash
+     sysctl -w net.ipv4.tcp_tw_reuse=1
+     ```
+
+2. The TCP connection pool (`MC_TCP_ENABLE_CONNECTION_POOL=1`) has two known limitations in the current implementation. The pool is functional for most workloads, but operators running long-lived services should be aware of them:
+
+   * **Idle-expired connections are not always reclaimed.** `cleanupIdleConnections()` only inspects the tail of each endpoint's deque. When a newer `in_use` entry has been pushed behind an older idle-expired entry, the loop terminates at the tail and the idle entry is never removed. The pool's reported state diverges from reality: it still lists the connection as idle while the socket has been sitting past `kConnectionIdleTimeout`, may have been half-closed by the peer, and will fail on the next `getConnection()` that tries to reuse it. In long-running services this also leaks sockets and file descriptors until the process is restarted.
+
+     **Diagnostic Commands:**
+     ```bash
+     # Watch for unbounded growth of open sockets from the process
+     ls /proc/$PID/fd | wc -l
+     ss -tan | awk '$1=="ESTAB"' | wc -l
+     ```
+
+     **Workaround:** restart the process periodically if fd usage climbs without bound.
+
+   * **`asio::socket::close()` runs under `pool_mutex_`.** `close()` cancels outstanding async operations and posts completion handlers to the io_context. Handlers such as `returnConnection()` also acquire `pool_mutex_`, so the current code is one scheduling step away from a circular wait. No deadlock has been observed in practice, but if the transfer engine hangs with all worker threads stuck waiting on `pool_mutex_`, this is the first place to look.
+
+## Memory Allocator
+
+Mooncake Store's mmap arena is opt-in for mmap buffer allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables it and pre-allocates a hugepage-backed pool; if it is enabled via gflag instead, the default pool size is `8gb`. If the arena cannot allocate hugepages, it falls back to regular pages automatically.
+
+If you encounter memory allocation issues related to the arena:
+
+- **HugeTLB pool is too small for the launch:** Run `python3 scripts/check_hicache_hugepage_requirements.py ...` from a source checkout, or `mooncake-hicache-sizing ...` inside the Docker image, using your `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values. If it reports `insufficient_for_baseline`, increase `vm.nr_hugepages`, reduce `--hicache-size`, or shrink `MOONCAKE_GLOBAL_SEGMENT_SIZE`.
+- **Arena pool too large for available hugepages:** Reduce the pool size with `MC_MMAP_ARENA_POOL_SIZE="8gb"` to fit within your hugepage budget, or leave `MC_MMAP_ARENA_POOL_SIZE` unset to stay on the baseline direct-`mmap()` path.
+- **Arena only partially fits:** If the helper reports `baseline_fits_arena_may_fallback`, the baseline should start but some arena allocations may spill onto regular pages. Either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`.
+- **Need to disable the arena entirely:** Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) before the first Mooncake mmap-buffer allocation to fall back to per-call `mmap()`.
+- **Arena init failed once and the process stayed on the baseline path:** Arena initialization is lazy and one-shot per process. After a failed first attempt, Mooncake keeps using direct `mmap()` until the process restarts. Fix the env / hugepage budget, then restart the process before retrying.
+- **Arena OOM during serving:** The arena logs a warning and falls back to direct `mmap()` for that allocation. If this happens frequently, increase `MC_MMAP_ARENA_POOL_SIZE`.
+- **Direct hugepage mmap fails immediately:** Verify the host really has hugepages reserved with `grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo`. When `MC_STORE_USE_HUGEPAGE=1` is set, direct `mmap()` allocations depend on the OS HugeTLB pool.
+
+To provision `2 MiB` hugepages on Linux:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=49152
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+printf 'vm.nr_hugepages=49152\n' | sudo tee /etc/sysctl.d/90-mooncake-hugepages.conf
+sudo sysctl --system
+```
+
+`49152` pages equals `96 GiB`; for `512 GiB` use `262144` pages.
 
 ## SGLang Common Questions
 

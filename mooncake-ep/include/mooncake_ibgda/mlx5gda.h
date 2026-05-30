@@ -87,7 +87,7 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
                                         struct memheap *ctrl_buf_heap,
                                         struct ibv_pd *pd, int wqe,
                                         uint8_t port_num, cudaStream_t stream);
-void mlx5gda_destroy_qp(struct mlx5gda_qp *qp);
+void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);
 int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,

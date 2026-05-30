@@ -7,6 +7,7 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <chrono>
 #include <cstdlib>
 
 #include "real_client.h"
@@ -16,171 +17,131 @@
 #include "rpc_types.h"
 #include "types.h"
 #include "default_config.h"
+#include "config.h"
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl_rt.h"
+#include "ascend_allocator.h"
+#endif
+
+namespace {
+size_t sum_value_sizes(const std::vector<std::span<const char>>& values) {
+    size_t total = 0;
+    for (const auto& value : values) {
+        total += value.size_bytes();
+    }
+    return total;
+}
+
+size_t sum_sizes(const std::vector<size_t>& sizes) {
+    size_t total = 0;
+    for (size_t size : sizes) {
+        total += size;
+    }
+    return total;
+}
+
+size_t sum_successful_sizes(const std::vector<int>& results,
+                            const std::vector<size_t>& sizes) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < sizes.size(); ++i) {
+        if (results[i] == 0) {
+            total += sizes[i];
+        }
+    }
+    return total;
+}
+
+size_t sum_successful_nested_sizes(
+    const std::vector<int>& results,
+    const std::vector<std::vector<size_t>>& nested_sizes) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < nested_sizes.size(); ++i) {
+        if (results[i] == 0) {
+            total += sum_sizes(nested_sizes[i]);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_results(const std::vector<int64_t>& results) {
+    size_t total = 0;
+    for (int64_t result : results) {
+        if (result > 0) {
+            total += static_cast<size_t>(result);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_results(const std::vector<int>& results) {
+    size_t total = 0;
+    for (int result : results) {
+        if (result > 0) {
+            total += static_cast<size_t>(result);
+        }
+    }
+    return total;
+}
+
+size_t sum_positive_ranges(
+    const std::vector<std::vector<std::vector<int64_t>>>& results) {
+    size_t total = 0;
+    for (const auto& key_rows : results) {
+        for (const auto& row : key_rows) {
+            total += sum_positive_results(row);
+        }
+    }
+    return total;
+}
+
+std::vector<uint64_t> void_ptrs_to_u64(const std::vector<void*>& ptrs) {
+    std::vector<uint64_t> out;
+    out.reserve(ptrs.size());
+    for (void* p : ptrs) {
+        out.push_back(reinterpret_cast<uint64_t>(p));
+    }
+    return out;
+}
+
+std::vector<std::vector<uint64_t>> void_ptr_rows_to_u64_nested(
+    const std::vector<std::vector<void*>>& rows) {
+    std::vector<std::vector<uint64_t>> nested;
+    nested.reserve(rows.size());
+    for (const auto& row : rows) {
+        nested.push_back(void_ptrs_to_u64(row));
+    }
+    return nested;
+}
+
+}  // namespace
 
 namespace mooncake {
 
-std::mutex ShmHelper::shm_mutex_;
-
-static int memfd_create_wrapper(const char* name, unsigned int flags) {
-#ifdef __NR_memfd_create
-    return syscall(__NR_memfd_create, name, flags);
-#else
-    return -1;  // Or appropriate fallback/error
-#endif
-}
-
-ShmHelper* ShmHelper::getInstance() {
-    static ShmHelper instance;
-    return &instance;
-}
-
-ShmHelper::ShmHelper() {
-    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
-}
-
-ShmHelper::~ShmHelper() { cleanup(); }
-
-bool ShmHelper::cleanup() {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    bool ret = true;
-    for (auto& shm : shms_) {
-        if (shm->fd != -1) {
-            close(shm->fd);
-            shm->fd = -1;
-        }
-        if (shm->base_addr) {
-            if (munmap(shm->base_addr, shm->size) == -1) {
-                LOG(ERROR) << "Failed to unmap shared memory: "
-                           << strerror(errno);
-                ret = false;
-            }
-            shm->base_addr = nullptr;
-        }
-    }
-    shms_.clear();
-    return ret;
-}
-
-void* ShmHelper::allocate(size_t size) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-
-    unsigned int flags = MFD_CLOEXEC;
-    if (use_hugepage_) {
-        bool use_memfd = true;
-        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
-        LOG(INFO) << "Using huge pages for shared memory, size: " << size;
-    }
-
-    // Create memfd
-    int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
-    if (fd == -1) {
-        std::string extra_msg =
-            use_hugepage_ ? " (Check /proc/sys/vm/nr_hugepages?)" : "";
-        throw std::runtime_error("Failed to create anonymous shared memory" +
-                                 extra_msg + ": " +
-                                 std::string(strerror(errno)));
-    }
-
-    // Set size
-    if (ftruncate(fd, size) == -1) {
-        close(fd);
-        throw std::runtime_error("Failed to set shared memory size: " +
-                                 std::string(strerror(errno)));
-    }
-
-    // Map memory
-    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_POPULATE, fd, 0);
-    if (base_addr == MAP_FAILED) {
-        close(fd);
-        throw std::runtime_error("Failed to map shared memory: " +
-                                 std::string(strerror(errno)));
-    }
-
-    auto shm = std::make_shared<ShmSegment>();
-    shm->fd = fd;
-    shm->base_addr = base_addr;
-    shm->size = size;
-    shm->name = MOONCAKE_SHM_NAME;
-    shm->registered = false;
-    shms_.push_back(shm);
-
-    return base_addr;
-}
-
-std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    for (auto& shm : shms_) {
-        if (addr >= shm->base_addr &&
-            reinterpret_cast<uint8_t*>(addr) <
-                reinterpret_cast<uint8_t*>(shm->base_addr) + shm->size) {
-            return shm;
-        }
-    }
-    return nullptr;
-}
-
-int ShmHelper::free(void* addr) {
-    std::lock_guard<std::mutex> lock(shm_mutex_);
-    for (auto it = shms_.begin(); it != shms_.end(); ++it) {
-        if ((*it)->base_addr == addr) {
-            if ((*it)->fd != -1) {
-                close((*it)->fd);
-            }
-            if ((*it)->base_addr &&
-                munmap((*it)->base_addr, (*it)->size) == -1) {
-                LOG(ERROR) << "Failed to unmap shared memory during free: "
-                           << strerror(errno);
-                return -1;
-            }
-            LOG(INFO) << "Freed shared memory at " << addr
-                      << ", size: " << (*it)->size;
-            shms_.erase(it);
-            return 0;
-        }
-    }
-    LOG(ERROR) << "Attempted to free unknown shared memory address: " << addr;
-    return -1;
-}
-
-static int send_fd(int socket, int fd, void* data, size_t data_len) {
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int))];
-    memset(buf, 0, sizeof(buf));
-
-    iov.iov_base = data;
-    iov.iov_len = data_len;
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-
-    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-
-    return sendmsg(socket, &msg, 0);
+template <auto ServiceMethod>
+constexpr bool can_invoke_when_disconnected() {
+    using Method = std::remove_reference_t<decltype(ServiceMethod)>;
+    return std::is_same_v<
+               Method, std::remove_reference_t<decltype(&RealClient::ping)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::service_ready_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::is_shm_mapped_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_shm_internal)>> ||
+           std::is_same_v<Method,
+                          std::remove_reference_t<
+                              decltype(&RealClient::ascend_ipc_shm_internal)>>;
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
-    if constexpr (!std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<decltype(&RealClient::ping)>> &&
-                  !std::is_same_v<
-                      std::remove_reference_t<decltype(ServiceMethod)>,
-                      std::remove_reference_t<
-                          decltype(&RealClient::service_ready_internal)>>) {
-        if (!connected_) {
+    if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
+        if (!connected_.load()) {
             LOG(ERROR) << "Dummy Client not connected";
             return tl::make_unexpected(ErrorCode::RPC_FAIL);
         }
@@ -211,7 +172,7 @@ template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
-    if (!connected_) {
+    if (!connected_.load()) {
         LOG(ERROR) << "Dummy Client not connected";
         std::vector<tl::expected<ResultType, ErrorCode>> error_results;
         error_results.reserve(input_size);
@@ -251,7 +212,10 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
         }());
 }
 
-DummyClient::DummyClient() : client_id_(generate_uuid()) {
+DummyClient::DummyClient()
+    : client_id_(generate_uuid()),
+      metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
+                                    false)) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     // Initialize client pools
@@ -262,6 +226,30 @@ DummyClient::DummyClient() : client_id_(generate_uuid()) {
 }
 
 DummyClient::~DummyClient() { tearDownAll(); }
+
+void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
+                                        const char* op_name, size_t bytes,
+                                        uint64_t latency_us, bool batch) {
+    if (!metrics_) {
+        return;
+    }
+    metrics_->ObserveTransferOperation(kind, op_name, bytes, latency_us);
+    if (kind == TransferOperationKind::kRead) {
+        metrics_->transfer_metric.total_read_bytes.inc(bytes);
+        if (batch) {
+            metrics_->transfer_metric.batch_get_latency_us.observe(latency_us);
+        } else {
+            metrics_->transfer_metric.get_latency_us.observe(latency_us);
+        }
+    } else {
+        metrics_->transfer_metric.total_write_bytes.inc(bytes);
+        if (batch) {
+            metrics_->transfer_metric.batch_put_latency_us.observe(latency_us);
+        } else {
+            metrics_->transfer_metric.put_latency_us.observe(latency_us);
+        }
+    }
+}
 
 ErrorCode DummyClient::connect(const std::string& server_address) {
     ScopedVLogTimer timer(1, "DummyClient::Connect");
@@ -284,8 +272,102 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         return result.error();
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
-    connected_ = true;
+    connected_.store(true);
     return ErrorCode::OK;
+}
+
+int DummyClient::register_ascend_shm(const ShmHelper::ShmSegment* shm,
+                                     bool is_local) {
+#ifdef USE_ASCEND_DIRECT
+    const auto dummy_base_addr = reinterpret_cast<uint64_t>(shm->base_addr);
+    auto mapped_result = invoke_rpc<&RealClient::is_shm_mapped_internal, bool>(
+        dummy_base_addr, client_id_);
+    if (!mapped_result.has_value()) {
+        LOG(WARNING) << "Failed to query real-side shared memory mapping, addr="
+                     << shm->base_addr;
+        return -1;
+    }
+    if (mapped_result.value()) {
+        LOG(INFO) << "Real-side shared memory mapping already exists, addr="
+                  << shm->base_addr << ", size=" << shm->size;
+        return 0;
+    }
+
+    // Detect memory type: device memory uses IPC sharing
+    aclrtPtrAttributes attributes;
+    auto ret = aclrtPointerGetAttributes(shm->base_addr, &attributes);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get pointer attributes, ret=" << ret;
+        return -1;
+    }
+    // all device mem shared by ipc
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        constexpr size_t kIPCKeyLen = 65;
+        char ipc_key[kIPCKeyLen] = {0};
+        ret = aclrtIpcMemGetExportKey(
+            shm->base_addr, shm->size, ipc_key, kIPCKeyLen,
+            ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtIpcMemGetExportKey failed, ret=" << ret
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            return -1;
+        }
+
+        std::string ipc_key_bytes(ipc_key, kIPCKeyLen);
+        auto map_ret = invoke_rpc<&RealClient::ascend_ipc_shm_internal, void>(
+            dummy_base_addr, shm->size, is_local, ipc_key_bytes, device_id_,
+            client_id_);
+        if (!map_ret.has_value()) {
+            LOG(ERROR) << "Failed to map IPC buffer on real side";
+            return -1;
+        }
+        LOG(INFO) << "Registered device memory via IPC, addr=" << shm->base_addr
+                  << ", size=" << shm->size << ", device_id=" << device_id_;
+        return 0;
+    }
+    if (!globalConfig().ascend_use_fabric_mem) {
+        // Host: memfd + mmap (ShmHelper); register with Real like non-agent GPU
+        // path.
+        if (shm->fd < 0) {
+            LOG(ERROR)
+                << "Host POSIX shared memory requires memfd-backed allocation "
+                   "(use ShmHelper::allocate / alloc_from_mem_pool)";
+            return -1;
+        }
+        return register_shm_via_ipc(shm, is_local);
+    }
+
+    // Fabric host mem shared by vmm
+    aclrtDrvMemHandle physical_handle =
+        ascend_get_physical_handle_from_va(shm->base_addr);
+    if (physical_handle == nullptr) {
+        LOG(ERROR) << "Failed to get physical handle for va (memory must be "
+                      "allocated via ascend_allocate_vmm_memory_direct)";
+        return -1;
+    }
+
+    aclrtMemFabricHandle export_handle = {};
+    ret = aclrtMemExportToShareableHandleV2(
+        physical_handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
+        ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &export_handle);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to export shareable handle, ret=" << ret;
+        return -1;
+    }
+
+    std::string handle_bytes(reinterpret_cast<char*>(&export_handle),
+                             sizeof(export_handle));
+    auto map_ret = invoke_rpc<&RealClient::ascend_shm_internal, void>(
+        dummy_base_addr, shm->size, is_local, handle_bytes, device_id_,
+        client_id_);
+    if (!map_ret.has_value()) {
+        LOG(ERROR) << "Failed to map VMM buffer on real side";
+        return -1;
+    }
+    LOG(INFO) << "Registered memory suc, addr=" << shm->base_addr
+              << ", size=" << shm->size << ", device_id=" << device_id_;
+#endif
+    return 0;
 }
 
 int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
@@ -324,14 +406,24 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
         return -1;
     }
 
+    // Send request type first
+    IpcRequestType type = IPC_SHM_REGISTER;
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+        LOG(ERROR) << "Failed to send IPC request type: " << strerror(errno);
+        close(sock_fd);
+        return -1;
+    }
+
     ShmRegisterRequest req;
     req.client_id_first = client_id_.first;
     req.client_id_second = client_id_.second;
     req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm->base_addr);
     req.shm_size = shm->size;
+    req.device_id = globalConfig().ascend_agent_mode ? device_id_
+                                                     : kInvalidPhysicalDeviceId;
     req.is_local_buffer = is_local;
 
-    if (send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
+    if (ipc_send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
         close(sock_fd);
         return -1;
@@ -360,6 +452,12 @@ int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
+    const char* use_fabric_mem_env =
+        std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+    if (use_fabric_mem_env && std::string(use_fabric_mem_env) == "1") {
+        globalConfig().ascend_use_fabric_mem = true;
+    }
+
     void* base_addr = nullptr;
     ErrorCode err = connect(server_address);
     if (err != ErrorCode::OK) {
@@ -367,41 +465,85 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
         return -1;
     }
 
-    shm_helper_ = ShmHelper::getInstance();
-    try {
-        base_addr = shm_helper_->allocate(local_buffer_size);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
+#ifdef USE_ASCEND_DIRECT
+    // just set to true when USE_ASCEND_DIRECT
+    globalConfig().ascend_agent_mode = true;
+    int32_t logic_dev = 0;
+    auto acl_ret = aclrtGetDevice(&logic_dev);
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get current device, ret=" << acl_ret;
         return -1;
     }
+    acl_ret = aclrtGetPhyDevIdByLogicDevId(logic_dev, &device_id_);
+    if (acl_ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get physical device id, ret=" << acl_ret
+                   << ", errmsg: " << aclGetRecentErrMsg();
+        return -1;
+    }
+    LOG(INFO) << "Setup dummy: logic_dev=" << logic_dev
+              << " physical_dev=" << device_id_;
+#endif
 
     ipc_socket_path_ = ipc_socket_path;
+    shm_helper_ = ShmHelper::getInstance();
+    if (local_buffer_size > 0) {
+        try {
+            base_addr = shm_helper_->allocate(local_buffer_size);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
+            return -1;
+        }
+        // Attempt registration for the primary segment
+        auto local_buffer_shm = shm_helper_->get_shm(base_addr);
+        if (!local_buffer_shm) {
+            LOG(ERROR) << "Failed to get shm segment for base address";
+            shm_helper_->free(base_addr);
+            return -1;
+        }
 
-    // Attempt registration for the primary segment
-    auto local_buffer_shm = shm_helper_->get_shm(base_addr);
-    if (!local_buffer_shm) {
-        LOG(ERROR) << "Failed to get shm segment for base address";
-        shm_helper_->free(base_addr);
-        return -1;
-    }
+        if (globalConfig().ascend_agent_mode) {
+            if (register_ascend_shm(local_buffer_shm.get(), true) != 0) {
+                LOG(ERROR) << "Failed to register SHM via IPC";
+                // Register failed, cleanup
+                shm_helper_->free(local_buffer_shm->base_addr);
+                return -1;
+            }
+        } else {
+            if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
+                LOG(ERROR) << "Failed to register SHM via IPC";
+                // Register failed, cleanup
+                shm_helper_->free(local_buffer_shm->base_addr);
+                return -1;
+            }
+        }
+        local_buffer_shm->registered = true;
+        local_buffer_shm->is_local = true;
 
-    if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
-        LOG(ERROR) << "Failed to register SHM via IPC";
-        // Register failed, cleanup
-        shm_helper_->free(local_buffer_shm->base_addr);
-        return -1;
+        // Best-effort: request hot cache shm from real client
+        if (request_hot_cache_fd() != 0) {
+            LOG(INFO)
+                << "Hot cache shm not available (real client may not have it)";
+        }
     }
-    local_buffer_shm->registered = true;
-    local_buffer_shm->is_local = true;
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
-
     return 0;
 }
 
 int DummyClient::tearDownAll() {
     unregister_shm();
+
+    // Cleanup hot cache shm mapping
+    if (hot_cache_base_) {
+        munmap(hot_cache_base_, hot_cache_size_);
+        hot_cache_base_ = nullptr;
+        hot_cache_size_ = 0;
+    }
+    if (hot_cache_fd_ >= 0) {
+        close(hot_cache_fd_);
+        hot_cache_fd_ = -1;
+    }
 
     if (ping_running_) {
         ping_running_ = false;
@@ -409,13 +551,95 @@ int DummyClient::tearDownAll() {
             ping_thread_.join();
         }
     }
+    connected_.store(false);
+    last_ping_healthy_.store(false);
+#if defined(USE_ASCEND_DIRECT)
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.clear();
+    }
+#endif
     return 0;
 }
 
 int64_t DummyClient::unregister_shm() {
+    LOG(INFO) << "[unregister_shm] client_id=" << client_id_;
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        return to_py_ret(
+            invoke_rpc<&RealClient::ascend_unmap_shm_internal, void>(
+                client_id_));
+    }
+#endif
     return to_py_ret(
         invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
+
+#if defined(USE_ASCEND_DIRECT)
+int DummyClient::register_device_buffer_for_reconnect(void* buffer,
+                                                      size_t size) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        auto it = registered_device_buffers_.find(buffer_addr);
+        if (it != registered_device_buffers_.end() && it->second != size) {
+            LOG(ERROR) << "Device buffer size mismatch for tracked buffer, "
+                       << "buffer=" << buffer << ", size=" << size
+                       << ", tracked_size=" << it->second;
+            return -1;
+        }
+    }
+
+    ShmHelper::ShmSegment shm{};
+    shm.base_addr = buffer;
+    shm.size = size;
+    if (register_ascend_shm(&shm, false) != 0) {
+        LOG(ERROR) << "Failed to register device buffer, buffer=" << buffer
+                   << ", size=" << size;
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_[buffer_addr] = size;
+    }
+    return 0;
+}
+
+int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
+    const auto buffer_addr = reinterpret_cast<uint64_t>(buffer);
+    {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        if (registered_device_buffers_.find(buffer_addr) ==
+            registered_device_buffers_.end()) {
+            LOG(ERROR) << "Device buffer is not registered with RealClient";
+            return -1;
+        }
+    }
+
+    auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
+        buffer_addr, client_id_);
+    if (ret.has_value()) {
+        std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+        registered_device_buffers_.erase(buffer_addr);
+    }
+    return to_py_ret(ret);
+}
+
+std::vector<ShmHelper::ShmSegment> DummyClient::get_registered_device_buffers()
+    const {
+    std::vector<ShmHelper::ShmSegment> device_buffers;
+    std::lock_guard<std::mutex> lock(registered_device_buffers_mutex_);
+    device_buffers.reserve(registered_device_buffers_.size());
+    for (const auto& [buffer_addr, size] : registered_device_buffers_) {
+        ShmHelper::ShmSegment shm{};
+        shm.base_addr = reinterpret_cast<void*>(buffer_addr);
+        shm.size = size;
+        device_buffers.push_back(std::move(shm));
+    }
+    return device_buffers;
+}
+#endif
 
 // Dummy only register buffer within the shared memory region
 int DummyClient::register_buffer(void* buffer, size_t size) {
@@ -423,6 +647,31 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
     }
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to get pointer attributes, ret=" << acl_ret;
+            return -1;
+        }
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return register_device_buffer_for_reconnect(buffer, size);
+        }
+        if (globalConfig().ascend_use_fabric_mem) {
+            auto shm = std::make_shared<ShmHelper::ShmSegment>();
+            shm->base_addr = buffer;
+            shm->size = size;
+            if (register_ascend_shm(shm.get(), false) != 0) {
+                LOG(ERROR) << "Failed to register buffer, buffer=" << buffer
+                           << ", size=" << size;
+                return -1;
+            }
+            return 0;
+        }
+        // non-Fabric Host: same rules as shm
+    }
+#endif
     // Find which shm this buffer belongs to
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
@@ -461,6 +710,17 @@ int DummyClient::unregister_buffer(void* buffer) {
         return -1;
     }
 
+#if defined(USE_ASCEND_DIRECT)
+    if (globalConfig().ascend_agent_mode) {
+        aclrtPtrAttributes attributes{};
+        auto acl_ret = aclrtPointerGetAttributes(buffer, &attributes);
+        if (acl_ret == ACL_ERROR_NONE &&
+            attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            return unregister_device_buffer_for_reconnect(buffer);
+        }
+    }
+#endif
+
     auto shm = shm_helper_->get_shm(buffer);
     if (!shm) {
         LOG(ERROR) << "Buffer is not in any registered shared memory";
@@ -495,22 +755,81 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_dummy_helper, void>(
-        key, value, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_dummy_helper>(
+        TransferOperationKind::kWrite, "put", value.size_bytes(), false, key,
+        value, config, client_id_);
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
-        keys, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper>(
+        TransferOperationKind::kWrite, "put_batch", sum_value_sizes(values),
+        true, keys, values, config, client_id_);
 }
 
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
-        key, values, config, client_id_));
+    return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper>(
+        TransferOperationKind::kWrite, "put_parts", sum_value_sizes(values),
+        false, key, values, config, client_id_);
+}
+
+int DummyClient::upsert(const std::string& key, std::span<const char> value,
+                        const ReplicateConfig& config) {
+    return invoke_observed_void_rpc<&RealClient::upsert_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert", value.size_bytes(), false, key,
+        value, config, client_id_);
+}
+
+int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
+                             const ReplicateConfig& config) {
+    uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
+    return invoke_observed_void_rpc<&RealClient::upsert_from_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_from", size, false, key,
+        dummy_addr, size, config, client_id_);
+}
+
+std::vector<int> DummyClient::batch_upsert_from(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
+    const std::vector<size_t>& sizes, const ReplicateConfig& config) {
+    std::vector<uint64_t> buffers;
+    for (auto ptr : buffer_ptrs) {
+        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
+    }
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_upsert_from_dummy_helper, void>(
+            keys.size(), keys, buffers, sizes, config, client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    const size_t successful_bytes = sum_successful_sizes(results, sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_upsert_from", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+int DummyClient::upsert_parts(const std::string& key,
+                              std::vector<std::span<const char>> values,
+                              const ReplicateConfig& config) {
+    return invoke_observed_void_rpc<&RealClient::upsert_parts_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_parts", sum_value_sizes(values),
+        false, key, values, config, client_id_);
+}
+
+int DummyClient::upsert_batch(const std::vector<std::string>& keys,
+                              const std::vector<std::span<const char>>& values,
+                              const ReplicateConfig& config) {
+    return invoke_observed_void_rpc<&RealClient::upsert_batch_dummy_helper>(
+        TransferOperationKind::kWrite, "upsert_batch", sum_value_sizes(values),
+        true, keys, values, config, client_id_);
 }
 
 int DummyClient::remove(const std::string& key, bool force) {
@@ -526,6 +845,19 @@ long DummyClient::removeByRegex(const std::string& str, bool force) {
 long DummyClient::removeAll(bool force) {
     return to_py_ret(
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
+}
+
+std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
+                                          bool force) {
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batchRemove_internal, void>(keys.size(),
+                                                                  keys, force);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    return results;
 }
 
 int DummyClient::isExist(const std::string& key) {
@@ -563,31 +895,174 @@ int64_t DummyClient::getSize(const std::string& key) {
 }
 
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
-    // Dummy client does not use BufferHandle, so we return nullptr
-    return nullptr;
-}
+    const auto start_time = std::chrono::steady_clock::now();
+    // Try hot cache path if shm is mapped
+    if (hot_cache_base_) {
+        auto result = invoke_rpc<&RealClient::acquire_hot_cache,
+                                 std::tuple<uint64_t, size_t>>(key);
+        if (result.has_value()) {
+            auto [offset, size] = result.value();
+            if (offset + size > hot_cache_size_) {
+                LOG(ERROR) << "Hot cache offset out of bounds: offset="
+                           << offset << " size=" << size
+                           << " cache_size=" << hot_cache_size_;
+                return nullptr;
+            }
+            void* local_ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
+            std::string key_copy = key;
+            auto release = [this, key_copy]() {
+                (void)invoke_rpc<&RealClient::release_hot_cache, void>(
+                    key_copy);
+            };
+            ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer",
+                                  size, elapsed_us_since(start_time), false);
+            return std::make_shared<BufferHandle>(local_ptr, size,
+                                                  std::move(release));
+        }
+    }
 
-std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
-    const std::string& key) {
-    auto result = invoke_rpc<&RealClient::get_buffer_info_dummy_helper,
+    // Fallback: allocator-backed buffer via shm
+    auto result = invoke_rpc<&RealClient::acquire_buffer_dummy,
                              std::tuple<uint64_t, size_t>>(key, client_id_);
     if (!result.has_value()) {
-        LOG(ERROR) << "Get buffer failed: " << toString(result.error());
-        return std::make_tuple(0, 0);
+        return nullptr;
     }
-    return result.value();
+
+    auto [dummy_addr, size] = result.value();
+    void* local_ptr = reinterpret_cast<void*>(dummy_addr);
+    auto release = [this, dummy_addr]() {
+        (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(dummy_addr,
+                                                                  client_id_);
+    };
+    ObserveTransferMetric(TransferOperationKind::kRead, "get_buffer", size,
+                          elapsed_us_since(start_time), false);
+    return std::make_shared<BufferHandle>(local_ptr, size, std::move(release));
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     const std::vector<std::string>& keys) {
-    // TODO: implement this function
-    return std::vector<std::shared_ptr<BufferHandle>>();
+    const auto start_time = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<BufferHandle>> results(keys.size(), nullptr);
+    if (keys.empty()) return results;
+
+    // Phase 1: batch hot cache acquire
+    std::vector<size_t> miss_indices;
+    if (hot_cache_base_) {
+        auto hot_results =
+            invoke_batch_rpc<&RealClient::batch_acquire_hot_cache,
+                             std::tuple<uint64_t, size_t>>(keys.size(), keys);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (hot_results[i].has_value()) {
+                auto [offset, size] = hot_results[i].value();
+                if (offset + size > hot_cache_size_) {
+                    LOG(ERROR)
+                        << "Hot cache offset out of bounds: offset=" << offset
+                        << " size=" << size
+                        << " cache_size=" << hot_cache_size_;
+                    miss_indices.push_back(i);
+                    continue;
+                }
+                void* ptr = static_cast<uint8_t*>(hot_cache_base_) + offset;
+                auto release = [this, key = keys[i]]() {
+                    (void)invoke_rpc<&RealClient::release_hot_cache, void>(key);
+                };
+                results[i] = std::make_shared<BufferHandle>(ptr, size,
+                                                            std::move(release));
+            } else {
+                miss_indices.push_back(i);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) miss_indices.push_back(i);
+    }
+
+    if (miss_indices.empty()) return results;
+
+    // Phase 2: batch allocator acquire for misses
+    std::vector<std::string> miss_keys;
+    miss_keys.reserve(miss_indices.size());
+    for (size_t idx : miss_indices) {
+        miss_keys.push_back(keys[idx]);
+    }
+
+    auto alloc_results =
+        invoke_batch_rpc<&RealClient::batch_acquire_buffer_dummy,
+                         std::tuple<uint64_t, size_t>>(miss_keys.size(),
+                                                       miss_keys, client_id_);
+
+    for (size_t i = 0; i < miss_indices.size(); ++i) {
+        if (!alloc_results[i].has_value()) continue;
+        auto [dummy_addr, size] = alloc_results[i].value();
+        void* ptr = reinterpret_cast<void*>(dummy_addr);
+        auto release = [this, dummy_addr]() {
+            (void)invoke_rpc<&RealClient::release_buffer_dummy, void>(
+                dummy_addr, client_id_);
+        };
+        results[miss_indices[i]] =
+            std::make_shared<BufferHandle>(ptr, size, std::move(release));
+    }
+
+    size_t total_bytes = 0;
+    for (const auto& result : results) {
+        if (result != nullptr) {
+            total_bytes += result->size();
+        }
+    }
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_buffer",
+                              total_bytes, elapsed_us_since(start_time), true);
+    }
+
+    return results;
 }
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
-    // TODO: implement this function
-    return -1;
+    uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
+                             tl::expected<int64_t, ErrorCode>>(
+        key, buf_addr, 0, 0, size, client_id_);
+    if (!result) {
+        return static_cast<int64_t>(toInt(result.error()));
+    }
+    const int64_t bytes_read = to_py_ret(*result);
+    if (bytes_read >= 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_into",
+                              static_cast<size_t>(bytes_read),
+                              elapsed_us_since(start_time), false);
+    }
+    return bytes_read;
+}
+
+std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes) {
+    std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_rpc<&RealClient::get_into_ranges_shm_helper,
+                   std::vector<std::vector<
+                       std::vector<tl::expected<int64_t, ErrorCode>>>>>(
+            dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
+            all_sizes, device_id_, client_id_);
+
+    if (!internal_results) {
+        LOG(ERROR) << "get_into_ranges RPC failed";
+        return build_ranged_read_error_results(buffers.size(), all_keys,
+                                               all_dst_offsets,
+                                               internal_results.error());
+    }
+    auto results = convert_ranged_read_results(internal_results.value());
+    const size_t total_bytes = sum_positive_ranges(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
+                              total_bytes, elapsed_us_since(start_time), true);
+    }
+    return results;
 }
 
 std::string DummyClient::get_hostname() const {
@@ -598,18 +1073,23 @@ std::string DummyClient::get_hostname() const {
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
-    std::vector<uint64_t> buffers;
-    for (auto ptr : buffer_ptrs) {
-        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
-    }
+    std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
-            keys.size(), keys, buffers, sizes, config, client_id_);
+            keys.size(), keys, buffers, sizes, config, device_id_, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+
+    const size_t successful_bytes = sum_successful_sizes(results, sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite, "batch_put_from",
+                              successful_bytes, elapsed_us_since(start_time),
+                              true);
     }
 
     return results;
@@ -624,18 +1104,22 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
-    std::vector<uint64_t> buffers;
-    for (auto ptr : buffer_ptrs) {
-        buffers.push_back(reinterpret_cast<uint64_t>(ptr));
-    }
+    std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
-            keys.size(), keys, buffers, sizes, client_id_);
+            keys.size(), keys, buffers, sizes, device_id_, client_id_);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
     for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
+    }
+
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_into",
+                              total_bytes, elapsed_us_since(start_time), true);
     }
 
     return results;
@@ -654,9 +1138,26 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    // TODO: implement this function
-    std::vector<int> vec(keys.size(), -1);
-    return vec;
+    std::vector<std::vector<uint64_t>> dummy_nested =
+        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
+                         void>(keys.size(), keys, dummy_nested, all_sizes,
+                               config, device_id_, client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    const size_t successful_bytes =
+        sum_successful_nested_sizes(results, all_sizes);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_put_from_multi_buffers", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
 }
 
 std::vector<int> DummyClient::batch_get_into_multi_buffers(
@@ -664,9 +1165,26 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     bool prefer_alloc_in_same_node) {
-    // TODO: implement this function
-    std::vector<int> vec(keys.size(), -1);
-    return vec;
+    std::vector<std::vector<uint64_t>> dummy_nested =
+        void_ptr_rows_to_u64_nested(all_buffer_ptrs);
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_get_into_multi_buffers_dummy_helper,
+                         int64_t>(keys.size(), keys, dummy_nested, all_sizes,
+                                  prefer_alloc_in_same_node, device_id_,
+                                  client_id_);
+    std::vector<int> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(to_py_ret(result));
+    }
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead,
+                              "batch_get_into_multi_buffers", total_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
 }
 
 std::map<std::string, std::vector<Replica::Descriptor>>
@@ -731,6 +1249,7 @@ void DummyClient::ping_thread_main() {
         if (ping_result.has_value() &&
             ping_result.value().client_status == ClientStatus::OK) {
             ping_fail_count = 0;
+            last_ping_healthy_.store(true);
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;
@@ -738,11 +1257,12 @@ void DummyClient::ping_thread_main() {
 
         // Ping failed
         ping_fail_count++;
+        last_ping_healthy_.store(false);
         LOG(WARNING) << "Ping failed " << ping_fail_count << "/"
                      << max_ping_fail_count;
 
         if (ping_fail_count >= max_ping_fail_count) {
-            connected_ = false;
+            connected_.store(false);
             LOG(ERROR) << "RealClient lost, entering reconnection loop...";
 
             // Reconnection Loop
@@ -752,8 +1272,17 @@ void DummyClient::ping_thread_main() {
                 const auto& shms = shm_helper_->get_shms();
                 for (const auto& shm_ptr : shms) {
                     if (shm_ptr->registered) {
-                        if (register_shm_via_ipc(shm_ptr.get(),
-                                                 shm_ptr->is_local) != 0) {
+                        if (globalConfig().ascend_agent_mode) {
+                            if (register_ascend_shm(shm_ptr.get(),
+                                                    shm_ptr->is_local) != 0) {
+                                LOG(WARNING)
+                                    << "Failed to re-register Ascend shared "
+                                       "memory during reconnection";
+                                all_registered = false;
+                                break;
+                            }
+                        } else if (register_shm_via_ipc(
+                                       shm_ptr.get(), shm_ptr->is_local) != 0) {
                             LOG(WARNING)
                                 << "Failed to re-register shared memory "
                                    "during reconnection";
@@ -762,6 +1291,23 @@ void DummyClient::ping_thread_main() {
                         }
                     }
                 }
+
+#if defined(USE_ASCEND_DIRECT)
+                if (all_registered && globalConfig().ascend_agent_mode) {
+                    auto device_buffers = get_registered_device_buffers();
+                    for (const auto& device_buffer : device_buffers) {
+                        if (register_ascend_shm(&device_buffer, false) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register device buffer "
+                                   "during reconnection, buffer="
+                                << device_buffer.base_addr
+                                << ", size=" << device_buffer.size;
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
+#endif
 
                 if (all_registered) {
                     LOG(INFO)
@@ -772,10 +1318,11 @@ void DummyClient::ping_thread_main() {
                     // if RPC is responsive
                     auto check_rpc =
                         invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
-                    if (check_rpc.has_value()) {
+                    if (check_rpc.has_value() &&
+                        check_rpc.value().client_status == ClientStatus::OK) {
                         LOG(INFO) << "RPC connection restored";
                         ping_fail_count = 0;
-                        connected_ = true;
+                        connected_.store(true);
                         break;  // Exit reconnection loop
                     }
                 }
@@ -790,6 +1337,79 @@ void DummyClient::ping_thread_main() {
                 std::chrono::milliseconds(fail_ping_interval_ms));
         }
     }
+}
+
+int DummyClient::health_check() {
+    if (!ping_running_.load()) return HC_NOT_INITIALIZED;
+    if (!connected_.load()) return HC_MASTER_UNREACHABLE;
+    if (!last_ping_healthy_.load()) return HC_MASTER_UNREACHABLE;
+    return HC_HEALTHY;
+}
+
+int DummyClient::request_hot_cache_fd() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, ipc_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + ipc_socket_path_.length();
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+        close(sock_fd);
+        return -1;
+    }
+
+    // Send request type
+    IpcRequestType type = IPC_SHM_FD_REQUEST;
+    if (::send(sock_fd, &type, sizeof(type), 0) < 0) {
+        LOG(ERROR) << "Failed to send IPC request type";
+        close(sock_fd);
+        return -1;
+    }
+
+    // Send payload
+    ShmFdRequest req;
+    req.client_id_first = client_id_.first;
+    req.client_id_second = client_id_.second;
+    req.segment_type = SHM_SEG_HOT_CACHE;
+    if (::send(sock_fd, &req, sizeof(req), 0) < 0) {
+        LOG(ERROR) << "Failed to send ShmFdRequest";
+        close(sock_fd);
+        return -1;
+    }
+
+    // Receive fd + response
+    ShmFdResponse resp;
+    int fd = ipc_recv_fd(sock_fd, &resp, sizeof(resp));
+    close(sock_fd);
+
+    if (fd < 0 || resp.status != 0) {
+        LOG(ERROR) << "Failed to receive hot cache fd, status=" << resp.status;
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+
+    // mmap the received fd
+    void* base = mmap(nullptr, resp.shm_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        LOG(ERROR) << "Failed to mmap hot cache shm: " << strerror(errno);
+        close(fd);
+        return -1;
+    }
+
+    hot_cache_fd_ = fd;
+    hot_cache_base_ = base;
+    hot_cache_size_ = resp.shm_size;
+    LOG(INFO) << "Hot cache shm mapped at " << base
+              << ", size=" << resp.shm_size;
+    return 0;
 }
 
 }  // namespace mooncake

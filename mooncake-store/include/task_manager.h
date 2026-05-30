@@ -75,6 +75,7 @@ struct Task {
 
     std::string message;
     UUID assigned_client;
+    uint32_t max_retry_attempts;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -92,9 +93,10 @@ struct Task {
 
 struct ReplicaCopyPayload {
     std::string key;
+    std::string source;
     std::vector<std::string> targets;
 };
-YLT_REFL(ReplicaCopyPayload, key, targets);
+YLT_REFL(ReplicaCopyPayload, key, source, targets);
 
 struct ReplicaMovePayload {
     std::string key;
@@ -137,6 +139,15 @@ class ScopedTaskReadAccess {
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
+    using task_iterator =
+        std::unordered_map<UUID, Task, boost::hash<UUID>>::const_iterator;
+
+    task_iterator begin() const;
+
+    task_iterator end() const;
+
+    size_t size() const;
+
    private:
     const ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -163,6 +174,10 @@ class ScopedTaskWriteAccess {
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
 
+    void restore_task(Task&& task);
+
+    void clear_all();
+
     void prune_finished_tasks();
 
     void prune_expired_tasks();
@@ -186,7 +201,8 @@ class ClientTaskManager {
           max_total_pending_tasks_(config.max_total_pending_tasks),
           max_total_processing_tasks_(config.max_total_processing_tasks),
           pending_task_timeout_sec_(config.pending_task_timeout_sec),
-          processing_task_timeout_sec_(config.processing_task_timeout_sec) {}
+          processing_task_timeout_sec_(config.processing_task_timeout_sec),
+          max_retry_attempts_(config.max_retry_attempts) {}
 
     ~ClientTaskManager() = default;
 
@@ -208,6 +224,7 @@ class ClientTaskManager {
     // 0 = no timeout
     uint64_t pending_task_timeout_sec_;
     uint64_t processing_task_timeout_sec_;
+    uint32_t max_retry_attempts_;
 
     size_t total_pending_tasks_ GUARDED_BY(mutex_) = 0;
     size_t total_processing_tasks_ GUARDED_BY(mutex_) = 0;
@@ -230,5 +247,24 @@ class ClientTaskManager {
     // Tracks the order of finished tasks (Oldest -> Newest)
     // Used to implement LRU eviction for completed tasks
     std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
+};
+
+class TaskManagerSerializer {
+    static constexpr size_t kTaskSerializedFields = 8;
+    static constexpr size_t kMaxDecompressedSize = 1024 * 1024 * 1024;  // 1 GB
+
+   public:
+    explicit TaskManagerSerializer(ClientTaskManager* task_manager)
+        : task_manager_(task_manager) {}
+
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+
+    tl::expected<void, SerializationError> Deserialize(
+        const std::vector<uint8_t>& data);
+
+    void Reset();
+
+   private:
+    ClientTaskManager* task_manager_;
 };
 }  // namespace mooncake

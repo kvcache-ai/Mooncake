@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -652,6 +654,82 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     }
 }
 
+TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
+    auto find_group_id_on_different_shard = [](const std::string& key) {
+        static constexpr size_t kMetadataShardCountForTest = 1024;
+        const size_t key_shard =
+            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+        for (int i = 0; i < 10000; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (std::hash<std::string>{}(group_id) %
+                    kMetadataShardCountForTest !=
+                key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_fallback_group";
+    };
+
+    const std::vector<std::string> keys = {
+        "client_batch_grouped_a",
+        "client_batch_ungrouped",
+        "client_batch_grouped_b",
+    };
+    const std::vector<std::string> values = {
+        "grouped-value-a",
+        "ungrouped-value",
+        "grouped-value-b",
+    };
+
+    std::vector<void*> source_buffers;
+    std::vector<std::vector<Slice>> batched_slices;
+    source_buffers.reserve(values.size());
+    batched_slices.reserve(values.size());
+    for (const auto& value : values) {
+        void* buffer = client_buffer_allocator_->allocate(value.size());
+        memcpy(buffer, value.data(), value.size());
+        source_buffers.push_back(buffer);
+        batched_slices.push_back({Slice{buffer, value.size()}});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids =
+        std::vector<std::string>{find_group_id_on_different_shard(keys[0]), "",
+                                 find_group_id_on_different_shard(keys[2])};
+
+    auto put_results = test_client_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(put_results.size(), keys.size());
+    for (const auto& result : put_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchPut failed: " << toString(result.error());
+    }
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        client_buffer_allocator_->deallocate(source_buffers[i],
+                                             values[i].size());
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        void* target_buffer =
+            client_buffer_allocator_->allocate(values[i].size());
+        std::vector<Slice> slices{Slice{target_buffer, values[i].size()}};
+        auto get_result = test_client_->Get(keys[i], slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get failed: " << toString(get_result.error());
+        EXPECT_EQ(slices[0].size, values[i].size());
+        EXPECT_EQ(memcmp(slices[0].ptr, values[i].data(), values[i].size()), 0);
+        client_buffer_allocator_->deallocate(target_buffer, values[i].size());
+    }
+
+    auto remove_results = test_client_->BatchRemove(keys, /*force=*/true);
+    ASSERT_EQ(remove_results.size(), keys.size());
+    for (const auto& result : remove_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchRemove failed: " << toString(result.error());
+    }
+}
+
 // Test batch IsExist operations through the client
 TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
     int batch_size = 50;
@@ -995,6 +1073,776 @@ TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
     // Non-existent keys should not be in results (silently skipped)
     EXPECT_TRUE(non_existent_result.value().empty())
         << "Non-existent keys should return empty results";
+}
+
+// Helper: extract transport endpoints from Query() result
+static std::unordered_set<std::string> ExtractReplicaEndpoints(
+    const decltype(std::declval<Client>()
+                       .Query(std::declval<std::string>())
+                       .value())& q) {
+    std::unordered_set<std::string> endpoints;
+    for (const auto& r : q.replicas) {
+        // Memory replicas carry buffer_descriptor.transport_endpoint_
+        endpoints.insert(
+            r.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+    }
+    return endpoints;
+}
+
+// Helper: fill a target segment by placing many objects there until Put fails.
+// Returns keys that were successfully placed on target.
+static std::vector<std::string> FillSegmentUntilFull(
+    const std::shared_ptr<Client>& writer_client, SimpleAllocator* writer_alloc,
+    const std::string& target_segment_name, size_t value_size, int num_keys) {
+    std::vector<std::string> keys;
+    keys.reserve(num_keys);
+
+    std::string payload(value_size, 'X');
+
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    cfg.preferred_segment = target_segment_name;
+
+    for (int i = 0; i < num_keys; ++i) {
+        std::string key =
+            "fill_" + target_segment_name + "_" + std::to_string(i);
+
+        void* buf = writer_alloc->allocate(payload.size());
+        if (!buf) {
+            EXPECT_NE(buf, nullptr);
+            return keys;
+        }
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        writer_client->Put(key, slices, cfg);
+        writer_alloc->deallocate(buf, payload.size());
+
+        keys.push_back(std::move(key));
+    }
+    return keys;
+}
+
+// Helper: poll QueryTask until SUCCESS/FAILED or timeout.
+static TaskStatus WaitTaskTerminalStatus(const std::shared_ptr<Client>& client,
+                                         const UUID& task_id,
+                                         std::chrono::milliseconds timeout,
+                                         std::chrono::milliseconds interval) {
+    const auto start = std::chrono::steady_clock::now();
+    TaskStatus last = TaskStatus::PROCESSING;
+
+    while (std::chrono::steady_clock::now() - start < timeout) {
+        auto q = client->QueryTask(task_id);
+        EXPECT_TRUE(q.has_value())
+            << "QueryTask failed: " << toString(q.error());
+        last = q.value().status;
+
+        if (last == TaskStatus::SUCCESS || last == TaskStatus::FAILED)
+            return last;
+        std::this_thread::sleep_for(interval);
+    }
+    return last;
+}
+
+TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
+    // Create two extra clients:
+    // - target_small: small segment to force allocation failure
+    // - target_big: normal segment for copy/move verification
+    const std::string target_small_name = "localhost:17814";
+    const std::string target_big_name = "localhost:17815";
+
+    auto target_small = CreateClient(target_small_name);
+    ASSERT_TRUE(target_small != nullptr);
+
+    auto target_big = CreateClient(target_big_name);
+    ASSERT_TRUE(target_big != nullptr);
+
+    // Mount segments for the extra clients
+    constexpr size_t kSegAlign = 16 * 1024 * 1024;  // 16MB alignment
+    const size_t kSmallSeg = kSegAlign;             // 16MB
+    const size_t kBigSeg = 8 * kSegAlign;           // 128MB
+
+    void* small_seg_ptr = allocate_buffer_allocator_memory(kSmallSeg);
+    ASSERT_NE(small_seg_ptr, nullptr);
+    auto m1 = target_small->MountSegment(small_seg_ptr, kSmallSeg);
+    ASSERT_TRUE(m1.has_value())
+        << "MountSegment(small) failed: " << toString(m1.error());
+
+    void* big_seg_ptr = allocate_buffer_allocator_memory(kBigSeg);
+    ASSERT_NE(big_seg_ptr, nullptr);
+    auto m2 = target_big->MountSegment(big_seg_ptr, kBigSeg);
+    ASSERT_TRUE(m2.has_value())
+        << "MountSegment(big) failed: " << toString(m2.error());
+
+    // --- Phase A: Fill small target (segment full) ---
+    const size_t kFillValueSize = 512 * 1024;  // 512KB
+    auto fill_keys = FillSegmentUntilFull(
+        test_client_, client_buffer_allocator_.get(), target_small_name,
+        kFillValueSize, /*num_keys=*/50);
+
+    ASSERT_FALSE(fill_keys.empty())
+        << "Failed to fill anything into target_small; test setup invalid";
+
+    // --- Phase B: COPY retry should succeed after freeing space ---
+    {
+        const std::string source_key = "retry_key_success_cpp";
+        std::string payload(kFillValueSize, 'A');
+
+        // Put source object onto the source segment (test_client_ segment).
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";  // test_client_ name
+
+        void* buf = client_buffer_allocator_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+        auto put_res = test_client_->Put(source_key, slices, cfg);
+        client_buffer_allocator_->deallocate(buf, payload.size());
+        ASSERT_TRUE(put_res.has_value())
+            << "Put(source) failed: " << toString(put_res.error());
+
+        // Start COPY task to the full small target.
+        auto copy_task =
+            test_client_->CreateCopyTask(source_key, {target_small_name});
+        ASSERT_TRUE(copy_task.has_value())
+            << "CreateCopyTask failed: " << toString(copy_task.error());
+        const auto copy_task_id = copy_task.value();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            500));  // Give some time for initial attempt
+
+        // Free space by removing one of the fill keys.
+        test_client_->Remove(fill_keys.front());
+
+        // Poll task: should succeed after space is freed.
+        auto status =
+            WaitTaskTerminalStatus(test_client_, copy_task_id,
+                                   /*timeout=*/std::chrono::seconds(30),
+                                   /*interval=*/std::chrono::milliseconds(200));
+
+        ASSERT_EQ(status, TaskStatus::SUCCESS)
+            << "COPY task did not succeed after freeing space";
+
+        // Verify replica now exists on target_small (by endpoint)
+        auto q = test_client_->Query(source_key);
+        ASSERT_TRUE(q.has_value()) << "Query failed: " << toString(q.error());
+
+        auto endpoints = ExtractReplicaEndpoints(q.value());
+        EXPECT_TRUE(endpoints.contains(target_small->GetTransportEndpoint()))
+            << "Expected a replica on target_small endpoint";
+    }
+
+    // --- Phase C: COPY retry should fail if we do NOT free space ---
+    {
+        const std::string source_key = "retry_key_fail_cpp";
+        std::string payload(kFillValueSize, 'B');
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";
+
+        void* buf = client_buffer_allocator_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+        auto put_res = test_client_->Put(source_key, slices, cfg);
+        client_buffer_allocator_->deallocate(buf, payload.size());
+        ASSERT_TRUE(put_res.has_value())
+            << "Put(source) failed: " << toString(put_res.error());
+
+        auto copy_task =
+            test_client_->CreateCopyTask(source_key, {target_small_name});
+        ASSERT_TRUE(copy_task.has_value())
+            << "CreateCopyTask failed: " << toString(copy_task.error());
+        const auto copy_task_id = copy_task.value();
+
+        // Do NOT free space; wait for retries to exhaust.
+        auto status =
+            WaitTaskTerminalStatus(test_client_, copy_task_id,
+                                   /*timeout=*/std::chrono::seconds(60),
+                                   /*interval=*/std::chrono::milliseconds(300));
+
+        ASSERT_EQ(status, TaskStatus::FAILED)
+            << "COPY task unexpectedly succeeded or did not fail in time";
+    }
+
+    // --- Phase D: Basic multi-client COPY and MOVE---
+    {
+        const int kNumKeys = 10;
+        std::vector<std::string> keys;
+        keys.reserve(kNumKeys);
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        cfg.preferred_segment = "localhost:17813";
+
+        // Put keys on source segment
+        for (int i = 0; i < kNumKeys; ++i) {
+            std::string key = "cm_key_" + std::to_string(i);
+            std::string payload(4 * 1024, static_cast<char>('a' + (i % 26)));
+
+            void* buf = client_buffer_allocator_->allocate(payload.size());
+            ASSERT_NE(buf, nullptr);
+            std::memcpy(buf, payload.data(), payload.size());
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{buf, payload.size()});
+
+            auto r = test_client_->Put(key, slices, cfg);
+            client_buffer_allocator_->deallocate(buf, payload.size());
+            ASSERT_TRUE(r.has_value()) << "Put failed: " << toString(r.error());
+
+            keys.push_back(std::move(key));
+        }
+
+        // COPY all keys to target_big
+        std::vector<UUID> copy_task_ids;
+
+        copy_task_ids.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto t = test_client_->CreateCopyTask(key, {target_big_name});
+            ASSERT_TRUE(t.has_value())
+                << "CreateCopyTask failed: " << toString(t.error());
+            copy_task_ids.push_back(t.value());
+        }
+
+        for (const auto& tid : copy_task_ids) {
+            auto status = WaitTaskTerminalStatus(
+                test_client_, tid,
+                /*timeout=*/std::chrono::seconds(30),
+                /*interval=*/std::chrono::milliseconds(200));
+            ASSERT_EQ(status, TaskStatus::SUCCESS) << "COPY did not succeed";
+        }
+
+        // MOVE first 5 keys from source -> target_big
+        std::vector<UUID> move_task_ids;
+
+        for (int i = 0; i < 5; ++i) {
+            auto t = test_client_->CreateMoveTask(keys[i], "localhost:17813",
+                                                  target_big_name);
+            ASSERT_TRUE(t.has_value())
+                << "CreateMoveTask failed: " << toString(t.error());
+            move_task_ids.push_back(t.value());
+        }
+
+        for (const auto& tid : move_task_ids) {
+            auto status = WaitTaskTerminalStatus(
+                test_client_, tid,
+                /*timeout=*/std::chrono::seconds(30),
+                /*interval=*/std::chrono::milliseconds(200));
+            ASSERT_EQ(status, TaskStatus::SUCCESS) << "MOVE did not succeed";
+        }
+
+        // Verify moved keys are on target_big and (ideally) not on source
+        // endpoint
+        const auto source_ep = test_client_->GetTransportEndpoint();
+        const auto target_ep = target_big->GetTransportEndpoint();
+
+        for (int i = 0; i < 5; ++i) {
+            auto q = test_client_->Query(keys[i]);
+            ASSERT_TRUE(q.has_value())
+                << "Query failed: " << toString(q.error());
+            auto eps = ExtractReplicaEndpoints(q.value());
+
+            EXPECT_TRUE(eps.contains(target_ep))
+                << "Moved key missing on target_big";
+            EXPECT_FALSE(eps.contains(source_ep))
+                << "Moved key still present on source";
+        }
+    }
+
+    // Unmount and free extra segments
+    auto u1 = target_small->UnmountSegment(small_seg_ptr, kSmallSeg);
+    EXPECT_TRUE(u1.has_value()) << "UnmountSegment(small) failed";
+    auto u2 = target_big->UnmountSegment(big_seg_ptr, kBigSeg);
+    EXPECT_TRUE(u2.has_value()) << "UnmountSegment(big) failed";
+
+    std::free(small_seg_ptr);
+    std::free(big_seg_ptr);
+}
+
+// ---------------------------------------------------------------------------
+// Eviction notification integration test
+// Uses a separate InProcMaster with root_fs_dir and small quota_bytes so that
+// StorageBackend triggers FIFO eviction after a few Puts. Verifies that the
+// evicted key's DISK replica is removed from master metadata.
+// ---------------------------------------------------------------------------
+class EvictionNotificationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // Create a temporary directory for storage
+        tmp_dir_ = std::filesystem::temp_directory_path() /
+                   ("mc_evict_test_" + std::to_string(::getpid()));
+        std::filesystem::create_directories(tmp_dir_);
+
+        // Start master with root_fs_dir pointing to our temp dir and small
+        // quota. The client will discover fsdir = root_fs_dir/cluster_id and
+        // initialise a StorageBackend with the given quota.
+        auto config = InProcMasterConfigBuilder()
+                          .set_root_fs_dir(tmp_dir_.string())
+                          .set_enable_disk_eviction(true)
+                          .set_quota_bytes(kQuotaBytes)
+                          .build();
+        ASSERT_TRUE(master_.Start(config));
+        master_address_ = master_.master_address();
+    }
+
+    void TearDown() override {
+        client_.reset();
+        master_.Stop();
+        std::error_code ec;
+        std::filesystem::remove_all(tmp_dir_, ec);
+    }
+
+    void CreateClientAndMount() {
+        auto client_opt = Client::Create("localhost:17820",  // unique hostname
+                                         "P2PHANDSHAKE", FLAGS_protocol,
+                                         std::nullopt, master_address_);
+        ASSERT_TRUE(client_opt.has_value()) << "Failed to create client";
+        client_ = client_opt.value();
+
+        // Mount segment so that PutStart can allocate memory replicas
+        constexpr size_t kSegSize = 64 * 1024 * 1024;  // 64MB
+        seg_ptr_ = allocate_buffer_allocator_memory(kSegSize);
+        ASSERT_NE(seg_ptr_, nullptr);
+        seg_size_ = kSegSize;
+        auto mount = client_->MountSegment(seg_ptr_, seg_size_, FLAGS_protocol);
+        ASSERT_TRUE(mount.has_value())
+            << "MountSegment failed: " << toString(mount.error());
+
+        // Register local memory for client-side buffers
+        alloc_ = std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+        auto reg = client_->RegisterLocalMemory(
+            alloc_->getBase(), 16 * 1024 * 1024, "cpu:0", false, false);
+        ASSERT_TRUE(reg.has_value())
+            << "RegisterLocalMemory failed: " << toString(reg.error());
+    }
+
+    // Helper: check if a key has a DISK replica in master
+    bool HasDiskReplica(const std::string& key) {
+        auto q = client_->Query(key);
+        if (!q.has_value()) return false;
+        for (const auto& r : q.value().replicas) {
+            if (r.is_disk_replica()) return true;
+        }
+        return false;
+    }
+
+    // Helper: wait until a key has a DISK replica (async PutToLocalFile)
+    bool WaitForDiskReplica(const std::string& key,
+                            std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Helper: wait until a key no longer has a DISK replica
+    bool WaitForNoDiskReplica(const std::string& key,
+                              std::chrono::milliseconds timeout) {
+        auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < timeout) {
+            if (!HasDiskReplica(key)) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+
+    // Quota: 3KB so that 3 × 1KB objects fit, and the 4th triggers eviction
+    static constexpr uint64_t kQuotaBytes = 3 * 1024;
+    static constexpr size_t kValueSize = 1024;
+
+    InProcMaster master_;
+    std::string master_address_;
+    std::filesystem::path tmp_dir_;
+    std::shared_ptr<Client> client_;
+    std::unique_ptr<SimpleAllocator> alloc_;
+    void* seg_ptr_ = nullptr;
+    size_t seg_size_ = 0;
+};
+
+TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
+    CreateClientAndMount();
+
+    // Put 3 keys — should all fit within quota.
+    // Wait for each DISK replica before putting the next key so that the
+    // FIFO write-queue order is deterministic (write_thread_pool_ has >1
+    // thread, so concurrent writes can reorder).
+    std::vector<std::string> keys;
+    for (int i = 0; i < 3; ++i) {
+        std::string key = "evict_test_key_" + std::to_string(i);
+        std::string payload(kValueSize, 'A' + i);
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+
+        // Wait for this key's DISK replica before proceeding to the next
+        // Put, ensuring deterministic FIFO order in the eviction queue.
+        ASSERT_TRUE(WaitForDiskReplica(key, std::chrono::seconds(10)))
+            << "DISK replica did not appear for key: " << key;
+    }
+
+    // Put a 4th key — triggers eviction of the oldest (key 0) due to FIFO
+    {
+        std::string key = "evict_test_key_3";
+        std::string payload(kValueSize, 'D');
+
+        void* buf = alloc_->allocate(payload.size());
+        ASSERT_NE(buf, nullptr);
+        std::memcpy(buf, payload.data(), payload.size());
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buf, payload.size()});
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto put = client_->Put(key, slices, cfg);
+        ASSERT_TRUE(put.has_value())
+            << "Put(" << key << ") failed: " << toString(put.error());
+        alloc_->deallocate(buf, payload.size());
+        keys.push_back(key);
+    }
+
+    // Wait for the 4th key's DISK replica to appear
+    ASSERT_TRUE(WaitForDiskReplica(keys[3], std::chrono::seconds(10)))
+        << "DISK replica did not appear for eviction-trigger key";
+
+    // The oldest key (key 0) should have had its DISK replica evicted
+    EXPECT_TRUE(WaitForNoDiskReplica(keys[0], std::chrono::seconds(10)))
+        << "Evicted key's DISK replica was not removed from master";
+
+    // Keys 1..3 should still have DISK replicas
+    for (int i = 1; i <= 3; ++i) {
+        EXPECT_TRUE(HasDiskReplica(keys[i]))
+            << "Key " << keys[i] << " should still have a DISK replica";
+    }
+
+    // Clean up: unmount segment
+    auto unmount = client_->UnmountSegment(seg_ptr_, seg_size_);
+    EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
+    std::free(seg_ptr_);
+    seg_ptr_ = nullptr;
+}
+
+// Test Upsert Case A: key does not exist — equivalent to Put
+TEST_F(ClientIntegrationTest, UpsertNewKey) {
+    const std::string test_data = "upsert_new_key_data";
+    const std::string key = "upsert_case_a_key";
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    ASSERT_NE(buffer, nullptr);
+
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Upsert on a non-existent key should succeed (Case A)
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case A) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Verify data through Get
+    buffer = client_buffer_allocator_->allocate(test_data.size());
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case B: key exists, same size — in-place update
+TEST_F(ClientIntegrationTest, UpsertSameSize) {
+    const std::string key = "upsert_case_b_key";
+    const size_t data_size = 64;
+
+    // Initial data: all 'A'
+    std::string initial_data(data_size, 'A');
+    void* buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), data_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, data_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // First Put to create the key
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with same size but different content: all 'B'
+    std::string updated_data(data_size, 'B');
+    buffer = client_buffer_allocator_->allocate(data_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case B) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Verify the data was updated
+    buffer = client_buffer_allocator_->allocate(data_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, data_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), data_size), 0)
+        << "Data should be updated to 'B's after in-place upsert";
+    client_buffer_allocator_->deallocate(buffer, data_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test Upsert Case C: key exists, different size — delete and reallocate
+TEST_F(ClientIntegrationTest, UpsertDifferentSize) {
+    const std::string key = "upsert_case_c_key";
+    const size_t initial_size = 64;
+    const size_t updated_size = 128;
+
+    // Initial data: 64 bytes of 'X'
+    std::string initial_data(initial_size, 'X');
+    void* buffer = client_buffer_allocator_->allocate(initial_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, initial_data.data(), initial_size);
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, initial_size});
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Initial Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, initial_size);
+
+    // Wait for lease to expire so refcnt drops to 0
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Upsert with different (larger) size: 128 bytes of 'Y'
+    std::string updated_data(updated_size, 'Y');
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    ASSERT_NE(buffer, nullptr);
+    memcpy(buffer, updated_data.data(), updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+
+    auto upsert_result = test_client_->Upsert(key, slices, config);
+    ASSERT_TRUE(upsert_result.has_value())
+        << "Upsert (Case C) failed: " << toString(upsert_result.error());
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Verify the data was updated with new size
+    buffer = client_buffer_allocator_->allocate(updated_size);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, updated_size});
+    auto get_result = test_client_->Get(key, slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Get after Upsert failed: " << toString(get_result.error());
+    ASSERT_EQ(slices[0].size, updated_size);
+    ASSERT_EQ(memcmp(slices[0].ptr, updated_data.data(), updated_size), 0)
+        << "Data should be updated to 'Y's with new size";
+    client_buffer_allocator_->deallocate(buffer, updated_size);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    auto remove_result = test_client_->Remove(key);
+    ASSERT_TRUE(remove_result.has_value())
+        << "Remove failed: " << toString(remove_result.error());
+}
+
+// Test BatchUpsert with mixed cases (A + B + C)
+TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
+    const size_t data_size = 64;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Pre-create key_b (for Case B: same size) and key_c (for Case C: diff
+    // size)
+    std::string key_b = "batch_upsert_case_b";
+    std::string key_c = "batch_upsert_case_c";
+
+    // Put key_b: 64 bytes of 'M'
+    {
+        std::string data(data_size, 'M');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_b, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_b failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Put key_c: 64 bytes of 'N'
+    {
+        std::string data(data_size, 'N');
+        void* buf = client_buffer_allocator_->allocate(data_size);
+        memcpy(buf, data.data(), data_size);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, data_size});
+        auto r = test_client_->Put(key_c, sl, config);
+        ASSERT_TRUE(r.has_value())
+            << "Put key_c failed: " << toString(r.error());
+        client_buffer_allocator_->deallocate(buf, data_size);
+    }
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+
+    // Now BatchUpsert:
+    //   key_a (new)            → Case A, 64 bytes of 'P'
+    //   key_b (exists, same)   → Case B, 64 bytes of 'Q'
+    //   key_c (exists, larger) → Case C, 128 bytes of 'R'
+    std::string key_a = "batch_upsert_case_a";
+    std::vector<std::string> keys = {key_a, key_b, key_c};
+
+    const size_t size_a = data_size;
+    const size_t size_b = data_size;
+    const size_t size_c = data_size * 2;
+    std::string data_a(size_a, 'P');
+    std::string data_b(size_b, 'Q');
+    std::string data_c(size_c, 'R');
+
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> alloc_ptrs;  // track for cleanup
+
+    auto alloc_and_fill = [&](const std::string& data, size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        EXPECT_NE(buf, nullptr);
+        memcpy(buf, data.data(), sz);
+        alloc_ptrs.push_back(buf);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        batched_slices.push_back(std::move(sl));
+    };
+
+    alloc_and_fill(data_a, size_a);
+    alloc_and_fill(data_b, size_b);
+    alloc_and_fill(data_c, size_c);
+
+    auto batch_results =
+        test_client_->BatchUpsert(keys, batched_slices, config);
+    ASSERT_EQ(batch_results.size(), 3);
+    for (size_t i = 0; i < batch_results.size(); ++i) {
+        ASSERT_TRUE(batch_results[i].has_value())
+            << "BatchUpsert failed for key " << keys[i] << ": "
+            << toString(batch_results[i].error());
+    }
+
+    // Free write buffers
+    client_buffer_allocator_->deallocate(alloc_ptrs[0], size_a);
+    client_buffer_allocator_->deallocate(alloc_ptrs[1], size_b);
+    client_buffer_allocator_->deallocate(alloc_ptrs[2], size_c);
+
+    // Verify each key's data
+    auto verify = [&](const std::string& key, const std::string& expected,
+                      size_t sz) {
+        void* buf = client_buffer_allocator_->allocate(sz);
+        std::vector<Slice> sl;
+        sl.emplace_back(Slice{buf, sz});
+        auto get_result = test_client_->Get(key, sl);
+        EXPECT_TRUE(get_result.has_value())
+            << "Get failed for " << key << ": " << toString(get_result.error());
+        if (get_result.has_value()) {
+            EXPECT_EQ(sl[0].size, sz);
+            EXPECT_EQ(memcmp(sl[0].ptr, expected.data(), sz), 0)
+                << "Data mismatch for " << key;
+        }
+        client_buffer_allocator_->deallocate(buf, sz);
+    };
+
+    verify(key_a, data_a, size_a);
+    verify(key_b, data_b, size_b);
+    verify(key_c, data_c, size_c);
+
+    // Clean up
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_));
+    for (const auto& key : keys) {
+        auto r = test_client_->Remove(key);
+        EXPECT_TRUE(r.has_value())
+            << "Remove failed for " << key << ": " << toString(r.error());
+    }
+}
+
+TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
+    // Allocate a small buffer for this test
+    size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    // Test MountSegmentAndGetId returns a valid UUID
+    auto mount_result = test_client_->MountSegmentAndGetId(
+        test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+    UUID segment_id = mount_result.value();
+    EXPECT_NE(segment_id.first, 0u);
+    EXPECT_NE(segment_id.second, 0u);
+
+    // Test UnmountSegmentById succeeds
+    auto unmount_result = test_client_->UnmountSegmentById(segment_id);
+    EXPECT_TRUE(unmount_result.has_value())
+        << "UnmountSegmentById failed: " << toString(unmount_result.error());
+
+    // Test MountSegment delegates to MountSegmentAndGetId (equivalent behavior)
+    auto mount2 =
+        test_client_->MountSegment(test_buffer, test_size, FLAGS_protocol);
+    EXPECT_TRUE(mount2.has_value())
+        << "MountSegment failed: " << toString(mount2.error());
+
+    // Test UnmountSegment delegates to UnmountSegmentImpl (equivalent behavior)
+    auto unmount2 = test_client_->UnmountSegment(test_buffer, test_size);
+    EXPECT_TRUE(unmount2.has_value())
+        << "UnmountSegment failed: " << toString(unmount2.error());
+
+    free(test_buffer);
 }
 
 }  // namespace testing

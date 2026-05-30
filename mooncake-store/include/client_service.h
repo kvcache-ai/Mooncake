@@ -1,6 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <boost/functional/hash.hpp>
+#include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -12,7 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
-#include "ha_helper.h"
+#include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
@@ -21,6 +24,9 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "count_min_sketch.h"
+#include "local_hot_cache.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
@@ -56,7 +62,9 @@ class QueryResult {
  */
 class Client {
    public:
-    ~Client();
+    virtual ~Client();
+
+    const UUID& getClientId() const { return client_id_; }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -67,8 +75,8 @@ class Client {
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
-     *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
-     *        HA mode)
+     *        address for non-HA mode, or <backend>://connstring for HA mode,
+     *        e.g. etcd://IP:Port;IP:Port;...;IP:Port)
      * @return std::optional containing a shared_ptr to Client if successful,
      * std::nullopt otherwise
      */
@@ -162,6 +170,10 @@ class Client {
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices,
+                                      uint64_t src_offset);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -199,6 +211,28 @@ class Client {
         const ReplicateConfig& config);
 
     /**
+     * @brief Upserts data: inserts if key doesn't exist, updates if it does
+     * @param key Object key
+     * @param slices Vector of data slices to store
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                         std::vector<Slice>& slices,
+                                         const ReplicateConfig& config);
+
+    /**
+     * @brief Batch upsert data with replication
+     * @param keys Object keys
+     * @param batched_slices Vector of vectors of data slices
+     * @param config Replication configuration
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
+
+    /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @param force If true, skip lease and replication task checks
@@ -225,13 +259,34 @@ class Client {
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<ObjectKey>& keys, bool force = false);
+
+    /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     */
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> MountSegment(
-        const void* buffer, size_t size, const std::string& protocol = "tcp");
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
 
     /**
      * @brief Unregisters a memory segment from master
@@ -241,6 +296,23 @@ class Client {
      */
     tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
                                                  size_t size);
+
+    /**
+     * @brief Mounts a memory segment and returns its generated Segment UUID.
+     *        Logic is identical to MountSegment, but returns the segment id.
+     */
+    tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
+        const void* buffer, size_t size, const std::string& protocol = "tcp",
+        const std::string& location = kWildcardLocation);
+
+    /**
+     * @brief Unmounts a segment by its UUID.
+     *        Logic is identical to UnmountSegment, but looks up by id.
+     * @param grace_period_ms 0 = immediate unmount (legacy behavior).
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentById(
+        const UUID& segment_id, uint64_t grace_period_ms = 0,
+        std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -335,6 +407,52 @@ class Client {
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
+    tl::expected<void, ErrorCode> ReportSsdCapacity(
+        int64_t ssd_total_capacity_bytes);
+
+    /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
+     * client. Mirror of OffloadObjectHeartbeat. Returns key->size pairs the
+     * caller (FileStorage) must read from local SSD and stage as MEMORY
+     * replicas via PromotionAllocStart + NotifyPromotionSuccess.
+     */
+    // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
+        std::unordered_map<std::string, int64_t>& promotion_objects);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * L2->L1 promotion. Returns the new replica's descriptor that the caller
+     * writes via Transfer Engine before calling NotifyPromotionSuccess.
+     */
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key);
+
+    /**
+     * @brief Release master-side promotion task after a client-side failure
+     * between PromotionAllocStart and the transfer's completion. Idempotent.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key);
+
+    /**
+     * @brief Write `slices` into the memory replica described by
+     * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
+     * PROCESSING memory replica staged by PromotionAllocStart before calling
+     * NotifyPromotionSuccess.
+     */
+    virtual ErrorCode PromotionWrite(
+        const Replica::Descriptor& memory_descriptor,
+        std::vector<Slice>& slices);
+
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
@@ -350,7 +468,8 @@ class Client {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batch_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batch_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -394,6 +513,15 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    void ObserveTransferOperation(TransferOperationKind kind,
+                                  const std::string& op_name, uint64_t bytes,
+                                  uint64_t latency_us) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveTransferOperation(kind, op_name, bytes,
+                                               latency_us);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -404,21 +532,104 @@ class Client {
         return str;
     }
 
+    SsdMetric* GetSsdMetricPtr() {
+        return metrics_ ? &metrics_->ssd_metric : nullptr;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    /**
+     * @brief Get the endpoint address for segment operations.
+     * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
+     *         For other modes, returns the logical local hostname used for
+     * segment registration.
+     */
+    [[nodiscard]] std::string GetSegmentEndpoint() {
+        return (metadata_connstring_ == P2PHANDSHAKE) ? GetTransportEndpoint()
+                                                      : local_hostname_;
+    }
+
+    // Return sorted NUMA node IDs that have at least one RDMA NIC.
+    [[nodiscard]] std::vector<int> GetNicNumaNodes() const;
+
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 
-   private:
+    std::unordered_set<std::string> GetLocalEndpoints() const {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        std::unordered_set<std::string> endpoints;
+        for (const auto& [segment_id, segment] : mounted_segments_) {
+            endpoints.insert(segment.te_endpoint);
+        }
+        return endpoints;
+    }
+
     /**
-     * @brief Private constructor to enforce creation through Create() method
+     * @brief Check if local hot cache is enabled
+     * @return true if hot cache is enabled, false otherwise
+     */
+    bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+
+    /**
+     * @brief Get the local hot cache instance.
+     * @return shared_ptr to LocalHotCache, or nullptr if disabled.
+     */
+    std::shared_ptr<LocalHotCache> GetHotCache() const { return hot_cache_; }
+
+    /**
+     * @brief Get the number of cache blocks in local hot cache
+     * @return Number of cache blocks if hot cache is enabled, 0 otherwise
+     */
+    size_t GetLocalHotCacheBlockCount() const {
+        if (hot_cache_ != nullptr) {
+            return hot_cache_->GetCacheSize();
+        }
+        return 0;
+    }
+
+    bool is_ping_healthy() const { return last_ping_success_.load(); }
+
+    /**
+     * @brief Get current frequency admission count for a key.
+     * @return estimated count, or 0 if admission sketch is disabled.
+     */
+    uint8_t GetAdmissionCount(const std::string& key) const {
+        if (admission_sketch_ == nullptr) {
+            return 0;
+        }
+        return admission_sketch_->count(key);
+    }
+
+    /**
+     * @brief Decide whether a key should be admitted to local hot cache.
+     * Updates admission sketch only when cache was not used.
+     */
+    bool ShouldAdmitToHotCache(const std::string& key, bool cache_used) {
+        if (!(hot_cache_ && !cache_used)) {
+            return false;
+        }
+        if (admission_sketch_ == nullptr) {
+            return true;
+        }
+        return admission_sketch_->increment(key) >= admission_threshold_;
+    }
+
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+   protected:
+    /**
+     * @brief Constructor exposed to subclasses for testing only; production
+     * code must go through Create().
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring, const std::string& protocol,
            const std::map<std::string, std::string>& labels = {});
 
+   private:
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -431,10 +642,16 @@ class Client {
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
+    ErrorCode TransferReadInternal(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
+    ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
+                                std::vector<Slice>& slices,
+                                uint64_t src_offset);
 
     /**
      * @brief Prepare and use the storage backend for persisting data
@@ -447,6 +664,48 @@ class Client {
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
                         const DiskDescriptor& disk_descriptor);
+    /**
+     * @brief Initialize local hot cache
+     * @return ErrorCode::OK if use local hot cache,
+     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
+     */
+    ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
+     * @return Cache size in bytes, or 0 if not set or invalid
+     */
+    size_t GetLocalHotCacheSizeFromEnv();
+
+    /**
+     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @param default_value Default block size to use if env var is not set or
+     * invalid
+     * @return Parsed block size from environment, or default_value if not
+     * set/invalid
+     */
+    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
+
+    /**
+     * @brief Redirect replica descriptor to local hot cache if cache hit
+     * @param key Object key
+     * @param replica Replica descriptor
+     * @return true if cache hit and replica descriptor was updated, false
+     * otherwise
+     */
+    bool RedirectToHotCache(const std::string& key,
+                            Replica::Descriptor& replica);
+
+    /**
+     * @brief Asynchronously process slices and update hot cache for TE
+     * transfers.
+     * @param key Object key.
+     * @param slices Vector of slices to check and cache.
+     * @param replica Replica descriptor to identify slice sources.
+     */
+    void ProcessSlicesAsync(const std::string& key,
+                            const std::vector<Slice>& slices,
+                            const Replica::Descriptor& replica);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -470,6 +729,9 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void StartBatchUpsert(std::vector<PutOperation>& ops,
+                          const ReplicateConfig& config);
+    void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
@@ -492,8 +754,31 @@ class Client {
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_
-    std::mutex mounted_segments_mutex_;
+    mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+
+    // Segments in graceful unmount: readable by remote peers, not allocatable
+    // locally. TE MR remains registered until master confirms removal.
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>
+        gracefully_unmounting_segments_;
+    std::unordered_map<UUID, std::function<void(const UUID&)>,
+                       boost::hash<UUID>>
+        graceful_unmount_cleanup_callbacks_;
+
+    /**
+     * @brief Internal helper to unmount a segment by iterator.
+     *        Caller must hold mounted_segments_mutex_.
+     */
+    tl::expected<void, ErrorCode> UnmountSegmentImpl(
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
+    void StartGracefulUnmountTimer(const UUID& segment_id,
+                                   uint64_t grace_period_ms);
+    void OnGracefulUnmountTimer(const UUID& segment_id, int retry_left);
+    bool WaitForGracefulUnmountDelay(std::chrono::milliseconds delay);
+    std::mutex graceful_unmount_timer_mutex_;
+    std::condition_variable graceful_unmount_timer_cv_;
+    bool graceful_unmount_timer_stopping_{false};
 
     // Configuration
     const std::string local_hostname_;
@@ -501,14 +786,91 @@ class Client {
     const std::string protocol_;
 
     // Client persistent thread pool for async operations
+    // Pinned host memory pool for GPU D2H staging (must outlive
+    // write_thread_pool_)
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 
     // For high availability
-    MasterViewHelper master_view_helper_;
-    std::thread ping_thread_;
-    std::atomic<bool> ping_running_{false};
-    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
+    std::mutex leader_switch_mutex_;
+    std::optional<ha::MasterView> current_master_view_;
+    std::string direct_master_address_;
+    std::thread leader_monitor_thread_;
+    std::atomic<bool> leader_monitor_running_{false};
+    std::thread storage_heartbeat_thread_;
+    std::atomic<bool> storage_heartbeat_running_{false};
+    std::thread task_poll_thread_;
+    std::atomic<bool> task_poll_running_{false};
+    std::atomic<bool> last_ping_success_{false};
+    std::atomic<bool> segment_desc_publish_pending_{false};
+    std::atomic<bool> rpc_meta_publish_pending_{false};
+    ErrorCode SwitchLeader(const ha::MasterView& target_view);
+    void LeaderMonitorThreadMain();
+    void StorageHeartbeatThreadMain();
+    void TaskPollThreadMain();
+    void EnsureStorageControlPlaneStarted();
+    void PollAndDispatchTasks();
+    void SubmitTask(const TaskAssignment& assignment);
+
+    // For task management
+    // Client-side task representation
+    struct ClientTask {
+        TaskAssignment assignment;
+        uint32_t retry_count = 0;
+
+        void increment_retry() { retry_count++; }
+    };
+
+    void ExecuteTask(const ClientTask& client_task);
+
+    tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
+        const std::string& key, const std::string& action_name,
+        std::function<tl::expected<void, ErrorCode>()> end_fn,
+        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        const Replica::Descriptor& source,
+        const std::vector<Replica::Descriptor>& targets);
+
+    /**
+     * @brief Copy an object's replica to target segments
+     * @param key Object key
+     * @param source Source segment
+     * @param targets Target segments
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
+
+    /**
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+
+    // Task thread pool for async task execution
+    ThreadPool task_thread_pool_;
+    std::atomic<bool> task_running_{true};
+
+    // Task polling configuration
+    static constexpr size_t kTaskBatchSize =
+        16;  // Number of tasks to fetch per poll
+
+    bool te_initialized_{false};
+
+    // Local hot cache and async handler
+    std::shared_ptr<LocalHotCache> hot_cache_;
+    std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
+
+    // Frequency admission: only cache keys whose CMS count >= threshold
+    std::unique_ptr<CountMinSketch> admission_sketch_;
+    uint8_t admission_threshold_ = 2;
 };
 
 }  // namespace mooncake

@@ -8,13 +8,15 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
-  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA" target="_blank"><strong>Slack</strong></a>
   <br />
   <br />
 
   [![Docs](https://img.shields.io/badge/docs-live-brightgreen)](https://kvcache-ai.github.io/Mooncake/)
   [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
   [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
+  [![CUDA <=12.9](https://img.shields.io/static/v1?label=CUDA&message=%3C%3D12.9&color=76B900)](https://pypi.org/project/mooncake-transfer-engine)
+  [![CUDA 13.0/13.1](https://img.shields.io/static/v1?label=CUDA&message=13.0%2F13.1&color=76B900)](https://pypi.org/project/mooncake-transfer-engine-cuda13)
   [![PyPI - Downloads](https://img.shields.io/pypi/dm/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
   [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
   [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
@@ -29,8 +31,15 @@ This repository also hosts its technical report and the open-sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **May 7, 2026**: 🚀 [vLLM officially features Mooncake Store](https://vllm.ai/blog/mooncake-store) — a deep dive into how Mooncake's distributed KVCache engine supercharges vLLM inference with high-throughput, memory-efficient, cross-instance KV cache sharing!
+- **Apr 29, 2026**: SGLang introduces [RDMA-based P2P weight transfer for large-scale distributed RL](https://lmsys.org/blog/2026-04-29-p2p-update/) using Mooncake TransferEngine, achieving 7x faster weight updates for the 1T-parameter Kimi-K2 model (53s → 7.2s) with zero-copy RDMA transfer across thousands of GPUs.
+- **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
+- **Mar 5, 2026**: [LightX2V](https://github.com/ModelTC/LightX2V/pull/893) now supports disaggregated deployment based on Mooncake, enabling encoder/transformer service decoupling with Mooncake Transfer Engine for high-performance cross-device and cross-machine data transfer.
+- **Feb 25, 2026**: [SGLang](https://github.com/sgl-project/sglang) merged [Encoder Global Cache Manager](https://github.com/sgl-project/sglang/pull/16137), introducing a Mooncake-powered global multimodal embedding cache that enables cross-instance sharing of ViT embeddings to avoid redundant GPU computation.
+- **Feb 24, 2026**: [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/design/feature/disaggregated_inference/) introduces disaggregated inference connectors with support for both `MooncakeStoreConnector` and `MooncakeTransferEngineConnector` for multi-node omni-modality pipelines.
+- **Feb 12, 2026**: [Mooncake Joins PyTorch Ecosystem](https://pytorch.org/blog/mooncake-joins-pytorch-ecosystem/) We are thrilled to announce that Mooncake has officially joined the PyTorch Ecosystem!
 - **Jan 28, 2026**: [FlexKV](https://github.com/taco-project/FlexKV), a distributed KV store and cache system from Tencent and NVIDIA in collaboration with the community, now supports [distributed KVCache reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md) with the Mooncake Transfer Engine.
- - **Jan 21, 2026**: Mooncake Project has been approved as a [PyTorch Ecosystem](https://github.com/pytorch-fdn/ecosystem/issues/52) project. See [PyTorch Landscape](https://landscape.pytorch.org/?item=optimizations--general--mooncake) for details.
+ - **Dec 27, 2025**: Collaboration with [ROLL](https://github.com/alibaba/ROLL)! Check out the paper [here](https://arxiv.org/abs/2512.22560).
  - **Dec 23, 2025**: SGLang introduces [Encode-Prefill-Decode (EPD) Disaggregation](https://lmsys.org/blog/2026-01-12-epd/) with Mooncake as a transfer backend. This integration allows decoupling compute-intensive multimodal encoders (e.g., Vision Transformers) from language model nodes, utilizing Mooncake's RDMA engine for zero-copy transfer of large multimodal embeddings.
  - **Dec 19, 2025**: Mooncake Transfer Engine has been [integrated into TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/executor/cache_transmission/mooncake_utils) for KVCache transfer in PD-disaggregated inference.
  - **Dec 19, 2025**: Mooncake Transfer Engine has been directly integrated into vLLM v1 as a [KV Connector](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/) in PD-disaggregated setups.
@@ -86,11 +95,68 @@ Mooncake adds elasticity and fault tolerance support for MoE model inference, en
 **Tensor-Centric Ecosystem**
 Mooncake establishes a full-stack, Tensor-oriented AI infrastructure where Tensors serve as the fundamental data carrier. The ecosystem spans from the Transfer Engine, which accelerates Tensor data movement across heterogeneous storage (DRAM/VRAM/NVMe), to the P2P Store and Mooncake Store for distributed management of Tensor objects (e.g., Checkpoints and KVCache), up to the Mooncake Backend enabling Tensor-based elastic distributed computing. This architecture is designed to maximize Tensor processing efficiency for large-scale model inference and training.
 
+<h2 id="supported-hardware">🖥️ Supported Hardware</h2>
+
+Mooncake supports heterogeneous accelerators, NICs, and specialized transport paths. The summary below focuses on runtime and transport coverage that is already exposed through build options, documented protocols, or dedicated examples in this repository.
+
+<div align="center">
+  <table>
+    <tr>
+      <td align="center"><img src="image/partners/huawei_logo.png" alt="Huawei" height="26" /><br/><sub>Huawei</sub></td>
+      <td align="center"><img src="https://www.cambricon.com/favicon.ico" alt="Cambricon" height="24" /><br/><sub>Cambricon</sub></td>
+      <td align="center"><img src="image/partners/moore_thread_logo.jpg" alt="Moore Threads" height="26" /><br/><sub>Moore Threads</sub></td>
+      <td align="center"><img src="https://www.metax-tech.com/favicon.ico" alt="MetaX" height="24" /><br/><sub>MetaX</sub></td>
+      <td align="center"><img src="https://www.t-head.cn/favicon.ico" alt="T-Head" height="24" /><br/><sub>T-Head</sub></td>
+      <td align="center"><img src="image/partners/nvidia_logo.png" alt="NVIDIA" height="26" /><br/><sub>NVIDIA</sub></td>
+      <td align="center"><img src="image/partners/amd_logo.png" alt="AMD" height="26" /><br/><sub>AMD</sub></td>
+      <td align="center"><img src="image/partners/aliyun_logo.png" alt="Alibaba Cloud" height="24" /><br/><sub>Alibaba Cloud</sub></td>
+      <td align="center"><img src="image/partners/aws-logo.png" alt="AWS" height="24" /><br/><sub>AWS</sub></td>
+    </tr>
+  </table>
+</div>
+
+#### Accelerator runtimes
+
+| Vendor / Platform | Hardware / Runtime | Current support in Mooncake | How it is exposed |
+|-------------------|--------------------|-----------------------------|-------------------|
+| Huawei Ascend | Ascend NPUs | Supported | `-DUSE_ASCEND=ON`, `-DUSE_ASCEND_DIRECT=ON`, `-DUSE_UBSHMEM=ON`, `-DUSE_ASCEND_HETEROGENEOUS=ON`; covers HCCL transport, Ascend Direct transport, UBShmem transport, and heterogeneous Ascend-GPU transport |
+| Cambricon | MLU + Neuware | Supported | `-DUSE_MLU=ON`; MLU memory detection, topology discovery, and registration reuse the standard `rdma` data path |
+| Moore Threads | MUSA GPUs | Supported | `-DUSE_MUSA=ON`; accelerator-aware data transfer with MUSA runtime integration |
+| MetaX (Muxi) | MACA GPUs | Supported | `-DUSE_MACA=ON`; source build support through the MACA SDK |
+| T-Head | PPU / Barex | Supported | T-Head PPU deployments are represented here through Barex-based transport support |
+| NVIDIA | CUDA GPUs / NVLink | Supported | `-DUSE_CUDA=ON`, `-DUSE_INTRA_NVLINK=ON`, `-DUSE_MNNVL=ON`; covers CUDA memory, GPUDirect RDMA, GPUDirect Storage, intra-node NVLink, and multi-node NVLink |
+| AMD | ROCm / HIP GPUs | Supported | `-DUSE_HIP=ON`; HIP transport for AMD GPU communication |
+| Hygon | DCU / DTK | Supported | `-DUSE_HYGON=ON`; CUDA-compatible runtime via Hygon DTK SDK |
+| Iluvatar | CoreX | Supported | `-DUSE_COREX=ON`; CUDA-compatible runtime via Iluvatar CoreX SDK |
+
+#### Network and fabric support
+
+| Vendor / Fabric | Hardware / Transport | Current support in Mooncake | How it is exposed |
+|-----------------|----------------------|-----------------------------|-------------------|
+| Alibaba Cloud | eRDMA NICs | Supported | `rdma` data path with eRDMA devices such as `erdma_0`; the build also enables `CONFIG_ERDMA` |
+| Standard RDMA ecosystem | InfiniBand / RoCE NICs | Supported | Available through the standard `rdma` protocol path with topology-aware NIC selection |
+| AWS | Elastic Fabric Adapter (EFA) | Supported | `-DUSE_EFA=ON`; EFA transport built on libfabric SRD |
+| Storage disaggregation | NVMe-oF | Supported | Enabled with `-DUSE_NVMEOF=ON` |
+| Memory pooling | CXL | Supported | Enabled with `-DUSE_CXL=ON` |
+| Baseline networking | TCP/IP | Supported | `tcp` works in all environments |
+
+#### Specialized transport paths
+
+| Transport path | Current support in Mooncake | How it is exposed |
+|----------------|-----------------------------|-------------------|
+| Ascend HCCL transport | Supported | Enabled by `-DUSE_ASCEND=ON`; examples use `hccl` for Ascend NPU data movement |
+| Ascend Direct transport | Supported | Enabled by `-DUSE_ASCEND_DIRECT=ON`; dedicated Ascend Direct examples and docs are included |
+| UBShmem transport | Supported | Enabled by `-DUSE_UBSHMEM=ON`; Transfer Engine examples accept `--protocol=ubshmem` |
+| Heterogeneous Ascend transport | Supported | Enabled by `-DUSE_ASCEND_HETEROGENEOUS=ON`; used for Ascend-GPU heterogeneous transfer |
+| Barex transport | Supported | Enabled by `-DUSE_BAREX=ON`; documented as the `barex` advanced transport |
+| Sunrise Transport | Supported | Included here as an additional specialized transport path to reflect current hardware support positioning |
+| T-Head PPU / Barex | Supported | Barex-based transport coverage is available for T-Head PPU deployments |
+
 <h2 id="show-cases">🔥 Show Cases</h2>
 
 ### Use Transfer Engine Standalone ([Guide](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html))
 
-Transfer Engine is a high-performance data transfer framework. Transfer Engine provides a unified interface to transfer data from DRAM, VRAM or NVMe, while the technical details related to hardware are hidden. Transfer Engine supports multiple communication protocols including TCP, RDMA (InfiniBand/RoCEv2/eRDMA/NVIDIA GPUDirect), NVMe over Fabric (NVMe-of), NVLink, HIP, CXL, and Ascend. For a complete list of supported protocols and configuration guide, see the [Supported Protocols Documentation](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html).
+Transfer Engine is a high-performance data transfer framework. Transfer Engine provides a unified interface to transfer data from DRAM, VRAM or NVMe, while the technical details related to hardware are hidden. Transfer Engine supports multiple communication protocols including TCP, RDMA (InfiniBand/RoCEv2/eRDMA/NVIDIA GPUDirect), AWS EFA, NVMe over Fabric (NVMe-of), NVLink, HIP, Barex, CXL, and Ascend-family transports. When built with the corresponding runtime, Transfer Engine can also detect and route accelerator memory on CUDA, MUSA, HIP, MACA, Cambricon MLU, and Ascend-enabled environments. For a complete list of supported protocols and configuration guide, see the [Supported Protocols Documentation](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html).
 
 #### Highlights
 - **Efficient use of multiple RDMA NIC devices.** Transfer Engine supports the use of multiple RDMA NIC devices to achieve the *aggregation of transfer bandwidth*.
@@ -171,13 +237,22 @@ The following need to be installed before running any component of Mooncake:
 - RDMA Driver & SDK, such as Mellanox OFED.
 - Python 3.10, virtual environment is recommended.
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+- Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
+- Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
+- Iluvatar CoreX SDK, if the package is built with `-DUSE_COREX`. By default Mooncake looks for CoreX under `COREX_HOME` or `/usr/local/corex`.
 
 ### Use Python package
 The simplest way to use Mooncake Transfer Engine is using `pip`:
 
 **For CUDA-enabled systems:**
+
+- CUDA < 13.0
 ```bash
 pip install mooncake-transfer-engine
+```
+- CUDA >= 13.0
+```bash
+pip install mooncake-transfer-engine-cuda13
 ```
 
 **For non-CUDA systems:**
@@ -188,18 +263,61 @@ pip install mooncake-transfer-engine-non-cuda
 > [!IMPORTANT]
 > - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
 > - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
+> - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
 > - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
+
+To produce an image that compiles Mooncake from source, builds the wheel via `scripts/build_wheel.sh`, and installs that wheel inside the container, use `build-wheel.dockerfile`:
+
+```bash
+docker build -f docker/mooncake.Dockerfile \
+  --build-arg PYTHON_VERSION=3.10 \
+  --build-arg EP_TORCH_VERSIONS="2.9.1" \
+  -t mooncake:from-source .
+```
+
+The resulting image already has a virtual environment at `/opt/venv` with the freshly built wheel installed. Launch it with GPU/RDMA access as needed, for example:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+
+docker run --gpus all \
+  --network host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --shm-size=128g \
+  -e MC_STORE_USE_HUGEPAGE=1 \
+  -e MC_STORE_HUGEPAGE_SIZE=2MB \
+  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
+  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
+  -it mooncake:from-source /bin/bash
+```
+
+The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not allocator defaults. The arena is off by default. Setting `MC_MMAP_ARENA_POOL_SIZE=...` explicitly both enables and sizes the arena; if you enable it via gflag instead, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) instead when you want the baseline direct-`mmap()` path. Like the arena size itself, this must be set before the first Mooncake mmap-buffer allocation in the process. Arena bring-up is a one-shot lazy init, so after a failed first attempt you need to restart the process to retry with corrected env / hugepage settings. Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is present, Mooncake instead preserves the strict hugepage contract for both arena and direct-`mmap()` host-buffer allocation instead of silently downgrading to regular pages.
+
+> [!NOTE]
+> Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.
 
 ### Build and use binaries
 The following are additional dependencies for building Mooncake:
 - Build essentials, including gcc, g++ (9.4+) and cmake (3.16+).
 - Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- [Optional] Rust Toolchain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
+- Cambricon Neuware, if you want to build with `-DUSE_MLU`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `NEUWARE_HOME` or `/usr/local/neuware` by default, and also supports overriding `MLU_INCLUDE_DIR` / `MLU_LIB_DIR` during CMake configure.
+- Hygon DTK SDK, if you want to build with `-DUSE_HYGON`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `DTK_HOME` or `/opt/dtk` by default, and also supports overriding `DTK_INCLUDE_DIR` / `DTK_LIB_DIR` during CMake configure.
+- Iluvatar CoreX SDK, if you want to build with `-DUSE_COREX`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `COREX_HOME` or `/usr/local/corex` by default, and also supports overriding `COREX_INCLUDE_DIR` / `COREX_LIB_DIR` during CMake configure.
+- [Optional] Rust Toolchain and libclang, if you want to build Transfer Engine Rust examples with `-DWITH_RUST_EXAMPLE=ON` or Mooncake Store Rust bindings with `-DWITH_STORE_RUST=ON`. *This is NOT included in the `dependencies.sh` script.*
+- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers, or with `-DSTORE_USE_REDIS` to use Redis for Mooncake Store failover.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
 The build and installation steps are as follows:
@@ -222,6 +340,14 @@ The build and installation steps are as follows:
    make -j
    sudo make install # optional, make it ready to be used by vLLM/SGLang
    ```
+
+For Cambricon MLU builds, configure CMake with `-DUSE_MLU=ON`. For example:
+```bash
+mkdir build
+cd build
+cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=/usr/local/neuware
+make -j
+```
 
 
 <h2 id="milestones"> 🛣️ Incoming Milestones</h2>
@@ -251,9 +377,16 @@ The above presents two samples from our trace dataset. The trace includes the ti
 **_Update[Feb 21, 2025]: The updated [traces](FAST25-release/traces) used in our FAST'25 paper have been released! Please refer to the paper's appendix (found [here](FAST25-release/Mooncake-FAST25.pdf)) for more details._**
 
 <h2 id="citation">📑 Citation</h2>
-Please kindly cite our paper if you find the paper or the traces are useful:
+Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
+@article{sun2026survivingpartialrankfailures,
+  title     = {Surviving Partial Rank Failures in Wide Expert-Parallel MoE Inference},
+  author    = {Xun Sun and Shaoyuan Chen and Pingchuan Ma and Yue Chen and Ziwei Yuan and Zhanhao Cao and Han Han and Shangming Cai and Teng Ma and Xuchun Shang and Xinpeng Zhao and Ke Yang and Junlin Wei and Lianzhi Lin and Yuji Liu and Feng Ren and Haoran Hu and Cheng Wan and Yingdi Shan and Yongwei Wu and Mingxing Zhang},
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2605.10670},
+}
+
 @article{qin2025mooncake_tos,
   author    = {Qin Ruoyu and Li Zheming and He Weiran and Cui Jialei and Tang Heyi and Ren Feng and Ma Teng and Cai Shangming and Zhang Yineng and Zhang Mingxing and Wu Yongwei and Zheng Weimin and Xu Xinran},
   title     = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},

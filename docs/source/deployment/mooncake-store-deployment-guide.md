@@ -8,6 +8,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--rpc_port` (int, default 50051): RPC listen port.
   - `--rpc_thread_num` (int, default min(4, CPU cores)): RPC worker threads. If not set, uses `--max_threads` (default 4) capped by CPU cores.
   - `--rpc_address` (str, default `0.0.0.0`): RPC bind address.
+  - `--rpc_interface` (str, default empty): Network interface used to resolve the final RPC address. When set, Mooncake Master resolves the interface's current IPv4 address at startup and uses it as the final `rpc_address`. This overrides `--rpc_address`.
   - `--rpc_conn_timeout_seconds` (int, default `0`): RPC idle connection timeout; `0` disables.
   - `--rpc_enable_tcp_no_delay` (bool, default `true`): Enable TCP_NODELAY.
 
@@ -20,22 +21,47 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--http_metadata_server_host` (str, default `0.0.0.0`): Metadata bind host.
   - `--http_metadata_server_port` (int, default `8080`): Metadata TCP port.
 
+- Allocation Strategy
+  - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
+    - `random`: Pure random selection across segments (baseline, fastest).
+    - `free_ratio_first`: Free-ratio-first strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+
 - Eviction and TTLs
-  - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
-  - `--default_kv_soft_pin_ttl` (uint64, default `1800000` ms): Soft pin TTL (30 minutes).
+  - `--default_kv_lease_ttl` (duration, default `5000` ms): Default lease TTL for KV objects. The default unit is milliseconds, so `5000` means `5000ms`. Duration strings such as `5000ms`, `5s`, `30m`, or `1h` are also supported.
+  - `--default_kv_soft_pin_ttl` (duration, default `1800000` ms): Soft pin TTL (30 minutes). The default unit is milliseconds, so `1800000` means `1800000ms`. Duration strings such as `1800000ms`, `30m`, or `1h` are also supported.
   - `--allow_evict_soft_pinned_objects` (bool, default `true`): Allow evicting soft-pinned objects.
   - `--eviction_ratio` (double, default `0.05`): Fraction evicted when hitting high watermark.
   - `--eviction_high_watermark_ratio` (double, default `0.95`): Usage ratio to trigger eviction.
+  - `--client_ttl` (int64, default `10` s): Seconds a client stays considered alive after the last heartbeat. If this TTL elapses without a refresh, the master treats the client as disconnected and may unmount its segments.
 
 - High Availability (optional)
   - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
-  - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+
+- Task Manager (optional)
+  - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
+  - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
+  - `--max_total_processing_tasks` (uint32, default `10000`): Maximum number of tasks that can be processing simultaneously. When this limit is reached, no new tasks will be popped from the pending queue until some processing tasks complete.
+  - `--max_retry_attempts` (uint32, default `10`): Maximum number of retry attempts for failed tasks. Tasks that fail with `NO_AVAILABLE_HANDLE` error will be retried up to this many times before being marked as failed.
 
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
   - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.
+
+- Snapshot / Restore (optional)
+  - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata data (effective when using the `offset` memory allocator).
+  - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
+  - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
+  - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
+  - `--snapshot_object_store_type` (str, required when snapshot enabled): Snapshot object store type: `local` for local filesystem, `s3` for S3 storage.
+  - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the backend fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
+  - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_object_store_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
+
+  > **Warning: Managed Directory**
+  >
+  > The snapshot storage path (`MOONCAKE_SNAPSHOT_LOCAL_PATH` for local backend, or S3 bucket for S3 backend) is a **managed directory** exclusively controlled by the Mooncake snapshot system. **DO NOT store other files or data in this directory.** Old snapshots exceeding `--snapshot_retention_count` will be automatically and permanently deleted during cleanup. Use a dedicated, isolated directory for snapshot storage to avoid accidental data loss.
 
 Example (enable embedded HTTP metadata and metrics):
 
@@ -49,13 +75,41 @@ mooncake_master \
   --enable_metric_reporting=true
 ```
 
+Example (resolve the master RPC address from a stable interface name in a container):
+
+```bash
+mooncake_master \
+  --rpc_interface=eth0 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
+```
+
+This resolves the current IPv4 address of `eth0` at startup and uses it as the final `rpc_address`.
+
+Example (use free-ratio-first allocation strategy for better load balancing):
+
+```bash
+mooncake_master \
+  --allocation_strategy=free_ratio_first \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080
+```
+
 **Tips:**
 
 In addition to command-line flags, the Master also supports configuration via JSON and YAML files. For example:
 
 ```bash
 mooncake_master \
-  --config_path=mooncake-store/conf/master.yaml 
+  --config_path=mooncake-store/conf/master.yaml
+```
+
+For config files, the equivalent setting is:
+
+```yaml
+rpc_interface: "eth0"
+rpc_port: 50051
 ```
 
 ## Metrics Endpoints
@@ -72,6 +126,21 @@ curl -s http://<master_host>:9003/metrics
 curl -s http://<master_host>:9003/metrics/summary
 ```
 
+Mooncake Store can report Store-observed cache reuse signals, such as
+completed `GetReplicaList` results served from memory/SSD and current cached
+object counts. These signals help operators understand reuse inside the Store,
+but they are not the final request-level or token-level cache hit ratio for an
+inference system. That end-to-end hit ratio should be calculated by Conductor or
+the inference engine, which can observe the full request path across GPU, CPU,
+and Mooncake tiers.
+
+For `CalcCacheStats()`, prefer the `MEMORY_CURRENT_CACHED_OBJECTS`,
+`SSD_CURRENT_CACHED_OBJECTS`, and `*_HITS_PER_CURRENT_CACHED_OBJECT` enum
+aliases when consuming Store-side values. The older `*_TOTAL` and `*_HIT_RATE`
+names are retained for compatibility. The `*_HIT_RATE` values divide cumulative
+Store-observed hits by current cached object counts, so they are not bounded
+request-level hit ratios and may exceed `1.0`.
+
 ## Client/Engine Tuning (Env Vars, with defaults)
 
 - Topology discovery (Store Client → Transfer Engine)
@@ -86,9 +155,33 @@ curl -s http://<master_host>:9003/metrics/summary
 - Client metrics (enabled by default)
   - `MC_STORE_CLIENT_METRIC` (default `1`): Client-side metrics on by default; set `0` to disable entirely.
   - `MC_STORE_CLIENT_METRIC_INTERVAL` (default `0`): Reporting interval in seconds; `0` collects but does not periodically report.
+  - `MC_STORE_CLIENT_MIN_PORT` (default `12300`): Minimum local port for client connections. Must be in range 1024–32767 or 61000–65535 (well-known and ephemeral ports are excluded). Falls back to default on invalid input.
+  - `MC_STORE_CLIENT_MAX_PORT` (default `14300`): Maximum local port for client connections. Same range constraints as `MC_STORE_CLIENT_MIN_PORT`; must be ≥ `MC_STORE_CLIENT_MIN_PORT`.
 
 - Local memcpy optimization (Store transfer path)
   - `MC_STORE_MEMCPY` (default `0`/false): Set to `1` to prefer local memcpy when source/destination are on the same client.
+
+- Memory allocator (mmap buffer path)
+  - `MC_STORE_USE_HUGEPAGE` (default unset): Set to `1` to request HugeTLB-backed `mmap()` allocations for the direct allocation path. This requires hugepages to be reserved on the host first.
+  - `MC_STORE_HUGEPAGE_SIZE` (default `2MB`): Hugepage size to request when hugepages are enabled. Supported values are `2MB` and `1GB`.
+  - `MC_MMAP_ARENA_POOL_SIZE` (default unset): Size of the pre-allocated arena pool for mmap buffer allocations. Accepts human-readable sizes (e.g., `8gb`, `20gb`). Setting this variable explicitly enables the arena; if the arena is enabled via gflag instead, the default pool size is `8gb`. The arena is allocated once at first use and serves subsequent allocations via lock-free atomic bump pointer. Set this to match available hugepage capacity.
+  - `MC_DISABLE_MMAP_ARENA` (default unset): Set to `1` to disable the arena and fall back to per-call `mmap()`, even if the arena was explicitly requested. Also accepts `true`, `yes`, or `on`. This must be set before the first Mooncake mmap-buffer allocation in the process. Useful for debugging or when hugepage capacity is limited. Lazy arena initialization is one-shot per process, so after a failed first attempt you need to restart the process to retry arena bring-up.
+
+For HiCache-style deployments or other large buffer allocations, pre-flight the host with the sizing helper before reserving hugepages:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+  --tp-size 4 \
+  --hicache-size 64gb \
+  --global-segment-size 8gb \
+  --arena-pool-size 56gb \
+  --available-hugetlb 512gb
+
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
+
+The `64gb` / `56gb` inputs above are tuned examples for large HiCache deployments, not defaults. The arena remains disabled unless you explicitly enable it. If you enable it via gflag without an env override, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper.
 
 ## Set the Log Level for yalantinglibs coro_rpc and coro_http
 By default, the log level is set to warning. You can customize it using the following environment variable:
@@ -104,3 +197,13 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
+
+
+---
+
+:::{toctree}
+:caption: Advanced Topics
+:maxdepth: 1
+
+ssd-offload
+:::

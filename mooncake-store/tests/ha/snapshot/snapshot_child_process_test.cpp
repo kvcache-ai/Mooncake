@@ -1,0 +1,1089 @@
+#include "master_service.h"
+#include "master_metric_manager.h"
+#include "ha/snapshot/catalog/snapshot_catalog_store.h"
+#include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_test_utils.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/oplog/etcd_oplog_store.h"
+#endif
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <regex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "utils/file_util.h"
+
+namespace mooncake::test {
+
+namespace fs = std::filesystem;
+
+class SnapshotChildProcessTest : public ::testing::Test {
+   protected:
+    const std::string& tmp_dir() const { return tmp_dir_; }
+
+    std::unique_ptr<MasterService> service_;
+
+    static constexpr const char* kEnvSnapshotLocalPath =
+        "MOONCAKE_SNAPSHOT_LOCAL_PATH";
+
+    void SetUp() override {
+        google::InitGoogleLogging("SnapshotChildProcessTest");
+        FLAGS_logtostderr = true;
+
+        // Reset metric state for isolation
+        MasterMetricManager::instance().reset_allocated_mem_size();
+        MasterMetricManager::instance().reset_total_mem_capacity();
+
+        // Create temp directory
+        std::string tmpl =
+            (fs::temp_directory_path() / "snap_child_test_XXXXXX").string();
+        char* dir = mkdtemp(tmpl.data());
+        ASSERT_NE(dir, nullptr) << "Failed to create temp directory";
+        tmp_dir_ = dir;
+
+        // Set env for LocalFileSnapshotObjectStore
+        ::setenv(kEnvSnapshotLocalPath, tmp_dir().c_str(), 1);
+    }
+
+    void TearDown() override {
+        service_.reset();
+        if (!tmp_dir().empty() && fs::exists(tmp_dir())) {
+            fs::remove_all(tmp_dir());
+        }
+        ::unsetenv(kEnvSnapshotLocalPath);
+        google::ShutdownGoogleLogging();
+    }
+
+    // Create a default service with snapshot_restore enabled (backend
+    // initialized)
+    void CreateDefaultService(ViewVersionId view_version = 0) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        service_ = std::make_unique<MasterService>(config);
+    }
+
+#ifdef STORE_USE_ETCD
+    void CreateEtcdHASnapshotService(const std::string& cluster_id,
+                                     const std::string& etcd_endpoints,
+                                     ViewVersionId view_version) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_enable_ha(true)
+                          .set_ha_backend_type("etcd")
+                          .set_ha_backend_connstring(etcd_endpoints)
+                          .set_cluster_id(cluster_id)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        service_ = std::make_unique<MasterService>(config);
+    }
+#endif
+
+    // Helper wrappers for private methods (friend access)
+    std::string CallFormatTimestamp(
+        const std::chrono::system_clock::time_point& tp) {
+        return service_->FormatTimestamp(tp);
+    }
+
+    void CallHandleChildExit(pid_t pid, int status,
+                             const std::string& snapshot_id) {
+        service_->HandleChildExit(pid, status, snapshot_id);
+    }
+
+    void CallHandleChildTimeout(pid_t pid, const std::string& snapshot_id) {
+        service_->HandleChildTimeout(pid, snapshot_id);
+    }
+
+    void CallCleanupOldSnapshot(int keep_count,
+                                const std::string& snapshot_id) {
+        service_->CleanupOldSnapshot(keep_count, snapshot_id);
+    }
+
+    tl::expected<void, SerializationError> CallUploadSnapshotPayloadFile(
+        const std::vector<uint8_t>& data, const std::string& path,
+        const std::string& local_filename, const std::string& snapshot_id) {
+        return service_->UploadSnapshotPayloadFile(data, path, local_filename,
+                                                   snapshot_id);
+    }
+
+    SnapshotObjectStore* GetSnapshotObjectStore() {
+        return service_->snapshot_object_store_.get();
+    }
+
+    ha::SnapshotCatalogStore* GetSnapshotCatalogStore() {
+        return service_->snapshot_catalog_store_.get();
+    }
+
+    tl::expected<void, SerializationError> CallPersistState(
+        const std::string& snapshot_id) {
+        return service_->PersistState(snapshot_id);
+    }
+
+    tl::expected<void, SerializationError> CallPersistState(
+        const ha::SnapshotDescriptor& descriptor) {
+        return service_->PersistState(descriptor);
+    }
+
+    bool GetUseSnapshotBackupDir() {
+        return service_->use_snapshot_backup_dir_;
+    }
+
+    // Check if a key exists in raw metadata (regardless of replica status)
+    bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
+        size_t shard_idx = svc->getShardIndex(key);
+        auto& shard = svc->metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        auto tenant_it = shard.tenants.find("default");
+        return tenant_it != shard.tenants.end() &&
+               tenant_it->second.metadata.find(key) !=
+                   tenant_it->second.metadata.end();
+    }
+
+    uint32_t GetShardIndexForTest(const std::string& key) {
+        return static_cast<uint32_t>(service_->getShardIndex(key));
+    }
+
+    tl::expected<void, SerializationError> DeserializeMetadataForTest(
+        const std::vector<uint8_t>& data) {
+        MasterService::MetadataSerializer serializer(service_.get());
+        return serializer.Deserialize(data);
+    }
+
+    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
+        auto& shard = service_->metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+            auto it = tenant_state.metadata.find(key);
+            if (it != tenant_state.metadata.end()) {
+                return it->second.IsGrouped();
+            }
+        }
+        return false;
+    }
+
+    std::string FindGroupIdOnDifferentShard(MasterService* svc,
+                                            const std::string& key) {
+        const size_t key_shard = svc->getShardIndex(key);
+        for (int i = 0; i < 1024; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (svc->getShardIndex(group_id) != key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_group";
+    }
+
+   private:
+    std::string tmp_dir_;
+};
+
+// ========== FormatTimestamp ==========
+
+TEST_F(SnapshotChildProcessTest, FormatTimestamp_MatchesExpectedFormat) {
+    CreateDefaultService();
+    auto ts = CallFormatTimestamp(std::chrono::system_clock::now());
+    // Expected format: YYYYMMDD_HHMMSS_mmm
+    std::regex pattern(R"(^\d{8}_\d{6}_\d{3}$)");
+    EXPECT_TRUE(std::regex_match(ts, pattern))
+        << "FormatTimestamp returned: " << ts;
+}
+
+// ========== HandleChildExit ==========
+
+TEST_F(SnapshotChildProcessTest, HandleChildExit_NormalSuccess) {
+    CreateDefaultService();
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        _exit(0);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    // Should not crash; exercises the success path
+    EXPECT_NO_FATAL_FAILURE(
+        CallHandleChildExit(pid, status, "test_snapshot_success"));
+}
+
+TEST_F(SnapshotChildProcessTest, HandleChildExit_NormalFailure) {
+    CreateDefaultService();
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        _exit(1);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    // Should not crash; exercises the error path
+    EXPECT_NO_FATAL_FAILURE(
+        CallHandleChildExit(pid, status, "test_snapshot_failure"));
+}
+
+TEST_F(SnapshotChildProcessTest, HandleChildExit_Signaled) {
+    CreateDefaultService();
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        // Sleep long enough for parent to send signal
+        sleep(300);
+        _exit(0);
+    }
+    // Kill child with SIGKILL
+    kill(pid, SIGKILL);
+    int status;
+    waitpid(pid, &status, 0);
+    // Should not crash; exercises the signal path
+    EXPECT_NO_FATAL_FAILURE(
+        CallHandleChildExit(pid, status, "test_snapshot_signaled"));
+}
+
+// ========== HandleChildTimeout ==========
+
+TEST_F(SnapshotChildProcessTest, HandleChildTimeout_KillsSleepingChild) {
+    CreateDefaultService();
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        // Sleep indefinitely; parent will kill us
+        sleep(300);
+        _exit(0);
+    }
+    // HandleChildTimeout sends SIGTERM, waits 5s, then SIGKILL if needed
+    EXPECT_NO_FATAL_FAILURE(
+        CallHandleChildTimeout(pid, "test_snapshot_timeout"));
+
+    // Verify child is truly gone
+    int status;
+    pid_t result = waitpid(pid, &status, WNOHANG);
+    // result should be -1 (already reaped) or pid (just reaped)
+    // It should NOT be 0 (still running)
+    EXPECT_NE(result, 0) << "Child process should have been terminated";
+}
+
+// ========== CleanupOldSnapshot ==========
+
+TEST_F(SnapshotChildProcessTest, CleanupOldSnapshot_KeepsRecentDeletesOld) {
+    CreateDefaultService();
+    auto* backend = GetSnapshotObjectStore();
+    ASSERT_NE(backend, nullptr);
+
+    // Create 5 fake snapshots with valid catalog descriptors so cleanup sees
+    // the same metadata shape as production snapshots.
+    std::vector<std::string> snapshot_ids = {
+        "20240101_000000_000", "20240102_000000_000", "20240103_000000_000",
+        "20240104_000000_000", "20240105_000000_000"};
+
+    for (const auto& id : snapshot_ids) {
+        std::string key = "mooncake_master_snapshot/" + id + "/metadata";
+        backend->UploadString(key, "dummy_metadata");
+        std::string manifest_key =
+            "mooncake_master_snapshot/" + id + "/manifest.txt";
+        backend->UploadString(manifest_key, "messagepack|1.0.0|" + id);
+
+        auto descriptor =
+            ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(id);
+        auto descriptor_payload =
+            ha::snapshot_catalog_store_detail::SerializeSnapshotDescriptor(
+                descriptor);
+        auto descriptor_key =
+            ha::snapshot_catalog_store_detail::BuildDescriptorKey(id);
+        backend->UploadString(descriptor_key, descriptor_payload);
+    }
+
+    // Keep only 2, cleanup with current snapshot_id = last one
+    CallCleanupOldSnapshot(2, "20240105_000000_000");
+
+    // Verify: list remaining objects
+    std::vector<std::string> remaining;
+    backend->ListObjectsWithPrefix("mooncake_master_snapshot/", remaining);
+
+    // Only the 2 newest (20240104, 20240105) should remain
+    for (const auto& key : remaining) {
+        EXPECT_TRUE(key.find("20240104_000000_000") != std::string::npos ||
+                    key.find("20240105_000000_000") != std::string::npos)
+            << "Unexpected remaining key: " << key;
+    }
+    EXPECT_GE(remaining.size(), 2u);
+}
+
+// ========== UploadSnapshotPayloadFile ==========
+
+TEST_F(SnapshotChildProcessTest, UploadSnapshotPayloadFile_Success) {
+    CreateDefaultService();
+    std::vector<uint8_t> data = {10, 20, 30, 40, 50};
+    std::string path = "mooncake_master_snapshot/test_upload/metadata";
+    auto result =
+        CallUploadSnapshotPayloadFile(data, path, "metadata", "test_upload");
+    ASSERT_TRUE(result.has_value())
+        << "UploadSnapshotPayloadFile failed: " << result.error().message;
+
+    // Verify data can be downloaded back
+    std::vector<uint8_t> downloaded;
+    auto dl = GetSnapshotObjectStore()->DownloadBuffer(path, downloaded);
+    ASSERT_TRUE(dl.has_value()) << dl.error();
+    EXPECT_EQ(downloaded, data);
+}
+
+// ========== Auto Snapshot Thread ==========
+
+TEST_F(SnapshotChildProcessTest, AutoSnapshot_GeneratesFiles) {
+    // Create a service with snapshot enabled and short interval
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(true)
+                      .set_enable_snapshot_restore(false)
+                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                      .set_snapshot_interval_seconds(2)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    auto auto_service = std::make_unique<MasterService>(config);
+
+    // Wait long enough for at least one snapshot cycle to complete
+    // interval=2s, so wait ~5s to be safe
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    // Check if latest.txt was generated
+    std::string latest_path =
+        tmp_dir() + "/mooncake_master_snapshot/latest.txt";
+    bool found = fs::exists(latest_path);
+
+    // Destroy service to stop snapshot thread before assertions
+    auto_service.reset();
+
+    EXPECT_TRUE(found) << "Snapshot thread should have generated latest.txt at "
+                       << latest_path;
+}
+
+TEST_F(SnapshotChildProcessTest, PersistState_PublishesSnapshotDescriptor) {
+    constexpr ViewVersionId kViewVersion = 37;
+    const std::string snapshot_id = "20240601_120000_123";
+    CreateDefaultService(kViewVersion);
+
+    auto before_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    auto persist_result = CallPersistState(snapshot_id);
+    auto after_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().snapshot_id, snapshot_id);
+    EXPECT_EQ(latest->value().manifest_key,
+              "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt");
+    EXPECT_EQ(latest->value().object_prefix,
+              "mooncake_master_snapshot/" + snapshot_id + "/");
+    EXPECT_EQ(latest->value().last_included_seq, 0u);
+    EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
+    const auto created_at_ms = latest->value().created_at_ms;
+    EXPECT_GE(created_at_ms, before_ms);
+    EXPECT_LE(created_at_ms, after_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
+    const std::string snapshot_id = "20240601_120000_124";
+    CreateDefaultService();
+
+    auto descriptor =
+        ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(snapshot_id);
+    descriptor.last_included_seq = 123;
+    descriptor.producer_view_version = 41;
+    descriptor.manifest_key =
+        "mooncake_master_snapshot/" + snapshot_id + "/manifest.txt";
+    descriptor.object_prefix = "mooncake_master_snapshot/" + snapshot_id + "/";
+    descriptor.created_at_ms = 1717243200123;
+
+    auto persist_result = CallPersistState(descriptor);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().snapshot_id, descriptor.snapshot_id);
+    EXPECT_EQ(latest->value().manifest_key, descriptor.manifest_key);
+    EXPECT_EQ(latest->value().object_prefix, descriptor.object_prefix);
+    EXPECT_EQ(latest->value().last_included_seq, descriptor.last_included_seq);
+    EXPECT_EQ(latest->value().producer_view_version,
+              descriptor.producer_view_version);
+    EXPECT_EQ(latest->value().created_at_ms, descriptor.created_at_ms);
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "grouped_snapshot_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "snapshot_grouped_route_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(service_.get(), key)};
+
+    auto put_start = service_->PutStart(client_id, key, 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->ExistKey(key).value_or(false));
+
+    auto persist_result = CallPersistState("20240701_130000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    auto restored_replicas = service_->GetReplicaList(key);
+    ASSERT_TRUE(restored_replicas.has_value())
+        << "Grouped key should remain reachable by key after restore";
+    ASSERT_TRUE(service_->Remove(key, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->ExistKey(key).value_or(true));
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
+    CreateDefaultService();
+    const std::string key = "legacy_snapshot_no_group_id_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(8);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{10});
+
+    auto deserialize_result =
+        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+}
+
+TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
+    MasterConfig legacy_config;
+    legacy_config.enable_ha = true;
+    legacy_config.ha_backend_type = "etcd";
+    legacy_config.ha_backend_connstring.clear();
+    legacy_config.etcd_endpoints = "127.0.0.1:2379";
+
+    WrappedMasterServiceConfig wrapped_config(legacy_config, 11);
+    EXPECT_EQ(wrapped_config.ha_backend_connstring,
+              legacy_config.etcd_endpoints);
+
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(service_config.ha_backend_connstring,
+              legacy_config.etcd_endpoints);
+}
+
+#ifdef STORE_USE_ETCD
+TEST_F(SnapshotChildProcessTest,
+       PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {
+    const std::string etcd_endpoints = "127.0.0.1:2379";
+    auto connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+    if (connect_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(connect_err);
+    }
+
+    const std::string cluster_id =
+        "snapshot-descriptor-" + UuidToString(generate_uuid());
+    constexpr ViewVersionId kViewVersion = 19;
+    constexpr uint64_t kLatestSequenceId = 123;
+    const std::string snapshot_id = "20240601_120000_456";
+
+    EtcdOpLogStore oplog_store(cluster_id);
+    auto init_err = oplog_store.Init();
+    if (init_err != ErrorCode::OK) {
+        GTEST_SKIP() << "failed to initialize etcd oplog store: "
+                     << toString(init_err);
+    }
+
+    auto update_err = oplog_store.UpdateLatestSequenceId(kLatestSequenceId);
+    if (update_err != ErrorCode::OK) {
+        GTEST_SKIP() << "failed to update etcd latest sequence id: "
+                     << toString(update_err);
+    }
+
+    CreateEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    auto persist_result = CallPersistState(snapshot_id);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    auto* catalog_store = GetSnapshotCatalogStore();
+    ASSERT_NE(catalog_store, nullptr);
+    auto latest = catalog_store->GetLatest();
+    ASSERT_TRUE(latest.has_value());
+    ASSERT_TRUE(latest->has_value());
+
+    EXPECT_EQ(latest->value().last_included_seq, kLatestSequenceId);
+    EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
+    EXPECT_GT(latest->value().created_at_ms, 0);
+}
+#endif
+
+// ========== Snapshot Backup Dir ==========
+
+TEST_F(SnapshotChildProcessTest, RestoreWithBackupDir_CreatesBackupFiles) {
+    // Step 1: Create a snapshot using a service
+    CreateDefaultService();
+    auto persist_result = CallPersistState("20240601_120000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    // Destroy the service
+    service_.reset();
+
+    // Step 2: Create a new service with restore + backup_dir set
+    std::string backup_dir = tmp_dir() + "/backup_restore_test";
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir(backup_dir)
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    auto restore_service = std::make_unique<MasterService>(config);
+
+    // Step 3: Verify backup files were created in
+    // {backup_dir}/mooncake_snapshot_restore_backup/
+    std::string restore_dir = backup_dir + "/mooncake_snapshot_restore_backup";
+    EXPECT_TRUE(fs::exists(restore_dir + "/manifest.txt"))
+        << "manifest.txt should be backed up during restore";
+    EXPECT_TRUE(fs::exists(restore_dir + "/metadata"))
+        << "metadata should be backed up during restore";
+    EXPECT_TRUE(fs::exists(restore_dir + "/segments"))
+        << "segments should be backed up during restore";
+    EXPECT_TRUE(fs::exists(restore_dir + "/task_manager"))
+        << "task_manager should be backed up during restore";
+
+    restore_service.reset();
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
+    // Step 1: Create a snapshot using a service
+    CreateDefaultService();
+    auto persist_result = CallPersistState("20240601_120000_001");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    // Destroy the service
+    service_.reset();
+
+    // Step 2: Create a new service with restore but NO backup_dir
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir("")  // empty = no backup
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    auto restore_service = std::make_unique<MasterService>(config);
+
+    // Step 3: Verify NO backup directory was created
+    // With empty backup_dir, use_snapshot_backup_dir_ should be false
+    // and no restore directory should exist anywhere in tmp_dir()
+    bool any_restore_dir_found = false;
+    for (auto& entry : fs::recursive_directory_iterator(tmp_dir())) {
+        if (entry.is_directory() &&
+            entry.path().filename() == "mooncake_snapshot_restore_backup") {
+            any_restore_dir_found = true;
+            break;
+        }
+    }
+    EXPECT_FALSE(any_restore_dir_found)
+        << "No restore backup directory should exist when backup_dir is empty";
+
+    restore_service.reset();
+}
+
+TEST_F(SnapshotChildProcessTest,
+       RestoreFallsBackToPreviousHealthySnapshotWhenLatestIsCorrupted) {
+    CreateDefaultService();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore_fallback_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value())
+        << "MountSegment failed";
+
+    const std::string key1 = "restore_fallback_key_1";
+    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key1 failed";
+    EXPECT_TRUE(service_->ExistKey(key1).value_or(false))
+        << "ExistKey should refresh lease for key1 before snapshot1";
+
+    const std::string snapshot_id1 = "20240702_120000_000";
+    auto persist_result = CallPersistState(snapshot_id1);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot1 failed: "
+        << persist_result.error().message;
+
+    const std::string key2 = "restore_fallback_key_2";
+    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put2.has_value()) << "PutStart for key2 failed";
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value())
+        << "PutEnd for key2 failed";
+    EXPECT_TRUE(service_->ExistKey(key2).value_or(false))
+        << "ExistKey should refresh lease for key2 before snapshot2";
+
+    const std::string snapshot_id2 = "20240702_120500_000";
+    persist_result = CallPersistState(snapshot_id2);
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState for snapshot2 failed: "
+        << persist_result.error().message;
+
+    const fs::path corrupted_metadata = fs::path(tmp_dir()) /
+                                        "mooncake_master_snapshot" /
+                                        snapshot_id2 / "metadata";
+    std::ofstream corrupt_stream(corrupted_metadata, std::ios::binary);
+    ASSERT_TRUE(corrupt_stream.is_open())
+        << "Failed to corrupt latest snapshot metadata";
+    corrupt_stream << "corrupted-snapshot-payload";
+    corrupt_stream.close();
+
+    service_.reset();
+
+    auto restore_config = MasterServiceConfigBuilder()
+                              .set_enable_snapshot(false)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                              .set_snapshot_interval_seconds(100)
+                              .set_snapshot_child_timeout_seconds(60)
+                              .set_snapshot_retention_count(3)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+
+    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
+        << "Restore should fall back to the previous healthy snapshot";
+    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false))
+        << "Corrupted latest snapshot must not be partially restored";
+
+    restored_service.reset();
+}
+
+// ========== Environment Variable Tests ==========
+
+TEST_F(SnapshotChildProcessTest, EnableSnapshotWithoutEnvVar_Throws) {
+    // Unset env var
+    ::unsetenv(kEnvSnapshotLocalPath);
+
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(true)
+                      .set_enable_snapshot_restore(false)
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+
+    // LocalFileSnapshotObjectStore default constructor throws when env var is
+    // missing
+    EXPECT_THROW(MasterService service(config), std::runtime_error);
+}
+
+TEST_F(SnapshotChildProcessTest, DisableSnapshotWithoutEnvVar_NoThrow) {
+    // Unset env var
+    ::unsetenv(kEnvSnapshotLocalPath);
+
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(false)
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+
+    // With snapshot disabled, backend is never created, so no throw
+    EXPECT_NO_THROW({ MasterService service(config); });
+}
+
+// ========== Restore Dirty Data Cleanup ==========
+
+TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
+    // Step 1: Create service and add both clean and dirty data
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    service_ = std::make_unique<MasterService>(config);
+
+    // Mount a segment
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
+
+    // Add a complete object (clean data)
+    std::string clean_key = "clean_object";
+    auto put_result =
+        service_->PutStart(client_id, clean_key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put_result.has_value()) << "PutStart clean failed";
+    auto put_end_result =
+        service_->PutEnd(client_id, clean_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value()) << "PutEnd clean failed";
+
+    // Add an incomplete object (PutStart without PutEnd -> non-COMPLETE)
+    std::string dirty_key = "dirty_incomplete";
+    auto put_dirty_result =
+        service_->PutStart(client_id, dirty_key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put_dirty_result.has_value()) << "PutStart dirty failed";
+    // Intentionally NO PutEnd -> replica stays in PENDING status
+
+    // Verify both keys exist in metadata before snapshot
+    EXPECT_TRUE(service_->ExistKey(clean_key).value_or(false));
+    EXPECT_TRUE(KeyExistsInMetadata(service_.get(), dirty_key))
+        << "Dirty key should exist in raw metadata after PutStart";
+
+    // Step 2: Persist state
+    auto persist_result = CallPersistState("20240701_120000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+    service_.reset();
+
+    // Step 3: Restore into a new service
+    auto restore_config = MasterServiceConfigBuilder()
+                              .set_enable_snapshot(false)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                              .set_snapshot_interval_seconds(100)
+                              .set_snapshot_child_timeout_seconds(60)
+                              .set_snapshot_retention_count(3)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+
+    // Step 4: Verify non-COMPLETE replica was cleaned, complete one remains
+    EXPECT_TRUE(restored_service->ExistKey(clean_key).value_or(false))
+        << "Complete object should survive restore";
+    EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), dirty_key))
+        << "Non-COMPLETE object should be cleaned from metadata during restore";
+
+    restored_service.reset();
+}
+
+TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
+    // Step 1: Create service with long lease TTL
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .set_default_kv_lease_ttl(600000)  // 10 min lease
+                      .build();
+    service_ = std::make_unique<MasterService>(config);
+
+    // Mount a segment
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
+
+    // Add two complete objects via PutStart + PutEnd
+    // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
+    std::string expired_key = "expired_lease_object";
+    auto put_exp =
+        service_->PutStart(client_id, expired_key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put_exp.has_value()) << "PutStart expired failed";
+    ASSERT_TRUE(service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
+                    .has_value())
+        << "PutEnd expired failed";
+
+    std::string normal_key = "normal_lease_object";
+    auto put_norm =
+        service_->PutStart(client_id, normal_key, {1024}, {.replica_num = 1});
+    ASSERT_TRUE(put_norm.has_value()) << "PutStart normal failed";
+    ASSERT_TRUE(service_->PutEnd(client_id, normal_key, ReplicaType::MEMORY)
+                    .has_value())
+        << "PutEnd normal failed";
+
+    // ExistKey grants a fresh lease (now + 600s) to normal_key
+    EXPECT_TRUE(service_->ExistKey(normal_key).value_or(false));
+    // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
+
+    // Step 2: Persist state
+    auto persist_result = CallPersistState("20240701_120000_001");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+    service_.reset();
+
+    // Step 3: Restore into a new service
+    auto restore_config = MasterServiceConfigBuilder()
+                              .set_enable_snapshot(false)
+                              .set_enable_snapshot_restore(true)
+                              .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                              .set_snapshot_interval_seconds(100)
+                              .set_snapshot_child_timeout_seconds(60)
+                              .set_snapshot_retention_count(3)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    auto restored_service = std::make_unique<MasterService>(restore_config);
+
+    // Step 4: Verify normal data retained, expired-lease data cleaned
+    EXPECT_TRUE(restored_service->ExistKey(normal_key).value_or(false))
+        << "Normal object with valid lease should survive restore";
+    EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
+        << "Lease-expired object should be cleaned during restore";
+
+    restored_service.reset();
+}
+
+// ========== PersistState Fail-Fast ==========
+
+TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
+    // Create service WITHOUT backup_dir to test fail-fast behavior
+    auto config =
+        MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir("")  // empty = no backup, fail-fast
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .build();
+    service_ = std::make_unique<MasterService>(config);
+
+    // Mount a segment to have some data to serialize
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x200000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Create a FILE named "mooncake_master_snapshot" to block directory
+    // creation This will cause the upload to fail when trying to create
+    // subdirectory
+    std::string snapshot_root = tmp_dir() + "/mooncake_master_snapshot";
+    std::ofstream blocker(snapshot_root);
+    blocker << "blocking file";
+    blocker.close();
+
+    // PersistState should fail on first upload attempt
+    auto result = CallPersistState("20240701_failfast_000");
+    EXPECT_FALSE(result.has_value()) << "PersistState should fail";
+
+    // Remove the blocking file for cleanup
+    fs::remove(snapshot_root);
+
+    // Verify error message contains only first file error (fail-fast behavior)
+    // Upload order: metadata -> segments -> task_manager -> manifest.txt
+    ASSERT_FALSE(result.has_value()) << "PersistState should fail";
+
+    const auto& error_msg = result.error().message;
+    LOG(INFO) << "PersistState error: " << error_msg;
+
+    // Should contain "metadata" (first upload that fails)
+    EXPECT_NE(error_msg.find("metadata"), std::string::npos)
+        << "Error should be about metadata file (first upload), got: "
+        << error_msg;
+
+    // Should NOT contain subsequent files (fail-fast stops after first error)
+    EXPECT_EQ(error_msg.find("segments"), std::string::npos)
+        << "Error should NOT contain 'segments' (fail-fast should stop before "
+           "this), got: "
+        << error_msg;
+    EXPECT_EQ(error_msg.find("task_manager"), std::string::npos)
+        << "Error should NOT contain 'task_manager' (fail-fast should stop "
+           "before this), got: "
+        << error_msg;
+    EXPECT_EQ(error_msg.find("manifest"), std::string::npos)
+        << "Error should NOT contain 'manifest' (fail-fast should stop before "
+           "this), got: "
+        << error_msg;
+}
+
+// ========== Backup Dir Upload Fail ==========
+
+TEST_F(SnapshotChildProcessTest, UploadFail_WithBackupDir_SavesAllFiles) {
+    // Create service WITH backup_dir to test non-fail-fast behavior
+    std::string backup_dir = tmp_dir() + "/backup_upload_fail";
+    auto config = MasterServiceConfigBuilder()
+                      .set_enable_snapshot(false)
+                      .set_enable_snapshot_restore(true)
+                      .set_snapshot_backup_dir(backup_dir)
+                      .set_snapshot_interval_seconds(100)
+                      .set_snapshot_child_timeout_seconds(60)
+                      .set_snapshot_retention_count(3)
+                      .set_snapshot_object_store_type("local")
+                      .build();
+    service_ = std::make_unique<MasterService>(config);
+
+    // Mount a segment to have some data to serialize
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "test_segment";
+    segment.base = 0x200000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    // Create a FILE named "mooncake_master_snapshot" to block directory
+    // creation, causing all uploads to fail
+    std::string snapshot_root = tmp_dir() + "/mooncake_master_snapshot";
+    std::ofstream blocker(snapshot_root);
+    blocker << "blocking file";
+    blocker.close();
+
+    // PersistState should fail but try all uploads
+    auto result = CallPersistState("20240701_backup_all_000");
+    EXPECT_FALSE(result.has_value()) << "PersistState should fail";
+
+    // Verify error message contains ALL files (non-fail-fast with backup_dir)
+    const auto& error_msg = result.error().message;
+    LOG(INFO) << "PersistState error: " << error_msg;
+
+    EXPECT_NE(error_msg.find("metadata"), std::string::npos)
+        << "Error should contain 'metadata', got: " << error_msg;
+    EXPECT_NE(error_msg.find("segments"), std::string::npos)
+        << "Error should contain 'segments', got: " << error_msg;
+    EXPECT_NE(error_msg.find("task_manager"), std::string::npos)
+        << "Error should contain 'task_manager', got: " << error_msg;
+    EXPECT_NE(error_msg.find("manifest"), std::string::npos)
+        << "Error should contain 'manifest', got: " << error_msg;
+
+    // Verify ALL files were saved to backup_dir/mooncake_snapshot_save_backup/
+    std::string save_dir = backup_dir + "/mooncake_snapshot_save_backup";
+    EXPECT_TRUE(fs::exists(save_dir + "/metadata"))
+        << "metadata should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/segments"))
+        << "segments should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/task_manager"))
+        << "task_manager should be saved to backup dir";
+    EXPECT_TRUE(fs::exists(save_dir + "/manifest.txt"))
+        << "manifest.txt should be saved to backup dir";
+
+    // Remove the blocking file for cleanup
+    fs::remove(snapshot_root);
+}
+
+}  // namespace mooncake::test
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
