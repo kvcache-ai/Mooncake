@@ -228,8 +228,8 @@ System-managed behavior:
 | `tags` | `["dram"]` | tags published with the segment |
 | `alignment` | `64` | allocation alignment |
 | `reclaim_grace_ms` | `1000` | delayed reclaim window |
-| `eviction_high_watermark_percent` | `95` | start background eviction when local usage reaches this percentage |
-| `eviction_low_watermark_percent` | `90` | stop background eviction after usage falls to this percentage |
+| `eviction_high_watermark_percent` | `90` | start background eviction when local usage reaches this percentage |
+| `eviction_low_watermark_percent` | `80` | stop background eviction after usage falls to this percentage |
 | `eviction_poll_interval` | `100ms` | background storage-owner eviction polling interval; `0` disables the worker |
 | `hugepage_enabled` | `None` | override hugepage enablement for local storage and scratch |
 | `hugepage_size_bytes` | `None` | override hugepage size; `2 MiB` and `1 GiB` are supported |
