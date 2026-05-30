@@ -2209,6 +2209,7 @@ fn storage_config() -> LocalMemoryConfig {
         .storage_bytes(4096)
         .scratch_bytes(4096)
         .reclaim_grace_ms(0)
+        .eviction_poll_interval(Duration::ZERO)
 }
 
 fn storage_config_with_bytes(storage_bytes: usize) -> LocalMemoryConfig {
@@ -2247,6 +2248,7 @@ fn storage_config_with_layout(
         .scratch_bytes(scratch_bytes)
         .alignment(alignment)
         .reclaim_grace_ms(0)
+        .eviction_poll_interval(Duration::ZERO)
 }
 
 fn rw_only_config() -> LocalMemoryConfig {
@@ -2470,6 +2472,17 @@ fn wait_for_membership_convergence(clients: &[&StoreClient]) {
             wait_for_runtime_visibility(client, runtime);
         }
     }
+}
+
+fn wait_for_active_stream_session(client: &ControlPlaneClient, context: &'static str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if client.active_stream_sessions() >= 1 {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    panic!("{context}");
 }
 
 fn wait_for_storage_clock_hot(storage: &StoreClient, route: &ObjectRoute) {
@@ -4382,7 +4395,7 @@ fn singleton_control_plane_paths_use_stream_sessions() {
     wait_for_membership_convergence(&[&storage, &router, &reader]);
 
     assert_eq!(router.control_client.active_stream_sessions(), 0);
-    router
+    let route = router
         .put_in_tenant("tenant-a", "single-stream-key", b"single-stream-payload")
         .expect("routed put should succeed");
     assert!(
@@ -4397,10 +4410,11 @@ fn singleton_control_plane_paths_use_stream_sessions() {
             .expect("reader get should succeed"),
         b"single-stream-payload"
     );
-    assert!(
-        reader.control_client.active_stream_sessions() >= 1,
-        "single-item route lookup should open a reusable control stream"
+    wait_for_active_stream_session(
+        &reader.control_client,
+        "async route hit reporting should open a reusable control stream",
     );
+    wait_for_storage_clock_hot(&storage, &route);
 }
 
 #[test]

@@ -494,6 +494,13 @@ impl StoreClientBuilder {
         )?;
         let async_replica_tracking = AsyncReplicaTrackHandle::spawn(
             &runtime,
+            runtime_metadata.clone(),
+            control_client.clone(),
+            live_client_cache.clone(),
+        )?;
+        let async_route_hit_reporting = AsyncRouteHitReportHandle::spawn(
+            &runtime,
+            runtime_metadata.clone(),
             control_client.clone(),
             live_client_cache.clone(),
         )?;
@@ -511,6 +518,7 @@ impl StoreClientBuilder {
             membership_sync,
             _async_eviction: async_eviction,
             async_replica_tracking,
+            async_route_hit_reporting,
             default_tenant: self.default_tenant,
             local_memory: self.local_memory,
             transport: self.transport,

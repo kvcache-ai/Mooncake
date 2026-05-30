@@ -1847,6 +1847,7 @@ impl Drop for StoreClient {
     fn drop(&mut self) {
         self.membership_sync.shutdown();
         self.async_replica_tracking.shutdown();
+        self.async_route_hit_reporting.shutdown();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {

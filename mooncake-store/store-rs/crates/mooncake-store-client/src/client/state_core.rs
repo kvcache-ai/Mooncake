@@ -350,6 +350,7 @@ struct ClockEntry {
     id: ClockEntryId,
     length_bytes: u64,
     hot: bool,
+    hot_credit: u8,
     fresh_write: bool,
 }
 

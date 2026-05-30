@@ -1447,6 +1447,7 @@ impl StoreClient {
                             BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
                             Some(current),
                         ) => {
+                            self.storage_owner.track_route(&current);
                             debug!(
                                 runtime = %self.lease.runtime,
                                 key = %pending.key.0,

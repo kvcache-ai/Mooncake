@@ -2704,38 +2704,8 @@ impl StoreClient {
         if remote_hits.is_empty() {
             return;
         }
-        let leases = if force_membership_refresh_on_miss {
-            self.lookup_runtime_leases(remote_hits.keys().cloned())
-        } else {
-            self.lookup_cached_runtime_leases_best_effort(remote_hits.keys().cloned())
-        };
-        let leases = match leases {
-            Ok(leases) => leases,
-            Err(error) => {
-                debug!(
-                    runtime = %self.lease.runtime,
-                    error = %error,
-                    targets = remote_hits.len(),
-                    "failed to resolve storage-owner leases for hit reporting"
-                );
-                return;
-            }
-        };
-        for (owner, keys) in remote_hits {
-            let Some(lease) = leases.get(&owner) else {
-                continue;
-            };
-            let keys = keys.into_iter().collect::<Vec<_>>();
-            if let Err(error) = self.control_client.batch_report_route_hits(lease, &keys) {
-                debug!(
-                    runtime = %self.lease.runtime,
-                    storage_owner = %owner,
-                    error = %error,
-                    items = keys.len(),
-                    "storage-owner hit report failed"
-                );
-            }
-        }
+        self.async_route_hit_reporting
+            .enqueue(remote_hits, force_membership_refresh_on_miss);
     }
 
     fn track_remote_storage_owners_best_effort(&self, routes: &[ObjectRoute]) {
