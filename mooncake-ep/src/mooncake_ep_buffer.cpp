@@ -20,8 +20,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
 #ifdef MOONCAKE_EP_USE_MUSA
-    MUSA_CHECK(musaGetDevice(&device_id));
-    MUSA_CHECK(musaDeviceGetAttribute(&clock_rate_khz,
+    CUDA_CHECK(musaGetDevice(&device_id));
+    CUDA_CHECK(musaDeviceGetAttribute(&clock_rate_khz,
                                       musaDevAttrClockRate, device_id));
 #else
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -77,8 +77,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 
     // Workspace
 #ifdef MOONCAKE_EP_USE_MUSA
-    MUSA_CHECK(musaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    MUSA_CHECK(musaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES,
+    CUDA_CHECK(musaMalloc(&workspace, NUM_WORKSPACE_BYTES));
+    CUDA_CHECK(musaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES,
                                comm_stream.stream()));
 #else
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));

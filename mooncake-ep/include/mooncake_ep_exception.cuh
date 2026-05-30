@@ -22,6 +22,16 @@ class EPException : public std::exception {
 };
 
 #ifndef CUDA_CHECK
+#ifdef MOONCAKE_EP_USE_MUSA
+#define CUDA_CHECK(cmd)                                    \
+    do {                                                   \
+        musaError_t e = (cmd);                             \
+        if (e != musaSuccess) {                            \
+            throw EPException("MUSA", __FILE__, __LINE__,  \
+                              musaGetErrorString(e));      \
+        }                                                  \
+    } while (0)
+#else
 #define CUDA_CHECK(cmd)                                   \
     do {                                                  \
         cudaError_t e = (cmd);                            \
@@ -30,6 +40,7 @@ class EPException : public std::exception {
                               cudaGetErrorString(e));     \
         }                                                 \
     } while (0)
+#endif
 #endif
 
 #ifndef EP_HOST_ASSERT
@@ -47,7 +58,7 @@ class EPException : public std::exception {
         if (not(cond)) {                                                 \
             printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
                    __LINE__, #cond);                                     \
-            asm("trap;");                                                \
+            __trap();                                                    \
         }                                                                \
     } while (0)
 #endif

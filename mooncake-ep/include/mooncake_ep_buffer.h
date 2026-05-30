@@ -20,8 +20,7 @@
 
 namespace mooncake {
 
-// Same value as mlx5gda.h MAX_QP_COUNT.
-inline constexpr int MAX_QP_COUNT = 256;
+// MAX_QP_COUNT is defined in mooncake_ep_configs.cuh (shared with kernel code).
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;

@@ -452,11 +452,13 @@ class Buffer:
             num_local_experts = num_experts // num_ranks
 
             # Gather sizes first to handle variable num_tokens per rank
+            # MUSA/gloo: all_gather requires CPU tensors
+            gather_device = "cpu" if _USE_MUSA else x.device
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=x.device
+                [num_tokens], dtype=torch.int64, device=gather_device
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=x.device)
+                torch.empty(1, dtype=torch.int64, device=gather_device)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
@@ -493,14 +495,25 @@ class Buffer:
             num_max_dispatch_tokens = num_ranks * num_max_dispatch_tokens_per_rank
 
             # Gather inputs from all ranks (all have same shape after padding)
-            all_x = torch.empty(
-                (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
-            all_topk = torch.empty(
-                (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device=x.device
-            )
-            dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
+            # MUSA/gloo: all_gather_into_tensor requires flat CPU tensors
+            if _USE_MUSA:
+                flat_x_size = num_ranks * max_num_tokens * hidden
+                flat_topk_size = num_ranks * max_num_tokens * k
+                all_x_cpu = torch.empty(flat_x_size, dtype=x.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_x_cpu, x_padded.cpu().reshape(-1), group=self.group)
+                all_x = all_x_cpu.view(num_ranks, max_num_tokens, hidden).to(x.device)
+                all_topk_cpu = torch.empty(flat_topk_size, dtype=topk_idx.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_topk_cpu, topk_padded.cpu().reshape(-1), group=self.group)
+                all_topk = all_topk_cpu.view(num_ranks, max_num_tokens, k).to(x.device)
+            else:
+                all_x = torch.empty(
+                    (num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device
+                )
+                dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
+                all_topk = torch.empty(
+                    (num_ranks, max_num_tokens, k), dtype=topk_idx.dtype, device=x.device
+                )
+                dist.all_gather_into_tensor(all_topk, topk_padded, group=self.group)
 
             # Prepare outputs per local expert
             recv_x_list: List[torch.Tensor] = []
@@ -678,11 +691,13 @@ class Buffer:
             num_local_experts = num_experts // num_ranks
 
             # Gather sizes first to handle variable num_tokens per rank
+            # MUSA/gloo: all_gather requires CPU tensors
+            gather_device = "cpu" if _USE_MUSA else topk_idx.device
             num_tokens_tensor = torch.tensor(
-                [num_tokens], dtype=torch.int64, device=topk_idx.device
+                [num_tokens], dtype=torch.int64, device=gather_device
             )
             num_tokens_list = [
-                torch.empty(1, dtype=torch.int64, device=topk_idx.device)
+                torch.empty(1, dtype=torch.int64, device=gather_device)
                 for _ in range(num_ranks)
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
@@ -725,18 +740,28 @@ class Buffer:
                 topk_padded = topk_idx
                 topk_w_padded = topk_weights
 
-            all_topk_idx = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_idx.dtype,
-                device=topk_idx.device,
-            )
-            dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
-            all_topk_w = torch.empty(
-                (num_ranks, max_num_tokens, k),
-                dtype=topk_weights.dtype,
-                device=topk_weights.device,
-            )
-            dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
+            # MUSA/gloo: all_gather_into_tensor requires flat CPU tensors
+            if _USE_MUSA:
+                flat_topk_size = num_ranks * max_num_tokens * k
+                all_topk_idx_cpu = torch.empty(flat_topk_size, dtype=topk_idx.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_topk_idx_cpu, topk_padded.cpu().reshape(-1), group=self.group)
+                all_topk_idx = all_topk_idx_cpu.view(num_ranks, max_num_tokens, k).to(topk_idx.device)
+                all_topk_w_cpu = torch.empty(flat_topk_size, dtype=topk_weights.dtype, device="cpu")
+                dist.all_gather_into_tensor(all_topk_w_cpu, topk_w_padded.cpu().reshape(-1), group=self.group)
+                all_topk_w = all_topk_w_cpu.view(num_ranks, max_num_tokens, k).to(topk_weights.device)
+            else:
+                all_topk_idx = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_idx.dtype,
+                    device=topk_idx.device,
+                )
+                dist.all_gather_into_tensor(all_topk_idx, topk_padded, group=self.group)
+                all_topk_w = torch.empty(
+                    (num_ranks, max_num_tokens, k),
+                    dtype=topk_weights.dtype,
+                    device=topk_weights.device,
+                )
+                dist.all_gather_into_tensor(all_topk_w, topk_w_padded, group=self.group)
 
             expert_buffers = self._fallback_next_combine_buffer if zero_copy else x
             # Ensure bf16 input for accumulation
@@ -781,7 +806,13 @@ class Buffer:
                         send_buf[src_rank, tokens_valid] += contrib_valid * weights
 
             # All-reduce then take local slice (only valid tokens)
-            dist.all_reduce(send_buf, group=self.group)
+            # MUSA/gloo: all_reduce requires CPU tensors
+            if _USE_MUSA:
+                send_buf_cpu = send_buf.cpu()
+                dist.all_reduce(send_buf_cpu, group=self.group)
+                send_buf = send_buf_cpu.to(send_buf.device)
+            else:
+                dist.all_reduce(send_buf, group=self.group)
             combined_x = send_buf[self.rank, :num_tokens]
 
             # Write to out if provided

@@ -62,9 +62,16 @@ __device__ __forceinline__ int ep_atomic_add_release(const int* ptr, int val) {
 
 // ---------------------------------------------------------------------------
 // Non-coherent loads — MUSA has no nc/no_allocate cache hints; use volatile.
+// int4 volatile copy not supported by MUSA compiler; copy field-by-field.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int4 ep_ld_nc(const int4* ptr) {
-    return *const_cast<volatile const int4*>(ptr);
+    const volatile int* vp = reinterpret_cast<const volatile int*>(ptr);
+    int4 ret;
+    ret.x = vp[0];
+    ret.y = vp[1];
+    ret.z = vp[2];
+    ret.w = vp[3];
+    return ret;
 }
 
 __device__ __forceinline__ int ep_ld_nc_s32(const int* ptr) {
@@ -81,9 +88,14 @@ __device__ __forceinline__ int64_t ep_ld_nc_s64(const int64_t* ptr) {
 
 // ---------------------------------------------------------------------------
 // Non-temporal stores — MUSA has no nt/no_allocate hints; plain store.
+// int4 volatile assignment not supported by MUSA compiler; copy field-by-field.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void ep_st_na(const int4* ptr, const int4& val) {
-    *const_cast<volatile int4*>(ptr) = val;
+    volatile int* vp = reinterpret_cast<volatile int*>(const_cast<int4*>(ptr));
+    vp[0] = val.x;
+    vp[1] = val.y;
+    vp[2] = val.z;
+    vp[3] = val.w;
 }
 
 // ---------------------------------------------------------------------------

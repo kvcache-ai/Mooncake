@@ -46,12 +46,9 @@ if use_musa:
         "--cuda-gpu-arch=mp_31",
         "-O3",
     ]
-    extra_compile_args = {"cxx": cxx_flags, "musa": musa_flags}
-    extra_link_args = [
-        "-Wl,-rpath,$ORIGIN",
-        "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
-        "-l:engine.so",
-    ]
+    extra_compile_args = {"cxx": cxx_flags, "mcc": musa_flags}
+    # MUSA: stub provides createIbgdaDeviceTransport; no engine.so needed
+    extra_link_args = ["-Wl,-rpath,$ORIGIN"]
 else:
     ExtensionClass = CUDAExtension
     BuildClass = BuildExtension

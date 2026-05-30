@@ -10,7 +10,11 @@ import faulthandler
 import traceback
 
 from mooncake.mooncake_ep_buffer import Buffer
-import mooncake.pg as pg
+try:
+    import mooncake.pg as pg
+    _HAS_PG = True
+except (ModuleNotFoundError, ImportError):
+    _HAS_PG = False
 
 _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 if _USE_MUSA:
@@ -202,9 +206,16 @@ def worker(rank, world_size, config_dict):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device(_DEVICE)
 
-    dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
+    if _USE_MUSA or not _HAS_PG:
+        backend = "gloo"
+        cpu_backend = "gloo"
+    else:
+        backend = "mooncake"
+        cpu_backend = "mooncake-cpu"
+
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
-    cpu_group = dist.new_group(list(range(world_size)), backend="mooncake-cpu")
+    cpu_group = dist.new_group(list(range(world_size)), backend=cpu_backend)
 
     try:
         run_test_iteration(
@@ -218,7 +229,13 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    dist.destroy_process_group()
+    # torch_musa registers the musa device globally; gloo doesn't have a musa
+    # backend, so destroy_process_group raises.  Ignore the error on MUSA.
+    try:
+        dist.destroy_process_group()
+    except RuntimeError:
+        if not _USE_MUSA:
+            raise
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
@@ -291,6 +308,10 @@ def generate_tests():
         raw_dict = dict(zip(keys, t))
 
         if raw_dict["async_finish"] and raw_dict["return_recv_hook"]:
+            continue
+
+        # MUSA/gloo: os._exit(0) breaks TCP connections; skip fail_rank tests
+        if _USE_MUSA and raw_dict["fail_rank"] != -1:
             continue
 
         # Flatten
