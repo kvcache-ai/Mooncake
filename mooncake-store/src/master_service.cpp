@@ -3597,13 +3597,13 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
-    // Start with an already-elapsed window so the first loop iteration
-    // (after kEvictionThreadSleepMs) triggers DiscardExpiredProcessingReplicas.
-    // Without this, a task admitted shortly after thread startup can survive
-    // the first reaper cycle and not be cleaned until ~2s later, causing
-    // promotion-on-hit tests that sleep for 2s to flake.
+    // Sweep expired PROCESSING / replication / offload / promotion state on a
+    // bounded cadence instead of only once per release TTL. Otherwise a task
+    // admitted just after a sweep can miss the next TTL-sized check, forcing
+    // cleanup to wait nearly another full TTL after it has already expired.
+    constexpr auto kDiscardSweepInterval = std::chrono::milliseconds(100);
     auto last_discard_time =
-        std::chrono::system_clock::now() - put_start_release_timeout_sec_;
+        std::chrono::system_clock::now() - kDiscardSweepInterval;
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -3623,9 +3623,11 @@ void MasterService::EvictionThreadFunc() {
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
-        } else if (now - last_discard_time > put_start_release_timeout_sec_) {
-            // Try discarding expired processing keys and ongoing replication
-            // tasks if we have not done this for a long time.
+        } else if (now - last_discard_time >= kDiscardSweepInterval) {
+            // Expiry still uses each task's own put_start_release_timeout_sec_
+            // inside DiscardExpiredProcessingReplicas. This cadence only
+            // bounds how late we notice work that has already crossed its
+            // deadline when the system is otherwise idle.
             {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
