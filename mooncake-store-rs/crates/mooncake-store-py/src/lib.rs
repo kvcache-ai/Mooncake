@@ -1989,8 +1989,8 @@ mod tests {
     use pyo3::{prepare_freethreaded_python, Python};
 
     use super::{
-        _store_rs, init_tracing, metrics_server_address, metrics_text, parse_initial_state_arg,
-        batch_put_from_fanout_ranges, batch_put_from_fanout_width, pointer_from_usize,
+        _store_rs, batch_put_from_fanout_ranges, batch_put_from_fanout_width, init_tracing,
+        metrics_server_address, metrics_text, parse_initial_state_arg, pointer_from_usize,
         replication_policy, route_to_py, segment_to_py, start_metrics_server, stop_metrics_server,
         store_error_to_py, DummySession, PyMooncakeDistributedStore, PyMooncakeHostMemAllocator,
         StoreBackend, BATCH_PUT_FROM_FANOUT_ENV,

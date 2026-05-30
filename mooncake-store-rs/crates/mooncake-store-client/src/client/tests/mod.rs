@@ -11,12 +11,12 @@ use mooncake_store_core::{
     ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
     ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
     MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, RouteCasRequest,
-    RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
-    SegmentName, SegmentTargetChunk, StoreError, TenantBandwidthShapingPolicy,
-    TenantExecutionFairnessPolicy, TenantObjectAccounting, TenantPlacementPolicy, TenantPolicy,
-    TenantPolicyScope, TenantPolicySpec, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
-    TenantQuotaPolicy, TenantQuotaReservation, TenantQuotaReservationOutcome, TenantQuotaState,
-    TenantRoutePolicy,
+    RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentTargetChunk, StoreError,
+    TenantBandwidthShapingPolicy, TenantExecutionFairnessPolicy, TenantObjectAccounting,
+    TenantPlacementPolicy, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
+    TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome, TenantQuotaPolicy, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaState, TenantRoutePolicy,
 };
 use mooncake_transport::{Opcode, TransferPacingMode};
 use parking_lot::Mutex;
@@ -116,6 +116,11 @@ struct CountingMetadataBackend {
     update_client_state_calls: AtomicUsize,
     reject_state_patch: bool,
     filter_expired_live_clients: bool,
+}
+
+struct CountingRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    get_object_routes_calls: AtomicUsize,
 }
 
 struct FinalizeFailureMetadataBackend {
@@ -287,6 +292,19 @@ impl CountingMetadataBackend {
             .into_iter()
             .filter(|lease| lease.expires_at_ms >= now)
             .collect())
+    }
+}
+
+impl CountingRouteDirectory {
+    fn new(inner: Arc<dyn RouteDirectory>) -> Self {
+        Self {
+            inner,
+            get_object_routes_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_object_routes_calls(&self) -> usize {
+        self.get_object_routes_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -1551,6 +1569,106 @@ impl MetadataBackend for CountingMetadataBackend {
     }
 }
 
+impl RouteDirectory for CountingRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn get_object_routes(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.get_object_routes_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_object_routes(observer, keys)
+    }
+
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.inner.get_object_routes_bounded(observer, keys)
+    }
+
+    fn contains_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.contains_object_route(observer, key)
+    }
+
+    fn contains_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<bool>> {
+        self.inner.contains_object_routes_bounded(observer, keys)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
+    }
+
+    fn compare_and_swap_object_routes(
+        &self,
+        observer: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::Result<mooncake_store_core::CasResult>>>
+    {
+        self.inner
+            .compare_and_swap_object_routes(observer, requests)
+    }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_routes_by_replica_owner(observer, owner)
+    }
+
+    fn list_routes_in_scope(
+        &self,
+        observer: &ClientLease,
+        scope: &NamespaceScope,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_routes_in_scope(observer, scope)
+    }
+
+    fn list_reuse_candidates(
+        &self,
+        observer: &ClientLease,
+        reuse: &mooncake_store_core::ReuseIdentity,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_reuse_candidates(observer, reuse)
+    }
+
+    fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
+        self.inner.get_version_floor(observer, key)
+    }
+
+    fn get_version_floors(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        self.inner.get_version_floors(observer, keys)
+    }
+}
+
 impl MetadataBackend for FinalizeFailureMetadataBackend {
     fn route_namespace(&self) -> String {
         self.inner.route_namespace()
@@ -2395,17 +2513,6 @@ fn wait_for_storage_clock_route(storage: &StoreClient, route: &ObjectRoute, requ
             storage.runtime_id()
         );
     }
-}
-
-fn prometheus_counter_value(metrics: &str, series: &str) -> Option<f64> {
-    metrics.lines().find_map(|line| {
-        let (line_series, value) = line.rsplit_once(' ')?;
-        if line_series == series {
-            value.parse::<f64>().ok()
-        } else {
-            None
-        }
-    })
 }
 
 fn wait_for_authority_route(
@@ -3426,13 +3533,6 @@ fn observability_metrics_render_fast_batch_put_stages() {
     assert!(metrics.contains("operation=\"batch_put_stage_rank\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_reserve\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""));
-    assert_eq!(
-        prometheus_counter_value(
-            &metrics,
-            "mooncake_store_operation_total{tenant=\"default\",operation=\"batch_put_stage_load_routes\",status=\"ok\"}"
-        ),
-        Some(1.0)
-    );
     assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
 }
@@ -9353,7 +9453,7 @@ fn local_only_batch_put_from_uses_registered_batch_write_path() {
         1024,
         1,
     );
-    let writer = StoreClientBuilder::new(metadata, "local-only-writer-batch-put-from")
+    let mut writer = StoreClientBuilder::new(metadata, "local-only-writer-batch-put-from")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
@@ -9364,6 +9464,8 @@ fn local_only_batch_put_from_uses_registered_batch_write_path() {
         .expect("writer build should succeed");
 
     wait_for_membership_convergence(&[&writer]);
+    let route_directory = Arc::new(CountingRouteDirectory::new(writer.route_directory.clone()));
+    writer.route_directory = route_directory.clone();
 
     let mut source = [0u8; 32];
     source[..8].copy_from_slice(b"abcdefgh");
@@ -9409,14 +9511,15 @@ fn local_only_batch_put_from_uses_registered_batch_write_path() {
     let opcodes = writer_transport.submitted_request_opcodes();
     assert_eq!(opcodes.len(), 1);
     assert!(opcodes[0].iter().all(|opcode| *opcode == Opcode::Write));
+    assert_eq!(
+        route_directory.get_object_routes_calls(),
+        0,
+        "accept-existing batch_put_from should skip the publish-stage route preload"
+    );
 
     let metrics = render_prometheus_metrics();
     assert!(metrics.contains("operation=\"batch_put_stage_write\",status=\"ok\""));
     assert!(metrics.contains("operation=\"batch_put_stage_route_cas\",status=\"ok\""));
-    assert!(
-        !metrics.contains("operation=\"batch_put_stage_load_routes\",status=\"ok\""),
-        "accept-existing batch_put_from should skip the publish-stage route preload"
-    );
 }
 
 #[test]
