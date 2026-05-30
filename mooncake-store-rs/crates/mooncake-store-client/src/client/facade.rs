@@ -1519,17 +1519,27 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
         let tracker = OperationTracker::new("batch_get")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
-        let mut resolved = self.resolve_objects(objects)?;
-        let mut buffers = resolved
+        let (mut resolved, resolved_indices) = self.resolve_objects(objects)?;
+        if resolved.is_empty() && !objects.is_empty() {
+            let result: Result<Vec<Vec<u8>>> =
+                Err(StoreError::NotFound("no resolvable objects in batch".into()));
+            tracker.finish(&result, 0);
+            return result;
+        }
+        let mut dense_buffers = resolved
             .iter()
             .map(|entry| vec![0u8; entry.replica.length as usize])
             .collect::<Vec<_>>();
-        let mut slices = buffers
+        let mut dense_slices = dense_buffers
             .iter_mut()
             .map(Vec::as_mut_slice)
             .collect::<Vec<_>>();
         self.report_get_hits_best_effort(&resolved);
-        self.execute_batch_get_into(&mut resolved, &mut slices)?;
+        self.execute_batch_get_into(&mut resolved, &mut dense_slices)?;
+        let mut buffers = vec![Vec::new(); objects.len()];
+        for (dense_idx, &orig_idx) in resolved_indices.iter().enumerate() {
+            buffers[orig_idx] = std::mem::take(&mut dense_buffers[dense_idx]);
+        }
         let bytes_out = buffers
             .iter()
             .map(|buffer| buffer.len() as u64)
@@ -1571,14 +1581,29 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 object
             })
             .collect::<Vec<_>>();
-        let mut resolved = self.resolve_objects(&objects)?;
-        let mut buffers = requests
+        let (mut resolved, resolved_indices) = self.resolve_objects(&objects)?;
+        if resolved.is_empty() {
+            let sizes = vec![0; requests.len()];
+            let result = Ok(sizes);
+            tracker.finish(&result, 0);
+            return result;
+        }
+        let mut all_buffers: Vec<&mut [u8]> = requests
             .iter_mut()
             .map(|request| &mut *request.buffer)
-            .collect::<Vec<_>>();
+            .collect();
+        let mut dense_buffers: Vec<&mut [u8]> = resolved_indices
+            .iter()
+            .map(|&i| std::mem::take(&mut all_buffers[i]))
+            .collect();
+        drop(all_buffers);
         self.report_get_hits_best_effort(&resolved);
-        let sizes = self.execute_batch_get_into(&mut resolved, &mut buffers)?;
-        drop(buffers);
+        let dense_sizes = self.execute_batch_get_into(&mut resolved, &mut dense_buffers)?;
+        drop(dense_buffers);
+        let mut sizes = vec![0usize; requests.len()];
+        for (dense_idx, &orig_idx) in resolved_indices.iter().enumerate() {
+            sizes[orig_idx] = dense_sizes[dense_idx];
+        }
         let bytes_out = sizes.iter().copied().sum::<usize>() as u64;
         self.record_batch_get_into_items(&tracker, requests, &sizes, bytes_out);
         let result = Ok(sizes);
