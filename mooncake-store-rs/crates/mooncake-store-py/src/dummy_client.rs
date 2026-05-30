@@ -474,6 +474,7 @@ impl DummySession {
             .unwrap_or(-1))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn get_into_ranges(
         &self,
         buffer_ptrs: &[usize],
