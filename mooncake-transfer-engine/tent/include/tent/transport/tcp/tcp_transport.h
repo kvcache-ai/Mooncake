@@ -41,6 +41,7 @@ struct TcpTask {
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
     uint64_t target_addr = 0;
+    std::shared_ptr<BatchEventSink> terminal_sink;
 
     TcpTask() = default;
     TcpTask(TcpTask &&other) noexcept
@@ -48,7 +49,8 @@ struct TcpTask {
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
-          target_addr(other.target_addr) {}
+          target_addr(other.target_addr),
+          terminal_sink(std::move(other.terminal_sink)) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;
 };
@@ -71,6 +73,8 @@ class TcpTransport : public Transport {
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
+
+    virtual Status drain() override;
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
