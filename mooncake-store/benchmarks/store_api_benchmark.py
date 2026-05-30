@@ -1766,24 +1766,30 @@ def summarize_repeats(iterations: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def extract_repeat_iteration(
     iteration_number: int, result: dict[str, Any]
 ) -> dict[str, Any]:
+    latency_ms = result.get("latency_ms") or {}
+    if not isinstance(latency_ms, dict):
+        latency_ms = {}
     return {
         "iteration": iteration_number,
         "api_calls_per_s": result.get("api_calls_per_s", 0.0),
         "objects_per_s": result.get("objects_per_s", 0.0),
         "throughput_mib_s": result.get("throughput_mib_s", 0.0),
         "latency_ms": {
-            "p50": result.get("latency_ms", {}).get("p50", 0.0),
-            "p95": result.get("latency_ms", {}).get("p95", 0.0),
-            "p99": result.get("latency_ms", {}).get("p99", 0.0),
+            "p50": latency_ms.get("p50", 0.0),
+            "p95": latency_ms.get("p95", 0.0),
+            "p99": latency_ms.get("p99", 0.0),
         },
         "misses": result.get("misses", 0),
         "failures": result.get("failures", 0),
-        "memory": result.get("memory", {}),
+        "memory": result.get("memory") or {},
     }
 
 
 def aggregate_memory_reports(iterations: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    memory_reports = [iteration.get("memory", {}) for iteration in iterations]
+    memory_reports = []
+    for iteration in iterations:
+        memory = iteration.get("memory") or {}
+        memory_reports.append(memory if isinstance(memory, dict) else {})
     if not memory_reports:
         return {}
     if not all(report.get("available", False) for report in memory_reports):
@@ -1870,6 +1876,9 @@ def parse_concurrency_scan(value: str | None) -> list[int]:
 def trend_entry(
     operation: str, concurrency: int, result: dict[str, Any]
 ) -> dict[str, Any]:
+    latency_ms = result.get("latency_ms") or {}
+    if not isinstance(latency_ms, dict):
+        latency_ms = {}
     return {
         "operation": operation,
         "concurrency": concurrency,
@@ -1877,9 +1886,9 @@ def trend_entry(
         "objects_per_s": result.get("objects_per_s", 0.0),
         "throughput_mib_s": result.get("throughput_mib_s", 0.0),
         "misses": result.get("misses", 0),
-        "latency_p50_ms": result.get("latency_ms", {}).get("p50", 0.0),
-        "latency_p95_ms": result.get("latency_ms", {}).get("p95", 0.0),
-        "latency_p99_ms": result.get("latency_ms", {}).get("p99", 0.0),
+        "latency_p50_ms": latency_ms.get("p50", 0.0),
+        "latency_p95_ms": latency_ms.get("p95", 0.0),
+        "latency_p99_ms": latency_ms.get("p99", 0.0),
         "failures": result.get("failures", 0),
     }
 
@@ -2053,7 +2062,10 @@ def run_child_benchmark_process(
 
 
 def extract_mixed_result(report: dict[str, Any]) -> dict[str, Any]:
-    return report.get("results", {}).get("mixed", {})
+    results = report.get("results") or {}
+    if not isinstance(results, dict):
+        return {}
+    return results.get("mixed", {})
 
 
 def aggregate_multi_client_results(
@@ -2119,8 +2131,11 @@ def run_multi_client_mixed(args: argparse.Namespace) -> dict[str, Any]:
 
     baseline = None
     baseline_report = None
+    temporary_output_paths = []
     if not args.skip_single_client_baseline:
         baseline_output = child_output_path(args.output_json, "single_client")
+        if not args.output_json:
+            temporary_output_paths.append(baseline_output)
         baseline_key_prefix = f"{args.key_prefix}:single_client"
         baseline_command = build_multi_client_child_command(
             args,
@@ -2139,6 +2154,8 @@ def run_multi_client_mixed(args: argparse.Namespace) -> dict[str, Any]:
         child_output_path(args.output_json, f"client{client_index}")
         for client_index in range(args.multi_client_count)
     ]
+    if not args.output_json:
+        temporary_output_paths.extend(output_paths)
     commands = [
         build_multi_client_child_command(
             args,
@@ -2188,6 +2205,11 @@ def run_multi_client_mixed(args: argparse.Namespace) -> dict[str, Any]:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
+        for output_path in temporary_output_paths:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     wall_time_s = time.perf_counter() - started_at
 
     aggregate = aggregate_multi_client_results(client_reports, wall_time_s)
@@ -2244,7 +2266,10 @@ def find_report_metric_nodes(node: Any, prefix: str = "") -> dict[str, dict[str,
 def metric_value(node: dict[str, Any], metric: str) -> float | None:
     if metric.startswith("latency_ms."):
         _, percentile_name = metric.split(".", 1)
-        value = node.get("latency_ms", {}).get(percentile_name)
+        latency_ms = node.get("latency_ms") or {}
+        if not isinstance(latency_ms, dict):
+            return None
+        value = latency_ms.get(percentile_name)
     else:
         value = node.get(metric)
     if isinstance(value, (int, float)):
@@ -2546,6 +2571,8 @@ def main() -> int:
     ):
         args.master_metrics_url = f"http://127.0.0.1:{args.master_metrics_port}/metrics"
     value_size_bounds(args)
+    baseline_path = Path(args.compare) if args.compare else None
+    baseline = json.loads(baseline_path.read_text()) if baseline_path else None
     if psutil is None:
         print(
             "warning: psutil is not installed; RSS memory tracking will be disabled",
@@ -2597,9 +2624,7 @@ def main() -> int:
 
         metrics_snapshot = collect_metrics_snapshots(args)
         report = build_report(args, import_mode, master, results, metrics_snapshot)
-        if args.compare:
-            baseline_path = Path(args.compare)
-            baseline = json.loads(baseline_path.read_text())
+        if baseline is not None and baseline_path is not None:
             report["comparison"] = compare_reports(baseline, report)
             report["comparison"]["baseline_path"] = str(baseline_path.resolve())
         output = json.dumps(report, indent=2, sort_keys=True)
