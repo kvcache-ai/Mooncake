@@ -1717,8 +1717,10 @@ impl MooncakeCompatibilityFacade for StoreClient {
             return result;
         }
         let object = ObjectRef::new(key).tenant(tenant);
-        let mut resolved = self.resolve_objects(std::slice::from_ref(&object))?;
-        let entry = &resolved[0];
+        let (mut resolved, _) = self.resolve_objects(std::slice::from_ref(&object))?;
+        let entry = resolved.first().ok_or_else(|| {
+            StoreError::NotFound(format!("tenant={tenant} key={key} could not be resolved"))
+        })?;
         let object_length = entry.replica.length as usize;
         if src_offset.checked_add(size).is_none_or(|end| end > object_length) {
             let result: Result<usize> = Err(StoreError::InvalidState(format!(
@@ -1778,7 +1780,13 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 let resolved = metadata_cache.entry(key).or_insert_with(|| {
                     let object = ObjectRef::new(key).tenant(tenant);
                     self.resolve_objects(std::slice::from_ref(&object))
-                        .map(|mut v| v.pop().expect("resolve_objects returned empty vec"))
+                        .and_then(|(mut v, _)| {
+                            v.pop().ok_or_else(|| {
+                                StoreError::NotFound(format!(
+                                    "tenant={tenant} key={key} could not be resolved"
+                                ))
+                            })
+                        })
                 });
 
                 let resolved_obj = match resolved {
