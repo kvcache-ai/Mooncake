@@ -1,6 +1,10 @@
+import os
 import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
+
+_USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+_DEVICE = "musa" if _USE_MUSA else "cuda"
 
 
 class EventOverlap:
@@ -63,21 +67,17 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
-        from mooncake import ep, pg
+        from mooncake import ep
 
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
-        # Get the index of the closest NIC
         self.backend = self.group
-        preferred_hca = pg.get_preferred_hca(
-            self.group, f"cuda:{torch.cuda.current_device()}"
-        )
-        self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca
-        )
+        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
+        # Set MOONCAKE_EP_DEVICE_FILTER=mlx5_1,mlx5_2 to restrict NIC selection.
+        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes)
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
@@ -91,100 +91,93 @@ class Buffer:
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+            raddr = torch.tensor([raddr], dtype=torch.int64, device=_DEVICE)
             raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=_DEVICE)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(raddrs, raddr, self.group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+            rkey = torch.tensor([rkey], dtype=torch.int32, device=_DEVICE)
             rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
+                torch.empty(1, dtype=torch.int32, device=_DEVICE)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+            qps_per_rank = ep.MAX_QP_COUNT // self.group_size
 
             if is_update:
                 self.runtime.update_local_qpns()
 
+            # Exchange per-rank QPN slices via all_to_all
             local_qpns = self.runtime.get_local_qpns()
-            local_qpns = list(
+            local_qpns_split = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
-                        -1, all_to_all_size
+                    torch.tensor(local_qpns, dtype=torch.int32, device=_DEVICE).view(
+                        -1, qps_per_rank
                     )
                 )
             )
-            remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+            remote_qpns_flat = [
+                torch.empty(qps_per_rank, dtype=torch.int32, device=_DEVICE)
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_qpns, local_qpns, self.group)
-            remote_qpns = torch.cat(remote_qpns).tolist()
+            dist.all_to_all(remote_qpns_flat, local_qpns_split, self.group)
+            # remote_qpns[r] = list of QPNs for rank r
+            remote_qpns = [t.tolist() for t in remote_qpns_flat]
 
-            if self.runtime.is_roce():
-                (subnet_prefix, interface_id) = self.runtime.get_gid()
-
-                subnet_prefix = torch.tensor(
-                    [subnet_prefix], dtype=torch.int64, device="cuda"
-                )
-                subnet_prefixes = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
-                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
-
-                interface_id = torch.tensor(
-                    [interface_id], dtype=torch.int64, device="cuda"
-                )
-                interface_ids = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(interface_ids, interface_id, self.group)
-                interface_ids = torch.cat(interface_ids).tolist()
-
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_roce(
-                    raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids,
-                    active_ranks_mask
-                )
-            else:
-                local_lids = self.runtime.get_local_lids()
-                local_lids = list(
-                    torch.unbind(
-                        torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                            -1, all_to_all_size
-                        )
+            # Exchange per-rank LID slices via all_to_all
+            local_lids = self.runtime.get_local_lids()
+            local_lids_split = list(
+                torch.unbind(
+                    torch.tensor(local_lids, dtype=torch.int32, device=_DEVICE).view(
+                        -1, qps_per_rank
                     )
                 )
-                remote_lids = [
-                    torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_to_all(remote_lids, local_lids, self.group)
-                remote_lids = torch.cat(remote_lids).tolist()
+            )
+            remote_lids_flat = [
+                torch.empty(qps_per_rank, dtype=torch.int32, device=_DEVICE)
+                for _ in range(self.group_size)
+            ]
+            dist.all_to_all(remote_lids_flat, local_lids_split, self.group)
+            remote_lids = [t.tolist() for t in remote_lids_flat]
 
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
-                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids,
-                                     active_ranks_mask)
+            # Exchange GIDs (needed for RoCE; harmless for IB)
+            (subnet_prefix, interface_id) = self.runtime.get_gid()
+            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device=_DEVICE)
+            subnet_prefixes_list = [
+                torch.empty(1, dtype=torch.int64, device=_DEVICE)
+                for _ in range(self.group_size)
+            ]
+            dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
+            subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
+
+            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device=_DEVICE)
+            interface_ids_list = [
+                torch.empty(1, dtype=torch.int64, device=_DEVICE)
+                for _ in range(self.group_size)
+            ]
+            dist.all_gather(interface_ids_list, interface_id_t, self.group)
+            interface_ids = torch.cat(interface_ids_list).tolist()
+
+            from mooncake.ep import get_active_ranks
+            active_ranks_mask = get_active_ranks(self.backend).tolist()
+            self.runtime.sync_ibgda_peers(
+                raddrs, rkeys, remote_qpns, remote_lids,
+                subnet_prefixes, interface_ids, active_ranks_mask
+            )
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
+                local_handle_ints, dtype=torch.int32, device=_DEVICE
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                torch.empty(len(local_handle_ints), dtype=torch.int32, device=_DEVICE)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
@@ -411,7 +404,7 @@ class Buffer:
                         hidden,
                     ),
                     dtype=torch.bfloat16,
-                    device="cuda",
+                    device=_DEVICE,
                 )
             return self._fallback_next_combine_buffer
         return self.runtime.get_next_combine_buffer(
@@ -423,7 +416,11 @@ class Buffer:
     # -----------------
     class _DummyEvent:
         def current_stream_wait(self):
-            torch.cuda.synchronize()
+            if _USE_MUSA:
+                import torch_musa
+                torch_musa.synchronize()
+            else:
+                torch.cuda.synchronize()
 
     @staticmethod
     def _fp8_cast(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

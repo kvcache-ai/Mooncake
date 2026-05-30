@@ -12,6 +12,19 @@ import traceback
 from mooncake.mooncake_ep_buffer import Buffer
 import mooncake.pg as pg
 
+_USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+if _USE_MUSA:
+    import torch_musa
+    _sync = torch_musa.synchronize
+    _set_device = torch_musa.set_device
+    _device_count = torch_musa.device_count
+    _DEVICE = "musa"
+else:
+    _sync = torch.cuda.synchronize
+    _set_device = torch.cuda.set_device
+    _device_count = torch.cuda.device_count
+    _DEVICE = "cuda"
+
 
 def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     hidden = x_fp8.shape[-1]
@@ -114,7 +127,7 @@ def run_test_iteration(
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _sync()
     # Fault-tolerance check
     if fail_rank != -1:
         assert active_ranks[fail_rank].item() == 0, (
@@ -170,7 +183,7 @@ def run_test_iteration(
     if async_finish:
         event.current_stream_wait()
 
-    torch.cuda.synchronize()
+    _sync()
 
     testing.assert_close(
         combined_x,
@@ -180,23 +193,14 @@ def run_test_iteration(
         msg=lambda msg: f"[Rank {rank}] Combine Mismatch. {msg}",
     )
 
-    torch.cuda.synchronize()
+    _sync()
     dist.barrier(cpu_group)
 
 
 def worker(rank, world_size, config_dict):
-    # Device filter
-    device_filter = [
-        f
-        for f in os.getenv("DEVICE_FILTER", "mlx5_1,mlx5_2,mlx5_3,mlx5_4").split(",")
-        if f
-    ]
-    if device_filter:
-        pg.set_device_filter(device_filter)
-
-    torch.cuda.set_device(rank)
+    _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
+    torch.set_default_device(_DEVICE)
 
     dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
     group = dist.group.WORLD
@@ -219,7 +223,7 @@ def worker(rank, world_size, config_dict):
 
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
-        self.world_size = torch.cuda.device_count()
+        self.world_size = _device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 

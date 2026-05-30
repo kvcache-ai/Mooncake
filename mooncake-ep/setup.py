@@ -13,46 +13,89 @@ module_name = "mooncake.ep" + version_suffix
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
-# Try to link against the CUDA driver stub library if it exists.
-cuda_libraries = ["ibverbs", "mlx5"]
-cuda_library_dirs = []
+use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 
-if CUDA_HOME is not None:
-    cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
-    cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
-    if os.path.exists(cuda_stub_lib):
-        cuda_libraries.insert(0, "cuda")
-        cuda_library_dirs.append(cuda_stub_dir)
-
-
+if use_musa:
+    from torch_musa.utils.musa_extension import MUSAExtension
+    from torch_musa.utils.musa_extension import BuildExtension as MUSABuildExtension
+    ExtensionClass = MUSAExtension
+    BuildClass = MUSABuildExtension
+    libraries = ["glog"]
+    library_dirs = []
+    sources = [
+        "src/ep_py.cpp",
+        "src/mooncake_ep_buffer.cpp",
+        "src/mooncake_ep_kernel.mu",
+        "../mooncake-transfer-engine/src/transport/ep_device_transport/p2p_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport_musa_stub.cpp",
+    ]
+    cxx_flags = [
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+        "-std=c++17",
+        "-O3",
+        "-g0",
+    ]
+    musa_flags = [
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+        "-DUSE_MUSA",
+        "-DMOONCAKE_EP_USE_MUSA=1",
+        "-std=c++17",
+        "--cuda-gpu-arch=mp_21",
+        "--cuda-gpu-arch=mp_31",
+        "-O3",
+    ]
+    extra_compile_args = {"cxx": cxx_flags, "musa": musa_flags}
+    extra_link_args = [
+        "-Wl,-rpath,$ORIGIN",
+        "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+        "-l:engine.so",
+    ]
+else:
+    ExtensionClass = CUDAExtension
+    BuildClass = BuildExtension
+    libraries = ["ibverbs", "mlx5"]
+    library_dirs = []
+    if CUDA_HOME is not None:
+        cuda_stub_dir = os.path.join(CUDA_HOME, "lib64", "stubs")
+        cuda_stub_lib = os.path.join(cuda_stub_dir, "libcuda.so")
+        if os.path.exists(cuda_stub_lib):
+            libraries.insert(0, "cuda")
+            library_dirs.append(cuda_stub_dir)
+    sources = [
+        "src/ep_py.cpp",
+        "src/mooncake_ep_buffer.cpp",
+        "src/mooncake_ep_kernel.cu",
+        "src/mooncake_ibgda/mlx5gda.cpp",
+        "../mooncake-transfer-engine/src/transport/ep_device_transport/p2p_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport.cpp",
+    ]
+    extra_compile_args = {
+        "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_CUDA", "-std=c++20", "-O3", "-g0"],
+        "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_CUDA", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+    }
+    extra_link_args = [
+        "-Wl,-rpath,$ORIGIN",
+        "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+        "-l:engine.so",
+    ]
 
 setup(
     name=module_name,
     ext_modules=[
-        CUDAExtension(
+        ExtensionClass(
             name=module_name,
             include_dirs=[
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
             ],
-            sources=[
-                "src/ep_py.cpp",
-                "src/mooncake_ep_buffer.cpp",
-                "src/mooncake_ep_kernel.cu",
-                "src/mooncake_ibgda/mlx5gda.cpp",
-            ],
-            extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
-            },
-            libraries=cuda_libraries,
-            library_dirs=cuda_library_dirs,
-            extra_link_args=[
-                "-Wl,-rpath,$ORIGIN",
-                "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
-                "-l:engine.so",
-            ],
+            sources=sources,
+            extra_compile_args=extra_compile_args,
+            libraries=libraries,
+            library_dirs=library_dirs,
+            extra_link_args=extra_link_args,
         )
     ],
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass={"build_ext": BuildClass},
 )

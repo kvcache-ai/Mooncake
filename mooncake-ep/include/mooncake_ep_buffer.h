@@ -1,20 +1,27 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAContext.h>
+#include <musa_runtime.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <fstream>
-#include <mooncake_ibgda/memheap.h>
-#include <mooncake_ibgda/mlx5gda.h>
+#endif
+#include <memory>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <torch/torch.h>
+#include <transport/ep_device_transport/device_transport.h>
 
 namespace mooncake {
+
+// Same value as mlx5gda.h MAX_QP_COUNT.
+inline constexpr int MAX_QP_COUNT = 256;
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
@@ -66,53 +73,38 @@ struct MooncakeEpBuffer {
     int rank, num_ranks;
     int clock_rate_khz;
 
-    // MXA Buffer
+    // GDR buffer — owned by p2p_transport_
     int buffer_idx{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
-    // IBGDA
-    static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
-    void* ctrl_buf = nullptr;
-    // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
-    // fails.
-    ibv_mr* mr = nullptr;
-    std::vector<mlx5gda_qp*> qps;
-    ibv_gid gid;
-    void* raddrs = nullptr;
-    void* rkeys = nullptr;
-    void* qp_devctxs = nullptr;
-    std::string device_name;
-    bool is_roce_ = false;
+    // Device transports — own all platform-specific state.
+    // p2p_transport_: NVLink (CUDA) or MTLink (MUSA) intra-node P2P.
+    // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
+    std::unique_ptr<ep::P2pTransport> p2p_transport_;
+    std::unique_ptr<ep::RdmaTransport> rdma_transport_;
+
     bool ibgda_disabled_ = false;
-    int gid_index_ = -1;  // Dynamically discovered GID index
+
     int USE_QP_COUNT = MAX_QP_COUNT;
 
-    mlx5dv_devx_umem* ctrl_buf_umem;
-    ibv_pd* pd;
-    mlx5dv_pd mpd;
-    memheap* ctrl_buf_heap;
-
-    // Fabric memory (MNNVL)
-    bool use_fabric_mem_ = false;
-    CUmemGenericAllocationHandle fabric_mem_handle_{};
-    size_t fabric_alloc_size_ = 0;
-
-    // NVLink P2P
-    int32_t* nvlink_available = nullptr;
-    void** ipc_peer_ptrs_host = nullptr;
-    void** ipc_peer_ptrs = nullptr;
-    bool p2p_ipc_all_enabled_ = false;
-
     // Stream for communication
+#ifdef MOONCAKE_EP_USE_MUSA
+    at::musa::MUSAStream comm_stream;
+#else
     at::cuda::CUDAStream comm_stream;
+#endif
 
     // Workspace
     void* workspace = nullptr;
 
    public:
+    // p2p_transport and rdma_transport are optional injected transports.
+    // When null, EP creates its own via the factory functions.
+    // When provided, EP takes ownership and uses them directly.
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     std::string device_name);
+                     std::unique_ptr<ep::P2pTransport> p2p_transport = nullptr,
+                     std::unique_ptr<ep::RdmaTransport> rdma_transport = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -136,79 +128,63 @@ struct MooncakeEpBuffer {
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);
 
-    int init_ibgda();
+    bool ibgda_disabled() const { return ibgda_disabled_; }
 
-    bool ibgda_disabled() { return ibgda_disabled_; }
-
-    bool is_roce() { return is_roce_; }
-
-    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
-    //
-    // There are two independent ways EP kernels can work:
-    // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
-    // - NVLink P2P+IPC path: requires full P2P+IPC across ranks on the same
-    // node.
-    //
-    // IMPORTANT INVARIANT:
-    // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
-    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA
-    // kernels will never take the IBGDA branch and therefore do NOT require
-    // `qps`.
-    bool use_fast_path() {
-        if (!ibgda_disabled_) {
-            return true;  // IBGDA available
-        }
-        // IBGDA disabled: only allow fast-path if we can rely on NVLink
-        // P2P+IPC.
-        if (!p2p_ipc_all_enabled_) {
-            LOG(WARNING) << "Failed to initialize IBGDA. "
-                         << "Using fallback implementation. "
-                         << "Performance will be degraded.";
-        }
-        return p2p_ipc_all_enabled_;
+    bool is_roce() const {
+        return rdma_transport_ && rdma_transport_->isRoce();
     }
 
+    // Fast-path: IBGDA available, or all peers accessible via P2P.
+    bool use_fast_path() {
+        if (!ibgda_disabled_) return true;
+        bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
+        if (!p2p_all) {
+            LOG(WARNING) << "IBGDA unavailable and P2P not fully accessible. "
+                         << "Using fallback (degraded performance).";
+        }
+        return p2p_all;
+    }
+
+    // Recreate QPs (called when active_ranks changes).
     void update_local_qpns();
 
-    void sync_ib(const std::vector<int64_t>& remote_addrs,
-                 const std::vector<int32_t>& remote_keys,
-                 const std::vector<int32_t>& remote_qpns,
-                 const std::vector<int32_t>& remote_lids,
-                 const std::vector<int>& active_ranks_mask);
+    // Connect IBGDA QPs to peers.  Unified entry point — handles both IB and
+    // RoCE based on is_roce().
+    void sync_ibgda_peers(
+        const std::vector<int64_t>& remote_addrs,
+        const std::vector<int32_t>& remote_keys,
+        const std::vector<std::vector<int32_t>>& peer_qpns,
+        const std::vector<std::vector<int32_t>>& peer_lids,
+        const std::vector<int64_t>& subnet_prefixes,
+        const std::vector<int64_t>& interface_ids,
+        const std::vector<int>& active_ranks_mask);
 
-    void sync_roce(const std::vector<int64_t>& remote_addrs,
-                   const std::vector<int32_t>& remote_keys,
-                   const std::vector<int32_t>& remote_qpns,
-                   const std::vector<int64_t>& subnet_prefixes,
-                   const std::vector<int64_t>& interface_ids,
-                   const std::vector<int>& active_ranks_mask);
-
+    // Metadata accessors for Python-level bootstrap exchange.
     std::tuple<int64_t, int32_t> get_mr_info() {
-        return {(int64_t)mr->addr, (int32_t)mr->rkey};
+        if (!rdma_transport_) return {0, 0};
+        auto m = rdma_transport_->localMetadata();
+        return {m.raddr, m.rkey};
     }
 
     std::tuple<int64_t, int64_t> get_gid() {
-        return {(int64_t)gid.global.subnet_prefix,
-                (int64_t)gid.global.interface_id};
+        if (!rdma_transport_) return {0, 0};
+        auto m = rdma_transport_->localMetadata();
+        return {m.subnet_prefix, m.interface_id};
     }
 
     std::vector<int32_t> get_local_qpns() {
-        std::vector<int32_t> local_qpns;
-        for (int i = 0; i < USE_QP_COUNT; ++i) {
-            local_qpns.push_back((int32_t)qps[i]->qpn);
-        }
-        return local_qpns;
+        if (!rdma_transport_) return {};
+        return rdma_transport_->localMetadata().qpns;
     }
 
     std::vector<int32_t> get_local_lids() {
-        std::vector<int32_t> local_lids;
-        for (int i = 0; i < USE_QP_COUNT; ++i) {
-            local_lids.push_back((int32_t)qps[i]->port_attr.lid);
-        }
-        return local_lids;
+        if (!rdma_transport_) return {};
+        return rdma_transport_->localMetadata().lids;
     }
 
+    // IPC handle for P2P (NVLink / MTLink).
     std::vector<int32_t> get_ipc_handle();
+
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask);
