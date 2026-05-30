@@ -154,6 +154,10 @@ const ASYNC_REPLICA_TRACK_QUEUE_CAPACITY: usize = 1024;
 const ASYNC_REPLICA_TRACK_DRAIN_BUDGET: usize = 4096;
 const ASYNC_REPLICA_TRACK_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const ASYNC_REPLICA_TRACK_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+const ASYNC_ROUTE_HIT_QUEUE_CAPACITY: usize = 4096;
+const ASYNC_ROUTE_HIT_DRAIN_BUDGET: usize = 8192;
+const ASYNC_ROUTE_HIT_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const ASYNC_ROUTE_HIT_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 
 struct AsyncReplicaTrackHandle {
     sender: Option<std::sync::mpsc::SyncSender<Vec<ObjectRoute>>>,
@@ -164,6 +168,7 @@ struct AsyncReplicaTrackHandle {
 impl AsyncReplicaTrackHandle {
     fn spawn(
         runtime: &ClientRuntimeId,
+        metadata: Arc<dyn MetadataBackend>,
         control_client: Arc<ControlPlaneClient>,
         live_client_cache: SharedLiveClientCache,
     ) -> Result<Self> {
@@ -197,6 +202,7 @@ impl AsyncReplicaTrackHandle {
                     }
                     flush_async_replica_tracks(
                         &local_runtime,
+                        metadata.as_ref(),
                         control_client.as_ref(),
                         &live_client_cache,
                         &routes,
@@ -251,8 +257,213 @@ impl Drop for AsyncReplicaTrackHandle {
     }
 }
 
+struct RouteHitReportBatch {
+    remote_hits: BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+    force_membership_refresh_on_miss: bool,
+}
+
+struct AsyncRouteHitReportHandle {
+    sender: Option<std::sync::mpsc::SyncSender<RouteHitReportBatch>>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AsyncRouteHitReportHandle {
+    fn spawn(
+        runtime: &ClientRuntimeId,
+        metadata: Arc<dyn MetadataBackend>,
+        control_client: Arc<ControlPlaneClient>,
+        live_client_cache: SharedLiveClientCache,
+    ) -> Result<Self> {
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<RouteHitReportBatch>(ASYNC_ROUTE_HIT_QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let stable_id = runtime.stable_id.0.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("mooncake-route-hit-report-{stable_id}"))
+            .spawn(move || {
+                loop {
+                    if shutdown_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let mut batch = match receiver.recv_timeout(ASYNC_ROUTE_HIT_RECV_TIMEOUT) {
+                        Ok(batch) => batch,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let started = Instant::now();
+                    let mut item_count = route_hit_report_item_count(&batch.remote_hits);
+                    while item_count < ASYNC_ROUTE_HIT_DRAIN_BUDGET
+                        && started.elapsed() < ASYNC_ROUTE_HIT_COALESCE_WINDOW
+                    {
+                        match receiver.try_recv() {
+                            Ok(more) => {
+                                item_count = item_count.saturating_add(route_hit_report_item_count(
+                                    &more.remote_hits,
+                                ));
+                                batch.force_membership_refresh_on_miss |=
+                                    more.force_membership_refresh_on_miss;
+                                merge_route_hit_reports(&mut batch.remote_hits, more.remote_hits);
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    flush_async_route_hit_reports(
+                        metadata.as_ref(),
+                        control_client.as_ref(),
+                        &live_client_cache,
+                        batch.remote_hits,
+                        batch.force_membership_refresh_on_miss,
+                    );
+                }
+            })
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to spawn async route hit reporting worker: {error}"
+                ))
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn enqueue(
+        &self,
+        remote_hits: BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+        force_membership_refresh_on_miss: bool,
+    ) {
+        if remote_hits.is_empty() {
+            return;
+        }
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        let item_count = route_hit_report_item_count(&remote_hits);
+        match sender.try_send(RouteHitReportBatch {
+            remote_hits,
+            force_membership_refresh_on_miss,
+        }) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::debug!(
+                    items = item_count,
+                    "dropping best-effort route hit reporting after async queue filled"
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.sender.take();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for AsyncRouteHitReportHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn route_hit_report_item_count(remote_hits: &BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>) -> usize {
+    remote_hits.values().map(BTreeSet::len).sum()
+}
+
+fn merge_route_hit_reports(
+    target: &mut BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+    more: BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+) {
+    for (owner, keys) in more {
+        target.entry(owner).or_default().extend(keys);
+    }
+}
+
+fn flush_async_route_hit_reports(
+    metadata: &dyn MetadataBackend,
+    control_client: &ControlPlaneClient,
+    live_client_cache: &SharedLiveClientCache,
+    remote_hits: BTreeMap<ClientRuntimeId, BTreeSet<ObjectKey>>,
+    force_membership_refresh_on_miss: bool,
+) {
+    if remote_hits.is_empty() {
+        return;
+    }
+    let wanted = remote_hits.keys().cloned().collect::<BTreeSet<_>>();
+    let leases = match route_hit_report_leases(
+        metadata,
+        live_client_cache,
+        &wanted,
+        force_membership_refresh_on_miss,
+    ) {
+        Ok(leases) => leases,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                targets = wanted.len(),
+                "failed to resolve storage-owner leases for async hit reporting"
+            );
+            return;
+        }
+    };
+    for (owner, keys) in remote_hits {
+        let Some(lease) = leases.get(&owner) else {
+            continue;
+        };
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if let Err(error) = control_client.batch_report_route_hits(lease, &keys) {
+            tracing::debug!(
+                storage_owner = %owner,
+                error = %error,
+                items = keys.len(),
+                "async storage-owner hit report failed"
+            );
+        }
+    }
+}
+
+fn route_hit_report_leases(
+    metadata: &dyn MetadataBackend,
+    live_client_cache: &SharedLiveClientCache,
+    wanted: &BTreeSet<ClientRuntimeId>,
+    force_membership_refresh_on_miss: bool,
+) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
+    let mut leases = live_client_cache
+        .lock()
+        .snapshot()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|lease| wanted.contains(&lease.runtime))
+        .map(|lease| (lease.runtime.clone(), lease))
+        .collect::<BTreeMap<_, _>>();
+    let missing = wanted
+        .iter()
+        .any(|runtime| !leases.contains_key(runtime));
+    if missing && force_membership_refresh_on_miss {
+        leases = refresh_live_client_cache(
+            metadata,
+            live_client_cache,
+            "live_client_snapshot_hit_report",
+        )?
+        .into_iter()
+        .filter(|lease| wanted.contains(&lease.runtime))
+        .map(|lease| (lease.runtime.clone(), lease))
+        .collect();
+    }
+    Ok(leases)
+}
+
 fn flush_async_replica_tracks(
     local_runtime: &ClientRuntimeId,
+    metadata: &dyn MetadataBackend,
     control_client: &ControlPlaneClient,
     live_client_cache: &SharedLiveClientCache,
     routes: &[ObjectRoute],
@@ -276,17 +487,18 @@ fn flush_async_replica_tracks(
     if grouped.is_empty() {
         return;
     }
-    let Some(snapshot) = live_client_cache.lock().snapshot() else {
-        tracing::debug!(
-            targets = grouped.len(),
-            "dropping best-effort replica tracking before membership snapshot is ready"
-        );
-        return;
+    let wanted = grouped.keys().cloned().collect::<BTreeSet<_>>();
+    let leases = match replica_track_leases(metadata, live_client_cache, &wanted) {
+        Ok(leases) => leases,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                targets = wanted.len(),
+                "failed to resolve storage-owner leases for async replica tracking"
+            );
+            return;
+        }
     };
-    let leases = snapshot
-        .into_iter()
-        .map(|lease| (lease.runtime.clone(), lease))
-        .collect::<BTreeMap<_, _>>();
     for (owner, routes) in grouped {
         let Some(lease) = leases.get(&owner) else {
             tracing::debug!(
@@ -306,6 +518,33 @@ fn flush_async_replica_tracks(
             );
         }
     }
+}
+
+fn replica_track_leases(
+    metadata: &dyn MetadataBackend,
+    live_client_cache: &SharedLiveClientCache,
+    wanted: &BTreeSet<ClientRuntimeId>,
+) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
+    let mut leases = live_client_cache
+        .lock()
+        .snapshot()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|lease| wanted.contains(&lease.runtime))
+        .map(|lease| (lease.runtime.clone(), lease))
+        .collect::<BTreeMap<_, _>>();
+    if wanted.iter().any(|runtime| !leases.contains_key(runtime)) {
+        leases = refresh_live_client_cache(
+            metadata,
+            live_client_cache,
+            "live_client_snapshot_replica_track",
+        )?
+        .into_iter()
+        .filter(|lease| wanted.contains(&lease.runtime))
+        .map(|lease| (lease.runtime.clone(), lease))
+        .collect();
+    }
+    Ok(leases)
 }
 
 pub(crate) fn refresh_live_client_cache(

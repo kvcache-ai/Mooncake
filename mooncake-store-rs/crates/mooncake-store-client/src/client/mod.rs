@@ -110,6 +110,7 @@ pub struct StoreClient {
     membership_sync: MembershipSyncHandle,
     _async_eviction: AsyncEvictionHandle,
     async_replica_tracking: AsyncReplicaTrackHandle,
+    async_route_hit_reporting: AsyncRouteHitReportHandle,
     default_tenant: String,
     local_memory: LocalMemoryConfig,
     transport: Option<Arc<dyn StoreTransport>>,

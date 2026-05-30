@@ -754,6 +754,30 @@ mod state_store_tests {
             "read-hot routes should outlive write-fresh routes during the same CLOCK scan"
         );
     }
+
+    #[test]
+    fn read_hot_route_gets_more_clock_credit_than_fresh_write() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let hot_route = test_route("hot", &runtime);
+        let fresh_a = test_route("fresh-a", &runtime);
+        let fresh_b = test_route("fresh-b", &runtime);
+
+        clock.track_fresh_route(&hot_route, &runtime);
+        clock.track_fresh_route(&fresh_a, &runtime);
+        clock.track_fresh_route(&fresh_b, &runtime);
+        clock.mark_hot_keys(&[hot_route.key.clone()]);
+
+        let first = clock
+            .pick_victim(None)
+            .expect("clock should evict a fresh route before read-hot route");
+        let second = clock
+            .pick_victim(None)
+            .expect("clock should still evict fresh routes before read-hot route");
+
+        assert_ne!(first.route_key, hot_route.key);
+        assert_ne!(second.route_key, hot_route.key);
+    }
 }
 
 impl StorageOwnerState {
@@ -1034,8 +1058,10 @@ fn route_storage_bytes(route: &ObjectRoute, runtime: &ClientRuntimeId) -> u64 {
 }
 
 impl StorageClockState {
+    const READ_HOT_CLOCK_CREDIT: u8 = 2;
+
     fn eviction_budget(&self) -> usize {
-        self.entries.len().saturating_mul(2)
+        self.entries.len().saturating_mul(3)
     }
 
     fn track_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
@@ -1098,6 +1124,8 @@ impl StorageClockState {
         for index in slots {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
                 entry.hot = true;
+                entry.hot_credit = Self::READ_HOT_CLOCK_CREDIT;
+                entry.fresh_write = false;
             }
         }
         RouteTrafficReport::new(keys.len(), bytes)
@@ -1117,8 +1145,9 @@ impl StorageClockState {
             if preferred_segment.is_some_and(|segment| entry.id.segment_name != *segment) {
                 continue;
             }
-            if entry.hot {
-                entry.hot = false;
+            if entry.hot_credit > 0 {
+                entry.hot_credit -= 1;
+                entry.hot = entry.hot_credit > 0;
                 continue;
             }
             if entry.fresh_write {
@@ -1144,15 +1173,23 @@ impl StorageClockState {
         if let Some(index) = self.by_id.get(&id).copied() {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
                 entry.length_bytes = replica.length;
-                entry.fresh_write |= fresh_write;
+                if fresh_write && entry.hot_credit == 0 {
+                    entry.fresh_write = true;
+                }
             }
             return;
         }
+        let hot_credit = if self.pending_hot_keys.contains(&route.key) {
+            Self::READ_HOT_CLOCK_CREDIT
+        } else {
+            0
+        };
         let entry = ClockEntry {
             id: id.clone(),
             length_bytes: replica.length,
-            hot: self.pending_hot_keys.contains(&route.key),
-            fresh_write,
+            hot: hot_credit > 0,
+            hot_credit,
+            fresh_write: fresh_write && hot_credit == 0,
         };
         let index = self
             .entries

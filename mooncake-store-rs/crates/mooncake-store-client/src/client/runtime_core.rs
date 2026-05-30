@@ -658,25 +658,6 @@ impl StoreClient {
         }
     }
 
-    fn lookup_cached_runtime_leases_best_effort(
-        &self,
-        runtimes: impl IntoIterator<Item = ClientRuntimeId>,
-    ) -> Result<BTreeMap<ClientRuntimeId, ClientLease>> {
-        let wanted = runtimes
-            .into_iter()
-            .filter(|runtime| *runtime != self.lease.runtime)
-            .collect::<BTreeSet<_>>();
-        if wanted.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        Ok(self
-            .available_compatible_live_clients(false)?
-            .into_iter()
-            .filter(|lease| wanted.contains(&lease.runtime))
-            .map(|lease| (lease.runtime.clone(), lease))
-            .collect())
-    }
-
     fn resolve_preferred_storage_owners_once(
         &self,
         selectors: &[String],
