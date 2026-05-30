@@ -107,8 +107,7 @@ void EfaTransport::startWorkerThreads() {
     if (worker_running_) return;
 
     worker_running_ = true;
-    // Default: one poller thread per context. MC_EFA_CQ_THREADS caps this when
-    // multiple EFA consumers coexist (e.g., Mooncake KV transfer + DeepEP).
+    // MC_EFA_CQ_THREADS caps CQ poller count (default 1). Set 0 to disable cap.
     size_t num_threads = context_list_.size();
     int cq_cap = Environ::Get().GetEfaCqThreads();
     if (cq_cap > 0 && static_cast<size_t>(cq_cap) < num_threads) {
