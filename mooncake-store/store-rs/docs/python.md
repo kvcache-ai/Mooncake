@@ -81,6 +81,11 @@ the dispatcher retries the missed entries one by one and returns a per-key statu
 counts for restored entries and negative soft-miss codes for the entries that still failed. A dead
 cache replica therefore does not turn healthy keys in the same HiCache batch into misses.
 
+Real-mode `batch_put_from(...)` keeps the caller's batch together by default so the Rust write path
+can coalesce placement, remote transfer, route publication, and replica tracking. Operators that
+prefer Python-side sharding for a specific workload can set
+`MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT` to an explicit positive fanout width.
+
 `setup(...)` accepts `eviction_high_watermark_percent=` and
 `eviction_low_watermark_percent=` for storage-role runtimes. The same values can come from
 `MC_STORE_RS_EVICTION_HIGH_WATERMARK_PERCENT` and

@@ -54,7 +54,7 @@ fn finalize_real_dispatcher_setup(
 
 pub const DEFAULT_COMPAT_WORKER_SCOPE: &str = "worker-1";
 const BATCH_PUT_FROM_FANOUT_ENV: &str = "MC_STORE_RS_PY_BATCH_PUT_FROM_FANOUT";
-const DEFAULT_BATCH_PUT_FROM_FANOUT_WIDTH: usize = 8;
+const DEFAULT_BATCH_PUT_FROM_FANOUT_WIDTH: usize = 1;
 
 fn resolve_real_worker_scope(keyspace: Option<&str>, worker_scope: Option<&str>) -> String {
     if let Some(scope) = worker_scope
@@ -1990,9 +1990,10 @@ mod tests {
 
     use super::{
         _store_rs, init_tracing, metrics_server_address, metrics_text, parse_initial_state_arg,
-        pointer_from_usize, replication_policy, route_to_py, segment_to_py, start_metrics_server,
-        stop_metrics_server, store_error_to_py, DummySession, PyMooncakeDistributedStore,
-        PyMooncakeHostMemAllocator, StoreBackend,
+        batch_put_from_fanout_ranges, batch_put_from_fanout_width, pointer_from_usize,
+        replication_policy, route_to_py, segment_to_py, start_metrics_server, stop_metrics_server,
+        store_error_to_py, DummySession, PyMooncakeDistributedStore, PyMooncakeHostMemAllocator,
+        StoreBackend, BATCH_PUT_FROM_FANOUT_ENV,
     };
     use crate::dispatcher::{CompatNamespaceScope, StoreDispatcher};
     use crate::dummy_service::pb;
@@ -3438,6 +3439,25 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn batch_put_from_default_fanout_keeps_single_rust_batch() {
+        let _guard = env_test_lock().lock();
+        let _env = EnvVarGuard::unset(BATCH_PUT_FROM_FANOUT_ENV);
+        assert_eq!(batch_put_from_fanout_width(32), 1);
+        assert_eq!(batch_put_from_fanout_ranges(32, 1), vec![0..32]);
+    }
+
+    #[test]
+    fn batch_put_from_fanout_env_can_explicitly_shard_large_batches() {
+        let _guard = env_test_lock().lock();
+        let _env = EnvVarGuard::set(BATCH_PUT_FROM_FANOUT_ENV, "4");
+        assert_eq!(batch_put_from_fanout_width(32), 4);
+        assert_eq!(
+            batch_put_from_fanout_ranges(32, 4),
+            vec![0..8, 8..16, 16..24, 24..32]
+        );
     }
 
     #[derive(Clone)]
