@@ -115,10 +115,6 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
     return ErrorCode::OK;
 }
 
-bool IsZeroUUID(const UUID& uuid) {
-    return uuid.first == 0 && uuid.second == 0;
-}
-
 }  // namespace
 
 // ================================================================
@@ -278,10 +274,16 @@ DataManager::ScanExpiredRecordShard<DataManager::PinnedKeyRecord>(
 DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id) {
+    const auto now = std::chrono::steady_clock::now();
     std::unique_lock lock(shard.mutex);
     auto it = shard.existed_operation_key_map.find(key);
     if (it == shard.existed_operation_key_map.end()) {
         return PendingWriteEraseResult::NotFound;
+    }
+    if (it->second.deadline <= now) {
+        shard.ordered_list.erase(it->second.list_it);
+        shard.existed_operation_key_map.erase(it);
+        return PendingWriteEraseResult::LeaseExpired;
     }
     if (it->second.write_operation_id != write_operation_id) {
         return PendingWriteEraseResult::WriteOperationIdMismatch;
@@ -289,27 +291,6 @@ DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     shard.ordered_list.erase(it->second.list_it);
     shard.existed_operation_key_map.erase(it);
     return PendingWriteEraseResult::Erased;
-}
-
-void DataManager::AbortPendingWriteInternal(const KeyCtx& ctx,
-                                            const UUID& write_operation_id) {
-    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) return;
-    auto& pending_write_shard = GetPendingWriteShard(ctx);
-    switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
-                                    write_operation_id)) {
-        case PendingWriteEraseResult::NotFound:
-            LOG(WARNING)
-                << "AbortPendingWrite: no pending write record for key: "
-                << ctx.key;
-            break;
-        case PendingWriteEraseResult::WriteOperationIdMismatch:
-            LOG(ERROR)
-                << "AbortPendingWrite: write_operation_id mismatch for key: "
-                << ctx.key;
-            break;
-        case PendingWriteEraseResult::Erased:
-            break;
-    }
 }
 
 tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
@@ -401,6 +382,42 @@ DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
     return record_it->second.handle;
 }
 
+tl::expected<void, ErrorCode> DataManager::WriteRevoke(
+    std::string_view key, const UUID& write_operation_id) {
+    return WriteRevokeInternal(BuildKeyCtx(key), write_operation_id);
+}
+
+tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
+    const KeyCtx& ctx, const UUID& write_operation_id) {
+    ScopedVLogTimer timer(1, "DataManager::WriteRevoke");
+    timer.LogRequest("key=", ctx.key);
+
+    if (ctx.key.empty() || IsZeroUUID(write_operation_id)) {
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& pending_write_shard = GetPendingWriteShard(ctx);
+    switch (ErasePendingWriteRecord(pending_write_shard, ctx.key,
+                                    write_operation_id)) {
+        case PendingWriteEraseResult::Erased:
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              "record_erased=", true);
+            return {};
+        case PendingWriteEraseResult::NotFound:
+            timer.LogResponse("error_code=", ErrorCode::OK,
+                              "idempotent=", true);
+            return {};
+        case PendingWriteEraseResult::LeaseExpired:
+            timer.LogResponse("error_code=", ErrorCode::LEASE_EXPIRED);
+            return tl::make_unexpected(ErrorCode::LEASE_EXPIRED);
+        case PendingWriteEraseResult::WriteOperationIdMismatch:
+            timer.LogResponse("error_code=", ErrorCode::INVALID_WRITE);
+            return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    return {};
+}
+
 void DataManager::ShutdownLeaseScanner() {
     lease_scanner_stop_requested_.store(true);
     lease_scanner_cv_.notify_all();
@@ -480,7 +497,10 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         return tl::unexpected(validate_result.error());
     }
 
-    auto prewrite_result = PreWriteInternal(kctx, total_size, std::nullopt);
+    // Local Put: allocation follows tier backend policy (not restricted to
+    // DRAM).
+    auto prewrite_result =
+        PreWriteInternal(kctx, total_size, std::nullopt, false);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaTe: PreWrite failed"
                    << ", key=" << key
@@ -496,7 +516,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         LOG(ERROR) << "SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
-        AbortPendingWriteInternal(kctx, write_operation_id);
+        (void)WriteRevokeInternal(kctx, write_operation_id);
         return tl::unexpected(submit_result.error());
     }
 
@@ -511,7 +531,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                 LOG(ERROR) << "WaitAllTransferBatches failed"
                            << ", key=" << kctx.key
                            << ", error_code=" << toString(wait_result.error());
-                AbortPendingWriteInternal(kctx, write_operation_id);
+                (void)WriteRevokeInternal(kctx, write_operation_id);
                 return tl::unexpected(wait_result.error());
             }
 
@@ -528,7 +548,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
                         << "CopyFromDRAMBuffer failed"
                         << ", key=" << kctx.key
                         << ", error_code=" << toString(copy_result.error());
-                    AbortPendingWriteInternal(kctx, write_operation_id);
+                    (void)WriteRevokeInternal(kctx, write_operation_id);
                     return tl::unexpected(copy_result.error());
                 }
             }
@@ -554,7 +574,9 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     const KeyCtx kctx = BuildKeyCtx(key);
     Slice slice = slices[0];
 
-    auto prewrite_result = PreWriteInternal(kctx, slice.size, std::nullopt);
+    // Same allocation policy as PutViaTe.
+    auto prewrite_result =
+        PreWriteInternal(kctx, slice.size, std::nullopt, false);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaMemcpy: PreWrite failed"
                    << ", key=" << key
@@ -574,7 +596,7 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
         if (!write_result.has_value()) {
             LOG(ERROR) << "Failed to write data for key: " << kctx.key
                        << ", error: " << write_result.error();
-            AbortPendingWriteInternal(kctx, write_operation_id);
+            (void)WriteRevokeInternal(kctx, write_operation_id);
             return tl::make_unexpected(write_result.error());
         }
         return {};
@@ -790,8 +812,9 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         return tl::make_unexpected(validate_result.error());
     }
 
-    // Reverse RDMA read stays on the direct object-handle path. Only forward
-    // RDMA read uses the 3-phase PinKey -> TE Read -> UnPinKey flow.
+    // Reverse transfer read stays on the direct object-handle path. Only
+    // forward transfer read uses the 3-phase PinKey -> TE Read -> UnPinKey
+    // flow.
     auto handle_result = tiered_backend_->Get(key);
     if (!handle_result) {
         LOG(ERROR) << "ReadRemoteData: Get failed"
@@ -848,9 +871,10 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     size_t total_size = 0;
     for (const auto& buf : src_buffers) total_size += buf.size;
 
-    // Reverse RDMA path: still one RPC, but internally use the 3-phase write
-    // model (PreWrite -> transfer -> WriteCommit).
-    auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id);
+    // Reverse transfer path: still one RPC, but internally use the 3-phase
+    // write model (PreWrite -> transfer -> WriteCommit). Target tier may be
+    // non-DRAM.
+    auto prewrite_result = PreWriteInternal(kctx, total_size, tier_id, false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
         return tl::make_unexpected(prewrite_result.error());
@@ -862,7 +886,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     // Transfer phase — no long key lock held.
     auto transfer_result = TransferDataFromRemote(handle, src_buffers);
     if (!transfer_result) {
-        AbortPendingWriteInternal(kctx, write_operation_id);
+        (void)WriteRevokeInternal(kctx, write_operation_id);
         timer.LogResponse("error_code=", transfer_result.error());
         return tl::make_unexpected(transfer_result.error());
     }
@@ -878,25 +902,33 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     return result_tier_id;
 }
 
-tl::expected<DataManager::PreWriteResult, ErrorCode> DataManager::PreWrite(
+tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
     auto internal_result =
-        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id);
+        PreWriteInternal(BuildKeyCtx(key), size_bytes, tier_id, true);
     if (!internal_result) {
         LOG(WARNING) << "PreWrite failed"
                      << ", key=" << key
                      << ", error=" << toString(internal_result.error());
         return tl::make_unexpected(internal_result.error());
     }
-    PreWriteResult rpc_result;
-    rpc_result.remote_buffer = std::move(internal_result->remote_buffer);
-    rpc_result.write_operation_id = internal_result->write_operation_id;
-    return rpc_result;
+    PreWriteResponse out;
+    out.remote_buffer = std::move(internal_result->remote_buffer);
+    out.write_operation_id = internal_result->write_operation_id;
+    return out;
 }
 
 tl::expected<DataManager::PreWriteResult, ErrorCode>
 DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
-                              std::optional<UUID> tier_id) {
+                              std::optional<UUID> tier_id,
+                              bool enforce_dram_allocation) {
+    // TODO(tiered_backend): `enforce_dram_allocation` is temporary. Today
+    // `tiered_backend_->Allocate()` does not yet allocate from a
+    // caller-selected tier in a way that guarantees DRAM for the cross-node
+    // forward TE path. Public PreWrite passes true to reject non-DRAM handles;
+    // local Put and WriteRemoteData pass false. Remove this parameter once
+    // TieredBackend is refactored to allocate from the intended tier
+    // explicitly.
     ScopedVLogTimer timer(1, "DataManager::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
@@ -946,6 +978,18 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     }
 
     auto handle = std::move(handle_result.value());
+
+    if (enforce_dram_allocation && handle->loc.data.type != MemoryType::DRAM) {
+        LOG(ERROR) << "PreWrite: DRAM allocation failed"
+                   << ", key=" << ctx.key << ", error="
+                   << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        (void)ErasePendingWriteRecord(pending_write_shard, ctx.key,
+                                      write_operation_id);
+        timer.LogResponse("error_code=",
+                          ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
     auto attach_result = AttachPendingWriteHandle(pending_write_shard, ctx.key,
                                                   write_operation_id, handle);
     if (!attach_result) {
@@ -999,7 +1043,8 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
         if (err == ErrorCode::LEASE_EXPIRED) {
             const auto erased = ErasePendingWriteRecord(
                 pending_write_shard, ctx.key, write_operation_id);
-            if (erased == PendingWriteEraseResult::Erased) {
+            if (erased == PendingWriteEraseResult::Erased ||
+                erased == PendingWriteEraseResult::LeaseExpired) {
                 LOG(ERROR)
                     << "WriteCommit: removed expired pending write record"
                     << ", key=" << ctx.key;
@@ -1042,9 +1087,16 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     return {};
 }
 
-tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKey(
+tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
     std::string_view key, std::optional<UUID> tier_id) {
-    return PinKeyInternal(BuildKeyCtx(key), tier_id);
+    auto internal_result = PinKeyInternal(BuildKeyCtx(key), tier_id);
+    if (!internal_result) {
+        return tl::make_unexpected(internal_result.error());
+    }
+    PinKeyResponse out;
+    out.remote_buffer = std::move(internal_result->remote_buffer);
+    out.read_operation_id = internal_result->read_operation_id;
+    return out;
 }
 
 tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
@@ -1065,6 +1117,16 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     // Active pin: bump ref_count / renew lease; no tiered_backend::Get.
     const auto bump_existing_pin =
         [&](auto it) -> tl::expected<PinKeyResult, ErrorCode> {
+        // PinKey forward path: DRAM-only for now; non-DRAM replica handling
+        // TODO.
+        if (it->second.handle->loc.data.type != MemoryType::DRAM) {
+            LOG(ERROR) << "PinKey: DRAM-only forward path, non-DRAM replica"
+                       << ", key=" << ctx.key << ", error="
+                       << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            timer.LogResponse("error_code=",
+                              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        }
         auto remote_buffer_result = BuildRemoteBufferDesc(it->second.handle);
         if (!remote_buffer_result) {
             timer.LogResponse("error_code=", remote_buffer_result.error());
@@ -1298,6 +1360,33 @@ DataManager::SubmitTeTransferInternal(
             std::move(buffer_result.value());
     }
 
+    auto batches_result = SubmitTeTransferBatches(transfer_ptr, total_data_size,
+                                                  remote_buffers, opcode);
+    if (!batches_result) {
+        LOG(ERROR) << "SubmitTeTransferInternal: SubmitTeTransferBatches "
+                      "failed: "
+                   << toString(batches_result.error());
+        return tl::unexpected(batches_result.error());
+    }
+
+    TeSubmitResult result;
+    result.transfer_batches = std::move(batches_result.value());
+    result.temp_buffer = std::move(temp_buffer_owner);
+    result.handle = handle;
+    return result;
+}
+
+tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
+             ErrorCode>
+DataManager::SubmitTeTransferBatches(
+    void* transfer_ptr, size_t total_data_size,
+    const std::vector<RemoteBufferDesc>& remote_buffers,
+    Transport::TransferRequest::OpCode opcode) {
+    if (!transfer_ptr || total_data_size == 0) {
+        LOG(ERROR) << "SubmitTeTransferBatches: invalid local transfer pointer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::unordered_map<std::string, std::vector<size_t>> segment_buffers;
     for (size_t i = 0; i < remote_buffers.size(); ++i) {
         segment_buffers[remote_buffers[i].segment_endpoint].push_back(i);
@@ -1370,11 +1459,45 @@ DataManager::SubmitTeTransferInternal(
         return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    TeSubmitResult result;
-    result.transfer_batches = std::move(submitted_batches);
-    result.temp_buffer = std::move(temp_buffer_owner);
-    result.handle = handle;
-    return result;
+    return submitted_batches;
+}
+
+tl::expected<void, ErrorCode> DataManager::TransferData(
+    void* local_transfer_base, size_t total_size,
+    const std::vector<RemoteBufferDesc>& peer_buffers,
+    Transport::TransferRequest::OpCode opcode) {
+    auto validate_result = ValidateRemoteBuffers(peer_buffers);
+    if (!validate_result) {
+        LOG(ERROR) << "TransferData: ValidateRemoteBuffers failed: "
+                   << toString(validate_result.error());
+        return tl::make_unexpected(validate_result.error());
+    }
+    size_t total_remote_size = 0;
+    for (const auto& buf : peer_buffers) total_remote_size += buf.size;
+    if (total_remote_size != total_size) {
+        LOG(ERROR) << "TransferData: peer buffer size mismatch ("
+                   << total_remote_size << " vs " << total_size << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto batches = SubmitTeTransferBatches(local_transfer_base, total_size,
+                                           peer_buffers, opcode);
+    if (!batches) {
+        LOG(ERROR) << "TransferData: SubmitTeTransferBatches failed: "
+                   << toString(batches.error());
+        return tl::unexpected(batches.error());
+    }
+    auto wait_result = WaitAllTransferBatches(batches.value());
+    if (!wait_result) {
+        LOG(ERROR) << "TransferData: WaitAllTransferBatches "
+                      "failed: "
+                   << toString(wait_result.error());
+        return wait_result;
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(

@@ -21,6 +21,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
         {ErrorCode::INVALID_PARAMS, "INVALID_PARAMS"},
         {ErrorCode::ILLEGAL_CLIENT, "ILLEGAL_CLIENT"},
+        {ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED,
+         "NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED"},
         {ErrorCode::INVALID_WRITE, "INVALID_WRITE"},
         {ErrorCode::INVALID_READ, "INVALID_READ"},
         {ErrorCode::INVALID_REPLICA, "INVALID_REPLICA"},

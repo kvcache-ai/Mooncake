@@ -293,15 +293,51 @@ class P2PClientService final : public ClientService {
         std::unique_ptr<TaskHandle<void>> Dispatch() override;
     };
 
-    struct RemoteWriteOp : WriteOp {
+    struct RemoteForwardWriteOp : WriteOp {
+        using WritePromise =
+            async_simple::Promise<tl::expected<void, ErrorCode>>;
+        using TeTransferFn = std::function<tl::expected<void, ErrorCode>(
+            void* local_base, size_t size,
+            const std::vector<RemoteBufferDesc>& dest_buffers)>;
+
+        PeerClient* peer_ptr;
+        std::shared_ptr<RemoteWriteRequest> write_req;
+        std::string endpoint;
+        std::vector<Slice>* slices;
+        TeTransferFn te_transfer;
+
+        RemoteForwardWriteOp(PeerClient* p,
+                             std::shared_ptr<RemoteWriteRequest> wr,
+                             std::string ep, std::vector<Slice>* s,
+                             TeTransferFn transfer)
+            : peer_ptr(p),
+              write_req(std::move(wr)),
+              endpoint(std::move(ep)),
+              slices(s),
+              te_transfer(std::move(transfer)) {}
+
+        std::string_view route() const override { return endpoint; }
+        std::unique_ptr<TaskHandle<void>> Dispatch() override;
+
+       private:
+        static async_simple::coro::Lazy<void> RunForwardRemotePut(
+            std::shared_ptr<WritePromise> promise, PeerClient* peer,
+            TeTransferFn te_transfer,
+            std::shared_ptr<RemoteWriteRequest> write_req,
+            std::vector<Slice>* slices);
+    };
+
+    struct RemoteReverseWriteOp : WriteOp {
         PeerClient* peer_ptr;
         std::shared_ptr<RemoteWriteRequest> write_req;
         P2PProxyDescriptor proxy;
         RouteCache* route_cache;
         std::string endpoint;
 
-        RemoteWriteOp(PeerClient* p, std::shared_ptr<RemoteWriteRequest> wr,
-                      P2PProxyDescriptor px, RouteCache* rc, std::string ep)
+        RemoteReverseWriteOp(PeerClient* p,
+                             std::shared_ptr<RemoteWriteRequest> wr,
+                             P2PProxyDescriptor px, RouteCache* rc,
+                             std::string ep)
             : peer_ptr(p),
               write_req(std::move(wr)),
               proxy(std::move(px)),
@@ -423,6 +459,14 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise);
 
+    // Returns per-route ErrorCode. On OK, fulfills promise. INVALID_PARAMS /
+    // NOT_IMPLEMENTED are terminal in RunReadWithRetry; other codes retry until
+    // routes are exhausted (final_result set at end).
+    async_simple::coro::Lazy<ErrorCode> RunForwardReadOnRoute(
+        const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
+        std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+            promise);
+
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
                                  const ReadRouteConfig& config);
@@ -458,6 +502,10 @@ class P2PClientService final : public ClientService {
 
     // HA recovery manager
     std::unique_ptr<HARecoveryManager> ha_manager_;
+
+    // Cross-node transfer direction from P2PClientConfig at Init().
+    TransferDirectionMode transfer_direction_mode_ =
+        TransferDirectionMode::REVERSE;
 };
 
 }  // namespace mooncake

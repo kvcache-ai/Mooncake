@@ -132,6 +132,9 @@ enum class ErrorCode : int32_t {
     // Parameter errors (Range: -600 to -699)
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
+    NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED =
+        -602,  ///< Non-contiguous buffer not supported in forward transfer
+               ///< mode.
 
     // Engine operation errors (Range: -700 to -711)
     INVALID_WRITE = -700,    ///< Invalid write operation.
@@ -486,6 +489,31 @@ inline std::ostream& operator<<(
 
     os << (strategy_strings.count(strategy) ? strategy_strings.at(strategy)
                                             : "UNKNOWN");
+    return os;
+}
+
+// Who initiates the cross-node transfer for the data plane: REVERSE matches the
+// historical target-initiated path and is the conventional default when unset
+// optional or client-level config omits an explicit override.
+enum class TransferDirectionMode : uint8_t {
+    REVERSE = 0,
+    FORWARD = 1,
+};
+
+// Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
+inline std::ostream& operator<<(std::ostream& os,
+                                const TransferDirectionMode& mode) noexcept {
+    switch (mode) {
+        case TransferDirectionMode::REVERSE:
+            os << "REVERSE";
+            break;
+        case TransferDirectionMode::FORWARD:
+            os << "FORWARD";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
     return os;
 }
 

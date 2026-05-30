@@ -55,6 +55,20 @@ class ClientRpcService {
     tl::expected<UUID, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
 
+    tl::expected<PreWriteResponse, ErrorCode> PreWrite(
+        const PreWriteRequest& request);
+
+    tl::expected<void, ErrorCode> WriteCommit(
+        const WriteCommitRequest& request);
+
+    tl::expected<void, ErrorCode> WriteRevoke(
+        const WriteRevokeRequest& request);
+
+    tl::expected<PinKeyResponse, ErrorCode> PinKey(
+        const PinKeyRequest& request);
+
+    tl::expected<void, ErrorCode> UnPinKey(const UnPinKeyRequest& request);
+
    private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
     P2PClientMetric* metrics_;   // Optional: owned by P2PClientService

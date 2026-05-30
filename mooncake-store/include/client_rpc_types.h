@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <optional>
 #include <cstdint>
 #include "types.h"
 #include "ylt/struct_json/json_reader.h"
@@ -83,5 +84,57 @@ struct BatchRemoteWriteRequest {
 };
 
 YLT_REFL(BatchRemoteWriteRequest, keys, src_buffers_list, target_tier_ids);
+
+struct PreWriteRequest {
+    std::string_view key;
+    uint64_t size_bytes = 0;
+    std::optional<UUID> target_tier_id;
+};
+
+YLT_REFL(PreWriteRequest, key, size_bytes, target_tier_id);
+
+struct PreWriteResponse {
+    RemoteBufferDesc remote_buffer;
+    UUID write_operation_id;
+};
+
+YLT_REFL(PreWriteResponse, remote_buffer, write_operation_id);
+
+struct WriteCommitRequest {
+    std::string_view key;
+    UUID write_operation_id;
+};
+
+YLT_REFL(WriteCommitRequest, key, write_operation_id);
+
+/** Drops a pending PreWrite allocation without committing (e.g. after TE
+ * failure). */
+struct WriteRevokeRequest {
+    std::string_view key;
+    UUID write_operation_id;
+};
+
+YLT_REFL(WriteRevokeRequest, key, write_operation_id);
+
+struct PinKeyRequest {
+    std::string_view key;
+    std::optional<UUID> target_tier_id;
+};
+
+YLT_REFL(PinKeyRequest, key, target_tier_id);
+
+struct PinKeyResponse {
+    RemoteBufferDesc remote_buffer;
+    UUID read_operation_id;
+};
+
+YLT_REFL(PinKeyResponse, remote_buffer, read_operation_id);
+
+struct UnPinKeyRequest {
+    std::string_view key;
+    UUID read_operation_id;
+};
+
+YLT_REFL(UnPinKeyRequest, key, read_operation_id);
 
 }  // namespace mooncake

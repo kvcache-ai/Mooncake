@@ -15,6 +15,7 @@
 #include <json/json.h>
 #include "common.h"
 
+#include "types.h"
 namespace mooncake {
 
 class TransferEngine;
@@ -179,6 +180,11 @@ struct P2PClientConfig : RealClientConfigBase {
     static constexpr uint32_t kP2pDefaultKeyLeaseScanIntervalMs = 1000;
     uint32_t p2p_key_lease_duration_ms = kP2pDefaultKeyLeaseDurationMs;
     uint32_t p2p_key_lease_scan_interval_ms = kP2pDefaultKeyLeaseScanIntervalMs;
+
+    // Cross-node transfer direction (reverse = owner TE, forward = accessor
+    // TE). Configured at client startup only.
+    TransferDirectionMode transfer_direction_mode =
+        TransferDirectionMode::REVERSE;
 };
 
 // ============================================================================
@@ -248,7 +254,8 @@ class ClientConfigBuilder {
         size_t async_sender_thread_count = 0,
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
         uint32_t p2p_key_lease_duration_ms = 0,
-        uint32_t p2p_key_lease_scan_interval_ms = 0) {
+        uint32_t p2p_key_lease_scan_interval_ms = 0,
+        const std::string& p2p_transfer_direction_mode = "reverse") {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -288,6 +295,8 @@ class ClientConfigBuilder {
             config.p2p_key_lease_scan_interval_ms =
                 p2p_key_lease_scan_interval_ms;
         }
+        config.transfer_direction_mode =
+            parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
         return config;
     }
@@ -392,6 +401,22 @@ class ClientConfigBuilder {
         }
         throw std::runtime_error(
             "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
+    }
+
+    static TransferDirectionMode parse_p2p_transfer_direction_mode(
+        std::string mode) {
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "reverse") {
+            return TransferDirectionMode::REVERSE;
+        }
+        if (mode == "forward") {
+            return TransferDirectionMode::FORWARD;
+        }
+        throw std::runtime_error(
+            "Invalid p2p transfer direction mode. Expected 'reverse' or "
+            "'forward'.");
     }
 };
 

@@ -35,7 +35,9 @@ class P2PClientIntegrationTest : public ::testing::Test {
 
     static std::shared_ptr<P2PClientService> CreateP2PClient(
         const std::string& host_name, uint32_t rpc_port = 0,
-        const std::string& local_transfer_mode = "te") {
+        const std::string& local_transfer_mode = "te",
+        TransferDirectionMode transfer_direction_mode =
+            TransferDirectionMode::REVERSE) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
         auto config = ClientConfigBuilder::build_p2p_real_client(
@@ -47,6 +49,7 @@ class P2PClientIntegrationTest : public ::testing::Test {
         } else {
             config.local_transfer_mode = LocalTransferMode::MEMCPY;
         }
+        config.transfer_direction_mode = transfer_direction_mode;
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.metrics_port,
@@ -620,6 +623,159 @@ TEST_F(P2PClientIntegrationTest, LocalGetBufferHandleWithTeTransferMode) {
     auto unreg_src = te_client->unregisterLocalMemory(payload.data(), false);
     EXPECT_TRUE(unreg_dst.has_value());
     EXPECT_TRUE(unreg_src.has_value());
+}
+
+TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
+    const std::vector<std::string> transfer_modes = {"te", "memcpy"};
+    for (const auto& mode : transfer_modes) {
+        SCOPED_TRACE("local_transfer_mode=" + mode);
+
+        std::string host = "localhost:" + std::to_string(getFreeTcpPort());
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode,
+                                             TransferDirectionMode::FORWARD);
+        ASSERT_NE(remote_writer, nullptr);
+
+        const std::string key = "p2p_fwd_put_get_" + mode + "_" + host;
+        const std::string payload = "forward_payload_" + mode + "_data";
+
+        WriteRouteRequestConfig route;
+        route.allow_local = false;
+        route.prefer_local = false;
+        route.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+        std::vector<Slice> slices;
+        slices.emplace_back(
+            Slice{const_cast<char*>(payload.data()), payload.size()});
+        auto put_res = remote_writer->Put(key, slices, route);
+        ASSERT_TRUE(put_res.has_value())
+            << "Forward Put failed mode=" << mode
+            << " err=" << static_cast<int>(put_res.error());
+
+        // confirm the object is visible on the owner peer (suite client_).
+        auto exist_on_owner = client_->IsExist(key);
+        ASSERT_TRUE(exist_on_owner.has_value())
+            << "Owner IsExist failed mode=" << mode
+            << " err=" << static_cast<int>(exist_on_owner.error());
+        EXPECT_TRUE(exist_on_owner.value())
+            << "Forward Put should leave key on owner peer, mode=" << mode;
+
+        ReadRouteConfig rcfg;
+        rcfg.max_candidates =
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+
+        std::vector<char> buf(payload.size(), 0);
+        auto get_res =
+            remote_writer->Get(key, {(void*)buf.data()}, {buf.size()}, rcfg);
+        ASSERT_TRUE(get_res.has_value())
+            << "Forward Get failed mode=" << mode
+            << " err=" << static_cast<int>(get_res.error());
+        EXPECT_EQ(static_cast<size_t>(get_res.value()), payload.size());
+        EXPECT_EQ(std::string(buf.data(), buf.size()), payload);
+    }
+}
+
+// FORWARD remote BatchPut + BatchGet (raw buffers and allocator paths).
+TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
+    const std::vector<std::string> transfer_modes = {"te", "memcpy"};
+    for (const auto& mode : transfer_modes) {
+        SCOPED_TRACE("local_transfer_mode=" + mode);
+
+        std::string host = "localhost:" + std::to_string(getFreeTcpPort());
+        auto remote_writer = CreateP2PClient(host, /*rpc_port=*/0, mode,
+                                             TransferDirectionMode::FORWARD);
+        ASSERT_NE(remote_writer, nullptr);
+
+        const int batch_size = 6;
+        std::vector<std::string> keys;
+        std::vector<std::string> payloads;
+        std::vector<std::vector<Slice>> batched_slices;
+
+        keys.reserve(batch_size);
+        payloads.reserve(batch_size);
+        batched_slices.reserve(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            std::string key_prefix = "p2p_fwd_remote_batch_" + mode + "_";
+            keys.push_back(key_prefix + "key_" + std::to_string(i));
+            payloads.push_back(key_prefix + "payload_" + std::to_string(i));
+        }
+        for (int i = 0; i < batch_size; ++i) {
+            std::vector<Slice> slices;
+            slices.emplace_back(Slice{const_cast<char*>(payloads[i].data()),
+                                      payloads[i].size()});
+            batched_slices.push_back(std::move(slices));
+        }
+
+        WriteRouteRequestConfig remote_put_config;
+        remote_put_config.allow_local = false;
+        remote_put_config.prefer_local = false;
+        remote_put_config.max_candidates =
+            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+        auto put_results =
+            remote_writer->BatchPut(keys, batched_slices, remote_put_config);
+        ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
+        for (size_t i = 0; i < put_results.size(); ++i) {
+            ASSERT_TRUE(put_results[i].has_value())
+                << "Forward BatchPut failed mode=" << mode << " key=" << keys[i]
+                << " err=" << static_cast<int>(put_results[i].error());
+        }
+
+        for (const auto& key : keys) {
+            auto exist_on_owner = client_->IsExist(key);
+            ASSERT_TRUE(exist_on_owner.has_value())
+                << "Owner IsExist failed mode=" << mode << " key=" << key
+                << " err=" << static_cast<int>(exist_on_owner.error());
+            EXPECT_TRUE(exist_on_owner.value())
+                << "Forward BatchPut should leave key on owner peer, key="
+                << key << " mode=" << mode;
+        }
+
+        ReadRouteConfig read_config;
+        read_config.max_candidates =
+            GetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+
+        std::vector<std::vector<char>> read_payloads(batch_size);
+        std::vector<std::vector<void*>> all_buffers(batch_size);
+        std::vector<std::vector<size_t>> all_sizes(batch_size);
+        for (int i = 0; i < batch_size; ++i) {
+            read_payloads[i].resize(payloads[i].size(), 0);
+            all_buffers[i].push_back(read_payloads[i].data());
+            all_sizes[i].push_back(read_payloads[i].size());
+        }
+
+        auto batch_get_results =
+            remote_writer->BatchGet(keys, all_buffers, all_sizes, read_config);
+        ASSERT_EQ(batch_get_results.size(), static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+            ASSERT_TRUE(batch_get_results[i].has_value())
+                << "Forward BatchGet(raw) failed mode=" << mode
+                << " key=" << keys[i]
+                << " err=" << static_cast<int>(batch_get_results[i].error());
+            EXPECT_EQ(static_cast<size_t>(batch_get_results[i].value()),
+                      payloads[i].size());
+            EXPECT_EQ(
+                std::string(read_payloads[i].data(), read_payloads[i].size()),
+                payloads[i]);
+        }
+
+        auto allocator = ClientBufferAllocator::create(8 * 1024 * 1024);
+        ASSERT_NE(allocator, nullptr);
+        auto batch_get_handles =
+            remote_writer->BatchGet(keys, allocator, read_config);
+        ASSERT_EQ(batch_get_handles.size(), static_cast<size_t>(batch_size));
+        for (int i = 0; i < batch_size; ++i) {
+            ASSERT_TRUE(batch_get_handles[i].has_value())
+                << "Forward BatchGet(allocator) failed mode=" << mode
+                << " key=" << keys[i]
+                << " err=" << static_cast<int>(batch_get_handles[i].error());
+            auto buffer_handle = batch_get_handles[i].value();
+            ASSERT_NE(buffer_handle, nullptr);
+            ASSERT_EQ(buffer_handle->size(), payloads[i].size());
+            EXPECT_EQ(std::string(static_cast<char*>(buffer_handle->ptr()),
+                                  buffer_handle->size()),
+                      payloads[i]);
+        }
+    }
 }
 
 }  // namespace testing
