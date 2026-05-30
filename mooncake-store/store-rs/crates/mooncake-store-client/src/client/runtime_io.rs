@@ -1980,7 +1980,10 @@ impl StoreClient {
         true
     }
 
-    fn resolve_objects(&self, objects: &[ObjectRef<'_>]) -> Result<Vec<ResolvedObject>> {
+    fn resolve_objects(
+        &self,
+        objects: &[ObjectRef<'_>],
+    ) -> Result<(Vec<ResolvedObject>, Vec<usize>)> {
         let tracker = OperationTracker::new("route_lookup_many")
             .attribute_u64("mooncake.item_count", objects.len() as u64);
         let result = (|| {
@@ -1989,10 +1992,17 @@ impl StoreClient {
                 .map(|object| {
                     let tenant = object.tenant.unwrap_or(self.default_tenant());
                     let object_id = LogicalObjectId::new(
-                        NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+                        NamespaceScope::with_defaults(
+                            Some(tenant),
+                            object.domain,
+                            object.object_set,
+                        ),
                         object.key,
                     );
-                    (tenant.to_string(), mooncake_store_core::ObjectKey::from_logical_id(&object_id))
+                    (
+                        tenant.to_string(),
+                        mooncake_store_core::ObjectKey::from_logical_id(&object_id),
+                    )
                 })
                 .collect::<Vec<_>>();
             let routes = self.route_ops().load_routes(
@@ -2004,79 +2014,110 @@ impl StoreClient {
             let local_segments = self.local_storage_segments();
             let readable_runtimes = self.readable_runtime_set(false)?;
             let mut resolved = Vec::with_capacity(objects.len());
-            for (((tenant, _scoped), object), route) in scoped
+            let mut resolved_indices = Vec::with_capacity(objects.len());
+            for (index, (((tenant, _scoped), object), route)) in scoped
                 .into_iter()
                 .zip(objects.iter())
                 .zip(routes)
+                .enumerate()
             {
-                let route = route.ok_or_else(|| {
-                    StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
-                })?;
-                if route.state != RouteState::Active {
-                    return Err(StoreError::NotFound(format!(
-                        "tenant={tenant} key={} is not readable",
-                        object.key
-                    )));
-                }
-                let (replica, readable_for_route) = match Self::select_readable_replica(
-                    &route,
-                    &self.lease.runtime,
-                    &local_segments,
-                    &readable_runtimes,
-                ) {
-                    Some(replica) => (replica, readable_runtimes.clone()),
-                    None => {
-                        let refreshed_readable = self.readable_runtime_set(true)?;
-                        let replica = Self::select_readable_replica(
-                            &route,
-                            &self.lease.runtime,
-                            &local_segments,
-                            &refreshed_readable,
-                        )
-                        .ok_or_else(|| {
-                            StoreError::NotFound(format!(
-                                "tenant={tenant} key={} has no readable replica owner",
-                                object.key
-                            ))
-                        })?;
-                        (replica, refreshed_readable)
+                let item = (|| -> Result<ResolvedObject> {
+                    let route = route.ok_or_else(|| {
+                        StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
+                    })?;
+                    if route.state != RouteState::Active {
+                        return Err(StoreError::NotFound(format!(
+                            "tenant={tenant} key={} is not readable",
+                            object.key
+                        )));
                     }
-                };
-                if route
-                    .replicas
-                    .iter()
-                    .min_by_key(|candidate| candidate.priority)
-                    .is_some_and(|primary| primary.owner != replica.owner)
-                {
-                    self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+                    let (replica, readable_for_route) = match Self::select_readable_replica(
+                        &route,
+                        &self.lease.runtime,
+                        &local_segments,
+                        &readable_runtimes,
+                    ) {
+                        Some(replica) => (replica, readable_runtimes.clone()),
+                        None => {
+                            let refreshed_readable = self.readable_runtime_set(true)?;
+                            let replica = Self::select_readable_replica(
+                                &route,
+                                &self.lease.runtime,
+                                &local_segments,
+                                &refreshed_readable,
+                            )
+                            .ok_or_else(|| {
+                                StoreError::NotFound(format!(
+                                    "tenant={tenant} key={} has no readable replica owner",
+                                    object.key
+                                ))
+                            })?;
+                            (replica, refreshed_readable)
+                        }
+                    };
+                    if route
+                        .replicas
+                        .iter()
+                        .min_by_key(|candidate| candidate.priority)
+                        .is_some_and(|primary| primary.owner != replica.owner)
+                    {
+                        self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+                    }
+                    let fallback_replicas = Self::fallback_replicas_for_route(
+                        &route,
+                        &replica,
+                        &self.lease.runtime,
+                        &local_segments,
+                        &readable_for_route,
+                    );
+                    Ok(ResolvedObject {
+                        tenant: tenant.to_string(),
+                        key: object.key.to_string(),
+                        route,
+                        replica,
+                        fallback_replicas,
+                    })
+                })();
+                match item {
+                    Ok(r) => {
+                        resolved.push(r);
+                        resolved_indices.push(index);
+                    }
+                    Err(error) => {
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            tenant,
+                            key = %object.key,
+                            error = %error,
+                            "skipping unresolvable object in batch get"
+                        );
+                    }
                 }
-                let fallback_replicas = Self::fallback_replicas_for_route(
-                    &route,
-                    &replica,
-                    &self.lease.runtime,
-                    &local_segments,
-                    &readable_for_route,
-                );
-                resolved.push(ResolvedObject {
-                    tenant: tenant.to_string(),
-                    key: object.key.to_string(),
-                    route,
-                    replica,
-                    fallback_replicas,
-                });
             }
-            Ok(resolved)
+            Ok((resolved, resolved_indices))
         })();
-        if let Ok(resolved) = &result {
-            debug!(
-                runtime = %self.lease.runtime,
-                items = resolved.len(),
-                "resolved object routes"
-            );
+        if let Ok((resolved, _)) = &result {
+            let skipped = objects.len() - resolved.len();
+            if skipped > 0 {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    resolved = resolved.len(),
+                    skipped,
+                    "resolved object routes with partial failures"
+                );
+            } else {
+                debug!(
+                    runtime = %self.lease.runtime,
+                    items = resolved.len(),
+                    "resolved object routes"
+                );
+            }
         }
         tracker.finish_with_result(
             match &result {
-                Ok(_) => "ok",
+                Ok((resolved, _)) if resolved.len() == objects.len() => "ok",
+                Ok((resolved, _)) if resolved.is_empty() => "miss",
+                Ok(_) => "partial",
                 Err(StoreError::NotFound(_)) => "miss",
                 Err(StoreError::Conflict(_)) => "conflict",
                 Err(_) => "error",

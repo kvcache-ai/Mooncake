@@ -15417,6 +15417,161 @@ fn due_reclaims_are_sorted_by_policy_rank_then_due_time() {
     assert_eq!(due[2].segment_name, SegmentName::new("seg-a"));
 }
 
+#[test]
+fn batch_get_into_returns_partial_results_when_some_keys_miss() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("partial-resolve-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("partial-resolve-router-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "partial-resolve-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "partial-resolve-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let payload = b"partial-resolve-payload";
+    router
+        .put("existing-key", payload)
+        .expect("put should succeed");
+
+    let mut buf_a = vec![0u8; 64];
+    let mut buf_b = vec![0u8; 64];
+    let mut requests = vec![
+        GetRequest::new("existing-key", &mut buf_a),
+        GetRequest::new("missing-key", &mut buf_b),
+    ];
+    let sizes = router
+        .batch_get_into(&mut requests)
+        .expect("batch_get_into should return Ok even when some keys are missing");
+    assert_eq!(sizes[0], payload.len(), "existing key should return data");
+    assert_eq!(sizes[1], 0, "missing key should return zero bytes");
+    assert_eq!(&buf_a[..sizes[0]], payload);
+}
+
+#[test]
+fn batch_get_returns_empty_for_missing_keys_in_partial_batch() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("partial-batch-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("partial-batch-router-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "partial-batch-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "partial-batch-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let payload = b"partial-batch-payload";
+    router
+        .put("batch-existing", payload)
+        .expect("put should succeed");
+
+    let result = router
+        .batch_get(&[
+            ObjectRef::new("batch-existing"),
+            ObjectRef::new("batch-missing"),
+        ])
+        .expect("batch_get should return Ok for partial results");
+    assert_eq!(result[0], payload, "existing key should return data");
+    assert!(result[1].is_empty(), "missing key should return empty vec");
+}
+
+#[test]
+fn single_get_still_returns_not_found_for_missing_key() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("single-miss-storage-segment"));
+    let router_transport = Arc::new(storage_transport.peer("single-miss-router-segment"));
+
+    let storage = StoreClientBuilder::new(metadata.clone(), "single-miss-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let router = StoreClientBuilder::new(metadata.clone(), "single-miss-router")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(router_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(
+            PlacementPlanner::new(metadata).require_label("storage", "true"),
+            1,
+        )
+        .build(test_future_expiry_ms())
+        .expect("router build should succeed");
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    router
+        .register_local_memory()
+        .expect("router memory should register");
+    wait_for_membership_convergence(&[&storage, &router]);
+
+    let error = router.get("nonexistent-key").unwrap_err();
+    assert!(
+        matches!(error, StoreError::NotFound(_)),
+        "single get of missing key should return NotFound, got {error}"
+    );
+}
+
 mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;
