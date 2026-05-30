@@ -237,6 +237,9 @@ Route publication and eviction are intentionally decoupled across two owners:
 After a write publishes a route, the writer groups replicas by remote storage owner and sends the published routes through `BatchTrackReplicaRoutes`.
 
 This lets each storage owner update its local eviction clock from the published route directly, instead of rebuilding state from metadata during normal write traffic.
+Newly published replicas enter the storage-owner clock with one write-fresh grace pass. Real read
+and route-query hits still use the read-hot path, so hot data outlives merely fresh writes without
+coupling boolean existence probes to eviction accounting.
 
 ## Read Path
 
@@ -348,8 +351,8 @@ This keeps steady-state pressure off the front path while still preserving a det
 
 Default local-memory thresholds are:
 
-- high watermark: `95%`
-- low watermark: `90%`
+- high watermark: `90%`
+- low watermark: `80%`
 - poll interval: `100ms`
 
 Startup also normalizes the storage role:

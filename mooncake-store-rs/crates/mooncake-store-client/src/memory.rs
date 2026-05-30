@@ -18,8 +18,8 @@ use mooncake_store_transport_core::MemoryRegistration;
 const DEFAULT_STORAGE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_ALIGNMENT: usize = 64;
-const DEFAULT_EVICTION_HIGH_WATERMARK_PERCENT: u8 = 95;
-const DEFAULT_EVICTION_LOW_WATERMARK_PERCENT: u8 = 90;
+const DEFAULT_EVICTION_HIGH_WATERMARK_PERCENT: u8 = 90;
+const DEFAULT_EVICTION_LOW_WATERMARK_PERCENT: u8 = 80;
 const DEFAULT_EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_NUMA_AWARE: bool = true;
 

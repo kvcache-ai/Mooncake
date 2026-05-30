@@ -280,8 +280,8 @@ The current behavior is:
 
 Default local-memory settings are:
 
-- high watermark: `95%`
-- low watermark: `90%`
+- high watermark: `90%`
+- low watermark: `80%`
 - poll interval: `100ms`
 
 ### Read-hit reporting
@@ -301,6 +301,9 @@ Hit reporting is best-effort. A lost hit can reduce eviction quality, but it doe
 After a writer successfully publishes a route, it groups the remote replica owners and sends the published routes through `BatchTrackReplicaRoutes`.
 
 This gives each storage owner a current route view for the replicas it stores without requiring a metadata scan on the write hot path.
+Freshly published replicas get one CLOCK grace pass on the storage owner. Completed reads and
+route-query access signals still set the stronger read-hot bit; boolean existence probes remain
+pure probes and do not report hits.
 
 ### Route-owner CAS reclaim
 

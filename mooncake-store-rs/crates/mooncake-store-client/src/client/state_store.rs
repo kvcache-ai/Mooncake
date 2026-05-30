@@ -734,6 +734,26 @@ mod state_store_tests {
             "sync_route must not resurrect stale hotness for k-2 after fresh rebuild"
         );
     }
+
+    #[test]
+    fn fresh_writes_get_one_clock_grace_but_read_hot_still_wins() {
+        let runtime = test_runtime();
+        let mut clock = StorageClockState::default();
+        let hot_route = test_route("hot", &runtime);
+        let fresh_route = test_route("fresh", &runtime);
+
+        clock.track_fresh_route(&hot_route, &runtime);
+        clock.track_fresh_route(&fresh_route, &runtime);
+        clock.mark_hot_keys(&[hot_route.key.clone()]);
+
+        let victim = clock
+            .pick_victim(None)
+            .expect("clock should pick a victim after grace expires");
+        assert_eq!(
+            victim.route_key, fresh_route.key,
+            "read-hot routes should outlive write-fresh routes during the same CLOCK scan"
+        );
+    }
 }
 
 impl StorageOwnerState {
@@ -768,7 +788,7 @@ impl StorageOwnerState {
         }
         let mut clock = self.clock.lock();
         for route in routes {
-            clock.sync_route(route, &self.runtime);
+            clock.sync_fresh_route(route, &self.runtime);
         }
         RouteTrafficReport::new(routes.len(), bytes)
     }
@@ -777,7 +797,7 @@ impl StorageOwnerState {
         self.allocator
             .lock()
             .clear_pending_route(route, &self.runtime);
-        self.clock.lock().track_route(route, &self.runtime);
+        self.clock.lock().track_fresh_route(route, &self.runtime);
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
@@ -1019,8 +1039,25 @@ impl StorageClockState {
     }
 
     fn track_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
-        for replica in route.replicas.iter().filter(|replica| replica.owner == *runtime) {
-            self.upsert_replica(route, replica);
+        self.track_route_with_fresh_write(route, runtime, false);
+    }
+
+    fn track_fresh_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.track_route_with_fresh_write(route, runtime, true);
+    }
+
+    fn track_route_with_fresh_write(
+        &mut self,
+        route: &ObjectRoute,
+        runtime: &ClientRuntimeId,
+        fresh_write: bool,
+    ) {
+        for replica in route
+            .replicas
+            .iter()
+            .filter(|replica| replica.owner == *runtime)
+        {
+            self.upsert_replica(route, replica, fresh_write);
         }
     }
 
@@ -1037,6 +1074,11 @@ impl StorageClockState {
     fn sync_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
         self.remove_key(&route.key);
         self.track_route(route, runtime);
+    }
+
+    fn sync_fresh_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
+        self.remove_key(&route.key);
+        self.track_fresh_route(route, runtime);
     }
 
     fn mark_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
@@ -1079,12 +1121,21 @@ impl StorageClockState {
                 entry.hot = false;
                 continue;
             }
+            if entry.fresh_write {
+                entry.fresh_write = false;
+                continue;
+            }
             return Some(entry.id.clone());
         }
         None
     }
 
-    fn upsert_replica(&mut self, route: &ObjectRoute, replica: &ReplicaRoute) {
+    fn upsert_replica(
+        &mut self,
+        route: &ObjectRoute,
+        replica: &ReplicaRoute,
+        fresh_write: bool,
+    ) {
         let id = ClockEntryId {
             route_key: route.key.clone(),
             segment_name: replica.segment_name.clone(),
@@ -1093,6 +1144,7 @@ impl StorageClockState {
         if let Some(index) = self.by_id.get(&id).copied() {
             if let Some(entry) = self.entries.get_mut(index).and_then(Option::as_mut) {
                 entry.length_bytes = replica.length;
+                entry.fresh_write |= fresh_write;
             }
             return;
         }
@@ -1100,6 +1152,7 @@ impl StorageClockState {
             id: id.clone(),
             length_bytes: replica.length,
             hot: self.pending_hot_keys.contains(&route.key),
+            fresh_write,
         };
         let index = self
             .entries
