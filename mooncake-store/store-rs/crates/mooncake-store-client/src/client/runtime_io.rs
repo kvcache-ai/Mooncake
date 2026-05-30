@@ -515,6 +515,7 @@ impl StoreClient {
                 let retry_version = next_route_version(None, &self.route_ops(), &scoped_key);
                 if retry_version > route.version {
                     route.version = retry_version;
+                    let retry_started = Instant::now();
                     let retry_result =
                         self.route_ops()
                             .publish_route(&route.key, expected_version, &route);
@@ -525,7 +526,7 @@ impl StoreClient {
                             Err(StoreError::Conflict(_)) => "conflict",
                             Err(_) => "error",
                         },
-                        publish_started.elapsed(),
+                        retry_started.elapsed(),
                     );
                     cas = retry_result?;
                 }
