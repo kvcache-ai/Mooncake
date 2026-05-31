@@ -609,6 +609,162 @@ TEST_F(OpLogApplierTest, TestGetExpectedSequenceId) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
+// ========== Segment OpLog apply tests ==========
+
+std::string MakeSegmentMountPayload(const std::string& segment_name,
+                                    const std::string& transport_endpoint,
+                                    uint64_t capacity = 1024,
+                                    bool is_memory = true,
+                                    const std::string& file_path = "") {
+    SegmentMountOp op;
+    op.segment_name = segment_name;
+    op.transport_endpoint = transport_endpoint;
+    op.capacity = capacity;
+    op.is_memory_segment = is_memory;
+    op.file_path = file_path;
+    auto result = struct_pack::serialize(op);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MakeSegmentUnmountPayload(const std::string& transport_endpoint) {
+    SegmentUnmountOp op;
+    op.transport_endpoint = transport_endpoint;
+    auto result = struct_pack::serialize(op);
+    return std::string(result.begin(), result.end());
+}
+
+std::string MakeSegmentUpdatePayload(const std::string& segment_name,
+                                     const std::string& transport_endpoint,
+                                     uint64_t capacity = 2048,
+                                     bool is_memory = true,
+                                     const std::string& file_path = "") {
+    SegmentUpdateOp op;
+    op.segment_name = segment_name;
+    op.transport_endpoint = transport_endpoint;
+    op.capacity = capacity;
+    op.is_memory_segment = is_memory;
+    op.file_path = file_path;
+    auto result = struct_pack::serialize(op);
+    return std::string(result.begin(), result.end());
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentMount) {
+    std::string payload =
+        MakeSegmentMountPayload("seg1", "192.168.1.1:12345", 1024, true);
+    OpLogEntry entry = MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", payload);
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+
+    const auto& registry = applier_->GetSegmentRegistry();
+    EXPECT_TRUE(registry.HasSegment("192.168.1.1:12345"));
+    auto info = registry.GetSegment("192.168.1.1:12345");
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ("seg1", info->segment_name);
+    EXPECT_EQ(1024u, info->capacity);
+    EXPECT_TRUE(info->is_memory_segment);
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {
+    // Mount first
+    std::string mount_payload =
+        MakeSegmentMountPayload("seg1", "192.168.1.1:12345", 1024, true);
+    OpLogEntry mount_entry =
+        MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", mount_payload);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(mount_entry));
+    EXPECT_TRUE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
+
+    // Then unmount
+    std::string unmount_payload = MakeSegmentUnmountPayload("192.168.1.1:12345");
+    OpLogEntry unmount_entry =
+        MakeEntry(2, OpType::SEGMENT_UNMOUNT, "seg1", unmount_payload);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount_entry));
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+
+    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
+    // Mount first
+    std::string mount_payload =
+        MakeSegmentMountPayload("seg1", "192.168.1.1:12345", 1024, true);
+    OpLogEntry mount_entry =
+        MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", mount_payload);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(mount_entry));
+
+    auto info_before = applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
+    ASSERT_TRUE(info_before.has_value());
+    EXPECT_EQ(1024u, info_before->capacity);
+
+    // Update
+    std::string update_payload =
+        MakeSegmentUpdatePayload("seg1", "192.168.1.1:12345", 2048, true);
+    OpLogEntry update_entry =
+        MakeEntry(2, OpType::SEGMENT_UPDATE, "seg1", update_payload);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(update_entry));
+    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
+
+    auto info_after = applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
+    ASSERT_TRUE(info_after.has_value());
+    EXPECT_EQ(2048u, info_after->capacity);
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentMount_InvalidPayload) {
+    OpLogEntry entry = MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", "garbage");
+
+    // Should not crash, but should not add segment either
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("seg1"));
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentUnmount_NonExistent) {
+    // Unmount a segment that was never mounted - should not crash
+    std::string unmount_payload = MakeSegmentUnmountPayload("192.168.1.1:12345");
+    OpLogEntry unmount_entry =
+        MakeEntry(1, OpType::SEGMENT_UNMOUNT, "seg1", unmount_payload);
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount_entry));
+    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
+    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
+}
+
+TEST_F(OpLogApplierTest, TestApplySegmentOperations_Mixed) {
+    // Mount multiple segments
+    OpLogEntry mount1 =
+        MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1",
+                  MakeSegmentMountPayload("seg1", "192.168.1.1:12345", 1024));
+    OpLogEntry mount2 =
+        MakeEntry(2, OpType::SEGMENT_MOUNT, "seg2",
+                  MakeSegmentMountPayload("seg2", "192.168.1.2:12345", 2048));
+    OpLogEntry mount3 =
+        MakeEntry(3, OpType::SEGMENT_MOUNT, "seg3",
+                  MakeSegmentMountPayload("seg3", "192.168.1.3:12345", 4096));
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(mount1));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(mount2));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(mount3));
+
+    const auto& registry = applier_->GetSegmentRegistry();
+    EXPECT_EQ(3u, registry.GetAllSegments().size());
+
+    // Unmount one
+    OpLogEntry unmount2 =
+        MakeEntry(4, OpType::SEGMENT_UNMOUNT, "seg2",
+                  MakeSegmentUnmountPayload("192.168.1.2:12345"));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount2));
+    EXPECT_EQ(2u, registry.GetAllSegments().size());
+    EXPECT_FALSE(registry.HasSegment("192.168.1.2:12345"));
+
+    // Update another
+    OpLogEntry update3 =
+        MakeEntry(5, OpType::SEGMENT_UPDATE, "seg3",
+                  MakeSegmentUpdatePayload("seg3", "192.168.1.3:12345", 8192));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(update3));
+    auto info3 = registry.GetSegment("192.168.1.3:12345");
+    ASSERT_TRUE(info3.has_value());
+    EXPECT_EQ(8192u, info3->capacity);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

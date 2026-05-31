@@ -134,6 +134,17 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
               descriptor_.last_included_seq);
     ASSERT_EQ(snapshot->value().metadata.size(), 1u);
 
+    // The test snapshot's segment payload is built from an empty
+    // SegmentManager (BuildSegmentsPayload), so the loaded snapshot
+    // must report no StandbySegmentInfo entries. This pins the contract
+    // documented at the extraction site in
+    // catalog_backed_snapshot_provider.cpp: only memory segments
+    // (mounted_segments_) populate snapshot.segments; local-disk and
+    // NoF segments arrive via SEGMENT_MOUNT OpLog replay instead.
+    EXPECT_TRUE(snapshot->value().segments.empty())
+        << "Empty segment manager must produce zero StandbySegmentInfo "
+           "entries";
+
     const auto& [key, metadata] = snapshot->value().metadata.front();
     EXPECT_EQ(key, kDefaultTestObjectKey);
     EXPECT_EQ(metadata.client_id, (UUID{1, 2}));

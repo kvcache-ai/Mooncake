@@ -164,6 +164,66 @@ TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, controller->PromoteStandby());
 }
 
+TEST(StandbyControllerTest, PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::UNKNOWN,
+        .connstring = "",
+        .cluster_namespace = "promotion-context-test",
+    };
+    MasterServiceSupervisorConfig config;
+    config.cluster_id = "promotion-context-test";
+    config.local_hostname = "127.0.0.1:50051";
+    config.enable_snapshot_restore = true;
+    config.snapshot_object_store_type = "local";
+    config.snapshot_catalog_store_type = "invalid";
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(controller, nullptr);
+
+    // When never started
+    auto result = controller->PromoteStandbyAndExport();
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+
+    // After failed start
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
+              controller->StartStandby(std::nullopt));
+    result = controller->PromoteStandbyAndExport();
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+}
+
+TEST_P(HotStandbySnapshotBootstrapTest,
+       PromoteStandbyAndExport_SuccessWithSnapshot) {
+    PublishSnapshot();
+
+    ha::HABackendSpec spec{
+        .type = ha::HABackendType::UNKNOWN,
+        .connstring = "",
+        .cluster_namespace = cluster_id_,
+    };
+
+    auto config =
+        MakeSnapshotProviderConfig(GetParam(), cluster_id_, FLAGS_redis_endpoint);
+    config.enable_snapshot_restore = true;
+    config.local_hostname = "127.0.0.1:50051";
+
+    auto controller = ha::CreateStandbyController(spec, config);
+    ASSERT_NE(controller, nullptr);
+
+    EXPECT_EQ(ErrorCode::OK, controller->StartStandby(std::nullopt));
+
+    auto result = controller->PromoteStandbyAndExport();
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+
+    const auto& ctx = result.value();
+    EXPECT_EQ(descriptor_.last_included_seq, ctx.applied_seq_id);
+    ASSERT_EQ(1u, ctx.objects.size());
+    EXPECT_EQ(kDefaultTestObjectKey, ctx.objects[0].first);
+    EXPECT_EQ(kDefaultTestObjectSize, ctx.objects[0].second.size);
+    EXPECT_TRUE(ctx.segments.empty());
+}
+
 INSTANTIATE_TEST_SUITE_P(
     SnapshotCatalogBackends, HotStandbySnapshotBootstrapTest,
     ::testing::ValuesIn(BuildCatalogBackendParams()),
