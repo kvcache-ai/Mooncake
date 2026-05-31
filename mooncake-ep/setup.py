@@ -26,8 +26,8 @@ if use_musa:
         "src/ep_py.cpp",
         "src/mooncake_ep_buffer.cpp",
         "src/mooncake_ep_kernel.mu",
-        "../mooncake-transfer-engine/src/transport/ep_device_transport/p2p_device_transport.cpp",
-        "../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport_musa_stub.cpp",
+        "../mooncake-transfer-engine/src/transport/device/p2p_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/device/ibgda_device_transport_musa_stub.cpp",
     ]
     cxx_flags = [
         f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
@@ -65,8 +65,8 @@ else:
         "src/mooncake_ep_buffer.cpp",
         "src/mooncake_ep_kernel.cu",
         "src/mooncake_ibgda/mlx5gda.cpp",
-        "../mooncake-transfer-engine/src/transport/ep_device_transport/p2p_device_transport.cpp",
-        "../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/device/p2p_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/device/ibgda_device_transport.cpp",
     ]
     extra_compile_args = {
         "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_CUDA", "-std=c++20", "-O3", "-g0"],

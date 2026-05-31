@@ -18,7 +18,7 @@
 // Uses ibv_open_device / ibv_alloc_pd directly (same as the original
 // MooncakeEpBuffer::init_ibgda()), but encapsulated in a reusable class.
 
-#include "transport/ep_device_transport/device_transport.h"
+#include "transport/device/device_transport.h"
 
 #include <arpa/inet.h>
 #include <glog/logging.h>
@@ -34,7 +34,7 @@
 #include "topology.h"
 
 namespace mooncake {
-namespace ep {
+namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
 
@@ -390,5 +390,5 @@ std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
     return std::make_unique<IbgdaDeviceTransportImpl>(device_filter);
 }
 
-}  // namespace ep
+}  // namespace device
 }  // namespace mooncake

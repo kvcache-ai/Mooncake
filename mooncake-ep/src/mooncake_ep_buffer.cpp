@@ -6,8 +6,8 @@ namespace mooncake {
 
 MooncakeEpBuffer::MooncakeEpBuffer(
     int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-    std::unique_ptr<ep::P2pTransport> p2p_transport,
-    std::unique_ptr<ep::RdmaTransport> rdma_transport)
+    std::unique_ptr<device::P2pTransport> p2p_transport,
+    std::unique_ptr<device::RdmaTransport> rdma_transport)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
@@ -33,7 +33,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     if (p2p_transport) {
         p2p_transport_ = std::move(p2p_transport);
     } else {
-        p2p_transport_ = ep::createP2pDeviceTransport(num_ranks);
+        p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
     }
 
     gdr_buffer = p2p_transport_->allocateBuffer(num_ep_buffer_bytes);
@@ -55,7 +55,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
                 if (!tok.empty()) device_filter.push_back(tok);
             }
         }
-        auto t = ep::createIbgdaDeviceTransport(device_filter);
+        auto t = device::createIbgdaDeviceTransport(device_filter);
         // initialize() returns non-zero on failure (no RDMA NIC, etc.)
         int ret = t->initialize("", num_ranks, USE_QP_COUNT);
         if (ret == 0) {

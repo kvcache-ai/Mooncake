@@ -90,3 +90,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStream_t musaStream_t
 #define cudaSuccess musaSuccess
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaEvent_t musaEvent_t
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
+#define cudaDevAttrClockRate musaDevAttrClockRate

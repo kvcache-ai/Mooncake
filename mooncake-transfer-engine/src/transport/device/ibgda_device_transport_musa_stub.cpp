@@ -6,10 +6,10 @@
 // and returns a transport whose initialize() always fails, causing the EP
 // buffer to set ibgda_disabled_ = true and fall back to P2P-only.
 
-#include "transport/ep_device_transport/device_transport.h"
+#include "transport/device/device_transport.h"
 
 namespace mooncake {
-namespace ep {
+namespace device {
 
 class NullRdmaTransport : public RdmaTransport {
    public:
@@ -38,5 +38,5 @@ std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
     return std::make_unique<NullRdmaTransport>();
 }
 
-}  // namespace ep
+}  // namespace device
 }  // namespace mooncake

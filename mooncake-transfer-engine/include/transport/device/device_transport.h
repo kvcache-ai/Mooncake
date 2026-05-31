@@ -23,7 +23,7 @@
 //                    Manages QP lifecycle, MR, and device context table.
 //
 // EP code includes only this header and calls the abstract interface.
-// Platform-specific implementations live in ep_device_transport/ and are
+// Platform-specific implementations live in device/ and are
 // selected at build time by the factory functions at the bottom of this file.
 //
 // The header intentionally avoids including cuda_alike.h so it can be included
@@ -35,7 +35,7 @@
 #include <vector>
 
 namespace mooncake {
-namespace ep {
+namespace device {
 
 // ---------------------------------------------------------------------------
 // P2pTransport
@@ -144,7 +144,7 @@ class RdmaTransport {
 };
 
 // ---------------------------------------------------------------------------
-// Factory functions — implemented in ep_device_transport.cpp.
+// Factory functions — implemented in device_transport.cpp.
 // Returns nullptr if the transport is not available on this platform.
 // ---------------------------------------------------------------------------
 
@@ -158,5 +158,5 @@ std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks);
 std::unique_ptr<RdmaTransport> createIbgdaDeviceTransport(
     const std::vector<std::string>& device_filter = {});
 
-}  // namespace ep
+}  // namespace device
 }  // namespace mooncake

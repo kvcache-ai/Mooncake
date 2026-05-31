@@ -16,7 +16,7 @@
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
 #include <torch/torch.h>
-#include <transport/ep_device_transport/device_transport.h>
+#include <transport/device/device_transport.h>
 
 namespace mooncake {
 
@@ -80,8 +80,8 @@ struct MooncakeEpBuffer {
     // Device transports — own all platform-specific state.
     // p2p_transport_: NVLink (CUDA) or MTLink (MUSA) intra-node P2P.
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
-    std::unique_ptr<ep::P2pTransport> p2p_transport_;
-    std::unique_ptr<ep::RdmaTransport> rdma_transport_;
+    std::unique_ptr<device::P2pTransport> p2p_transport_;
+    std::unique_ptr<device::RdmaTransport> rdma_transport_;
 
     bool ibgda_disabled_ = false;
 
@@ -102,8 +102,8 @@ struct MooncakeEpBuffer {
     // When null, EP creates its own via the factory functions.
     // When provided, EP takes ownership and uses them directly.
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     std::unique_ptr<ep::P2pTransport> p2p_transport = nullptr,
-                     std::unique_ptr<ep::RdmaTransport> rdma_transport = nullptr);
+                     std::unique_ptr<device::P2pTransport> p2p_transport = nullptr,
+                     std::unique_ptr<device::RdmaTransport> rdma_transport = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 

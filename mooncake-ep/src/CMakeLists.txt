@@ -1,13 +1,13 @@
 set(EP_TRANSPORT_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/ep_device_transport/p2p_device_transport.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/device/p2p_device_transport.cpp
 )
 if(MOONCAKE_EP_USE_MUSA)
     list(APPEND EP_TRANSPORT_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport_musa_stub.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/device/ibgda_device_transport_musa_stub.cpp
     )
 else()
     list(APPEND EP_TRANSPORT_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/ep_device_transport/ibgda_device_transport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/src/transport/device/ibgda_device_transport.cpp
     )
 endif()
 

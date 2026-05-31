@@ -17,7 +17,7 @@
 // Uses cuda_alike.h so all cuda* APIs map to musa* when USE_MUSA is defined.
 // No #ifdef USE_MUSA / MOONCAKE_EP_USE_MUSA in this file.
 
-#include "transport/ep_device_transport/device_transport.h"
+#include "transport/device/device_transport.h"
 
 #include <glog/logging.h>
 #include <algorithm>
@@ -26,7 +26,7 @@
 #include "cuda_alike.h"
 
 namespace mooncake {
-namespace ep {
+namespace device {
 
 class P2pDeviceTransportImpl : public P2pTransport {
    public:
@@ -180,5 +180,5 @@ std::unique_ptr<P2pTransport> createP2pDeviceTransport(int num_ranks) {
     return std::make_unique<P2pDeviceTransportImpl>(num_ranks);
 }
 
-}  // namespace ep
+}  // namespace device
 }  // namespace mooncake

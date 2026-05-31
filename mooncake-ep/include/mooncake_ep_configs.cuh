@@ -40,7 +40,7 @@
 #endif
 
 #ifdef MOONCAKE_EP_USE_MUSA
-#include <musa_runtime.h>
+#include "cuda_alike.h"
 #include <musa_bf16.h>
 // MUSA type aliases for CUDA compatibility
 #ifdef __MUSA_ARCH__
@@ -62,33 +62,6 @@ __device__ __forceinline__ __nv_fp8x2_storage_t __nv_cvt_float2_to_fp8x2(float2,
                                                                          int) {
     return 0;
 }
-// MUSA runtime API aliases
-#define cudaMalloc musaMalloc
-#define cudaMallocHost musaMallocHost
-#define cudaFree musaFree
-#define cudaFreeHost musaFreeHost
-#define cudaMemcpy musaMemcpy
-#define cudaMemcpyAsync musaMemcpyAsync
-#define cudaMemset musaMemset
-#define cudaMemsetAsync musaMemsetAsync
-#define cudaGetDevice musaGetDevice
-#define cudaGetDeviceCount musaGetDeviceCount
-#define cudaSetDevice musaSetDevice
-#define cudaDeviceGetAttribute musaDeviceGetAttribute
-#define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
-#define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
-#define cudaGetLastError musaGetLastError
-#define cudaStream_t musaStream_t
-#define cudaEvent_t musaEvent_t
-#define cudaIpcMemHandle_t musaIpcMemHandle_t
-#define cudaIpcGetMemHandle musaIpcGetMemHandle
-#define cudaIpcOpenMemHandle musaIpcOpenMemHandle
-#define cudaMemcpyHostToDevice musaMemcpyHostToDevice
-#define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
-#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
-#define cudaDevAttrClockRate musaDevAttrClockRate
-#define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
-#define cudaSuccess musaSuccess
 #else
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
