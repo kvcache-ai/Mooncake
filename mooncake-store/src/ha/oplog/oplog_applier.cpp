@@ -128,6 +128,15 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::REMOVE:
             ApplyRemove(entry);
             break;
+        case OpType::SEGMENT_MOUNT:
+            ApplySegmentMount(entry);
+            break;
+        case OpType::SEGMENT_UNMOUNT:
+            ApplySegmentUnmount(entry);
+            break;
+        case OpType::SEGMENT_UPDATE:
+            ApplySegmentUpdate(entry);
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
@@ -274,6 +283,15 @@ size_t OpLogApplier::ProcessPendingEntries() {
                 break;
             case OpType::REMOVE:
                 ApplyRemove(entry_copy);
+                break;
+            case OpType::SEGMENT_MOUNT:
+                ApplySegmentMount(entry_copy);
+                break;
+            case OpType::SEGMENT_UNMOUNT:
+                ApplySegmentUnmount(entry_copy);
+                break;
+            case OpType::SEGMENT_UPDATE:
+                ApplySegmentUpdate(entry_copy);
                 break;
             default:
                 LOG(ERROR)
@@ -557,6 +575,63 @@ bool OpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
     }
 
     return true;
+}
+
+const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {
+    return segment_registry_;
+}
+
+void OpLogApplier::LoadSegmentRegistry(
+    const std::vector<StandbySegmentInfo>& segments) {
+    segment_registry_.Clear();
+    for (const auto& seg : segments) {
+        segment_registry_.OnSegmentMount(seg);
+    }
+}
+
+void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
+    SegmentMountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_MOUNT payload for key "
+                   << entry.object_key;
+        return;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = op.segment_name;
+    info.transport_endpoint = op.transport_endpoint;
+    info.capacity = op.capacity;
+    info.is_memory_segment = op.is_memory_segment;
+    info.file_path = op.file_path;
+    segment_registry_.OnSegmentMount(info);
+    HAMetricManager::instance().inc_oplog_applied_entries();
+}
+
+void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
+    SegmentUnmountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
+                   << entry.object_key;
+        return;
+    }
+    segment_registry_.OnSegmentUnmount(op.transport_endpoint);
+    HAMetricManager::instance().inc_oplog_applied_entries();
+}
+
+void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
+    SegmentUpdateOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize SEGMENT_UPDATE payload for key "
+                   << entry.object_key;
+        return;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = op.segment_name;
+    info.transport_endpoint = op.transport_endpoint;
+    info.capacity = op.capacity;
+    info.is_memory_segment = op.is_memory_segment;
+    info.file_path = op.file_path;
+    segment_registry_.OnSegmentUpdate(info);
+    HAMetricManager::instance().inc_oplog_applied_entries();
 }
 
 }  // namespace mooncake
