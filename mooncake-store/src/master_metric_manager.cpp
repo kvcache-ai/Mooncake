@@ -2037,10 +2037,7 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
-    int64_t file_display_capacity =
-        (dfs_capacity_unlimited_ && file_capacity == 0)
-            ? std::numeric_limits<int64_t>::max()
-            : file_capacity;
+    int64_t file_display_capacity = get_total_file_capacity();
     ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
        << byte_size_to_string(nof_capacity);
     if (nof_capacity > 0) {
