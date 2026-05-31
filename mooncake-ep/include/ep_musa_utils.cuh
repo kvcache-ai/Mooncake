@@ -2,8 +2,6 @@
 
 #include <mooncake_ep_exception.cuh>
 
-namespace mooncake {
-
 __device__ __forceinline__ void trap() { __trap(); }
 __device__ __forceinline__ void memory_fence() { __threadfence_system(); }
 __device__ __forceinline__ void memory_fence_gpu() { __threadfence(); }
@@ -108,5 +106,3 @@ __device__ __forceinline__ void st_na_release(const uint64_t *ptr,
 #endif
 
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
-
-}  // namespace mooncake

@@ -2,8 +2,6 @@
 
 #include <mooncake_ep_exception.cuh>
 
-namespace mooncake {
-
 __device__ __forceinline__ void trap() { asm("trap;"); }
 
 __device__ __forceinline__ void memory_fence() {
@@ -378,5 +376,3 @@ __forceinline__ __device__ int get_lane_id() {
     asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
     return lane_id;
 }
-
-}  // namespace mooncake
