@@ -2076,6 +2076,7 @@ impl MetadataBackend for RedisMetadataBackend {
         Ok(CasResult {
             applied: current_payload.0 == 1,
             current,
+            version_floor: None,
         })
     }
 

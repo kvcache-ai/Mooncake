@@ -435,6 +435,7 @@ mod tests {
             Ok(CasResult {
                 applied: expected == Some(RouteVersion(7)),
                 current: next.cloned().or_else(|| Some(sample_route(key.0.as_str()))),
+                version_floor: None,
             })
         }
     }

@@ -358,7 +358,9 @@ fn cas_result_exposes_current_route_on_conflict() {
     meta.compare_and_swap_object_route(&obj_key, None, Some(&route))
         .expect("insert");
 
-    let CasResult { applied, current } = meta
+    let CasResult {
+        applied, current, ..
+    } = meta
         .compare_and_swap_object_route(&obj_key, None, Some(&route))
         .expect("conflict CAS");
     assert!(!applied, "duplicate insert must conflict");

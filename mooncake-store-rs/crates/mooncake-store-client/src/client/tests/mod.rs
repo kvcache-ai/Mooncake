@@ -15660,6 +15660,75 @@ fn batch_put_from_overwrites_stale_route_when_readable_filter_excludes_replica_o
     );
 }
 
+#[test]
+fn batch_put_from_succeeds_when_authority_has_version_floor_but_no_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("floor-test-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "floor-test-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("memory should register");
+    wait_for_membership_convergence(&[&store]);
+
+    let source = b"floor-test-initial-data-padding";
+    store
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    let initial_routes = store
+        .batch_put_from(&[PutFromRequest::new(
+            "floor-test-key",
+            source.as_ptr().cast(),
+            source.len(),
+        )])
+        .expect("initial put should succeed");
+    assert_eq!(initial_routes.len(), 1);
+    let initial_version = initial_routes[0].version;
+
+    store
+        .remove("floor-test-key", false)
+        .expect("remove should succeed");
+    let exists_after_remove = store
+        .is_exist("floor-test-key")
+        .expect("is_exist should succeed");
+    assert!(!exists_after_remove, "route should be gone after remove");
+
+    let namespace = metadata.route_namespace();
+    mooncake_store_route::update_readable_filter(
+        &namespace,
+        Some(BTreeSet::from([store.runtime_id().clone()])),
+    );
+
+    let new_source = b"floor-test-new-data-after-floor";
+    store
+        .register_buffer(new_source.as_ptr() as *mut c_void, new_source.len())
+        .expect("new source buffer should register");
+
+    let new_routes = store
+        .batch_put_from(&[PutFromRequest::new(
+            "floor-test-key",
+            new_source.as_ptr().cast(),
+            new_source.len(),
+        )])
+        .expect("put after remove should succeed via version_floor in CAS response");
+    assert_eq!(new_routes.len(), 1);
+    assert!(
+        new_routes[0].version > initial_version,
+        "new route version ({:?}) should exceed initial version ({:?}) due to floor",
+        new_routes[0].version,
+        initial_version,
+    );
+}
+
 mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;

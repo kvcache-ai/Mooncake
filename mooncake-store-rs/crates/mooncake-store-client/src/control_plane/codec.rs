@@ -277,6 +277,7 @@ pub(super) fn try_cas_result(result: pb::CasResult) -> Result<CasResult> {
     Ok(CasResult {
         applied: result.applied,
         current: result.current.map(try_object_route).transpose()?,
+        version_floor: None,
     })
 }
 

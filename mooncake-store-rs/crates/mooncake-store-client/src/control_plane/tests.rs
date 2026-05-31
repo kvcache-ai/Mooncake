@@ -90,7 +90,11 @@ impl mooncake_store_route::RouteAuthorityService for TestAuthority {
                 }
             }
         }
-        Ok(CasResult { applied, current })
+        Ok(CasResult {
+            applied,
+            current,
+            version_floor: None,
+        })
     }
 
     fn replace_route(
@@ -1509,6 +1513,7 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
     let cas = CasResult {
         applied: true,
         current: Some(route.clone()),
+        version_floor: None,
     };
     assert_eq!(
         try_cas_result(pb_cas_result(&cas)).expect("cas result should round-trip"),
