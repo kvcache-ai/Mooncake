@@ -9,3 +9,16 @@ install(FILES transfer_engine.h DESTINATION include)
 install(FILES transfer_metadata.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
+
+# Device API headers (header-only, consumed by EP kernel)
+install(FILES transport/device/device_transport.h DESTINATION include/transport/device)
+install(FILES transport/device/device_ops.cuh DESTINATION include/transport/device)
+install(FILES transport/device/comm_device.cuh DESTINATION include/transport/device)
+install(FILES transport/device/p2p_device.cuh DESTINATION include/transport/device)
+install(FILES transport/device/ibgda_device.cuh DESTINATION include/transport/device)
+install(FILES transport/device/cuda/cuda_ops.cuh DESTINATION include/transport/device/cuda)
+install(FILES transport/device/musa/musa_ops.cuh DESTINATION include/transport/device/musa)
+
+# IBGDA library headers
+install(DIRECTORY mooncake_ibgda/ DESTINATION include/mooncake_ibgda
+        FILES_MATCHING PATTERN "*.h")
