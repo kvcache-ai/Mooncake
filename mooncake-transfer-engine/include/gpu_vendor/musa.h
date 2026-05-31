@@ -94,3 +94,9 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaEvent_t musaEvent_t
 #define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaLaunchConfig_t musaLaunchConfig_t
+#define cudaLaunchAttribute musaLaunchAttribute
+#define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define CUDA_R_16BF MUSA_R_16BF
+#define CUDA_R_32F MUSA_R_32F
