@@ -15572,6 +15572,94 @@ fn single_get_still_returns_not_found_for_missing_key() {
     );
 }
 
+#[test]
+fn batch_put_from_overwrites_stale_route_when_readable_filter_excludes_replica_owner() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let dead_transport = Arc::new(TestTransport::new("stale-overwrite-dead-segment"));
+    let writer_transport = Arc::new(dead_transport.peer("stale-overwrite-writer-segment"));
+
+    let dead_store = StoreClientBuilder::new(metadata.clone(), "stale-overwrite-dead")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(dead_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("dead store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "stale-overwrite-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    dead_store
+        .register_local_memory()
+        .expect("dead store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&dead_store, &writer]);
+
+    let source = b"stale-overwrite-initial-data-pad";
+    writer
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(dead_store.runtime_id().storage_key());
+    let initial_routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "stale-overwrite-key",
+            source.as_ptr().cast(),
+            source.len(),
+        )
+        .replication(policy)])
+        .expect("initial put should succeed");
+    assert_eq!(initial_routes.len(), 1);
+    assert_eq!(
+        initial_routes[0].replicas[0].owner,
+        *dead_store.runtime_id(),
+        "initial route should point to dead_store"
+    );
+
+    let namespace = metadata.route_namespace();
+    mooncake_store_route::update_readable_filter(
+        &namespace,
+        Some(BTreeSet::from([writer.runtime_id().clone()])),
+    );
+
+    let new_source = b"stale-overwrite-replaced-data!!";
+    writer
+        .register_buffer(new_source.as_ptr() as *mut c_void, new_source.len())
+        .expect("new source buffer should register");
+
+    let local_policy = ReplicationPolicy::new().prefer_local(true);
+    let new_routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "stale-overwrite-key",
+            new_source.as_ptr().cast(),
+            new_source.len(),
+        )
+        .replication(local_policy)])
+        .expect("put with stale route should succeed via stale overwrite");
+    assert_eq!(new_routes.len(), 1);
+    assert_eq!(
+        new_routes[0].replicas[0].owner,
+        *writer.runtime_id(),
+        "stale route should be overwritten to point to writer's local storage"
+    );
+    assert!(
+        new_routes[0].version > initial_routes[0].version,
+        "overwritten route version should be higher than stale version"
+    );
+}
+
 mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;

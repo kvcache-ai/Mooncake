@@ -249,6 +249,21 @@ pub fn update_readable_filter(namespace: &str, filter: Option<BTreeSet<ClientRun
     *mesh.readable_filter.lock() = filter.map(Arc::new);
 }
 
+pub fn is_readable_filter_active(namespace: &str) -> bool {
+    let mesh = route_mesh(namespace);
+    let active = mesh.readable_filter.lock().is_some();
+    active
+}
+
+pub fn route_has_readable_replicas(namespace: &str, route: &ObjectRoute) -> bool {
+    let mesh = route_mesh(namespace);
+    let filter = mesh.readable_filter.lock().clone();
+    match filter {
+        None => true,
+        Some(readable) => route.replicas.iter().any(|r| readable.contains(&r.owner)),
+    }
+}
+
 #[derive(Default)]
 struct AuthoritySlot {
     ref_count: usize,
