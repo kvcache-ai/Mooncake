@@ -3,9 +3,6 @@
 // CommCtx bundles all transport state the kernel needs.  The kernel
 // constructs one from the raw pointers passed in and calls mc_route_put /
 // mc_signal / mc_red_add instead of touching transport internals directly.
-//
-// Design mirrors the TENT branch's CommCtx / comm_ops.cuh but uses
-// TE's device_ops.cuh inline functions instead of DeviceOps* pointers.
 #pragma once
 
 #include "transport/device/device_ops.cuh"

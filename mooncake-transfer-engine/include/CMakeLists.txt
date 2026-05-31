@@ -20,5 +20,5 @@ install(FILES transport/device/cuda/cuda_ops.cuh DESTINATION include/transport/d
 install(FILES transport/device/musa/musa_ops.cuh DESTINATION include/transport/device/musa)
 
 # IBGDA library headers
-install(DIRECTORY mooncake_ibgda/ DESTINATION include/mooncake_ibgda
+install(DIRECTORY transport/device/ibgda/ DESTINATION include/transport/device/ibgda
         FILES_MATCHING PATTERN "*.h")

@@ -5,10 +5,10 @@
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
-#include <mooncake_ibgda/memheap.h>
-#include <mooncake_ibgda/mlx5gda.h>
-#include <mooncake_ibgda/mlx5_ifc.h>
-#include <mooncake_ibgda/mlx5_prm.h>
+#include <transport/device/ibgda/memheap.h>
+#include <transport/device/ibgda/mlx5gda.h>
+#include <transport/device/ibgda/mlx5_ifc.h>
+#include <transport/device/ibgda/mlx5_prm.h>
 
 template <typename T>
 inline T IBGDA_ILOG2(T _n) {

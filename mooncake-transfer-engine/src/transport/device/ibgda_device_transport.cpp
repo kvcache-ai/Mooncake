@@ -29,8 +29,8 @@
 #include <stdexcept>
 
 #include "cuda_alike.h"
-#include "mooncake_ibgda/memheap.h"
-#include "mooncake_ibgda/mlx5gda.h"
+#include "transport/device/ibgda/memheap.h"
+#include "transport/device/ibgda/mlx5gda.h"
 #include "topology.h"
 
 namespace mooncake {

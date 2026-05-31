@@ -5,6 +5,24 @@
 
 namespace mooncake {
 
+// Initialize an RDMA transport: register memory, allocate control buffer,
+// create QPs.  Returns true on success, false if IBGDA is unavailable.
+static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
+                              int64_t num_ep_buffer_bytes, int num_ranks,
+                              int use_qp_count, void* stream) {
+    int ret = t->initialize("", num_ranks, use_qp_count);
+    if (ret == 0) {
+        ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes);
+    }
+    if (ret == 0) {
+        ret = t->allocateControlBuffer();
+    }
+    if (ret == 0) {
+        ret = t->createQueuePairs(stream);
+    }
+    return ret == 0;
+}
+
 MooncakeEpBuffer::MooncakeEpBuffer(
     int rank, int num_ranks, int64_t num_ep_buffer_bytes,
     TransferEngine* engine)
@@ -46,18 +64,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     if (engine) {
         rdma_transport_ = engine->getOrCreateRdmaTransport();
         if (rdma_transport_) {
-            // Initialize the transport obtained from the engine.
-            int ret = rdma_transport_->initialize("", num_ranks, USE_QP_COUNT);
-            if (ret == 0) {
-                ret = rdma_transport_->registerMemory(gdr_buffer, num_ep_buffer_bytes);
-            }
-            if (ret == 0) {
-                ret = rdma_transport_->allocateControlBuffer();
-            }
-            if (ret == 0) {
-                ret = rdma_transport_->createQueuePairs(comm_stream.stream());
-            }
-            if (ret != 0) {
+            if (!initRdmaTransport(rdma_transport_, gdr_buffer,
+                                   num_ep_buffer_bytes, num_ranks,
+                                   USE_QP_COUNT, comm_stream.stream())) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -77,18 +86,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(
             }
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
-        // initialize() returns non-zero on failure (no RDMA NIC, etc.)
-        int ret = t->initialize("", num_ranks, USE_QP_COUNT);
-        if (ret == 0) {
-            ret = t->registerMemory(gdr_buffer, num_ep_buffer_bytes);
-        }
-        if (ret == 0) {
-            ret = t->allocateControlBuffer();
-        }
-        if (ret == 0) {
-            ret = t->createQueuePairs(comm_stream.stream());
-        }
-        if (ret == 0) {
+        if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
+                              num_ranks, USE_QP_COUNT,
+                              comm_stream.stream())) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -322,6 +322,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
+    // Allocate output tensor
     torch::Tensor combined_x;
     if (out.has_value()) {
         EP_HOST_ASSERT(out->dim() == 2 and out->is_contiguous());
@@ -344,6 +345,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
 
+    // Kernel launch
     auto launcher = [=](int phases) {
         mooncake::combine(
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,

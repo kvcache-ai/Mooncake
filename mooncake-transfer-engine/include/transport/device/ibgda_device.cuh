@@ -13,7 +13,7 @@
 #include "transport/device/device_ops.cuh"
 
 #ifndef MOONCAKE_EP_USE_MUSA
-#include <mooncake_ibgda/mlx5gda.h>
+#include <transport/device/ibgda/mlx5gda.h>
 
 // mlx5 32-bit atomic-add WQE segment (not in mlx5gda.h; defined here for use
 // in mc_ibgda_write_rdma_atomic_add_wqe).
