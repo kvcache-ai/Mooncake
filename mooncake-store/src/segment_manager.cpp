@@ -1,5 +1,4 @@
 #include "segment_manager.h"
-#include "master_metric_manager.h"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -22,15 +21,11 @@ tl::expected<void, ErrorCode> SegmentManager::MountSegment(
                    << ", ret=" << ret.error();
         return ret;
     }
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                           segment.size);
     return {};
 }
 
 tl::expected<void, ErrorCode> SegmentManager::UnmountSegment(
     const UUID& segment_id) {
-    std::string segment_name;
-    size_t segment_size = 0;
     {
         // Phase 1: Remove segment under segment_mutex_ (fast).
         // For centralized structure, after this its allocator is removed from
@@ -48,8 +43,6 @@ tl::expected<void, ErrorCode> SegmentManager::UnmountSegment(
                        << ", ret=" << ret.error();
             return ret;
         }
-        segment_name = it->second->name;
-        segment_size = it->second->size;
         mounted_segments_.erase(it);
     }
     // Phase 2: Clean up metadata referencing this segment WITHOUT holding
@@ -57,8 +50,6 @@ tl::expected<void, ErrorCode> SegmentManager::UnmountSegment(
     if (segment_removal_cb_) {
         segment_removal_cb_(segment_id);
     }
-    MasterMetricManager::instance().dec_total_mem_capacity(segment_name,
-                                                           segment_size);
     return {};
 }
 

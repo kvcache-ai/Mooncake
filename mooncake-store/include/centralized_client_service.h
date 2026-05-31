@@ -6,12 +6,77 @@
 #include "file_storage.h"
 #include "transfer_task.h"
 #include "thread_pool.h"
+#include "rpc_types.h"
 #include <chrono>
 
 namespace mooncake {
 
 class PutOperation;
 class FileStorage;
+class RealClient;
+
+/**
+ * @brief RPC client pool for inter-client offload communication.
+ * Used to call remote clients' batch_get_offload_object RPC handler.
+ */
+class ClientRequester {
+   public:
+    ClientRequester();
+
+    /**
+     * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
+     * @param client_addr Network address (e.g., "ip:port") of the remote
+     * Transfer Engine service.
+     * @param keys Map from object key to size (bytes);
+     */
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::string& client_addr,
+                             const std::vector<std::string>& keys,
+                             const std::vector<int64_t> sizes);
+
+   private:
+    /**
+     * @brief A batch of allocated memory buffers, tracking both handles and
+     * mapped addresses. This struct holds a collection of buffer resources
+     * obtained from a memory allocator. It includes:
+     * - `handles`: Opaque handles used to manage lifetime and deallocation.
+     * - `pointers`: Direct virtual addresses where the buffers are accessible.
+     */
+    struct AllocatedBatch {
+        std::vector<BufferHandle>
+            handles;  ///< Unique handles for each buffer (used for release)
+        std::vector<uintptr_t>
+            pointers;  ///< Virtual memory addresses where buffers are mapped
+
+        // Allow move semantics
+        AllocatedBatch() = default;
+        AllocatedBatch(AllocatedBatch&&) = default;
+        AllocatedBatch& operator=(AllocatedBatch&&) = default;
+
+        // Prevent copying (because BufferHandle is move-only)
+        AllocatedBatch(const AllocatedBatch&) = delete;
+        AllocatedBatch& operator=(const AllocatedBatch&) = delete;
+
+        ~AllocatedBatch() =
+            default;  // Automatically releases all handles via RAII
+    };
+
+    mutable std::shared_mutex client_pool_mutex_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
+
+    /**
+     * @brief Generic RPC invocation helper for single-result operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ReturnType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param args Arguments to pass to the RPC call
+     * @return The result of the RPC call
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        const std::string& client_addr, Args&&... args);
+};
 
 /**
  * @brief Centralized-specific query result with lease timeout information
@@ -41,8 +106,8 @@ class CentralizedClientService
       public std::enable_shared_from_this<CentralizedClientService> {
    public:
     CentralizedClientService(
-        const std::string& metadata_connstring, uint16_t metrics_port = 9003,
-        bool enable_metrics_http = true,
+        const std::string& metadata_connstring, const std::string& protocol,
+        uint16_t metrics_port = 9003, bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {});
 
     ~CentralizedClientService() override;
@@ -103,35 +168,75 @@ class CentralizedClientService
         std::vector<std::vector<Slice>>& batched_slices,
         const WriteConfig& config) override;
 
-    tl::expected<void, ErrorCode> Remove(const ObjectKey& key) override;
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false) override;
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str) override;
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                bool force = false) override;
 
-    tl::expected<long, ErrorCode> RemoveAll() override;
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false) override;
 
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                               size_t size) override;
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size,
+        const std::string& protocol = "tcp") override;
 
     tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
                                                  size_t size) override;
 
+    void* GetBaseAddr();
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     * @param offloading_objects On return, contains a map from object key to
+     * size (in bytes) for all objects that require offload.
+     */
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
-    tl::expected<void, ErrorCode> BatchPutOffloadObject(
+    /**
+     * @brief Performs a batched read of multiple objects using a
+     * high-throughput Transfer Engine.
+     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
+     * "ip:port").
+     * @param keys List of keys identifying the data objects to be transferred
+     * @param pointers Array of destination memory addresses on the remote node
+     *                         where data will be written (one per key)
+     * @param batch_slices Map from object key to its data slice
+     * (`mooncake::Slice`), containing raw bytes to be written.
+     */
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batch_slices);
 
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
+
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    BatchGetOffloadObjectFromStorage(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& sizes);
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -246,9 +351,16 @@ class CentralizedClientService
         const std::vector<Replica::Descriptor>& replica_list,
         Replica::Descriptor& replica);
 
+    tl::expected<void, ErrorCode> BatchGetIntoOffloadObjectInternal(
+        const std::string& target_rpc_service_addr,
+        std::unordered_map<std::string, Slice>& objects);
+
    private:
     // Client-side metrics (must be initialized before master_client_)
     std::unique_ptr<ClientMetric> metrics_;
+
+    // Transfer protocol (tcp/rdma/cxl)
+    const std::string protocol_;
 
     // Global segment memory management
     struct SegmentDeleter {
@@ -282,6 +394,9 @@ class CentralizedClientService
 
     // File storage for offloading
     std::shared_ptr<FileStorage> file_storage_;
+
+    // RPC client pool for inter-client offload communication
+    std::shared_ptr<ClientRequester> client_requester_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;

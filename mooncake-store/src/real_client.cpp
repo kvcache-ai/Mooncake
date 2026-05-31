@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "centralized_client_service.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "types.h"
@@ -270,6 +271,18 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     // Gracefully stop accepting new requests and drain in-flight operations
     client_service_->Stop();
+
+    // Unregister local memory after stopping the service
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+        auto unregister_result = client_service_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!unregister_result) {
+            LOG(WARNING)
+                << "Failed to unregister client local buffer on tear down: "
+                << toString(unregister_result.error());
+        }
+    }
+
     client_service_->Destroy();
 
     // Reset all resources
@@ -537,44 +550,46 @@ int RealClient::put_parts(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
-    const std::string& key) {
+    const std::string& key, bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto remove_result = client_service_->Remove(key);
+    auto remove_result = client_service_->Remove(key, force);
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
     return {};
 }
 
-int RealClient::remove(const std::string& key) {
-    return to_py_ret(remove_internal(key));
+int RealClient::remove(const std::string& key, bool force) {
+    return to_py_ret(remove_internal(key, force));
 }
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
-    const std::string& str) {
+    const std::string& str, bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_service_->RemoveByRegex(str);
+    return client_service_->RemoveByRegex(str, force);
 }
 
-long RealClient::removeByRegex(const std::string& str) {
-    return to_py_ret(removeByRegex_internal(str));
+long RealClient::removeByRegex(const std::string& str, bool force) {
+    return to_py_ret(removeByRegex_internal(str, force));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal() {
+tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_service_->RemoveAll();
+    return client_service_->RemoveAll(force);
 }
 
-long RealClient::removeAll() { return to_py_ret(removeAll_internal()); }
+long RealClient::removeAll(bool force) {
+    return to_py_ret(removeAll_internal(force));
+}
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string& key) {
@@ -1719,4 +1734,16 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     return client_service_->QueryTask(task_id);
 }
 
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+RealClient::batch_get_offload_object(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& sizes) {
+    auto* centralized =
+        dynamic_cast<CentralizedClientService*>(client_service_.get());
+    if (!centralized) {
+        LOG(ERROR)
+            << "batch_get_offload_object requires CentralizedClientService";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return centralized->BatchGetOffloadObjectFromStorage(keys, sizes);
+}
 }  // namespace mooncake

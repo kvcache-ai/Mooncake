@@ -25,11 +25,8 @@ setup(
             ],
             sources=[
                 "../mooncake-integration/ep/ep_py.cpp",
-                "src/mooncake_backend.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
-                "src/mooncake_worker.cu",
-                "src/mooncake_worker_thread.cpp",
                 "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={

@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <random>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <sys/mman.h>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
 #include "config.h"
+#include "common.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -34,7 +36,7 @@ bool isPortAvailable(int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    bool available = (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0);
     close(sock);
     return available;
 }
@@ -61,7 +63,7 @@ int AutoPortBinder::tryBindPort() {
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port);
 
-        if (bind(socket_fd_, (sockaddr *)&addr, sizeof(addr)) == 0) {
+        if (bind(socket_fd_, (sockaddr*)&addr, sizeof(addr)) == 0) {
             port_ = port;
             return port;
         } else {
@@ -87,8 +89,49 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-void *allocate_buffer_allocator_memory(size_t total_size,
-                                       const std::string &protocol,
+#if defined(USE_ASCEND_DIRECT) && defined(ASCEND_SUPPORT_FABRIC_MEM)
+int allocate_physical_memory(size_t total_size, aclrtDrvMemHandle& handle) {
+    int32_t user_dev_id;
+    auto ret = aclrtGetDevice(&user_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get device: " << ret;
+        return -1;
+    }
+    int32_t physical_dev_id;
+    ret = aclrtGetPhyDevIdByLogicDevId(user_dev_id, &physical_dev_id);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "Failed to get physical dev id: " << ret;
+        return -1;
+    }
+    aclrtPhysicalMemProp prop = {};
+    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+    prop.memAttr = ACL_MEM_P2P_HUGE1G;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
+    // Only 0 2 4 6 is available for fabric mem, map 4 device to one numa.
+    const int32_t kDevicesPerChip = 4;
+    const int32_t kNumaNodeStep = 2;
+    prop.location.id = (physical_dev_id / kDevicesPerChip) * kNumaNodeStep;
+    prop.reserve = 0;
+    LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
+    ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(INFO) << "Malloc host memory for numa:" << prop.location.id
+                  << " failed, try common allocate instead.";
+        prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+        prop.location.id = 0;
+        ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "Failed to allocate memory: " << ret;
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif
+
+void* allocate_buffer_allocator_memory(size_t total_size,
+                                       const std::string& protocol,
                                        size_t alignment) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
@@ -100,35 +143,12 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     if (protocol == "ascend" && total_size > 0) {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
         if (globalConfig().ascend_use_fabric_mem) {
-            int32_t device_logic_id;
-            auto ret = aclrtGetDevice(&device_logic_id);
-            if (ret != ACL_ERROR_NONE) {
-                LOG(ERROR) << "Failed to get device: " << ret;
-                return nullptr;
-            }
             aclrtDrvMemHandle handle = nullptr;
-            aclrtPhysicalMemProp prop = {};
-            prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
-            prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-            prop.memAttr = ACL_MEM_P2P_HUGE1G;
-            prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-            prop.location.id = static_cast<int32_t>(device_logic_id / 4) * 2;
-            prop.reserve = 0;
-            LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
-            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-            if (ret != ACL_ERROR_NONE) {
-                LOG(ERROR) << "Failed to allocate specific numa memory: "
-                           << ret;
-                prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
-                prop.location.id = 0;
-                ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
-                if (ret != ACL_ERROR_NONE) {
-                    LOG(ERROR) << "Failed to allocate memory: " << ret;
-                }
+            if (allocate_physical_memory(total_size, handle) != 0) {
                 return nullptr;
             }
-            void *va;
-            ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+            void* va;
+            auto ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
             if (ret != ACL_ERROR_NONE) {
                 LOG(ERROR) << "Failed to reserve memory: " << ret;
                 return nullptr;
@@ -141,7 +161,7 @@ void *allocate_buffer_allocator_memory(size_t total_size,
             return va;
         }
 #endif
-        void *buffer = nullptr;
+        void* buffer = nullptr;
         auto ret = aclrtMallocHost(&buffer, total_size);
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "Failed to allocate memory: " << ret;
@@ -154,7 +174,7 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     return aligned_alloc(alignment, total_size);
 }
 
-void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     if (total_size == 0) {
         LOG(ERROR) << "Total size must be greater than 0 for hugepage mmap";
         return nullptr;
@@ -165,7 +185,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
         std::max(alignment, get_hugepage_size_from_env(&flags));
     const size_t map_size = align_up(total_size, effective_alignment);
 
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    void* ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "Hugepage mmap failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
@@ -175,7 +195,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     return ptr;
 }
 
-void free_buffer_mmap_memory(void *ptr, size_t total_size) {
+void free_buffer_mmap_memory(void* ptr, size_t total_size) {
     if (!ptr || total_size == 0) {
         return;
     }
@@ -187,7 +207,7 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
     }
 }
 
-void free_memory(const std::string &protocol, void *ptr) {
+void free_memory(const std::string& protocol, void* ptr) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
@@ -220,7 +240,7 @@ void free_memory(const std::string &protocol, void *ptr) {
     free(ptr);
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
+std::string formatDeviceNames(const std::string& device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -238,7 +258,7 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
-std::vector<std::string> splitString(const std::string &str, char delimiter,
+std::vector<std::string> splitString(const std::string& str, char delimiter,
                                      bool trim_spaces, bool keep_empty) {
     std::vector<std::string> result;
 
@@ -247,7 +267,7 @@ std::vector<std::string> splitString(const std::string &str, char delimiter,
         keep_empty ? boost::token_compress_off : boost::token_compress_on);
 
     if (trim_spaces) {
-        for (auto &token : result) {
+        for (auto& token : result) {
             boost::trim(token);
         }
     }
@@ -255,7 +275,7 @@ std::vector<std::string> splitString(const std::string &str, char delimiter,
     return result;
 }
 
-tl::expected<std::string, int> httpGet(const std::string &url) {
+tl::expected<std::string, int> httpGet(const std::string& url) {
     coro_http::coro_http_client client;
     auto res = client.get(url);
     if (res.status == 200) {
@@ -271,12 +291,12 @@ int getFreeTcpPort() {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(0);
-    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         ::close(sock);
         return -1;
     }
     socklen_t len = sizeof(addr);
-    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+    if (::getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
         ::close(sock);
         return -1;
     }
@@ -291,8 +311,8 @@ int64_t time_gen() {
         .count();
 }
 
-std::string GetEnvStringOr(const char *name, const std::string &default_value) {
-    const char *env_val = std::getenv(name);
+std::string GetEnvStringOr(const char* name, const std::string& default_value) {
+    const char* env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;
 }
 

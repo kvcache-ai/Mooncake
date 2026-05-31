@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -52,11 +53,13 @@ class WrappedMasterService {
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig());
 
-    tl::expected<void, ErrorCode> Remove(std::string_view key);
+    tl::expected<void, ErrorCode> Remove(std::string_view key,
+                                         bool force = false);
 
-    tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str);
+    tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str,
+                                                bool force = false);
 
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);

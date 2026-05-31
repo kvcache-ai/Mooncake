@@ -1,6 +1,9 @@
 #include "master_client.h"
 
-#include <coroutine>
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -234,30 +237,32 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::Remove(std::string_view key) {
+tl::expected<void, ErrorCode> MasterClient::Remove(std::string_view key,
+                                                   bool force) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", key, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key);
+    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
-    std::string_view str) {
+tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(std::string_view str,
+                                                          bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
-    timer.LogRequest("key=", str);
+    timer.LogRequest("key=", str, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str);
+    auto result =
+        invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
+tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>();
+    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(force);
     timer.LogResponseExpected(result);
     return result;
 }

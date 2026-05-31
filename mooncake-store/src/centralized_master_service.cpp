@@ -85,8 +85,9 @@ bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned(
 
 // Hook Implementations
 tl::expected<void, ErrorCode>
-CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable() const {
-    if (!IsLeaseExpired()) {
+CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable(
+    bool force) const {
+    if (!force && !IsLeaseExpired()) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
@@ -145,7 +146,8 @@ CentralizedMasterService::CentralizedMasterService(
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       client_manager_(config.client_live_ttl_sec, config.client_crashed_ttl_sec,
-                      config.memory_allocator, view_version_),
+                      config.memory_allocator, view_version_, config.enable_cxl,
+                      config.cxl_path, config.cxl_size),
       memory_allocator_type_(config.memory_allocator),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
@@ -456,6 +458,8 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
         }
         auto allocation_result = client_manager_.Allocate(
             slice_length, config.replica_num, preferred_segments);
@@ -622,8 +626,10 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {

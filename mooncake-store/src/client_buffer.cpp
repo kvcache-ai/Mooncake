@@ -113,9 +113,11 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
     uint64_t total_length = 0;
     if (replica.is_p2p_proxy_replica()) {
         total_length = replica.get_p2p_proxy_descriptor().object_size;
-    } else if (replica.is_memory_replica() == false) {
+    } else if (replica.is_disk_replica()) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
+    } else if (replica.is_local_disk_replica()) {
+        total_length = replica.get_local_disk_descriptor().object_size;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }

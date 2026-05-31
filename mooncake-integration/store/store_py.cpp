@@ -5,18 +5,23 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "types.h"
 #include "p2p_rpc_types.h"
 #include "rpc_types.h"
 
 #include <cstdlib>  // for atexit
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 
 #include "integration_utils.h"
 
 namespace py = pybind11;
 
 namespace mooncake {
+
+using ConfigDict = std::unordered_map<std::string, std::string>;
+
 namespace {
 
 struct PyTensorInfo {
@@ -25,7 +30,44 @@ struct PyTensorInfo {
     TensorMetadata metadata;
 
     // Check validity
-    bool valid() const { return tensor_size > 0; }
+    bool valid() const {
+        // Basic size check
+        if (tensor_size == 0 || data_ptr == 0) {
+            return false;
+        }
+
+        // Validate metadata
+        // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
+        // excluding UNKNOWN=-1)
+        if (metadata.dtype < 0 ||
+            metadata.dtype >= static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
+            return false;
+        }
+
+        // Check ndim is within valid range (0 to shape array size)
+        const int kMaxDims = std::size(metadata.shape);
+        if (metadata.ndim < 0 || metadata.ndim > kMaxDims) {
+            return false;
+        }
+
+        // Validate shape array
+        // For valid dimensions (0 to ndim-1), shape should be >= 0
+        for (int i = 0; i < metadata.ndim; ++i) {
+            if (metadata.shape[i] <= 0) {
+                return false;  // Invalid dimension size
+            }
+        }
+
+        // For padding dimensions (ndim to kMaxDims-1), shape should be -1
+        // (placeholder)
+        for (int i = metadata.ndim; i < kMaxDims; ++i) {
+            if (metadata.shape[i] != -1) {
+                return false;  // Padding dimensions should be -1
+            }
+        }
+
+        return true;
+    }
 };
 
 PyTensorInfo extract_tensor_info(const py::object& tensor,
@@ -219,6 +261,16 @@ class MooncakeStorePyWrapper {
     bool use_dummy_client_{false};
 
     MooncakeStorePyWrapper() = default;
+
+    // Helper to initialize real client and register it
+    std::shared_ptr<RealClient> init_real_client() {
+        auto real_client = RealClient::create();
+        use_dummy_client_ = false;
+        store_ = real_client;
+        ResourceTracker::getInstance().registerInstance(
+            std::dynamic_pointer_cast<PyClient>(store_));
+        return real_client;
+    }
 
     bool is_client_initialized() const {
         // Check if the store and client are initialized
@@ -1120,11 +1172,7 @@ PYBIND11_MODULE(store, m) {
                uint32_t p2p_key_lease_scan_interval_ms = 1000,
                const std::string& p2p_transfer_direction_mode = "reverse",
                const py::object& engine = py::none()) {
-                auto& resource_tracker = ResourceTracker::getInstance();
-                self.use_dummy_client_ = false;
-                auto real_client = std::make_shared<RealClient>();
-                resource_tracker.registerInstance(
-                    std::static_pointer_cast<PyClient>(real_client));
+                auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
@@ -1149,7 +1197,6 @@ PYBIND11_MODULE(store, m) {
                     p2p_transfer_direction_mode);
 
                 auto ret = real_client->setup(config);
-                self.store_ = real_client;
                 return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
@@ -1184,11 +1231,7 @@ PYBIND11_MODULE(store, m) {
                const py::object& engine = py::none(),
                bool enable_offload = false, uint16_t metrics_port = 9003,
                bool enable_metrics_http = true) {
-                auto& resource_tracker = ResourceTracker::getInstance();
-                self.use_dummy_client_ = false;
-                auto real_client = std::make_shared<RealClient>();
-                resource_tracker.registerInstance(
-                    std::static_pointer_cast<PyClient>(real_client));
+                auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
@@ -1206,7 +1249,6 @@ PYBIND11_MODULE(store, m) {
                         metrics_port, enable_metrics_http, {});
 
                 auto ret = real_client->setup(config);
-                self.store_ = real_client;
                 return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
@@ -1215,6 +1257,79 @@ PYBIND11_MODULE(store, m) {
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
             py::arg("enable_offload") = false, py::arg("metrics_port") = 9003,
             py::arg("enable_metrics_http") = true)
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
+                auto real_client = self.init_real_client();
+
+                // Convert py::dict to ConfigDict (all values as strings)
+                ConfigDict config;
+                for (auto item : config_dict) {
+                    std::string key = py::str(item.first);
+                    std::string value = py::str(item.second);
+                    config[key] = value;
+                }
+
+                auto centralized_config =
+                    ClientConfigBuilder::build_centralized_real_client(config);
+                auto ret = real_client->setup(centralized_config);
+                return ret;
+            },
+            py::arg("config"),
+            "Setup the store with a configuration dictionary.\n"
+            "Supported keys:\n"
+            "  local_hostname (required): Local hostname.\n"
+            "  metadata_server (required): Metadata server address.\n"
+            "  global_segment_size: Global segment size (default 16MB).\n"
+            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  protocol: Transfer protocol (default 'tcp').\n"
+            "  rdma_devices: RDMA device list.\n"
+            "  master_server_addr: Master server address.\n"
+            "  ipc_socket_path: IPC socket path.")
+        .def(
+            "setup_p2p_real_client",
+            [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
+                auto real_client = self.init_real_client();
+
+                ConfigDict config;
+                for (auto item : config_dict) {
+                    std::string key = py::str(item.first);
+                    std::string value = py::str(item.second);
+                    config[key] = value;
+                }
+
+                auto p2p_config =
+                    ClientConfigBuilder::build_p2p_real_client(config);
+                auto ret = real_client->setup(p2p_config);
+                return ret;
+            },
+            py::arg("config"),
+            "Setup the store in P2P mode with a configuration dictionary.\n"
+            "Supported keys:\n"
+            "  local_hostname (required): Local hostname.\n"
+            "  metadata_server (required): Metadata server address.\n"
+            "  protocol: Transfer protocol (default 'tcp').\n"
+            "  rdma_devices: RDMA device list.\n"
+            "  master_server_addr: Master server address (default "
+            "'127.0.0.1:50051').\n"
+            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  tiered_backend_config: Tiered backend JSON config path or "
+            "content.\n"
+            "  client_rpc_port: P2P RPC port (default 12345).\n"
+            "  rpc_thread_num: P2P RPC thread count (default 2).\n"
+            "  lock_shard_count: Key lock shard count (default 1024).\n"
+            "  route_cache_max_memory_bytes: Route cache max memory in bytes.\n"
+            "  route_cache_ttl_ms: Route cache TTL in ms.\n"
+            "  local_transfer_mode: Local transfer mode, 'te' or 'memcpy' "
+            "(default 'te').\n"
+            "  local_memcpy_async_worker_num: Async memcpy worker count "
+            "(default 32).\n"
+            "  async_sender_thread_count: Async route sender thread count "
+            "(default 0).\n"
+            "  async_max_batch_size: Async route max batch size (default "
+            "2000).\n"
+            "  async_route_queue_size: Async route queue size (default 0).\n"
+            "  ipc_socket_path: IPC socket path.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper& self, size_t mem_pool_size,
@@ -1276,25 +1391,36 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("config") = py::none(),
             py::return_value_policy::take_ownership)
-        .def("remove",
-             [](MooncakeStorePyWrapper& self, const std::string& key) {
-                 py::gil_scoped_release release;
-                 return self.store_->remove(key);
-             })
+        .def(
+            "remove",
+            [](MooncakeStorePyWrapper& self, const std::string& key,
+               bool force) {
+                py::gil_scoped_release release;
+                return self.store_->remove(key, force);
+            },
+            py::arg("key"), py::arg("force") = false,
+            "Remove an object from the store. If force=True, skip lease and "
+            "replication task checks.")
         .def(
             "remove_by_regex",
-            [](MooncakeStorePyWrapper& self, const std::string& str) {
+            [](MooncakeStorePyWrapper& self, const std::string& str,
+               bool force) {
                 py::gil_scoped_release release;
-                return self.store_->removeByRegex(str);
+                return self.store_->removeByRegex(str, force);
             },
-            py::arg("regex_pattern"),
+            py::arg("regex_pattern"), py::arg("force") = false,
             "Removes objects from the store whose keys match the given "
-            "regular expression.")
-        .def("remove_all",
-             [](MooncakeStorePyWrapper& self) {
-                 py::gil_scoped_release release;
-                 return self.store_->removeAll();
-             })
+            "regular expression. If force=True, skip lease and replication "
+            "task checks.")
+        .def(
+            "remove_all",
+            [](MooncakeStorePyWrapper& self, bool force) {
+                py::gil_scoped_release release;
+                return self.store_->removeAll(force);
+            },
+            py::arg("force") = false,
+            "Remove all objects from the store. If force=True, skip lease "
+            "and replication task checks.")
         .def("is_exist",
              [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;

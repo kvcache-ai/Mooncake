@@ -1,9 +1,11 @@
 #include "rpc_service.h"
+#include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
 #include <chrono>
+#include <sstream>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -90,6 +92,89 @@ void WrappedMasterService::init_http_server() {
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/batch_query_keys",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto keys_view = req.get_query_value("keys");
+            std::vector<std::string> keys;
+
+            if (!keys_view.empty()) {
+                std::string keys_str(keys_view);
+                std::string key;
+                std::istringstream iss(keys_str);
+                while (std::getline(iss, key, ',')) {
+                    keys.push_back(std::move(key));
+                }
+            }
+
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+
+            if (keys.empty()) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"No keys provided. Use "
+                    "?keys=key1,key2,...\"}");
+                return;
+            }
+
+            std::vector<std::string_view> key_views;
+            key_views.reserve(keys.size());
+            for (const auto& k : keys) {
+                key_views.push_back(k);
+            }
+            auto results = this->BatchGetReplicaList(key_views);
+            const size_t n = std::min(keys.size(), results.size());
+
+            std::string ss;
+            ss.reserve(n * 512);
+
+            ss += "{\"success\":true,\"data\":{";
+
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) ss += ",";
+
+                const auto& key = keys[i];
+                const auto& r = results[i];
+
+                ss += "\"";
+                ss += key;
+                ss += "\":";
+
+                if (!r.has_value()) {
+                    ss += "{\"ok\":false,\"error\":\"";
+                    ss += toString(r.error());
+                    ss += "\"}";
+                    continue;
+                }
+
+                ss += "{\"ok\":true,\"values\":[";
+                bool first = true;
+
+                const auto& replicas = r.value().replicas;
+                for (const auto& rep : replicas) {
+                    if (!rep.is_memory_replica()) continue;
+
+                    auto& mem_desc = rep.get_memory_descriptor();
+                    std::string tmp;
+                    struct_json::to_json(mem_desc.buffer_descriptor, tmp);
+                    if (!first) ss += ",";
+                    ss += tmp;
+                    first = false;
+                }
+                ss += "]}";
+            }
+
+            ss += "}}";
+
+            if (results.size() != keys.size()) {
+                LOG(WARNING)
+                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
+                    << " results=" << results.size();
+            }
+
+            resp.set_status_and_content(status_type::ok, std::move(ss));
         });
 
     http_server_.async_start();
@@ -260,29 +345,32 @@ WrappedMasterService::BatchGetReplicaList(
     return results;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    std::string_view key) {
+tl::expected<void, ErrorCode> WrappedMasterService::Remove(std::string_view key,
+                                                           bool force) {
     return execute_rpc(
-        "Remove", [&] { return GetMasterService().Remove(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "Remove", [&] { return GetMasterService().Remove(key, force); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    std::string_view str) {
+    std::string_view str, bool force) {
     return execute_rpc(
-        "RemoveByRegex", [&] { return GetMasterService().RemoveByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        "RemoveByRegex",
+        [&] { return GetMasterService().RemoveByRegex(str, force); },
+        [&](auto& timer) {
+            timer.LogRequest("regex=", str, ", force=", force);
+        },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll() {
+long WrappedMasterService::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = GetMasterService().RemoveAll();
+    long result = GetMasterService().RemoveAll(force);
     timer.LogResponse("items_removed=", result);
     return result;
 }

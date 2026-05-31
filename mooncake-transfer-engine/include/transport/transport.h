@@ -148,6 +148,9 @@ class Transport {
                 void *handle;
                 int64_t start_time;
             } ascend_direct;
+            struct {
+                uint64_t dest_addr;
+            } ubshmem;
         };
 
        public:

@@ -138,6 +138,7 @@ class AscendDirectTransport : public Transport {
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
+    bool auto_connect_{false};
     int32_t base_port_ = 20000;
     std::unordered_set<SegmentID> need_update_metadata_segs_;
     bool use_short_connection_{false};

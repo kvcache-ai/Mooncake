@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <csignal>
 #include <algorithm>
 #include <coroutine>
 #include <cstdlib>
@@ -1887,7 +1888,8 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
 // The external active remove call is not allowed currently
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key) {
+tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
+                                                       bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1898,7 +1900,7 @@ tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
-    const ObjectKey& str) {
+    const ObjectKey& str, bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1908,7 +1910,7 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
     return {};  // return ok for ut
 }
 
-tl::expected<long, ErrorCode> P2PClientService::RemoveAll() {
+tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1922,8 +1924,8 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll() {
 // MountSegment / UnmountSegment (Not Supported)
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::MountSegment(const void* buffer,
-                                                             size_t size) {
+tl::expected<void, ErrorCode> P2PClientService::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";

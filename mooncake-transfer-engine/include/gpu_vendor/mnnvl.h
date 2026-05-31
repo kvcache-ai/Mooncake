@@ -14,12 +14,18 @@
 
 #pragma once
 
-#ifdef USE_HIP
+#if defined(USE_HIP)
 #include <transport/hip_transport/hip_transport.h>
 #define allocateFabricMemory(size) \
     mooncake::HipTransport::allocatePinnedLocalMemory(size)
 #define freeFabricMemory(addr) \
     mooncake::HipTransport::freePinnedLocalMemory(addr)
+#elif defined(USE_UBSHMEM)
+#include <transport/ascend_transport/ubshmem_transport/ubshmem_transport.h>
+#define allocateFabricMemory(size) \
+    mooncake::UBShmemTransport::allocatePinnedLocalMemory(size)
+#define freeFabricMemory(addr) \
+    mooncake::UBShmemTransport::freePinnedLocalMemory(addr)
 #else
 #include <transport/nvlink_transport/nvlink_transport.h>
 #define allocateFabricMemory(size) \

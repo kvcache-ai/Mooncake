@@ -371,7 +371,7 @@ auto MasterService::GetReplicaList(std::string_view key,
     return resp;
 }
 
-auto MasterService::Remove(std::string_view key)
+auto MasterService::Remove(std::string_view key, bool force)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
@@ -381,7 +381,7 @@ auto MasterService::Remove(std::string_view key)
 
     auto& metadata = accessor.Get();
 
-    if (auto res = metadata.IsObjectRemovable(); !res) {
+    if (auto res = metadata.IsObjectRemovable(force); !res) {
         VLOG(1) << "key=" << key << ", error=" << res.error();
         return tl::make_unexpected(res.error());
     }
@@ -392,7 +392,7 @@ auto MasterService::Remove(std::string_view key)
     return {};
 }
 
-auto MasterService::RemoveByRegex(std::string_view regex_pattern)
+auto MasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
@@ -412,7 +412,7 @@ auto MasterService::RemoveByRegex(std::string_view regex_pattern)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second->IsObjectRemovable()) {
+                if (!it->second->IsObjectRemovable(force)) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but object is not removable";
                     ++it;
@@ -437,15 +437,19 @@ auto MasterService::RemoveByRegex(std::string_view regex_pattern)
     return removed_count;
 }
 
-long MasterService::RemoveAll() {
+long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
 
     for (size_t i = 0; i < GetShardCount(); ++i) {
         MetadataShardAccessorRW shard(this, i);
+        if (shard->metadata.empty()) {
+            continue;
+        }
+
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second->IsObjectRemovable()) {
+            if (it->second->IsObjectRemovable(force)) {
                 auto mem_rep_count =
                     it->second->CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second->size_ * mem_rep_count;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <memory>
 #include <ylt/util/tl/expected.hpp>
 #include "client_rpc_types.h"

@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include <variant>
@@ -84,6 +85,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
+    server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
 }
 }  // namespace mooncake
 
@@ -142,7 +145,8 @@ int main(int argc, char* argv[]) {
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
                 FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_metrics_port),
-                FLAGS_enable_metrics_http);
+                FLAGS_enable_metrics_http, {},
+                static_cast<uint16_t>(FLAGS_port));
         }
     }();
 

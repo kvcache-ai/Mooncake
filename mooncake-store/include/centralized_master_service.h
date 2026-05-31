@@ -394,7 +394,8 @@ class CentralizedMasterService final : public MasterService {
 
        public:
         // Hook functions
-        tl::expected<void, ErrorCode> IsObjectRemovable() const override;
+        tl::expected<void, ErrorCode> IsObjectRemovable(
+            bool force = false) const override;
         bool IsReplicaAccessible(const Replica& replica) const override;
         tl::expected<void, ErrorCode> IsReplicaRemovable(
             const Replica& replica) const override;
@@ -492,6 +493,21 @@ class CentralizedMasterService final : public MasterService {
             c_shard_.replication_tasks.erase(replication_task_it_);
             replication_task_it_ = c_shard_.replication_tasks.end();
             Get().replication_task_cnt_--;
+        }
+
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas,
+                    bool enable_soft_pin) NO_THREAD_SAFETY_ANALYSIS {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            auto metadata = std::make_unique<CentralizedObjectMetadata>(
+                client_id, now, total_length, std::move(replicas),
+                enable_soft_pin);
+            it_ = c_shard_.metadata
+                      .emplace(std::string(GetKey()), std::move(metadata))
+                      .first;
         }
 
         void AddReplicationTask(

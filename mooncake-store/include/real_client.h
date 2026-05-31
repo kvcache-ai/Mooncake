@@ -242,11 +242,11 @@ class RealClient : public PyClient {
         const std::vector<std::string>& keys,
         const ReadRouteConfig& config = {}) override;
 
-    int remove(const std::string& key) override;
+    int remove(const std::string& key, bool force = false) override;
 
-    long removeByRegex(const std::string& str) override;
+    long removeByRegex(const std::string& str, bool force = false) override;
 
-    long removeAll() override;
+    long removeAll(bool force = false) override;
 
     int tearDownAll() override;
 
@@ -417,12 +417,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> remove_internal(const std::string& key);
+    tl::expected<void, ErrorCode> remove_internal(const std::string& key,
+                                                  bool force = false);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(
-        const std::string& str);
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string& str,
+                                                         bool force = false);
 
-    tl::expected<int64_t, ErrorCode> removeAll_internal();
+    tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
@@ -448,6 +449,10 @@ class RealClient : public PyClient {
     std::vector<Replica::Descriptor> get_replica_desc(const std::string& key);
 
     tl::expected<HeartbeatResponse, ErrorCode> ping(const UUID& client_id);
+
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes);
 
     std::string protocol;
     std::string device_name;
