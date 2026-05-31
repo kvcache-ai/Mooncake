@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <musa.h>
 #include <musa_runtime.h>
