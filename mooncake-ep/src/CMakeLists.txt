@@ -19,8 +19,14 @@ else()
     set(EP_KERNEL_SOURCE mooncake_ep_kernel.cu)
 endif()
 
-add_library(mooncake_ep ep_py.cpp mooncake_ep_buffer.cpp ${EP_KERNEL_SOURCE}
-            ${EP_IBGDA_SOURCES} ${EP_TRANSPORT_SOURCES})
+if(MOONCAKE_EP_USE_MUSA)
+    # MUSA_ADD_LIBRARY handles .mu compilation with mcc
+    MUSA_ADD_LIBRARY(mooncake_ep ep_py.cpp mooncake_ep_buffer.cpp ${EP_KERNEL_SOURCE}
+                ${EP_IBGDA_SOURCES} ${EP_TRANSPORT_SOURCES})
+else()
+    add_library(mooncake_ep ep_py.cpp mooncake_ep_buffer.cpp ${EP_KERNEL_SOURCE}
+                ${EP_IBGDA_SOURCES} ${EP_TRANSPORT_SOURCES})
+endif()
 
 set_target_properties(mooncake_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mooncake_ep PRIVATE
@@ -30,7 +36,7 @@ target_include_directories(mooncake_ep PRIVATE
 
 if(MOONCAKE_EP_USE_MUSA)
     target_compile_definitions(mooncake_ep PRIVATE USE_MUSA MOONCAKE_EP_USE_MUSA=1)
-    target_link_libraries(mooncake_ep PUBLIC ${TORCH_LIBRARIES} transfer_engine)
+    target_link_libraries(mooncake_ep ${MUSA_LIBRARIES} ${TORCH_LIBRARIES} transfer_engine)
 else()
     target_link_libraries(mooncake_ep PUBLIC ${TORCH_LIBRARIES} transfer_engine ibverbs mlx5)
 endif()
