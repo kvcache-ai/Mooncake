@@ -293,6 +293,10 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     for (const auto& kv : snapshot.metadata) {
         metadata_store_->PutMetadata(kv.first, kv.second);
     }
+    // Load segment registry from snapshot
+    if (oplog_applier_) {
+        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
+    }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
     return ErrorCode::OK;
@@ -631,6 +635,78 @@ ErrorCode HotStandbyService::Promote() {
     return ErrorCode::OK;
 }
 
+ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (!IsReadyForPromotion()) {
+        LOG(ERROR) << "Standby is not ready for promotion, state="
+                   << StandbyStateToString(GetState());
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    // Trigger PROMOTE event
+    auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!result.allowed) {
+        LOG(ERROR) << "Cannot promote: " << result.reason;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    StandbySyncStatus status = GetSyncStatus();
+    uint64_t current_applied_seq_id = status.applied_seq_id;
+
+    LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
+              << current_applied_seq_id << ", lag: " << status.lag_entries
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
+
+    if (oplog_replicator_) {
+        oplog_replicator_->Stop();
+    }
+
+    ResolvePromotionGapsLocked();
+
+    auto catch_up_err = FinalCatchUpForPromotionLocked(current_applied_seq_id);
+    if (catch_up_err != ErrorCode::OK) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return catch_up_err;
+    }
+
+    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+    primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+
+    auto promotion_success =
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
+    if (!promotion_success.allowed) {
+        LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // Export snapshot BEFORE unlocking mutex (atomic promotion + export)
+    out.oplog_sequence_id = latest_applied_seq_id;
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
+    lock.unlock();
+    Stop();
+
+    if (config_.enable_oplog_following) {
+        LOG(INFO) << "Standby promoted to Primary successfully. "
+                  << "All remaining OpLog entries have been synced.";
+    } else {
+        LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
+    }
+    return ErrorCode::OK;
+}
+
 size_t HotStandbyService::GetMetadataCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return metadata_store_ ? metadata_store_->GetKeyCount() : 0;
@@ -655,6 +731,37 @@ bool HotStandbyService::ExportMetadataSnapshot(
         return false;
     }
     metadata_store_->Snapshot(out);
+    return true;
+}
+
+bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsRunning()) {
+        return false;
+    }
+
+    // Get applied sequence ID (inline to avoid recursive mutex lock)
+    if (oplog_applier_) {
+        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
+        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
+    } else {
+        out.oplog_sequence_id = applied_seq_id_.load();
+    }
+
+    // Export object metadata
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+
+    // Export segments from OpLogApplier's registry (Patch B)
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
     return true;
 }
 

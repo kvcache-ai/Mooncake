@@ -458,6 +458,53 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+
+        // Extract standby segment registry entries from the deserialized
+        // SegmentManager. The snapshot's SegmentSerializer::Serialize()
+        // currently carries enough data to rebuild only memory segments
+        // (segment_manager.mounted_segments_, where buf_allocator is non-null
+        // by construction — MountSegment is the only path that populates it).
+        //
+        // Local-disk segments are serialized as per-client offloading
+        // bookkeeping (client_local_disk_segment_'s offloading_objects map)
+        // without the transport_endpoint / file_path / capacity fields that
+        // StandbySegmentInfo needs, and NoF segments are not serialized at
+        // all in this snapshot path. Both have to be re-mounted explicitly
+        // via SEGMENT_MOUNT OpLog replay after standby promotion (see
+        // OpLogApplier::Apply / HotStandbyService::LoadSnapshotBaselineLocked).
+        //
+        // If a future change makes the serializer carry richer per-segment
+        // data, the predicate below should be replaced with explicit branches
+        // for each segment type.
+        ScopedSegmentAccess segment_access =
+            segment_manager.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        segment_access.GetAllSegments(all_segments);
+        SegmentView view = segment_manager.getView();
+        for (const auto& [seg, client_id] : all_segments) {
+            MountedSegment mounted;
+            if (view.GetMountedSegment(seg.id, mounted) != ErrorCode::OK) {
+                continue;
+            }
+            if (mounted.buf_allocator == nullptr) {
+                // Defensive: a MountedSegment without an allocator should
+                // not exist in the snapshot today. Log and skip rather
+                // than emitting a half-populated StandbySegmentInfo.
+                LOG(WARNING)
+                    << "snapshot contains MountedSegment without allocator; "
+                    << "skipping segment_name=" << seg.name
+                    << " segment_id=" << seg.id;
+                continue;
+            }
+            StandbySegmentInfo info;
+            info.segment_name = seg.name;
+            info.transport_endpoint = seg.te_endpoint;
+            info.capacity = seg.size;
+            info.is_memory_segment = true;
+            // file_path stays empty for memory segments by contract.
+            snapshot.segments.push_back(std::move(info));
+        }
+
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }
 
