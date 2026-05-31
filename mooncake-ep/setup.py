@@ -31,7 +31,7 @@ if use_musa:
         f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
         "-DUSE_MUSA",
         "-DMOONCAKE_EP_USE_MUSA=1",
-        "-std=c++17",
+        "-std=c++20",
         "-O3",
         "-g0",
     ]
@@ -39,7 +39,7 @@ if use_musa:
         f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
         "-DUSE_MUSA",
         "-DMOONCAKE_EP_USE_MUSA=1",
-        "-std=c++17",
+        "-std=c++20",
         "--cuda-gpu-arch=mp_21",
         "--cuda-gpu-arch=mp_31",
         "-O3",
