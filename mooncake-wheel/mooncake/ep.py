@@ -19,8 +19,8 @@ except ModuleNotFoundError:
     )
 globals().update({k: v for k, v in backend_module.__dict__.items() if not k.startswith("_")})
 
-# Try to import the PG module (only available in TENT builds).  On TE builds
-# it won't exist, so fall back to a simple all-ones tensor.
+# PG module is optional — it may not be built (e.g. MUSA builds where PG
+# source depends on CUDA headers).  Fall back to a simple all-ones tensor.
 try:
     backend_compat_module = importlib.import_module("mooncake.pg" + version_suffix)
     globals().update({k: v for k, v in backend_compat_module.__dict__.items() if not k.startswith("_")})

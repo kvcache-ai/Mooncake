@@ -114,6 +114,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                            int num_max_dispatch_tokens_per_rank,
                            int num_experts, int timeout_us, bool use_fp8,
                            bool async, bool return_recv_hook) {
+    // Tensor checks
+    // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and
                    x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
@@ -130,12 +132,15 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
          num_topk = static_cast<int>(topk_idx.size(1));
     int num_local_experts = num_experts / num_ranks;
 
+    // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
+    // Wait previous tasks to be finished
+    // NOTES: the hook mode will always use the default stream
 #ifdef MOONCAKE_EP_USE_MUSA
     auto compute_stream = at::musa::getCurrentMUSAStream();
 #else
@@ -145,6 +150,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
+    // Allocate packed tensors
     auto packed_recv_x = torch::empty(
         {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank,
          hidden},
@@ -158,6 +164,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     auto packed_recv_count = torch::zeros(
         {num_local_experts}, torch::dtype(torch::kInt32).device(x.device()));
 
+    // Allocate column-majored scales
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
     float* packed_recv_x_scales_ptr = nullptr;
     if (use_fp8) {
@@ -201,17 +208,23 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
                  ? LOW_LATENCY_SEND_PHASE
                  : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
+    // Wait streams
     std::optional<EventHandle> event;
     if (async) {
+        // NOTES: we must ensure the all tensors will not be deallocated
+        // before the stream-wait happens, so in Python API, we must wrap
+        // all tensors into the event handle.
         event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
 
+    // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
+    // Return values
     return {packed_recv_x,
             packed_recv_x_scales,
             packed_recv_count,
@@ -232,6 +245,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
                           int timeout_us, bool zero_copy, bool async,
                           bool return_recv_hook,
                           const std::optional<torch::Tensor>& out) {
+    // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and
                    x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(x.size(0) == num_experts / num_ranks);
@@ -257,12 +271,15 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
          num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
 
+    // Buffer control
     BufferPair layout(gdr_buffer, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_ep_buffer_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
 
+    // Wait previous tasks to be finished
+    // NOTES: the hook mode will always use the default stream
 #ifdef MOONCAKE_EP_USE_MUSA
     auto compute_stream = at::musa::getCurrentMUSAStream();
 #else
@@ -312,17 +329,23 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
                  ? LOW_LATENCY_SEND_PHASE
                  : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
+    // Wait streams
     std::optional<EventHandle> event;
     if (async) {
+        // NOTES: we must ensure the all tensors will not be deallocated
+        // before the stream-wait happens, so in Python API, we must wrap
+        // all tensors into the event handle.
         event = EventHandle(launch_stream);
     } else if (not return_recv_hook) {
         stream_wait(compute_stream, launch_stream);
     }
 
+    // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
     if (return_recv_hook)
         recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
 
+    // Return values
     return {combined_x, event, recv_hook};
 }
 
