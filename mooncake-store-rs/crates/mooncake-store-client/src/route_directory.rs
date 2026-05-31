@@ -66,6 +66,14 @@ pub(crate) fn authority_get_many(
     LocalRouteAuthority::new(namespace, authority.clone()).get_routes(keys)
 }
 
+pub(crate) fn authority_contains_many(
+    namespace: &str,
+    authority: &ClientStableId,
+    keys: &[ObjectKey],
+) -> Result<Vec<bool>> {
+    LocalRouteAuthority::new(namespace, authority.clone()).contains_routes(keys)
+}
+
 pub(crate) fn authority_list_routes_by_replica_owner(
     namespace: &str,
     authority: &ClientStableId,

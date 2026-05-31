@@ -82,6 +82,21 @@ impl mooncake_store_route::RouteAuthorityService for LocalAuthorityAdapter {
         }
     }
 
+    fn batch_contains_routes(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        keys: &[ObjectKey],
+    ) -> Vec<Result<bool>> {
+        match authority_contains_many(namespace, authority, keys) {
+            Ok(results) => results.into_iter().map(Ok).collect(),
+            Err(error) => keys
+                .iter()
+                .map(|_| Err(StoreError::NotFound(error.to_string())))
+                .collect(),
+        }
+    }
+
     fn batch_compare_and_swap_routes(
         &self,
         namespace: &str,
