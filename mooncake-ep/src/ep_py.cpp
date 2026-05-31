@@ -7,10 +7,20 @@
 #include <torch/python.h>
 #include <torch/torch.h>
 #include <transfer_engine.h>
+#include <cstdint>
 
 namespace py = pybind11;
 
 namespace mooncake {
+
+// Trampoline: Python passes engine pointer as uintptr_t (from
+// engine.get_engine_ptr()), C++ receives it as TransferEngine*.
+// This avoids cross-module pybind11 type registration issues.
+MooncakeEpBuffer* make_buffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+                              uint64_t engine_ptr) {
+    auto* engine = reinterpret_cast<TransferEngine*>(engine_ptr);
+    return new MooncakeEpBuffer(rank, num_ranks, num_ep_buffer_bytes, engine);
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
@@ -22,10 +32,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, TransferEngine*>(),
+        .def(py::init(&make_buffer),
              py::arg("rank"), py::arg("num_ranks"),
              py::arg("num_ep_buffer_bytes"),
-             py::arg("engine") = nullptr)
+             py::arg("engine_ptr") = uint64_t(0))
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
