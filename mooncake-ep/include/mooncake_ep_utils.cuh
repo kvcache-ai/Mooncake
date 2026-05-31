@@ -22,6 +22,12 @@
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                       \
     }
 
+#ifdef MOONCAKE_EP_USE_MUSA
+#include "ep_musa_utils.cuh"
+#else
+#include "ep_cuda_utils.cuh"
+#endif
+
 namespace mooncake {
 
 template <int kBytes>
@@ -46,12 +52,6 @@ template <>
 struct VecInt<16> {
     using vec_t = int4;
 };
-
-#ifdef MOONCAKE_EP_USE_MUSA
-#include "ep_musa_utils.cuh"
-#else
-#include "ep_cuda_utils.cuh"
-#endif
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
