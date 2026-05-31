@@ -20,6 +20,14 @@ cluster_id: "mooncake_cluster"
 memory_allocator: "offset"
 client_live_ttl_sec: 60
 
+# OpLog store configuration for HA hot-standby replication
+# OpLog store type: "etcd", "localfs", or empty (default: etcd if compiled with etcd support, else localfs)
+oplog_store_type: ""
+# Root directory for localfs OpLog store
+oplog_store_root_dir: "/tmp/mooncake_oplog"
+# Poll interval in milliseconds for localfs OpLog store
+oplog_poll_interval_ms: 1000
+
 enable_http_metadata_server: false
 http_metadata_server_host: "0.0.0.0"
 http_metadata_server_port: 8080
