@@ -66,7 +66,8 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0,
+                 engine=None):
         from mooncake import ep
 
         # Initialize the CPP runtime
@@ -77,7 +78,15 @@ class Buffer:
         self.backend = self.group
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         # Set MOONCAKE_EP_DEVICE_FILTER=mlx5_1,mlx5_2 to restrict NIC selection.
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes)
+        # If engine is provided, pass the TransferEngine* so EP can get
+        # P2pTransport/RdmaTransport from it instead of creating its own.
+        if engine is not None:
+            engine_ptr = engine.get_engine_ptr()
+            self.runtime = ep.Buffer(self.rank, self.group_size,
+                                     num_ep_buffer_bytes, engine_ptr)
+        else:
+            self.runtime = ep.Buffer(self.rank, self.group_size,
+                                     num_ep_buffer_bytes)
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
         # P2P+IPC succeeds for all ranks). We re-evaluate after IPC sync below.
@@ -825,3 +834,21 @@ class Buffer:
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
             return combined, event, hook
+
+
+# Monkey-patch get_active_ranks into the ep module so that
+# `from mooncake.ep import get_active_ranks` works even when the PG
+# module is not available (TE-only builds).  This avoids modifying ep.py.
+try:
+    from mooncake import ep as _ep_module
+    if not hasattr(_ep_module, "get_active_ranks"):
+        def _get_active_ranks_fallback(group):
+            size = dist.get_world_size(group)
+            if _USE_MUSA:
+                device = "musa:" + str(torch.musa.current_device())
+            else:
+                device = "cuda:" + str(torch.cuda.current_device())
+            return torch.ones(size, dtype=torch.int32, device=device)
+        _ep_module.get_active_ranks = _get_active_ranks_fallback
+except (ImportError, AttributeError):
+    pass

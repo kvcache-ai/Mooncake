@@ -25,6 +25,10 @@ class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
+namespace device {
+class P2pTransport;
+class RdmaTransport;
+}  // namespace device
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -149,6 +153,14 @@ class TransferEngine {
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
     Transport* getTransport(const std::string& proto);
+
+    // Device transport accessors (P2P + IBGDA).  Lazily created on first
+    // call and owned by the TransferEngine.  These allow EP (and future
+    // CPU-proxy paths) to obtain device transports from an engine instance
+    // instead of calling the global factory functions directly.
+    device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
+    device::RdmaTransport* getOrCreateRdmaTransport(
+        const std::vector<std::string>& device_filter = {});
 
     /**
      * @brief Check if TCP is the only installed transport.

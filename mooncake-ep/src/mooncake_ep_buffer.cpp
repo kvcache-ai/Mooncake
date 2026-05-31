@@ -1,13 +1,13 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <sstream>
+#include <transfer_engine.h>
 
 namespace mooncake {
 
 MooncakeEpBuffer::MooncakeEpBuffer(
     int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-    std::unique_ptr<device::P2pTransport> p2p_transport,
-    std::unique_ptr<device::RdmaTransport> rdma_transport)
+    TransferEngine* engine)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
@@ -30,10 +30,11 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 #endif
 
     // P2P transport — owns GDR buffer allocation and IPC handle exchange.
-    if (p2p_transport) {
-        p2p_transport_ = std::move(p2p_transport);
+    if (engine) {
+        p2p_transport_ = engine->getOrCreateP2pTransport(num_ranks);
     } else {
-        p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
+        owned_p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
+        p2p_transport_ = owned_p2p_transport_.get();
     }
 
     gdr_buffer = p2p_transport_->allocateBuffer(num_ep_buffer_bytes);
@@ -42,8 +43,28 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     }
 
     // RDMA transport — optional; disabled if init fails.
-    if (rdma_transport) {
-        rdma_transport_ = std::move(rdma_transport);
+    if (engine) {
+        rdma_transport_ = engine->getOrCreateRdmaTransport();
+        if (rdma_transport_) {
+            // Initialize the transport obtained from the engine.
+            int ret = rdma_transport_->initialize("", num_ranks, USE_QP_COUNT);
+            if (ret == 0) {
+                ret = rdma_transport_->registerMemory(gdr_buffer, num_ep_buffer_bytes);
+            }
+            if (ret == 0) {
+                ret = rdma_transport_->allocateControlBuffer();
+            }
+            if (ret == 0) {
+                ret = rdma_transport_->createQueuePairs(comm_stream.stream());
+            }
+            if (ret != 0) {
+                rdma_transport_ = nullptr;
+                ibgda_disabled_ = true;
+                LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
+            }
+        } else {
+            ibgda_disabled_ = true;
+        }
     } else {
         // Read optional NIC whitelist from env var (same convention as PG tests).
         std::vector<std::string> device_filter;
@@ -68,7 +89,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
             ret = t->createQueuePairs(comm_stream.stream());
         }
         if (ret == 0) {
-            rdma_transport_ = std::move(t);
+            owned_rdma_transport_ = std::move(t);
+            rdma_transport_ = owned_rdma_transport_.get();
         } else {
             ibgda_disabled_ = true;
             LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -88,15 +110,26 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // rdma_transport_ destructor handles QP/MR/ctrl_buf teardown.
-    rdma_transport_.reset();
+    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf teardown.
+    // When engine owns it, just clear the pointer.
+    owned_rdma_transport_.reset();
+    rdma_transport_ = nullptr;
 
-    // p2p_transport_ destructor handles IPC handle close.
-    if (gdr_buffer) {
-        p2p_transport_->freeBuffer(gdr_buffer);
-        gdr_buffer = nullptr;
+    // When EP owns the p2p transport, free the buffer and reset.
+    if (owned_p2p_transport_) {
+        if (gdr_buffer) {
+            owned_p2p_transport_->freeBuffer(gdr_buffer);
+            gdr_buffer = nullptr;
+        }
+        owned_p2p_transport_.reset();
+    } else {
+        // Engine-owned: just free the buffer via the engine's transport.
+        if (gdr_buffer && p2p_transport_) {
+            p2p_transport_->freeBuffer(gdr_buffer);
+            gdr_buffer = nullptr;
+        }
     }
-    p2p_transport_.reset();
+    p2p_transport_ = nullptr;
 
 #ifdef MOONCAKE_EP_USE_MUSA
     if (workspace) musaFree(workspace);

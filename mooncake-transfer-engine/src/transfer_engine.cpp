@@ -179,6 +179,15 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    return impl_->getOrCreateRdmaTransport(device_filter);
+}
+
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
@@ -578,6 +587,17 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
         return nullptr;
     else
         return impl_->getTransport(proto);
+}
+
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateRdmaTransport(device_filter);
 }
 
 bool TransferEngine::isTcpOnly() const {

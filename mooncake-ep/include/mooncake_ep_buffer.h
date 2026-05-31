@@ -20,6 +20,8 @@
 
 namespace mooncake {
 
+class TransferEngine;
+
 // MAX_QP_COUNT is defined in mooncake_ep_configs.cuh (shared with kernel code).
 
 struct BufferLayout {
@@ -80,8 +82,13 @@ struct MooncakeEpBuffer {
     // Device transports — own all platform-specific state.
     // p2p_transport_: NVLink (CUDA) or MTLink (MUSA) intra-node P2P.
     // rdma_transport_: IBGDA inter-node RDMA.  nullptr when IBGDA unavailable.
-    std::unique_ptr<device::P2pTransport> p2p_transport_;
-    std::unique_ptr<device::RdmaTransport> rdma_transport_;
+    device::P2pTransport* p2p_transport_ = nullptr;
+    device::RdmaTransport* rdma_transport_ = nullptr;
+    // When EP creates transports itself (no engine provided), ownership lives
+    // in these unique_ptrs.  When an engine is provided, the engine owns them
+    // and these remain null.
+    std::unique_ptr<device::P2pTransport> owned_p2p_transport_;
+    std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
 
     bool ibgda_disabled_ = false;
 
@@ -98,12 +105,11 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
-    // p2p_transport and rdma_transport are optional injected transports.
-    // When null, EP creates its own via the factory functions.
-    // When provided, EP takes ownership and uses them directly.
+    // If engine is provided, EP gets P2pTransport/RdmaTransport from it
+    // (engine owns the transports).  Otherwise EP creates its own via the
+    // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     std::unique_ptr<device::P2pTransport> p2p_transport = nullptr,
-                     std::unique_ptr<device::RdmaTransport> rdma_transport = nullptr);
+                     TransferEngine* engine = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
 

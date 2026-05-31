@@ -6,6 +6,7 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
 #include <torch/torch.h>
+#include <transfer_engine.h>
 
 namespace py = pybind11;
 
@@ -21,7 +22,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t>())
+        .def(py::init<int, int, int64_t, TransferEngine*>(),
+             py::arg("rank"), py::arg("num_ranks"),
+             py::arg("num_ep_buffer_bytes"),
+             py::arg("engine") = nullptr)
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("update_local_qpns", &MooncakeEpBuffer::update_local_qpns)
