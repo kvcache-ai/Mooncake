@@ -106,8 +106,10 @@ if (WITH_EP)
     include_directories(mooncake-pg/include)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    if(USE_CUDA)
+      find_package(CUDAToolkit REQUIRED)
+      message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    endif()
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
