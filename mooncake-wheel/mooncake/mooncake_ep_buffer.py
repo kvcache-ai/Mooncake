@@ -181,12 +181,14 @@ class Buffer:
 
         try:
             local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
+            # pybind11 converts std::vector<int32_t> to a list of integers.
+            # IPC handles are just int32 data — exchange on CPU so gloo
+            # backend works on MUSA (gloo has no MUSA device support).
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device=_DEVICE
+                local_handle_ints, dtype=torch.int32, device="cpu"
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device=_DEVICE)
+                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cpu")
                 for _ in range(self.group_size)
             ]
             dist.all_gather(handles, local_handle_tensor, self.group)
