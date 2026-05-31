@@ -1159,6 +1159,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     return Ok(CasResult {
                         applied: false,
                         current,
+                        version_floor: None,
                     });
                 }
 
@@ -1179,6 +1180,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                         return Ok(CasResult {
                             applied: true,
                             current: None,
+                            version_floor: None,
                         });
                     }
                     Txn::new()
@@ -1198,6 +1200,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     return Ok(CasResult {
                         applied: true,
                         current: next.cloned(),
+                        version_floor: None,
                     });
                 }
             }

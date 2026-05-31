@@ -94,10 +94,17 @@ impl LocalRouteTable {
             (Some(version), Some(route)) => route.version == version,
             _ => false,
         };
-        if !matches || self.version_floor_blocks_insert(key, expected, next) {
+        let floor_blocked = self.version_floor_blocks_insert(key, expected, next);
+        if !matches || floor_blocked {
+            let version_floor = if floor_blocked && current.is_none() {
+                self.version_floors.get(&key.0).copied()
+            } else {
+                None
+            };
             let result = CasResult {
                 applied: false,
                 current,
+                version_floor,
             };
             record_cas_outcome(&result, next, key);
             return result;
@@ -107,6 +114,7 @@ impl LocalRouteTable {
         let result = CasResult {
             applied: true,
             current: next.cloned(),
+            version_floor: None,
         };
         record_cas_outcome(&result, next, key);
         result

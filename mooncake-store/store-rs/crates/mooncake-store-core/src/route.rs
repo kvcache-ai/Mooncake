@@ -181,6 +181,8 @@ pub struct SegmentReservation {
 pub struct CasResult {
     pub applied: bool,
     pub current: Option<ObjectRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_floor: Option<RouteVersion>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
