@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "types.h"
 #include "replica.h"
 #include "heartbeat_type.h"

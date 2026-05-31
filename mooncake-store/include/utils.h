@@ -264,6 +264,11 @@ struct StringHash {
     }
 };
 
+/** @brief Returns true if the UUID is the all-zero sentinel value. */
+[[nodiscard]] inline bool IsZeroUUID(const UUID& uuid) noexcept {
+    return uuid.first == 0 && uuid.second == 0;
+}
+
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;

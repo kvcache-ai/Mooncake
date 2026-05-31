@@ -1,6 +1,10 @@
 #include "client_rpc_service.h"
+
+#include <utility>
+
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -157,10 +161,139 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     return result;
 }
 
+// TODO(metrics): Add peer_request metrics for forward TE control-plane RPCs
+// below (PreWrite, WriteCommit, WriteRevoke, PinKey, UnPinKey), following the
+// same pattern as WriteRemoteData/ReadRemoteData (Stopwatch, requests/failures/
+// bytes, latency histograms). Follow-up PR.
+
+tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(
+    const PreWriteRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::PreWrite");
+    timer.LogRequest("key=", request.key, "size_bytes=", request.size_bytes);
+
+    if (request.key.empty() || request.size_bytes == 0) {
+        LOG(ERROR) << "PreWriteRequest: invalid key or size";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result = data_manager_.PreWrite(request.key, request.size_bytes,
+                                         request.target_tier_id);
+    if (!result) {
+        LOG(ERROR) << "PreWrite failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return tl::make_unexpected(result.error());
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return std::move(*result);
+}
+
+tl::expected<void, ErrorCode> ClientRpcService::WriteCommit(
+    const WriteCommitRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::WriteCommit");
+    timer.LogRequest("key=", request.key);
+
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
+        LOG(ERROR) << "WriteCommitRequest: invalid key or token";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result =
+        data_manager_.WriteCommit(request.key, request.write_operation_id);
+    if (!result) {
+        LOG(ERROR) << "WriteCommit failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return result;
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return {};
+}
+
+tl::expected<void, ErrorCode> ClientRpcService::WriteRevoke(
+    const WriteRevokeRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::WriteRevoke");
+    timer.LogRequest("key=", request.key);
+
+    if (request.key.empty() || IsZeroUUID(request.write_operation_id)) {
+        LOG(ERROR) << "WriteRevokeRequest: invalid key or token";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result =
+        data_manager_.WriteRevoke(request.key, request.write_operation_id);
+    if (!result) {
+        LOG(ERROR) << "WriteRevoke failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return result;
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return {};
+}
+
+tl::expected<PinKeyResponse, ErrorCode> ClientRpcService::PinKey(
+    const PinKeyRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::PinKey");
+    timer.LogRequest("key=", request.key);
+
+    if (request.key.empty()) {
+        LOG(ERROR) << "PinKeyRequest: empty key";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result = data_manager_.PinKey(request.key, request.target_tier_id);
+    if (!result) {
+        LOG(ERROR) << "PinKey failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return tl::make_unexpected(result.error());
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return std::move(*result);
+}
+
+tl::expected<void, ErrorCode> ClientRpcService::UnPinKey(
+    const UnPinKeyRequest& request) {
+    ScopedVLogTimer timer(1, "ClientRpcService::UnPinKey");
+    timer.LogRequest("key=", request.key);
+
+    if (request.key.empty() || IsZeroUUID(request.read_operation_id)) {
+        LOG(ERROR) << "UnPinKeyRequest: invalid key or token";
+        timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto result =
+        data_manager_.UnPinKey(request.key, request.read_operation_id);
+    if (!result) {
+        LOG(ERROR) << "UnPinKey failed for key: " << request.key
+                   << ", error: " << toString(result.error());
+        timer.LogResponse("error_code=", result.error());
+        return result;
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return {};
+}
+
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
                               ClientRpcService& service) {
     server.register_handler<&ClientRpcService::ReadRemoteData>(&service);
     server.register_handler<&ClientRpcService::WriteRemoteData>(&service);
+    server.register_handler<&ClientRpcService::PreWrite>(&service);
+    server.register_handler<&ClientRpcService::WriteCommit>(&service);
+    server.register_handler<&ClientRpcService::WriteRevoke>(&service);
+    server.register_handler<&ClientRpcService::PinKey>(&service);
+    server.register_handler<&ClientRpcService::UnPinKey>(&service);
 }
 
 }  // namespace mooncake

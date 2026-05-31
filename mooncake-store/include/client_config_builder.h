@@ -17,6 +17,7 @@
 #include "common.h"
 #include "types.h"
 
+#include "types.h"
 namespace mooncake {
 
 class TransferEngine;
@@ -149,8 +150,8 @@ struct P2PClientConfig : RealClientConfigBase {
     // Parsed custom tiered backend configuration
     Json::Value tiered_backend_config;
 
-    // Number of key lock shards for DataManager.
-    // Higher values reduce contention of key.
+    // Number of TieredBackend metadata index shards (and matching DataManager
+    // pending-write/pinned-key lease shards). Higher values reduce contention.
     size_t lock_shard_count = 1024;
 
     // RouteCache configuration
@@ -176,6 +177,19 @@ struct P2PClientConfig : RealClientConfigBase {
     // When local_transfer_mode == MEMCPY, the following parameter is used:
     // 0 means forbid async memcpy (fall back to synchronous).
     size_t local_memcpy_async_worker_num = 32;
+
+    // PreWrite / PinKey key lease: maximum time (ms) a key may stay in
+    // intermediate (lease-protected) state before expiring.
+    static constexpr uint32_t kP2pDefaultKeyLeaseDurationMs = 5000;
+    // Interval (ms) for the background scanner that removes expired leases.
+    static constexpr uint32_t kP2pDefaultKeyLeaseScanIntervalMs = 1000;
+    uint32_t p2p_key_lease_duration_ms = kP2pDefaultKeyLeaseDurationMs;
+    uint32_t p2p_key_lease_scan_interval_ms = kP2pDefaultKeyLeaseScanIntervalMs;
+
+    // Cross-node transfer direction (reverse = owner TE, forward = accessor
+    // TE). Configured at client startup only.
+    TransferDirectionMode transfer_direction_mode =
+        TransferDirectionMode::REVERSE;
 };
 
 // ============================================================================
@@ -277,7 +291,10 @@ class ClientConfigBuilder {
         bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {},
         size_t async_sender_thread_count = 0,
-        size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0) {
+        size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
+        uint32_t p2p_key_lease_duration_ms = 0,
+        uint32_t p2p_key_lease_scan_interval_ms = 0,
+        const std::string& p2p_transfer_direction_mode = "reverse") {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -309,6 +326,16 @@ class ClientConfigBuilder {
                 "via tiered_backend_config_json parameter.");
         }
         config.tiered_backend_config = tiered_config;
+
+        if (p2p_key_lease_duration_ms > 0) {
+            config.p2p_key_lease_duration_ms = p2p_key_lease_duration_ms;
+        }
+        if (p2p_key_lease_scan_interval_ms > 0) {
+            config.p2p_key_lease_scan_interval_ms =
+                p2p_key_lease_scan_interval_ms;
+        }
+        config.transfer_direction_mode =
+            parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
         return config;
     }
@@ -572,6 +599,22 @@ class ClientConfigBuilder {
         }
         throw std::runtime_error(
             "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
+    }
+
+    static TransferDirectionMode parse_p2p_transfer_direction_mode(
+        std::string mode) {
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "reverse") {
+            return TransferDirectionMode::REVERSE;
+        }
+        if (mode == "forward") {
+            return TransferDirectionMode::FORWARD;
+        }
+        throw std::runtime_error(
+            "Invalid p2p transfer direction mode. Expected 'reverse' or "
+            "'forward'.");
     }
 };
 

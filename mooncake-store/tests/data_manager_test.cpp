@@ -63,7 +63,9 @@ class DataManagerTest : public ::testing::Test {
         Json::Value config;
         ASSERT_TRUE(parseJsonString(json_config_str, config));
 
-        tiered_backend_ = std::make_unique<TieredBackend>();
+        const size_t metadata_shard_count =
+            GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024);
+        tiered_backend_ = std::make_unique<TieredBackend>(metadata_shard_count);
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
         auto init_result = InitTieredBackendForTest(*tiered_backend_, config);
@@ -80,9 +82,17 @@ class DataManagerTest : public ::testing::Test {
         LocalTransferConfig transfer_config;
         transfer_config.mode = LocalTransferMode::MEMCPY;
         transfer_config.local_memcpy_async_worker_num = 32;
+
+        // Save raw pointer before move for tests that need direct backend
+        // access
+        TieredBackend* backend_raw_ptr = tiered_backend_.get();
         data_manager_ = std::make_unique<DataManager>(
-            std::move(tiered_backend_), transfer_engine_, 1024,
+            std::move(tiered_backend_), transfer_engine_, metadata_shard_count,
             transfer_config);
+        // Keep the raw pointer accessible for tests that need direct backend
+        // access Note: The backend is now owned by DataManager, but tests can
+        // still use it
+        tiered_backend_raw_ptr_ = backend_raw_ptr;
     }
 
     void TearDown() override {
@@ -145,6 +155,8 @@ class DataManagerTest : public ::testing::Test {
 
     std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<TieredBackend> tiered_backend_;
+    TieredBackend* tiered_backend_raw_ptr_ =
+        nullptr;  // Raw pointer for tests that need direct backend access
     std::shared_ptr<TransferEngine> transfer_engine_;
     std::optional<UUID> saved_tier_id_;
 };
@@ -282,6 +294,303 @@ TEST_F(DataManagerTest, DeleteWithTierId) {
         << "Delete failed with error: " << toString(delete_result.error());
 
     ASSERT_FALSE(data_manager_->Exist(key));
+}
+
+// BuildRemoteBufferDesc: null allocation buffer is an internal error.
+TEST_F(DataManagerTest, BuildRemoteBufferDescRejectsNullBuffer) {
+    auto alloc_result = tiered_backend_raw_ptr_->Allocate(64, GetTierId());
+    ASSERT_TRUE(alloc_result.has_value())
+        << "Allocate failed: " << toString(alloc_result.error());
+
+    AllocationHandle handle = alloc_result.value();
+    auto saved_buffer = std::move(handle->loc.data.buffer);
+    ASSERT_EQ(handle->loc.data.buffer, nullptr);
+
+    auto desc_result = data_manager_->BuildRemoteBufferDesc(handle);
+    ASSERT_FALSE(desc_result.has_value());
+    EXPECT_EQ(desc_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    // Restore buffer so AllocationEntry destructor can release via tier.
+    handle->loc.data.buffer = std::move(saved_buffer);
+}
+
+// Test PreWrite: concurrent PreWrite should be rejected by a pending lease.
+TEST_F(DataManagerTest, PreWriteRejectsConcurrentLease) {
+    const std::string key = "prewrite_lifecycle_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    auto second_prewrite = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_FALSE(second_prewrite.has_value());
+    EXPECT_EQ(second_prewrite.error(), ErrorCode::REPLICA_IS_PROCESSING);
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
+    }
+}
+
+// Test WriteCommit: successful commit should erase the pending write record.
+TEST_F(DataManagerTest, WriteCommitErasesPendingWriteRecord) {
+    const std::string key = "write_commit_erases_record_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    auto commit_result =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_TRUE(commit_result.has_value())
+        << "WriteCommit failed: " << toString(commit_result.error());
+    EXPECT_TRUE(data_manager_->Exist(key));
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
+    }
+}
+
+// WriteCommit without a pending write (e.g. duplicate commit) is an error.
+TEST_F(DataManagerTest, WriteCommitWithoutPendingWriteFails) {
+    const std::string key = "write_commit_no_pending_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value());
+
+    auto first_commit =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_TRUE(first_commit.has_value());
+
+    auto second_commit =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_FALSE(second_commit.has_value());
+    EXPECT_EQ(second_commit.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+// Test WriteCommit: token mismatch should fail without erasing the record.
+TEST_F(DataManagerTest, WriteCommitTokenMismatchKeepsPendingWriteRecord) {
+    const std::string key = "write_commit_token_mismatch_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    UUID wrong_token = prewrite_result->write_operation_id;
+    wrong_token.first += 1;
+    auto wrong_commit = data_manager_->WriteCommit(key, wrong_token);
+    ASSERT_FALSE(wrong_commit.has_value());
+    EXPECT_EQ(wrong_commit.error(), ErrorCode::INVALID_WRITE);
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
+    }
+}
+
+// WriteRevoke removes pending allocation without committing the object.
+TEST_F(DataManagerTest, WriteRevokeErasesPendingWriteRecord) {
+    const std::string key = "write_revoke_erases_record_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    auto revoke_result =
+        data_manager_->WriteRevoke(key, prewrite_result->write_operation_id);
+    ASSERT_TRUE(revoke_result.has_value())
+        << "WriteRevoke failed: " << toString(revoke_result.error());
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
+    }
+}
+
+// WriteRevoke: wrong token should not erase the pending record.
+TEST_F(DataManagerTest, WriteRevokeTokenMismatchKeepsPendingWriteRecord) {
+    const std::string key = "write_revoke_token_mismatch_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 256, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    UUID wrong_token = prewrite_result->write_operation_id;
+    wrong_token.first += 1;
+    auto wrong_revoke = data_manager_->WriteRevoke(key, wrong_token);
+    ASSERT_FALSE(wrong_revoke.has_value());
+    EXPECT_EQ(wrong_revoke.error(), ErrorCode::INVALID_WRITE);
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.write_operation_id,
+                  prewrite_result->write_operation_id);
+    }
+}
+
+// Test Pin/Unpin: ref_count increments on PinKey and reaches zero on final
+// UnPinKey.
+TEST_F(DataManagerTest, PinKeyTracksRefCountUntilFinalUnpin) {
+    const std::string key = "pin_ref_count_key";
+    const std::string test_data = "Pin key ref count payload";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(DoPut(key, buffer.get(), test_data.size()).has_value());
+
+    auto first_pin = data_manager_->PinKey(key, GetTierId());
+    ASSERT_TRUE(first_pin.has_value())
+        << "First PinKey failed: " << toString(first_pin.error());
+
+    auto second_pin = data_manager_->PinKey(key, GetTierId());
+    ASSERT_TRUE(second_pin.has_value())
+        << "Second PinKey failed: " << toString(second_pin.error());
+    EXPECT_EQ(first_pin->read_operation_id, second_pin->read_operation_id);
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.ref_count, 2U);
+    }
+
+    auto first_unpin =
+        data_manager_->UnPinKey(key, first_pin->read_operation_id);
+    ASSERT_TRUE(first_unpin.has_value())
+        << "First UnPinKey failed: " << toString(first_unpin.error());
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.ref_count, 1U);
+    }
+
+    auto second_unpin =
+        data_manager_->UnPinKey(key, second_pin->read_operation_id);
+    ASSERT_TRUE(second_unpin.has_value())
+        << "Second UnPinKey failed: " << toString(second_unpin.error());
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
+    }
+}
+
+// Test UnPinKey: token mismatch should fail without erasing or decrementing the
+// record.
+TEST_F(DataManagerTest, UnPinKeyTokenMismatchKeepsPinnedRecord) {
+    const std::string key = "unpin_token_mismatch_key";
+    const std::string test_data = "Unpin token mismatch payload";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(DoPut(key, buffer.get(), test_data.size()).has_value());
+
+    auto pin_result = data_manager_->PinKey(key, GetTierId());
+    ASSERT_TRUE(pin_result.has_value())
+        << "PinKey failed: " << toString(pin_result.error());
+
+    UUID wrong_token = pin_result->read_operation_id;
+    wrong_token.first += 1;
+    auto wrong_unpin = data_manager_->UnPinKey(key, wrong_token);
+    ASSERT_FALSE(wrong_unpin.has_value());
+    EXPECT_EQ(wrong_unpin.error(), ErrorCode::INVALID_READ);
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        EXPECT_EQ(it->second.ref_count, 1U);
+        EXPECT_EQ(it->second.read_operation_id, pin_result->read_operation_id);
+    }
+}
+
+// Test WriteCommit: lease expiry causes commit failure and allows subsequent
+// PreWrite.
+TEST_F(DataManagerTest,
+       WriteCommitFailsAfterLeaseExpiryAndAllowsRetryPreWrite) {
+    const std::string key = "expired_prewrite_key";
+    auto prewrite_result = data_manager_->PreWrite(key, 512, GetTierId());
+    ASSERT_TRUE(prewrite_result.has_value())
+        << "PreWrite failed: " << toString(prewrite_result.error());
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPendingWriteShard(kctx);
+    {
+        std::unique_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        const auto expired_deadline =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        it->second.deadline = expired_deadline;
+        it->second.list_it->second = expired_deadline;
+    }
+
+    auto commit_result =
+        data_manager_->WriteCommit(key, prewrite_result->write_operation_id);
+    ASSERT_FALSE(commit_result.has_value());
+    EXPECT_EQ(commit_result.error(), ErrorCode::LEASE_EXPIRED);
+
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
+    }
+
+    auto retry_prewrite = data_manager_->PreWrite(key, 512, GetTierId());
+    ASSERT_TRUE(retry_prewrite.has_value())
+        << "PreWrite should succeed after expired record is cleaned: "
+        << toString(retry_prewrite.error());
+}
+
+// Test UnPinKey: lease expiry causes unpin failure and cleans up the pin
+// record.
+TEST_F(DataManagerTest,
+       ExpiredPinnedLeaseBlocksUnpinButDeleteCanProceedAfterCleanup) {
+    const std::string key = "expired_pin_key";
+    const std::string test_data = "Expired pin payload";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(DoPut(key, buffer.get(), test_data.size()).has_value());
+
+    auto pin_result = data_manager_->PinKey(key, GetTierId());
+    ASSERT_TRUE(pin_result.has_value())
+        << "PinKey failed: " << toString(pin_result.error());
+
+    const auto kctx = data_manager_->BuildKeyCtx(key);
+    auto& shard = data_manager_->GetPinnedKeyShard(kctx);
+    {
+        std::unique_lock shard_lock(shard.mutex);
+        auto it = shard.existed_operation_key_map.find(key);
+        ASSERT_NE(it, shard.existed_operation_key_map.end());
+        const auto expired_deadline =
+            std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+        it->second.deadline = expired_deadline;
+        it->second.list_it->second = expired_deadline;
+    }
+
+    auto unpin_result =
+        data_manager_->UnPinKey(key, pin_result->read_operation_id);
+    ASSERT_FALSE(unpin_result.has_value());
+    EXPECT_EQ(unpin_result.error(), ErrorCode::LEASE_EXPIRED);
+
+    {
+        std::shared_lock shard_lock(shard.mutex);
+        EXPECT_EQ(shard.existed_operation_key_map.count(key), 0U);
+    }
 }
 
 // Test concurrent Put operations

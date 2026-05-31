@@ -6,8 +6,11 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "types.h"
+#include "p2p_rpc_types.h"
+#include "rpc_types.h"
 
 #include <cstdlib>  // for atexit
+#include <cstdint>
 #include <map>
 #include <unordered_map>
 
@@ -982,6 +985,10 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("max_candidates", &ReadRouteConfig::max_candidates)
         .def_readwrite("p2p_config", &ReadRouteConfig::p2p_config);
 
+    py::enum_<TransferDirectionMode>(m, "TransferDirectionMode")
+        .value("REVERSE", TransferDirectionMode::REVERSE)
+        .value("FORWARD", TransferDirectionMode::FORWARD);
+
     py::class_<WriteRouteRequestConfig>(m, "WriteRouteRequestConfig")
         .def(py::init<>())  // Default constructor
         .def_readwrite("max_candidates",
@@ -1161,6 +1168,9 @@ PYBIND11_MODULE(store, m) {
                size_t async_sender_thread_count = 0,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
+               uint32_t p2p_key_lease_duration_ms = 5000,
+               uint32_t p2p_key_lease_scan_interval_ms = 1000,
+               const std::string& p2p_transfer_direction_mode = "reverse",
                const py::object& engine = py::none()) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
@@ -1182,7 +1192,9 @@ PYBIND11_MODULE(store, m) {
                     local_transfer_mode, local_memcpy_async_worker_num,
                     metrics_port, enable_metrics_http, {},
                     async_sender_thread_count, async_max_batch_size,
-                    async_route_queue_size);
+                    async_route_queue_size, p2p_key_lease_duration_ms,
+                    p2p_key_lease_scan_interval_ms,
+                    p2p_transfer_direction_mode);
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1202,6 +1214,9 @@ PYBIND11_MODULE(store, m) {
             py::arg("async_sender_thread_count") = 0,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
+            py::arg("p2p_key_lease_duration_ms") = 5000,
+            py::arg("p2p_key_lease_scan_interval_ms") = 1000,
+            py::arg("p2p_transfer_direction_mode") = "reverse",
             py::arg("engine") = py::none(),
             "Setup the store in P2P architecture.")
         .def(
@@ -1446,7 +1461,9 @@ PYBIND11_MODULE(store, m) {
             "  tp_size: The total tensor parallel size (default 1).\n"
             "  split_dim: The dimension to split the tensor along "
             "(default 0).\n"
-            "  config: ReadRouteConfig.")
+            "  config: ReadRouteConfig (optional; omit for defaults). "
+            "Cross-node transfer direction is set at setup_p2p_real_client via "
+            "p2p_transfer_direction_mode.")
         .def("batch_get_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_get_tensor_with_tp,
              py::arg("base_keys"), py::arg("tp_rank") = 0,
@@ -1530,7 +1547,9 @@ PYBIND11_MODULE(store, m) {
             "  tp_size: The total tensor parallel size (default 1).\n"
             "  split_dim: The dimension to split the tensor along"
             "(default 0).\n"
-            "  config: ReadRouteConfig.")
+            "  config: ReadRouteConfig (optional; omit for defaults). "
+            "Cross-node transfer direction is set at setup_p2p_real_client via "
+            "p2p_transfer_direction_mode.")
         .def(
             "batch_get_tensor_with_tp_into",
             &MooncakeStorePyWrapper::batch_get_tensor_with_tp_into,

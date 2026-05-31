@@ -48,6 +48,7 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | OBJECT_ALREADY_EXISTS (-705)   | Object already exists                                                                                     |
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
 |                          | LEASE_EXPIRED (-707)           | Lease expired before data transfer completed                                                              |
+|                          | REPLICA_IS_PROCESSING (-711)   | Replica is processing an in-flight write                                                                  |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
 | High Availability        | ETCD_OPERATION_ERROR (-1000)   | etcd operation failed                                                                                     |

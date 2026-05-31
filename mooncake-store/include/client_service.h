@@ -19,6 +19,7 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "p2p_rpc_types.h"
+#include "rpc_types.h"
 #include "replica.h"
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
