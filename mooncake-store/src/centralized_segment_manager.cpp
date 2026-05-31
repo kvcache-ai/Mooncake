@@ -57,6 +57,7 @@ ErrorCode CentralizedSegmentManager::InnerCheckMountSegment(
     }
 
     if (memory_allocator_ == BufferAllocatorType::CACHELIB &&
+        segment.GetCentralizedExtra().protocol != "cxl" &&
         (buffer % facebook::cachelib::Slab::kSize ||
          size % facebook::cachelib::Slab::kSize)) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size

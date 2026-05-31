@@ -92,11 +92,6 @@ struct MooncakeEpBuffer {
     void** ipc_peer_ptrs = nullptr;
     bool p2p_ipc_all_enabled_ = false;
 
-    // NVLink P2P
-    int32_t* nvlink_available = nullptr;
-    void** ipc_peer_ptrs_host = nullptr;
-    void** ipc_peer_ptrs = nullptr;
-
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
