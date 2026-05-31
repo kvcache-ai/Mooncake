@@ -16,6 +16,8 @@ impl MembershipSyncHandle {
         metadata: Arc<dyn MetadataBackend>,
         live_client_cache: SharedLiveClientCache,
         interval: Duration,
+        namespace: String,
+        suspect_runtime_cache: SharedSuspectRuntimeCache,
     ) -> Result<Self> {
         if interval.is_zero() {
             return Ok(Self::disabled());
@@ -31,15 +33,33 @@ impl MembershipSyncHandle {
                     match shutdown_rx.recv_timeout(wait) {
                         Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if let Err(error) = refresh_live_client_cache(
+                            match refresh_live_client_cache(
                                 metadata.as_ref(),
                                 &live_client_cache,
                                 "live_client_snapshot_refresh",
                             ) {
-                                tracing::warn!(
-                                    error = %error,
-                                    "background live-client refresh failed"
-                                );
+                                Ok(leases) => {
+                                    let readable = {
+                                        let mut suspects = suspect_runtime_cache.lock();
+                                        suspects.reconcile_with_leases(&leases);
+                                        leases
+                                            .iter()
+                                            .filter(|l| l.state.serves_reads())
+                                            .filter(|l| !suspects.contains(&l.runtime))
+                                            .map(|l| l.runtime.clone())
+                                            .collect::<BTreeSet<_>>()
+                                    };
+                                    mooncake_store_route::update_readable_filter(
+                                        &namespace,
+                                        Some(readable),
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "background live-client refresh failed"
+                                    );
+                                }
                             }
                             if let Err(error) = refresh_due_tenant_quota_policy_cache(
                                 metadata.as_ref(),

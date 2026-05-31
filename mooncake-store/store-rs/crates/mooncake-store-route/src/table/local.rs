@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 use mooncake_store_core::{
@@ -28,6 +28,19 @@ impl LocalRouteTable {
     pub(crate) fn contains_many(&self, keys: &[ObjectKey]) -> Vec<bool> {
         keys.iter()
             .map(|key| self.routes.contains_key(&key.0))
+            .collect()
+    }
+
+    pub(crate) fn contains_readable_many(
+        &self,
+        keys: &[ObjectKey],
+        readable: &BTreeSet<ClientRuntimeId>,
+    ) -> Vec<bool> {
+        keys.iter()
+            .map(|key| match self.routes.get(&key.0) {
+                None => false,
+                Some(route) => route.replicas.iter().any(|r| readable.contains(&r.owner)),
+            })
             .collect()
     }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -5,6 +6,7 @@ use mooncake_store_core::{
     CasResult, ClientRuntimeId, ClientStableId, NamespaceScope, ObjectKey, ObjectRoute, Result,
     ReuseIdentity, RouteCasRequest, RouteVersion, StoreError,
 };
+use parking_lot::Mutex as ParkingMutex;
 
 use crate::shim::RouteAuthorityService;
 use crate::table::LocalRouteTable;
@@ -66,7 +68,11 @@ pub(crate) fn authority_contains_many(
     if slot.ref_count == 0 {
         return Err(not_attached(authority));
     }
-    Ok(slot.table.contains_many(keys))
+    let filter = mesh.readable_filter.lock().clone();
+    match filter {
+        None => Ok(slot.table.contains_many(keys)),
+        Some(readable) => Ok(slot.table.contains_readable_many(keys, &readable)),
+    }
 }
 
 pub(crate) fn authority_get_version_floor(
@@ -226,14 +232,21 @@ pub(crate) fn authority_replace_many(
 
 struct ClusterRouteMesh {
     authorities: DashMap<String, AuthoritySlot>,
+    readable_filter: ParkingMutex<Option<Arc<BTreeSet<ClientRuntimeId>>>>,
 }
 
 impl ClusterRouteMesh {
     fn new() -> Self {
         Self {
             authorities: DashMap::new(),
+            readable_filter: ParkingMutex::new(None),
         }
     }
+}
+
+pub fn update_readable_filter(namespace: &str, filter: Option<BTreeSet<ClientRuntimeId>>) {
+    let mesh = route_mesh(namespace);
+    *mesh.readable_filter.lock() = filter.map(Arc::new);
 }
 
 #[derive(Default)]

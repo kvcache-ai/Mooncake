@@ -485,6 +485,8 @@ impl StoreClientBuilder {
             runtime_metadata.clone(),
             live_client_cache.clone(),
             self.live_client_sync_interval,
+            route_namespace.clone(),
+            suspect_runtime_cache.clone(),
         )?;
         let async_eviction = AsyncEvictionHandle::spawn(
             &runtime,
