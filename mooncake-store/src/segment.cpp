@@ -1397,4 +1397,29 @@ int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
     if (disk_it == client_local_disk_segment_.end()) return 0;
     return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
 }
+
+bool SegmentManager::HasSegmentByEndpoint(
+    const std::string& endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        if (mounted_segment.segment.te_endpoint == endpoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
+                                        std::string& segment_name,
+                                        std::string& te_endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = mounted_segments_.find(segment_id);
+    if (it == mounted_segments_.end()) {
+        return false;
+    }
+    const Segment& seg = it->second.segment;
+    segment_name = seg.name;
+    te_endpoint = seg.te_endpoint;
+    return true;
+}
 }  // namespace mooncake
