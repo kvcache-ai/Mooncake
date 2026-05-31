@@ -127,6 +127,20 @@ class MockOpLogStore : public OpLogStore {
         return entries_.size();
     }
 
+    // Find the latest OpLog entry for a given key. Returns OPLOG_ENTRY_NOT_FOUND
+    // if no entry matches.
+    ErrorCode FindLatestEntryForKey(const std::string& key,
+                                    OpLogEntry& out) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            if (it->second.object_key == key) {
+                out = it->second;
+                return ErrorCode::OK;
+            }
+        }
+        return ErrorCode::OPLOG_ENTRY_NOT_FOUND;
+    }
+
    private:
     mutable std::mutex mutex_;
     std::map<uint64_t, OpLogEntry> entries_;

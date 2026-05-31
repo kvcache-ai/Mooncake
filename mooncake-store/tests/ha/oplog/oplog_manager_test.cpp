@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "mock_oplog_store.h"
+
 namespace mooncake::test {
 
 class OpLogManagerTest : public ::testing::Test {
@@ -313,6 +315,44 @@ TEST_F(OpLogManagerTest, TestAllocateEntry_FieldsComplete) {
     EXPECT_TRUE(OpLogManager::VerifyChecksum(e));
     // "del-key" prefix hash
     EXPECT_NE(0u, e.prefix_hash);
+}
+
+TEST_F(OpLogManagerTest, RetryPreservesSequenceId) {
+    // Core invariant: when persist fails, retry must use the SAME
+    // pre-allocated OpLogEntry (same sequence_id), not allocate a new one.
+    MockOpLogStore mock_store;
+
+    // First write fails
+    mock_store.SetWriteError(ErrorCode::PERSISTENT_FAIL);
+    manager_->SetOpLogStore(
+        std::shared_ptr<OpLogStore>(&mock_store, [](OpLogStore*) {}));
+
+    // Allocate entry with seq=1
+    OpLogEntry entry = manager_->AllocateEntry(OpType::REMOVE, "key1", {});
+    EXPECT_EQ(1u, entry.sequence_id);
+    EXPECT_EQ(1u, manager_->GetLastSequenceId());
+
+    // First persist attempt fails
+    ErrorCode err = manager_->PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
+    EXPECT_EQ(0u, mock_store.EntryCount());
+
+    // Retry with the SAME entry (same sequence_id) — this is what the fixed
+    // EnqueueRetryOnPersistFailure does
+    mock_store.SetWriteError(ErrorCode::OK);
+    err = manager_->PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(1u, mock_store.EntryCount());
+
+    // Verify the persisted entry has the original sequence_id
+    OpLogEntry persisted;
+    EXPECT_EQ(ErrorCode::OK, mock_store.ReadOpLog(1, persisted));
+    EXPECT_EQ(1u, persisted.sequence_id);
+    EXPECT_EQ("key1", persisted.object_key);
+    EXPECT_EQ(OpType::REMOVE, persisted.op_type);
+
+    // Only ONE sequence id was ever allocated
+    EXPECT_EQ(1u, manager_->GetLastSequenceId());
 }
 
 }  // namespace mooncake::test
