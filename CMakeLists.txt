@@ -22,7 +22,12 @@ option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+# Use vendored pybind11 if the submodule is checked out, otherwise find it on the system.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11/CMakeLists.txt")
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+else()
+  find_package(pybind11 REQUIRED)
+endif()
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH

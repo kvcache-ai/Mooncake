@@ -44,8 +44,17 @@ message("${PYTHON_SYS_PATH}")
 set(PYTHON_PACKAGE_NAME "mooncake")
 
 if(WITH_TE)
+  # Include device_transport objects directly so their symbols survive the
+  # static-library link into the shared module (the linker otherwise strips
+  # unreferenced object files from libtransfer_engine.a).
+  set(_ENGINE_EXTRA_OBJECTS "")
+  if(USE_CUDA OR USE_MUSA)
+    list(APPEND _ENGINE_EXTRA_OBJECTS $<TARGET_OBJECTS:device_transport>)
+  endif()
+
   pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-                      transfer_engine/transfer_engine_py.cpp)
+                      transfer_engine/transfer_engine_py.cpp
+                      ${_ENGINE_EXTRA_OBJECTS})
   set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
   # Propagate EFA compile definition to engine target
