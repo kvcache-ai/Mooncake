@@ -52,6 +52,11 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
+    // OpLog store configuration
+    std::string oplog_store_type;
+    std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
+    int oplog_poll_interval_ms = 1000;
+
     std::string cluster_id;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
@@ -151,6 +156,10 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    // OpLog store configuration
+    std::string oplog_store_type;
+    std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
+    int oplog_poll_interval_ms = 1000;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -229,6 +238,9 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        oplog_store_type = config.oplog_store_type;
+        oplog_store_root_dir = config.oplog_store_root_dir;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -361,6 +373,10 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_max_per_heartbeat = 1;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    // OpLog store configuration
+    std::string oplog_store_type;
+    std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
+    int oplog_poll_interval_ms = 1000;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -431,6 +447,9 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        oplog_store_type = config.oplog_store_type;
+        oplog_store_root_dir = config.oplog_store_root_dir;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -517,6 +536,9 @@ class WrappedMasterServiceConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        oplog_store_type = config.oplog_store_type;
+        oplog_store_root_dir = config.oplog_store_root_dir;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -576,6 +598,10 @@ class MasterServiceConfigBuilder {
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
+    // OpLog store configuration
+    std::string oplog_store_type_;
+    std::string oplog_store_root_dir_ = "/tmp/mooncake_oplog";
+    int oplog_poll_interval_ms_ = 1000;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -694,6 +720,23 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_store_type(
+        const std::string& store_type) {
+        oplog_store_type_ = store_type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_store_root_dir(
+        const std::string& root_dir) {
+        oplog_store_root_dir_ = root_dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_poll_interval_ms(int interval_ms) {
+        oplog_poll_interval_ms_ = interval_ms;
         return *this;
     }
 
@@ -900,6 +943,10 @@ class MasterServiceConfig {
     uint32_t promotion_max_per_heartbeat = 1;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    // OpLog store configuration
+    std::string oplog_store_type;
+    std::string oplog_store_root_dir = "/tmp/mooncake_oplog";
+    int oplog_poll_interval_ms = 1000;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -964,6 +1011,9 @@ class MasterServiceConfig {
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        oplog_store_type = config.oplog_store_type;
+        oplog_store_root_dir = config.oplog_store_root_dir;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1026,6 +1076,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.oplog_store_type = oplog_store_type_;
+    config.oplog_store_root_dir = oplog_store_root_dir_;
+    config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
