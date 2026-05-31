@@ -128,6 +128,17 @@ class HotStandbyService {
     ErrorCode Promote();
 
     /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    /**
      * @brief Get the number of metadata entries in the local store
      */
     size_t GetMetadataCount() const;
@@ -147,6 +158,17 @@ class HotStandbyService {
     // after leader election (fast recovery).
     bool ExportMetadataSnapshot(
         std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);

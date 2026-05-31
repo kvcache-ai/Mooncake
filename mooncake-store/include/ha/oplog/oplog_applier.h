@@ -91,6 +91,17 @@ class OpLogApplier {
     };
     GapResolveResult TryResolveGapsOnceForPromotion(size_t max_ids = 1024);
 
+    const StandbySegmentRegistry& GetSegmentRegistry() const;
+    void ApplySegmentMount(const OpLogEntry& entry);
+    void ApplySegmentUnmount(const OpLogEntry& entry);
+    void ApplySegmentUpdate(const OpLogEntry& entry);
+
+    /**
+     * @brief Load segment registry from snapshot baseline.
+     * Clears existing registry and replaces with given segments.
+     */
+    void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
+
    private:
     /**
      * @brief Check if the entry's sequence order is valid
@@ -150,6 +161,9 @@ class OpLogApplier {
     // Next expected global sequence_id. Read frequently from monitoring thread,
     // updated by watch/apply thread. Use atomic to avoid data races.
     std::atomic<uint64_t> expected_sequence_id_{1};
+
+    // Standby segment registry
+    StandbySegmentRegistry segment_registry_;
 
     // Constants for missing entry handling
     // IMPORTANT: request must happen BEFORE skip, otherwise we will never
