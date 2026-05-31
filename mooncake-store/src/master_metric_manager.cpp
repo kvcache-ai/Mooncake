@@ -715,14 +715,14 @@ int64_t MasterMetricManager::get_allocated_file_size() {
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return std::numeric_limits<int64_t>::max();
     }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return 0.0;
     }
     double allocated = file_allocated_size_.value();
