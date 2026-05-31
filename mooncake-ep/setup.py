@@ -26,6 +26,9 @@ if use_musa:
         "src/ep_py.cpp",
         "src/mooncake_ep_buffer.cpp",
         "src/mooncake_ep_kernel.mu",
+        # MUSA stub + P2P have no external deps — compile directly
+        "../mooncake-transfer-engine/src/transport/device/p2p_device_transport.cpp",
+        "../mooncake-transfer-engine/src/transport/device/ibgda_device_transport_musa_stub.cpp",
     ]
     cxx_flags = [
         f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
@@ -45,12 +48,8 @@ if use_musa:
         "-O3",
     ]
     extra_compile_args = {"cxx": cxx_flags, "mcc": musa_flags}
-    # Device transport symbols now come from engine.so
-    extra_link_args = [
-        "-Wl,-rpath,$ORIGIN",
-        "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
-        "-l:engine.so",
-    ]
+    # MUSA stub has no IB/TE deps — no engine.so needed
+    extra_link_args = ["-Wl,-rpath,$ORIGIN"]
 else:
     ExtensionClass = CUDAExtension
     BuildClass = BuildExtension
