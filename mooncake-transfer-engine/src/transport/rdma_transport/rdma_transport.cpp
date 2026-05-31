@@ -21,6 +21,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <future>
 #include <set>
 #include <thread>

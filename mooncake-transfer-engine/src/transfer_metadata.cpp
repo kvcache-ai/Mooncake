@@ -219,6 +219,9 @@ static int encodeMultiProtocolSegmentDesc(
     const TransferMetadata::SegmentDesc &desc, Json::Value &segmentJSON) {
     // Multi-protocol encoding for CXL+TCP or CXL+RDMA combination
     segmentJSON["name"] = desc.name;
+    if (!desc.rdma_server_name.empty()) {
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
     Json::Value protocolJSON(Json::arrayValue);
     for (const auto &proto : protocols) {
         if (proto == "rdma") {
@@ -511,6 +514,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("rdma_server_name"))
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
     for (const auto &protocolStr : segmentJSON["protocol"]) {
         std::string proto = protocolStr.asString();
