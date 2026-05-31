@@ -39,6 +39,11 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
+#include "ha/oplog/oplog_manager.h"
+#include "ha/oplog/oplog_store.h"
+#include "ha/oplog/oplog_store_factory.h"
+#include "allocator.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 
@@ -72,6 +77,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+class MasterServiceHATest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -103,6 +109,7 @@ class MasterService {
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
+    friend class test::MasterServiceHATest;
 
    public:
     using NoFProbeFn =
@@ -128,6 +135,28 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    /**
+     * @brief Inject a mock OpLogStore for testing. Must be called before
+     *        any HA OpLog operations.
+     */
+    void SetOpLogStoreForTesting(std::shared_ptr<OpLogStore> store);
+
+    /**
+     * @brief Override retry behavior for OpLog persist in tests.
+     */
+    void SetOpLogRetryConfigForTesting(uint32_t max_attempts,
+                                       uint32_t max_backoff_ms);
+
+    /**
+     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
+     *        unit tests can drive a single eviction cycle synchronously
+     *        without standing up the periodic eviction thread.
+     */
+    void RunBatchEvictForTesting(double evict_ratio_target,
+                                 double evict_ratio_lowerbound);
+    void RunNoFBatchEvictForTesting(double evict_ratio_target,
+                                    double evict_ratio_lowerbound);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -765,6 +794,16 @@ class MasterService {
      */
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    /**
+     * @brief Restore primary state from standby promotion context.
+     * Called once at promotion time before serving requests.
+     */
+    void RestoreFromStandbySnapshot(
+        const std::vector<std::pair<std::string, StandbyObjectMetadata>>&
+            objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
 
     /**
      * @brief Query the status of a task
@@ -2190,6 +2229,107 @@ class MasterService {
                                     const std::string& medium,
                                     const ObjectMetadata& metadata,
                                     const TenantId& tenant_id);
+
+    // OpLog publishing
+    std::shared_ptr<OpLogStore> oplog_store_;
+    OpLogManager oplog_manager_;
+
+    // OpLog publishing helpers
+    void AppendOpLogAndNotify(OpType type, const std::string& key,
+                              const std::string& payload = {});
+    tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
+        OpType type, const std::string& key, const std::string& payload = {});
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogWithoutMemReplicas(
+        const ObjectMetadata& metadata) const;
+    std::string SerializeMetadataForOpLogFromReplicaDescriptors(
+        const UUID& client_id, uint64_t size,
+        const std::vector<Replica::Descriptor>& replicas) const;
+    ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
+
+    // Invalid endpoints from standby that don't exist locally
+    std::unordered_set<std::string> invalid_replica_endpoints_;
+
+    // Keep DummyBufferAllocator alive after standby restore.
+    // Key: transport_endpoint, Value: allocator.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocator_keepalive_;
+
+    // Pending mutation retry queue
+    enum class PendingMutationKind : uint8_t {
+        EVICT_MEM_REPLICAS = 1,
+        CLEAR_ALL_REPLICAS = 2,
+        CLEAR_REPLICAS_ON_SEGMENT = 3,
+        SEGMENT_LIFECYCLE = 4,
+    };
+
+    struct PendingMutation {
+        PendingMutationKind kind;
+        std::string key;
+        std::string segment_name;
+        OpLogEntry oplog_entry;
+        uint32_t attempt{0};
+        std::chrono::steady_clock::time_point next_retry_at{};
+    };
+
+    void EnqueuePendingMutation(PendingMutation m);
+    void PendingMutationWorker();
+    bool ProcessPendingMutationOnce(PendingMutation& m);
+    void EnqueueRetryOnPersistFailure(const char* why, PendingMutationKind kind,
+                                      OpLogEntry entry);
+    void AppendOrPersistOrEnqueue(const char* why, OpType type,
+                                  const std::string& key,
+                                  const std::string& payload,
+                                  PendingMutationKind kind);
+    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
+                                      const std::string& key,
+                                      const std::string& payload,
+                                      PendingMutationKind kind);
+
+    /**
+     * Strong-consistency variant: if OpLog persist fails, returns error.
+     * Caller must NOT proceed with local mutation if this returns error.
+     */
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
+        OpType type, const std::string& key, const std::string& payload);
+
+    /**
+     * Segment lifecycle persist helper. Tries to durably persist the
+     * SEGMENT_MOUNT / SEGMENT_UNMOUNT entry up-front; on failure enqueues
+     * the same OpLogEntry (with its already-allocated sequence_id) for
+     * background retry so the standby segment registry eventually
+     * converges. Suitable for paths where the local segment commit has
+     * already happened (UnmountSegment) and rolling back is impossible.
+     */
+    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                        const std::string& key,
+                                        const std::string& payload);
+
+    /**
+     * Helper to persist REMOVE OpLog for a key with strong-consistency.
+     * @return OK on success, error on persist failure (caller must skip erase)
+     */
+    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+                                                     const std::string& key);
+
+    /**
+     * Build replica descriptors after removing replicas matching pred_fn.
+     * Returns empty if no complete replicas remain.
+     */
+    std::vector<Replica::Descriptor> BuildRemainingReplicaDescriptors(
+        const ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& should_remove) const;
+
+    std::mutex pending_mutations_mutex_;
+    std::condition_variable pending_mutations_cv_;
+    std::deque<PendingMutation> pending_mutations_;
+    std::atomic<bool> pending_mutations_running_{false};
+    std::thread pending_mutations_thread_;
+    static constexpr size_t kMaxPendingMutations = 10000;
+
+    // Test-only overrides for PersistOpLogEntryWithSyncRetries
+    std::atomic<uint32_t> oplog_retry_max_attempts_for_testing_{10};
+    std::atomic<uint32_t> oplog_retry_max_backoff_ms_for_testing_{30000};
 };
 
 }  // namespace mooncake

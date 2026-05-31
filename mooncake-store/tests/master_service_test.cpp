@@ -820,6 +820,29 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 }
 
+TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
+    const TenantId tenant_a("tenant_restore_a");
+    const TenantId tenant_b("tenant_restore_b");
+    MasterService service(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    const std::string key = "shared_restore_key";
+
+    Replica replica(generate_uuid(), 128, "local://standby",
+                    ReplicaStatus::COMPLETE);
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = 128;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    service.RestoreFromStandbySnapshot(
+        {{tenant_a.MakeScopedKey(key), metadata}},
+        /*initial_oplog_sequence_id=*/0, {});
+
+    EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
+    EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
+    EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
+}
+
 TEST_F(MasterServiceTest, BatchGetReplicaListPreservesOrderWithGroupedKeys) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
