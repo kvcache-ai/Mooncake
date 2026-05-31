@@ -8,6 +8,8 @@ pub(crate) mod registry;
 pub(crate) mod selection;
 
 pub use local_authority::LocalRouteAuthority;
-pub use registry::update_readable_filter;
+pub use registry::{
+    is_readable_filter_active, route_has_readable_replicas, update_readable_filter,
+};
 
 pub(crate) use directory::build_embedded_wrh_route_directory;

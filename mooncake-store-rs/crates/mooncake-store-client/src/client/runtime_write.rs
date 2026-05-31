@@ -1395,6 +1395,108 @@ impl StoreClient {
                 }
             }
         }
+        let route_namespace = self.metadata.route_namespace();
+        let stale_overwrite_indices = cas_results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| match result {
+                Ok(cas) if !cas.applied && routes[index].expected_version.is_none() => {
+                    cas.current.as_ref().and_then(|current| {
+                        if !mooncake_store_route::route_has_readable_replicas(
+                            &route_namespace,
+                            current,
+                        ) {
+                            Some((index, current.version))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !stale_overwrite_indices.is_empty() {
+            let mut retry_requests = Vec::new();
+            let mut retry_indices = Vec::new();
+            for (index, stale_version) in &stale_overwrite_indices {
+                routes[*index].route.version = stale_version.next();
+                routes[*index].expected_version = Some(*stale_version);
+                retry_indices.push(*index);
+                retry_requests.push(RouteCasRequest {
+                    key: routes[*index].key.clone(),
+                    expected: Some(*stale_version),
+                    next: Some(routes[*index].route.clone()),
+                });
+            }
+            let retry_tracker =
+                OperationTracker::new("batch_put_stage_route_cas_stale_overwrite");
+            let retry_result = self.route_ops().publish_routes(&retry_requests);
+            retry_tracker.finish(&retry_result, 0);
+            match retry_result {
+                Ok(results) => {
+                    let mut fallback_indices = Vec::new();
+                    let mut fallback_keys = Vec::new();
+                    for (index, result) in retry_indices.into_iter().zip(results) {
+                        match &result {
+                            Ok(cas) if !cas.applied && cas.current.is_none() => {
+                                routes[index].expected_version = None;
+                                fallback_indices.push(index);
+                                fallback_keys.push(routes[index].key.clone());
+                            }
+                            _ => {
+                                cas_results[index] = result;
+                            }
+                        }
+                    }
+                    if !fallback_indices.is_empty() {
+                        let fallback_current = vec![None; fallback_keys.len()];
+                        let fallback_versions = next_route_versions(
+                            &fallback_current,
+                            &self.route_ops(),
+                            &fallback_keys,
+                        );
+                        let fallback_requests = fallback_indices
+                            .iter()
+                            .zip(fallback_versions)
+                            .map(|(index, version)| {
+                                routes[*index].route.version = version;
+                                RouteCasRequest {
+                                    key: routes[*index].key.clone(),
+                                    expected: None,
+                                    next: Some(routes[*index].route.clone()),
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let fallback_tracker = OperationTracker::new(
+                            "batch_put_stage_route_cas_stale_overwrite_fallback",
+                        );
+                        let fallback_result =
+                            self.route_ops().publish_routes(&fallback_requests);
+                        fallback_tracker.finish(&fallback_result, 0);
+                        match fallback_result {
+                            Ok(fallback_results) => {
+                                for (index, result) in
+                                    fallback_indices.into_iter().zip(fallback_results)
+                                {
+                                    cas_results[index] = result;
+                                }
+                            }
+                            Err(error) => {
+                                release_prepared(
+                                    &prepared,
+                                    "batch_put_stale_overwrite_fallback_failed",
+                                );
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    release_prepared(&prepared, "batch_put_stale_overwrite_failed");
+                    return Err(error);
+                }
+            }
+        }
 
         let mut published = Vec::with_capacity(routes.len());
         let mut first_error = None;
