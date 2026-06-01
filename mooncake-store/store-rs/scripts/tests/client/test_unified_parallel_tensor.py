@@ -249,7 +249,11 @@ def test_full_reconstruction(store, tenant):
 
 
 def test_dp_tp_shard_roundtrip(store, tenant):
-    """Write DP=2 TP=4 shards, read back with exact match."""
+    """Write DP=2 TP=4 shards, read back with exact match.
+
+    Note: all DP ranks store the same TP shard data here because this test
+    validates multi-axis key naming and retrieval, not DP data semantics.
+    """
     full_weight = generate_weight([128, 64], seed=8)
     dp_size = 2
     tp_size = 4
@@ -354,7 +358,7 @@ def test_invalid_axis_rejected(store, tenant):
             "test_invalid.weight", weight, parallelism=par, tenant=tenant
         )
         raise AssertionError("should have raised for invalid axis")
-    except (ValueError, Exception):
+    except ValueError:
         pass
 
 
@@ -368,7 +372,7 @@ def test_read_nonexistent_shard(store, tenant):
             tenant=tenant,
         )
         raise AssertionError("should have raised for non-existent key")
-    except (KeyError, RuntimeError, Exception):
+    except RuntimeError:
         pass
 
 

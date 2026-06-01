@@ -118,6 +118,9 @@ impl ParallelAxisSpec {
     /// Parse from a wire-format `LayoutAxis`.
     pub fn from_layout_axis(axis: &LayoutAxis) -> Option<Self> {
         let kind = ParallelAxisKind::from_i32(axis.kind)?;
+        if axis.reserved1 < i32::MIN as i64 || axis.reserved1 > i32::MAX as i64 {
+            return None;
+        }
         Some(Self {
             kind,
             rank: axis.shard_rank,
@@ -327,6 +330,9 @@ impl WriterShardManifest {
             return None;
         }
         if manifest.shard_count <= 0 {
+            return None;
+        }
+        if manifest.split_dim < 0 {
             return None;
         }
         Some(manifest)
