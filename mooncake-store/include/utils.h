@@ -207,6 +207,9 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     } catch (const std::exception&) {
         return std::nullopt;  // Failed to parse number
     }
+    if (value < 0) {
+        return std::nullopt;
+    }
 
     if (pos >= s.length()) {
         // No unit specified, assume bytes

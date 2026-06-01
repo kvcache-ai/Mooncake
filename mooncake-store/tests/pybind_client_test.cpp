@@ -973,6 +973,7 @@ TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
     const InvalidSizeCase invalid_size_cases[] = {
         {"localhost:17816", "50%", "16MB"},
         {"localhost:17817", "16MB", "16XB"},
+        {"localhost:17818", "-5", "16MB"},
     };
 
     for (const auto& test_case : invalid_size_cases) {
