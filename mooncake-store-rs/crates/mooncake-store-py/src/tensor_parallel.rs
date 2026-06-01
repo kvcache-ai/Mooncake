@@ -5,9 +5,9 @@
 
 use mooncake_tensor::{
     calculate_shard_range, calculate_strided_shard_ranges, get_parallelism_key_name,
-    get_writer_partition_key_name, parallelism_matches_metadata, ParallelAxisKind,
-    ParallelAxisSpec, ReadTargetMode, ReadTargetSpec, TensorDtype, TensorMetadata,
-    TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
+    get_parallelism_manifest_key, get_writer_partition_key_name, parallelism_matches_metadata,
+    ParallelAxisKind, ParallelAxisSpec, ReadTargetMode, ReadTargetSpec, TensorDtype,
+    TensorMetadata, TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -323,11 +323,42 @@ impl PyMooncakeDistributedStore {
                     &spec.canonicalize().axes,
                     info.data_bytes as u64,
                 );
-                self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)
+                let status =
+                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                if status != 0 {
+                    return Ok(status);
+                }
+
+                let tp = spec.tp_axis();
+                if let Some(tp_axis) = tp {
+                    let manifest = WriterShardManifest::new(
+                        info.dtype as i32,
+                        global_shape.len() as i32,
+                        tp_axis.split_dim,
+                        tp_axis.size,
+                        &global_shape,
+                    );
+                    let manifest_key = get_parallelism_manifest_key(key);
+                    self.put(
+                        &manifest_key,
+                        manifest.as_bytes().to_vec(),
+                        tenant,
+                        replica_count,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        false,
+                    )?;
+                }
+                Ok(status)
             }
             WriteRoute::WriterPartition => {
                 let wp = wp_spec.expect("WriterPartition route must have wp_spec");
-                let storage_key = get_writer_partition_key_name(key, wp.rank);
+                let storage_key =
+                    get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
 
                 let mut global_shape = info.shape.clone();
                 let dim = wp.split_dim as usize;
@@ -401,11 +432,15 @@ impl PyMooncakeDistributedStore {
             .transpose()?;
 
         let storage_key = match (&par_spec, &wp_spec) {
-            (Some(spec), _) => get_parallelism_key_name(key, spec),
+            (Some(spec), _) => {
+                let par_manifest_key = get_parallelism_manifest_key(key);
+                let _ = self.remove(&par_manifest_key, false, tenant);
+                get_parallelism_key_name(key, spec)
+            }
             (_, Some(wp)) => {
                 let manifest_key = WriterShardManifest::manifest_key(key);
                 let _ = self.remove(&manifest_key, false, tenant);
-                get_writer_partition_key_name(key, wp.rank)
+                get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim)
             }
             _ => key.to_string(),
         };
@@ -419,6 +454,54 @@ impl PyMooncakeDistributedStore {
             writer_partition,
             tenant,
             replica_count,
+        )
+    }
+
+    /// Put a tensor from a raw buffer `[TensorMetadata | data]` with parallelism.
+    #[pyo3(signature = (
+        key, buffer_ptr, size, *,
+        parallelism = None,
+        writer_partition = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn put_tensor_with_parallelism_from(
+        &self,
+        key: &str,
+        buffer_ptr: usize,
+        size: usize,
+        parallelism: Option<PyTensorParallelism>,
+        writer_partition: Option<(i32, i32, i32)>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<i32> {
+        self.put_tensor_from_internal(
+            key, buffer_ptr, size, parallelism, writer_partition, tenant, replica_count, false,
+        )
+    }
+
+    /// Upsert a tensor from a raw buffer with parallelism.
+    #[pyo3(signature = (
+        key, buffer_ptr, size, *,
+        parallelism = None,
+        writer_partition = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_tensor_with_parallelism_from(
+        &self,
+        key: &str,
+        buffer_ptr: usize,
+        size: usize,
+        parallelism: Option<PyTensorParallelism>,
+        writer_partition: Option<(i32, i32, i32)>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<i32> {
+        self.put_tensor_from_internal(
+            key, buffer_ptr, size, parallelism, writer_partition, tenant, replica_count, true,
         )
     }
 
@@ -498,9 +581,349 @@ impl PyMooncakeDistributedStore {
             }
         }
     }
+
+    // ─── Batch methods ────────────────────────────────────────────────────
+
+    /// Batch put tensors with parallelism.
+    #[pyo3(signature = (
+        keys, tensors, *,
+        parallelisms = None,
+        writer_partitions = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_put_tensor_with_parallelism(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        tensors: Vec<Bound<'_, PyAny>>,
+        parallelisms: Option<Vec<Option<PyTensorParallelism>>>,
+        writer_partitions: Option<Vec<Option<(i32, i32, i32)>>>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        validate_batch_write_args(&keys, tensors.len(), &parallelisms, &writer_partitions)?;
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let par = parallelisms.as_ref().and_then(|v| v[i].clone());
+            let wp = writer_partitions.as_ref().and_then(|v| v[i]);
+            let status = self.put_tensor_with_parallelism(
+                &keys[i],
+                &tensors[i],
+                par,
+                wp,
+                tenant,
+                replica_count,
+            )?;
+            results.push(status);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
+
+    /// Batch upsert tensors with parallelism.
+    #[pyo3(signature = (
+        keys, tensors, *,
+        parallelisms = None,
+        writer_partitions = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_upsert_tensor_with_parallelism(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        tensors: Vec<Bound<'_, PyAny>>,
+        parallelisms: Option<Vec<Option<PyTensorParallelism>>>,
+        writer_partitions: Option<Vec<Option<(i32, i32, i32)>>>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        validate_batch_write_args(&keys, tensors.len(), &parallelisms, &writer_partitions)?;
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let par = parallelisms.as_ref().and_then(|v| v[i].clone());
+            let wp = writer_partitions.as_ref().and_then(|v| v[i]);
+            let status = self.upsert_tensor_with_parallelism(
+                &keys[i],
+                &tensors[i],
+                par,
+                wp,
+                tenant,
+                replica_count,
+            )?;
+            results.push(status);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
+
+    /// Batch put tensors from raw buffers with parallelism.
+    #[pyo3(signature = (
+        keys, buffer_ptrs, sizes, *,
+        parallelisms = None,
+        writer_partitions = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_put_tensor_with_parallelism_from(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        buffer_ptrs: Vec<usize>,
+        sizes: Vec<usize>,
+        parallelisms: Option<Vec<Option<PyTensorParallelism>>>,
+        writer_partitions: Option<Vec<Option<(i32, i32, i32)>>>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        validate_batch_from_args(&keys, &buffer_ptrs, &sizes, &parallelisms, &writer_partitions)?;
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let par = parallelisms.as_ref().and_then(|v| v[i].clone());
+            let wp = writer_partitions.as_ref().and_then(|v| v[i]);
+            let status = self.put_tensor_from_internal(
+                &keys[i],
+                buffer_ptrs[i],
+                sizes[i],
+                par,
+                wp,
+                tenant,
+                replica_count,
+                false,
+            )?;
+            results.push(status);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
+
+    /// Batch upsert tensors from raw buffers with parallelism.
+    #[pyo3(signature = (
+        keys, buffer_ptrs, sizes, *,
+        parallelisms = None,
+        writer_partitions = None,
+        tenant = None,
+        replica_count = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn batch_upsert_tensor_with_parallelism_from(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        buffer_ptrs: Vec<usize>,
+        sizes: Vec<usize>,
+        parallelisms: Option<Vec<Option<PyTensorParallelism>>>,
+        writer_partitions: Option<Vec<Option<(i32, i32, i32)>>>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        validate_batch_from_args(&keys, &buffer_ptrs, &sizes, &parallelisms, &writer_partitions)?;
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let par = parallelisms.as_ref().and_then(|v| v[i].clone());
+            let wp = writer_partitions.as_ref().and_then(|v| v[i]);
+            let status = self.put_tensor_from_internal(
+                &keys[i],
+                buffer_ptrs[i],
+                sizes[i],
+                par,
+                wp,
+                tenant,
+                replica_count,
+                true,
+            )?;
+            results.push(status);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
+
+    /// Batch get tensors with parallelism, returning raw bytes or tensor.
+    #[pyo3(signature = (keys, *, targets = None, tensors = None, tenant = None))]
+    fn batch_get_tensor_with_parallelism<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<String>,
+        targets: Option<Vec<Option<PyReadTarget>>>,
+        tensors: Option<Vec<Option<Bound<'py, PyAny>>>>,
+        tenant: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        if let Some(ref t) = targets {
+            if t.len() != keys.len() {
+                return Err(PyValueError::new_err(
+                    "targets must have the same length as keys",
+                ));
+            }
+        }
+        if let Some(ref t) = tensors {
+            if t.len() != keys.len() {
+                return Err(PyValueError::new_err(
+                    "tensors must have the same length as keys",
+                ));
+            }
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let target = targets.as_ref().and_then(|v| v[i].clone());
+            let tensor = tensors.as_ref().and_then(|v| v[i].as_ref().map(|t| t.clone()));
+            let result = self.get_tensor_with_parallelism(
+                py,
+                &keys[i],
+                target,
+                tensor.as_ref(),
+                tenant,
+            )?;
+            results.push(result);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
+
+    /// Batch get tensors into pre-registered buffers with parallelism.
+    ///
+    /// Builds scatter-gather plans for all keys, then issues a single
+    /// merged `get_into_ranges` call to minimize round trips.
+    #[pyo3(signature = (keys, buffer_ptrs, sizes, *, targets = None, tenant = None))]
+    fn batch_get_tensor_with_parallelism_into(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        buffer_ptrs: Vec<usize>,
+        sizes: Vec<usize>,
+        targets: Option<Vec<Option<PyReadTarget>>>,
+        tenant: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
+            return Err(PyValueError::new_err(
+                "keys, buffer_ptrs, and sizes must have the same length",
+            ));
+        }
+        if let Some(ref t) = targets {
+            if t.len() != keys.len() {
+                return Err(PyValueError::new_err(
+                    "targets must have the same length as keys",
+                ));
+            }
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let target = targets.as_ref().and_then(|v| v[i].clone());
+            let result = self.get_tensor_with_parallelism_into(
+                &keys[i],
+                buffer_ptrs[i],
+                sizes[i],
+                target,
+                tenant,
+            )?;
+            results.push(result);
+        }
+        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+    }
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
+
+// ─── Batch validation helpers ─────────────────────────────────────────────
+
+fn validate_batch_write_args(
+    keys: &[String],
+    tensor_count: usize,
+    parallelisms: &Option<Vec<Option<PyTensorParallelism>>>,
+    writer_partitions: &Option<Vec<Option<(i32, i32, i32)>>>,
+) -> PyResult<()> {
+    if keys.len() != tensor_count {
+        return Err(PyValueError::new_err(
+            "keys and tensors must have the same length",
+        ));
+    }
+    if parallelisms.is_some() && writer_partitions.is_some() {
+        return Err(PyValueError::new_err(
+            "parallelisms and writer_partitions cannot both be provided in the same batch",
+        ));
+    }
+    if let Some(pars) = parallelisms {
+        if pars.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "parallelisms must have the same length as keys",
+            ));
+        }
+    }
+    if let Some(wps) = writer_partitions {
+        if wps.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "writer_partitions must have the same length as keys",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_from_args(
+    keys: &[String],
+    buffer_ptrs: &[usize],
+    sizes: &[usize],
+    parallelisms: &Option<Vec<Option<PyTensorParallelism>>>,
+    writer_partitions: &Option<Vec<Option<(i32, i32, i32)>>>,
+) -> PyResult<()> {
+    if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
+        return Err(PyValueError::new_err(
+            "keys, buffer_ptrs, and sizes must have the same length",
+        ));
+    }
+    if parallelisms.is_some() && writer_partitions.is_some() {
+        return Err(PyValueError::new_err(
+            "parallelisms and writer_partitions cannot both be provided in the same batch",
+        ));
+    }
+    if let Some(pars) = parallelisms {
+        if pars.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "parallelisms must have the same length as keys",
+            ));
+        }
+    }
+    if let Some(wps) = writer_partitions {
+        if wps.len() != keys.len() {
+            return Err(PyValueError::new_err(
+                "writer_partitions must have the same length as keys",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Extract TensorInfo from a raw buffer containing `[TensorMetadata | data]`.
+fn extract_tensor_info_from_buffer(
+    buffer_ptr: usize,
+    size: usize,
+) -> PyResult<(TensorInfo, TensorMetadata)> {
+    if size < TensorMetadata::WIRE_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "buffer too small for tensor metadata: need at least {} bytes, got {size}",
+            TensorMetadata::WIRE_SIZE
+        )));
+    }
+    let _ = pointer_from_usize(buffer_ptr)?;
+    let data =
+        unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, TensorMetadata::WIRE_SIZE) };
+    let parsed = TensorMetadata::parse(data).ok_or_else(|| {
+        PyValueError::new_err("invalid tensor metadata in raw buffer")
+    })?;
+
+    let ndim = parsed.metadata.header.ndim as usize;
+    let shape = parsed.metadata.layout.local_shape.to_vec(ndim);
+    let dtype_i32 = parsed.metadata.header.dtype;
+    let dtype = TensorDtype::from_i32(dtype_i32).ok_or_else(|| {
+        PyValueError::new_err(format!("unsupported dtype in raw buffer: {dtype_i32}"))
+    })?;
+
+    let info = TensorInfo {
+        data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
+        data_bytes: parsed.data_bytes,
+        shape,
+        dtype,
+    };
+    Ok((info, parsed.metadata))
+}
 
 impl PyMooncakeDistributedStore {
     fn put_tensor_object(
@@ -540,6 +963,156 @@ impl PyMooncakeDistributedStore {
             false,
             false,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_tensor_from_internal(
+        &self,
+        key: &str,
+        buffer_ptr: usize,
+        size: usize,
+        parallelism: Option<PyTensorParallelism>,
+        writer_partition: Option<(i32, i32, i32)>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+        is_upsert: bool,
+    ) -> PyResult<i32> {
+        let (info, _original_metadata) = extract_tensor_info_from_buffer(buffer_ptr, size)?;
+        let par_spec = parallelism.as_ref().map(|p| p.to_spec()).transpose()?;
+        let wp_spec = writer_partition
+            .map(|(rank, sz, split_dim)| {
+                let spec = WriterPartitionSpec::new(rank, sz, split_dim);
+                spec.validate()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok::<_, PyErr>(spec)
+            })
+            .transpose()?;
+
+        let route = resolve_write_route(&par_spec, &wp_spec);
+
+        if is_upsert {
+            let remove_key = match (&par_spec, &wp_spec) {
+                (Some(spec), _) => {
+                    let par_manifest_key = get_parallelism_manifest_key(key);
+                    let _ = self.remove(&par_manifest_key, false, tenant);
+                    get_parallelism_key_name(key, spec)
+                }
+                (_, Some(wp)) => {
+                    let manifest_key = WriterShardManifest::manifest_key(key);
+                    let _ = self.remove(&manifest_key, false, tenant);
+                    get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim)
+                }
+                _ => key.to_string(),
+            };
+            let _ = self.remove(&remove_key, false, tenant);
+        }
+
+        match route {
+            WriteRoute::DirectFull => self.put_from(
+                key,
+                buffer_ptr,
+                size,
+                tenant,
+                replica_count,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            ),
+            WriteRoute::LegacySingleTp | WriteRoute::MultiAxisParallelism => {
+                let spec = par_spec
+                    .as_ref()
+                    .expect("parallelism routes must have par_spec");
+                let storage_key = get_parallelism_key_name(key, spec);
+                let global_shape = compute_global_shape(&info.shape, spec);
+                let metadata = TensorMetadata::build_shard(
+                    info.dtype as i32,
+                    &global_shape,
+                    &info.shape,
+                    &spec.canonicalize().axes,
+                    info.data_bytes as u64,
+                );
+                let status =
+                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                if status != 0 {
+                    return Ok(status);
+                }
+
+                let tp = spec.tp_axis();
+                if let Some(tp_axis) = tp {
+                    let manifest = WriterShardManifest::new(
+                        info.dtype as i32,
+                        global_shape.len() as i32,
+                        tp_axis.split_dim,
+                        tp_axis.size,
+                        &global_shape,
+                    );
+                    let manifest_key = get_parallelism_manifest_key(key);
+                    self.put(
+                        &manifest_key,
+                        manifest.as_bytes().to_vec(),
+                        tenant,
+                        replica_count,
+                        None,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                        false,
+                    )?;
+                }
+                Ok(status)
+            }
+            WriteRoute::WriterPartition => {
+                let wp = wp_spec.expect("WriterPartition route must have wp_spec");
+                let storage_key =
+                    get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
+
+                let mut global_shape = info.shape.clone();
+                let dim = wp.split_dim as usize;
+                if dim < global_shape.len() {
+                    global_shape[dim] = global_shape[dim] * wp.size as i64;
+                }
+                let metadata = TensorMetadata::build_shard(
+                    info.dtype as i32,
+                    &global_shape,
+                    &info.shape,
+                    &[],
+                    info.data_bytes as u64,
+                );
+                let status =
+                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                if status != 0 {
+                    return Ok(status);
+                }
+
+                let manifest = WriterShardManifest::new(
+                    info.dtype as i32,
+                    global_shape.len() as i32,
+                    wp.split_dim,
+                    wp.size,
+                    &global_shape,
+                );
+                let manifest_key = WriterShardManifest::manifest_key(key);
+                self.put(
+                    &manifest_key,
+                    manifest.as_bytes().to_vec(),
+                    tenant,
+                    replica_count,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+            }
+        }
     }
 
     fn get_raw_bytes(&self, key: &str, tenant: Option<&str>) -> PyResult<Vec<u8>> {
@@ -1148,6 +1721,7 @@ impl PyMooncakeDistributedStore {
         base_key: &str,
         tenant: Option<&str>,
     ) -> PyResult<Vec<ShardSource>> {
+        // 1. Try writer manifest (__writer_manifest)
         let manifest_key = WriterShardManifest::manifest_key(base_key);
         if let Ok(manifest_data) = self.get_raw_bytes(&manifest_key, tenant) {
             if let Some(manifest) = WriterShardManifest::parse(&manifest_data) {
@@ -1155,6 +1729,15 @@ impl PyMooncakeDistributedStore {
             }
         }
 
+        // 2. Try parallelism manifest (__parallelism_manifest)
+        let par_manifest_key = get_parallelism_manifest_key(base_key);
+        if let Ok(manifest_data) = self.get_raw_bytes(&par_manifest_key, tenant) {
+            if let Some(manifest) = WriterShardManifest::parse(&manifest_data) {
+                return self.sources_from_parallelism_manifest(base_key, &manifest, tenant);
+            }
+        }
+
+        // 3. Fallback: legacy _tp_N enumeration
         self.sources_from_legacy_tp(base_key, tenant)
     }
 
@@ -1168,12 +1751,56 @@ impl PyMooncakeDistributedStore {
         let mut sources = Vec::with_capacity(manifest.shard_count as usize);
 
         for rank in 0..manifest.shard_count {
-            let key = get_writer_partition_key_name(base_key, rank);
+            let key = get_writer_partition_key_name(
+                base_key,
+                rank,
+                manifest.shard_count,
+                manifest.split_dim,
+            );
             let raw = self.get_raw_bytes(&key, tenant)?;
 
             let parsed = TensorMetadata::parse(&raw).ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
                     "invalid tensor metadata for writer partition key={key}"
+                ))
+            })?;
+
+            sources.push(ShardSource {
+                storage_key: key,
+                data_bytes: parsed.data_bytes,
+                global_shape: global_shape.clone(),
+                split_dim: manifest.split_dim,
+                src_rank: rank as usize,
+                dtype: parsed.metadata.header.dtype,
+            });
+        }
+        Ok(sources)
+    }
+
+    fn sources_from_parallelism_manifest(
+        &self,
+        base_key: &str,
+        manifest: &WriterShardManifest,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<ShardSource>> {
+        let global_shape = manifest.global_shape.to_vec(manifest.ndim as usize);
+        let mut sources = Vec::with_capacity(manifest.shard_count as usize);
+
+        for rank in 0..manifest.shard_count {
+            let tp_spec = TensorParallelismSpec::new(vec![ParallelAxisSpec {
+                kind: ParallelAxisKind::TP,
+                rank,
+                size: manifest.shard_count,
+                split_dim: manifest.split_dim,
+                expert_id: 0,
+                stage_id: 0,
+            }]);
+            let key = get_parallelism_key_name(base_key, &tp_spec);
+            let raw = self.get_raw_bytes(&key, tenant)?;
+
+            let parsed = TensorMetadata::parse(&raw).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "invalid tensor metadata for parallelism shard key={key}"
                 ))
             })?;
 
