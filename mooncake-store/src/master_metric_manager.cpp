@@ -765,14 +765,14 @@ int64_t MasterMetricManager::get_allocated_file_size() {
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return std::numeric_limits<int64_t>::max();
     }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return 0.0;
     }
     double allocated = file_allocated_size_.value();
@@ -2166,9 +2166,7 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
-    int64_t file_display_capacity = dfs_capacity_unlimited_
-                                        ? std::numeric_limits<int64_t>::max()
-                                        : file_capacity;
+    int64_t file_display_capacity = get_total_file_capacity();
     ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
        << byte_size_to_string(nof_capacity);
     if (nof_capacity > 0) {
