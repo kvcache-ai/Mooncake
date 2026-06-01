@@ -15729,6 +15729,53 @@ fn batch_put_from_succeeds_when_authority_has_version_floor_but_no_route() {
     );
 }
 
+#[test]
+fn put_succeeds_when_authority_has_version_floor_but_no_route() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("put-floor-segment"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "put-floor-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("memory should register");
+    wait_for_membership_convergence(&[&store]);
+
+    let initial_data = b"put-floor-initial-data-padding";
+    let initial_route = store
+        .put("put-floor-key", initial_data)
+        .expect("initial put should succeed");
+    let initial_version = initial_route.version;
+
+    store
+        .remove("put-floor-key", false)
+        .expect("remove should succeed");
+    assert!(
+        !store
+            .is_exist("put-floor-key")
+            .expect("is_exist should succeed"),
+        "route should be gone after remove"
+    );
+
+    let new_data = b"put-floor-new-data-after-floor-";
+    let new_route = store
+        .put("put-floor-key", new_data)
+        .expect("put after remove should succeed via version_floor in CAS response");
+    assert!(
+        new_route.version > initial_version,
+        "new route version ({:?}) should exceed initial version ({:?}) due to floor",
+        new_route.version,
+        initial_version,
+    );
+}
+
 mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;

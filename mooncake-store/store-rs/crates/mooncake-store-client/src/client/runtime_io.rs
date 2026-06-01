@@ -512,7 +512,12 @@ impl StoreClient {
             cas_tracker.finish(&cas_result, 0);
             let mut cas = cas_result?;
             if !cas.applied && expected_version.is_none() && cas.current.is_none() {
-                let retry_version = next_route_version(None, &self.route_ops(), &scoped_key);
+                let retry_version = cas
+                    .version_floor
+                    .map(|floor| floor.next())
+                    .unwrap_or_else(|| {
+                        next_route_version(None, &self.route_ops(), &scoped_key)
+                    });
                 if retry_version > route.version {
                     route.version = retry_version;
                     let retry_started = Instant::now();
