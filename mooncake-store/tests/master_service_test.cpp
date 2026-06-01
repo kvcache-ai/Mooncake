@@ -4149,6 +4149,117 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
         << "Client with all empty te_endpoints should have empty IP vector";
 }
 
+TEST_F(MasterServiceTest, BatchQueryIpBracketedIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a bracketed IPv6 endpoint
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "[::1]:17813";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpLinkLocalIpv6WithScopeTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a link-local IPv6 address with scope ID
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "fe80::a236:bcff:fecb:a1be%eno2:15773";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("fe80::a236:bcff:fecb:a1be%eno2", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpIpv6NoPortTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with an IPv6 address without port
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "::1";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount segments with IPv4 and IPv6 endpoints for the same client
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    Segment segment1 = MakeSegment("segment1", buffer1, size);
+    segment1.te_endpoint = "192.168.1.1:12345";
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+
+    Segment segment2 = MakeSegment("segment2", buffer2, size);
+    segment2.te_endpoint = "[::1]:17813";
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(2u, ip_addresses.size());
+
+    std::unordered_set<std::string> ip_set(ip_addresses.begin(),
+                                           ip_addresses.end());
+    EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
+    EXPECT_NE(ip_set.find("::1"), ip_set.end());
+}
+
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
