@@ -889,7 +889,6 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
         let mut resolved = vec![false; keys.len()];
-        let mut retry = vec![false; keys.len()];
         self.contains_ranked_authorities(
             keys,
             &ranked_authorities,
@@ -897,27 +896,25 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             &mut resolved,
             RouteContainsProbe {
                 should_probe: None,
-                retry_on_error: Some(&mut retry),
+                retry_on_error: None,
             },
             "authority bounded route contains failed; trying mirrored authorities",
         )?;
         for rank in 1..self.route_topk {
-            if !retry.iter().any(|value| *value) {
+            if resolved.iter().all(|r| *r) {
                 break;
             }
-            let mut next_retry = vec![false; keys.len()];
             self.contains_ranked_authorities(
                 keys,
                 &ranked_authorities,
                 rank,
                 &mut resolved,
                 RouteContainsProbe {
-                    should_probe: Some(&retry),
-                    retry_on_error: Some(&mut next_retry),
+                    should_probe: None,
+                    retry_on_error: None,
                 },
                 "mirrored bounded route contains failed; trying other authorities",
             )?;
-            retry = next_retry;
         }
         Ok(resolved)
     }
