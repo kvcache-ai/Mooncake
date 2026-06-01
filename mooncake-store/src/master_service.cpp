@@ -6110,6 +6110,15 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     replicas.reserve(replicas_count);
 
     for (uint32_t i = 0; i < replicas_count; i++) {
+        // Defensive bound: the data_type skip above can consume a slot the
+        // size check counted on, so a crafted entry whose first post-count
+        // field looks like a data_type could otherwise read past the array.
+        // Mirrors the standby reader in catalog_backed_snapshot_provider.cpp.
+        if (index >= total_elements) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize ObjectMetadata truncated"));
+        }
         auto result = Serializer<Replica>::deserialize(
             array[index++], service_->segment_manager_.getView());
         if (!result) {
