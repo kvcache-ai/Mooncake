@@ -1177,14 +1177,10 @@ impl PyMooncakeDistributedStore {
                 ))
             })?;
 
-            let ndim = parsed.metadata.header.ndim as usize;
-            let local_shape = parsed.metadata.layout.local_shape.to_vec(ndim);
-
             sources.push(ShardSource {
                 storage_key: key,
                 data_bytes: parsed.data_bytes,
                 global_shape: global_shape.clone(),
-                local_shape,
                 split_dim: manifest.split_dim,
                 src_rank: rank as usize,
                 dtype: parsed.metadata.header.dtype,
@@ -1215,7 +1211,6 @@ impl PyMooncakeDistributedStore {
 
             let ndim = parsed.metadata.header.ndim as usize;
             let global_shape = parsed.metadata.layout.global_shape.to_vec(ndim);
-            let local_shape = parsed.metadata.layout.local_shape.to_vec(ndim);
             let split_dim = if parsed.metadata.layout.axis_count > 0 {
                 parsed.metadata.layout.axes[0].split_dim
             } else {
@@ -1226,7 +1221,6 @@ impl PyMooncakeDistributedStore {
                 storage_key: key,
                 data_bytes: parsed.data_bytes,
                 global_shape,
-                local_shape,
                 split_dim,
                 src_rank: rank as usize,
                 dtype: parsed.metadata.header.dtype,
@@ -1247,7 +1241,6 @@ struct ShardSource {
     storage_key: String,
     data_bytes: usize,
     global_shape: Vec<i64>,
-    local_shape: Vec<i64>,
     split_dim: i32,
     src_rank: usize,
     dtype: i32,
