@@ -868,7 +868,7 @@ class MooncakeDistributedStore:
         buffer_ptr: int,
         size: int,
         *,
-        target=None,
+        target: ReadTarget | None = None,
         tenant: str | None = None,
     ):
         """Read a parallelism-aware tensor into a pre-registered buffer.
@@ -939,8 +939,8 @@ class MooncakeDistributedStore:
         keys: list[str],
         tensors: list,
         *,
-        parallelisms: list | None = None,
-        writer_partitions: list | None = None,
+        parallelisms: list[TensorParallelism | None] | None = None,
+        writer_partitions: list[tuple[int, int, int] | None] | None = None,
         tenant: str | None = None,
         config: ReplicateConfig | None = None,
     ):
@@ -960,8 +960,8 @@ class MooncakeDistributedStore:
         keys: list[str],
         tensors: list,
         *,
-        parallelisms: list | None = None,
-        writer_partitions: list | None = None,
+        parallelisms: list[TensorParallelism | None] | None = None,
+        writer_partitions: list[tuple[int, int, int] | None] | None = None,
         tenant: str | None = None,
         config: ReplicateConfig | None = None,
     ):
@@ -982,8 +982,8 @@ class MooncakeDistributedStore:
         buffer_ptrs: list[int],
         sizes: list[int],
         *,
-        parallelisms: list | None = None,
-        writer_partitions: list | None = None,
+        parallelisms: list[TensorParallelism | None] | None = None,
+        writer_partitions: list[tuple[int, int, int] | None] | None = None,
         tenant: str | None = None,
         config: ReplicateConfig | None = None,
     ):
@@ -1005,8 +1005,8 @@ class MooncakeDistributedStore:
         buffer_ptrs: list[int],
         sizes: list[int],
         *,
-        parallelisms: list | None = None,
-        writer_partitions: list | None = None,
+        parallelisms: list[TensorParallelism | None] | None = None,
+        writer_partitions: list[tuple[int, int, int] | None] | None = None,
         tenant: str | None = None,
         config: ReplicateConfig | None = None,
     ):
@@ -1026,7 +1026,7 @@ class MooncakeDistributedStore:
         self,
         keys: list[str],
         *,
-        targets: list | None = None,
+        targets: list[ReadTarget | None] | None = None,
         tensors: list | None = None,
         tenant: str | None = None,
     ):
@@ -1051,7 +1051,7 @@ class MooncakeDistributedStore:
         buffer_ptrs: list[int],
         sizes: list[int],
         *,
-        targets: list | None = None,
+        targets: list[ReadTarget | None] | None = None,
         tenant: str | None = None,
     ):
         """Batch get tensors into pre-registered buffers with parallelism."""
