@@ -27,6 +27,7 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 #include "transport/device/ibgda/memheap.h"
@@ -44,19 +45,59 @@ static bool isIpv4Mapped(const struct in6_addr* a) {
             a->s6_addr32[2] == htonl(0x0000ffff));
 }
 
-// Find the best GID index: RoCE v2 + IPv4-mapped, or IB.
+// Check if a GID index has an associated network device (required for
+// RoCE ARP resolution).  Reads from sysfs:
+//   /sys/class/infiniband/<dev>/ports/<port>/gid_attrs/ndevs/<idx>
+static bool gidHasNetworkDevice(const std::string& dev_name, uint8_t port,
+                                int gid_index) {
+    std::string path = "/sys/class/infiniband/" + dev_name +
+                       "/ports/" + std::to_string(port) +
+                       "/gid_attrs/ndevs/" + std::to_string(gid_index);
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return false;
+    char buf[64] = {};
+    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+    fclose(f);
+    // Non-empty string (e.g. "eth0\n") means a network device is bound
+    return buf[0] != '\0' && buf[0] != '\n';
+}
+
+// Find the best GID index with the same priority as the Verbs path:
+//   1. RoCE v2 + IPv4-mapped + has network device  (best for RoCE)
+//   2. RoCE v2 + IPv4-mapped + no network device
+//   3. IB GID
+// Returns -1 if no suitable GID found.
 static int findBestGidIndex(ibv_context* ctx, uint8_t port,
                             const ibv_port_attr& port_attr) {
+    std::string dev_name = ibv_get_device_name(ctx->device);
+    int fallback_v4_no_netdev = -1;
+
     for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
         ibv_gid_entry entry;
         if (ibv_query_gid_ex(ctx, port, i, &entry, 0)) continue;
-        bool v4mapped = isIpv4Mapped(
-            reinterpret_cast<const struct in6_addr*>(entry.gid.raw));
-        if ((v4mapped && entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
-            entry.gid_type == IBV_GID_TYPE_IB) {
-            return i;
+
+        if (entry.gid_type == IBV_GID_TYPE_IB) {
+            // InfiniBand — use immediately (no network device needed)
+            if (fallback_v4_no_netdev < 0) return i;
+            continue;
+        }
+
+        if (entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+            bool v4mapped = isIpv4Mapped(
+                reinterpret_cast<const struct in6_addr*>(entry.gid.raw));
+            if (!v4mapped) continue;  // Skip link-local IPv6 GIDs
+
+            bool has_netdev = gidHasNetworkDevice(dev_name, port, i);
+            if (has_netdev) {
+                return i;  // Best: RoCEv2 + IPv4 + netdev
+            }
+            if (fallback_v4_no_netdev < 0) {
+                fallback_v4_no_netdev = i;
+            }
         }
     }
+
+    if (fallback_v4_no_netdev >= 0) return fallback_v4_no_netdev;
     return -1;
 }
 
@@ -193,15 +234,16 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                        << cudaGetErrorString(err);
             return -1;
         }
+
         ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
                                                IBV_ACCESS_LOCAL_WRITE);
         if (!ctrl_buf_umem_) {
-            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed. "
-                       << "GPU may not support GPUDirect RDMA.";
-            cudaFree(ctrl_buf_);
-            ctrl_buf_ = nullptr;
+            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
+                       << errno << ")";
             return -1;
         }
+        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
+
         ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
         if (!ctrl_buf_heap_) {
             LOG(ERROR) << "[EP IBGDA] memheap_create failed";
@@ -284,7 +326,13 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
             if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr,
                                                remote_qpns[i], IBV_MTU_4096)) {
-                LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i;
+                LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i
+                           << " (roce=" << is_roce
+                           << " gid_idx=" << gid_index_
+                           << " remote_qpn=" << remote_qpns[i]
+                           << " udp_sport=" << ah_attr.dlid
+                           << " hop_limit=" << (int)ah_attr.grh.hop_limit
+                           << ")";
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rtr2rts(qps_[i])) {
@@ -370,7 +418,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     std::vector<std::string> device_filter_;
 
     // Control buffer
-    void* ctrl_buf_ = nullptr;
+    void* ctrl_buf_ = nullptr;          // GPU VA
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 

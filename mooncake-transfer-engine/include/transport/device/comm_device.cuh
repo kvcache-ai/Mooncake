@@ -18,7 +18,7 @@ namespace device {
 
 struct CommCtx {
     P2PContext p2p;
-    IbgdaContext ibgda;  // empty struct on MUSA — zero overhead
+    IbgdaContext ibgda;
     int rank;
 };
 
@@ -35,11 +35,9 @@ make_comm_ctx(void* gdr_buffer, const int32_t* nvlink_available,
     ctx.p2p.peer_ptrs = ipc_peer_ptrs;
     ctx.p2p.local_base = gdr_buffer;
 
-#ifndef MOONCAKE_EP_USE_MUSA
     ctx.ibgda.qp_devctxs = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
     ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(raddrs);
     ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
-#endif
 
     return ctx;
 }
@@ -83,7 +81,6 @@ __device__ __forceinline__ void mc_rdma_put(
     const void* send_ptr,
     void* recv_ptr,  // local VA of the recv slot (for raddr computation)
     uint32_t nbytes, int lane_id) {
-#ifndef MOONCAKE_EP_USE_MUSA
     if (lane_id == 0) {
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
@@ -92,7 +89,6 @@ __device__ __forceinline__ void mc_rdma_put(
         mc_ibgda_put(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                      send_ptr, recv_raddr, nbytes);
     }
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +108,6 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
     if (mc_comm_p2p_available(ctx, dst_rank)) {
         mc_p2p_signal(ctx.p2p, dst_rank, sig_ptr, val);
     } else {
-#ifndef MOONCAKE_EP_USE_MUSA
         uint64_t recv_raddr =
             ctx.ibgda.raddrs[dst_rank] +
             (reinterpret_cast<const char*>(sig_ptr) -
@@ -122,7 +117,6 @@ __device__ __forceinline__ void mc_signal(const CommCtx& ctx, int dst_rank,
                           reinterpret_cast<const char*>(ctx.p2p.local_base));
         mc_ibgda_red_add(ctx.ibgda, channel, dst_rank, ctx.rank, qps_per_rank,
                          laddr, recv_raddr, val);
-#endif
     }
 }
 

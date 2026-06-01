@@ -100,17 +100,19 @@ class Buffer:
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device=_DEVICE)
+            # gloo all_gather requires CPU tensors on MUSA
+            _gather_dev = "cpu" if _USE_MUSA else _DEVICE
+            raddr = torch.tensor([raddr], dtype=torch.int64, device=_gather_dev)
             raddrs = [
-                torch.empty(1, dtype=torch.int64, device=_DEVICE)
+                torch.empty(1, dtype=torch.int64, device=_gather_dev)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(raddrs, raddr, self.group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device=_DEVICE)
+            rkey = torch.tensor([rkey], dtype=torch.int32, device=_gather_dev)
             rkeys = [
-                torch.empty(1, dtype=torch.int32, device=_DEVICE)
+                torch.empty(1, dtype=torch.int32, device=_gather_dev)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(rkeys, rkey, self.group)
@@ -121,52 +123,54 @@ class Buffer:
             if is_update:
                 self.runtime.update_local_qpns()
 
-            # Exchange per-rank QPN slices via all_to_all
+            # Exchange per-rank QPN slices via all_gather (gloo has no all_to_all)
             local_qpns = self.runtime.get_local_qpns()
-            local_qpns_split = list(
-                torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device=_DEVICE).view(
-                        -1, qps_per_rank
-                    )
-                )
+            local_qpns_flat = torch.tensor(
+                local_qpns, dtype=torch.int32, device=_gather_dev
             )
-            remote_qpns_flat = [
-                torch.empty(qps_per_rank, dtype=torch.int32, device=_DEVICE)
+            all_qpns_list = [
+                torch.empty_like(local_qpns_flat)
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_qpns_flat, local_qpns_split, self.group)
-            # remote_qpns[r] = list of QPNs for rank r
-            remote_qpns = [t.tolist() for t in remote_qpns_flat]
+            dist.all_gather(all_qpns_list, local_qpns_flat, self.group)
+            # all_qpns_list[r] = rank r's full QPN list
+            remote_qpns = []
+            for r in range(self.group_size):
+                qpns = all_qpns_list[r].tolist()
+                # Take the slice of rank r's QPs that target this rank
+                start = self.rank * qps_per_rank
+                remote_qpns.append(qpns[start:start + qps_per_rank])
 
-            # Exchange per-rank LID slices via all_to_all
+            # Exchange per-rank LID slices via all_gather (gloo has no all_to_all)
             local_lids = self.runtime.get_local_lids()
-            local_lids_split = list(
-                torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device=_DEVICE).view(
-                        -1, qps_per_rank
-                    )
-                )
+            local_lids_flat = torch.tensor(
+                local_lids, dtype=torch.int32, device=_gather_dev
             )
-            remote_lids_flat = [
-                torch.empty(qps_per_rank, dtype=torch.int32, device=_DEVICE)
+            all_lids_list = [
+                torch.empty_like(local_lids_flat)
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_lids_flat, local_lids_split, self.group)
-            remote_lids = [t.tolist() for t in remote_lids_flat]
+            dist.all_gather(all_lids_list, local_lids_flat, self.group)
+            remote_lids = []
+            for r in range(self.group_size):
+                lids = all_lids_list[r].tolist()
+                # Take the slice of rank r's LIDs that target this rank
+                start = self.rank * qps_per_rank
+                remote_lids.append(lids[start:start + qps_per_rank])
 
             # Exchange GIDs (needed for RoCE; harmless for IB)
             (subnet_prefix, interface_id) = self.runtime.get_gid()
-            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device=_DEVICE)
+            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device=_gather_dev)
             subnet_prefixes_list = [
-                torch.empty(1, dtype=torch.int64, device=_DEVICE)
+                torch.empty(1, dtype=torch.int64, device=_gather_dev)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
             subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
 
-            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device=_DEVICE)
+            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device=_gather_dev)
             interface_ids_list = [
-                torch.empty(1, dtype=torch.int64, device=_DEVICE)
+                torch.empty(1, dtype=torch.int64, device=_gather_dev)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(interface_ids_list, interface_id_t, self.group)
@@ -179,44 +183,53 @@ class Buffer:
                 subnet_prefixes, interface_ids, active_ranks_mask
             )
 
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers.
-            # IPC handles are just int32 data — exchange on CPU so gloo
-            # backend works on MUSA (gloo has no MUSA device support).
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cpu"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cpu")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
-            self.runtime.sync_nvlink_ipc_handles(remote_handles,
-                                                 active_ranks_mask)
-            # Verify that peer-mapped memory is actually writable.
-            # This catches cases where musaIpcOpenMemHandle succeeds
-            # but the mapped memory is not usable from the device.
-            peer_ok = self.runtime.verify_peer_access()
-            if not peer_ok:
+        # P2P/NVLink IPC handle exchange — skip entirely when disabled.
+        _disable_p2p = os.getenv("MOONCAKE_EP_DISABLE_P2P", "").upper() in {"1", "ON", "TRUE", "YES"}
+        if not _disable_p2p:
+            try:
+                local_handle_ints = self.runtime.get_ipc_handle()
+                # pybind11 converts std::vector<int32_t> to a list of integers.
+                # IPC handles are just int32 data — exchange on CPU so gloo
+                # backend works on MUSA (gloo has no MUSA device support).
+                local_handle_tensor = torch.tensor(
+                    local_handle_ints, dtype=torch.int32, device="cpu"
+                )
+                handles = [
+                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cpu")
+                    for _ in range(self.group_size)
+                ]
+                dist.all_gather(handles, local_handle_tensor, self.group)
+                remote_handles = [h.tolist() for h in handles]
+                from mooncake.ep import get_active_ranks
+                active_ranks_mask = get_active_ranks(self.backend).tolist()
+                self.runtime.sync_nvlink_ipc_handles(remote_handles,
+                                                     active_ranks_mask)
+                # Verify that peer-mapped memory is actually writable.
+                # This catches cases where musaIpcOpenMemHandle succeeds
+                # but the mapped memory is not usable from the device.
+                # Only verify if all peers have non-null IPC pointers; otherwise
+                # skip (the C++ verifyPeerAccess can SIGSEGV on partially-valid
+                # IPC mappings).
+                try:
+                    peer_ok = self.runtime.verify_peer_access()
+                except Exception:
+                    peer_ok = False
+                if not peer_ok:
+                    import warnings
+                    warnings.warn(
+                        f"[Rank {self.rank}] P2P peer access verification failed. "
+                        f"Will use fallback path.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            except Exception as e:
                 import warnings
+
                 warnings.warn(
-                    f"[Rank {self.rank}] P2P peer access verification failed. "
-                    f"Will use fallback path.",
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-        except Exception as e:
-            import warnings
-
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
         use_fast_path = False
         try:
@@ -888,17 +901,23 @@ class Buffer:
 
 # Monkey-patch get_active_ranks into the ep module so that
 # `from mooncake.ep import get_active_ranks` works even when the PG
-# module is not available (TE-only builds).  This avoids modifying ep.py.
+# module is not available (TE-only builds), or when using a non-mooncake
+# ProcessGroup (e.g. gloo) that the C++ get_active_ranks cannot cast.
+# This avoids modifying ep.py.
 try:
     from mooncake import ep as _ep_module
-    if not hasattr(_ep_module, "get_active_ranks"):
-        def _get_active_ranks_fallback(group):
-            size = dist.get_world_size(group)
-            if _USE_MUSA:
-                device = "musa:" + str(torch.musa.current_device())
-            else:
-                device = "cuda:" + str(torch.cuda.current_device())
-            return torch.ones(size, dtype=torch.int32, device=device)
-        _ep_module.get_active_ranks = _get_active_ranks_fallback
+    _original_get_active_ranks = getattr(_ep_module, "get_active_ranks", None)
+
+    def _get_active_ranks_safe(group):
+        # The C++ get_active_ranks segfaults on non-MooncakeBackend groups
+        # (e.g. gloo), so only call it if the group backend is "mooncake".
+        backend_name = getattr(group, "backend", "")
+        if backend_name == "mooncake" and _original_get_active_ranks is not None:
+            return _original_get_active_ranks(group)
+        # Fallback: all ranks active.
+        size = dist.get_world_size(group)
+        return torch.ones(size, dtype=torch.int32, device="cpu")
+
+    _ep_module.get_active_ranks = _get_active_ranks_safe
 except (ImportError, AttributeError):
     pass

@@ -443,9 +443,13 @@ void MooncakeEpBuffer::sync_ibgda_peers(
         }
     }
 
-    rdma_transport_->connectPeers(
+    int ret = rdma_transport_->connectPeers(
         rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
         flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
+    if (ret != 0) {
+        ibgda_disabled_ = true;
+        LOG(WARNING) << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
+    }
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {

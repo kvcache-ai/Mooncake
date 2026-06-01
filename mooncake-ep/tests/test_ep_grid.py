@@ -63,13 +63,13 @@ def run_test_iteration(
     num_tokens = int(max_tokens * scale)
 
     # Prepare test data
-    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=_DEVICE)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=_DEVICE)
     topk_idx = torch.topk(scores, top_k, dim=-1)[1]
     topk_weights = torch.softmax(
-        torch.rand(num_tokens, top_k, dtype=torch.float32), dim=-1
+        torch.rand(num_tokens, top_k, dtype=torch.float32, device=_DEVICE), dim=-1
     )
-    active_ranks = torch.ones((num_ranks,), dtype=torch.int32)
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32, device=_DEVICE)
 
     # Prepare expected result
     def get_mock_factor(expert_id):
@@ -96,11 +96,15 @@ def run_test_iteration(
     expected_out = x * sum_weights
     expected_out = expected_out.to(torch.bfloat16)
 
-    # Initialize the buffer.
+    # Initialize the buffer.  This triggers IBGDA initialization which
+    # must complete BEFORE torch.set_default_device("musa") on MUSA.
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         max_tokens, hidden, num_ranks, num_experts
     )
     buf = Buffer(group, num_ep_buffer_bytes)
+
+    # Safe to set default device now — IBGDA init is done.
+    torch.set_default_device(_DEVICE)
 
     if use_fallback:
         buf._use_fallback = True
@@ -126,7 +130,7 @@ def run_test_iteration(
         return_recv_hook=return_recv_hook,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -182,7 +186,7 @@ def run_test_iteration(
         out=out_tensor,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -204,7 +208,11 @@ def run_test_iteration(
 def worker(rank, world_size, config_dict):
     _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device(_DEVICE)
+    # NOTE: On MUSA, torch.set_default_device("musa") must be called
+    # AFTER IBGDA initialization (inside Buffer()).  Setting it before
+    # corrupts the MUSA runtime's float32 fill path, causing all
+    # subsequent torch.float32 zeros/ones operations to fail with
+    # "illegal memory access".  We set it after Buffer creation below.
 
     if _USE_MUSA or not _HAS_PG:
         backend = "gloo"
