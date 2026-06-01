@@ -230,7 +230,8 @@ Status Workers::cancel(RdmaSliceList& slice_list) {
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
-    std::string rpc_server_addr, target_seg_name, target_dev_name;
+    std::string rpc_server_addr, target_seg_name, target_dev_name,
+        target_nic_path_name;
     RouteHint hint;
     auto& segment_manager = transport_->metadata_->segmentManager();
     auto target_id = path.remote_segment_id;
@@ -248,6 +249,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                 rpc_server_addr = segment->rpc_server_addr;
             }
             target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
             target_dev_name = hint.topo->getNicName(device_id);
             if (target_seg_name.empty() || target_dev_name.empty()) {
                 return Status::NeedsRefreshCache(
@@ -268,7 +270,7 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
                          // connection unavailable
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
+    auto peer_name = MakeNicPath(target_nic_path_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
