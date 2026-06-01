@@ -477,7 +477,14 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
     ) -> PyResult<i32> {
         self.put_tensor_from_internal(
-            key, buffer_ptr, size, parallelism, writer_partition, tenant, replica_count, false,
+            key,
+            buffer_ptr,
+            size,
+            parallelism,
+            writer_partition,
+            tenant,
+            replica_count,
+            false,
         )
     }
 
@@ -501,7 +508,14 @@ impl PyMooncakeDistributedStore {
         replica_count: Option<usize>,
     ) -> PyResult<i32> {
         self.put_tensor_from_internal(
-            key, buffer_ptr, size, parallelism, writer_partition, tenant, replica_count, true,
+            key,
+            buffer_ptr,
+            size,
+            parallelism,
+            writer_partition,
+            tenant,
+            replica_count,
+            true,
         )
     }
 
@@ -678,7 +692,13 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
         replica_count: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
-        validate_batch_from_args(&keys, &buffer_ptrs, &sizes, &parallelisms, &writer_partitions)?;
+        validate_batch_from_args(
+            &keys,
+            &buffer_ptrs,
+            &sizes,
+            &parallelisms,
+            &writer_partitions,
+        )?;
         let mut results = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
             let par = parallelisms.as_ref().and_then(|v| v[i].clone());
@@ -718,7 +738,13 @@ impl PyMooncakeDistributedStore {
         tenant: Option<&str>,
         replica_count: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
-        validate_batch_from_args(&keys, &buffer_ptrs, &sizes, &parallelisms, &writer_partitions)?;
+        validate_batch_from_args(
+            &keys,
+            &buffer_ptrs,
+            &sizes,
+            &parallelisms,
+            &writer_partitions,
+        )?;
         let mut results = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
             let par = parallelisms.as_ref().and_then(|v| v[i].clone());
@@ -765,14 +791,11 @@ impl PyMooncakeDistributedStore {
         let mut results = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
             let target = targets.as_ref().and_then(|v| v[i].clone());
-            let tensor = tensors.as_ref().and_then(|v| v[i].as_ref().map(|t| t.clone()));
-            let result = self.get_tensor_with_parallelism(
-                py,
-                &keys[i],
-                target,
-                tensor.as_ref(),
-                tenant,
-            )?;
+            let tensor = tensors
+                .as_ref()
+                .and_then(|v| v[i].as_ref().map(|t| t.clone()));
+            let result =
+                self.get_tensor_with_parallelism(py, &keys[i], target, tensor.as_ref(), tenant)?;
             results.push(result);
         }
         Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
@@ -905,9 +928,8 @@ fn extract_tensor_info_from_buffer(
     let _ = pointer_from_usize(buffer_ptr)?;
     let data =
         unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, TensorMetadata::WIRE_SIZE) };
-    let parsed = TensorMetadata::parse(data).ok_or_else(|| {
-        PyValueError::new_err("invalid tensor metadata in raw buffer")
-    })?;
+    let parsed = TensorMetadata::parse(data)
+        .ok_or_else(|| PyValueError::new_err("invalid tensor metadata in raw buffer"))?;
 
     let ndim = parsed.metadata.header.ndim as usize;
     let shape = parsed.metadata.layout.local_shape.to_vec(ndim);
