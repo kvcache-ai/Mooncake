@@ -86,7 +86,8 @@ class Client {
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
-        std::map<std::string, std::string> labels = {});
+        std::map<std::string, std::string> labels = {},
+        const std::string& tenant_id = "default");
 
     /**
      * @brief Retrieves data for a given key
@@ -627,7 +628,8 @@ class Client {
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring, const std::string& protocol,
-           const std::map<std::string, std::string>& labels = {});
+           const std::map<std::string, std::string>& labels = {},
+           const std::string& tenant_id = "default");
 
    private:
     /**

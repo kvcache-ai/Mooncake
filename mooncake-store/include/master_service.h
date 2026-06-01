@@ -318,6 +318,9 @@ class MasterService {
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const UUID& client_id, const std::string& key,
+                   const std::string& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -327,6 +330,10 @@ class MasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revoke a batch of put operations
@@ -335,6 +342,10 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -359,12 +370,18 @@ class MasterService {
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
                    ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+    auto UpsertEnd(const UUID& client_id, const std::string& key,
+                   const std::string& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
                       ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+    auto UpsertRevoke(const UUID& client_id, const std::string& key,
+                      const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -375,18 +392,30 @@ class MasterService {
                      const std::vector<std::string>& keys,
                      const std::vector<uint64_t>& slice_lengths,
                      const ReplicateConfig& config);
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const UUID& client_id,
+                     const std::vector<std::string>& keys,
+                     const std::string& tenant_id,
+                     const std::vector<uint64_t>& slice_lengths,
+                     const ReplicateConfig& config);
 
     /**
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id);
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::string& tenant_id);
 
     /**
      * @brief Evict a disk replica for a key (triggered by client-side disk
@@ -488,6 +517,7 @@ class MasterService {
      * @return return the number of objects removed
      */
     long RemoveAll(bool force = false);
+    long RemoveAll(const std::string& tenant_id, bool force = false);
 
     /**
      * @brief Batch remove objects and their replicas
@@ -496,6 +526,9 @@ class MasterService {
      * @return Vector of expected results for each key.
      */
     auto BatchRemove(const std::vector<std::string>& keys, bool force = false)
+        -> std::vector<tl::expected<void, ErrorCode>>;
+    auto BatchRemove(const std::vector<std::string>& keys,
+                     const std::string& tenant_id, bool force = false)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**

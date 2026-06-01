@@ -1404,6 +1404,101 @@ TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 }
 
+TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::vector<std::string> keys = {"tenant_batch_upsert_key_a",
+                                           "tenant_batch_upsert_key_b"};
+    const std::vector<uint64_t> sizes = {1024, 2048};
+    const std::string tenant_a = "tenant_batch_upsert_a";
+    const std::string tenant_b = "tenant_batch_upsert_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto tenant_a_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_a, sizes, config);
+    ASSERT_EQ(tenant_a_results.size(), keys.size());
+    for (const auto& result : tenant_a_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_a_end = svc->BatchUpsertEnd(client_id, keys, tenant_a);
+    ASSERT_EQ(tenant_a_end.size(), keys.size());
+    for (const auto& result : tenant_a_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    auto tenant_b_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_b, sizes, config);
+    ASSERT_EQ(tenant_b_results.size(), keys.size());
+    for (const auto& result : tenant_b_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_b_end = svc->BatchUpsertEnd(client_id, keys, tenant_b);
+    ASSERT_EQ(tenant_b_end.size(), keys.size());
+    for (const auto& result : tenant_b_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : keys) {
+        EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_a).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_b).has_value());
+    }
+
+    const std::string revoke_key = "tenant_batch_upsert_revoke_key";
+    auto revoke_start =
+        svc->UpsertStart(client_id, revoke_key, tenant_a, 1024, config);
+    ASSERT_TRUE(revoke_start.has_value());
+    ASSERT_TRUE(
+        svc->UpsertRevoke(client_id, revoke_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_FALSE(svc->GetReplicaList(revoke_key, tenant_a).has_value());
+}
+
+TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string shared_key = "tenant_batch_remove_shared_key";
+    const std::string tenant_a = "tenant_batch_remove_a";
+    const std::string tenant_b = "tenant_batch_remove_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_a, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_b, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_b, ReplicaType::MEMORY)
+            .has_value());
+
+    auto remove_a = svc->BatchRemove({shared_key}, tenant_a, /*force=*/true);
+    ASSERT_EQ(remove_a.size(), 1u);
+    ASSERT_TRUE(remove_a[0].has_value());
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_a).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(tenant_b, /*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key).has_value());
+}
+
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     // For backward compatibility, test the deprecated single preferred_segment
     std::unique_ptr<MasterService> service_(new MasterService());
