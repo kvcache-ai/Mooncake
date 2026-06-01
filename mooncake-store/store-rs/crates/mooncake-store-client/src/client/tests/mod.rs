@@ -15776,6 +15776,213 @@ fn put_succeeds_when_authority_has_version_floor_but_no_route() {
     );
 }
 
+#[test]
+fn batch_put_from_version_floor_works_with_remote_storage_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("floor-remote-store-segment"));
+    let writer_transport = Arc::new(store_transport.peer("floor-remote-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "floor-remote-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "floor-remote-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store, &writer]);
+
+    let source = b"floor-remote-initial-data-pad!!";
+    writer
+        .register_buffer(source.as_ptr() as *mut c_void, source.len())
+        .expect("source buffer should register");
+
+    let initial_routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "floor-remote-key",
+            source.as_ptr().cast(),
+            source.len(),
+        )])
+        .expect("initial put should succeed");
+    assert_eq!(initial_routes.len(), 1);
+    let initial_version = initial_routes[0].version;
+    assert_eq!(
+        initial_routes[0].replicas[0].owner,
+        *store.runtime_id(),
+        "initial route should point to the remote storage store"
+    );
+
+    writer
+        .remove("floor-remote-key", false)
+        .expect("remove should succeed");
+
+    let new_source = b"floor-remote-new-data-after-fl!";
+    writer
+        .register_buffer(new_source.as_ptr() as *mut c_void, new_source.len())
+        .expect("new source buffer should register");
+
+    let new_routes = writer
+        .batch_put_from(&[PutFromRequest::new(
+            "floor-remote-key",
+            new_source.as_ptr().cast(),
+            new_source.len(),
+        )])
+        .expect("put after remove should succeed via version_floor in CAS response");
+    assert_eq!(new_routes.len(), 1);
+    assert!(
+        new_routes[0].version > initial_version,
+        "new route version ({:?}) should exceed initial version ({:?}) due to floor",
+        new_routes[0].version,
+        initial_version,
+    );
+}
+
+#[test]
+fn put_version_floor_works_with_remote_storage_authority() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new("put-floor-remote-store-seg"));
+    let writer_transport = Arc::new(store_transport.peer("put-floor-remote-writer-seg"));
+
+    let store = StoreClientBuilder::new(metadata.clone(), "put-floor-remote-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "put-floor-remote-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&store, &writer]);
+
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(store.runtime_id().storage_key());
+    let initial_data = b"put-floor-remote-initial-data!";
+    let initial_route = writer
+        .put_with_policy("put-floor-remote-key", initial_data, &policy)
+        .expect("initial put should succeed");
+    let initial_version = initial_route.version;
+
+    writer
+        .remove("put-floor-remote-key", false)
+        .expect("remove should succeed");
+
+    let new_data = b"put-floor-remote-new-data-pad!";
+    let new_route = writer
+        .put_with_policy("put-floor-remote-key", new_data, &policy)
+        .expect("put after remove should succeed via version_floor in CAS response");
+    assert!(
+        new_route.version > initial_version,
+        "new route version ({:?}) should exceed initial version ({:?}) due to floor",
+        new_route.version,
+        initial_version,
+    );
+}
+
+#[test]
+fn batch_is_exist_returns_false_when_readable_filter_excludes_all_replica_owners() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let dead_transport = Arc::new(TestTransport::new("is-exist-filter-dead-segment"));
+    let reader_transport = Arc::new(dead_transport.peer("is-exist-filter-reader-seg"));
+
+    let dead_store = StoreClientBuilder::new(metadata.clone(), "is-exist-filter-dead")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(dead_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("dead store build should succeed");
+    let reader = StoreClientBuilder::new(metadata.clone(), "is-exist-filter-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(reader_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    dead_store
+        .register_local_memory()
+        .expect("dead store memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&dead_store, &reader]);
+
+    let data = b"is-exist-filter-test-data-pad!";
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(dead_store.runtime_id().storage_key());
+    dead_store
+        .put_with_policy("is-exist-filter-key", data, &policy)
+        .expect("initial put should succeed");
+
+    assert!(
+        reader
+            .is_exist("is-exist-filter-key")
+            .expect("is_exist should succeed"),
+        "route should be visible before readable filter activation"
+    );
+
+    let namespace = metadata.route_namespace();
+    mooncake_store_route::update_readable_filter(
+        &namespace,
+        Some(BTreeSet::from([reader.runtime_id().clone()])),
+    );
+
+    assert!(
+        !reader
+            .is_exist("is-exist-filter-key")
+            .expect("is_exist should succeed"),
+        "route should be invisible when readable filter excludes all replica owners"
+    );
+
+    mooncake_store_route::update_readable_filter(&namespace, None);
+
+    assert!(
+        reader
+            .is_exist("is-exist-filter-key")
+            .expect("is_exist should succeed"),
+        "route should be visible again after readable filter deactivation"
+    );
+}
+
 mod adversarial;
 mod fault_injection_prop;
 mod lifecycle_tests;

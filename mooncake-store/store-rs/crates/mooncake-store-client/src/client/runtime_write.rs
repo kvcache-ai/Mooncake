@@ -1549,7 +1549,13 @@ impl StoreClient {
                     );
                     match (
                         conflict_policy,
-                        cas.current.filter(|route| route.state == RouteState::Active),
+                        cas.current.filter(|route| {
+                            route.state == RouteState::Active
+                                && mooncake_store_route::route_has_readable_replicas(
+                                    &route_namespace,
+                                    route,
+                                )
+                        }),
                     ) {
                         (
                             BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
