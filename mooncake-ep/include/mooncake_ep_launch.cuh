@@ -3,6 +3,14 @@
 #include <mooncake_ep_configs.cuh>
 
 #ifndef SETUP_LAUNCH_CONFIG
+#ifdef MOONCAKE_EP_USE_MUSA
+// MUSA does not support cooperative kernel launches.
+// Use a plain launch config without the cooperative attribute.
+#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
+    dim3 _grid(num_sms);                                  \
+    dim3 _block(num_threads);                              \
+    cudaStream_t _stream = stream
+#else
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
     cudaLaunchConfig_t cfg = {                            \
         (num_sms), (num_threads), 0, stream, nullptr, 0}; \
@@ -12,10 +20,17 @@
     cfg.attrs = attr;                                     \
     cfg.numAttrs = 1
 #endif
+#endif
 
 #ifndef LAUNCH_KERNEL
+#ifdef MOONCAKE_EP_USE_MUSA
+#define LAUNCH_KERNEL(config, kernel, ...) \
+    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__); \
+    { auto _err = musaGetLastError(); if (_err != musaSuccess) { fprintf(stderr, "[EP] kernel launch failed: %s\n", musaGetErrorString(_err)); } }
+#else
 #define LAUNCH_KERNEL(config, kernel, ...) \
     CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
+#endif
 #endif
 
 #define SWITCH_RANKS(case_macro)                           \

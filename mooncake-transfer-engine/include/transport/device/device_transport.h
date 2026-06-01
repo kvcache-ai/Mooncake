@@ -77,6 +77,11 @@ class P2pTransport {
 
     // True if all active ranks have P2P access (fast-path condition).
     virtual bool allPeersAccessible() const = 0;
+
+    // Verify that peer-mapped memory is writable (via memcpy).
+    // Returns true if a small test write to each peer's mapped buffer
+    // succeeds.  On failure, sets all_peers_accessible to false.
+    virtual bool verifyPeerAccess() = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -107,11 +107,17 @@ class P2pDeviceTransportImpl : public P2pTransport {
             int dst_device = dst % device_count;
             int can_access = 0;
             cudaDeviceCanAccessPeer(&can_access, device_id, dst_device);
+            LOG(INFO) << "[EP P2P] rank " << rank << " (device " << device_id
+                      << ") -> rank " << dst << " (device " << dst_device
+                      << "): canAccessPeer=" << can_access;
             if (!can_access) continue;
 
             cudaError_t err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (err != cudaSuccess &&
                 err != cudaErrorPeerAccessAlreadyEnabled) {
+                LOG(WARNING) << "[EP P2P] rank " << rank
+                             << " failed to enable peer access to device "
+                             << dst_device << ": " << cudaGetErrorString(err);
                 continue;
             }
             if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
@@ -137,6 +143,9 @@ class P2pDeviceTransportImpl : public P2pTransport {
                              << ": " << cudaGetErrorString(err);
                 continue;
             }
+            LOG(INFO) << "[EP P2P] rank " << rank
+                      << " opened IPC handle for rank " << dst
+                      << ": peer_ptr=" << peer_ptr;
             available[dst] = 1;
             peer_ptrs_host_[dst] = peer_ptr;
         }
@@ -166,6 +175,77 @@ class P2pDeviceTransportImpl : public P2pTransport {
     int32_t* availableTablePtr() override { return available_table_; }
     void** peerPtrsTablePtr() override { return peer_ptrs_dev_; }
     bool allPeersAccessible() const override { return all_peers_accessible_; }
+
+    bool verifyPeerAccess() override {
+        if (!all_peers_accessible_) return false;
+
+        int device_id = 0;
+        cudaGetDevice(&device_id);
+
+        bool all_ok = true;
+        for (int i = 0; i < num_ranks_; ++i) {
+            if (i == device_id) continue;
+            if (!peer_ptrs_host_[i] || peer_ptrs_host_[i] == local_ptr_) continue;
+
+            // Test: write a pattern to the peer buffer via cudaMemcpy, then
+            // read it back.  This verifies the IPC mapping is writable.
+            constexpr int kTestBytes = 256;
+            std::vector<uint8_t> pattern(kTestBytes);
+            for (int j = 0; j < kTestBytes; ++j) pattern[j] = (uint8_t)(j ^ 0xA5);
+
+            cudaError_t err = cudaMemcpy(peer_ptrs_host_[i], pattern.data(),
+                                         kTestBytes, cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "[EP P2P] verifyPeerAccess: rank " << device_id
+                             << " cannot write to peer " << i
+                             << " mapped buffer: " << cudaGetErrorString(err);
+                all_ok = false;
+                continue;
+            }
+
+            // Read back and verify
+            std::vector<uint8_t> readback(kTestBytes, 0);
+            err = cudaMemcpy(readback.data(), peer_ptrs_host_[i],
+                             kTestBytes, cudaMemcpyDeviceToHost);
+            if (err != cudaSuccess) {
+                LOG(WARNING) << "[EP P2P] verifyPeerAccess: rank " << device_id
+                             << " cannot read back from peer " << i
+                             << " mapped buffer: " << cudaGetErrorString(err);
+                all_ok = false;
+                continue;
+            }
+
+            bool match = (memcmp(readback.data(), pattern.data(), kTestBytes) == 0);
+            if (!match) {
+                LOG(WARNING) << "[EP P2P] verifyPeerAccess: rank " << device_id
+                             << " readback mismatch from peer " << i;
+                all_ok = false;
+            } else {
+                LOG(INFO) << "[EP P2P] verifyPeerAccess: rank " << device_id
+                          << " peer " << i << " OK (memcpy write/read)";
+            }
+        }
+
+        if (!all_ok) {
+            all_peers_accessible_ = false;
+            // Update device table to reflect failure
+            std::vector<int32_t> avail_h(num_ranks_, 0);
+            cudaMemcpy(avail_h.data(), available_table_,
+                       num_ranks_ * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < num_ranks_; ++i) {
+                if (i == device_id) continue;
+                if (!peer_ptrs_host_[i] || peer_ptrs_host_[i] == local_ptr_) continue;
+                // Leave self as available; only clear failed peers
+            }
+            // Re-upload with all peers marked unavailable except self
+            std::vector<int32_t> cleared(num_ranks_, 0);
+            cleared[device_id] = 1;
+            cudaMemcpy(available_table_, cleared.data(),
+                       num_ranks_ * sizeof(int32_t), cudaMemcpyHostToDevice);
+        }
+
+        return all_ok;
+    }
 
    private:
     int num_ranks_;

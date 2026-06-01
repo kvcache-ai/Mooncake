@@ -197,6 +197,18 @@ class Buffer:
             active_ranks_mask = get_active_ranks(self.backend).tolist()
             self.runtime.sync_nvlink_ipc_handles(remote_handles,
                                                  active_ranks_mask)
+            # Verify that peer-mapped memory is actually writable.
+            # This catches cases where musaIpcOpenMemHandle succeeds
+            # but the mapped memory is not usable from the device.
+            peer_ok = self.runtime.verify_peer_access()
+            if not peer_ok:
+                import warnings
+                warnings.warn(
+                    f"[Rank {self.rank}] P2P peer access verification failed. "
+                    f"Will use fallback path.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         except Exception as e:
             import warnings
 
@@ -251,6 +263,18 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        # MUSA does not support cooperative kernel launches, so mc_grid_sync()
+        # is a no-op.  When both SEND and RECV run in one kernel, the RECV
+        # phase can start before all SMs finish the SEND phase, causing illegal
+        # memory access.  Force split-kernel mode on MUSA.
+        # Note: return_recv_hook and async_finish are mutually exclusive
+        # (C++ assertion), so also force async_finish=False.
+        # Additionally, P2P writes via MTLink may not be visible to peer
+        # devices without an explicit host-side barrier between SEND and RECV.
+        if _USE_MUSA and not return_recv_hook:
+            return_recv_hook = True
+            async_finish = False
+
         if self._use_fallback:
             from mooncake.ep import get_active_ranks
 
@@ -316,7 +340,7 @@ class Buffer:
             packed_recv_count,
             handle,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            self._wrap_hook_musa(hook) if (_USE_MUSA and hook) else hook,
         )
 
     # noinspection PyTypeChecker
@@ -333,6 +357,11 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        # Same MUSA split-kernel fix as dispatch()
+        if _USE_MUSA and not return_recv_hook:
+            return_recv_hook = True
+            async_finish = False
+
         (
             src_info,
             layout_range,
@@ -387,8 +416,27 @@ class Buffer:
         return (
             combined_x,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            self._wrap_hook_musa(hook) if (_USE_MUSA and hook) else hook,
         )
+
+    def _wrap_hook_musa(self, hook):
+        """On MUSA, wrap the RECV hook to add a host-side barrier + device sync.
+
+        This ensures all ranks' SEND kernels are complete and P2P writes are
+        visible before any rank starts its RECV kernel.  Without this, MTLink
+        P2P writes may not be visible to peer devices because MUSA has no
+        cooperative launch / grid sync.
+        """
+        import torch_musa
+
+        def wrapped():
+            # Synchronize the device to ensure SEND kernel is complete
+            torch_musa.synchronize()
+            # Barrier so all ranks finish SEND before any starts RECV
+            dist.barrier(self.group)
+            hook()
+
+        return wrapped
 
     def get_next_combine_buffer(self, handle: object):
         (

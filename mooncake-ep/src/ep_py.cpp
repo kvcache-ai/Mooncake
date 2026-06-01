@@ -48,6 +48,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_ipc_handle", &MooncakeEpBuffer::get_ipc_handle)
         .def("sync_nvlink_ipc_handles",
              &MooncakeEpBuffer::sync_nvlink_ipc_handles)
+        .def("verify_peer_access", &MooncakeEpBuffer::verify_peer_access)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",

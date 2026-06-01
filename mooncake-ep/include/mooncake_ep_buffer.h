@@ -193,6 +193,11 @@ struct MooncakeEpBuffer {
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
         const std::vector<int>& active_ranks_mask);
+
+    // Verify P2P peer access works (host-side memcpy test).
+    bool verify_peer_access() {
+        return p2p_transport_ && p2p_transport_->verifyPeerAccess();
+    }
 };
 
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,

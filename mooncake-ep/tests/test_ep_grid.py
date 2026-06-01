@@ -314,6 +314,15 @@ def generate_tests():
         if _USE_MUSA and raw_dict["fail_rank"] != -1:
             continue
 
+        # MUSA does not support FP8 in the kernel
+        if _USE_MUSA and raw_dict["use_fp8"]:
+            continue
+
+        # MUSA: cooperative launch not supported, so return_recv_hook is forced
+        # True; async_finish + return_recv_hook is invalid, skip async_finish
+        if _USE_MUSA and raw_dict["async_finish"]:
+            continue
+
         # Flatten
         config_dict = {}
         for k, v in raw_dict.items():
