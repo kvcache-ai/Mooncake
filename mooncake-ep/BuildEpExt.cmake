@@ -11,6 +11,11 @@
 #   EP_USE_TENT         - whether to compile the EP extension with TENT bridge
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   TENT_SHARED_SO_PATH - absolute path to libtent_shared.so
+#   TENT_LIB_DIR        - directory containing libtent_shared.so
+#   ASIO_LIB_DIR        - directory containing libasio.so
+#   YLT_INCLUDE_DIRS    - pipe-separated yalantinglibs include directories
+#   BUILD_DIR           - top-level CMake binary directory
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -36,6 +41,21 @@ set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 set(ENV{MOONCAKE_EP_USE_TENT} "${EP_USE_TENT}")
+if(TENT_SHARED_SO_PATH)
+  set(ENV{MOONCAKE_TENT_SHARED_SO_PATH} "${TENT_SHARED_SO_PATH}")
+endif()
+if(TENT_LIB_DIR)
+  set(ENV{MOONCAKE_TENT_LIB_DIR} "${TENT_LIB_DIR}")
+endif()
+if(ASIO_LIB_DIR)
+  set(ENV{MOONCAKE_ASIO_LIB_DIR} "${ASIO_LIB_DIR}")
+endif()
+if(YLT_INCLUDE_DIRS)
+  set(ENV{MOONCAKE_YLT_INCLUDE_DIRS} "${YLT_INCLUDE_DIRS}")
+endif()
+if(BUILD_DIR)
+  set(ENV{MOONCAKE_BUILD_DIR} "${BUILD_DIR}")
+endif()
 
 # MUSA support: pass MOONCAKE_EP_USE_MUSA to setup.py
 if(EP_USE_MUSA)

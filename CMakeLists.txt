@@ -133,6 +133,14 @@ if (WITH_EP)
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
+    set(_ylt_include_dirs "")
+    if(TARGET yalantinglibs::yalantinglibs)
+      get_target_property(_ylt_include_dirs yalantinglibs::yalantinglibs INTERFACE_INCLUDE_DIRECTORIES)
+      if(NOT _ylt_include_dirs)
+        set(_ylt_include_dirs "")
+      endif()
+    endif()
+    string(REPLACE ";" "|" _ylt_include_dirs_pipe "${_ylt_include_dirs}")
 
     if(USE_MUSA)
       # MUSA: no engine.so dependency, build EP standalone
@@ -144,8 +152,14 @@ if (WITH_EP)
           "-DEP_USE_TENT=${USE_TENT}"
           "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
           "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          "-DTENT_SHARED_SO_PATH=$<TARGET_FILE:tent_shared>"
+          "-DTENT_LIB_DIR=$<TARGET_FILE_DIR:tent_shared>"
+          "-DASIO_LIB_DIR=$<TARGET_FILE_DIR:asio_shared>"
+          "-DYLT_INCLUDE_DIRS=${_ylt_include_dirs_pipe}"
+          "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
         COMMENT "Building Mooncake EP Python extension (MUSA)"
+        DEPENDS tent_shared asio_shared
         VERBATIM
       )
     else()
@@ -160,9 +174,14 @@ if (WITH_EP)
           "-DEP_USE_TENT=${USE_TENT}"
           "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
           "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+          "-DTENT_SHARED_SO_PATH=$<TARGET_FILE:tent_shared>"
+          "-DTENT_LIB_DIR=$<TARGET_FILE_DIR:tent_shared>"
+          "-DASIO_LIB_DIR=$<TARGET_FILE_DIR:asio_shared>"
+          "-DYLT_INCLUDE_DIRS=${_ylt_include_dirs_pipe}"
+          "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
         COMMENT "Building Mooncake EP Python extension(s)"
-        DEPENDS engine
+        DEPENDS engine tent_shared asio_shared
         VERBATIM
       )
     endif()
@@ -176,9 +195,14 @@ if (WITH_EP)
           "-DEP_USE_TENT=${USE_TENT}"
           "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
           "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
+          "-DTENT_SHARED_SO_PATH=$<TARGET_FILE:tent_shared>"
+          "-DTENT_LIB_DIR=$<TARGET_FILE_DIR:tent_shared>"
+          "-DASIO_LIB_DIR=$<TARGET_FILE_DIR:asio_shared>"
+          "-DYLT_INCLUDE_DIRS=${_ylt_include_dirs_pipe}"
+          "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
         COMMENT "Building Mooncake PG Python extension (MUSA)"
-        DEPENDS mooncake_ep_ext
+        DEPENDS mooncake_ep_ext tent_shared asio_shared
         VERBATIM
       )
     else()
@@ -193,9 +217,17 @@ if (WITH_EP)
           "-DEP_USE_TENT=${USE_TENT}"
           "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
           "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+          "-DTENT_SHARED_SO_PATH=$<TARGET_FILE:tent_shared>"
+          "-DTENT_LIB_DIR=$<TARGET_FILE_DIR:tent_shared>"
+          "-DASIO_LIB_DIR=$<TARGET_FILE_DIR:asio_shared>"
+          "-DTRANSFER_ENGINE_LIB_DIR=$<TARGET_FILE_DIR:transfer_engine>"
+          "-DTE_COMMON_LIB_DIR=$<TARGET_FILE_DIR:base>"
+          "-DMOONCAKE_COMMON_LIB_DIR=$<TARGET_FILE_DIR:mooncake_common>"
+          "-DYLT_INCLUDE_DIRS=${_ylt_include_dirs_pipe}"
+          "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
         COMMENT "Building Mooncake PG Python extension(s)"
-        DEPENDS engine mooncake_ep_ext
+        DEPENDS engine mooncake_ep_ext tent_shared asio_shared transfer_engine base mooncake_common
         VERBATIM
       )
     endif()

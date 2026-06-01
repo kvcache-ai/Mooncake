@@ -12,6 +12,37 @@ module_name = "mooncake.pg" + version_suffix
 
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
+
+
+def _env_path(name: str, fallback: str) -> str:
+    return os.path.abspath(os.getenv(name, fallback))
+
+
+def _tent_paths():
+    tent_build_dir = _env_path(
+        "MOONCAKE_TENT_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"),
+    )
+    tent_lib = os.path.abspath(
+        os.getenv(
+            "MOONCAKE_TENT_SHARED_SO_PATH",
+            os.path.join(tent_build_dir, "libtent_shared.so"),
+        )
+    )
+    if not os.path.exists(tent_lib):
+        raise FileNotFoundError(
+            f"TENT shared library not found at {tent_lib}. "
+            "Build the transfer engine first, or set "
+            "MOONCAKE_TENT_SHARED_SO_PATH/MOONCAKE_TENT_LIB_DIR."
+        )
+    return tent_lib, tent_build_dir
+
+
+def _env_paths(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [os.path.abspath(path) for path in value.split("|") if path]
+
+
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
     "1",
     "ON",
@@ -57,24 +88,22 @@ else:
 # Build link args: link against libtent_shared.so instead of engine.so
 extra_link_args = ["-Wl,-rpath,$ORIGIN"]
 if not use_musa:
-    tent_build_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
+    tent_lib, tent_build_dir = _tent_paths()
+    asio_lib_dir = _env_path(
+        "MOONCAKE_ASIO_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-common"),
     )
-    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
-    if not os.path.exists(tent_lib):
-        raise FileNotFoundError(
-            f"TENT shared library not found at {tent_lib}. "
-            "Build the transfer engine first: cmake --build build-phase2"
-        )
-    asio_lib_dir = os.path.join(current_dir, "../build-phase2/mooncake-common")
-    mc_common_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-common/src"
+    mc_common_dir = _env_path(
+        "MOONCAKE_COMMON_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-common/src"),
     )
-    te_build_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/src"
+    te_build_dir = _env_path(
+        "MOONCAKE_TRANSFER_ENGINE_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-transfer-engine/src"),
     )
-    te_common_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/src/common/base"
+    te_common_dir = _env_path(
+        "MOONCAKE_TE_COMMON_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-transfer-engine/src/common/base"),
     )
     extra_link_args.extend([
         "-Wl,-rpath," + tent_build_dir,
@@ -101,8 +130,8 @@ setup(
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
                 os.path.join(current_dir, "../mooncake-common/include"),
-                "/root/ylt-install/include",
-            ],
+            ] + _env_paths("MOONCAKE_YLT_INCLUDE_DIRS")
+              + _env_paths("MOONCAKE_PG_EXTRA_INCLUDE"),
             sources=[
                 "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",

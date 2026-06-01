@@ -12,6 +12,36 @@ module_name = "mooncake.ep" + version_suffix
 abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
+
+def _env_path(name: str, fallback: str) -> str:
+    return os.path.abspath(os.getenv(name, fallback))
+
+
+def _tent_paths():
+    tent_build_dir = _env_path(
+        "MOONCAKE_TENT_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"),
+    )
+    tent_lib = os.path.abspath(
+        os.getenv(
+            "MOONCAKE_TENT_SHARED_SO_PATH",
+            os.path.join(tent_build_dir, "libtent_shared.so"),
+        )
+    )
+    if not os.path.exists(tent_lib):
+        raise FileNotFoundError(
+            f"TENT shared library not found at {tent_lib}. "
+            "Build the transfer engine first, or set "
+            "MOONCAKE_TENT_SHARED_SO_PATH/MOONCAKE_TENT_LIB_DIR."
+        )
+    return tent_lib, tent_build_dir
+
+
+def _env_paths(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [os.path.abspath(path) for path in value.split("|") if path]
+
+
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
     "1",
     "ON",
@@ -75,15 +105,7 @@ if use_tent:
     # Link against the TENT shared library built from source.  This provides
     # IbGdaTransport, NvLinkDeviceTransport, and all their dependencies
     # (RPC, metastore, etc.) without needing the old engine.so Python module.
-    tent_build_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
-    )
-    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
-    if not os.path.exists(tent_lib):
-        raise FileNotFoundError(
-            f"TENT shared library not found at {tent_lib}. "
-            "Build the transfer engine first: cmake --build build-phase2"
-        )
+    tent_lib, tent_build_dir = _tent_paths()
 
     extra_link_args = [
         "-Wl,-rpath,$ORIGIN",
@@ -93,8 +115,9 @@ if use_tent:
     ]
     if not use_musa:
         # CUDA builds also need asio_shared
-        asio_lib_dir = os.path.join(
-            current_dir, "../build-phase2/mooncake-common"
+        asio_lib_dir = _env_path(
+            "MOONCAKE_ASIO_LIB_DIR",
+            os.path.join(current_dir, "../build-phase2/mooncake-common"),
         )
         extra_link_args.extend([
             "-L" + asio_lib_dir,
@@ -106,17 +129,10 @@ else:
     # DeviceTransport sources are compiled directly (no MOONCAKE_EP_USE_TENT
     # macro), so the kernel uses the direct IbGdaCtx path while the host side
     # still uses the unified DeviceTransport interface.
-    tent_build_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-transfer-engine/tent/src"
-    )
-    tent_lib = os.path.join(tent_build_dir, "libtent_shared.so")
-    if not os.path.exists(tent_lib):
-        raise FileNotFoundError(
-            f"TENT shared library not found at {tent_lib}. "
-            "Build the transfer engine first: cmake --build build-phase2"
-        )
-    asio_lib_dir = os.path.join(
-        current_dir, "../build-phase2/mooncake-common"
+    tent_lib, tent_build_dir = _tent_paths()
+    asio_lib_dir = _env_path(
+        "MOONCAKE_ASIO_LIB_DIR",
+        os.path.join(current_dir, "../build-phase2/mooncake-common"),
     )
     extra_link_args = [
         "-Wl,-rpath,$ORIGIN",
@@ -138,7 +154,8 @@ setup(
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/tent/include"),
                 os.path.join(current_dir, "../mooncake-common/include"),
-            ] + ([p] if (p := os.getenv("MOONCAKE_EP_EXTRA_INCLUDE", "/root/ylt-install/include")) and os.path.isdir(p) else []),
+            ] + _env_paths("MOONCAKE_YLT_INCLUDE_DIRS")
+              + _env_paths("MOONCAKE_EP_EXTRA_INCLUDE"),
             sources=sources,
             extra_compile_args={
                 "cxx": [

@@ -12,6 +12,14 @@
 #   EP_USE_TENT         - whether the extension should expose TENT device APIs
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   TENT_SHARED_SO_PATH - absolute path to libtent_shared.so
+#   TENT_LIB_DIR        - directory containing libtent_shared.so
+#   ASIO_LIB_DIR        - directory containing libasio.so
+#   TRANSFER_ENGINE_LIB_DIR - directory containing libtransfer_engine.a
+#   TE_COMMON_LIB_DIR   - directory containing libbase.a
+#   MOONCAKE_COMMON_LIB_DIR - directory containing libmooncake_common.a
+#   YLT_INCLUDE_DIRS    - pipe-separated yalantinglibs include directories
+#   BUILD_DIR           - top-level CMake binary directory
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -37,6 +45,30 @@ set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
 set(ENV{MOONCAKE_PG_USE_TENT_DEVICE_API} "${EP_USE_TENT}")
+if(TENT_SHARED_SO_PATH)
+  set(ENV{MOONCAKE_TENT_SHARED_SO_PATH} "${TENT_SHARED_SO_PATH}")
+endif()
+if(TENT_LIB_DIR)
+  set(ENV{MOONCAKE_TENT_LIB_DIR} "${TENT_LIB_DIR}")
+endif()
+if(ASIO_LIB_DIR)
+  set(ENV{MOONCAKE_ASIO_LIB_DIR} "${ASIO_LIB_DIR}")
+endif()
+if(TRANSFER_ENGINE_LIB_DIR)
+  set(ENV{MOONCAKE_TRANSFER_ENGINE_LIB_DIR} "${TRANSFER_ENGINE_LIB_DIR}")
+endif()
+if(TE_COMMON_LIB_DIR)
+  set(ENV{MOONCAKE_TE_COMMON_LIB_DIR} "${TE_COMMON_LIB_DIR}")
+endif()
+if(MOONCAKE_COMMON_LIB_DIR)
+  set(ENV{MOONCAKE_COMMON_LIB_DIR} "${MOONCAKE_COMMON_LIB_DIR}")
+endif()
+if(YLT_INCLUDE_DIRS)
+  set(ENV{MOONCAKE_YLT_INCLUDE_DIRS} "${YLT_INCLUDE_DIRS}")
+endif()
+if(BUILD_DIR)
+  set(ENV{MOONCAKE_BUILD_DIR} "${BUILD_DIR}")
+endif()
 
 # ---------------------------------------------------------------------------
 # 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.
