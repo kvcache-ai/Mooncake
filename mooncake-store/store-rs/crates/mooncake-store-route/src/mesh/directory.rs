@@ -888,22 +888,13 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             .iter()
             .map(|key| ranked_top_authorities(&self.namespace, &candidates, key, self.route_topk))
             .collect::<Vec<_>>();
+        let start_rank = observer_start_rank(observer, self.route_topk);
         let mut resolved = vec![false; keys.len()];
-        self.contains_ranked_authorities(
-            keys,
-            &ranked_authorities,
-            0,
-            &mut resolved,
-            RouteContainsProbe {
-                should_probe: None,
-                retry_on_error: None,
-            },
-            "authority bounded route contains failed; trying mirrored authorities",
-        )?;
-        for rank in 1..self.route_topk {
-            if resolved.iter().all(|r| *r) {
+        for step in 0..self.route_topk {
+            if step > 0 && resolved.iter().all(|r| *r) {
                 break;
             }
+            let rank = (start_rank + step) % self.route_topk;
             self.contains_ranked_authorities(
                 keys,
                 &ranked_authorities,
@@ -913,7 +904,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                     should_probe: None,
                     retry_on_error: None,
                 },
-                "mirrored bounded route contains failed; trying other authorities",
+                if step == 0 {
+                    "authority bounded route contains failed; trying mirrored authorities"
+                } else {
+                    "mirrored bounded route contains failed; trying other authorities"
+                },
             )?;
         }
         Ok(resolved)
@@ -1162,4 +1157,13 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
         floors
     }
+}
+
+fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
+    if topk <= 1 {
+        return 0;
+    }
+    let id = &observer.runtime.stable_id.0;
+    let hash = id.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    (hash as usize) % topk
 }
