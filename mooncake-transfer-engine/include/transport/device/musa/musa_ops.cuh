@@ -99,8 +99,11 @@ __device__ __forceinline__ void mc_st_na(const int4* ptr, const int4& val) {
 }
 
 // ---------------------------------------------------------------------------
-// Named barrier — MUSA has no bar.sync; use __syncthreads() (CTA scope).
-// The bar_id and num_threads parameters are ignored.
+// Named barrier — MUSA has no bar.sync.
+// On MUSA, mc_bar_sync is implemented as __syncthreads() (full CTA barrier).
+// Kernels that call mc_bar_sync from a subset of threads must ensure the
+// remaining threads call it the same number of times from another code path.
+// See mooncake_ep_kernel.cu for the warp-31 dispatch-send workaround.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_bar_sync(int /*bar_id*/,
                                             int /*num_threads*/) {

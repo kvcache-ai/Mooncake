@@ -103,8 +103,13 @@ __device__ __forceinline__ void mc_st_na(const int4* ptr, const int4& val) {
 }
 
 // ---------------------------------------------------------------------------
+// Named barrier init — no-op on CUDA (hardware named barriers need no setup).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_bar_init() {}
+
+// ---------------------------------------------------------------------------
 // Named barrier (warp-group scope) — CUDA PTX bar.sync
-// On MUSA this is replaced by __syncthreads() in musa_ops.cuh.
+// On MUSA this maps to __syncthreads(); see musa_ops.cuh for details.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_bar_sync(int bar_id, int num_threads) {
     asm volatile("bar.sync %0, %1;" : : "r"(bar_id), "r"(num_threads));

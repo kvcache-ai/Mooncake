@@ -26,9 +26,15 @@ using mooncake::device::mc_ld_acquire;
 using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
 
+#ifdef MOONCAKE_EP_USE_MUSA
+template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
+__global__ void
+dispatch(void* packed_recv_x, float* packed_recv_x_scales,
+#else
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
+#endif
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
          void* mxa_buffer,
@@ -191,6 +197,19 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto expert_begin_idx = sm_id * kNumWarpGroups;
         const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
 
+#ifdef MOONCAKE_EP_USE_MUSA
+        // mc_bar_sync maps to __syncthreads() on MUSA, which requires ALL threads.
+        // Warp 31 doesn't call mc_bar_sync so we decouple counting from syncing:
+        // (a) flat token count (correct sum over all tokens, same as CUDA), then
+        // (b) dummy loop calling __syncthreads() to match warps 0-30's mc_bar_sync count.
+        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
+            auto idx = static_cast<int>(__ldg(topk_idx + i));
+            if (idx >= expert_begin_idx && idx < expert_end_idx)
+                expert_count[idx - expert_begin_idx]++;
+        }
+        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms)
+            mc_bar_sync(1, (num_warps - 1) * 32);
+#else
         // Per lane count
         #pragma unroll 8
         for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
@@ -198,6 +217,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             if (idx >= expert_begin_idx and idx < expert_end_idx)
                 expert_count[idx - expert_begin_idx] ++;
         }
+#endif
 
         // Warp reduce
         #pragma unroll
@@ -218,7 +238,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-        while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+        { int _v; int _tries = 0; while ((_v = mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx)) != FINISHED_SUM_TAG * 2) { if (++_tries >= 1000000) { printf("[R%d E%d] SPIN TIMEOUT finish=%d expected=%d\n", rank, responsible_expert_idx, _v, FINISHED_SUM_TAG * 2); break; } } }
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
             mc_red_add(comm_ctx, dst_rank, dst_expert_local_idx % num_qp_per_rank, num_qp_per_rank,
@@ -369,12 +389,17 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    fprintf(stderr, "[EP] dispatch kernel: num_sms=%d phases=%d\n", num_sms, phases);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
+#ifdef MOONCAKE_EP_USE_MUSA
+__global__ void
+#else
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+#endif
 combine(void* combined_x, int32_t* active_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
