@@ -4,10 +4,10 @@
 //! metadata tagging, and cross-TP scatter-gather reconstruction.
 
 use mooncake_tensor::{
-    calculate_shard_range, get_parallelism_key_name, get_writer_partition_key_name,
-    parallelism_matches_metadata, ParallelAxisKind, ParallelAxisSpec, ReadTargetMode,
-    ReadTargetSpec, TensorMetadata, TensorParallelismSpec, WriterPartitionSpec,
-    WriterShardManifest,
+    calculate_shard_range, calculate_strided_shard_ranges, get_parallelism_key_name,
+    get_writer_partition_key_name, parallelism_matches_metadata, ParallelAxisKind,
+    ParallelAxisSpec, ReadTargetMode, ReadTargetSpec, TensorDtype, TensorMetadata,
+    TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -329,7 +329,11 @@ impl PyMooncakeDistributedStore {
                 let wp = wp_spec.expect("WriterPartition route must have wp_spec");
                 let storage_key = get_writer_partition_key_name(key, wp.rank);
 
-                let global_shape = info.shape.clone();
+                let mut global_shape = info.shape.clone();
+                let dim = wp.split_dim as usize;
+                if dim < global_shape.len() {
+                    global_shape[dim] = global_shape[dim] * wp.size as i64;
+                }
                 let metadata = TensorMetadata::build_shard(
                     info.dtype as i32,
                     &global_shape,
@@ -388,11 +392,21 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<i32> {
         let par_spec = parallelism.as_ref().map(|p| p.to_spec()).transpose()?;
         let wp_spec = writer_partition
-            .map(|(rank, size, split_dim)| WriterPartitionSpec::new(rank, size, split_dim));
+            .map(|(rank, size, split_dim)| {
+                let spec = WriterPartitionSpec::new(rank, size, split_dim);
+                spec.validate()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok::<_, PyErr>(spec)
+            })
+            .transpose()?;
 
         let storage_key = match (&par_spec, &wp_spec) {
             (Some(spec), _) => get_parallelism_key_name(key, spec),
-            (_, Some(wp)) => get_writer_partition_key_name(key, wp.rank),
+            (_, Some(wp)) => {
+                let manifest_key = WriterShardManifest::manifest_key(key);
+                let _ = self.remove(&manifest_key, false, tenant);
+                get_writer_partition_key_name(key, wp.rank)
+            }
             _ => key.to_string(),
         };
 
@@ -664,15 +678,34 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<TensorReadResult> {
         let sources = self.discover_shard_sources(base_key, tenant)?;
 
+        let first = sources.first().ok_or_else(|| {
+            PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
+        })?;
+
         let target_tp = target_par.tp_axis();
         let (target_rank, target_tp_size) = match target_tp {
             Some(tp) => (tp.rank as usize, tp.size as usize),
             None => (0, 1),
         };
 
-        let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
-        let (target_offset, target_size) =
-            calculate_shard_range(total_data_size, target_rank, target_tp_size);
+        let split_dim = match target_tp {
+            Some(tp) => tp.split_dim as usize,
+            None => first.split_dim as usize,
+        };
+
+        let global_shape = first.global_shape.clone();
+        let mut local_shape = global_shape.clone();
+        if let Some(tp) = target_tp {
+            let dim = tp.split_dim as usize;
+            if dim < local_shape.len() && tp.size > 0 {
+                local_shape[dim] = local_shape[dim] / tp.size as i64;
+            }
+        }
+
+        let target_size: usize = local_shape.iter().map(|&d| d as usize).product::<usize>()
+            * TensorDtype::from_i32(first.dtype)
+                .map(|d| d.element_size())
+                .unwrap_or(1);
 
         let total_needed = TensorMetadata::WIRE_SIZE + target_size;
         if buffer_size < total_needed {
@@ -681,43 +714,70 @@ impl PyMooncakeDistributedStore {
             )));
         }
 
-        let first = sources.first().ok_or_else(|| {
-            PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
-        })?;
+        let element_size = TensorDtype::from_i32(first.dtype)
+            .map(|d| d.element_size())
+            .unwrap_or(1);
+        let src_count = sources.len();
 
         let mut keys = Vec::new();
         let mut dst_offsets = Vec::new();
         let mut src_offsets = Vec::new();
         let mut sizes = Vec::new();
 
-        let mut source_cumulative_offset = 0usize;
-        for source in &sources {
-            let source_start = source_cumulative_offset;
-            let source_end = source_start + source.data_bytes;
+        if split_dim == 0 {
+            let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
+            let (target_offset, _) =
+                calculate_shard_range(total_data_size, target_rank, target_tp_size);
 
-            let overlap_start = target_offset.max(source_start);
-            let overlap_end = (target_offset + target_size).min(source_end);
+            let mut source_cumulative_offset = 0usize;
+            for source in &sources {
+                let source_start = source_cumulative_offset;
+                let source_end = source_start + source.data_bytes;
 
-            if overlap_start < overlap_end {
-                let fragment_size = overlap_end - overlap_start;
-                let dst_off = TensorMetadata::WIRE_SIZE + (overlap_start - target_offset);
-                let src_off = TensorMetadata::WIRE_SIZE + (overlap_start - source_start);
+                let overlap_start = target_offset.max(source_start);
+                let overlap_end = (target_offset + target_size).min(source_end);
 
-                keys.push(source.storage_key.clone());
-                dst_offsets.push(vec![dst_off]);
-                src_offsets.push(vec![src_off]);
-                sizes.push(vec![fragment_size]);
+                if overlap_start < overlap_end {
+                    let fragment_size = overlap_end - overlap_start;
+                    let dst_off = TensorMetadata::WIRE_SIZE + (overlap_start - target_offset);
+                    let src_off = TensorMetadata::WIRE_SIZE + (overlap_start - source_start);
+
+                    keys.push(source.storage_key.clone());
+                    dst_offsets.push(vec![dst_off]);
+                    src_offsets.push(vec![src_off]);
+                    sizes.push(vec![fragment_size]);
+                }
+
+                source_cumulative_offset = source_end;
             }
-
-            source_cumulative_offset = source_end;
-        }
-
-        let global_shape = first.global_shape.clone();
-        let mut local_shape = global_shape.clone();
-        if let Some(tp) = target_tp {
-            let dim = tp.split_dim as usize;
-            if dim < local_shape.len() && tp.size > 0 {
-                local_shape[dim] = local_shape[dim] / tp.size as i64;
+        } else {
+            for source in &sources {
+                let ranges = calculate_strided_shard_ranges(
+                    &global_shape,
+                    split_dim,
+                    element_size,
+                    source.src_rank,
+                    src_count,
+                    target_rank,
+                    target_tp_size,
+                );
+                if let Some(transfers) = ranges {
+                    if transfers.is_empty() {
+                        continue;
+                    }
+                    let mut key_dst_offs = Vec::with_capacity(transfers.len());
+                    let mut key_src_offs = Vec::with_capacity(transfers.len());
+                    let mut key_sizes = Vec::with_capacity(transfers.len());
+                    for t in &transfers {
+                        key_dst_offs.push(TensorMetadata::WIRE_SIZE + t.dst_offset);
+                        key_src_offs.push(TensorMetadata::WIRE_SIZE + t.src_offset);
+                        key_sizes.push(t.size);
+                    }
+                    keys.push(source.storage_key.clone());
+                    dst_offsets.push(key_dst_offs);
+                    src_offsets.push(key_src_offs);
+                    sizes.push(key_sizes);
+                }
             }
         }
 
@@ -779,36 +839,14 @@ impl PyMooncakeDistributedStore {
             None => (0, 1),
         };
 
-        let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
-        let (target_offset, target_size) =
-            calculate_shard_range(total_data_size, target_rank, target_tp_size);
-
         let first = sources.first().ok_or_else(|| {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
         })?;
 
-        let mut result_data = vec![0u8; target_size];
-        let mut source_cumulative_offset = 0usize;
-
-        for source in &sources {
-            let source_start = source_cumulative_offset;
-            let source_end = source_start + source.data_bytes;
-            let overlap_start = target_offset.max(source_start);
-            let overlap_end = (target_offset + target_size).min(source_end);
-
-            if overlap_start < overlap_end {
-                let fragment_size = overlap_end - overlap_start;
-                let src_byte_off = TensorMetadata::WIRE_SIZE + (overlap_start - source_start);
-                let dst_byte_off = overlap_start - target_offset;
-
-                let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
-                if src_byte_off + fragment_size <= raw.len() {
-                    result_data[dst_byte_off..dst_byte_off + fragment_size]
-                        .copy_from_slice(&raw[src_byte_off..src_byte_off + fragment_size]);
-                }
-            }
-            source_cumulative_offset = source_end;
-        }
+        let split_dim = match target_tp {
+            Some(tp) => tp.split_dim as usize,
+            None => first.split_dim as usize,
+        };
 
         let global_shape = first.global_shape.clone();
         let mut local_shape = global_shape.clone();
@@ -816,6 +854,81 @@ impl PyMooncakeDistributedStore {
             let dim = tp.split_dim as usize;
             if dim < local_shape.len() && tp.size > 0 {
                 local_shape[dim] = local_shape[dim] / tp.size as i64;
+            }
+        }
+
+        let element_size = TensorDtype::from_i32(first.dtype)
+            .map(|d| d.element_size())
+            .unwrap_or(1);
+
+        let target_size: usize =
+            local_shape.iter().map(|&d| d as usize).product::<usize>() * element_size;
+        let src_count = sources.len();
+
+        let mut result_data = vec![0u8; target_size];
+
+        if split_dim == 0 {
+            let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
+            let (target_offset, _) =
+                calculate_shard_range(total_data_size, target_rank, target_tp_size);
+
+            let mut source_cumulative_offset = 0usize;
+            for source in &sources {
+                let source_start = source_cumulative_offset;
+                let source_end = source_start + source.data_bytes;
+                let overlap_start = target_offset.max(source_start);
+                let overlap_end = (target_offset + target_size).min(source_end);
+
+                if overlap_start < overlap_end {
+                    let fragment_size = overlap_end - overlap_start;
+                    let src_byte_off = TensorMetadata::WIRE_SIZE + (overlap_start - source_start);
+                    let dst_byte_off = overlap_start - target_offset;
+
+                    let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
+                    if src_byte_off + fragment_size > raw.len() {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "source data truncated for key={}: expected at least {} bytes, got {}",
+                            source.storage_key,
+                            src_byte_off + fragment_size,
+                            raw.len()
+                        )));
+                    }
+                    result_data[dst_byte_off..dst_byte_off + fragment_size]
+                        .copy_from_slice(&raw[src_byte_off..src_byte_off + fragment_size]);
+                }
+                source_cumulative_offset = source_end;
+            }
+        } else {
+            for source in &sources {
+                let ranges = calculate_strided_shard_ranges(
+                    &global_shape,
+                    split_dim,
+                    element_size,
+                    source.src_rank,
+                    src_count,
+                    target_rank,
+                    target_tp_size,
+                );
+                if let Some(transfers) = ranges {
+                    let raw = if !transfers.is_empty() {
+                        self.get_raw_bytes(&source.storage_key, tenant)?
+                    } else {
+                        continue;
+                    };
+                    for t in &transfers {
+                        let src_byte_off = TensorMetadata::WIRE_SIZE + t.src_offset;
+                        if src_byte_off + t.size > raw.len() {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "source data truncated for key={}: expected at least {} bytes, got {}",
+                                source.storage_key,
+                                src_byte_off + t.size,
+                                raw.len()
+                            )));
+                        }
+                        result_data[t.dst_offset..t.dst_offset + t.size]
+                            .copy_from_slice(&raw[src_byte_off..src_byte_off + t.size]);
+                    }
+                }
             }
         }
 
@@ -848,8 +961,20 @@ impl PyMooncakeDistributedStore {
         }
 
         let sources = self.discover_shard_sources(base_key, tenant)?;
-        let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
+
+        let first = sources.first().ok_or_else(|| {
+            PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
+        })?;
+
+        let global_shape = first.global_shape.clone();
+        let element_size = TensorDtype::from_i32(first.dtype)
+            .map(|d| d.element_size())
+            .unwrap_or(1);
+        let total_data_size: usize =
+            global_shape.iter().map(|&d| d as usize).product::<usize>() * element_size;
         let total_needed = TensorMetadata::WIRE_SIZE + total_data_size;
+        let split_dim = first.split_dim as usize;
+        let src_count = sources.len();
 
         if buffer_size < total_needed {
             return Err(PyValueError::new_err(format!(
@@ -857,12 +982,8 @@ impl PyMooncakeDistributedStore {
             )));
         }
 
-        let first = sources.first().ok_or_else(|| {
-            PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
-        })?;
-
         let metadata =
-            TensorMetadata::build_full(first.dtype, &first.global_shape, total_data_size as u64);
+            TensorMetadata::build_full(first.dtype, &global_shape, total_data_size as u64);
 
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -877,13 +998,44 @@ impl PyMooncakeDistributedStore {
         let mut src_offsets = Vec::new();
         let mut sizes = Vec::new();
 
-        let mut cumulative = 0usize;
-        for source in &sources {
-            keys.push(source.storage_key.clone());
-            dst_offsets.push(vec![TensorMetadata::WIRE_SIZE + cumulative]);
-            src_offsets.push(vec![TensorMetadata::WIRE_SIZE]);
-            sizes.push(vec![source.data_bytes]);
-            cumulative += source.data_bytes;
+        if split_dim == 0 {
+            let mut cumulative = 0usize;
+            for source in &sources {
+                keys.push(source.storage_key.clone());
+                dst_offsets.push(vec![TensorMetadata::WIRE_SIZE + cumulative]);
+                src_offsets.push(vec![TensorMetadata::WIRE_SIZE]);
+                sizes.push(vec![source.data_bytes]);
+                cumulative += source.data_bytes;
+            }
+        } else {
+            for source in &sources {
+                let ranges = calculate_strided_shard_ranges(
+                    &global_shape,
+                    split_dim,
+                    element_size,
+                    source.src_rank,
+                    src_count,
+                    0,
+                    1,
+                );
+                if let Some(transfers) = ranges {
+                    if transfers.is_empty() {
+                        continue;
+                    }
+                    let mut key_dst_offs = Vec::with_capacity(transfers.len());
+                    let mut key_src_offs = Vec::with_capacity(transfers.len());
+                    let mut key_sizes = Vec::with_capacity(transfers.len());
+                    for t in &transfers {
+                        key_dst_offs.push(TensorMetadata::WIRE_SIZE + t.dst_offset);
+                        key_src_offs.push(TensorMetadata::WIRE_SIZE + t.src_offset);
+                        key_sizes.push(t.size);
+                    }
+                    keys.push(source.storage_key.clone());
+                    dst_offsets.push(key_dst_offs);
+                    src_offsets.push(key_src_offs);
+                    sizes.push(key_sizes);
+                }
+            }
         }
 
         let results = self.get_into_ranges(
@@ -909,7 +1061,7 @@ impl PyMooncakeDistributedStore {
         Ok(TensorReadResult {
             data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
             data_bytes: total_data_size,
-            shape: first.global_shape.clone(),
+            shape: global_shape,
             dtype: first.dtype,
             total_bytes_read: total_needed,
         })
@@ -921,22 +1073,68 @@ impl PyMooncakeDistributedStore {
         }
 
         let sources = self.discover_shard_sources(base_key, tenant)?;
-        let total_data_size: usize = sources.iter().map(|s| s.data_bytes).sum();
 
         let first = sources.first().ok_or_else(|| {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
         })?;
 
+        let global_shape = first.global_shape.clone();
+        let element_size = TensorDtype::from_i32(first.dtype)
+            .map(|d| d.element_size())
+            .unwrap_or(1);
+        let total_data_size: usize =
+            global_shape.iter().map(|&d| d as usize).product::<usize>() * element_size;
+        let split_dim = first.split_dim as usize;
+        let src_count = sources.len();
+
         let metadata =
-            TensorMetadata::build_full(first.dtype, &first.global_shape, total_data_size as u64);
+            TensorMetadata::build_full(first.dtype, &global_shape, total_data_size as u64);
 
-        let mut output = Vec::with_capacity(TensorMetadata::WIRE_SIZE + total_data_size);
-        output.extend_from_slice(metadata.as_bytes());
+        let mut output = vec![0u8; TensorMetadata::WIRE_SIZE + total_data_size];
+        output[..TensorMetadata::WIRE_SIZE].copy_from_slice(metadata.as_bytes());
 
-        for source in &sources {
-            let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
-            if raw.len() > TensorMetadata::WIRE_SIZE {
-                output.extend_from_slice(&raw[TensorMetadata::WIRE_SIZE..]);
+        if split_dim == 0 {
+            let mut cumulative = 0usize;
+            for source in &sources {
+                let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
+                if raw.len() > TensorMetadata::WIRE_SIZE {
+                    let data = &raw[TensorMetadata::WIRE_SIZE..];
+                    let dst_start = TensorMetadata::WIRE_SIZE + cumulative;
+                    output[dst_start..dst_start + data.len()].copy_from_slice(data);
+                    cumulative += data.len();
+                }
+            }
+        } else {
+            for source in &sources {
+                let ranges = calculate_strided_shard_ranges(
+                    &global_shape,
+                    split_dim,
+                    element_size,
+                    source.src_rank,
+                    src_count,
+                    0,
+                    1,
+                );
+                if let Some(transfers) = ranges {
+                    if transfers.is_empty() {
+                        continue;
+                    }
+                    let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
+                    for t in &transfers {
+                        let src_byte_off = TensorMetadata::WIRE_SIZE + t.src_offset;
+                        let dst_byte_off = TensorMetadata::WIRE_SIZE + t.dst_offset;
+                        if src_byte_off + t.size > raw.len() {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "source data truncated for key={}: expected at least {} bytes, got {}",
+                                source.storage_key,
+                                src_byte_off + t.size,
+                                raw.len()
+                            )));
+                        }
+                        output[dst_byte_off..dst_byte_off + t.size]
+                            .copy_from_slice(&raw[src_byte_off..src_byte_off + t.size]);
+                    }
+                }
             }
         }
 
@@ -979,10 +1177,16 @@ impl PyMooncakeDistributedStore {
                 ))
             })?;
 
+            let ndim = parsed.metadata.header.ndim as usize;
+            let local_shape = parsed.metadata.layout.local_shape.to_vec(ndim);
+
             sources.push(ShardSource {
                 storage_key: key,
                 data_bytes: parsed.data_bytes,
                 global_shape: global_shape.clone(),
+                local_shape,
+                split_dim: manifest.split_dim,
+                src_rank: rank as usize,
                 dtype: parsed.metadata.header.dtype,
             });
         }
@@ -1009,16 +1213,22 @@ impl PyMooncakeDistributedStore {
                 None => break,
             };
 
-            let global_shape = parsed
-                .metadata
-                .layout
-                .global_shape
-                .to_vec(parsed.metadata.header.ndim as usize);
+            let ndim = parsed.metadata.header.ndim as usize;
+            let global_shape = parsed.metadata.layout.global_shape.to_vec(ndim);
+            let local_shape = parsed.metadata.layout.local_shape.to_vec(ndim);
+            let split_dim = if parsed.metadata.layout.axis_count > 0 {
+                parsed.metadata.layout.axes[0].split_dim
+            } else {
+                0
+            };
 
             sources.push(ShardSource {
                 storage_key: key,
                 data_bytes: parsed.data_bytes,
                 global_shape,
+                local_shape,
+                split_dim,
+                src_rank: rank as usize,
                 dtype: parsed.metadata.header.dtype,
             });
         }
@@ -1037,5 +1247,8 @@ struct ShardSource {
     storage_key: String,
     data_bytes: usize,
     global_shape: Vec<i64>,
+    local_shape: Vec<i64>,
+    split_dim: i32,
+    src_rank: usize,
     dtype: i32,
 }
