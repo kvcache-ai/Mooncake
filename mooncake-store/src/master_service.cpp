@@ -2963,6 +2963,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
                 EraseMetadata(tenant_state, it, normalized_tenant);
+                if (tenant_state.Empty()) {
+                    shard->tenants.erase(tenant_it);
+                }
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
