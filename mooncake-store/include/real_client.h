@@ -766,11 +766,22 @@ class RealClient : public PyClient {
         }
     };
 
+    struct UbSegmentDeleter {
+        size_t size = 0;
+        std::string protocol = "ub";
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
