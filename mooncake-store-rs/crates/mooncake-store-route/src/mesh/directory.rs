@@ -928,11 +928,10 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         }
 
         if !resolved.iter().all(|r| *r) && !self.baseline_candidates.is_empty() {
-            let current_ids: HashSet<String> = candidates
+            let has_new_members = candidates
                 .iter()
-                .map(|c| c.runtime.stable_id.0.clone())
-                .collect();
-            if current_ids != self.baseline_member_ids {
+                .any(|c| !self.baseline_member_ids.contains(&c.runtime.stable_id.0));
+            if has_new_members {
                 let baseline_ranked = keys
                     .iter()
                     .map(|key| {
