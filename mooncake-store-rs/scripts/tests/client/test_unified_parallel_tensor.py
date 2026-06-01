@@ -819,6 +819,337 @@ def test_writer_partition_upsert(store, tenant):
     assert_tensor_equal(result, weight_v2, "writer partition upsert should be v2")
 
 
+# ─── New test cases: batch, _from, manifest, writer key ─────────────────
+
+
+def build_raw_buffer(tensor: torch.Tensor) -> tuple:
+    """Build a raw [TensorMetadata | data] buffer from a tensor.
+
+    Returns (buffer_ptr, total_size, alloc_ref) where alloc_ref keeps
+    the underlying memory alive.
+    """
+    data_ptr = tensor.data_ptr()
+    data_bytes = tensor.nelement() * tensor.element_size()
+    ndim = tensor.dim()
+    shape = list(tensor.shape)
+
+    dtype_map = {
+        torch.float32: 0, torch.float64: 1, torch.int8: 2, torch.uint8: 3,
+        torch.int16: 4, torch.float16: 11, torch.bfloat16: 12,
+        torch.int32: 6, torch.int64: 8,
+    }
+    dtype_i32 = dtype_map[tensor.dtype]
+
+    header = struct.pack("<IHHII", 0x4D4F4F4E, 1, 0, dtype_i32, ndim)
+    header += struct.pack("<IIqq", 0, 0, TENSOR_METADATA_WIRE_SIZE, data_bytes)
+
+    global_shape = b""
+    for i in range(8):
+        global_shape += struct.pack("<q", shape[i] if i < ndim else 0)
+
+    local_shape = b""
+    for i in range(8):
+        local_shape += struct.pack("<q", shape[i] if i < ndim else 0)
+
+    axes = b"\x00" * 128
+    axis_count = struct.pack("<I", 0)
+    padding = b"\x00" * (TENSOR_METADATA_WIRE_SIZE - len(header) - len(global_shape) - len(local_shape) - len(axes) - len(axis_count))
+
+    metadata_bytes = header + global_shape + local_shape + axes + axis_count + padding
+    assert len(metadata_bytes) == TENSOR_METADATA_WIRE_SIZE
+
+    total_size = TENSOR_METADATA_WIRE_SIZE + data_bytes
+    buf = (ctypes.c_ubyte * total_size)()
+    ctypes.memmove(buf, metadata_bytes, TENSOR_METADATA_WIRE_SIZE)
+    ctypes.memmove(
+        ctypes.addressof(buf) + TENSOR_METADATA_WIRE_SIZE,
+        data_ptr,
+        data_bytes,
+    )
+    return ctypes.addressof(buf), total_size, buf
+
+
+def test_batch_put_get_tp(store, tenant):
+    """Batch put 3 TP shards + batch get them back."""
+    full_weight = generate_weight([128, 64], seed=50)
+    tp_size = 4
+    keys = ["batch_tp.weight"] * tp_size
+    shards = [compute_tp_shard(full_weight, r, tp_size) for r in range(tp_size)]
+    pars = [TensorParallelism([TP(r, tp_size)]) for r in range(tp_size)]
+
+    store.batch_put_tensor_with_parallelism(
+        keys, shards, parallelisms=pars, tenant=tenant
+    )
+
+    targets = [ReadTarget(READ_MODE_SHARD, parallelism=p) for p in pars]
+    results = store.batch_get_tensor_with_parallelism(
+        keys, targets=targets, tenant=tenant
+    )
+    assert len(results) == tp_size, f"expected {tp_size} results, got {len(results)}"
+    for rank in range(tp_size):
+        assert_tensor_equal(results[rank], shards[rank], f"batch tp rank {rank}")
+
+
+def test_batch_put_get_writer_partition(store, tenant):
+    """Batch put via writer_partitions, read back via batch_get FULL."""
+    full_weight = generate_weight([128, 64], seed=51)
+    num_writers = 4
+    keys = ["batch_wp.weight"] * num_writers
+    shards = [compute_tp_shard(full_weight, r, num_writers) for r in range(num_writers)]
+    wps = [(r, num_writers, 0) for r in range(num_writers)]
+
+    store.batch_put_tensor_with_parallelism(
+        keys, shards, writer_partitions=wps, tenant=tenant
+    )
+
+    result = store.get_tensor_with_parallelism(
+        "batch_wp.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "batch wp full roundtrip")
+
+
+def test_batch_upsert(store, tenant):
+    """Batch upsert overwrites previously written data."""
+    weight_v1 = generate_weight([64, 32], seed=52)
+    weight_v2 = generate_weight([64, 32], seed=53)
+    tp_size = 2
+    keys = ["batch_upsert.weight"] * tp_size
+    shards_v1 = [compute_tp_shard(weight_v1, r, tp_size) for r in range(tp_size)]
+    shards_v2 = [compute_tp_shard(weight_v2, r, tp_size) for r in range(tp_size)]
+    pars = [TensorParallelism([TP(r, tp_size)]) for r in range(tp_size)]
+
+    store.batch_put_tensor_with_parallelism(
+        keys, shards_v1, parallelisms=pars, tenant=tenant
+    )
+    store.batch_upsert_tensor_with_parallelism(
+        keys, shards_v2, parallelisms=pars, tenant=tenant
+    )
+
+    targets = [ReadTarget(READ_MODE_SHARD, parallelism=p) for p in pars]
+    results = store.batch_get_tensor_with_parallelism(
+        keys, targets=targets, tenant=tenant
+    )
+    for rank in range(tp_size):
+        assert_tensor_equal(results[rank], shards_v2[rank], f"batch upsert rank {rank}")
+
+
+def test_batch_mixed_routing_rejected(store, tenant):
+    """Passing both parallelisms and writer_partitions in a batch should raise."""
+    weight = generate_weight([32, 16], seed=54)
+    try:
+        store.batch_put_tensor_with_parallelism(
+            ["mixed.weight"],
+            [weight],
+            parallelisms=[TensorParallelism([TP(0, 2)])],
+            writer_partitions=[(0, 2, 0)],
+            tenant=tenant,
+        )
+        raise AssertionError("should have raised for mixed parallelisms + writer_partitions")
+    except (ValueError, RuntimeError):
+        pass
+
+
+def test_from_put_get_roundtrip(store, tenant):
+    """put_tensor_with_parallelism_from: write from raw buffer, read back."""
+    weight = generate_weight([64, 32], seed=55)
+    buf_ptr, buf_size, buf_ref = build_raw_buffer(weight)
+
+    store.put_tensor_with_parallelism_from(
+        "test_from_rt.weight", buf_ptr, buf_size, tenant=tenant
+    )
+
+    result = store.get_tensor_with_parallelism(
+        "test_from_rt.weight",
+        target=ReadTarget(READ_MODE_AS_STORED),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, weight, "from roundtrip")
+    del buf_ref
+
+
+def test_from_upsert(store, tenant):
+    """upsert_tensor_with_parallelism_from: overwrite via raw buffer."""
+    weight_v1 = generate_weight([32, 16], seed=56)
+    weight_v2 = generate_weight([32, 16], seed=57)
+
+    buf1_ptr, buf1_size, buf1_ref = build_raw_buffer(weight_v1)
+    store.put_tensor_with_parallelism_from(
+        "test_from_upsert.weight", buf1_ptr, buf1_size, tenant=tenant
+    )
+
+    buf2_ptr, buf2_size, buf2_ref = build_raw_buffer(weight_v2)
+    store.upsert_tensor_with_parallelism_from(
+        "test_from_upsert.weight", buf2_ptr, buf2_size, tenant=tenant
+    )
+
+    result = store.get_tensor_with_parallelism(
+        "test_from_upsert.weight",
+        target=ReadTarget(READ_MODE_AS_STORED),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, weight_v2, "from upsert should be v2")
+    del buf1_ref, buf2_ref
+
+
+def test_parallelism_manifest_discovery(store, tenant):
+    """TP write creates __parallelism_manifest; reader discovers via it."""
+    full_weight = generate_weight([128, 64], seed=58)
+    tp_size = 4
+
+    for rank in range(tp_size):
+        shard = compute_tp_shard(full_weight, rank, tp_size)
+        par = TensorParallelism([TP(rank, tp_size)])
+        store.put_tensor_with_parallelism(
+            "test_par_manifest.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    manifest_raw = store.get(
+        "test_par_manifest.weight__parallelism_manifest", tenant=tenant
+    )
+    assert len(manifest_raw) > 0, "parallelism manifest should exist"
+
+    result = store.get_tensor_with_parallelism(
+        "test_par_manifest.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "parallelism manifest full reconstruction")
+
+
+def test_writer_key_naming_format(store, tenant):
+    """Writer partition key should use format __writer_{rank}of{size}_sd{split_dim}."""
+    weight = generate_weight([64, 32], seed=59)
+    store.put_tensor_with_parallelism(
+        "test_wk_fmt.weight",
+        weight,
+        writer_partition=(1, 4, 0),
+        tenant=tenant,
+    )
+
+    raw = store.get("test_wk_fmt.weight__writer_1of4_sd0", tenant=tenant)
+    assert len(raw) > TENSOR_METADATA_WIRE_SIZE, "new writer key format should exist"
+
+    try:
+        store.get("test_wk_fmt.weight__writer_1", tenant=tenant)
+        raise AssertionError("old writer key format should NOT exist")
+    except RuntimeError:
+        pass
+
+
+def test_writer_key_naming_split_dim1(store, tenant):
+    """Writer partition key with split_dim=1."""
+    weight = generate_weight([32, 64], seed=60)
+    store.put_tensor_with_parallelism(
+        "test_wk_sd1.weight",
+        weight,
+        writer_partition=(2, 4, 1),
+        tenant=tenant,
+    )
+
+    raw = store.get("test_wk_sd1.weight__writer_2of4_sd1", tenant=tenant)
+    assert len(raw) > TENSOR_METADATA_WIRE_SIZE, "writer key sd1 format should exist"
+
+
+def test_batch_get_into_tp(store, allocator, tenant):
+    """batch_get_tensor_with_parallelism_into: read TP shards into buffers."""
+    full_weight = generate_weight([64, 32], seed=61)
+    tp_size = 2
+
+    for rank in range(tp_size):
+        shard = compute_tp_shard(full_weight, rank, tp_size)
+        par = TensorParallelism([TP(rank, tp_size)])
+        store.put_tensor_with_parallelism(
+            "test_batch_into.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    shard_0 = compute_tp_shard(full_weight, 0, tp_size)
+    shard_1 = compute_tp_shard(full_weight, 1, tp_size)
+    buf_size = TENSOR_METADATA_WIRE_SIZE + shard_0.nelement() * shard_0.element_size()
+
+    ptr0 = allocator.alloc(buf_size)
+    ptr1 = allocator.alloc(buf_size)
+    r0 = store.register_buffer(ptr0, buf_size)
+    r1 = store.register_buffer(ptr1, buf_size)
+    if r0 != 0 or r1 != 0:
+        raise SkipTest("register_buffer not supported")
+
+    try:
+        par0 = TensorParallelism([TP(0, tp_size)])
+        par1 = TensorParallelism([TP(1, tp_size)])
+        results = store.batch_get_tensor_with_parallelism_into(
+            ["test_batch_into.weight", "test_batch_into.weight"],
+            [ptr0, ptr1],
+            [buf_size, buf_size],
+            targets=[
+                ReadTarget(READ_MODE_SHARD, parallelism=par0),
+                ReadTarget(READ_MODE_SHARD, parallelism=par1),
+            ],
+            tenant=tenant,
+        )
+        assert len(results) == 2, f"expected 2 results, got {len(results)}"
+
+        for idx, (result, expected) in enumerate([(results[0], shard_0), (results[1], shard_1)]):
+            assert result.data_bytes == expected.nelement() * expected.element_size(), \
+                f"batch_into rank {idx}: data_bytes mismatch"
+    finally:
+        store.unregister_buffer(ptr0, buf_size)
+        store.unregister_buffer(ptr1, buf_size)
+
+
+def test_batch_get_cross_tp_reconstruction(store, tenant):
+    """batch_get with cross-TP: writer TP=2, reader TP=4."""
+    full_weight = generate_weight([128, 64], seed=62)
+    writer_tp = 2
+    reader_tp = 4
+
+    for rank in range(writer_tp):
+        shard = compute_tp_shard(full_weight, rank, writer_tp)
+        par = TensorParallelism([TP(rank, writer_tp)])
+        store.put_tensor_with_parallelism(
+            "test_batch_cross.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    keys = ["test_batch_cross.weight"] * reader_tp
+    targets = [
+        ReadTarget(READ_MODE_SHARD, parallelism=TensorParallelism([TP(r, reader_tp)]))
+        for r in range(reader_tp)
+    ]
+    results = store.batch_get_tensor_with_parallelism(
+        keys, targets=targets, tenant=tenant
+    )
+    for rank in range(reader_tp):
+        expected = compute_tp_shard(full_weight, rank, reader_tp)
+        assert_tensor_equal(results[rank], expected, f"batch cross tp rank {rank}")
+
+
+def test_batch_from_put_get(store, tenant):
+    """batch_put_tensor_with_parallelism_from: batch raw buffer write + read."""
+    weights = [generate_weight([32, 16], seed=63 + i) for i in range(3)]
+    buf_refs = []
+    ptrs = []
+    szs = []
+    keys = [f"batch_from.w{i}" for i in range(3)]
+
+    for w in weights:
+        p, s, ref = build_raw_buffer(w)
+        ptrs.append(p)
+        szs.append(s)
+        buf_refs.append(ref)
+
+    store.batch_put_tensor_with_parallelism_from(
+        keys, ptrs, szs, tenant=tenant
+    )
+
+    for i, key in enumerate(keys):
+        result = store.get_tensor_with_parallelism(
+            key, target=ReadTarget(READ_MODE_AS_STORED), tenant=tenant
+        )
+        assert_tensor_equal(result, weights[i], f"batch_from key {i}")
+    del buf_refs
+
+
 def main():
     args = parse_args()
 
@@ -899,6 +1230,28 @@ def main():
     print("\n  --- Mock RL E2E ---")
     run_test("rl weight sync e2e", test_rl_weight_sync_e2e, store, tenant)
     run_test("rl multi-layer sync", test_rl_weight_sync_multi_layer, store, tenant)
+
+    print("\n  --- Batch API ---")
+    run_test("batch put+get tp", test_batch_put_get_tp, store, tenant)
+    run_test("batch put+get writer partition", test_batch_put_get_writer_partition, store, tenant)
+    run_test("batch upsert", test_batch_upsert, store, tenant)
+    run_test("batch mixed routing rejected", test_batch_mixed_routing_rejected, store, tenant)
+    run_test("batch get cross-tp reconstruction", test_batch_get_cross_tp_reconstruction, store, tenant)
+
+    print("\n  --- _from API ---")
+    run_test("from put+get roundtrip", test_from_put_get_roundtrip, store, tenant)
+    run_test("from upsert", test_from_upsert, store, tenant)
+    run_test("batch from put+get", test_batch_from_put_get, store, tenant)
+
+    print("\n  --- Parallelism manifest ---")
+    run_test("parallelism manifest discovery", test_parallelism_manifest_discovery, store, tenant)
+
+    print("\n  --- Writer key naming ---")
+    run_test("writer key format", test_writer_key_naming_format, store, tenant)
+    run_test("writer key split_dim=1", test_writer_key_naming_split_dim1, store, tenant)
+
+    print("\n  --- Batch into buffer ---")
+    run_test("batch get into tp", test_batch_get_into_tp, store, allocator, tenant)
 
     store.close()
 
