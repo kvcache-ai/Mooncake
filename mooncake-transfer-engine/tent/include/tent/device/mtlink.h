@@ -22,8 +22,8 @@
 namespace mooncake {
 namespace tent {
 
-/// Factory: create an MTLink DeviceTransport.
-std::unique_ptr<DeviceTransport> createMtLinkDeviceTransport();
+/// Factory: create an MTLink P2P DeviceTransport.
+std::unique_ptr<P2pTransport> createMtLinkDeviceTransport();
 
 }  // namespace tent
 }  // namespace mooncake

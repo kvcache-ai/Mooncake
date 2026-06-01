@@ -31,11 +31,11 @@ using NvLinkDeviceTransportImpl = P2pDeviceTransportBase<CudaApiTraits, true>;
 
 }  // namespace
 
-std::unique_ptr<DeviceTransport> createNvLinkDeviceTransport() {
+std::unique_ptr<P2pTransport> createNvLinkDeviceTransport() {
     return std::make_unique<NvLinkDeviceTransportImpl>();
 }
 
-std::unique_ptr<DeviceTransport> createP2pDeviceTransport() {
+std::unique_ptr<P2pTransport> createP2pDeviceTransport() {
     return createNvLinkDeviceTransport();
 }
 

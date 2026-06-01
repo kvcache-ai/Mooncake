@@ -22,8 +22,8 @@
 namespace mooncake {
 namespace tent {
 
-/// Factory: create an NVLink DeviceTransport.
-std::unique_ptr<DeviceTransport> createNvLinkDeviceTransport();
+/// Factory: create an NVLink P2P DeviceTransport.
+std::unique_ptr<P2pTransport> createNvLinkDeviceTransport();
 
 /// Runtime probe for CUDA fabric memory handles used by MNNVL-style NVLink
 /// fabrics.  This keeps environment parsing and CUDA attribute checks in TENT

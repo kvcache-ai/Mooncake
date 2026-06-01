@@ -28,11 +28,11 @@ using MtLinkDeviceTransportImpl = P2pDeviceTransportBase<MusaApiTraits, false>;
 
 }  // namespace
 
-std::unique_ptr<DeviceTransport> createMtLinkDeviceTransport() {
+std::unique_ptr<P2pTransport> createMtLinkDeviceTransport() {
     return std::make_unique<MtLinkDeviceTransportImpl>();
 }
 
-std::unique_ptr<DeviceTransport> createP2pDeviceTransport() {
+std::unique_ptr<P2pTransport> createP2pDeviceTransport() {
     return createMtLinkDeviceTransport();
 }
 
