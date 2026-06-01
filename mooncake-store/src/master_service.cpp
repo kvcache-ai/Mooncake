@@ -699,9 +699,7 @@ MasterService::EraseMetadata(
     const std::string group_id = it->second.group_id;
     auto next = tenant_state.metadata.erase(it);
     if (had_completed_disk && shard) {
-        shard->OnDiskReplicaRemoved(had_completed_disk,
-                                     /*metadata_unused*/ {},
-                                     /*object_erased=*/true);
+        shard->OnDiskReplicaRemoved(had_completed_disk);
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
     return next;
@@ -1194,8 +1192,7 @@ auto MasterService::BatchReplicaClear(
                 });
             auto& shard = accessor.GetShard();
             accessor.Erase();
-            shard.OnDiskReplicaRemoved(had_completed_disk, metadata,
-                                        /*object_erased=*/true);
+            shard.OnDiskReplicaRemoved(had_completed_disk);
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
                        "for key="
@@ -1266,8 +1263,7 @@ auto MasterService::BatchReplicaClear(
                     });
                 auto& shard = accessor.GetShard();
                 accessor.Erase();
-                shard.OnDiskReplicaRemoved(had_completed_disk, metadata,
-                                            /*object_erased=*/true);
+                shard.OnDiskReplicaRemoved(had_completed_disk);
             }
 
             cleared_keys.emplace_back(key);
@@ -4840,7 +4836,7 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                  !it->second.IsSoftPinned(cleanup_now))) {
                                 VLOG(1) << "clear metadata key=" << it->first;
                                 it = EraseMetadata(tenant_state, it,
-                                                   tenant_it->first, &shard);
+                                                   tenant_it->first);
                             } else {
                                 ++it;
                             }

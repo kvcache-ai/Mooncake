@@ -1179,20 +1179,19 @@ class MasterService {
         // Called after removing a LOCAL_DISK replica, or when erasing an
         // object that had one. Pass had_completed_disk=true if the object
         // had at least one completed LOCAL_DISK replica before the removal.
-        // When the entire object is being erased (metadata no longer valid),
-        // pass object_erased=true to skip the still_has_disk check.
+        // When the entire object is being erased, call the one-arg overload.
         void OnDiskReplicaRemoved(bool had_completed_disk,
-                                  const ObjectMetadata& metadata,
-                                  bool object_erased = false) {
+                                  const ObjectMetadata& metadata) {
             if (!had_completed_disk) return;
-            if (object_erased) {
-                shard_.disk_object_count--;
-                return;
-            }
             bool still_has_disk = metadata.HasReplica([](const Replica& r) {
                 return r.is_local_disk_replica() && r.is_completed();
             });
             if (!still_has_disk) shard_.disk_object_count--;
+        }
+
+        // Overload for full object erasure — no metadata needed.
+        void OnDiskReplicaRemoved(bool had_completed_disk) {
+            if (had_completed_disk) shard_.disk_object_count--;
         }
 
        private:
