@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use mooncake_store_core::{
@@ -52,6 +52,8 @@ struct EmbeddedWrhRouteDirectory {
     authority_client: Arc<dyn RouteAuthorityClient>,
     membership: Arc<dyn RouteMembershipProvider>,
     async_mirror: AsyncRouteMirrorWorker,
+    baseline_member_ids: HashSet<String>,
+    baseline_candidates: Vec<ClientLease>,
 }
 
 struct RouteContainsProbe<'a> {
@@ -81,6 +83,12 @@ impl EmbeddedWrhRouteDirectory {
             authority_client.clone(),
             membership.clone(),
         );
+        let baseline_candidates = authority_candidates(membership.as_ref(), lease, false)
+            .unwrap_or_default();
+        let baseline_member_ids = baseline_candidates
+            .iter()
+            .map(|c| c.runtime.stable_id.0.clone())
+            .collect();
         Self {
             route_topk,
             namespace,
@@ -88,6 +96,8 @@ impl EmbeddedWrhRouteDirectory {
             authority_client,
             membership,
             async_mirror,
+            baseline_member_ids,
+            baseline_candidates,
         }
     }
 
@@ -911,6 +921,44 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
                 },
             )?;
         }
+
+        if !resolved.iter().all(|r| *r) && !self.baseline_candidates.is_empty() {
+            let current_ids: HashSet<String> = candidates
+                .iter()
+                .map(|c| c.runtime.stable_id.0.clone())
+                .collect();
+            if current_ids != self.baseline_member_ids {
+                let baseline_ranked = keys
+                    .iter()
+                    .map(|key| {
+                        ranked_top_authorities(
+                            &self.namespace,
+                            &self.baseline_candidates,
+                            key,
+                            self.route_topk,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for step in 0..self.route_topk {
+                    if resolved.iter().all(|r| *r) {
+                        break;
+                    }
+                    let rank = (start_rank + step) % self.route_topk;
+                    self.contains_ranked_authorities(
+                        keys,
+                        &baseline_ranked,
+                        rank,
+                        &mut resolved,
+                        RouteContainsProbe {
+                            should_probe: None,
+                            retry_on_error: None,
+                        },
+                        "baseline authority fallback route contains failed",
+                    )?;
+                }
+            }
+        }
+
         Ok(resolved)
     }
 
