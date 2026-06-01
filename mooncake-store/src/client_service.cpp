@@ -2511,9 +2511,9 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveAll();
-    // }
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
     return master_client_.RemoveAll(force);
 }
 
