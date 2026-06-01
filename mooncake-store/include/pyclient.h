@@ -422,7 +422,7 @@ inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
     for (const auto &[key, cached_result] : cached_query_results) {
         auto query_result =
             from_cached_query_result_response(cached_result, now);
-        if (query_result && query_result->IsLeaseExpired(now)) {
+        if (!query_result || query_result->IsLeaseExpired(now)) {
             continue;
         }
         query_result_cache.emplace(key, std::move(query_result));

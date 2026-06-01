@@ -87,7 +87,7 @@ struct TensorIntoFragment {
 
 struct PlannedQueryResult {
     std::string read_key;
-    CachedQueryResultResponse cached_query_result;
+    std::optional<CachedQueryResultResponse> cached_query_result;
 };
 
 struct TensorIntoPlan {
@@ -114,7 +114,7 @@ enum class ParallelismShardReadStorageRoute {
 struct ReconstructedShardSource {
     std::string read_key;
     ParsedTensorMetadata metadata;
-    CachedQueryResultResponse cached_query_result;
+    std::optional<CachedQueryResultResponse> cached_query_result;
 };
 
 struct FullTensorReconstructionSources {

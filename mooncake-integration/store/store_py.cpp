@@ -290,60 +290,11 @@ class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
     bool use_dummy_client_{false};
-    std::unique_ptr<char[]> metadata_prefix_scratch_;
-    size_t metadata_prefix_scratch_size_{0};
-    std::mutex metadata_prefix_scratch_mutex_;
 
     MooncakeStorePyWrapper() = default;
 
-    ~MooncakeStorePyWrapper() { release_metadata_prefix_scratch(); }
-
-    void release_metadata_prefix_scratch_locked() {
-        if (metadata_prefix_scratch_) {
-            if (store_ && is_client_initialized()) {
-                store_->unregister_buffer(metadata_prefix_scratch_.get());
-            }
-            metadata_prefix_scratch_.reset();
-            metadata_prefix_scratch_size_ = 0;
-        }
-    }
-
-    void release_metadata_prefix_scratch() {
-        std::lock_guard<std::mutex> lock(metadata_prefix_scratch_mutex_);
-        release_metadata_prefix_scratch_locked();
-    }
-
-    bool ensure_metadata_prefix_scratch_locked(size_t slot_count,
-                                               const std::string &context) {
-        const size_t required_size =
-            std::max<size_t>(slot_count, 1) * sizeof(TensorMetadata);
-        if (metadata_prefix_scratch_size_ >= required_size &&
-            metadata_prefix_scratch_) {
-            return true;
-        }
-
-        release_metadata_prefix_scratch_locked();
-        auto buffer = std::make_unique<char[]>(required_size);
-        if (store_->register_buffer(buffer.get(), required_size) != 0) {
-            LOG(ERROR) << context
-                       << ": failed to register metadata scratch buffer";
-            return false;
-        }
-
-        metadata_prefix_scratch_ = std::move(buffer);
-        metadata_prefix_scratch_size_ = required_size;
-        return true;
-    }
-
-    bool ensure_metadata_prefix_scratch(size_t slot_count,
-                                        const std::string &context) {
-        std::lock_guard<std::mutex> lock(metadata_prefix_scratch_mutex_);
-        return ensure_metadata_prefix_scratch_locked(slot_count, context);
-    }
-
     // Helper to initialize real client and register it
     std::shared_ptr<RealClient> init_real_client() {
-        release_metadata_prefix_scratch();
         auto &resource_tracker = ResourceTracker::getInstance();
         auto real_client = RealClient::create();
         use_dummy_client_ = false;
@@ -2071,7 +2022,6 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
-                self.release_metadata_prefix_scratch();
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
@@ -2190,7 +2140,6 @@ PYBIND11_MODULE(store, m) {
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
-                 self.release_metadata_prefix_scratch();
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;

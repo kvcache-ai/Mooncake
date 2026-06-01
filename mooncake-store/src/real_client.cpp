@@ -3382,7 +3382,7 @@ RealClient::get_into_ranges_internal(
     auto now = std::chrono::steady_clock::now();
     if (query_result_cache != nullptr) {
         for (const auto &[key, query_result] : *query_result_cache) {
-            if (query_result && query_result->IsLeaseExpired(now)) {
+            if (!query_result || query_result->IsLeaseExpired(now)) {
                 continue;
             }
             metadata_cache.emplace(key,

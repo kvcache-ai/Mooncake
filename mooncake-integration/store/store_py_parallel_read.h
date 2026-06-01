@@ -82,40 +82,39 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
 
     mooncake::PyClient::QueryResultCache query_result_cache;
     auto now = std::chrono::steady_clock::now();
-    std::vector<void *> metadata_buffers;
     std::vector<size_t> metadata_key_indices;
-    metadata_buffers.reserve(keys.size());
     metadata_key_indices.reserve(keys.size());
+    std::vector<std::optional<CachedQueryResultResponse>>
+        reusable_query_results(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
         auto query_result =
             from_cached_query_result_response(cached_query_results[i], now);
-        if (!query_result) {
-            LOG(ERROR) << context << ": missing query result for key "
-                       << keys[i] << ": " << toString(query_result.error());
-            return std::nullopt;
-        }
-        if (query_result->IsLeaseExpired(now)) {
-            LOG(ERROR) << context << ": expired query result for key "
-                       << keys[i];
-            return std::nullopt;
+        if (!query_result || query_result->IsLeaseExpired(now)) {
+            continue;
         }
 
         query_result_cache.emplace(keys[i], std::move(query_result));
+        reusable_query_results[i] = cached_query_results[i];
         metadata_key_indices.push_back(i);
     }
 
     std::vector<std::optional<ParsedTensorMetadata>> prefix_metadata(
         keys.size());
     if (!metadata_key_indices.empty()) {
-        std::unique_lock<std::mutex> scratch_lock(
-            metadata_prefix_scratch_mutex_);
-        if (!ensure_metadata_prefix_scratch_locked(metadata_key_indices.size(),
-                                                   context)) {
+        const size_t scratch_size =
+            std::max<size_t>(metadata_key_indices.size(), 1) *
+            sizeof(TensorMetadata);
+        auto scratch_buffer = std::make_unique<char[]>(scratch_size);
+        if (store_->register_buffer(scratch_buffer.get(), scratch_size) != 0) {
+            LOG(ERROR) << context
+                       << ": failed to register metadata scratch buffer";
             return std::nullopt;
         }
 
-        char *scratch_base = metadata_prefix_scratch_.get();
+        char *scratch_base = scratch_buffer.get();
+        std::vector<void *> metadata_buffers;
+        metadata_buffers.reserve(metadata_key_indices.size());
         std::vector<std::vector<std::string>> metadata_all_keys(
             metadata_key_indices.size());
         std::vector<std::vector<std::vector<size_t>>> metadata_all_dst_offsets(
@@ -130,10 +129,14 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
             metadata_all_dst_offsets[i] = {{i * sizeof(TensorMetadata)}};
         }
 
-        py::gil_scoped_release release_gil;
-        auto metadata_results = store_->get_into_ranges(
-            metadata_buffers, metadata_all_keys, metadata_all_dst_offsets,
-            metadata_all_src_offsets, metadata_all_sizes, &query_result_cache);
+        std::vector<std::vector<std::vector<int64_t>>> metadata_results;
+        {
+            py::gil_scoped_release release_gil;
+            metadata_results = store_->get_into_ranges(
+                metadata_buffers, metadata_all_keys, metadata_all_dst_offsets,
+                metadata_all_src_offsets, metadata_all_sizes,
+                &query_result_cache);
+        }
         for (size_t i = 0;
              i < metadata_results.size() && i < metadata_key_indices.size();
              ++i) {
@@ -147,14 +150,17 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
                     keys[key_index]);
             }
         }
+        store_->unregister_buffer(scratch_buffer.get());
     }
 
     std::vector<ReconstructedShardSource> sources;
     sources.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         auto parsed = std::move(prefix_metadata[i]);
+        auto reusable_query_result = reusable_query_results[i];
         if (!parsed.has_value()) {
             parsed = get_tensor_metadata(keys[i]);
+            reusable_query_result.reset();
         }
         if (!parsed.has_value()) {
             LOG(ERROR) << context
@@ -162,8 +168,8 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
                        << keys[i];
             return std::nullopt;
         }
-        sources.push_back(ReconstructedShardSource{keys[i], *parsed,
-                                                   cached_query_results[i]});
+        sources.push_back(
+            ReconstructedShardSource{keys[i], *parsed, reusable_query_result});
     }
     return sources;
 }
@@ -387,8 +393,10 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             covered[static_cast<size_t>(idx)] = true;
         }
 
-        plan.query_results.push_back(
-            PlannedQueryResult{source.read_key, source.cached_query_result});
+        if (source.cached_query_result.has_value()) {
+            plan.query_results.push_back(PlannedQueryResult{
+                source.read_key, std::move(source.cached_query_result)});
+        }
         for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
             const size_t dst_offset =
                 region->offset + sizeof(TensorMetadata) +
@@ -1234,8 +1242,11 @@ std::vector<bool> execute_tensor_into_plan_transfers(
         auto now = std::chrono::steady_clock::now();
         for (auto &plan : plans) {
             for (auto &planned_query_result : plan.query_results) {
+                if (!planned_query_result.cached_query_result.has_value()) {
+                    continue;
+                }
                 auto query_result = from_cached_query_result_response(
-                    planned_query_result.cached_query_result, now);
+                    *planned_query_result.cached_query_result, now);
                 if (!query_result || query_result->IsLeaseExpired(now)) {
                     continue;
                 }
