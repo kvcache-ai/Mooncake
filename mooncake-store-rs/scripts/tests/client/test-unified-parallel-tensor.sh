@@ -114,7 +114,6 @@ fi
 "${DAEMON_ARGS[@]}" >"${DAEMON_LOG}" 2>&1 &
 PIDS+=($!)
 wait_for_healthz "127.0.0.1:${METRICS_PORT}"
-sleep 0.5
 
 echo "==> running unified parallel tensor E2E tests"
 python3 ./scripts/tests/client/test_unified_parallel_tensor.py \
