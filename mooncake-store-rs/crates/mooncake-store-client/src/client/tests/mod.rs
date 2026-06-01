@@ -15976,10 +15976,87 @@ fn batch_is_exist_returns_false_when_readable_filter_excludes_all_replica_owners
     mooncake_store_route::update_readable_filter(&namespace, None);
 
     assert!(
-        reader
+        !reader
             .is_exist("is-exist-filter-key")
             .expect("is_exist should succeed"),
-        "route should be visible again after readable filter deactivation"
+        "route should remain absent after eviction even when readable filter is deactivated"
+    );
+}
+
+#[test]
+fn is_exist_evicts_unreadable_route_and_sets_version_floor() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let dead_transport = Arc::new(TestTransport::new("evict-floor-dead-seg"));
+    let writer_transport = Arc::new(dead_transport.peer("evict-floor-writer-seg"));
+
+    let dead_store = StoreClientBuilder::new(metadata.clone(), "evict-floor-dead")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(dead_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("dead store build should succeed");
+    let writer = StoreClientBuilder::new(metadata.clone(), "evict-floor-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .live_client_sync_interval(Duration::from_secs(60))
+        .transport(writer_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    dead_store
+        .register_local_memory()
+        .expect("dead store memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&dead_store, &writer]);
+
+    let data = b"evict-floor-test-data-payload!";
+    let policy = ReplicationPolicy::new()
+        .prefer_local(false)
+        .preferred_storage_owner(dead_store.runtime_id().storage_key());
+    dead_store
+        .put_with_policy("evict-floor-key", data, &policy)
+        .expect("initial put should succeed");
+
+    let initial_route = writer
+        .get_route("evict-floor-key")
+        .expect("get route should succeed")
+        .expect("route should exist after put");
+    let initial_version = initial_route.version;
+
+    let namespace = metadata.route_namespace();
+    mooncake_store_route::update_readable_filter(
+        &namespace,
+        Some(BTreeSet::from([writer.runtime_id().clone()])),
+    );
+
+    assert!(
+        !writer
+            .is_exist("evict-floor-key")
+            .expect("is_exist should succeed"),
+        "is_exist should return false when all replicas are unreadable"
+    );
+
+    mooncake_store_route::update_readable_filter(&namespace, None);
+
+    let new_data = b"evict-floor-test-data-updated";
+    writer
+        .put("evict-floor-key", new_data)
+        .expect("re-put after eviction should succeed");
+
+    let new_route = writer
+        .get_route("evict-floor-key")
+        .expect("get route should succeed")
+        .expect("route should exist after re-put");
+    assert!(
+        new_route.version > initial_version,
+        "re-put version {:?} must exceed evicted version {:?} due to version_floor",
+        new_route.version,
+        initial_version
     );
 }
 

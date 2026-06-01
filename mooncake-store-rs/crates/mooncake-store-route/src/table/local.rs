@@ -44,6 +44,22 @@ impl LocalRouteTable {
             .collect()
     }
 
+    pub(crate) fn evict_unreadable_routes(
+        &mut self,
+        keys: &[ObjectKey],
+        readable: &BTreeSet<ClientRuntimeId>,
+    ) {
+        for key in keys {
+            let dominated = self
+                .routes
+                .get(&key.0)
+                .is_some_and(|route| !route.replicas.iter().any(|r| readable.contains(&r.owner)));
+            if dominated {
+                self.apply_update(key, None);
+            }
+        }
+    }
+
     pub(crate) fn version_floor(&self, key: &ObjectKey) -> Option<RouteVersion> {
         self.version_floors.get(&key.0).copied()
     }
