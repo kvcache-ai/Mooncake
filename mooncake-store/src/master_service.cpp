@@ -1215,8 +1215,8 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            bool had_disk_on_segment = metadata.HasReplica(
-                [&segment_name](const Replica& r) {
+            bool had_disk_on_segment =
+                metadata.HasReplica([&segment_name](const Replica& r) {
                     if (!r.is_local_disk_replica()) return false;
                     for (const auto& name : r.get_segment_names()) {
                         if (name.has_value() && name.value() == segment_name)
@@ -4933,9 +4933,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         evict_ratio_lowerbound = evict_ratio_target;
     }
 
-    LOG(INFO) << "BatchEvict started, evict_ratio_target=" << evict_ratio_target
-              << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
-
     auto now = std::chrono::system_clock::now();
 
     auto can_evict_replicas = [](const ObjectMetadata& metadata) {
@@ -5185,8 +5182,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         candidates.reserve(total);
     }
     for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(),
-                          std::make_move_iterator(v.begin()),
+        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
                           std::make_move_iterator(v.end()));
     }
 
@@ -5210,16 +5206,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
     for (auto& v : local_soft_pin) {
         soft_pin_objects.insert(soft_pin_objects.end(),
-                               std::make_move_iterator(v.begin()),
-                               std::make_move_iterator(v.end()));
+                                std::make_move_iterator(v.begin()),
+                                std::make_move_iterator(v.end()));
     }
 
     if (total_eviction_base == 0) {
         need_mem_eviction_ = false;
-        LOG(INFO) << "[EVICT-DIAG] object_count=" << object_count
-                  << " disk_object_count=" << (object_count - total_eviction_base)
-                  << " eviction_base=0 shards=0/" << kNumShards
-                  << " (no evictable memory objects)";
+        VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
+                << " disk_object_count=" << (object_count - total_eviction_base)
+                << " eviction_base=0 shards=0/" << kNumShards
+                << " (no evictable memory objects)";
         return;
     }
 
@@ -5233,12 +5229,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
             std::ceil(total_eviction_base * evict_ratio_target);
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
-        std::nth_element(
-            candidates.begin(), candidates.begin() + (evict_num - 1),
-            candidates.end(),
-            [](const Candidate& a, const Candidate& b) {
-                return a.lease_timeout < b.lease_timeout;
-            });
+        std::nth_element(candidates.begin(),
+                         candidates.begin() + (evict_num - 1), candidates.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.lease_timeout < b.lease_timeout;
+                         });
         auto target_timeout = candidates[evict_num - 1].lease_timeout;
 
         for (auto& c : candidates) {
@@ -5261,8 +5256,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
             auto evict_result = try_evict_group_or_object(
-                c.tenant_id, c.key, it->second, shard,
-                tenant_state, /*allow_soft_pinned=*/false);
+                c.tenant_id, c.key, it->second, shard, tenant_state,
+                /*allow_soft_pinned=*/false);
             total_freed_size += evict_result.freed_bytes;
             if (!it->second.IsValid()) {
                 EraseMetadata(tenant_state, it, c.tenant_id);
@@ -5342,8 +5337,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.begin(),
                 soft_pin_objects.begin() + (soft_pin_evict_num - 1),
                 soft_pin_objects.end());
-            auto soft_target_timeout =
-                soft_pin_objects[soft_pin_evict_num - 1];
+            auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
                 MetadataShardAccessorRW shard(this,
@@ -5424,24 +5418,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     ? (double)evicted_count / total_eviction_base
                     : 0.0)
             << ", target_evict_ratio=" << evict_ratio_target;
-    LOG(INFO) << "[EVICT-DIAG] object_count=" << object_count
-              << " disk_object_count=" << (object_count - total_eviction_base)
-              << " eviction_base=" << total_eviction_base
-              << " disk_ratio="
-              << (object_count > 0
-                      ? (double)(object_count - total_eviction_base) / object_count
+    VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
+            << " disk_object_count=" << (object_count - total_eviction_base)
+            << " eviction_base=" << total_eviction_base << " disk_ratio="
+            << (object_count > 0
+                    ? (double)(object_count - total_eviction_base) /
+                          object_count
+                    : 0.0)
+            << " ideal_evict_num_inflated="
+            << (long)std::ceil(object_count * evict_ratio_target)
+            << " ideal_evict_num_correct="
+            << (long)std::ceil(total_eviction_base * evict_ratio_target);
+    LOG(INFO) << "[EVICT-RESULT] evicted_count=" << evicted_count
+              << ", eviction_base=" << total_eviction_base
+              << ", actual_evict_ratio="
+              << (total_eviction_base > 0
+                      ? (double)evicted_count / total_eviction_base
                       : 0.0)
-              << " ideal_evict_num_inflated="
-              << (long)std::ceil(object_count * evict_ratio_target)
-              << " ideal_evict_num_correct="
-              << (long)std::ceil(total_eviction_base * evict_ratio_target);
-    LOG(WARNING) << "[EVICT-RESULT] evicted_count=" << evicted_count
-                 << ", eviction_base=" << total_eviction_base
-                 << ", actual_evict_ratio="
-                 << (total_eviction_base > 0
-                         ? (double)evicted_count / total_eviction_base
-                         : 0.0)
-                 << ", target_evict_ratio=" << evict_ratio_target;
+              << ", target_evict_ratio=" << evict_ratio_target;
     if (offload_on_evict_ && evicted_count == 0 && offload_deferred_count > 0) {
         LOG(WARNING) << "[EVICT] No memory freed this cycle; "
                      << offload_deferred_count
