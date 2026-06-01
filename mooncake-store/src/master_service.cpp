@@ -690,8 +690,7 @@ std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const std::string& tenant_id,
-    MetadataShardAccessorRW* shard) {
+    const std::string& tenant_id, MetadataShardAccessorRW* shard) {
     bool had_completed_disk = it->second.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -1186,10 +1185,9 @@ auto MasterService::BatchReplicaClear(
                 });
 
             // Erase the entire metadata (all replicas will be deallocated)
-            bool had_completed_disk = metadata.HasReplica(
-                [](const Replica& r) {
-                    return r.is_local_disk_replica() && r.is_completed();
-                });
+            bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+                return r.is_local_disk_replica() && r.is_completed();
+            });
             auto& shard = accessor.GetShard();
             accessor.Erase();
             shard.OnDiskReplicaRemoved(had_completed_disk);
@@ -1252,13 +1250,13 @@ auto MasterService::BatchReplicaClear(
                 })) {
                 auto& shard = accessor.GetShard();
                 shard.OnDiskReplicaRemoved(had_completed_disk_on_segment,
-                                            metadata);
+                                           metadata);
             }
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
-                bool had_completed_disk = metadata.HasReplica(
-                    [](const Replica& r) {
+                bool had_completed_disk =
+                    metadata.HasReplica([](const Replica& r) {
                         return r.is_local_disk_replica() && r.is_completed();
                     });
                 auto& shard = accessor.GetShard();
@@ -1639,7 +1637,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);                it = tenant_state.metadata.end();
+                EraseMetadata(tenant_state, it, object_id.tenant_id, &shard);
+                it = tenant_state.metadata.end();
             } else {
                 auto& metadata = it->second;
                 if (metadata.HasReplica(&Replica::fn_is_completed) ||
@@ -2251,10 +2250,9 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        bool had_completed_disk = metadata.HasReplica(
-            [](const Replica& r) {
-                return r.is_local_disk_replica() && r.is_completed();
-            });
+        bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+            return r.is_local_disk_replica() && r.is_completed();
+        });
         metadata.EraseReplicas([&client_id](const Replica& replica) {
             return replica.is_local_disk_replica() &&
                    replica.get_descriptor()
@@ -2846,8 +2844,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                   &shard);
+                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -3768,8 +3765,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;
@@ -3784,8 +3780,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
                 if (!metadata.IsValid()) {
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
                 }
                 key_it = tenant_state.processing_keys.erase(key_it);
                 continue;

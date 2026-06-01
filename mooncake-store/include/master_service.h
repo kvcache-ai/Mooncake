@@ -1269,8 +1269,7 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const std::string& tenant_id,
-        MetadataShardAccessorRW* shard);
+        const std::string& tenant_id, MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
