@@ -45,14 +45,48 @@ pub(crate) fn authority_get_many(
     keys: &[ObjectKey],
 ) -> Result<Vec<Option<ObjectRoute>>> {
     let mesh = route_mesh(namespace);
-    let slot = mesh
-        .authorities
-        .get(&authority.0)
-        .ok_or_else(|| not_attached(authority))?;
-    if slot.ref_count == 0 {
-        return Err(not_attached(authority));
+    let filter = mesh.readable_filter.lock().clone();
+    match filter {
+        None => {
+            let slot = mesh
+                .authorities
+                .get(&authority.0)
+                .ok_or_else(|| not_attached(authority))?;
+            if slot.ref_count == 0 {
+                return Err(not_attached(authority));
+            }
+            Ok(slot.table.get_many(keys))
+        }
+        Some(readable) => {
+            let mut slot = mesh
+                .authorities
+                .get_mut(&authority.0)
+                .ok_or_else(|| not_attached(authority))?;
+            if slot.ref_count == 0 {
+                return Err(not_attached(authority));
+            }
+            let routes = slot.table.get_many(keys);
+            let evict_keys: Vec<_> = keys
+                .iter()
+                .zip(routes.iter())
+                .filter(|(_, route)| {
+                    route.as_ref().is_some_and(|r| {
+                        !r.replicas.iter().any(|rep| readable.contains(&rep.owner))
+                    })
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !evict_keys.is_empty() {
+                slot.table.evict_unreadable_routes(&evict_keys, &readable);
+            }
+            Ok(routes
+                .into_iter()
+                .map(|route| {
+                    route.filter(|r| r.replicas.iter().any(|rep| readable.contains(&rep.owner)))
+                })
+                .collect())
+        }
     }
-    Ok(slot.table.get_many(keys))
 }
 
 pub(crate) fn authority_contains_many(
