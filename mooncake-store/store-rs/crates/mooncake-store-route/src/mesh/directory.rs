@@ -83,8 +83,8 @@ impl EmbeddedWrhRouteDirectory {
             authority_client.clone(),
             membership.clone(),
         );
-        let baseline_candidates = authority_candidates(membership.as_ref(), lease, false)
-            .unwrap_or_default();
+        let baseline_candidates =
+            authority_candidates(membership.as_ref(), lease, false).unwrap_or_default();
         let baseline_member_ids = baseline_candidates
             .iter()
             .map(|c| c.runtime.stable_id.0.clone())
@@ -535,7 +535,12 @@ impl EmbeddedWrhRouteDirectory {
                 Ok(found) => {
                     successful_queries = successful_queries.saturating_add(1);
                     for route in found {
-                        merge_route_listing(&mut routes, route, &authority.runtime.to_string(), &self.namespace);
+                        merge_route_listing(
+                            &mut routes,
+                            route,
+                            &authority.runtime.to_string(),
+                            &self.namespace,
+                        );
                     }
                 }
                 Err(error) => {
@@ -1212,6 +1217,8 @@ fn observer_start_rank(observer: &ClientLease, topk: usize) -> usize {
         return 0;
     }
     let id = &observer.runtime.stable_id.0;
-    let hash = id.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let hash = id
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
     (hash as usize) % topk
 }

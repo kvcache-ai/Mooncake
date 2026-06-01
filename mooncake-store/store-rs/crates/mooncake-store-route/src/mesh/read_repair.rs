@@ -78,10 +78,8 @@ pub(crate) fn merge_fresher_route(
         None => *current = Some(candidate),
         Some(existing) if candidate.version > existing.version => *current = Some(candidate),
         Some(existing) if candidate.version == existing.version && *existing != candidate => {
-            let candidate_readable =
-                crate::route_has_readable_replicas(namespace, &candidate);
-            let existing_readable =
-                crate::route_has_readable_replicas(namespace, existing);
+            let candidate_readable = crate::route_has_readable_replicas(namespace, &candidate);
+            let existing_readable = crate::route_has_readable_replicas(namespace, existing);
             let choose_candidate = match (candidate_readable, existing_readable) {
                 (true, false) => true,
                 (false, true) => false,
@@ -117,10 +115,8 @@ pub(crate) fn merge_route_listing(
             routes.insert(candidate.key.0.clone(), candidate);
         }
         Some(current) if candidate.version == current.version && *current != candidate => {
-            let candidate_readable =
-                crate::route_has_readable_replicas(namespace, &candidate);
-            let existing_readable =
-                crate::route_has_readable_replicas(namespace, current);
+            let candidate_readable = crate::route_has_readable_replicas(namespace, &candidate);
+            let existing_readable = crate::route_has_readable_replicas(namespace, current);
             let choose_candidate = match (candidate_readable, existing_readable) {
                 (true, false) => true,
                 (false, true) => false,
