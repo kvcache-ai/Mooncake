@@ -1167,8 +1167,8 @@ class MasterService {
         const MetadataShard& get() const { return shard_; }
 
         // Called after adding a LOCAL_DISK replica. Increments
-        // disk_object_count if this is the first LOCAL_DISK replica
-        // for the object (i.e., exactly 1 completed disk replica now).
+        // disk_object_count if this is the first completed LOCAL_DISK
+        // replica for the object (i.e., exactly 1 completed disk replica now).
         void OnDiskReplicaAdded(const ObjectMetadata& metadata) {
             size_t disk_count = metadata.CountReplicas([](const Replica& r) {
                 return r.is_local_disk_replica() && r.is_completed();
@@ -1176,10 +1176,19 @@ class MasterService {
             if (disk_count == 1) shard_.disk_object_count++;
         }
 
-        // Called after removing a LOCAL_DISK replica. Decrements
-        // disk_object_count if the object no longer has any
-        // completed LOCAL_DISK replicas.
-        void OnDiskReplicaRemoved(const ObjectMetadata& metadata) {
+        // Called after removing a LOCAL_DISK replica, or when erasing an
+        // object that had one. Pass had_completed_disk=true if the object
+        // had at least one completed LOCAL_DISK replica before the removal.
+        // When the entire object is being erased (metadata no longer valid),
+        // pass object_erased=true to skip the still_has_disk check.
+        void OnDiskReplicaRemoved(bool had_completed_disk,
+                                  const ObjectMetadata& metadata,
+                                  bool object_erased = false) {
+            if (!had_completed_disk) return;
+            if (object_erased) {
+                shard_.disk_object_count--;
+                return;
+            }
             bool still_has_disk = metadata.HasReplica([](const Replica& r) {
                 return r.is_local_disk_replica() && r.is_completed();
             });
@@ -1258,6 +1267,11 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const std::string& tenant_id,
+        MetadataShardAccessorRW* shard);
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1494,7 +1508,8 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id);
+            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
+                                    &shard_guard_);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }
