@@ -445,6 +445,19 @@ impl TensorMetadata {
         axes: &[ParallelAxisSpec],
         data_bytes: u64,
     ) -> Self {
+        debug_assert_eq!(
+            local_shape.len(),
+            global_shape.len(),
+            "local_shape and global_shape must have same length"
+        );
+        debug_assert!(
+            global_shape
+                .iter()
+                .zip(local_shape.iter())
+                .all(|(g, l)| l <= g),
+            "local_shape dimensions must not exceed global_shape"
+        );
+
         let ndim = global_shape.len().min(MAX_TENSOR_DIMS) as i32;
         let data_offset = mem::size_of::<TensorMetadata>() as u64;
         let axis_count = axes.len().min(MAX_LAYOUT_AXES) as u32;

@@ -311,7 +311,9 @@ impl PyMooncakeDistributedStore {
                 self.put_tensor_object(key, &metadata, &info, tenant, replica_count)
             }
             WriteRoute::LegacySingleTp | WriteRoute::MultiAxisParallelism => {
-                let spec = par_spec.as_ref().unwrap();
+                let spec = par_spec
+                    .as_ref()
+                    .expect("parallelism routes must have par_spec");
                 let storage_key = get_parallelism_key_name(key, spec);
                 let global_shape = compute_global_shape(&info.shape, spec);
                 let metadata = TensorMetadata::build_shard(
@@ -324,7 +326,7 @@ impl PyMooncakeDistributedStore {
                 self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)
             }
             WriteRoute::WriterPartition => {
-                let wp = wp_spec.unwrap();
+                let wp = wp_spec.expect("WriterPartition route must have wp_spec");
                 let storage_key = get_writer_partition_key_name(key, wp.rank);
 
                 let global_shape = info.shape.clone();
@@ -501,6 +503,8 @@ impl PyMooncakeDistributedStore {
 
         let mut buffer = vec![0u8; total_size];
         buffer[..TensorMetadata::WIRE_SIZE].copy_from_slice(metadata.as_bytes());
+        // Safety: data_ptr comes from extract_tensor_info which verified is_contiguous,
+        // and data_bytes = numel * element_size is the exact allocation size.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 info.data_ptr as *const u8,
@@ -544,6 +548,11 @@ impl PyMooncakeDistributedStore {
         }
 
         let bytes_read = self.get_into_buffer_internal(key, buffer_ptr, size, tenant)?;
+        if bytes_read > size {
+            return Err(PyRuntimeError::new_err(format!(
+                "bytes_read ({bytes_read}) exceeds buffer size ({size})"
+            )));
+        }
 
         let data = unsafe { std::slice::from_raw_parts(buffer_ptr as *const u8, bytes_read) };
         let parsed = TensorMetadata::parse(data).ok_or_else(|| {
@@ -987,7 +996,8 @@ impl PyMooncakeDistributedStore {
     ) -> PyResult<Vec<ShardSource>> {
         let mut sources = Vec::new();
 
-        for rank in 0..1024 {
+        const MAX_LEGACY_TP_RANKS: u32 = 1024;
+        for rank in 0..MAX_LEGACY_TP_RANKS {
             let key = format!("{base_key}_tp_{rank}");
             let raw = match self.get_raw_bytes(&key, tenant) {
                 Ok(v) => v,
