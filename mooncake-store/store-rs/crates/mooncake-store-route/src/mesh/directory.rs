@@ -458,6 +458,7 @@ impl EmbeddedWrhRouteDirectory {
                                     route,
                                     &authority.runtime.to_string(),
                                     &key,
+                                    &self.namespace,
                                 );
                             }
                             Ok(None) => {
@@ -524,7 +525,7 @@ impl EmbeddedWrhRouteDirectory {
                 Ok(found) => {
                     successful_queries = successful_queries.saturating_add(1);
                     for route in found {
-                        merge_route_listing(&mut routes, route, &authority.runtime.to_string());
+                        merge_route_listing(&mut routes, route, &authority.runtime.to_string(), &self.namespace);
                     }
                 }
                 Err(error) => {
