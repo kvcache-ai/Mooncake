@@ -383,8 +383,13 @@ pub fn get_parallelism_key_name(base_key: &str, spec: &TensorParallelismSpec) ->
 }
 
 /// Generate a writer-partition shard key.
-pub fn get_writer_partition_key_name(base_key: &str, rank: i32) -> String {
-    format!("{base_key}__writer_{rank}")
+pub fn get_writer_partition_key_name(
+    base_key: &str,
+    rank: i32,
+    size: i32,
+    split_dim: i32,
+) -> String {
+    format!("{base_key}__writer_{rank}of{size}_sd{split_dim}")
 }
 
 /// Generate a parallelism manifest key.
@@ -794,8 +799,12 @@ mod tests {
     #[test]
     fn test_writer_partition_key_name() {
         assert_eq!(
-            get_writer_partition_key_name("model.weight", 3),
-            "model.weight__writer_3"
+            get_writer_partition_key_name("model.weight", 3, 4, 0),
+            "model.weight__writer_3of4_sd0"
+        );
+        assert_eq!(
+            get_writer_partition_key_name("model.weight", 1, 8, 1),
+            "model.weight__writer_1of8_sd1"
         );
     }
 
