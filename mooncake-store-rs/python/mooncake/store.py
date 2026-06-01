@@ -783,12 +783,12 @@ class MooncakeDistributedStore:
     def put_tensor_with_parallelism(
         self,
         key: str,
-        tensor,
+        tensor: torch.Tensor,
         *,
-        parallelism=None,
-        writer_partition=None,
+        parallelism: TensorParallelism | None = None,
+        writer_partition: tuple[int, int, int] | None = None,
         tenant: str | None = None,
-        config=None,
+        config: ReplicateConfig | None = None,
     ):
         """Store a tensor with parallelism metadata.
 
@@ -813,12 +813,12 @@ class MooncakeDistributedStore:
     def upsert_tensor_with_parallelism(
         self,
         key: str,
-        tensor,
+        tensor: torch.Tensor,
         *,
-        parallelism=None,
-        writer_partition=None,
+        parallelism: TensorParallelism | None = None,
+        writer_partition: tuple[int, int, int] | None = None,
         tenant: str | None = None,
-        config=None,
+        config: ReplicateConfig | None = None,
     ):
         """Upsert a tensor with parallelism: removes existing then puts."""
         return self._invoke(
@@ -835,8 +835,8 @@ class MooncakeDistributedStore:
         self,
         key: str,
         *,
-        target=None,
-        tensor=None,
+        target: ReadTarget | None = None,
+        tensor: torch.Tensor | None = None,
         tenant: str | None = None,
     ):
         """Read a tensor with parallelism-aware routing.
