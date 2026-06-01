@@ -645,6 +645,180 @@ def test_upsert_direct_full(store, tenant):
     assert_tensor_equal(result, weight_v2, "upsert direct full should be v2")
 
 
+def test_tp_split_dim1_cross_tp(store, tenant):
+    """Cross-TP reconstruction with split_dim=1: writer TP=2, reader TP=4."""
+    full_weight = generate_weight([64, 128], seed=30)
+    writer_tp = 2
+    reader_tp = 4
+
+    for rank in range(writer_tp):
+        shard = compute_tp_shard(full_weight, rank, writer_tp, split_dim=1)
+        par = TensorParallelism([TP(rank, writer_tp, split_dim=1)])
+        store.put_tensor_with_parallelism(
+            "test_sd1_cross.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    for rank in range(reader_tp):
+        par = TensorParallelism([TP(rank, reader_tp, split_dim=1)])
+        result = store.get_tensor_with_parallelism(
+            "test_sd1_cross.weight",
+            target=ReadTarget(READ_MODE_SHARD, parallelism=par),
+            tenant=tenant,
+        )
+        expected = compute_tp_shard(full_weight, rank, reader_tp, split_dim=1)
+        assert_tensor_equal(result, expected, f"sd1 cross 2->4 rank {rank}")
+
+
+def test_tp_split_dim1_merge_cross_tp(store, tenant):
+    """Cross-TP merge with split_dim=1: writer TP=4, reader TP=2."""
+    full_weight = generate_weight([64, 128], seed=31)
+    writer_tp = 4
+    reader_tp = 2
+
+    for rank in range(writer_tp):
+        shard = compute_tp_shard(full_weight, rank, writer_tp, split_dim=1)
+        par = TensorParallelism([TP(rank, writer_tp, split_dim=1)])
+        store.put_tensor_with_parallelism(
+            "test_sd1_merge.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    for rank in range(reader_tp):
+        par = TensorParallelism([TP(rank, reader_tp, split_dim=1)])
+        result = store.get_tensor_with_parallelism(
+            "test_sd1_merge.weight",
+            target=ReadTarget(READ_MODE_SHARD, parallelism=par),
+            tenant=tenant,
+        )
+        expected = compute_tp_shard(full_weight, rank, reader_tp, split_dim=1)
+        assert_tensor_equal(result, expected, f"sd1 merge 4->2 rank {rank}")
+
+
+def test_tp_split_dim1_full_reconstruction(store, tenant):
+    """Full reconstruction from split_dim=1 shards."""
+    full_weight = generate_weight([64, 128], seed=32)
+    tp_size = 4
+
+    for rank in range(tp_size):
+        shard = compute_tp_shard(full_weight, rank, tp_size, split_dim=1)
+        par = TensorParallelism([TP(rank, tp_size, split_dim=1)])
+        store.put_tensor_with_parallelism(
+            "test_sd1_full.weight", shard, parallelism=par, tenant=tenant
+        )
+
+    result = store.get_tensor_with_parallelism(
+        "test_sd1_full.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "sd1 full reconstruction")
+
+
+def test_writer_partition_roundtrip(store, tenant):
+    """Writer partition: 4 writers each put their shard, reader gets FULL."""
+    full_weight = generate_weight([256, 128], seed=40)
+    num_writers = 4
+    split_dim = 0
+
+    for rank in range(num_writers):
+        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
+        store.put_tensor_with_parallelism(
+            "test_wp_rt.weight",
+            shard,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    result = store.get_tensor_with_parallelism(
+        "test_wp_rt.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "writer partition full roundtrip")
+
+
+def test_writer_partition_to_tp_read(store, tenant):
+    """Writer partition=4 stored, reader reads with TP=2 (shard mode)."""
+    full_weight = generate_weight([128, 64], seed=41)
+    num_writers = 4
+    split_dim = 0
+
+    for rank in range(num_writers):
+        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
+        store.put_tensor_with_parallelism(
+            "test_wp_tp.weight",
+            shard,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    reader_tp = 2
+    for rank in range(reader_tp):
+        par = TensorParallelism([TP(rank, reader_tp)])
+        result = store.get_tensor_with_parallelism(
+            "test_wp_tp.weight",
+            target=ReadTarget(READ_MODE_SHARD, parallelism=par),
+            tenant=tenant,
+        )
+        expected = compute_tp_shard(full_weight, rank, reader_tp, split_dim=split_dim)
+        assert_tensor_equal(result, expected, f"wp->tp rank {rank}")
+
+
+def test_writer_partition_split_dim1(store, tenant):
+    """Writer partition with split_dim=1."""
+    full_weight = generate_weight([64, 128], seed=42)
+    num_writers = 4
+    split_dim = 1
+
+    for rank in range(num_writers):
+        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
+        store.put_tensor_with_parallelism(
+            "test_wp_sd1.weight",
+            shard,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    result = store.get_tensor_with_parallelism(
+        "test_wp_sd1.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "writer partition sd1 full roundtrip")
+
+
+def test_writer_partition_upsert(store, tenant):
+    """Upsert correctness for writer_partition."""
+    weight_v1 = generate_weight([64, 32], seed=43)
+    weight_v2 = generate_weight([64, 32], seed=44)
+    num_writers = 2
+    split_dim = 0
+
+    for rank in range(num_writers):
+        shard = compute_tp_shard(weight_v1, rank, num_writers, split_dim=split_dim)
+        store.put_tensor_with_parallelism(
+            "test_wp_upsert.weight",
+            shard,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    for rank in range(num_writers):
+        shard = compute_tp_shard(weight_v2, rank, num_writers, split_dim=split_dim)
+        store.upsert_tensor_with_parallelism(
+            "test_wp_upsert.weight",
+            shard,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    result = store.get_tensor_with_parallelism(
+        "test_wp_upsert.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, weight_v2, "writer partition upsert should be v2")
+
+
 def main():
     args = parse_args()
 
@@ -710,6 +884,17 @@ def main():
 
     print("\n  --- Upsert variants ---")
     run_test("upsert direct full", test_upsert_direct_full, store, tenant)
+
+    print("\n  --- Cross-TP split_dim=1 ---")
+    run_test("split_dim=1 cross 2->4", test_tp_split_dim1_cross_tp, store, tenant)
+    run_test("split_dim=1 merge 4->2", test_tp_split_dim1_merge_cross_tp, store, tenant)
+    run_test("split_dim=1 full reconstruction", test_tp_split_dim1_full_reconstruction, store, tenant)
+
+    print("\n  --- Writer partition ---")
+    run_test("writer partition roundtrip", test_writer_partition_roundtrip, store, tenant)
+    run_test("writer partition -> tp read", test_writer_partition_to_tp_read, store, tenant)
+    run_test("writer partition split_dim=1", test_writer_partition_split_dim1, store, tenant)
+    run_test("writer partition upsert", test_writer_partition_upsert, store, tenant)
 
     print("\n  --- Mock RL E2E ---")
     run_test("rl weight sync e2e", test_rl_weight_sync_e2e, store, tenant)

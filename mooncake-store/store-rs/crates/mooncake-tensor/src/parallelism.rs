@@ -490,6 +490,107 @@ impl TensorMetadata {
     }
 }
 
+// ─── Strided shard range calculation ───────────────────────────────────────
+
+/// A single byte-range transfer: copy `size` bytes from `src_offset` to `dst_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteRangeTransfer {
+    pub src_offset: usize,
+    pub dst_offset: usize,
+    pub size: usize,
+}
+
+/// Compute scatter-gather byte ranges for extracting a target shard from a source
+/// shard when `split_dim > 0` (non-leading dimension split).
+///
+/// For split_dim=0, the data is contiguous and `calculate_shard_range` suffices.
+/// For split_dim>0, each source shard stores data in row-major order with a
+/// different stride layout, so we need multiple non-contiguous transfers.
+///
+/// Parameters:
+/// - `global_shape`: full tensor shape
+/// - `split_dim`: dimension along which sharding occurs
+/// - `element_size`: bytes per element
+/// - `src_rank`, `src_count`: which source shard (rank) out of how many
+/// - `tgt_rank`, `tgt_count`: which target shard (rank) out of how many
+///
+/// Returns `None` if no data from this source overlaps the target, or if
+/// parameters are invalid. Otherwise returns the list of byte-range transfers
+/// where offsets are relative to the DATA portion (after metadata header).
+pub fn calculate_strided_shard_ranges(
+    global_shape: &[i64],
+    split_dim: usize,
+    element_size: usize,
+    src_rank: usize,
+    src_count: usize,
+    tgt_rank: usize,
+    tgt_count: usize,
+) -> Option<Vec<ByteRangeTransfer>> {
+    if split_dim >= global_shape.len() || src_count == 0 || tgt_count == 0 {
+        return None;
+    }
+
+    let global_dim_size = global_shape[split_dim] as usize;
+    if global_dim_size == 0 {
+        return None;
+    }
+
+    let src_dim_size = global_dim_size / src_count;
+    let tgt_dim_size = global_dim_size / tgt_count;
+
+    let src_dim_start = src_rank * src_dim_size;
+    let src_dim_end = src_dim_start + src_dim_size;
+
+    let tgt_dim_start = tgt_rank * tgt_dim_size;
+    let tgt_dim_end = tgt_dim_start + tgt_dim_size;
+
+    let overlap_start = src_dim_start.max(tgt_dim_start);
+    let overlap_end = src_dim_end.min(tgt_dim_end);
+    if overlap_start >= overlap_end {
+        return Some(vec![]);
+    }
+
+    let overlap_count = overlap_end - overlap_start;
+
+    // "inner size" = number of bytes per row at split_dim level
+    // = element_size * product(shape[split_dim+1:])
+    let inner_size: usize = global_shape[split_dim + 1..]
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        * element_size;
+
+    // "outer count" = number of independent "planes" above split_dim
+    // = product(shape[:split_dim])
+    let outer_count: usize = global_shape[..split_dim]
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+
+    // Within the source shard, row layout: outer_count rows, each of size src_dim_size * inner_size
+    let src_row_bytes = src_dim_size * inner_size;
+    // Within the target shard, row layout: outer_count rows, each of size tgt_dim_size * inner_size
+    let tgt_row_bytes = tgt_dim_size * inner_size;
+
+    let local_src_start = overlap_start - src_dim_start;
+    let local_tgt_start = overlap_start - tgt_dim_start;
+    let transfer_bytes = overlap_count * inner_size;
+
+    let mut transfers = Vec::with_capacity(outer_count);
+    for outer_idx in 0..outer_count {
+        let src_offset = outer_idx * src_row_bytes + local_src_start * inner_size;
+        let dst_offset = outer_idx * tgt_row_bytes + local_tgt_start * inner_size;
+        transfers.push(ByteRangeTransfer {
+            src_offset,
+            dst_offset,
+            size: transfer_bytes,
+        });
+    }
+
+    Some(transfers)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -738,5 +839,86 @@ mod tests {
     fn test_writer_manifest_wire_size() {
         // magic(4) + version(2) + pad(2) + dtype(4) + ndim(4) + split_dim(4) + shard_count(4) + global_shape(64) = 88
         assert_eq!(WriterShardManifest::WIRE_SIZE, 88);
+    }
+
+    #[test]
+    fn test_strided_ranges_split_dim0() {
+        // split_dim=0: each transfer is a single contiguous range
+        // shape [8, 4], elem=4, src: rank=0 of 2 (rows 0..3), tgt: rank=0 of 4 (rows 0..1)
+        let ranges = calculate_strided_shard_ranges(&[8, 4], 0, 4, 0, 2, 0, 4).unwrap();
+        // outer_count=1, inner_size=4*4=16, src has dim_size=4, tgt has dim_size=2
+        // overlap: [0, 2), transfer_bytes=2*16=32
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].src_offset, 0);
+        assert_eq!(ranges[0].dst_offset, 0);
+        assert_eq!(ranges[0].size, 32);
+    }
+
+    #[test]
+    fn test_strided_ranges_split_dim1_basic() {
+        // shape [4, 8], split_dim=1, elem=4 bytes
+        // src: rank=0 of 2 → cols 0..3, tgt: rank=0 of 4 → cols 0..1
+        let ranges = calculate_strided_shard_ranges(&[4, 8], 1, 4, 0, 2, 0, 4).unwrap();
+        // outer_count=4 (shape[0]=4), inner_size=4 bytes (shape[2:]=empty, so 1*4)
+        // src_dim_size=4, tgt_dim_size=2
+        // overlap [0,2), overlap_count=2, local_src_start=0, local_tgt_start=0
+        // transfer_bytes = 2*4 = 8
+        // src_row_bytes = 4*4=16, tgt_row_bytes = 2*4=8
+        assert_eq!(ranges.len(), 4);
+        for (i, r) in ranges.iter().enumerate() {
+            assert_eq!(r.src_offset, i * 16);
+            assert_eq!(r.dst_offset, i * 8);
+            assert_eq!(r.size, 8);
+        }
+    }
+
+    #[test]
+    fn test_strided_ranges_split_dim1_offset() {
+        // shape [4, 8], split_dim=1, elem=4
+        // src: rank=0 of 2 (cols 0..3), tgt: rank=1 of 4 (cols 2..3)
+        let ranges = calculate_strided_shard_ranges(&[4, 8], 1, 4, 0, 2, 1, 4).unwrap();
+        // tgt_dim_start=2, overlap [2,4), local_src_start=2, local_tgt_start=0
+        assert_eq!(ranges.len(), 4);
+        for (i, r) in ranges.iter().enumerate() {
+            assert_eq!(r.src_offset, i * 16 + 2 * 4); // skip first 2 cols
+            assert_eq!(r.dst_offset, i * 8);
+            assert_eq!(r.size, 8);
+        }
+    }
+
+    #[test]
+    fn test_strided_ranges_no_overlap() {
+        // shape [8, 4], split_dim=0
+        // src: rank=0 of 2 (rows 0..3), tgt: rank=1 of 2 (rows 4..7)
+        let ranges = calculate_strided_shard_ranges(&[8, 4], 0, 4, 0, 2, 1, 2).unwrap();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_strided_ranges_3d_split_dim1() {
+        // shape [2, 4, 3], split_dim=1, elem=4
+        // src: rank=0 of 2 (dim1: 0..1), tgt: rank=0 of 4 (dim1: 0..0, i.e. 1 element)
+        let ranges = calculate_strided_shard_ranges(&[2, 4, 3], 1, 4, 0, 2, 0, 4).unwrap();
+        // outer_count=2, inner_size=3*4=12
+        // src_dim_size=2, tgt_dim_size=1
+        // overlap [0,1), transfer_bytes=1*12=12
+        // src_row_bytes=2*12=24, tgt_row_bytes=1*12=12
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            ranges[0],
+            ByteRangeTransfer {
+                src_offset: 0,
+                dst_offset: 0,
+                size: 12
+            }
+        );
+        assert_eq!(
+            ranges[1],
+            ByteRangeTransfer {
+                src_offset: 24,
+                dst_offset: 12,
+                size: 12
+            }
+        );
     }
 }
