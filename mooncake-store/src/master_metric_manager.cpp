@@ -329,6 +329,46 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
+
+      // Promotion-on-hit Metrics
+      promotion_in_flight_metric_(
+          "master_promotion_in_flight",
+          "Current number of in-flight L2->L1 promotion tasks"),
+      promotion_admitted_(
+          "master_promotion_admitted_total",
+          "Total promotion tasks admitted past all gates and enqueued"),
+      promotion_completed_(
+          "master_promotion_completed_total",
+          "Total promotion tasks committed via NotifyPromotionSuccess"),
+      promotion_completed_bytes_(
+          "master_promotion_completed_bytes_total",
+          "Total bytes promoted from LOCAL_DISK to MEMORY"),
+      promotion_expired_("master_promotion_expired_total",
+                         "Total promotion tasks expired via the reaper "
+                         "(put_start_release_timeout_sec)"),
+      promotion_failed_(
+          "master_promotion_failed_total",
+          "Total promotion tasks aborted by holder via "
+          "NotifyPromotionFailure (holder reported a downstream failure)"),
+      promotion_cancelled_(
+          "master_promotion_cancelled_total",
+          "Total promotion tasks removed because the prerequisite went "
+          "away: object removal mid-flight (Remove / UpsertStart / etc.), "
+          "holder-client expiry (ClearInvalidHandles), or staged replica "
+          "lost (NotifyPromotionSuccess committed=false)"),
+      promotion_rejected_frequency_(
+          "master_promotion_rejected_frequency_total",
+          "Promotion attempts rejected because CountMinSketch frequency "
+          "was below promotion_admission_threshold"),
+      promotion_rejected_watermark_(
+          "master_promotion_rejected_watermark_total",
+          "Promotion attempts rejected because DRAM was at or above the "
+          "eviction high watermark"),
+      promotion_rejected_cap_(
+          "master_promotion_rejected_cap_total",
+          "Promotion attempts rejected because promotion_in_flight was at "
+          "promotion_queue_limit"),
+
       // Snapshot Metrics
       snapshot_duration_ms_(
           "master_snapshot_duration_ms",
@@ -417,8 +457,18 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
+    promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    promotion_admitted_.inc(0);
+    promotion_completed_.inc(0);
+    promotion_completed_bytes_.inc(0);
+    promotion_expired_.inc(0);
+    promotion_failed_.inc(0);
+    promotion_cancelled_.inc(0);
+    promotion_rejected_frequency_.inc(0);
+    promotion_rejected_watermark_.inc(0);
+    promotion_rejected_cap_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -1024,6 +1074,41 @@ void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
     put_start_discarded_staging_size_.dec(size);
 }
 
+// --- Promotion-on-hit Metrics ---
+void MasterMetricManager::inc_promotion_in_flight(int64_t val) {
+    promotion_in_flight_metric_.inc(val);
+}
+void MasterMetricManager::dec_promotion_in_flight(int64_t val) {
+    promotion_in_flight_metric_.dec(val);
+}
+void MasterMetricManager::inc_promotion_admitted(int64_t val) {
+    promotion_admitted_.inc(val);
+}
+void MasterMetricManager::inc_promotion_completed(int64_t val) {
+    promotion_completed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_completed_bytes(int64_t bytes) {
+    promotion_completed_bytes_.inc(bytes);
+}
+void MasterMetricManager::inc_promotion_expired(int64_t val) {
+    promotion_expired_.inc(val);
+}
+void MasterMetricManager::inc_promotion_failed(int64_t val) {
+    promotion_failed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_cancelled(int64_t val) {
+    promotion_cancelled_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_frequency(int64_t val) {
+    promotion_rejected_frequency_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
+    promotion_rejected_watermark_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
+    promotion_rejected_cap_.inc(val);
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -1376,6 +1461,38 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
+// --- Promotion-on-hit Metrics Getters ---
+int64_t MasterMetricManager::get_promotion_in_flight() {
+    return promotion_in_flight_metric_.value();
+}
+int64_t MasterMetricManager::get_promotion_admitted() {
+    return promotion_admitted_.value();
+}
+int64_t MasterMetricManager::get_promotion_completed() {
+    return promotion_completed_.value();
+}
+int64_t MasterMetricManager::get_promotion_completed_bytes() {
+    return promotion_completed_bytes_.value();
+}
+int64_t MasterMetricManager::get_promotion_expired() {
+    return promotion_expired_.value();
+}
+int64_t MasterMetricManager::get_promotion_failed() {
+    return promotion_failed_.value();
+}
+int64_t MasterMetricManager::get_promotion_cancelled() {
+    return promotion_cancelled_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_frequency() {
+    return promotion_rejected_frequency_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_watermark() {
+    return promotion_rejected_watermark_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_cap() {
+    return promotion_rejected_cap_.value();
+}
+
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 void MasterMetricManager::inc_copy_start_requests(int64_t val) {
     copy_start_requests_.inc(val);
@@ -1647,6 +1764,18 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_discard_cnt_);
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
+
+    // Serialize Promotion-on-hit Metrics
+    serialize_metric(promotion_in_flight_metric_);
+    serialize_metric(promotion_admitted_);
+    serialize_metric(promotion_completed_);
+    serialize_metric(promotion_completed_bytes_);
+    serialize_metric(promotion_expired_);
+    serialize_metric(promotion_failed_);
+    serialize_metric(promotion_cancelled_);
+    serialize_metric(promotion_rejected_frequency_);
+    serialize_metric(promotion_rejected_watermark_);
+    serialize_metric(promotion_rejected_cap_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);
@@ -2280,6 +2409,21 @@ std::string MasterMetricManager::get_summary_string(
        << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
+
+    // Promotion-on-hit summary (counters are cumulative, not deltas; the
+    // gauge is current-state).
+    ss << " | Promotion: "
+       << "in_flight=" << promotion_in_flight_metric_.value() << ", "
+       << "admitted=" << promotion_admitted_.value() << ", "
+       << "completed=" << promotion_completed_.value() << ", "
+       << "failed=" << promotion_failed_.value() << ", "
+       << "cancelled=" << promotion_cancelled_.value() << ", "
+       << "expired=" << promotion_expired_.value() << ", "
+       << "bytes=" << byte_size_to_string(promotion_completed_bytes_.value())
+       << ", "
+       << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
+       << "/" << promotion_rejected_watermark_.value() << "/"
+       << promotion_rejected_cap_.value();
 
     // Snapshot summary
     ss << " | Snapshots: "

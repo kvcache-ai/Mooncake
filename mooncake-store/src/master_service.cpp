@@ -258,6 +258,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
     promotion_on_hit_ = enable_offload_ && config.promotion_on_hit;
     promotion_admission_threshold_ = config.promotion_admission_threshold;
     promotion_queue_limit_ = config.promotion_queue_limit;
+    promotion_max_per_heartbeat_ = config.promotion_max_per_heartbeat;
+    // Clamp to >=1: 0 would make PromotionObjectHeartbeat return an empty
+    // batch every call, silently disabling promotion delivery.
+    if (promotion_max_per_heartbeat_ == 0) {
+        promotion_max_per_heartbeat_ = 1;
+    }
     // Defense-in-depth clamp: master.cpp clamps threshold into [1, 255]
     // at flag-parse time, but direct MasterServiceConfig construction
     // (tests, embedded users) bypasses that. Without the clamp here,
@@ -280,7 +286,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Promotion-on-hit mode enabled: LOCAL_DISK-only Gets "
                      "will queue async promotion to MEMORY (threshold="
                   << promotion_admission_threshold_
-                  << ", queue_limit=" << promotion_queue_limit_ << ")";
+                  << ", queue_limit=" << promotion_queue_limit_
+                  << ", max_per_heartbeat=" << promotion_max_per_heartbeat_
+                  << ")";
     }
 
     eviction_running_ = true;
@@ -767,10 +775,7 @@ void MasterService::ClearInvalidHandles(
                     tenant_state.processing_keys.erase(it->first);
                     tenant_state.replication_tasks.erase(it->first);
                     tenant_state.offloading_tasks.erase(it->first);
-                    if (tenant_state.promotion_tasks.erase(it->first) > 0) {
-                        promotion_in_flight_.fetch_sub(
-                            1, std::memory_order_relaxed);
-                    }
+                    ErasePromotionTaskIfPresent(tenant_state, it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
                 } else {
                     ++it;
@@ -3269,6 +3274,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // bypass the gate entirely since freq is uint8_t) cannot reach here.
     const uint8_t freq = promotion_sketch_->increment(key);
     if (freq < promotion_admission_threshold_) {
+        MasterMetricManager::instance().inc_promotion_rejected_frequency();
         return;
     }
 
@@ -3278,6 +3284,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     const double used_ratio =
         MasterMetricManager::instance().get_global_mem_used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
+        MasterMetricManager::instance().inc_promotion_rejected_watermark();
         return;
     }
 
@@ -3309,6 +3316,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // relaxed because the value is purely advisory.
     if (promotion_in_flight_.load(std::memory_order_relaxed) >=
         promotion_queue_limit_) {
+        MasterMetricManager::instance().inc_promotion_rejected_cap();
         return;
     }
 
@@ -3350,6 +3358,8 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
                            .start_time = std::chrono::system_clock::now(),
                            .holder_id = holder_id});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().inc_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_admitted();
     VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
 }
 
@@ -3365,17 +3375,16 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    // Return at most kMaxPerHeartbeat tasks. Each task does a
-    // synchronous SSD read + RDMA write on the client side; allowing
+    // Return at most promotion_max_per_heartbeat_ tasks. Each task does
+    // a synchronous SSD read + RDMA write on the client side; allowing
     // more than one per heartbeat risks blocking past the client-
     // liveness window and the master marking the client dead. The rest
     // stay queued in promotion_objects for subsequent heartbeats. The
     // cap must live here (server side) rather than on the client so
     // leftover work isn't silently dropped.
-    constexpr size_t kMaxPerHeartbeat = 1;
     auto& src = local_disk_segment_it->second->promotion_objects;
     std::unordered_map<std::string, int64_t> result;
-    while (result.size() < kMaxPerHeartbeat && !src.empty()) {
+    while (result.size() < promotion_max_per_heartbeat_ && !src.empty()) {
         auto node = src.extract(src.begin());
         result.insert(std::move(node));
     }
@@ -3515,8 +3524,17 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (source != nullptr) {
         source->dec_refcnt();
     }
+    const uint64_t completed_bytes = task_it->second.object_size;
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_promotion_in_flight();
+    if (committed) {
+        MasterMetricManager::instance().inc_promotion_completed();
+        MasterMetricManager::instance().inc_promotion_completed_bytes(
+            static_cast<int64_t>(completed_bytes));
+    } else {
+        MasterMetricManager::instance().inc_promotion_cancelled();
+    }
 
     // Erase the per-client promotion_objects entry (best-effort; the
     // heartbeat may have already drained it).
@@ -3574,6 +3592,8 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     }
     tenant_state.promotion_tasks.erase(task_it);
     promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_failed();
 
     // Clear the holder's per-client promotion_objects entry. Same
     // best-effort cleanup pattern as NotifyPromotionSuccess — the
@@ -3784,6 +3804,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                          << task_it->first;
             task_it = tenant_state.promotion_tasks.erase(task_it);
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            MasterMetricManager::instance().dec_promotion_in_flight();
+            MasterMetricManager::instance().inc_promotion_expired();
         }
 
         if (tenant_state.Empty()) {
