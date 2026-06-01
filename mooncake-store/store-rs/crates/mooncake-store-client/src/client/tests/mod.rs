@@ -16023,7 +16023,7 @@ fn is_exist_evicts_unreadable_route_and_sets_version_floor() {
         .expect("initial put should succeed");
 
     let initial_route = writer
-        .get_route("evict-floor-key")
+        .query_route("evict-floor-key")
         .expect("get route should succeed")
         .expect("route should exist after put");
     let initial_version = initial_route.version;
@@ -16049,7 +16049,7 @@ fn is_exist_evicts_unreadable_route_and_sets_version_floor() {
         .expect("re-put after eviction should succeed");
 
     let new_route = writer
-        .get_route("evict-floor-key")
+        .query_route("evict-floor-key")
         .expect("get route should succeed")
         .expect("route should exist after re-put");
     assert!(
