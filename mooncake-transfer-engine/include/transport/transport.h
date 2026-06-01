@@ -132,6 +132,7 @@ class Transport {
                 uint32_t max_retry_cnt;
                 void *r_seg;
                 void *l_seg;
+                void *endpoint;
             } ub;
             struct {
                 void *dest_addr;

@@ -1364,6 +1364,8 @@ class MasterService {
         NO_THREAD_SAFETY_ANALYSIS {
         if (tenant_state.promotion_tasks.erase(key) > 0) {
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            MasterMetricManager::instance().dec_promotion_in_flight();
+            MasterMetricManager::instance().inc_promotion_cancelled();
         }
     }
 
@@ -1740,6 +1742,7 @@ class MasterService {
     bool promotion_on_hit_{false};
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
+    uint32_t promotion_max_per_heartbeat_{1};
     // Global in-flight task counter, checked against promotion_queue_limit_
     // as the gate cap. Promotion specifically targets skewed
     // access (hot keys re-accessed after eviction), so the global counter

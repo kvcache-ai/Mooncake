@@ -523,6 +523,15 @@ export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 
 > **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
 
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. Default is `1`, which reaches 99.93% of peak GPU-to-GPU throughput while saving CPU for other workloads. Set to `0` to disable the cap (one poller per EFA context — the legacy behavior). Higher values (e.g., `MC_EFA_CQ_THREADS=4`) are available as an escape hatch for throughput tuning but rarely help in practice.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # default: single CQ poller (recommended)
+> export MC_EFA_CQ_THREADS=0   # disable cap: one poller per EFA context (legacy)
+> ```
+>
+> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
+
 ### 3. Prefill Instance
 
 ```bash

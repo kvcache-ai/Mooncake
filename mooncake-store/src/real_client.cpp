@@ -850,6 +850,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
+            } else if (this->protocol == "ub") {
+                ub_segment_ptrs_.emplace_back(ptr,
+                                              UbSegmentDeleter{mapped_size});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
@@ -1106,6 +1109,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
+    ub_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";

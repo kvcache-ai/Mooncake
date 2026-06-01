@@ -784,6 +784,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ub") {
+            auto deviceName = device_names.value_or("bonding_dev_0");
+            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
+            auto devices = splitString(deviceName, ',', true);
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
+            transport = transfer_engine_->installTransport("ub", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ub transport with specified "
+                              "devices";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
