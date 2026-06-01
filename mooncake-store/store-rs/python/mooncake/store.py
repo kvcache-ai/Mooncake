@@ -884,6 +884,186 @@ class MooncakeDistributedStore:
             tenant=tenant,
         )
 
+    # ─── _from Tensor API ──────────────────────────────────────────────────
+
+    def put_tensor_with_parallelism_from(
+        self,
+        key: str,
+        buffer_ptr: int,
+        size: int,
+        *,
+        parallelism: TensorParallelism | None = None,
+        writer_partition: tuple[int, int, int] | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Put a tensor from a raw buffer [TensorMetadata | data] with parallelism."""
+        return self._invoke(
+            "put_tensor_with_parallelism_from",
+            key,
+            buffer_ptr,
+            size,
+            parallelism=parallelism,
+            writer_partition=writer_partition,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def upsert_tensor_with_parallelism_from(
+        self,
+        key: str,
+        buffer_ptr: int,
+        size: int,
+        *,
+        parallelism: TensorParallelism | None = None,
+        writer_partition: tuple[int, int, int] | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Upsert a tensor from a raw buffer with parallelism."""
+        return self._invoke(
+            "upsert_tensor_with_parallelism_from",
+            key,
+            buffer_ptr,
+            size,
+            parallelism=parallelism,
+            writer_partition=writer_partition,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    # ─── Batch Tensor API ────────────────────────────────────────────────
+
+    def batch_put_tensor_with_parallelism(
+        self,
+        keys: list[str],
+        tensors: list,
+        *,
+        parallelisms: list | None = None,
+        writer_partitions: list | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Batch put tensors with parallelism metadata."""
+        return self._invoke(
+            "batch_put_tensor_with_parallelism",
+            keys,
+            tensors,
+            parallelisms=parallelisms,
+            writer_partitions=writer_partitions,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def batch_upsert_tensor_with_parallelism(
+        self,
+        keys: list[str],
+        tensors: list,
+        *,
+        parallelisms: list | None = None,
+        writer_partitions: list | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Batch upsert tensors with parallelism."""
+        return self._invoke(
+            "batch_upsert_tensor_with_parallelism",
+            keys,
+            tensors,
+            parallelisms=parallelisms,
+            writer_partitions=writer_partitions,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def batch_put_tensor_with_parallelism_from(
+        self,
+        keys: list[str],
+        buffer_ptrs: list[int],
+        sizes: list[int],
+        *,
+        parallelisms: list | None = None,
+        writer_partitions: list | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Batch put tensors from raw buffers with parallelism."""
+        return self._invoke(
+            "batch_put_tensor_with_parallelism_from",
+            keys,
+            buffer_ptrs,
+            sizes,
+            parallelisms=parallelisms,
+            writer_partitions=writer_partitions,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def batch_upsert_tensor_with_parallelism_from(
+        self,
+        keys: list[str],
+        buffer_ptrs: list[int],
+        sizes: list[int],
+        *,
+        parallelisms: list | None = None,
+        writer_partitions: list | None = None,
+        tenant: str | None = None,
+        config: ReplicateConfig | None = None,
+    ):
+        """Batch upsert tensors from raw buffers with parallelism."""
+        return self._invoke(
+            "batch_upsert_tensor_with_parallelism_from",
+            keys,
+            buffer_ptrs,
+            sizes,
+            parallelisms=parallelisms,
+            writer_partitions=writer_partitions,
+            tenant=tenant,
+            **_replication_kwargs_simple(config),
+        )
+
+    def batch_get_tensor_with_parallelism(
+        self,
+        keys: list[str],
+        *,
+        targets: list | None = None,
+        tensors: list | None = None,
+        tenant: str | None = None,
+    ):
+        """Batch get tensors with parallelism-aware routing."""
+        results = self._invoke(
+            "batch_get_tensor_with_parallelism",
+            keys,
+            targets=targets,
+            tensors=tensors,
+            tenant=tenant,
+        )
+        if isinstance(results, list):
+            return [
+                _tensor_from_raw_bytes(r) if isinstance(r, (bytes, bytearray)) else r
+                for r in results
+            ]
+        return results
+
+    def batch_get_tensor_with_parallelism_into(
+        self,
+        keys: list[str],
+        buffer_ptrs: list[int],
+        sizes: list[int],
+        *,
+        targets: list | None = None,
+        tenant: str | None = None,
+    ):
+        """Batch get tensors into pre-registered buffers with parallelism."""
+        return self._invoke(
+            "batch_get_tensor_with_parallelism_into",
+            keys,
+            buffer_ptrs,
+            sizes,
+            targets=targets,
+            tenant=tenant,
+        )
+
     # ─── End Tensor API ───────────────────────────────────────────────────
 
     def is_exist(self, key: str, *, tenant: str | None = None) -> bool:
