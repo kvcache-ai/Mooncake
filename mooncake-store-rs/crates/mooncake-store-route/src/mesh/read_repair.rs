@@ -72,12 +72,21 @@ pub(crate) fn merge_fresher_route(
     candidate: ObjectRoute,
     authority: &str,
     key: &ObjectKey,
+    namespace: &str,
 ) {
     match current {
         None => *current = Some(candidate),
         Some(existing) if candidate.version > existing.version => *current = Some(candidate),
         Some(existing) if candidate.version == existing.version && *existing != candidate => {
-            let choose_candidate = canonical_route_key(&candidate) < canonical_route_key(existing);
+            let candidate_readable =
+                crate::route_has_readable_replicas(namespace, &candidate);
+            let existing_readable =
+                crate::route_has_readable_replicas(namespace, existing);
+            let choose_candidate = match (candidate_readable, existing_readable) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => canonical_route_key(&candidate) < canonical_route_key(existing),
+            };
             let version = candidate.version.0;
             warn!(
                 key = %key.0,
@@ -98,6 +107,7 @@ pub(crate) fn merge_route_listing(
     routes: &mut BTreeMap<String, ObjectRoute>,
     candidate: ObjectRoute,
     authority: &str,
+    namespace: &str,
 ) {
     match routes.get(&candidate.key.0) {
         None => {
@@ -107,7 +117,15 @@ pub(crate) fn merge_route_listing(
             routes.insert(candidate.key.0.clone(), candidate);
         }
         Some(current) if candidate.version == current.version && *current != candidate => {
-            let choose_candidate = canonical_route_key(&candidate) < canonical_route_key(current);
+            let candidate_readable =
+                crate::route_has_readable_replicas(namespace, &candidate);
+            let existing_readable =
+                crate::route_has_readable_replicas(namespace, current);
+            let choose_candidate = match (candidate_readable, existing_readable) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => canonical_route_key(&candidate) < canonical_route_key(current),
+            };
             let key_str = candidate.key.0.clone();
             let version = candidate.version.0;
             warn!(
@@ -281,6 +299,7 @@ mod tests {
             candidate.clone(),
             "auth-a",
             &ObjectKey::new("key".to_string()),
+            "",
         );
         assert_eq!(current.unwrap().version, RouteVersion(5));
     }
@@ -294,6 +313,7 @@ mod tests {
             candidate,
             "auth-a",
             &ObjectKey::new("key".to_string()),
+            "",
         );
         assert_eq!(current.unwrap().version, RouteVersion(5));
     }
@@ -307,6 +327,7 @@ mod tests {
             candidate.clone(),
             "auth-a",
             &ObjectKey::new("key".to_string()),
+            "",
         );
         assert_eq!(current.unwrap().version, RouteVersion(1));
     }
@@ -316,8 +337,8 @@ mod tests {
         let mut routes = BTreeMap::new();
         let old = test_route("key-x", 1);
         let new = test_route("key-x", 3);
-        merge_route_listing(&mut routes, old, "auth-a");
-        merge_route_listing(&mut routes, new, "auth-b");
+        merge_route_listing(&mut routes, old, "auth-a", "");
+        merge_route_listing(&mut routes, new, "auth-b", "");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes["key-x"].version, RouteVersion(3));
     }
