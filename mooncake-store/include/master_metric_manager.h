@@ -295,6 +295,31 @@ class MasterMetricManager {
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
 
+    // Promotion-on-hit Metrics
+    void inc_promotion_in_flight(int64_t val = 1);
+    void dec_promotion_in_flight(int64_t val = 1);
+    void inc_promotion_admitted(int64_t val = 1);
+    void inc_promotion_completed(int64_t val = 1);
+    void inc_promotion_completed_bytes(int64_t bytes);
+    void inc_promotion_expired(int64_t val = 1);
+    void inc_promotion_failed(int64_t val = 1);
+    void inc_promotion_cancelled(int64_t val = 1);
+    void inc_promotion_rejected_frequency(int64_t val = 1);
+    void inc_promotion_rejected_watermark(int64_t val = 1);
+    void inc_promotion_rejected_cap(int64_t val = 1);
+
+    // Promotion-on-hit Metrics Getters
+    int64_t get_promotion_in_flight();
+    int64_t get_promotion_admitted();
+    int64_t get_promotion_completed();
+    int64_t get_promotion_completed_bytes();
+    int64_t get_promotion_expired();
+    int64_t get_promotion_failed();
+    int64_t get_promotion_cancelled();
+    int64_t get_promotion_rejected_frequency();
+    int64_t get_promotion_rejected_watermark();
+    int64_t get_promotion_rejected_cap();
+
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
     void inc_copy_start_failures(int64_t val = 1);
@@ -631,6 +656,18 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
+
+    // Promotion-on-hit Metrics
+    ylt::metric::gauge_t promotion_in_flight_metric_;
+    ylt::metric::counter_t promotion_admitted_;
+    ylt::metric::counter_t promotion_completed_;
+    ylt::metric::counter_t promotion_completed_bytes_;
+    ylt::metric::counter_t promotion_expired_;
+    ylt::metric::counter_t promotion_failed_;
+    ylt::metric::counter_t promotion_cancelled_;
+    ylt::metric::counter_t promotion_rejected_frequency_;
+    ylt::metric::counter_t promotion_rejected_watermark_;
+    ylt::metric::counter_t promotion_rejected_cap_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

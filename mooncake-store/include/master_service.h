@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
@@ -163,6 +164,8 @@ class MasterService {
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
      */
     auto ExistKey(const std::string& key) -> tl::expected<bool, ErrorCode>;
+    auto ExistKey(const std::string& key, const std::string& tenant_id)
+        -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
@@ -256,6 +259,11 @@ class MasterService {
         -> tl::expected<
             std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
             ErrorCode>;
+    auto GetReplicaListByRegex(const std::string& regex_pattern,
+                               const std::string& tenant_id)
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
 
     /**
      * @brief Get list of replicas for an object
@@ -264,6 +272,8 @@ class MasterService {
      * ready
      */
     auto GetReplicaList(const std::string& key)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+    auto GetReplicaList(const std::string& key, const std::string& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
@@ -277,6 +287,10 @@ class MasterService {
     auto PutStart(const UUID& client_id, const std::string& key,
                   const uint64_t slice_length, const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto PutStart(const UUID& client_id, const std::string& key,
+                  const std::string& tenant_id, const uint64_t slice_length,
+                  const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
@@ -286,6 +300,9 @@ class MasterService {
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
                 ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const UUID& client_id, const std::string& key,
+                const std::string& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -331,6 +348,10 @@ class MasterService {
      */
     auto UpsertStart(const UUID& client_id, const std::string& key,
                      const uint64_t slice_length, const ReplicateConfig& config)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    auto UpsertStart(const UUID& client_id, const std::string& key,
+                     const std::string& tenant_id, const uint64_t slice_length,
+                     const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -446,6 +467,8 @@ class MasterService {
      */
     auto Remove(const std::string& key, bool force = false)
         -> tl::expected<void, ErrorCode>;
+    auto Remove(const std::string& key, const std::string& tenant_id,
+                bool force = false) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
@@ -456,6 +479,8 @@ class MasterService {
      */
     auto RemoveByRegex(const std::string& str, bool force = false)
         -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegex(const std::string& str, const std::string& tenant_id,
+                       bool force = false) -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
@@ -726,6 +751,11 @@ class MasterService {
     void JobDispatchThreadFunc();
 
     // Internal data structures
+    struct ObjectIdentity {
+        std::string tenant_id;
+        std::string user_key;
+    };
+
     struct ObjectMetadata {
         // RAII-style metric management
         ~ObjectMetadata() {
@@ -743,12 +773,15 @@ class MasterService {
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-            std::string group_id_ = "")
+            std::string group_id_ = "", std::string tenant_id_ = "default",
+            std::string user_key_ = {})
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               data_type(data_type_),
               group_id(std::move(group_id_)),
+              tenant_id(std::move(tenant_id_)),
+              user_key(std::move(user_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -773,6 +806,8 @@ class MasterService {
         const size_t size;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
+        const std::string tenant_id;
+        const std::string user_key;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -1069,20 +1104,28 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    struct TenantState {
+        std::unordered_map<std::string, ObjectMetadata> metadata;
+        std::unordered_set<std::string> processing_keys;
+        std::unordered_map<std::string, const ReplicationTask>
+            replication_tasks;
+        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
+        std::unordered_map<std::string, PromotionTask> promotion_tasks;
+
+        std::unordered_map<std::string, std::unordered_set<std::string>>
+            group_members;  // group_id → set of keys
+
+        bool Empty() const {
+            return metadata.empty() && processing_keys.empty() &&
+                   replication_tasks.empty() && offloading_tasks.empty() &&
+                   promotion_tasks.empty() && group_members.empty();
+        }
+    };
+
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
-        std::unordered_map<std::string, ObjectMetadata> metadata
-            GUARDED_BY(mutex);
-        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
-        std::unordered_map<std::string, const ReplicationTask> replication_tasks
-            GUARDED_BY(mutex);
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks
-            GUARDED_BY(mutex);
-        std::unordered_map<std::string, PromotionTask> promotion_tasks
-            GUARDED_BY(mutex);
-        std::unordered_map<std::string, std::unordered_set<std::string>>
-            group_members GUARDED_BY(mutex);
+        std::unordered_map<std::string, TenantState> tenants GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -1091,6 +1134,17 @@ class MasterService {
     mutable std::unordered_set<std::string> groups_needing_lease_refresh_
         GUARDED_BY(group_routing_mutex_);
     mutable std::shared_mutex group_routing_mutex_;
+
+    static constexpr size_t kObjectOperationLockStripes = 4096;
+
+    struct ObjectOperationLock {
+        std::unique_lock<std::mutex> lock;
+    };
+
+    ObjectOperationLock AcquireObjectOperationLock(const std::string& tenant_id,
+                                                   const std::string& key);
+
+    std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
 
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
@@ -1130,22 +1184,59 @@ class MasterService {
         SharedMutexLocker lock_;
     };
 
-    // Helper to get shard index from key
+    static ObjectIdentity MakeObjectIdentity(
+        const std::string& user_key, const std::string& tenant_id = "default") {
+        return {NormalizeTenantId(tenant_id), user_key};
+    }
+
+    static std::string MakeTenantScopedKey(const std::string& tenant_id,
+                                           const std::string& key) {
+        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        std::string scoped_key;
+        scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
+        scoped_key.append(normalized_tenant);
+        scoped_key.push_back('\0');
+        scoped_key.append(key);
+        return scoped_key;
+    }
+
+    // Helper to get shard index from tenant-scoped object identity.
+    size_t getShardIndex(const std::string& tenant_id,
+                         const std::string& user_key) const {
+        const auto normalized_tenant = NormalizeTenantId(tenant_id);
+        if (normalized_tenant == "default") {
+            return std::hash<std::string>{}(user_key) % kNumShards;
+        }
+        size_t seed = std::hash<std::string>{}(normalized_tenant);
+        boost::hash_combine(seed, user_key);
+        return seed % kNumShards;
+    }
+
+    // Legacy helper routes plain keys to the default tenant.
     size_t getShardIndex(const std::string& key) const {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
     size_t getMetadataShardIndex(const std::string& key) const;
-    void RegisterGroupMember(MetadataShard& shard, const std::string& key,
+    size_t getMetadataShardIndex(const std::string& tenant_id,
+                                 const std::string& key) const;
+    std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
+                                             const std::string& key) const;
+    void RegisterGroupMember(TenantState& tenant_state,
+                             const std::string& tenant_id,
+                             const std::string& key,
                              const std::string& group_id);
-    void UnregisterGroupMember(MetadataShard& shard, const std::string& key,
+    void UnregisterGroupMember(TenantState& tenant_state,
+                               const std::string& tenant_id,
+                               const std::string& key,
                                const std::string& group_id);
-    std::unordered_map<std::string, ObjectMetadata>::iterator
-    EraseMetadataEntry(
-        MetadataShard& shard,
-        std::unordered_map<std::string, ObjectMetadata>::iterator it);
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const std::string& tenant_id);
     void RebuildGroupRoutingIndex();
-    void GrantLeaseForGroup(const MetadataShard& shard, const std::string& key,
+    void GrantLeaseForGroup(const TenantState& tenant_state,
+                            const std::string& key,
                             const ObjectMetadata& metadata) const;
 
     // Helper to clean up stale handles pointing to unmounted segments
@@ -1160,6 +1251,7 @@ class MasterService {
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
+        const std::string& tenant_id,
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
@@ -1186,8 +1278,8 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
-    tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
-                                                      Replica& replica);
+    tl::expected<void, ErrorCode> PushOffloadingQueue(
+        const ObjectIdentity& object_id, Replica& replica);
 
     // Graceful unmount scheduler
     class GracefulUnmountScheduler {
@@ -1225,8 +1317,8 @@ class MasterService {
      * Caller is responsible for refcnt-pinning the source replica and
      * recording the task in the shard's promotion_tasks map.
      */
-    tl::expected<void, ErrorCode> PushPromotionQueue(const std::string& key,
-                                                     Replica& source_replica);
+    tl::expected<void, ErrorCode> PushPromotionQueue(
+        const ObjectIdentity& object_id, Replica& source_replica);
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
@@ -1236,7 +1328,19 @@ class MasterService {
      * map. Acquires its own RW shard accessor; safe to call after
      * GetReplicaList's RO accessor has been released.
      */
-    void TryPushPromotionQueue(const std::string& key);
+    void TryPushPromotionQueue(const ObjectIdentity& object_id);
+
+    // Erase any in-flight PromotionTask for `key` and decrement the
+    // cluster-wide in-flight counter. Safe no-op if no task exists.
+    void ErasePromotionTaskIfPresent(TenantState& tenant_state,
+                                     const std::string& key)
+        NO_THREAD_SAFETY_ANALYSIS {
+        if (tenant_state.promotion_tasks.erase(key) > 0) {
+            promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+            MasterMetricManager::instance().dec_promotion_in_flight();
+            MasterMetricManager::instance().inc_promotion_cancelled();
+        }
+    }
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1275,19 +1379,37 @@ class MasterService {
     class MetadataAccessorRW {
        public:
         MetadataAccessorRW(MasterService* service, const std::string& key)
+            : MetadataAccessorRW(service, MakeObjectIdentity(key)) {}
+
+        MetadataAccessorRW(MasterService* service,
+                           const ObjectIdentity& object_id)
             : service_(service),
-              key_(key),
-              shard_idx_(service_->getMetadataShardIndex(key)),
+              object_id_(object_id),
+              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
+                                                         object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
-              it_(shard_guard_->metadata.find(key)),
-              processing_it_(shard_guard_->processing_keys.find(key)),
-              replication_task_it_(shard_guard_->replication_tasks.find(key)) {
+              tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
+              tenant_state_(tenant_it_ == shard_guard_->tenants.end()
+                                ? nullptr
+                                : &tenant_it_->second),
+              it_(tenant_state_ == nullptr
+                      ? ObjectMetadataIterator{}
+                      : tenant_state_->metadata.find(object_id_.user_key)),
+              processing_it_(tenant_state_ == nullptr
+                                 ? ProcessingIterator{}
+                                 : tenant_state_->processing_keys.find(
+                                       object_id_.user_key)),
+              replication_task_it_(tenant_state_ == nullptr
+                                       ? ReplicationTaskIterator{}
+                                       : tenant_state_->replication_tasks.find(
+                                             object_id_.user_key)) {
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
             // violation (client_mutex_ must be acquired before metadata shard).
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
-            if (it_ != shard_guard_->metadata.end()) {
+            if (tenant_state_ != nullptr &&
+                it_ != tenant_state_->metadata.end()) {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
@@ -1296,9 +1418,16 @@ class MasterService {
                 });
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
+                    const bool had_processing =
+                        processing_it_ != tenant_state_->processing_keys.end();
                     this->Erase();
-                    if (processing_it_ != shard_guard_->processing_keys.end()) {
+                    if (tenant_state_ != nullptr && had_processing) {
                         this->EraseFromProcessing();
+                    }
+                    if (tenant_state_ != nullptr) {
+                        service_->ErasePromotionTaskIfPresent(
+                            *tenant_state_, object_id_.user_key);
+                        MaybeEraseEmptyTenant();
                     }
                 }
             }
@@ -1306,20 +1435,29 @@ class MasterService {
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_guard_->metadata.end() && it_->second.IsValid();
+            return tenant_state_ != nullptr &&
+                   it_ != tenant_state_->metadata.end() &&
+                   it_->second.IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
-            return processing_it_ != shard_guard_->processing_keys.end();
+            return tenant_state_ != nullptr &&
+                   processing_it_ != tenant_state_->processing_keys.end();
         }
 
         bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
-            return replication_task_it_ !=
-                   shard_guard_->replication_tasks.end();
+            return tenant_state_ != nullptr &&
+                   replication_task_it_ !=
+                       tenant_state_->replication_tasks.end();
         }
 
         MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
             return shard_guard_;
+        }
+
+        TenantState& GetTenantState() NO_THREAD_SAFETY_ANALYSIS {
+            EnsureTenantState();
+            return *tenant_state_;
         }
 
         // Get metadata (only call when Exists() is true)
@@ -1331,44 +1469,80 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            it_ = service_->EraseMetadataEntry(shard_guard_.get(), it_);
+            service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id);
+            it_ = tenant_state_->metadata.end();
+            MaybeEraseEmptyTenant();
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
-            shard_guard_->processing_keys.erase(processing_it_);
-            processing_it_ = shard_guard_->processing_keys.end();
+            tenant_state_->processing_keys.erase(processing_it_);
+            processing_it_ = tenant_state_->processing_keys.end();
+            MaybeEraseEmptyTenant();
         }
 
         void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
-            shard_guard_->replication_tasks.erase(replication_task_it_);
-            replication_task_it_ = shard_guard_->replication_tasks.end();
+            tenant_state_->replication_tasks.erase(replication_task_it_);
+            replication_task_it_ = tenant_state_->replication_tasks.end();
+            MaybeEraseEmptyTenant();
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_soft_pin,
                     bool enable_hard_pin = false,
-                    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
+                    ObjectDataType data_type = ObjectDataType::UNKNOWN,
+                    std::string group_id = "") {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
             const auto now = std::chrono::system_clock::now();
-            auto result = shard_guard_->metadata.emplace(
-                std::piecewise_construct, std::forward_as_tuple(key_),
-                std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin,
-                                      enable_hard_pin, data_type));
+            EnsureTenantState();
+            auto result = tenant_state_->metadata.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(object_id_.user_key),
+                std::forward_as_tuple(
+                    client_id, now, total_length, std::move(replicas),
+                    enable_soft_pin, enable_hard_pin, data_type, group_id,
+                    object_id_.tenant_id, object_id_.user_key));
             it_ = result.first;
         }
 
        private:
+        using ObjectMetadataIterator =
+            std::unordered_map<std::string, ObjectMetadata>::iterator;
+        using ProcessingIterator = std::unordered_set<std::string>::iterator;
+        using ReplicationTaskIterator =
+            std::unordered_map<std::string, const ReplicationTask>::iterator;
+
+        void EnsureTenantState() NO_THREAD_SAFETY_ANALYSIS {
+            if (tenant_state_ != nullptr) {
+                return;
+            }
+            auto result =
+                shard_guard_->tenants.try_emplace(object_id_.tenant_id);
+            tenant_it_ = result.first;
+            tenant_state_ = &tenant_it_->second;
+            it_ = tenant_state_->metadata.end();
+            processing_it_ = tenant_state_->processing_keys.end();
+            replication_task_it_ = tenant_state_->replication_tasks.end();
+        }
+
+        void MaybeEraseEmptyTenant() NO_THREAD_SAFETY_ANALYSIS {
+            if (tenant_state_ == nullptr || !tenant_state_->Empty()) {
+                return;
+            }
+            shard_guard_->tenants.erase(tenant_it_);
+            tenant_state_ = nullptr;
+        }
+
         MasterService* service_;
-        std::string key_;
+        ObjectIdentity object_id_;
         size_t shard_idx_;
         MetadataShardAccessorRW shard_guard_;
-        std::unordered_map<std::string, ObjectMetadata>::iterator it_;
-        std::unordered_set<std::string>::iterator processing_it_;
-        std::unordered_map<std::string, const ReplicationTask>::iterator
-            replication_task_it_;
+        std::unordered_map<std::string, TenantState>::iterator tenant_it_;
+        TenantState* tenant_state_;
+        ObjectMetadataIterator it_;
+        ProcessingIterator processing_it_;
+        ReplicationTaskIterator replication_task_it_;
     };
 
     class MetadataSerializer {
@@ -1416,20 +1590,37 @@ class MasterService {
     class MetadataAccessorRO {
        public:
         MetadataAccessorRO(const MasterService* service, const std::string& key)
+            : MetadataAccessorRO(service, MakeObjectIdentity(key)) {}
+
+        MetadataAccessorRO(const MasterService* service,
+                           const ObjectIdentity& object_id)
             : service_(service),
-              key_(key),
-              shard_idx_(service_->getMetadataShardIndex(key)),
+              object_id_(object_id),
+              shard_idx_(service_->getMetadataShardIndex(object_id_.tenant_id,
+                                                         object_id_.user_key)),
               shard_guard_(service_, shard_idx_),
-              it_(shard_guard_->metadata.find(key)),
-              processing_it_(shard_guard_->processing_keys.find(key)) {}
+              tenant_it_(shard_guard_->tenants.find(object_id_.tenant_id)),
+              tenant_state_(tenant_it_ == shard_guard_->tenants.end()
+                                ? nullptr
+                                : &tenant_it_->second),
+              it_(tenant_state_ == nullptr
+                      ? ObjectMetadataConstIterator{}
+                      : tenant_state_->metadata.find(object_id_.user_key)),
+              processing_it_(tenant_state_ == nullptr
+                                 ? ProcessingConstIterator{}
+                                 : tenant_state_->processing_keys.find(
+                                       object_id_.user_key)) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_guard_->metadata.end() && it_->second.IsValid();
+            return tenant_state_ != nullptr &&
+                   it_ != tenant_state_->metadata.end() &&
+                   it_->second.IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
-            return processing_it_ != shard_guard_->processing_keys.end();
+            return tenant_state_ != nullptr &&
+                   processing_it_ != tenant_state_->processing_keys.end();
         }
 
         // Get metadata (only call when Exists() is true)
@@ -1441,13 +1632,24 @@ class MasterService {
             return shard_guard_;
         }
 
+        const TenantState* GetTenantState() const NO_THREAD_SAFETY_ANALYSIS {
+            return tenant_state_;
+        }
+
        private:
+        using ObjectMetadataConstIterator =
+            std::unordered_map<std::string, ObjectMetadata>::const_iterator;
+        using ProcessingConstIterator =
+            std::unordered_set<std::string>::const_iterator;
+
         const MasterService* service_;
-        const std::string key_;
+        const ObjectIdentity object_id_;
         const size_t shard_idx_;
         MetadataShardAccessorRO shard_guard_;
-        std::unordered_map<std::string, ObjectMetadata>::const_iterator it_;
-        std::unordered_set<std::string>::const_iterator processing_it_;
+        std::unordered_map<std::string, TenantState>::const_iterator tenant_it_;
+        const TenantState* tenant_state_;
+        ObjectMetadataConstIterator it_;
+        ProcessingConstIterator processing_it_;
     };
 
     friend class MetadataAccessorRW;
@@ -1513,6 +1715,7 @@ class MasterService {
     bool promotion_on_hit_{false};
     uint32_t promotion_admission_threshold_{2};
     uint32_t promotion_queue_limit_{50000};
+    uint32_t promotion_max_per_heartbeat_{1};
     // Global in-flight task counter, checked against promotion_queue_limit_
     // as the gate cap. Promotion specifically targets skewed
     // access (hot keys re-accessed after eviction), so the global counter
@@ -1658,8 +1861,13 @@ class MasterService {
     std::optional<std::string> SelectDrainTargetForKey(
         const ObjectMetadata& metadata, const std::string& source_segment,
         const std::vector<std::string>& requested_targets);
-    std::string MakeDrainUnitKey(const std::string& key,
+    std::string MakeDrainUnitKey(const std::string& tenant_id,
+                                 const std::string& key,
                                  const std::string& source_segment) const;
+    std::string MakeDrainUnitKey(const std::string& key,
+                                 const std::string& source_segment) const {
+        return MakeDrainUnitKey("default", key, source_segment);
+    }
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
