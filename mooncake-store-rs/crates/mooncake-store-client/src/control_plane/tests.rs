@@ -1520,6 +1520,17 @@ fn control_plane_helpers_round_trip_and_report_validation_errors() {
         cas
     );
 
+    let cas_with_floor = CasResult {
+        applied: false,
+        current: None,
+        version_floor: Some(RouteVersion(42)),
+    };
+    assert_eq!(
+        try_cas_result(pb_cas_result(&cas_with_floor))
+            .expect("cas result with version_floor should round-trip"),
+        cas_with_floor
+    );
+
     let reservation = SegmentReservation {
         owner: runtime.clone(),
         segment_name: SegmentName::new("segment-r"),
