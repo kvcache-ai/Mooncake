@@ -6249,7 +6249,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Format detection (decode optional fields by type for back-compat):
+    // Format detection:
     //   v1: 7 + replicas_count, no optional fields
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
@@ -6276,15 +6276,6 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     replicas.reserve(replicas_count);
 
     for (uint32_t i = 0; i < replicas_count; i++) {
-        // Defensive bound: the data_type skip above can consume a slot the
-        // size check counted on, so a crafted entry whose first post-count
-        // field looks like a data_type could otherwise read past the array.
-        // Mirrors the standby reader in catalog_backed_snapshot_provider.cpp.
-        if (index >= total_elements) {
-            return tl::unexpected(
-                SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   "deserialize ObjectMetadata truncated"));
-        }
         auto result = Serializer<Replica>::deserialize(
             array[index++], service_->segment_manager_.getView());
         if (!result) {
