@@ -2,6 +2,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <xxhash.h>
 #include <filesystem>
@@ -76,6 +77,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
 
+    // Ensure root directory exists before health check
+    std::error_code ec;
+    std::filesystem::create_directories(root_dir_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to create root directory " << root_dir_ << ": "
+                   << ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     if (distributed_config_.enable_health_check) {
         std::string probe_path =
             fmt::format("{}/.mooncake_health_probe_{}", root_dir_,
@@ -110,7 +120,6 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     }
 
     // Ensure hash bucket directories exist
-    std::error_code ec;
     for (int i = 0; i < hash_bucket_count_; ++i) {
         std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
         std::filesystem::create_directories(bucket_dir, ec);
@@ -225,6 +234,8 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
 
     std::vector<std::string> batch_keys;
     std::vector<StorageObjectMetadata> batch_metas;
+    const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
+        1, file_storage_config_.scanmeta_iterator_keys_limit));
 
     for (int i = 0; i < hash_bucket_count_; ++i) {
         std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);
@@ -245,7 +256,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
                                        static_cast<int64_t>(info.size), ""};
             batch_metas.push_back(meta);
 
-            if (batch_keys.size() >= 256) {
+            if (batch_keys.size() >= batch_limit) {
                 auto err = handler(batch_keys, batch_metas);
                 if (err != ErrorCode::OK) return tl::make_unexpected(err);
                 batch_keys.clear();
