@@ -589,8 +589,6 @@ void ResourceTracker::startSignalThread() {
 }
 
 RealClient::RealClient() {
-    // Initialize logging severity (leave as before)
-    mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
 }

@@ -16,6 +16,7 @@
 #include <memory>
 
 #include "integration_utils.h"
+#include "mooncake_log.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -1643,6 +1644,8 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    mooncake::InitMooncakeLogging("mooncake-store");
+
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
         .value("UNKNOWN", ObjectDataType::UNKNOWN)

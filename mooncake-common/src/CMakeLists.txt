@@ -22,9 +22,15 @@ else()
     message(STATUS "Found ASIO at: ${ASIO_INCLUDE_DIR}")
 endif()
 
+find_package(glog QUIET CONFIG)
+if(NOT TARGET glog::glog)
+    include(${CMAKE_CURRENT_LIST_DIR}/../FindGLOG.cmake)
+endif()
+
 set(MOONCAKE_COMMON_SOURCES
     default_config.cpp
     environ.cpp
+    mooncake_log.cpp
 )
 
 add_library(asio_shared SHARED asio_impl.cpp)
@@ -62,6 +68,7 @@ target_include_directories(mooncake_common PUBLIC
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
     jsoncpp
+    glog::glog
 )
 
 if (BUILD_SHARED_LIBS)
