@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use mooncake_store_core::{
     CasResult, ClientLease, ClientRuntimeId, ClientStableId, MetadataBackend, NamespaceScope,
@@ -45,6 +48,14 @@ pub(crate) fn build_embedded_wrh_route_directory(
     ))
 }
 
+const BASELINE_TTL: Duration = Duration::from_secs(300);
+
+struct BaselineState {
+    member_ids: HashSet<String>,
+    candidates: Vec<ClientLease>,
+    created_at: Instant,
+}
+
 struct EmbeddedWrhRouteDirectory {
     route_topk: usize,
     namespace: String,
@@ -52,8 +63,7 @@ struct EmbeddedWrhRouteDirectory {
     authority_client: Arc<dyn RouteAuthorityClient>,
     membership: Arc<dyn RouteMembershipProvider>,
     async_mirror: AsyncRouteMirrorWorker,
-    baseline_member_ids: HashSet<String>,
-    baseline_candidates: Vec<ClientLease>,
+    baseline: Mutex<BaselineState>,
 }
 
 struct RouteContainsProbe<'a> {
@@ -96,8 +106,11 @@ impl EmbeddedWrhRouteDirectory {
             authority_client,
             membership,
             async_mirror,
-            baseline_member_ids,
-            baseline_candidates,
+            baseline: Mutex::new(BaselineState {
+                member_ids: baseline_member_ids,
+                candidates: baseline_candidates,
+                created_at: Instant::now(),
+            }),
         }
     }
 
@@ -927,17 +940,35 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
             )?;
         }
 
-        if !resolved.iter().all(|r| *r) && !self.baseline_candidates.is_empty() {
-            let has_new_members = candidates
-                .iter()
-                .any(|c| !self.baseline_member_ids.contains(&c.runtime.stable_id.0));
-            if has_new_members {
+        if !resolved.iter().all(|r| *r) {
+            let fallback_candidates = {
+                let mut baseline = self.baseline.lock();
+                if baseline.created_at.elapsed() >= BASELINE_TTL {
+                    baseline.member_ids = candidates
+                        .iter()
+                        .map(|c| c.runtime.stable_id.0.clone())
+                        .collect();
+                    baseline.candidates = candidates.clone();
+                    baseline.created_at = Instant::now();
+                    None
+                } else {
+                    let has_new_members = candidates
+                        .iter()
+                        .any(|c| !baseline.member_ids.contains(&c.runtime.stable_id.0));
+                    if has_new_members && !baseline.candidates.is_empty() {
+                        Some(baseline.candidates.clone())
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(baseline_candidates) = fallback_candidates {
                 let baseline_ranked = keys
                     .iter()
                     .map(|key| {
                         ranked_top_authorities(
                             &self.namespace,
-                            &self.baseline_candidates,
+                            &baseline_candidates,
                             key,
                             self.route_topk,
                         )
