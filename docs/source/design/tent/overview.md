@@ -143,6 +143,6 @@ failover
 :::{toctree}
 :maxdepth: 1
 
-performance-tuning
-troubleshooting
+operations/performance-tuning
+operations/troubleshooting
 :::
