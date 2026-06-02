@@ -1948,7 +1948,7 @@ void MasterService::ClearInvalidHandles(
                     if (enable_ha_ && oplog_store_) {
                         auto err = PersistRemoveForHA(
                             "ClearInvalidHandles(last replica)",
-                            it->second.tenant_id.MakeScopedKey(it->first));
+                            tenant_it->first, it->first);
                         if (!err) {
                             ++it;
                             continue;
@@ -1965,8 +1965,7 @@ void MasterService::ClearInvalidHandles(
                         })) {
                         auto persist_result =
                             AppendOpLogAndNotifyDurableOrAbort(
-                                OpType::PUT_END,
-                                it->second.tenant_id.MakeScopedKey(it->first),
+                                OpType::PUT_END, tenant_it->first, it->first,
                                 SerializeMetadataForOpLogWithoutMemReplicas(
                                     it->second));
                         if (!persist_result) {
@@ -2435,8 +2434,18 @@ void MasterService::RestoreFromStandbySnapshot(
             }
         }
 
-        auto [tenant_id, user_key] = TenantId::ParseScopedKey(key);
-        auto shard_idx = getShardIndex(tenant_id, user_key);
+        auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(key);
+        TenantId tenant_id(entry.tenant_id);
+        if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
+            tenant_id = std::move(scoped_tenant_id);
+        }
+        if (!tenant_id.IsValid()) {
+            LOG(WARNING) << "RestoreFromStandbySnapshot: invalid tenant_id="
+                         << entry.tenant_id << ", key=" << key
+                         << ", skipping";
+            continue;
+        }
+        auto shard_idx = getMetadataShardIndex(tenant_id, user_key);
         MetadataShardAccessorRW shard(this, shard_idx);
         auto now = std::chrono::system_clock::now();
         auto& tenant_state = shard->tenants[tenant_id];
@@ -2444,7 +2453,8 @@ void MasterService::RestoreFromStandbySnapshot(
             std::piecewise_construct, std::forward_as_tuple(user_key),
             std::forward_as_tuple(standby_meta.client_id, now,
                                   standby_meta.size, std::move(replicas), false,
-                                  false, ObjectDataType::UNKNOWN, std::string(),
+                                  false, standby_meta.data_type,
+                                  standby_meta.group_id,
                                   tenant_id, user_key));
         tenant_state.processing_keys.erase(user_key);
     }
@@ -3375,7 +3385,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (enable_ha_ && oplog_store_) {
                         auto err = PersistRemoveForHA(
                             "PutStart(stale cleanup REMOVE)",
-                            it->second.tenant_id.MakeScopedKey(key));
+                            object_id.tenant_id, key);
                         if (!err) {
                             return tl::make_unexpected(err.error());
                         }
@@ -3397,7 +3407,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (enable_ha_ && oplog_store_) {
                         auto err = PersistRemoveForHA(
                             "PutStart(stale cleanup REMOVE)",
-                            metadata.tenant_id.MakeScopedKey(key));
+                            object_id.tenant_id, key);
                         if (!err) {
                             return tl::make_unexpected(err.error());
                         }
@@ -4954,7 +4964,7 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
     auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     if (enable_ha_ && oplog_store_) {
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::REMOVE, metadata.tenant_id.MakeScopedKey(key), {});
+            OpType::REMOVE, object_id.tenant_id, key, {});
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -5024,9 +5034,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 if (enable_ha_ && oplog_store_) {
-                    auto err = PersistRemoveForHA(
-                        "RemoveByRegex",
-                        it->second.tenant_id.MakeScopedKey(it->first));
+                    auto err = PersistRemoveForHA("RemoveByRegex",
+                                                  normalized_tenant,
+                                                  it->first);
                     if (!err) {
                         ++it;
                         continue;
@@ -5069,9 +5079,9 @@ long MasterService::RemoveAll(bool force) {
                         &Replica::fn_is_memory_replica);
 
                     if (enable_ha_ && oplog_store_) {
-                        auto err = PersistRemoveForHA(
-                            "RemoveAll",
-                            it->second.tenant_id.MakeScopedKey(it->first));
+                        auto err = PersistRemoveForHA("RemoveAll",
+                                                      tenant_it->first,
+                                                      it->first);
                         if (!err) {
                             ++it;
                             continue;  // skip erase on persist failure
@@ -6645,12 +6655,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (would_invalidate) {
                         persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::REMOVE,
-                            metadata.tenant_id.MakeScopedKey(*key_it), {});
+                            OpType::REMOVE, tenant_it->first, *key_it, {});
                     } else {
                         persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::PUT_END,
-                            metadata.tenant_id.MakeScopedKey(*key_it),
+                            OpType::PUT_END, tenant_it->first, *key_it,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size,
                                 post_descriptors));
@@ -6726,12 +6734,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (would_invalidate) {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::REMOVE,
-                        metadata.tenant_id.MakeScopedKey(task_it->first), {});
+                        OpType::REMOVE, tenant_it->first, task_it->first, {});
                 } else {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::PUT_END,
-                        metadata.tenant_id.MakeScopedKey(task_it->first),
+                        OpType::PUT_END, tenant_it->first, task_it->first,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata.client_id, metadata.size,
                             post_descriptors));
@@ -7453,7 +7459,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // and must NOT erase the metadata entry — local state must stay in
     // sync with what was published.
     auto persist_evict_oplog_or_skip =
-        [&, this](const std::string& key,
+        [&, this](const TenantId& tenant_id, const std::string& key,
                   const ObjectMetadata& metadata) -> bool {
         if (!enable_ha_ || !oplog_store_) return true;
 
@@ -7469,10 +7475,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::REMOVE, metadata.tenant_id.MakeScopedKey(key), {});
+                OpType::REMOVE, tenant_id, key, {});
         } else {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+                OpType::PUT_END, tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining));
         }
@@ -7497,7 +7503,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> EvictionResult {
         if (!metadata.IsGrouped()) {
-            if (!persist_evict_oplog_or_skip(key, metadata)) {
+            if (!persist_evict_oplog_or_skip(tenant_id, key, metadata)) {
                 return {};
             }
             uint64_t freed = try_evict_or_offload(
@@ -7507,7 +7513,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         auto group_it = tenant_state.group_members.find(metadata.group_id);
         if (group_it == tenant_state.group_members.end()) {
-            if (!persist_evict_oplog_or_skip(key, metadata)) {
+            if (!persist_evict_oplog_or_skip(tenant_id, key, metadata)) {
                 return {};
             }
             uint64_t freed = try_evict_or_offload(
@@ -7539,7 +7545,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
 
-            if (!persist_evict_oplog_or_skip(member_key, member_metadata)) {
+            if (!persist_evict_oplog_or_skip(tenant_id, member_key,
+                                             member_metadata)) {
                 continue;
             }
             uint64_t freed =
@@ -8009,12 +8016,10 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                     tl::expected<OpLogEntry, ErrorCode> persist_result;
                     if (remaining.empty()) {
                         persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::REMOVE,
-                            metadata.tenant_id.MakeScopedKey(it->first), {});
+                            OpType::REMOVE, tenant_it->first, it->first, {});
                     } else {
                         persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                            OpType::PUT_END,
-                            metadata.tenant_id.MakeScopedKey(it->first),
+                            OpType::PUT_END, tenant_it->first, it->first,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size, remaining));
                     }
@@ -10048,12 +10053,26 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
 
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
                                          const std::string& payload) {
-    oplog_manager_.Append(type, key, payload);
+    AppendOpLogAndNotify(type, TenantId::Default(), key, payload);
+}
+
+void MasterService::AppendOpLogAndNotify(OpType type,
+                                         const TenantId& tenant_id,
+                                         const std::string& key,
+                                         const std::string& payload) {
+    oplog_manager_.Append(type, tenant_id.value(), key, payload);
 }
 
 tl::expected<uint64_t, ErrorCode> MasterService::AppendOpLogAndNotifyDurable(
     OpType type, const std::string& key, const std::string& payload) {
-    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    return AppendOpLogAndNotifyDurable(type, TenantId::Default(), key, payload);
+}
+
+tl::expected<uint64_t, ErrorCode> MasterService::AppendOpLogAndNotifyDurable(
+    OpType type, const TenantId& tenant_id, const std::string& key,
+    const std::string& payload) {
+    const OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id.value(), key, payload);
     auto result = PersistOpLogEntryWithSyncRetries(entry);
     if (result != ErrorCode::OK) {
         return tl::unexpected(result);
@@ -10183,7 +10202,17 @@ void MasterService::AppendOrPersistOrEnqueue(const char* why, OpType type,
                                              const std::string& key,
                                              const std::string& payload,
                                              PendingMutationKind kind) {
-    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    AppendOrPersistOrEnqueue(why, type, TenantId::Default(), key, payload,
+                             kind);
+}
+
+void MasterService::AppendOrPersistOrEnqueue(const char* why, OpType type,
+                                             const TenantId& tenant_id,
+                                             const std::string& key,
+                                             const std::string& payload,
+                                             PendingMutationKind kind) {
+    OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id.value(), key, payload);
     auto result = PersistOpLogEntryWithSyncRetries(entry);
     if (result != ErrorCode::OK) {
         EnqueueRetryOnPersistFailure(why, kind, std::move(entry));
@@ -10194,14 +10223,30 @@ void MasterService::AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
                                                  const std::string& key,
                                                  const std::string& payload,
                                                  PendingMutationKind kind) {
-    AppendOrPersistOrEnqueue(why, type, key, payload, kind);
+    AppendOrPersistOrEnqueueLazy(why, type, TenantId::Default(), key, payload,
+                                 kind);
+}
+
+void MasterService::AppendOrPersistOrEnqueueLazy(
+    const char* why, OpType type, const TenantId& tenant_id,
+    const std::string& key, const std::string& payload,
+    PendingMutationKind kind) {
+    AppendOrPersistOrEnqueue(why, type, tenant_id, key, payload, kind);
 }
 
 tl::expected<OpLogEntry, ErrorCode>
-MasterService::AppendOpLogAndNotifyDurableOrAbort(OpType type,
-                                                  const std::string& key,
-                                                  const std::string& payload) {
-    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+MasterService::AppendOpLogAndNotifyDurableOrAbort(
+    OpType type, const std::string& key, const std::string& payload) {
+    return AppendOpLogAndNotifyDurableOrAbort(type, TenantId::Default(), key,
+                                              payload);
+}
+
+tl::expected<OpLogEntry, ErrorCode>
+MasterService::AppendOpLogAndNotifyDurableOrAbort(
+    OpType type, const TenantId& tenant_id, const std::string& key,
+    const std::string& payload) {
+    const OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id.value(), key, payload);
     auto result = PersistOpLogEntryWithSyncRetries(entry);
     if (result != ErrorCode::OK) {
         LOG(ERROR) << "OpLog persist failed for key=" << key
@@ -10216,7 +10261,13 @@ MasterService::AppendOpLogAndNotifyDurableOrAbort(OpType type,
 
 tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     const char* why, const std::string& key) {
-    auto result = AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, key, {});
+    return PersistRemoveForHA(why, TenantId::Default(), key);
+}
+
+tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
+    const char* why, const TenantId& tenant_id, const std::string& key) {
+    auto result =
+        AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, tenant_id, key, {});
     if (!result) {
         LOG(WARNING) << why << ": REMOVE persist failed for key=" << key
                      << ", err=" << static_cast<int>(result.error());
@@ -10225,13 +10276,21 @@ tl::expected<void, ErrorCode> MasterService::PersistRemoveForHA(
     return {};
 }
 
-void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                                   const std::string& key,
-                                                   const std::string& payload) {
+void MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const std::string& key,
+    const std::string& payload) {
+    PersistSegmentOpForHAOrEnqueue(why, type, TenantId::Default(), key,
+                                   payload);
+}
+
+void MasterService::PersistSegmentOpForHAOrEnqueue(
+    const char* why, OpType type, const TenantId& tenant_id,
+    const std::string& key, const std::string& payload) {
     // Allocate the entry up-front so the retry queue and the up-front
     // attempt share the same sequence_id — standby applies idempotent
     // segment events but the seq must be monotonic.
-    OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    OpLogEntry entry =
+        oplog_manager_.AllocateEntry(type, tenant_id.value(), key, payload);
     auto result = PersistOpLogEntryWithSyncRetries(entry);
     if (result == ErrorCode::OK) {
         return;

@@ -4,6 +4,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -11,6 +12,10 @@
 #include "types.h"
 
 namespace mooncake {
+
+inline std::string NormalizeTenantId(std::string_view tenant_id) {
+    return TenantId(std::string(tenant_id)).value();
+}
 
 /**
  * @brief Metadata structure for Standby to store and restore object information
