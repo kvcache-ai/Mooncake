@@ -1,6 +1,6 @@
 # TENT C API Reference
 
-This document provides a complete reference for the TENT C API. The C API is defined in [`mooncake-transfer-engine/tent/include/tent/transfer_engine.h`](../../../mooncake-transfer-engine/tent/include/tent/transfer_engine.h) and provides a C-compatible interface for applications that cannot or prefer not to use C++.
+This document provides a complete reference for the TENT C API. The C API is defined in [`mooncake-transfer-engine/tent/include/tent/transfer_engine.h`](../../../../../mooncake-transfer-engine/tent/include/tent/transfer_engine.h) and provides a C-compatible interface for applications that cannot or prefer not to use C++.
 
 For conceptual background, see [TENT Overview](overview.md). For C++ API documentation, see [C++ API Reference](cpp-api.md).
 

@@ -137,7 +137,7 @@ TENT extends the classic Mooncake Transfer Engine by moving transport selection,
 
 - [Transfer Engine (Classic)](../transfer-engine/index.md) - Classic TE documentation
 - [Mooncake Store](../mooncake-store.md) - Distributed KVCache store
-- [Python API Reference](../../python-api-reference/transfer-engine.md) - Python bindings
+- [Python API Reference](../../../python-api-reference/transfer-engine.md) - Python bindings
 
 ## Getting Help
 

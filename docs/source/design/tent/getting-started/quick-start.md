@@ -1,6 +1,6 @@
 # TENT Quick Start Guide
 
-This guide will help you get started with TENT (Transfer Engine NEXT) using the C++ API. For the Python API, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
+This guide will help you get started with TENT (Transfer Engine NEXT) using the C++ API. For the Python API, see [Transfer Engine Python API](../../../../python-api-reference/transfer-engine.md).
 
 ## Prerequisites
 
@@ -487,11 +487,11 @@ For better performance:
 
 ## Next Steps
 
-- [C++ API Reference](cpp-api.md) - Complete API documentation
-- [C API Reference](c-api.md) - C API documentation
-- [Configuration Reference](configuration.md) - All configuration options
+- [C++ API Reference](../api/cpp-api.md) - Complete API documentation
+- [C API Reference](../api/c-api.md) - C API documentation
+- [Configuration Reference](../configuration/configuration.md) - All configuration options
 - [Transport Selector](../features/transport-selector.md) - Transport selection policies
-- [QoS](qos.md) - Quality of Service configuration
+- [QoS](../features/qos.md) - Quality of Service configuration
 - [Failover](../features/failover.md) - Failure handling and recovery
 
 ## Getting Help
