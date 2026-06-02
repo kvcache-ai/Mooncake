@@ -1535,17 +1535,18 @@ WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
 }
 
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
-    const UUID& client_id, const std::string& key,
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
     return execute_rpc(
         "CopyStart",
         [&] {
-            return master_service_.CopyStart(client_id, key, src_segment,
-                                             tgt_segments);
+            return master_service_.CopyStart(client_id, key, tenant_id,
+                                             src_segment, tgt_segments);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id,
                              ", src_segment=", src_segment,
                              ", tgt_segments_count=", tgt_segments.size());
         },
@@ -1554,39 +1555,45 @@ tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     return execute_rpc(
-        "CopyEnd", [&] { return master_service_.CopyEnd(client_id, key); },
+        "CopyEnd",
+        [&] { return master_service_.CopyEnd(client_id, key, tenant_id); },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id);
         },
         [] { MasterMetricManager::instance().inc_copy_end_requests(); },
         [] { MasterMetricManager::instance().inc_copy_end_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     return execute_rpc(
         "CopyRevoke",
-        [&] { return master_service_.CopyRevoke(client_id, key); },
+        [&] { return master_service_.CopyRevoke(client_id, key, tenant_id); },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id);
         },
         [] { MasterMetricManager::instance().inc_copy_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
 }
 
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
-    const UUID& client_id, const std::string& key,
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
     const std::string& src_segment, const std::string& tgt_segment) {
     return execute_rpc(
         "MoveStart",
         [&] {
-            return master_service_.MoveStart(client_id, key, src_segment,
-                                             tgt_segment);
+            return master_service_.MoveStart(client_id, key, tenant_id,
+                                             src_segment, tgt_segment);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id,
                              ", src_segment=", src_segment,
                              ", tgt_segment=", tgt_segment);
         },
@@ -1595,38 +1602,45 @@ tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     return execute_rpc(
-        "MoveEnd", [&] { return master_service_.MoveEnd(client_id, key); },
+        "MoveEnd",
+        [&] { return master_service_.MoveEnd(client_id, key, tenant_id); },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id);
         },
         [] { MasterMetricManager::instance().inc_move_end_requests(); },
         [] { MasterMetricManager::instance().inc_move_end_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     return execute_rpc(
         "MoveRevoke",
-        [&] { return master_service_.MoveRevoke(client_id, key); },
+        [&] { return master_service_.MoveRevoke(client_id, key, tenant_id); },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id);
         },
         [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type) {
     return execute_rpc(
         "EvictDiskReplica",
         [&] {
-            return master_service_.EvictDiskReplica(client_id, key,
+            return master_service_.EvictDiskReplica(client_id, key, tenant_id,
                                                     replica_type);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tenant_id=", tenant_id,
                              ", replica_type=", replica_type);
         },
         [] {
@@ -1640,15 +1654,16 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type) {
+    const std::string& tenant_id, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "BatchEvictDiskReplica");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys,
+                     ", tenant_id=", tenant_id,
                      ", replica_type=", replica_type);
     MasterMetricManager::instance().inc_evict_disk_replica_requests();
 
-    auto results =
-        master_service_.BatchEvictDiskReplica(client_id, keys, replica_type);
+    auto results = master_service_.BatchEvictDiskReplica(
+        client_id, keys, tenant_id, replica_type);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -1670,12 +1685,14 @@ WrappedMasterService::BatchEvictDiskReplica(
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
-    const std::string& key, const std::vector<std::string>& targets) {
+    const std::string& key, const std::string& tenant_id,
+    const std::vector<std::string>& targets) {
     return execute_rpc(
         "CreateCopyTask",
-        [&] { return master_service_.CreateCopyTask(key, targets); },
+        [&] { return master_service_.CreateCopyTask(key, tenant_id, targets); },
         [&](auto& timer) {
-            timer.LogRequest("key=", key, ", targets_size=", targets.size());
+            timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                             ", targets_size=", targets.size());
         },
         [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
         [] {
@@ -1684,14 +1701,17 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
 }
 
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
-    const std::string& key, const std::string& source,
-    const std::string& target) {
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::string& target) {
     return execute_rpc(
         "CreateMoveTask",
-        [&] { return master_service_.CreateMoveTask(key, source, target); },
+        [&] {
+            return master_service_.CreateMoveTask(key, tenant_id, source,
+                                                  target);
+        },
         [&](auto& timer) {
-            timer.LogRequest("key=", key, ", source=", source,
-                             ", target=", target);
+            timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                             ", source=", source, ", target=", target);
         },
         [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
         [] {
@@ -1799,8 +1819,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
-             ErrorCode>
+tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
     ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
@@ -1820,18 +1839,18 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
     timer.LogRequest("action=notify_offload_success");
 
     auto result =
-        master_service_.NotifyOffloadSuccess(client_id, keys, metadatas);
+        master_service_.NotifyOffloadSuccess(client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
     timer.LogRequest("action=promotion_object_heartbeat");
@@ -1840,30 +1859,34 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
-    const UUID& client_id, const std::string& key, uint64_t size,
-    const std::vector<std::string>& preferred_segments) {
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t size, const std::vector<std::string>& preferred_segments) {
     ScopedVLogTimer timer(1, "PromotionAllocStart");
     timer.LogRequest("action=promotion_alloc_start");
-    auto result = master_service_.PromotionAllocStart(client_id, key, size,
-                                                      preferred_segments);
+    auto result = master_service_.PromotionAllocStart(client_id, key, tenant_id,
+                                                      size, preferred_segments);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccess(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
     timer.LogRequest("action=notify_promotion_success");
-    auto result = master_service_.NotifyPromotionSuccess(client_id, key);
+    auto result =
+        master_service_.NotifyPromotionSuccess(client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
-    const UUID& client_id, const std::string& key) {
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "NotifyPromotionFailure");
     timer.LogRequest("action=notify_promotion_failure");
-    auto result = master_service_.NotifyPromotionFailure(client_id, key);
+    auto result =
+        master_service_.NotifyPromotionFailure(client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }

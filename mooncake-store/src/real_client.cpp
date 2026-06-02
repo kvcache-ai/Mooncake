@@ -5483,15 +5483,18 @@ RealClient::batch_get_into_offload_object_internal(
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
+    std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
+        storage_keys.emplace_back(
+            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();

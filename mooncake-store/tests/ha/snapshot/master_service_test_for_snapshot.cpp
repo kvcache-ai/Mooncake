@@ -1,5 +1,6 @@
 #include "master_service_test_for_snapshot_base.h"
 
+#include <algorithm>
 #include <atomic>
 #include <random>
 #include <unordered_set>
@@ -2480,8 +2481,11 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 
     keys.clear();
@@ -2497,8 +2501,11 @@ TEST_F(MasterServiceSnapshotTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 }
 

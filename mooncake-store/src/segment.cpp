@@ -573,10 +573,10 @@ SegmentSerializer::Serialize() {
             segment_manager_->client_local_disk_segment_.at(client_uuid);
         packer.pack(UuidToString(client_uuid));
 
-        // Serialize LocalDiskSegment: [enable_offloading, count, key1, ts1,
-        // key2, ts2, ...] Sort keys to ensure determinism
+        // Serialize LocalDiskSegment: [enable_offloading, count, storage_key1,
+        // task1, storage_key2, task2, ...] Sort keys to ensure determinism.
         std::vector<std::string> sorted_keys;
-        for (const auto& [key, ts] : segment->offloading_objects) {
+        for (const auto& [key, _] : segment->offloading_objects) {
             sorted_keys.push_back(key);
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
@@ -587,7 +587,11 @@ SegmentSerializer::Serialize() {
 
         for (const auto& key : sorted_keys) {
             packer.pack(key);
-            packer.pack(segment->offloading_objects.at(key));
+            const auto& task = segment->offloading_objects.at(key);
+            packer.pack_array(3);
+            packer.pack(task.tenant_id);
+            packer.pack(task.key);
+            packer.pack(task.size);
         }
     }
 
@@ -902,8 +906,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                                 client_uuid_str)));
             }
 
-            // Parse LocalDiskSegment array: [enable_offloading, count, key1,
-            // ts1, ...]
+            // Parse LocalDiskSegment array: [enable_offloading, count,
+            // storage_key1, task1, ...]
             if (client_value.type != msgpack::type::ARRAY ||
                 client_value.via.array.size < 2) {
                 return tl::unexpected(
@@ -921,19 +925,43 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             // Parse offloading_objects
             for (uint64_t k = 0; k < count; ++k) {
                 size_t key_idx = 2 + k * 2;
-                size_t ts_idx = 2 + k * 2 + 1;
-                if (ts_idx >= client_value.via.array.size) {
+                size_t task_idx = 2 + k * 2 + 1;
+                if (task_idx >= client_value.via.array.size) {
                     return tl::unexpected(
                         SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                            "deserialize local_disk_segments "
                                            "offloading_objects out of bounds"));
                 }
 
+                if (client_value.via.array.ptr[key_idx].type !=
+                    msgpack::type::STR) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "deserialize local_disk_segments offloading key is "
+                        "not string"));
+                }
                 std::string key(
                     client_value.via.array.ptr[key_idx].via.str.ptr,
                     client_value.via.array.ptr[key_idx].via.str.size);
-                int64_t ts = client_value.via.array.ptr[ts_idx].as<int64_t>();
-                segment->offloading_objects[key] = ts;
+                const auto& task_obj = client_value.via.array.ptr[task_idx];
+                if (task_obj.type == msgpack::type::ARRAY &&
+                    task_obj.via.array.size == 3) {
+                    OffloadTaskItem task;
+                    task.tenant_id =
+                        task_obj.via.array.ptr[0].as<std::string>();
+                    task.key = task_obj.via.array.ptr[1].as<std::string>();
+                    task.size = task_obj.via.array.ptr[2].as<int64_t>();
+                    segment->offloading_objects[key] = std::move(task);
+                } else {
+                    // Backward compatibility for snapshots whose
+                    // offloading_objects value was key -> size.
+                    auto [tenant_id, user_key] =
+                        ParseTenantScopedStorageKey(key);
+                    segment->offloading_objects[key] =
+                        OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                                        .key = std::move(user_key),
+                                        .size = task_obj.as<int64_t>()};
+                }
             }
 
             segment_manager_->client_local_disk_segment_[client_id] =
