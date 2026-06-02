@@ -17,6 +17,7 @@
 #include "utils.h"
 
 #include "master_config.h"
+#include "master_log_journal.h"
 #include "version.h"
 
 using namespace coro_rpc;
@@ -243,6 +244,28 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+// Master log journal configuration. The journal merges every diagnostic
+// record (LOG()/VLOG()) into a single, chronologically ordered file inside one
+// directory, reusing glog's file sink, rotation, retention and symlink
+// machinery. See master_log_journal.h for details.
+DEFINE_bool(enable_log_journal, true,
+            "Merge all master logs into a single journal file inside one "
+            "directory (reuses glog). When false, keep glog's default "
+            "behavior (only log to files when --log_dir is set)");
+DEFINE_string(log_journal_dir, "",
+              "Directory holding the merged master log journal. When empty, "
+              "falls back to --log_dir, then to '<program>_logs'");
+DEFINE_bool(log_journal_merge, true,
+            "Merge all severities into one journal file. When false, keep "
+            "glog's per-severity files but inside the journal directory");
+DEFINE_uint32(log_journal_max_file_size_mb, 0,
+              "Journal file rotation threshold in MiB (0 = glog default via "
+              "--max_log_size)");
+DEFINE_uint32(log_journal_retention_days, 0,
+              "Delete journal files older than this many days (0 = keep all)");
+DEFINE_bool(log_journal_also_log_to_stderr, false,
+            "Also mirror journal records to stderr");
 
 namespace {
 
@@ -936,7 +959,31 @@ int main(int argc, char* argv[]) {
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
-    if (!FLAGS_log_dir.empty()) {
+    if (FLAGS_enable_log_journal) {
+        mooncake::MasterLogJournalConfig journal_config;
+        journal_config.enable = true;
+        journal_config.program_name =
+            std::filesystem::path(argv[0]).filename().string();
+        if (journal_config.program_name.empty()) {
+            journal_config.program_name = "mooncake_master";
+        }
+        journal_config.journal_dir = FLAGS_log_journal_dir;
+        journal_config.merge_severities = FLAGS_log_journal_merge;
+        journal_config.max_file_size_mb = FLAGS_log_journal_max_file_size_mb;
+        journal_config.retention_days = FLAGS_log_journal_retention_days;
+        journal_config.also_log_to_stderr =
+            FLAGS_log_journal_also_log_to_stderr;
+        if (!mooncake::MasterLogJournal::Instance().Init(journal_config)) {
+            // Fall back to legacy behavior if the journal directory could not
+            // be prepared.
+            if (!FLAGS_log_dir.empty() &&
+                !google::IsGoogleLoggingInitialized()) {
+                google::InitGoogleLogging(argv[0]);
+            }
+        }
+    } else if (!FLAGS_log_dir.empty()) {
+        // Legacy behavior: only initialize glog file logging when a log
+        // directory is explicitly configured.
         google::InitGoogleLogging(argv[0]);
     }
 

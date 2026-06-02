@@ -39,6 +39,15 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+- Logging / Log Journal (optional)
+  - The master merges all of its diagnostic logs (`LOG()`/`VLOG()`) into a single, chronologically ordered journal file inside one directory. This is built on top of glog, reusing its file sink, size-based rotation, time-based retention and "latest file" symlink.
+  - `--enable_log_journal` (bool, default `true`): Merge all master logs into one journal file inside a dedicated directory. When `false`, the master keeps glog's default behavior (only writes log files when `--log_dir` is set).
+  - `--log_journal_dir` (str, default empty): Directory holding the merged journal file. When empty it falls back to `--log_dir`, then to `<program>_logs` relative to the working directory. The current file is always reachable through the `mooncake_master.INFO` symlink in this directory.
+  - `--log_journal_merge` (bool, default `true`): Merge every severity (INFO/WARNING/ERROR/FATAL) into one file. When `false`, glog's per-severity files are kept but still placed inside the journal directory.
+  - `--log_journal_max_file_size_mb` (uint32, default `0`): Per-file rotation threshold in MiB. `0` keeps glog's default (`--max_log_size`).
+  - `--log_journal_retention_days` (uint32, default `0`): Delete journal files older than this many days using glog's log cleaner. `0` keeps all files.
+  - `--log_journal_also_log_to_stderr` (bool, default `false`): Also mirror journal records to stderr.
+
 - Task Manager (optional)
   - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
   - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
