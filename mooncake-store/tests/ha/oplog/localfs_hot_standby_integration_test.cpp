@@ -29,6 +29,7 @@
 #include "hot_standby_service.h"
 #include "ha/oplog/oplog_manager.h"
 #include "ha/oplog/oplog_store_factory.h"
+#include "metadata_store.h"
 #include "standby_state_machine.h"
 
 namespace mooncake {
@@ -448,6 +449,130 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestHighThroughputSync) {
         << "Standby lag should be zero after sync";
 
     LOG(INFO) << "Max lag observed: " << max_lag << " entries";
+}
+
+// Helper to build a struct_pack-serialized MetadataPayload for integration tests.
+std::string MakeTenantPayload(uint64_t size,
+                              const std::string& group_id = "",
+                              ObjectDataType data_type = ObjectDataType::UNKNOWN) {
+    MetadataPayload payload;
+    payload.client_id = {1, 2};
+    payload.size = size;
+    payload.group_id = group_id;
+    payload.data_type = data_type;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+TEST_F(LocalFsHotStandbyIntegrationTest, TestMultiTenantIsolation) {
+    // 1. Primary writes the same key under two different tenants with
+    //    distinct metadata (size / group_id / data_type).
+    auto primary = CreatePrimaryOpLogManager();
+    ASSERT_NE(primary, nullptr);
+
+    auto payload_a = MakeTenantPayload(1024, "groupA", ObjectDataType::KVCACHE);
+    auto payload_b = MakeTenantPayload(2048, "groupB", ObjectDataType::TENSOR);
+
+    primary->AppendAndPersist(OpType::PUT_END, "tenantA", "foo", payload_a);
+    primary->AppendAndPersist(OpType::PUT_END, "tenantB", "foo", payload_b);
+
+    uint64_t last_seq_id = primary->GetLastSequenceId();
+    LOG(INFO) << "Primary wrote " << last_seq_id
+              << " OpLog entries for multi-tenant test";
+
+    // 2. Start standby and wait for sync.
+    HotStandbyService standby(MakeHotStandbyConfig());
+    StandbyServiceGuard guard(&standby);
+
+    ASSERT_EQ(ErrorCode::OK, standby.Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitForSync(standby, last_seq_id))
+        << "Standby failed to sync multi-tenant entries";
+
+    // 3. Verify both tenant keys exist and are isolated.
+    std::vector<StandbyObjectEntry> snapshot;
+    ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
+    ASSERT_EQ(2u, snapshot.size())
+        << "Expected 2 entries (tenantA/foo + tenantB/foo), got "
+        << snapshot.size();
+
+    const StandbyObjectEntry* entry_a = nullptr;
+    const StandbyObjectEntry* entry_b = nullptr;
+    for (const auto& e : snapshot) {
+        if (e.tenant_id == "tenantA" && e.key == "foo") {
+            entry_a = &e;
+        } else if (e.tenant_id == "tenantB" && e.key == "foo") {
+            entry_b = &e;
+        }
+    }
+    ASSERT_NE(entry_a, nullptr) << "tenantA/foo missing from standby snapshot";
+    ASSERT_NE(entry_b, nullptr) << "tenantB/foo missing from standby snapshot";
+
+    // Verify metadata fields are preserved per-tenant.
+    EXPECT_EQ(1024u, entry_a->metadata.size);
+    EXPECT_EQ("groupA", entry_a->metadata.group_id);
+    EXPECT_EQ(ObjectDataType::KVCACHE, entry_a->metadata.data_type);
+
+    EXPECT_EQ(2048u, entry_b->metadata.size);
+    EXPECT_EQ("groupB", entry_b->metadata.group_id);
+    EXPECT_EQ(ObjectDataType::TENSOR, entry_b->metadata.data_type);
+
+    // 4. Promote and verify the snapshot still carries tenant isolation.
+    ASSERT_TRUE(standby.IsReadyForPromotion());
+    EXPECT_EQ(ErrorCode::OK, standby.Promote());
+
+    std::vector<StandbyObjectEntry> post_promotion;
+    ASSERT_TRUE(standby.ExportMetadataSnapshot(post_promotion));
+    ASSERT_EQ(2u, post_promotion.size());
+
+    entry_a = nullptr;
+    entry_b = nullptr;
+    for (const auto& e : post_promotion) {
+        if (e.tenant_id == "tenantA" && e.key == "foo") {
+            entry_a = &e;
+        } else if (e.tenant_id == "tenantB" && e.key == "foo") {
+            entry_b = &e;
+        }
+    }
+    ASSERT_NE(entry_a, nullptr)
+        << "tenantA/foo missing after promotion";
+    ASSERT_NE(entry_b, nullptr)
+        << "tenantB/foo missing after promotion";
+
+    EXPECT_EQ(1024u, entry_a->metadata.size);
+    EXPECT_EQ("groupA", entry_a->metadata.group_id);
+    EXPECT_EQ(ObjectDataType::KVCACHE, entry_a->metadata.data_type);
+
+    EXPECT_EQ(2048u, entry_b->metadata.size);
+    EXPECT_EQ("groupB", entry_b->metadata.group_id);
+    EXPECT_EQ(ObjectDataType::TENSOR, entry_b->metadata.data_type);
+}
+
+TEST_F(LocalFsHotStandbyIntegrationTest, TestMultiTenantRemove) {
+    // 1. PUT two keys under different tenants, then REMOVE one.
+    auto primary = CreatePrimaryOpLogManager();
+    ASSERT_NE(primary, nullptr);
+
+    auto payload = MakeTenantPayload(1024);
+    primary->AppendAndPersist(OpType::PUT_END, "tenantA", "bar", payload);
+    primary->AppendAndPersist(OpType::PUT_END, "tenantB", "bar", payload);
+    primary->AppendAndPersist(OpType::REMOVE, "tenantA", "bar", "");
+
+    uint64_t last_seq_id = primary->GetLastSequenceId();
+
+    // 2. Start standby and sync.
+    HotStandbyService standby(MakeHotStandbyConfig());
+    StandbyServiceGuard guard(&standby);
+
+    ASSERT_EQ(ErrorCode::OK, standby.Start("", "", cluster_id_));
+    ASSERT_TRUE(WaitForSync(standby, last_seq_id));
+
+    // 3. Verify only tenantB/bar remains.
+    std::vector<StandbyObjectEntry> snapshot;
+    ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
+    ASSERT_EQ(1u, snapshot.size())
+        << "Expected 1 entry after REMOVE, got " << snapshot.size();
+    EXPECT_EQ("tenantB", snapshot[0].tenant_id);
+    EXPECT_EQ("bar", snapshot[0].key);
 }
 
 }  // namespace testing

@@ -2456,6 +2456,10 @@ void MasterService::RestoreFromStandbySnapshot(
                                   false, standby_meta.data_type,
                                   standby_meta.group_id,
                                   tenant_id, user_key));
+        if (!standby_meta.group_id.empty()) {
+            RegisterGroupMember(tenant_state, tenant_id, user_key,
+                                standby_meta.group_id);
+        }
         tenant_state.processing_keys.erase(user_key);
     }
 
@@ -2569,7 +2573,7 @@ auto MasterService::BatchReplicaClear(
 
             if (enable_ha_ && oplog_store_) {
                 auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                    OpType::REMOVE, TenantId::Default().MakeScopedKey(key), {});
+                    OpType::REMOVE, key, {});
                 if (!persist_result) {
                     continue;
                 }
@@ -2628,13 +2632,13 @@ auto MasterService::BatchReplicaClear(
                 tl::expected<OpLogEntry, ErrorCode> persist_result;
                 if (remaining.empty()) {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::REMOVE, TenantId::Default().MakeScopedKey(key),
-                        {});
+                        OpType::REMOVE, key, {});
                 } else {
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                        OpType::PUT_END, TenantId::Default().MakeScopedKey(key),
+                        OpType::PUT_END, key,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
-                            metadata.client_id, metadata.size, remaining));
+                            metadata.client_id, metadata.size, remaining,
+                            metadata.group_id, metadata.data_type));
                 }
                 if (!persist_result) {
                     continue;
@@ -3579,8 +3583,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 
     if (enable_ha_ && oplog_store_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
-        AppendOpLogAndNotify(OpType::PUT_END,
-                             object_id.tenant_id.MakeScopedKey(key), payload);
+        AppendOpLogAndNotify(OpType::PUT_END, object_id.tenant_id, key,
+                             payload);
     }
     return {};
 }
@@ -3653,9 +3657,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+            OpType::PUT_END, object_id.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post));
+                metadata.client_id, metadata.size, post,
+                metadata.group_id, metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -3736,12 +3741,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::REMOVE, metadata.tenant_id.MakeScopedKey(key), {});
+                OpType::REMOVE, metadata.tenant_id, key, {});
         } else {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+                OpType::PUT_END, metadata.tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining));
+                    metadata.client_id, metadata.size, remaining,
+                    metadata.group_id, metadata.data_type));
         }
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
@@ -4236,12 +4242,13 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::REMOVE, metadata.tenant_id.MakeScopedKey(key), {});
+                OpType::REMOVE, metadata.tenant_id, key, {});
         } else {
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+                OpType::PUT_END, metadata.tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining));
+                    metadata.client_id, metadata.size, remaining,
+                    metadata.group_id, metadata.data_type));
         }
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
@@ -4520,9 +4527,10 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+            OpType::PUT_END, metadata.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post));
+                metadata.client_id, metadata.size, post,
+                metadata.group_id, metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -4835,9 +4843,10 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         }
 
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-            OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+            OpType::PUT_END, metadata.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post));
+                metadata.client_id, metadata.size, post,
+                metadata.group_id, metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -5135,8 +5144,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 if (enable_ha_ && oplog_store_) {
                     auto err = PersistRemoveForHA(
-                        "RemoveAll(tenant)",
-                        it->second.tenant_id.MakeScopedKey(it->first));
+                        "RemoveAll(tenant)", normalized_tenant, it->first);
                     if (!err) {
                         ++it;
                         continue;
@@ -5231,8 +5239,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             if (would_invalidate) {
                 if (had_complete_replica && enable_ha_ && oplog_store_) {
                     auto err = PersistRemoveForHA(
-                        "BatchRemove(stale cleanup)",
-                        it->second.tenant_id.MakeScopedKey(key));
+                        "BatchRemove(stale cleanup)", normalized_tenant, key);
                     if (!err) {
                         results[original_idx] =
                             tl::make_unexpected(err.error());
@@ -5292,8 +5299,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             if (enable_ha_ && oplog_store_) {
-                auto err = PersistRemoveForHA(
-                    "BatchRemove", metadata.tenant_id.MakeScopedKey(key));
+                auto err =
+                    PersistRemoveForHA("BatchRemove", normalized_tenant, key);
                 if (!err) {
                     results[original_idx] = tl::make_unexpected(err.error());
                     continue;
@@ -6401,9 +6408,10 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
             }
 
             auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                OpType::PUT_END, metadata.tenant_id.MakeScopedKey(key),
+                OpType::PUT_END, metadata.tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post));
+                    metadata.client_id, metadata.size, post,
+                    metadata.group_id, metadata.data_type));
             if (!persist_result) {
                 // Keep staged replica PROCESSING and task untouched. Caller
                 // can retry; promotion_in_flight remains accurate.
@@ -6661,7 +6669,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                             OpType::PUT_END, tenant_it->first, *key_it,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size,
-                                post_descriptors));
+                                post_descriptors,
+                                metadata.group_id, metadata.data_type));
                     }
                     if (!persist_result) {
                         LOG(WARNING) << "DiscardExpiredProcessingReplicas: "
@@ -6739,8 +6748,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     persist_result = AppendOpLogAndNotifyDurableOrAbort(
                         OpType::PUT_END, tenant_it->first, task_it->first,
                         SerializeMetadataForOpLogFromReplicaDescriptors(
-                            metadata.client_id, metadata.size,
-                            post_descriptors));
+                            metadata.client_id, metadata.size, post_descriptors,
+                            metadata.group_id, metadata.data_type));
                 }
                 if (!persist_result) {
                     LOG(WARNING)
@@ -7480,7 +7489,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             persist_result = AppendOpLogAndNotifyDurableOrAbort(
                 OpType::PUT_END, tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining));
+                    metadata.client_id, metadata.size, remaining,
+                    metadata.group_id, metadata.data_type));
         }
         if (!persist_result) {
             LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
@@ -8021,7 +8031,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                         persist_result = AppendOpLogAndNotifyDurableOrAbort(
                             OpType::PUT_END, tenant_it->first, it->first,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size, remaining));
+                                metadata.client_id, metadata.size, remaining,
+                                metadata.group_id, metadata.data_type));
                     }
                     if (!persist_result) {
                         LOG(WARNING)
@@ -10003,6 +10014,8 @@ std::string MasterService::SerializeMetadataForOpLog(
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
     payload.size = metadata.size;
+    payload.group_id = metadata.group_id;
+    payload.data_type = metadata.data_type;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -10026,6 +10039,8 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     MetadataPayload payload;
     payload.client_id = metadata.client_id;
     payload.size = metadata.size;
+    payload.group_id = metadata.group_id;
+    payload.data_type = metadata.data_type;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -10042,11 +10057,14 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
 
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     const UUID& client_id, uint64_t size,
-    const std::vector<Replica::Descriptor>& replicas) const {
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::string& group_id, ObjectDataType data_type) const {
     MetadataPayload payload;
     payload.client_id = client_id;
     payload.size = size;
     payload.replicas = replicas;
+    payload.group_id = group_id;
+    payload.data_type = data_type;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
