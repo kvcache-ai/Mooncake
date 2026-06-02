@@ -11,6 +11,8 @@
 #include <glog/logging.h>
 #include <ylt/util/tl/expected.hpp>
 
+#include "types.h"
+
 namespace mooncake {
 namespace ha {
 namespace backends {
@@ -369,7 +371,7 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
     if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
         resolved_namespace = env_cluster_id;
     } else {
-        resolved_namespace = "mooncake";
+        resolved_namespace = DEFAULT_CLUSTER_ID;
     }
     return resolved_namespace;
 }
