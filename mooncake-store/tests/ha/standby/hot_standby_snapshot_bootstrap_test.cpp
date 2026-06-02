@@ -114,13 +114,13 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     EXPECT_EQ(descriptor_.last_included_seq, status.applied_seq_id);
     EXPECT_EQ(descriptor_.last_included_seq, status.primary_seq_id);
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<StandbyObjectEntry> exported;
     ASSERT_TRUE(service.ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ(kDefaultTestObjectKey, exported.front().first);
-    EXPECT_EQ(kDefaultTestObjectSize, exported.front().second.size);
+    EXPECT_EQ(kDefaultTestObjectKey, exported.front().key);
+    EXPECT_EQ(kDefaultTestObjectSize, exported.front().metadata.size);
     EXPECT_EQ(descriptor_.last_included_seq,
-              exported.front().second.last_sequence_id);
+              exported.front().metadata.last_sequence_id);
 }
 
 TEST_P(HotStandbySnapshotBootstrapTest,
@@ -219,8 +219,8 @@ TEST_P(HotStandbySnapshotBootstrapTest,
     const auto& ctx = result.value();
     EXPECT_EQ(descriptor_.last_included_seq, ctx.applied_seq_id);
     ASSERT_EQ(1u, ctx.objects.size());
-    EXPECT_EQ(kDefaultTestObjectKey, ctx.objects[0].first);
-    EXPECT_EQ(kDefaultTestObjectSize, ctx.objects[0].second.size);
+    EXPECT_EQ(kDefaultTestObjectKey, ctx.objects[0].key);
+    EXPECT_EQ(kDefaultTestObjectSize, ctx.objects[0].metadata.size);
     EXPECT_TRUE(ctx.segments.empty());
 }
 

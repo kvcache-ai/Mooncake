@@ -23,11 +23,39 @@ namespace mooncake::test {
 // Minimal MetadataStore implementation for OpLogApplier
 class MinimalMockMetadataStore : public MetadataStore {
    public:
+    using MetadataStore::Exists;
+    using MetadataStore::GetMetadata;
+    using MetadataStore::PutMetadata;
+    using MetadataStore::Remove;
+
+    bool PutMetadata(const std::string& tenant_id,
+                     const std::string& key,
+                     const StandbyObjectMetadata& metadata) override {
+        if (tenant_id != "default") return true;
+        return PutMetadata(key, metadata);
+    }
+    bool Put(const std::string&, const std::string&) override { return true; }
+    std::optional<StandbyObjectMetadata> GetMetadata(
+        const std::string& tenant_id, const std::string& key) const override {
+        if (tenant_id != "default") return std::nullopt;
+        return GetMetadata(key);
+    }
+    bool Remove(const std::string& tenant_id, const std::string& key) override {
+        if (tenant_id != "default") return true;
+        return Remove(key);
+    }
+    bool Exists(const std::string& tenant_id, const std::string& key) const override {
+        if (tenant_id != "default") return false;
+        return Exists(key);
+    }
+    size_t GetKeyCountForTenant(const std::string& tenant_id) const override {
+        if (tenant_id != "default") return 0;
+        return GetKeyCount();
+    }
     bool PutMetadata(const std::string&,
                      const StandbyObjectMetadata&) override {
         return true;
     }
-    bool Put(const std::string&, const std::string&) override { return true; }
     std::optional<StandbyObjectMetadata> GetMetadata(
         const std::string&) const override {
         return std::nullopt;
