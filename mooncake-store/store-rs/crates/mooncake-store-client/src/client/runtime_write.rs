@@ -1547,20 +1547,42 @@ impl StoreClient {
                         prepared[index].quota_reservation.as_ref(),
                         "batch_put_route_compare_and_swap_conflict",
                     );
-                    match (
-                        conflict_policy,
-                        cas.current.filter(|route| {
-                            route.state == RouteState::Active
-                                && mooncake_store_route::route_has_readable_replicas(
-                                    &route_namespace,
-                                    route,
-                                )
-                        }),
-                    ) {
-                        (
-                            BatchPutRouteConflictPolicy::AcceptExistingActiveRoute,
-                            Some(current),
-                        ) => {
+                    let accepted_current = match conflict_policy {
+                        BatchPutRouteConflictPolicy::AcceptExistingActiveRoute => {
+                            if let Some(current) = cas.current.filter(|route| {
+                                route.state == RouteState::Active
+                                    && mooncake_store_route::route_has_readable_replicas(
+                                        &route_namespace,
+                                        route,
+                                    )
+                            }) {
+                                Some(current)
+                            } else {
+                                match self
+                                    .query_routes_by_object_keys_bounded(std::slice::from_ref(
+                                        &pending.key,
+                                    ))
+                                    .and_then(|routes| {
+                                        Self::expect_exactly_one(routes, "route recheck")
+                                    }) {
+                                    Ok(Some(current))
+                                        if current.state == RouteState::Active
+                                            && mooncake_store_route::route_has_readable_replicas(
+                                                &route_namespace,
+                                                &current,
+                                            ) => Some(current),
+                                    Ok(_) => None,
+                                    Err(error) => {
+                                        first_error.get_or_insert(error);
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    match accepted_current {
+                        Some(current) => {
                             self.storage_owner.track_route(&current);
                             debug!(
                                 runtime = %self.lease.runtime,
@@ -1570,7 +1592,7 @@ impl StoreClient {
                             );
                             published.push(current);
                         }
-                        _ => {
+                        None => {
                             first_error.get_or_insert_with(|| {
                                 StoreError::Conflict(format!(
                                     "route update lost race for key {}",
