@@ -128,7 +128,8 @@ class RdmaTransport {
     // Connect QPs to peers using exchanged metadata.
     // is_roce: true for RoCE, false for IB.
     virtual int connectPeers(
-        bool is_roce, const std::vector<int64_t>& remote_addrs,
+        int local_rank, bool is_roce,
+        const std::vector<int64_t>& remote_addrs,
         const std::vector<int32_t>& remote_keys,
         const std::vector<int32_t>& remote_qpns,
         const std::vector<int32_t>& remote_lids,

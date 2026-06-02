@@ -78,6 +78,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
+        rdma_send_signal_buffer, rdma_recv_signal_buffer,
         rank, num_ranks, MAX_QP_COUNT);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
@@ -238,7 +239,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-        { int _v; int _tries = 0; while ((_v = mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx)) != FINISHED_SUM_TAG * 2) { if (++_tries >= 1000000) { printf("[R%d E%d] SPIN TIMEOUT finish=%d expected=%d\n", rank, responsible_expert_idx, _v, FINISHED_SUM_TAG * 2); break; } } }
+        while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
             mc_red_add(comm_ctx, dst_rank, dst_expert_local_idx % num_qp_per_rank, num_qp_per_rank,
@@ -389,7 +390,6 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, phases); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-    fprintf(stderr, "[EP] dispatch kernel: num_sms=%d phases=%d\n", num_sms, phases);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -438,6 +438,7 @@ combine(void* combined_x, int32_t* active_ranks,
     const CommCtx comm_ctx = make_comm_ctx(
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
+        rdma_send_signal_buffer, rdma_recv_signal_buffer,
         rank, num_ranks, MAX_QP_COUNT);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 

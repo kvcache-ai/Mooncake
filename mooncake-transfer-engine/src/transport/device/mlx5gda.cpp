@@ -1,5 +1,4 @@
 #include <cmath>
-#include <unistd.h>
 
 #include "cuda_alike.h"
 
@@ -457,25 +456,9 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp* qp,
         struct mlx5dv_obj dv;
         struct mlx5dv_ah dah;
 
-        // ibv_create_ah triggers kernel-side ARP/ND resolution for the
-        // remote GID.  On RoCE this can fail if the ARP entry is not yet
-        // populated (e.g. first QP after boot, or container environment).
-        // Retry a few times with a short delay to give the kernel time to
-        // complete address resolution.
-        const int kMaxAhRetries = 5;
-        for (int attempt = 0; attempt < kMaxAhRetries; ++attempt) {
-            ah = ibv_create_ah(qp->pd, &ah_attr);
-            if (ah) break;
-            // EAGAIN / EWOULDBLOCK means address resolution is in progress
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000);  // 100 ms
-                continue;
-            }
-            // Other errors (ENODEV, EINVAL, etc.) are not recoverable
-            break;
-        }
+        ah = ibv_create_ah(qp->pd, &ah_attr);
         if (!ah) {
-            perror("Failed to create AH (RoCE address resolution failed)");
+            perror("Failed to create AH");
             ret = -1;
             goto cleanup;
         }

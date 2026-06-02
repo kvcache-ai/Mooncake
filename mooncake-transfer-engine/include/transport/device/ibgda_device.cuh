@@ -11,6 +11,9 @@
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
+#ifndef MOONCAKE_EP_USE_MUSA
+#include <cuda/atomic>
+#endif
 #include <transport/device/ibgda/mlx5gda.h>
 
 // mlx5 32-bit atomic-add WQE segment (not in mlx5gda.h; defined here for use
@@ -32,6 +35,8 @@ struct IbgdaContext {
     mlx5gda_qp_devctx* qp_devctxs;  // device ptr: [num_qps]
     const uint64_t* raddrs;         // device ptr: [num_ranks] remote GDR base
     const uint32_t* rkeys;          // device ptr: [num_ranks] remote rkey
+    const void* local_atomic_base;  // local scratch base for atomic responses
+    const void* remote_atomic_base; // symmetric remote signal base
 };
 
 // ---------------------------------------------------------------------------
@@ -45,14 +50,24 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
+#ifdef MOONCAKE_EP_USE_MUSA
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
     } while (old != 0);
+#else
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
+    while (lock.exchange(1u, cuda::memory_order_acquire) != 0u);
+#endif
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
+#ifdef MOONCAKE_EP_USE_MUSA
     mc_st_release_u32(&qp->mutex, 0u);
+#else
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
+    lock.store(0u, cuda::memory_order_release);
+#endif
 }
 
 __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
@@ -114,7 +129,10 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_write_wqe(
     ++qp->wq_head;
 }
 
-// Issue an RDMA ATOMIC FETCH-AND-ADD WQE (32-bit add_data in big-endian).
+// Issue an RDMA ATOMIC MASKED FETCH-AND-ADD WQE (32-bit add_data).
+// This matches the original CUDA IBGDA EP kernel. A regular 64-bit
+// MLX5_OPCODE_ATOMIC_FA does not implement the 32-bit signal-buffer add used
+// by dispatch/combine.
 __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     mlx5gda_qp_devctx* qp, int32_t value, uint64_t laddr, __be32 lkey,
     uint64_t raddr, __be32 rkey) {
@@ -125,7 +143,8 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 4);
     wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
     wqe->ctrl.opmod_idx_opcode = mc_bswap32(
-        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_ATOMIC_FA);
+        MLX5_OPCODE_ATOMIC_MASKED_FA |
+        (static_cast<uint32_t>(qp->wq_head) << 8) | 0x08000000);
 
     wqe->raddr.raddr = mc_bswap64(raddr);
     wqe->raddr.rkey = rkey;
@@ -138,7 +157,7 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     atomic_seg->field_boundary = 0;
     atomic_seg->compare = 0;
 
-    wqe->data.byte_count = mc_bswap32(8);  // atomic always 8 bytes
+    wqe->data.byte_count = mc_bswap32(static_cast<uint32_t>(4));
     wqe->data.lkey = lkey;
     wqe->data.addr = mc_bswap64(laddr);
 
@@ -150,7 +169,7 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
 // ---------------------------------------------------------------------------
 
 // RDMA WRITE: send `nbytes` from `send_ptr` to `recv_ptr` on `dst_rank`.
-// Must be called by lane 0 only; caller holds the QP lock.
+// Must be called by lane 0 only.
 __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              int channel, int dst_rank,
                                              int src_rank, int qps_per_rank,
@@ -159,7 +178,6 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              uint32_t nbytes) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
-    mc_ibgda_poll_cq(qp, qp->wq_head);
     mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
@@ -168,7 +186,7 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
 }
 
 // RDMA ATOMIC ADD: add `value` to the 32-bit word at `recv_raddr` on
-// `dst_rank`. Must be called by lane 0 only; caller holds the QP lock.
+// `dst_rank`. Must be called by lane 0 only.
 __device__ __forceinline__ void mc_ibgda_red_add(
     const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
     int qps_per_rank,
@@ -177,7 +195,6 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     int32_t value) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
-    mc_ibgda_poll_cq(qp, qp->wq_head);
     mc_ibgda_write_rdma_atomic_add_wqe(qp, value, laddr,
                                        mc_bswap32(ctx.rkeys[src_rank]),
                                        recv_raddr,

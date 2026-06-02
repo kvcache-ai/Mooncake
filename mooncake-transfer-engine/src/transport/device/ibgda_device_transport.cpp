@@ -27,7 +27,6 @@
 
 #include <cstring>
 #include <stdexcept>
-#include <unistd.h>
 
 #include "cuda_alike.h"
 #include "transport/device/ibgda/memheap.h"
@@ -45,59 +44,21 @@ static bool isIpv4Mapped(const struct in6_addr* a) {
             a->s6_addr32[2] == htonl(0x0000ffff));
 }
 
-// Check if a GID index has an associated network device (required for
-// RoCE ARP resolution).  Reads from sysfs:
-//   /sys/class/infiniband/<dev>/ports/<port>/gid_attrs/ndevs/<idx>
-static bool gidHasNetworkDevice(const std::string& dev_name, uint8_t port,
-                                int gid_index) {
-    std::string path = "/sys/class/infiniband/" + dev_name +
-                       "/ports/" + std::to_string(port) +
-                       "/gid_attrs/ndevs/" + std::to_string(gid_index);
-    FILE* f = fopen(path.c_str(), "r");
-    if (!f) return false;
-    char buf[64] = {};
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
-    fclose(f);
-    // Non-empty string (e.g. "eth0\n") means a network device is bound
-    return buf[0] != '\0' && buf[0] != '\n';
-}
-
-// Find the best GID index with the same priority as the Verbs path:
-//   1. RoCE v2 + IPv4-mapped + has network device  (best for RoCE)
-//   2. RoCE v2 + IPv4-mapped + no network device
-//   3. IB GID
-// Returns -1 if no suitable GID found.
 static int findBestGidIndex(ibv_context* ctx, uint8_t port,
                             const ibv_port_attr& port_attr) {
-    std::string dev_name = ibv_get_device_name(ctx->device);
-    int fallback_v4_no_netdev = -1;
-
     for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
         ibv_gid_entry entry;
         if (ibv_query_gid_ex(ctx, port, i, &entry, 0)) continue;
 
-        if (entry.gid_type == IBV_GID_TYPE_IB) {
-            // InfiniBand — use immediately (no network device needed)
-            if (fallback_v4_no_netdev < 0) return i;
-            continue;
-        }
-
         if (entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
             bool v4mapped = isIpv4Mapped(
                 reinterpret_cast<const struct in6_addr*>(entry.gid.raw));
-            if (!v4mapped) continue;  // Skip link-local IPv6 GIDs
-
-            bool has_netdev = gidHasNetworkDevice(dev_name, port, i);
-            if (has_netdev) {
-                return i;  // Best: RoCEv2 + IPv4 + netdev
-            }
-            if (fallback_v4_no_netdev < 0) {
-                fallback_v4_no_netdev = i;
-            }
+            if (v4mapped) return i;
+        } else if (entry.gid_type == IBV_GID_TYPE_IB) {
+            return i;
         }
     }
 
-    if (fallback_v4_no_netdev >= 0) return fallback_v4_no_netdev;
     return -1;
 }
 
@@ -296,7 +257,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return createQueuePairs(stream_ptr);
     }
 
-    int connectPeers(bool is_roce,
+    int connectPeers(int local_rank, bool is_roce,
                      const std::vector<int64_t>& remote_addrs,
                      const std::vector<int32_t>& remote_keys,
                      const std::vector<int32_t>& remote_qpns,
@@ -316,7 +277,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 ah_attr.is_global = 1;
                 ah_attr.grh.dgid = remote_gid;
                 ah_attr.grh.sgid_index = gid_index_;
-                ah_attr.grh.hop_limit = 1;
+                // Match the legacy IBGDA path.  mlx5gda previously hard-coded
+                // QPC hop_limit=255 and ignored this field; after moving QP
+                // setup into the device transport this value reaches hardware.
+                ah_attr.grh.hop_limit = 255;
                 ah_attr.port_num = 1;
                 ah_attr.dlid = qps_[i]->port_attr.lid | 0xC000;
             } else {
@@ -345,7 +309,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         for (int i = 0; i < num_ranks_; ++i) {
             if (active_ranks_mask[i] == 0) continue;
             uint64_t raddr = static_cast<uint64_t>(remote_addrs[i]);
-            uint32_t rkey = static_cast<uint32_t>(remote_keys[i]);
+            uint32_t rkey = (i == local_rank)
+                                ? static_cast<uint32_t>(mr_->lkey)
+                                : static_cast<uint32_t>(remote_keys[i]);
             cudaMemcpy(static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
                        &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
             cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t),
@@ -357,7 +323,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     RdmaLocalMetadata localMetadata() const override {
         RdmaLocalMetadata meta;
         meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
-        meta.rkey = mr_ ? static_cast<int32_t>(mr_->lkey) : 0;
+        meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
         meta.subnet_prefix =
             static_cast<int64_t>(gid_.global.subnet_prefix);
         meta.interface_id =

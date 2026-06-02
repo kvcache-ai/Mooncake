@@ -444,7 +444,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     }
 
     int ret = rdma_transport_->connectPeers(
-        rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
+        rank, rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
         flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
