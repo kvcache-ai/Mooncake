@@ -2528,10 +2528,11 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveAll();
-    // }
-    return master_client_.RemoveAll(force);
+    auto result = master_client_.RemoveAll(force);
+    if (result && storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
