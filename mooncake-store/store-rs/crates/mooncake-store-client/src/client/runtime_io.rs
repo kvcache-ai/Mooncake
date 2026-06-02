@@ -1606,19 +1606,33 @@ impl StoreClient {
         local_segments: &BTreeSet<SegmentName>,
         readable_runtimes: &BTreeSet<ClientRuntimeId>,
     ) -> Option<ReplicaRoute> {
-        route
-            .replicas
-            .iter()
-            .filter(|replica| {
-                Self::replica_is_readable(replica, local_runtime, local_segments, readable_runtimes)
-            })
-            .min_by_key(|replica| {
-                (
-                    !local_segments.contains(&replica.segment_name),
-                    replica.priority,
-                )
-            })
-            .cloned()
+        let mut local_best: Option<&ReplicaRoute> = None;
+        let mut remote_readable: Vec<&ReplicaRoute> = Vec::new();
+        for replica in &route.replicas {
+            if !Self::replica_is_readable(replica, local_runtime, local_segments, readable_runtimes)
+            {
+                continue;
+            }
+            if local_segments.contains(&replica.segment_name) {
+                if local_best.is_none() || replica.priority < local_best.unwrap().priority {
+                    local_best = Some(replica);
+                }
+            } else {
+                remote_readable.push(replica);
+            }
+        }
+        if let Some(local) = local_best {
+            return Some(local.clone());
+        }
+        match remote_readable.len() {
+            0 => None,
+            1 => Some(remote_readable[0].clone()),
+            n => {
+                remote_readable.sort_by_key(|r| r.priority);
+                let hash = replica_balance_hash(&local_runtime.stable_id.0) as usize;
+                Some(remote_readable[hash % n].clone())
+            }
+        }
     }
 
     fn replica_is_readable(
@@ -3961,6 +3975,14 @@ impl StoreClient {
             }
         }
     }
+}
+
+fn replica_balance_hash(reader_id: &str) -> u64 {
+    let mut h = 0u64;
+    for b in reader_id.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u64::from(b));
+    }
+    h
 }
 
 #[cfg(test)]

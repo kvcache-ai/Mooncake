@@ -4715,7 +4715,7 @@ fn routed_read_fails_over_within_same_request_after_primary_transport_failure() 
         .routed_writes(planner, 2)
         .build(test_future_expiry_ms())
         .expect("writer build should succeed");
-    let reader = StoreClientBuilder::new(metadata.clone(), "transport-failed-reader")
+    let reader = StoreClientBuilder::new(metadata.clone(), "transport-failed-reader-0")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
@@ -4833,7 +4833,7 @@ fn routed_read_probes_cached_remote_segment_before_reuse() {
         .routed_writes(planner, 2)
         .build(test_future_expiry_ms())
         .expect("writer build should succeed");
-    let reader = StoreClientBuilder::new(metadata.clone(), "cached-probe-reader")
+    let reader = StoreClientBuilder::new(metadata.clone(), "cached-probe-reader-0")
         .state(ClientLifecycleState::Active)
         .label("pool", "pool-a")
         .label("storage", "false")
@@ -5796,8 +5796,8 @@ fn suspect_authority_quarantine_is_shared_across_clients() {
                 .replica_count(2)
                 .prefer_local(false)
                 .preferred_storage_owners([
-                    store_a.runtime_id().storage_key(),
                     store_b.runtime_id().storage_key(),
+                    store_a.runtime_id().storage_key(),
                 ]),
         )
         .expect("replicated put should succeed");
