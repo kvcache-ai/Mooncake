@@ -463,17 +463,13 @@ impl PyMooncakeDistributedStore {
             })
             .transpose()?;
 
+        // Clean up both manifest types to prevent stale cross-route reads
+        let _ = self.remove(&get_parallelism_manifest_key(key), false, tenant);
+        let _ = self.remove(&WriterShardManifest::manifest_key(key), false, tenant);
+
         let storage_key = match (&par_spec, &wp_spec) {
-            (Some(spec), _) => {
-                let par_manifest_key = get_parallelism_manifest_key(key);
-                let _ = self.remove(&par_manifest_key, false, tenant);
-                get_parallelism_key_name(key, spec)
-            }
-            (_, Some(wp)) => {
-                let manifest_key = WriterShardManifest::manifest_key(key);
-                let _ = self.remove(&manifest_key, false, tenant);
-                get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim)
-            }
+            (Some(spec), _) => get_parallelism_key_name(key, spec),
+            (_, Some(wp)) => get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim),
             _ => key.to_string(),
         };
 
@@ -1109,6 +1105,13 @@ fn extract_tensor_info_from_buffer(
         PyValueError::new_err(format!("unsupported dtype in raw buffer: {dtype_i32}"))
     })?;
 
+    let required = TensorMetadata::WIRE_SIZE + parsed.data_bytes;
+    if size < required {
+        return Err(PyValueError::new_err(format!(
+            "buffer too small for tensor data: need {required} bytes, got {size}",
+        )));
+    }
+
     let info = TensorInfo {
         data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
         data_bytes: parsed.data_bytes,
@@ -1262,17 +1265,13 @@ impl PyMooncakeDistributedStore {
         let route = resolve_write_route(&par_spec, &wp_spec);
 
         if is_upsert {
+            // Clean up both manifest types to prevent stale cross-route reads
+            let _ = self.remove(&get_parallelism_manifest_key(key), false, tenant);
+            let _ = self.remove(&WriterShardManifest::manifest_key(key), false, tenant);
+
             let remove_key = match (&par_spec, &wp_spec) {
-                (Some(spec), _) => {
-                    let par_manifest_key = get_parallelism_manifest_key(key);
-                    let _ = self.remove(&par_manifest_key, false, tenant);
-                    get_parallelism_key_name(key, spec)
-                }
-                (_, Some(wp)) => {
-                    let manifest_key = WriterShardManifest::manifest_key(key);
-                    let _ = self.remove(&manifest_key, false, tenant);
-                    get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim)
-                }
+                (Some(spec), _) => get_parallelism_key_name(key, spec),
+                (_, Some(wp)) => get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim),
                 _ => key.to_string(),
             };
             let _ = self.remove(&remove_key, false, tenant);
@@ -2113,9 +2112,16 @@ impl PyMooncakeDistributedStore {
                 let raw = self.get_raw_bytes(&source.storage_key, tenant)?;
                 if raw.len() > TensorMetadata::WIRE_SIZE {
                     let data = &raw[TensorMetadata::WIRE_SIZE..];
+                    let copy_len = source.data_bytes.min(data.len());
                     let dst_start = TensorMetadata::WIRE_SIZE + cumulative;
-                    output[dst_start..dst_start + data.len()].copy_from_slice(data);
-                    cumulative += data.len();
+                    if dst_start + copy_len > output.len() {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "full reconstruction overflow: dst_start={dst_start}, copy_len={copy_len}, output_len={}",
+                            output.len()
+                        )));
+                    }
+                    output[dst_start..dst_start + copy_len].copy_from_slice(&data[..copy_len]);
+                    cumulative += copy_len;
                 }
             }
         } else {
