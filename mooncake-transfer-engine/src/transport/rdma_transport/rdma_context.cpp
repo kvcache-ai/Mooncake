@@ -658,7 +658,7 @@ size_t RdmaContext::getTotalQPNumber() const {
 }
 
 std::string RdmaContext::nicPath() const {
-    return MakeNicPath(engine_.local_server_name_, device_name_);
+    return MakeNicPath(engine_.rdma_server_name_, device_name_);
 }
 
 std::string RdmaContext::gid() const {

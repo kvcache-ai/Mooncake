@@ -129,6 +129,11 @@ class RdmaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
+    // rdma_server_name_ holds the RDMA-reachable address (e.g.
+    // "192.168.0.y:port") for NIC path construction, while
+    // local_server_name_ keeps the TCP-reachable address for P2P routing.
+    std::string rdma_server_name_;
 };
 
 using TransferRequest = Transport::TransferRequest;

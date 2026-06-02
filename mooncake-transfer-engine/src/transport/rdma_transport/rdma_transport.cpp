@@ -21,6 +21,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <future>
 #include <set>
 #include <thread>
@@ -101,6 +102,21 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+    // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
+    // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
+    // while local_server_name_ keeps the TCP-reachable address for P2P.
+    const char *rdma_bind_addr = std::getenv("MC_RDMA_BIND_ADDRESS");
+    if (rdma_bind_addr && rdma_bind_addr[0] != '\0') {
+        auto [host_name, port] = parseHostNameWithPort(local_server_name);
+        rdma_server_name_ =
+            std::string(rdma_bind_addr) + ":" + std::to_string(port);
+        LOG(INFO) << "RdmaTransport: using RDMA bind address "
+                  << rdma_server_name_
+                  << " (TCP address: " << local_server_name_ << ")";
+    } else {
+        rdma_server_name_ = local_server_name_;
+    }
 
     auto ret = initializeRdmaResources();
     if (ret) {
@@ -362,6 +378,11 @@ int RdmaTransport::allocateLocalSegmentID() {
     auto desc = metadata_->getSegmentDesc(local_server_name_);
     if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+    // Store RDMA server name for dual-NIC setups; when it differs from
+    // local_server_name_ the peer will use it for NIC path construction.
+    if (rdma_server_name_ != local_server_name_) {
+        desc->rdma_server_name = rdma_server_name_;
+    }
 #ifdef ENABLE_MULTI_PROTOCOL
     if (!desc->protocol.empty()) desc->protocol += ",";
     desc->protocol += "rdma";

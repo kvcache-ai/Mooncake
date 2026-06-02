@@ -267,6 +267,33 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
             getPortFromString(server_name.substr(colon_pos + 1), port)};
 }
 
+static inline bool hasExplicitPort(const std::string &server_name) {
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return !result.port.empty();
+    }
+    return server_name.rfind(':') != std::string::npos;
+}
+
+static inline std::string getHostNameWithoutPort(
+    const std::string &server_name) {
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return std::move(result.host);
+    }
+
+    const size_t colon_pos = server_name.rfind(':');
+    if (colon_pos == std::string::npos) {
+        return server_name;
+    }
+    return server_name.substr(0, colon_pos);
+}
+
+static inline std::string buildHostNameWithPort(const std::string &host,
+                                                uint16_t port) {
+    return maybeWrapIpV6(host) + ":" + std::to_string(port);
+}
+
 static inline uint16_t parsePortAndDevice(std::string_view suffix,
                                           uint16_t default_port,
                                           int *device_id) {

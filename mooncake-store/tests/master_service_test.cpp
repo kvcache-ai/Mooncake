@@ -1404,6 +1404,131 @@ TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 }
 
+TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::vector<std::string> keys = {"tenant_batch_upsert_key_a",
+                                           "tenant_batch_upsert_key_b"};
+    const std::vector<uint64_t> sizes = {1024, 2048};
+    const std::string tenant_a = "tenant_batch_upsert_a";
+    const std::string tenant_b = "tenant_batch_upsert_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto tenant_a_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_a, sizes, config);
+    ASSERT_EQ(tenant_a_results.size(), keys.size());
+    for (const auto& result : tenant_a_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_a_end = svc->BatchUpsertEnd(client_id, keys, tenant_a);
+    ASSERT_EQ(tenant_a_end.size(), keys.size());
+    for (const auto& result : tenant_a_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    auto tenant_b_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_b, sizes, config);
+    ASSERT_EQ(tenant_b_results.size(), keys.size());
+    for (const auto& result : tenant_b_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_b_end = svc->BatchUpsertEnd(client_id, keys, tenant_b);
+    ASSERT_EQ(tenant_b_end.size(), keys.size());
+    for (const auto& result : tenant_b_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : keys) {
+        EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_a).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_b).has_value());
+    }
+
+    const std::string revoke_key = "tenant_batch_upsert_revoke_key";
+    auto revoke_start =
+        svc->UpsertStart(client_id, revoke_key, tenant_a, 1024, config);
+    ASSERT_TRUE(revoke_start.has_value());
+    ASSERT_TRUE(
+        svc->UpsertRevoke(client_id, revoke_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_FALSE(svc->GetReplicaList(revoke_key, tenant_a).has_value());
+}
+
+TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string shared_key = "tenant_batch_remove_shared_key";
+    const std::string tenant_a = "tenant_batch_remove_a";
+    const std::string tenant_b = "tenant_batch_remove_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_a, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_b, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_b, ReplicaType::MEMORY)
+            .has_value());
+
+    auto remove_a = svc->BatchRemove({shared_key}, tenant_a, /*force=*/true);
+    ASSERT_EQ(remove_a.size(), 1u);
+    ASSERT_TRUE(remove_a[0].has_value());
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_a).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(tenant_b, /*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key).has_value());
+}
+
+TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "legacy_remove_all_shared_key";
+    const std::string tenant_a = "legacy_remove_all_a";
+    const std::string tenant_b = "legacy_remove_all_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(svc->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_b, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 3);
+    EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 0);
+}
+
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     // For backward compatibility, test the deprecated single preferred_segment
     std::unique_ptr<MasterService> service_(new MasterService());
@@ -4147,6 +4272,117 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
     const auto& ip_addresses = it->second;
     EXPECT_TRUE(ip_addresses.empty())
         << "Client with all empty te_endpoints should have empty IP vector";
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpBracketedIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a bracketed IPv6 endpoint
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "[::1]:17813";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpLinkLocalIpv6WithScopeTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a link-local IPv6 address with scope ID
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "fe80::a236:bcff:fecb:a1be%eno2:15773";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("fe80::a236:bcff:fecb:a1be%eno2", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpIpv6NoPortTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with an IPv6 address without port
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "::1";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount segments with IPv4 and IPv6 endpoints for the same client
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    Segment segment1 = MakeSegment("segment1", buffer1, size);
+    segment1.te_endpoint = "192.168.1.1:12345";
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+
+    Segment segment2 = MakeSegment("segment2", buffer2, size);
+    segment2.te_endpoint = "[::1]:17813";
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(2u, ip_addresses.size());
+
+    std::unordered_set<std::string> ip_set(ip_addresses.begin(),
+                                           ip_addresses.end());
+    EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
+    EXPECT_NE(ip_set.find("::1"), ip_set.end());
 }
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
