@@ -2013,9 +2013,15 @@ class MasterService {
     // OpLog publishing helpers
     void AppendOpLogAndNotify(OpType type, const std::string& key,
                               const std::string& payload = {});
+    void AppendOpLogAndNotify(OpType type, const std::string& tenant_id,
+                              const std::string& key,
+                              const std::string& payload);
     tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
         OpType type, const std::string& key,
         const std::string& payload = {});
+    tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
         const ObjectMetadata& metadata) const;
@@ -2057,8 +2063,18 @@ class MasterService {
                                       OpLogEntry entry);
     void AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
                                  const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueue(const char* why, OpType type,
+                                  const std::string& tenant_id,
+                                  const std::string& key,
+                                  const std::string& payload,
+                                  PendingMutationKind kind);
     void AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
                                      const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
+                                      const std::string& tenant_id,
+                                      const std::string& key,
+                                      const std::string& payload,
+                                      PendingMutationKind kind);
 
     /**
      * Strong-consistency variant: if OpLog persist fails, returns error.
@@ -2066,6 +2082,9 @@ class MasterService {
      */
     tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
         OpType type, const std::string& key, const std::string& payload);
+    tl::expected<OpLogEntry, ErrorCode> AppendOpLogAndNotifyDurableOrAbort(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
@@ -2078,6 +2097,10 @@ class MasterService {
     void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
                                          const std::string& key,
                                          const std::string& payload);
+    void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
+                                         const std::string& tenant_id,
+                                         const std::string& key,
+                                         const std::string& payload);
 
     /**
      * Helper to persist REMOVE OpLog for a key with strong-consistency.
@@ -2085,6 +2108,9 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> PersistRemoveForHA(
         const char* why, const std::string& key);
+    tl::expected<void, ErrorCode> PersistRemoveForHA(
+        const char* why, const std::string& tenant_id,
+        const std::string& key);
 
     /**
      * Build replica descriptors after removing replicas matching pred_fn.
