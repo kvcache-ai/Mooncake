@@ -463,15 +463,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " (value: " << ec.value() << ")";
                     // Post entire cleanup to ensure it runs after callback
                     // returns
-                    asio::post(socket_->get_executor(),
-                               [this, self,
-                                on_finalize = std::move(on_finalize_),
-                                on_complete = std::move(on_complete_)]() {
-                                   if (on_finalize)
-                                       on_finalize(TransferStatusEnum::FAILED);
-                                   session_mutex_.unlock();
-                                   if (on_complete) on_complete();
-                               });
+                    asio::post(
+                        socket_->get_executor(),
+                        [this, self, on_finalize = std::move(on_finalize_),
+                         on_complete = std::move(on_complete_)]() {
+                            if (on_finalize)
+                                on_finalize(TransferStatusEnum::FAILED);
+                            session_mutex_.unlock();
+                            if (on_complete) on_complete();
+                        });
                     return;
                 }
                 total_transferred_bytes_ += transferred_bytes;
