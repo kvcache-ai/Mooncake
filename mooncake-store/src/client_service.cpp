@@ -272,11 +272,13 @@ FinalizeDecision DetermineFinalizeDecision(
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
-               const std::map<std::string, std::string>& labels)
+               const std::map<std::string, std::string>& labels,
+               const std::string& tenant_id)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr),
+                     metrics_ ? &metrics_->master_client_metric : nullptr,
+                     tenant_id),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
@@ -832,9 +834,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels) {
-    auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, protocol, labels));
+    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    auto client = std::shared_ptr<Client>(new Client(
+        local_hostname, metadata_connstring, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
