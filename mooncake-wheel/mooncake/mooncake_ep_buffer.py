@@ -7,6 +7,19 @@ _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE",
 _DEVICE = "musa" if _USE_MUSA else "cuda"
 
 
+def _all_ranks_active(num_ranks: int) -> List[int]:
+    return [1] * num_ranks
+
+
+def _backend_active_ranks(group: dist.ProcessGroup) -> torch.Tensor:
+    try:
+        from mooncake.pg import get_active_ranks
+
+        return get_active_ranks(group)
+    except (ImportError, AttributeError, TypeError, RuntimeError):
+        return torch.ones(dist.get_world_size(group), dtype=torch.int32, device="cpu")
+
+
 class EventOverlap:
     """
     A wrapper class to manage CUDA events, also for better overlapping convenience.
@@ -176,11 +189,9 @@ class Buffer:
             dist.all_gather(interface_ids_list, interface_id_t, self.group)
             interface_ids = torch.cat(interface_ids_list).tolist()
 
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
             self.runtime.sync_ibgda_peers(
                 raddrs, rkeys, remote_qpns, remote_lids,
-                subnet_prefixes, interface_ids, active_ranks_mask
+                subnet_prefixes, interface_ids, _all_ranks_active(self.group_size)
             )
 
         # P2P/NVLink IPC handle exchange — skip entirely when disabled.
@@ -200,10 +211,8 @@ class Buffer:
                 ]
                 dist.all_gather(handles, local_handle_tensor, self.group)
                 remote_handles = [h.tolist() for h in handles]
-                from mooncake.ep import get_active_ranks
-                active_ranks_mask = get_active_ranks(self.backend).tolist()
                 self.runtime.sync_nvlink_ipc_handles(remote_handles,
-                                                     active_ranks_mask)
+                                                     _all_ranks_active(self.group_size))
                 # Verify that peer-mapped memory is actually writable.
                 # This catches cases where musaIpcOpenMemHandle succeeds
                 # but the mapped memory is not usable from the device.
@@ -289,8 +298,6 @@ class Buffer:
             async_finish = False
 
         if self._use_fallback:
-            from mooncake.ep import get_active_ranks
-
             (
                 packed_recv_x,
                 packed_recv_x_scales,
@@ -307,7 +314,7 @@ class Buffer:
                 use_fp8,
                 return_recv_hook,
             )
-            backend_active_ranks = get_active_ranks(self.backend).to(
+            backend_active_ranks = _backend_active_ranks(self.backend).to(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
             if active_ranks.numel() == backend_active_ranks.numel():
@@ -383,8 +390,6 @@ class Buffer:
             num_experts,
         ) = handle
         if self._use_fallback:
-            from mooncake.ep import get_active_ranks
-
             combined_x, event, hook = self._fallback_combine(
                 x,
                 topk_idx,
@@ -397,7 +402,7 @@ class Buffer:
                 return_recv_hook,
                 out,
             )
-            backend_active_ranks = get_active_ranks(self.backend).to(
+            backend_active_ranks = _backend_active_ranks(self.backend).to(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
             if active_ranks.numel() == backend_active_ranks.numel():
@@ -515,8 +520,6 @@ class Buffer:
         use_fp8: bool,
         return_recv_hook: bool,
     ):
-        from mooncake.ep import get_active_ranks
-
         with torch.profiler.record_function("dispatch"):
             num_tokens, hidden = x.shape
             k = topk_idx.size(1)
@@ -535,7 +538,7 @@ class Buffer:
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = get_active_ranks(self.backend).tolist()
+            backend_active_ranks = _backend_active_ranks(self.backend).tolist()
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
@@ -752,8 +755,6 @@ class Buffer:
         return_recv_hook: bool,
         out: Optional[torch.Tensor],
     ):
-        from mooncake.ep import get_active_ranks
-
         with torch.profiler.record_function("combine"):
             num_tokens = topk_idx.size(0)
             hidden = (x if not zero_copy else self._fallback_next_combine_buffer).size(
@@ -774,7 +775,7 @@ class Buffer:
             ]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = get_active_ranks(self.backend).tolist()
+            backend_active_ranks = _backend_active_ranks(self.backend).tolist()
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
@@ -897,27 +898,3 @@ class Buffer:
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
             return combined, event, hook
-
-
-# Monkey-patch get_active_ranks into the ep module so that
-# `from mooncake.ep import get_active_ranks` works even when the PG
-# module is not available (TE-only builds), or when using a non-mooncake
-# ProcessGroup (e.g. gloo) that the C++ get_active_ranks cannot cast.
-# This avoids modifying ep.py.
-try:
-    from mooncake import ep as _ep_module
-    _original_get_active_ranks = getattr(_ep_module, "get_active_ranks", None)
-
-    def _get_active_ranks_safe(group):
-        # The C++ get_active_ranks segfaults on non-MooncakeBackend groups
-        # (e.g. gloo), so only call it if the group backend is "mooncake".
-        backend_name = getattr(group, "backend", "")
-        if backend_name == "mooncake" and _original_get_active_ranks is not None:
-            return _original_get_active_ranks(group)
-        # Fallback: all ranks active.
-        size = dist.get_world_size(group)
-        return torch.ones(size, dtype=torch.int32, device="cpu")
-
-    _ep_module.get_active_ranks = _get_active_ranks_safe
-except (ImportError, AttributeError):
-    pass

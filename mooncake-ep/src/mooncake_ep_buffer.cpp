@@ -59,6 +59,11 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     if (!gdr_buffer) {
         throw std::runtime_error("[EP] Failed to allocate GDR buffer");
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    CUDA_CHECK(musaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
+#else
+    CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
+#endif
 
     // RDMA transport — optional; disabled if init fails.
     if (engine) {
