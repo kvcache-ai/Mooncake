@@ -4063,6 +4063,14 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     }
     const auto& key = object_id.user_key;
 
+    // Minimum protection: promotion-on-hit does not support non-default tenant
+    // because heartbeat and RPC only carry key, not tenant_id.
+    if (object_id.tenant_id != "default") {
+        VLOG(1) << "key=" << key << ", tenant=" << object_id.tenant_id
+                << ", action=skip_promotion_for_non_default_tenant";
+        return;
+    }
+
     // Frequency gate: bump and compare against the threshold. The sketch
     // returns uint8_t (saturating at 255); promotion_admission_threshold_
     // is clamped into [1, 255] at config parse time (see master.cpp), so

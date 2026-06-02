@@ -52,9 +52,8 @@ bool DeserializeOpLogEntry(const std::string& json_str, OpLogEntry& entry) {
         entry.op_type = static_cast<OpType>(root["op_type"].asInt());
 
         // Compatibility: old OpLog entries may not have tenant_id
-        entry.tenant_id = root.isMember("tenant_id")
-                              ? root["tenant_id"].asString()
-                              : "default";
+        entry.tenant_id = NormalizeTenantId(
+            root.isMember("tenant_id") ? root["tenant_id"].asString() : "default");
 
         entry.object_key = root["object_key"].asString();
         // CRITICAL: Base64 decode payload to restore binary data
