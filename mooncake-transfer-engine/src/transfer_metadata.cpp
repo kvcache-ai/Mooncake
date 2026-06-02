@@ -914,8 +914,7 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     // the TCP-routable segment_name. Cache the mapping so subsequent
     // sendHandshake() calls can resolve the peer's TCP address from the
     // RDMA server name extracted from NIC paths.
-    if (p2p_handshake_mode_ && result &&
-        !result->rdma_server_name.empty() &&
+    if (p2p_handshake_mode_ && result && !result->rdma_server_name.empty() &&
         result->rdma_server_name != segment_name) {
         auto [tcp_ip, tcp_port] = parseHostNameWithPort(segment_name);
         RWSpinlock::WriteGuard guard(rpc_meta_lock_);
@@ -926,8 +925,8 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
             meta.sockfd = -1;
             rpc_meta_map_[result->rdma_server_name] = meta;
             LOG(INFO) << "P2P: cached RDMA->TCP mapping: "
-                      << result->rdma_server_name << " -> " << tcp_ip
-                      << ":" << tcp_port;
+                      << result->rdma_server_name << " -> " << tcp_ip << ":"
+                      << tcp_port;
         }
     }
 
