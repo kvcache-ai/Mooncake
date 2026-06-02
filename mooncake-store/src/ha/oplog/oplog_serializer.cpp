@@ -18,6 +18,7 @@ std::string SerializeOpLogEntry(const OpLogEntry& entry) {
     root["sequence_id"] = static_cast<Json::UInt64>(entry.sequence_id);
     root["timestamp_ms"] = static_cast<Json::UInt64>(entry.timestamp_ms);
     root["op_type"] = static_cast<int>(entry.op_type);
+    root["tenant_id"] = entry.tenant_id;
     root["object_key"] = entry.object_key;
     // CRITICAL: Base64 encode binary payload to prevent UTF-8 corruption in
     // JSON
@@ -49,6 +50,12 @@ bool DeserializeOpLogEntry(const std::string& json_str, OpLogEntry& entry) {
         entry.sequence_id = root["sequence_id"].asUInt64();
         entry.timestamp_ms = root["timestamp_ms"].asUInt64();
         entry.op_type = static_cast<OpType>(root["op_type"].asInt());
+
+        // Compatibility: old OpLog entries may not have tenant_id
+        entry.tenant_id = root.isMember("tenant_id")
+                              ? root["tenant_id"].asString()
+                              : "default";
+
         entry.object_key = root["object_key"].asString();
         // CRITICAL: Base64 decode payload to restore binary data
         entry.payload = base64::Decode(root["payload"].asString());
