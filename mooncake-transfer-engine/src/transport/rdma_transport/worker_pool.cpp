@@ -550,8 +550,6 @@ void WorkerPool::monitorWorker() {
     while (workers_running_) {
         auto current_ts = getCurrentTimeInNano();
         if (current_ts - last_reset_ts > 1000000000ll) {
-            context_.set_active(true);
-            markContextSuccess();  // Reset failure counter periodically
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
             // from RdmaContext::endpoint() and the waiting list grows
