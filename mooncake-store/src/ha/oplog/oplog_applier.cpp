@@ -453,7 +453,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
                      << ", sequence_id=" << entry.sequence_id;
         StandbyObjectMetadata empty_metadata;
         empty_metadata.last_sequence_id = entry.sequence_id;
-        if (!metadata_store_->PutMetadata(entry.object_key, empty_metadata)) {
+        if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                          empty_metadata)) {
             LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
                        << entry.object_key
                        << ", sequence_id=" << entry.sequence_id;
@@ -472,7 +473,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
         // Fallback to empty metadata if parsing fails
         StandbyObjectMetadata empty_metadata;
         empty_metadata.last_sequence_id = entry.sequence_id;
-        metadata_store_->PutMetadata(entry.object_key, empty_metadata);
+        metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                     empty_metadata);
         return;
     }
 
@@ -480,7 +482,8 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
     StandbyObjectMetadata metadata =
         payload.ToStandbyMetadata(entry.sequence_id);
 
-    if (!metadata_store_->PutMetadata(entry.object_key, metadata)) {
+    if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
+                                      metadata)) {
         LOG(ERROR) << "OpLogApplier: failed to PutMetadata key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id;
     } else {
@@ -496,7 +499,7 @@ void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
     // (but the key itself may still exist if there are other replicas).
     // Current implementation removes the entire key; if we later support
     // partial replica revocation this logic will need to be refined.
-    if (!metadata_store_->Remove(entry.object_key)) {
+    if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
                      << " in PUT_REVOKE, sequence_id=" << entry.sequence_id
@@ -508,7 +511,7 @@ void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
 }
 
 void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
-    if (!metadata_store_->Remove(entry.object_key)) {
+    if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
                      << ", sequence_id=" << entry.sequence_id
