@@ -78,7 +78,7 @@ The design favors predictable behavior and operational simplicity over manual tu
 :::{toctree}
 :maxdepth: 1
 
-quick-start
+getting-started/quick-start
 :::
 
 ## TENT C++ API Reference
@@ -86,8 +86,8 @@ quick-start
 :::{toctree}
 :maxdepth: 1
 
-cpp-api
-c-api
+api/cpp-api
+api/c-api
 :::
 
 ## Configuration
@@ -95,7 +95,7 @@ c-api
 :::{toctree}
 :maxdepth: 1
 
-configuration
+configuration/configuration
 :::
 
 ## TENT Metrics System
@@ -103,7 +103,7 @@ configuration
 :::{toctree}
 :maxdepth: 1
 
-metrics
+features/metrics
 :::
 
 ## TENT Transport Selection
@@ -111,7 +111,7 @@ metrics
 :::{toctree}
 :maxdepth: 1
 
-transport-selector
+features/transport-selector
 :::
 
 ## TENT Quality of Service
@@ -119,7 +119,7 @@ transport-selector
 :::{toctree}
 :maxdepth: 1
 
-qos
+features/qos
 :::
 
 ## TENT Slice Spraying
@@ -127,7 +127,7 @@ qos
 :::{toctree}
 :maxdepth: 1
 
-slice-spraying
+features/slice-spraying
 :::
 
 ## TENT Failover
@@ -135,7 +135,7 @@ slice-spraying
 :::{toctree}
 :maxdepth: 1
 
-failover
+features/failover
 :::
 
 ## Performance and Operations

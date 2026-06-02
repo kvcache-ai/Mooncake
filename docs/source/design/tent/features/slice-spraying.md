@@ -393,6 +393,6 @@ device_selector_->printTrafficStats();
 
 ## References
 
-- [TENT Overview](overview.md)
-- [TENT QoS](qos.md)
-- [TENT C++ API](cpp-api.md)
+- [TENT Overview](../overview.md)
+- [TENT QoS](../features/qos.md)
+- [TENT C++ API](../api/cpp-api.md)
