@@ -145,14 +145,14 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
         << "Empty segment manager must produce zero StandbySegmentInfo "
            "entries";
 
-    const auto& [key, metadata] = snapshot->value().metadata.front();
-    EXPECT_EQ(key, kDefaultTestObjectKey);
-    EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
-    EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
-    EXPECT_EQ(metadata.last_sequence_id, descriptor_.last_included_seq);
-    ASSERT_EQ(metadata.replicas.size(), 1u);
+    const auto& entry = snapshot->value().metadata.front();
+    EXPECT_EQ(entry.key, kDefaultTestObjectKey);
+    EXPECT_EQ(entry.metadata.client_id, (UUID{1, 2}));
+    EXPECT_EQ(entry.metadata.size, kDefaultTestObjectSize);
+    EXPECT_EQ(entry.metadata.last_sequence_id, descriptor_.last_included_seq);
+    ASSERT_EQ(entry.metadata.replicas.size(), 1u);
 
-    const auto& replica = metadata.replicas.front();
+    const auto& replica = entry.metadata.replicas.front();
     EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
     ASSERT_TRUE(replica.is_disk_replica());
     EXPECT_EQ(replica.get_disk_descriptor().file_path,
