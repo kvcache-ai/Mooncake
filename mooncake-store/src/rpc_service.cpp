@@ -1613,7 +1613,7 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
 }
 
 void WrappedMasterService::RestoreFromStandby(
-    const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+    const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments) {
     master_service_.RestoreFromStandbySnapshot(objects, initial_oplog_sequence_id,
