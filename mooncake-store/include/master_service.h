@@ -2027,7 +2027,9 @@ class MasterService {
         const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const UUID& client_id, uint64_t size,
-        const std::vector<Replica::Descriptor>& replicas) const;
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::string& group_id = "",
+        ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
     ErrorCode PersistOpLogEntryWithSyncRetries(
         const OpLogEntry& entry) const;
 
