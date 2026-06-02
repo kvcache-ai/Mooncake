@@ -193,6 +193,7 @@
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
+- `-DUSE_SHCA=[ON|OFF]`: 启用 ScaleFabric SHCA InfiniBand 支持。默认 OFF；仅支持 Transfer Engine/TENT RDMA 路径，不支持 Mooncake-EP IBGDA；SHCA 构建下不支持 `MC_RPC_PROTOCOL=rdma`。
 - `-DUSE_HYGON=[ON|OFF]`: 通过 DTK SDK 启用对海光 DCU 的支持。默认 OFF；使用 CUDA 兼容运行时。
 - `-DDTK_ROOT=/path/to/dtk`: 在 `-DUSE_HYGON=ON` 时覆盖默认 DTK SDK 根路径；未设置时使用 `DTK_HOME` 或 `/opt/dtk`。
 - `-DDTK_INCLUDE_DIR=/path/to/include` / `-DDTK_LIB_DIR=/path/to/lib64`: 在 `-DUSE_HYGON=ON` 时覆盖 DTK 头文件与库目录。

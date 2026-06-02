@@ -1482,7 +1482,11 @@ int main(int argc, char* argv[]) {
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     std::string protocol = "tcp";
     if (value && std::string_view(value) == "rdma") {
+#ifdef YLT_ENABLE_IBV
         protocol = "rdma";
+#else
+        LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
+#endif
     }
 
     // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
@@ -1637,9 +1641,15 @@ int main(int argc, char* argv[]) {
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
+#ifdef YLT_ENABLE_IBV
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
+#else
+        if (value && std::string_view(value) == "rdma") {
+            LOG(WARNING) << "RDMA RPC is disabled at compile time; using TCP RPC";
+        }
+#endif
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
                 mooncake::WrappedMasterServiceConfig(master_config, version),

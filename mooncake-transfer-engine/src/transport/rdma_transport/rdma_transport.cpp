@@ -693,7 +693,7 @@ int RdmaTransport::allocateLocalSegmentID() {
 }
 
 int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
-                                          uint16_t lid,
+                                          uint32_t lid,
                                           const std::string &gid) {
     std::lock_guard<std::mutex> guard(local_desc_lock_);
     auto original_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
