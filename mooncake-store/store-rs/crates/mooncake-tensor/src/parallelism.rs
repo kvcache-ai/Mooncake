@@ -399,6 +399,20 @@ pub fn get_parallelism_manifest_key(base_key: &str) -> String {
 
 // ─── Shard range calculation ────────────────────────────────────────────────
 
+/// Validate that a dimension can be uniformly divided by the shard count.
+pub fn validate_uniform_shard(dim_size: i64, shard_count: i32) -> Result<(), &'static str> {
+    if shard_count <= 0 {
+        return Err("shard count must be positive");
+    }
+    if dim_size <= 0 {
+        return Err("dimension size must be positive");
+    }
+    if dim_size % shard_count as i64 != 0 {
+        return Err("dimension not uniformly divisible by shard count");
+    }
+    Ok(())
+}
+
 /// Compute (offset, size) for a uniform shard of `total_size` elements.
 ///
 /// Returns `(byte_offset, byte_count)` suitable for slicing into a flat buffer.
@@ -594,6 +608,88 @@ pub fn calculate_strided_shard_ranges(
     }
 
     Some(transfers)
+}
+
+// ─── Raw shard write planning ─────────────────────────────────────────────
+
+/// Plan for extracting a shard from a full-tensor raw buffer.
+/// `data_ranges` are `(src_offset_from_data_start, size)` pairs.
+#[derive(Debug, Clone)]
+pub struct RawShardWritePlan {
+    pub shard_shape: Vec<i64>,
+    pub shard_bytes: usize,
+    pub data_ranges: Vec<(usize, usize)>,
+}
+
+/// Compute the byte ranges within a full-tensor data section that correspond
+/// to a specific shard along `split_dim`.
+///
+/// Returns `None` if parameters are invalid.
+pub fn build_raw_shard_write_plan(
+    global_shape: &[i64],
+    split_dim: usize,
+    rank: usize,
+    count: usize,
+    element_size: usize,
+) -> Option<RawShardWritePlan> {
+    if count == 0 || split_dim >= global_shape.len() {
+        return None;
+    }
+    let dim_size = global_shape[split_dim] as usize;
+    if dim_size == 0 || !dim_size.is_multiple_of(count) {
+        return None;
+    }
+
+    let shard_extent = dim_size / count;
+    let shard_start = rank * shard_extent;
+
+    let mut shard_shape = global_shape.to_vec();
+    shard_shape[split_dim] = shard_extent as i64;
+
+    let shard_numel: usize = shard_shape.iter().map(|&d| d as usize).product();
+    let shard_bytes = shard_numel * element_size;
+
+    if split_dim == 0 {
+        let inner: usize = global_shape[1..]
+            .iter()
+            .map(|&d| d as usize)
+            .product::<usize>()
+            .max(1);
+        let offset = shard_start * inner * element_size;
+        return Some(RawShardWritePlan {
+            shard_shape,
+            shard_bytes,
+            data_ranges: vec![(offset, shard_bytes)],
+        });
+    }
+
+    // For split_dim > 0: strided extraction
+    let elements_before: usize = global_shape[..split_dim]
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+
+    let elements_after: usize = global_shape[split_dim + 1..]
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+
+    let row_bytes = shard_extent * elements_after * element_size;
+    let full_row_bytes = dim_size * elements_after * element_size;
+
+    let mut data_ranges = Vec::with_capacity(elements_before);
+    for slice_idx in 0..elements_before {
+        let src_offset = slice_idx * full_row_bytes + shard_start * elements_after * element_size;
+        data_ranges.push((src_offset, row_bytes));
+    }
+
+    Some(RawShardWritePlan {
+        shard_shape,
+        shard_bytes,
+        data_ranges,
+    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -929,5 +1025,64 @@ mod tests {
                 size: 12
             }
         );
+    }
+
+    #[test]
+    fn test_validate_uniform_shard() {
+        assert!(validate_uniform_shard(256, 4).is_ok());
+        assert!(validate_uniform_shard(128, 1).is_ok());
+        assert!(validate_uniform_shard(30, 4).is_err());
+        assert!(validate_uniform_shard(0, 4).is_err());
+        assert!(validate_uniform_shard(100, 0).is_err());
+        assert!(validate_uniform_shard(100, -1).is_err());
+    }
+
+    #[test]
+    fn test_build_raw_shard_write_plan_dim0() {
+        // shape [8, 4], split_dim=0, rank=1, count=4, elem_size=4
+        // shard_extent = 8/4 = 2, shard_start = 1*2 = 2
+        // shard_shape = [2, 4], shard_bytes = 2*4*4 = 32
+        // inner = 4, offset = 2 * 4 * 4 = 32
+        let plan = build_raw_shard_write_plan(&[8, 4], 0, 1, 4, 4).unwrap();
+        assert_eq!(plan.shard_shape, vec![2, 4]);
+        assert_eq!(plan.shard_bytes, 32);
+        assert_eq!(plan.data_ranges, vec![(32, 32)]);
+    }
+
+    #[test]
+    fn test_build_raw_shard_write_plan_dim1() {
+        // shape [4, 8], split_dim=1, rank=0, count=2, elem_size=4
+        // shard_extent = 8/2 = 4, shard_start = 0
+        // shard_shape = [4, 4], shard_bytes = 4*4*4 = 64
+        // elements_before = 4, elements_after = 1
+        // row_bytes = 4*1*4 = 16, full_row_bytes = 8*1*4 = 32
+        // ranges: [(0, 16), (32, 16), (64, 16), (96, 16)]
+        let plan = build_raw_shard_write_plan(&[4, 8], 1, 0, 2, 4).unwrap();
+        assert_eq!(plan.shard_shape, vec![4, 4]);
+        assert_eq!(plan.shard_bytes, 64);
+        assert_eq!(plan.data_ranges.len(), 4);
+        assert_eq!(plan.data_ranges[0], (0, 16));
+        assert_eq!(plan.data_ranges[1], (32, 16));
+        assert_eq!(plan.data_ranges[2], (64, 16));
+        assert_eq!(plan.data_ranges[3], (96, 16));
+    }
+
+    #[test]
+    fn test_build_raw_shard_write_plan_1d() {
+        // 1D: shape [1024], split_dim=0, rank=2, count=4, elem_size=4
+        // shard_extent = 256, shard_start = 512
+        // shard_bytes = 256*4 = 1024
+        // offset = 512 * 1(empty product, max(1)) * 4 = 2048
+        let plan = build_raw_shard_write_plan(&[1024], 0, 2, 4, 4).unwrap();
+        assert_eq!(plan.shard_shape, vec![256]);
+        assert_eq!(plan.shard_bytes, 1024);
+        assert_eq!(plan.data_ranges, vec![(2048, 1024)]);
+    }
+
+    #[test]
+    fn test_build_raw_shard_write_plan_invalid() {
+        assert!(build_raw_shard_write_plan(&[8, 4], 0, 0, 0, 4).is_none());
+        assert!(build_raw_shard_write_plan(&[8, 4], 3, 0, 2, 4).is_none());
+        assert!(build_raw_shard_write_plan(&[7, 4], 0, 0, 2, 4).is_none()); // 7 % 2 != 0
     }
 }
