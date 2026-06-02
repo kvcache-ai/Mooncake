@@ -18,8 +18,15 @@ void OpLogManager::SetOpLogStore(std::shared_ptr<OpLogStore> oplog_store) {
 
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
                               const std::string& payload) {
+    return Append(type, "default", key, payload);
+}
+
+uint64_t OpLogManager::Append(OpType type, const std::string& tenant_id,
+                              const std::string& key,
+                              const std::string& payload) {
     OpLogEntry entry;
     entry.op_type = type;
+    entry.tenant_id = tenant_id;
     entry.object_key = key;
     entry.payload = payload;
     entry.timestamp_ms = NowMs();
@@ -63,8 +70,16 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
 
 OpLogEntry OpLogManager::AllocateEntry(OpType type, const std::string& key,
                                        const std::string& payload) {
+    return AllocateEntry(type, "default", key, payload);
+}
+
+OpLogEntry OpLogManager::AllocateEntry(OpType type,
+                                       const std::string& tenant_id,
+                                       const std::string& key,
+                                       const std::string& payload) {
     OpLogEntry entry;
     entry.op_type = type;
+    entry.tenant_id = tenant_id;
     entry.object_key = key;
     entry.payload = payload;
     entry.timestamp_ms = NowMs();
@@ -96,8 +111,14 @@ ErrorCode OpLogManager::PersistEntry(const OpLogEntry& entry) const {
 
 tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
     OpType type, const std::string& key, const std::string& payload) {
+    return AppendAndPersist(type, "default", key, payload);
+}
+
+tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
+    OpType type, const std::string& tenant_id, const std::string& key,
+    const std::string& payload) {
     // Seq pre-allocation semantics: allocate first, then persist.
-    OpLogEntry entry = AllocateEntry(type, key, payload);
+    OpLogEntry entry = AllocateEntry(type, tenant_id, key, payload);
     ErrorCode err = PersistEntry(entry);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);

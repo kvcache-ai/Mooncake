@@ -78,7 +78,8 @@ struct OpLogEntry {
     uint64_t sequence_id{0};   // Monotonically increasing global sequence
     uint64_t timestamp_ms{0};  // Logical timestamp in milliseconds
     OpType op_type{OpType::PUT_END};
-    std::string object_key;  // Target object key
+    std::string tenant_id{"default"};  // Tenant identifier
+    std::string object_key;            // Target object key
     std::string payload;     // Serialized extra data (optional)
     uint32_t checksum{0};    // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{
@@ -138,6 +139,16 @@ class OpLogManager {
     tl::expected<uint64_t, ErrorCode> AppendAndPersist(
         OpType type, const std::string& key,
         const std::string& payload = std::string());
+
+    // NEW: tenant-aware overloads (4-param, NO default payload)
+    uint64_t Append(OpType type, const std::string& tenant_id,
+                    const std::string& key, const std::string& payload);
+    OpLogEntry AllocateEntry(OpType type, const std::string& tenant_id,
+                             const std::string& key,
+                             const std::string& payload);
+    tl::expected<uint64_t, ErrorCode> AppendAndPersist(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
 
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;
