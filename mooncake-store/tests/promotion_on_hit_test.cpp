@@ -7,6 +7,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -16,6 +17,13 @@
 #include "types.h"
 
 namespace mooncake::test {
+
+size_t CountPromotionTask(const std::vector<PromotionTaskItem>& tasks,
+                          const std::string& key) {
+    return std::count_if(
+        tasks.begin(), tasks.end(),
+        [&key](const PromotionTaskItem& task) { return task.key == key; });
+}
 
 class PromotionOnHitTest : public ::testing::Test {
    protected:
@@ -193,7 +201,7 @@ TEST_F(PromotionOnHitTest, MemoryReplicaPresentNoPromotion) {
     service->RemoveAll();
 }
 
-// PromotionObjectHeartbeat returns an empty map when called against a
+// PromotionObjectHeartbeat returns an empty task list when called against a
 // client that has no LocalDiskSegment registered.
 TEST_F(PromotionOnHitTest, HeartbeatReturnsErrorForUnknownClient) {
     MasterServiceConfig config;
@@ -275,7 +283,7 @@ TEST_F(PromotionOnHitTest, RacingReadersDedup) {
     EXPECT_EQ(pending->size(), 1u)
         << "Concurrent readers (" << kThreads << " x " << kReadsPerThread
         << ") must dedupe to a single promotion task";
-    ASSERT_TRUE(pending->count("k_cold"));
+    ASSERT_TRUE(CountPromotionTask(*pending, "k_cold"));
 
     service->RemoveAll();
 }
@@ -583,9 +591,9 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     EXPECT_EQ(heartbeat->size(), 1u)
         << "promotion_queue_limit=1 should admit only the first task "
         << "globally; k2's enqueue must be dropped";
-    EXPECT_EQ(heartbeat->count(k1), 1u)
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k1), 1u)
         << "k1 was read first and should be the surviving task";
-    EXPECT_EQ(heartbeat->count(k2), 0u)
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k2), 0u)
         << "k2 was rejected by the cap gate; should not appear";
     EXPECT_EQ(mm.get_promotion_rejected_cap() - cap_rej_pre, 1)
         << "k2's rejection must increment promotion_rejected_cap";
@@ -627,14 +635,14 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     ASSERT_TRUE(tick1.has_value());
     EXPECT_EQ(tick1->size(), 1u)
         << "heartbeat should return at most kMaxPerHeartbeat=1 entry";
-    std::string first_key = tick1->begin()->first;
+    std::string first_key = tick1->begin()->key;
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), first_key) != keys.end());
 
     // Second heartbeat returns another key (a different one).
     auto tick2 = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(tick2.has_value());
     EXPECT_EQ(tick2->size(), 1u);
-    std::string second_key = tick2->begin()->first;
+    std::string second_key = tick2->begin()->key;
     EXPECT_NE(second_key, first_key)
         << "second heartbeat must drain a different leftover key, not "
         << "re-return the one already extracted";
@@ -643,7 +651,7 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
     auto tick3 = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(tick3.has_value());
     EXPECT_EQ(tick3->size(), 1u);
-    std::string third_key = tick3->begin()->first;
+    std::string third_key = tick3->begin()->key;
     EXPECT_NE(third_key, first_key);
     EXPECT_NE(third_key, second_key);
 
@@ -808,8 +816,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
         << " must be rejected by the global gate. A per-shard heuristic "
         << "would admit it here since the destination shard's local "
         << "count is 0.";
-    EXPECT_EQ(heartbeat->count(k1), 1u);
-    EXPECT_EQ(heartbeat->count(k2), 0u);
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k1), 1u);
+    EXPECT_EQ(CountPromotionTask(*heartbeat, k2), 0u);
 
     service->RemoveAll();
 }
@@ -984,7 +992,7 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
         << "in-flight counter must decrement on the NotifyPromotionSuccess "
         << "success path. Without fetch_sub, the cap stays saturated and "
         << "k_second is silently dropped.";
-    EXPECT_EQ(pending->count("k_second"), 1u);
+    EXPECT_EQ(CountPromotionTask(*pending, "k_second"), 1u);
 
     service->RemoveAll();
 }
@@ -1201,7 +1209,7 @@ TEST_F(PromotionOnHitTest, NotifyFailureReleasesStateImmediately) {
     }
     auto heartbeat = service->PromotionObjectHeartbeat(seg.client_id);
     ASSERT_TRUE(heartbeat.has_value());
-    EXPECT_EQ(heartbeat->count("k_b"), 1u)
+    EXPECT_EQ(CountPromotionTask(*heartbeat, "k_b"), 1u)
         << "k_b admission must succeed after k_a's failure released the "
         << "slot. If this fires, NotifyPromotionFailure did not decrement "
         << "promotion_in_flight_, and transient client-side errors "
@@ -1452,7 +1460,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     auto pending_pre =
         service->PromotionObjectHeartbeat(second_holder.client_id);
     ASSERT_TRUE(pending_pre.has_value());
-    EXPECT_EQ(pending_pre->count("k_other"), 0u)
+    EXPECT_EQ(CountPromotionTask(*pending_pre, "k_other"), 0u)
         << "Sanity: queue_limit=1 should block the second admission "
         << "while the first task is in flight.";
 
@@ -1486,7 +1494,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     auto pending_post =
         service->PromotionObjectHeartbeat(second_holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("k_other"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "k_other"), 1u)
         << "After the holder expired, ClearInvalidHandles must have "
         << "erased its promotion_tasks entry and decremented "
         << "promotion_in_flight_. Otherwise the global cap remains "
@@ -1567,7 +1575,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     {
         auto pending = service->PromotionObjectHeartbeat(holder.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->count("k_first"), 1u);
+        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
     // Remove k_first with force=true. With the fix, this also wipes
@@ -1586,7 +1594,7 @@ TEST_F(PromotionOnHitTest, RemoveErasesPromotionTask) {
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("k_second"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after Remove of k_first — Remove "
         << "must erase the in-flight promotion_tasks entry and decrement "
         << "promotion_in_flight_, otherwise queue_limit=1 stays saturated.";
@@ -1636,7 +1644,7 @@ TEST_F(PromotionOnHitTest, RemoveByRegexErasesPromotionTask) {
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("other_k2"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "other_k2"), 1u)
         << "other_k2 must be admittable after RemoveByRegex of regex_k1 "
         << "— RemoveByRegex must erase the in-flight promotion_tasks "
         << "entry. Otherwise queue_limit=1 stays saturated.";
@@ -1675,7 +1683,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     {
         auto pending = service->PromotionObjectHeartbeat(holder.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->count("k_first"), 1u);
+        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
     auto removed = service->RemoveAll(/*force=*/true);
@@ -1693,7 +1701,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("k_second"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after RemoveAll of k_first — "
         << "otherwise queue_limit=1 stays saturated until reaper TTL.";
 
@@ -1739,7 +1747,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     {
         auto pending = service->PromotionObjectHeartbeat(holder.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->count("k_first"), 1u);
+        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
     auto results = service->BatchRemove({"k_first"}, /*force=*/true);
@@ -1757,7 +1765,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     }
     auto pending_post = service->PromotionObjectHeartbeat(holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("k_second"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after BatchRemove of k_first — "
         << "otherwise queue_limit=1 stays saturated until reaper TTL.";
 
@@ -1795,7 +1803,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     {
         auto pending = service->PromotionObjectHeartbeat(holder.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->count("k_first"), 1u);
+        EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
 
     auto results = service->BatchRemove({"k_first"}, /*force=*/true);
@@ -1828,7 +1836,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     auto pending_post =
         service->PromotionObjectHeartbeat(second_holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
-    EXPECT_EQ(pending_post->count("k_second"), 1u)
+    EXPECT_EQ(CountPromotionTask(*pending_post, "k_second"), 1u)
         << "k_second must be admittable after the stale-handle "
         << "BatchRemove — otherwise queue_limit=1 stays saturated until "
         << "reaper TTL.";

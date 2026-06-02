@@ -227,6 +227,51 @@ inline std::string NormalizeTenantId(const std::string& tenant_id) {
     return tenant_id.empty() ? "default" : tenant_id;
 }
 
+inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
+                                              const std::string& key) {
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    std::string scoped_key;
+    scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
+    scoped_key.append(normalized_tenant);
+    scoped_key.push_back('\0');
+    scoped_key.append(key);
+    return scoped_key;
+}
+
+inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
+    const std::string& storage_key) {
+    const auto separator = storage_key.find('\0');
+    if (separator == std::string::npos) {
+        return {"default", storage_key};
+    }
+    return {NormalizeTenantId(storage_key.substr(0, separator)),
+            storage_key.substr(separator + 1)};
+}
+
+struct OffloadTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const OffloadTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+
+struct PromotionTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const PromotionTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(PromotionTaskItem, tenant_id, key, size);
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
