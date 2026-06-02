@@ -188,6 +188,11 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         build_dir.join("mooncake-common").display()
     );
+    // mooncake_common static library lives in the src/ subdirectory.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("mooncake-common/src").display()
+    );
 
     // transfer_engine is built in a sibling directory.
     println!(
@@ -218,6 +223,7 @@ fn main() {
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
     println!("cargo:rustc-link-lib=transfer_engine");
+    println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
     println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency

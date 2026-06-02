@@ -4,6 +4,7 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -27,15 +28,6 @@ namespace mooncake {
 using ReplicaID = uint64_t;
 
 /**
- * @brief Type of buffer allocator used in the system
- */
-enum class ReplicaType {
-    MEMORY,     // Memory replica
-    DISK,       // Disk replica
-    LOCAL_DISK  // Local disk replica
-};
-
-/**
  * @brief Stream operator for ReplicaType
  */
 inline std::ostream& operator<<(std::ostream& os,
@@ -43,7 +35,9 @@ inline std::ostream& operator<<(std::ostream& os,
     static const std::unordered_map<ReplicaType, std::string_view>
         replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
                              {ReplicaType::DISK, "DISK"},
-                             {ReplicaType::LOCAL_DISK, "LOCAL_DISK"}};
+                             {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
+                             {ReplicaType::NOF_SSD, "NOF_SSD"},
+                             {ReplicaType::ALL, "ALL"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -86,18 +80,35 @@ inline std::ostream& operator<<(std::ostream& os,
  */
 struct ReplicateConfig {
     size_t replica_num{1};
+    size_t nof_replica_num{0};
     bool with_soft_pin{false};
     bool with_hard_pin{false};  // Hard pin: object cannot be evicted
     std::vector<std::string>
         preferred_segments{};         // Preferred segments for allocation
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
+    std::vector<std::string>
+        preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    // Optional per-key routing group IDs. Empty string keeps that key
+    // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
+    // and memory eviction behavior.
+    std::optional<std::vector<std::string>> group_ids{};
+
+    ReplicateConfig ForSingleKey(size_t key_index) const {
+        ReplicateConfig key_config = *this;
+        if (group_ids.has_value()) {
+            key_config.group_ids =
+                std::vector<std::string>{group_ids->at(key_index)};
+        }
+        return key_config;
+    }
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
         os << "ReplicateConfig: { replica_num: " << config.replica_num
+           << ", nof_replica_num: " << config.nof_replica_num
            << ", with_soft_pin: " << config.with_soft_pin
            << ", with_hard_pin: " << config.with_hard_pin
            << ", preferred_segments: [";
@@ -110,14 +121,50 @@ struct ReplicateConfig {
             os << ", preferred_segment (deprecated): "
                << config.preferred_segment;
         }
+        os << ", preferred_nof_segments: [";
+        for (size_t i = 0; i < config.preferred_nof_segments.size(); ++i) {
+            os << config.preferred_nof_segments[i];
+            if (i < config.preferred_nof_segments.size() - 1) os << ", ";
+        }
+        os << "]";
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
-           << ", data_type: " << config.data_type << " }";
+           << ", data_type: " << config.data_type;
+        if (config.group_ids.has_value()) {
+            os << ", group_ids: [";
+            for (size_t i = 0; i < config.group_ids->size(); ++i) {
+                os << config.group_ids->at(i);
+                if (i + 1 < config.group_ids->size()) os << ", ";
+            }
+            os << "]";
+        }
+        os << " }";
         return os;
     }
 };
 
+enum class ReplicaWriteMode {
+    SINGLE_REPLICA,
+    FLEXIBLE_DUAL_REPLICA,
+    RELIABLE_MULTI_REPLICA,
+};
+
+inline ReplicaWriteMode DetermineReplicaWriteMode(
+    const ReplicateConfig& config) {
+    if (config.replica_num == 1 && config.nof_replica_num == 1) {
+        return ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA;
+    }
+    if (config.replica_num > 1 || config.nof_replica_num > 1) {
+        return ReplicaWriteMode::RELIABLE_MULTI_REPLICA;
+    }
+    return ReplicaWriteMode::SINGLE_REPLICA;
+}
+
 struct MemoryReplicaData {
+    std::unique_ptr<AllocatedBuffer> buffer;
+};
+
+struct NoFReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;
 };
 
@@ -135,6 +182,11 @@ struct LocalDiskReplicaData {
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
+};
+
+struct NoFDescriptor {
+    AllocatedBuffer::Descriptor buffer_descriptor;
+    YLT_REFL(NoFDescriptor, buffer_descriptor);
 };
 
 struct DiskDescriptor {
@@ -160,6 +212,19 @@ class Replica {
           data_(MemoryReplicaData{std::move(buffer)}),
           status_(status),
           refcnt_(0) {}
+
+    // nof ssd replica constructor
+    Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status,
+            ReplicaType replica_type)
+        : id_(next_id_.fetch_add(1)), status_(status), refcnt_(0) {
+        if (replica_type == ReplicaType::MEMORY) {
+            data_ = MemoryReplicaData{std::move(buffer)};
+        } else if (replica_type == ReplicaType::NOF_SSD) {
+            data_ = NoFReplicaData{std::move(buffer)};
+        } else {
+            LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
+        }
+    }
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
@@ -275,6 +340,14 @@ class Replica {
         return replica.is_memory_replica();
     }
 
+    [[nodiscard]] bool is_nof_replica() const {
+        return std::holds_alternative<NoFReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_nof_replica(const Replica& replica) {
+        return replica.is_nof_replica();
+    }
+
     [[nodiscard]] bool is_disk_replica() const {
         return std::holds_alternative<DiskReplicaData>(data_);
     }
@@ -297,6 +370,14 @@ class Replica {
             return !mem_data.buffer->isAllocatorValid();
         }
         return false;  // DiskReplicaData does not have handles
+    }
+
+    [[nodiscard]] bool has_invalid_nof_handle() const {
+        if (is_nof_replica()) {
+            const auto& nof_data = std::get<NoFReplicaData>(data_);
+            return !nof_data.buffer->isAllocatorValid();
+        }
+        return false;
     }
 
     /**
@@ -372,6 +453,9 @@ class Replica {
         ReplicaType operator()(const MemoryReplicaData&) const {
             return ReplicaType::MEMORY;
         }
+        ReplicaType operator()(const NoFReplicaData&) const {
+            return ReplicaType::NOF_SSD;
+        }
         ReplicaType operator()(const DiskReplicaData&) const {
             return ReplicaType::DISK;
         }
@@ -382,7 +466,8 @@ class Replica {
 
     struct Descriptor {
         ReplicaID id;
-        std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor>
+        std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                     LocalDiskDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -394,6 +479,14 @@ class Replica {
 
         bool is_memory_replica() const noexcept {
             return std::holds_alternative<MemoryDescriptor>(descriptor_variant);
+        }
+
+        bool is_nof_replica() noexcept {
+            return std::holds_alternative<NoFDescriptor>(descriptor_variant);
+        }
+
+        bool is_nof_replica() const noexcept {
+            return std::holds_alternative<NoFDescriptor>(descriptor_variant);
         }
 
         bool is_disk_replica() noexcept {
@@ -422,6 +515,13 @@ class Replica {
             throw std::runtime_error("Expected MemoryDescriptor");
         }
 
+        NoFDescriptor& get_nof_descriptor() {
+            if (auto* desc = std::get_if<NoFDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected NoFDescriptor");
+        }
+
         DiskDescriptor& get_disk_descriptor() {
             if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
                 return *desc;
@@ -445,6 +545,13 @@ class Replica {
             throw std::runtime_error("Expected MemoryDescriptor");
         }
 
+        const NoFDescriptor& get_nof_descriptor() const {
+            if (auto* desc = std::get_if<NoFDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected NoFDescriptor");
+        }
+
         const DiskDescriptor& get_disk_descriptor() const {
             if (auto* desc = std::get_if<DiskDescriptor>(&descriptor_variant)) {
                 return *desc;
@@ -465,7 +572,8 @@ class Replica {
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
-    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
+    std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
+                 LocalDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -491,6 +599,18 @@ inline Replica::Descriptor Replica::get_descriptor() const {
             LOG(ERROR) << "Trying to get invalid memory replica descriptor";
         }
         desc.descriptor_variant = std::move(mem_desc);
+    } else if (is_nof_replica()) {
+        const auto& nof_data = std::get<NoFReplicaData>(data_);
+        NoFDescriptor nof_desc;
+        if (nof_data.buffer) {
+            nof_desc.buffer_descriptor = nof_data.buffer->get_descriptor();
+        } else {
+            nof_desc.buffer_descriptor.size_ = 0;
+            nof_desc.buffer_descriptor.buffer_address_ = 0;
+            nof_desc.buffer_descriptor.transport_endpoint_ = "";
+            LOG(ERROR) << "Trying to get invalid nof replica descriptor";
+        }
+        desc.descriptor_variant = std::move(nof_desc);
     } else if (is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(data_);
         DiskDescriptor disk_desc;
@@ -520,6 +640,15 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
             segment_names.push_back(std::nullopt);
         }
         return segment_names;
+    } else if (is_nof_replica()) {
+        const auto& nof_data = std::get<NoFReplicaData>(data_);
+        std::vector<std::optional<std::string>> segment_names;
+        if (nof_data.buffer && nof_data.buffer->isAllocatorValid()) {
+            segment_names.push_back(nof_data.buffer->getSegmentName());
+        } else {
+            segment_names.push_back(std::nullopt);
+        }
+        return segment_names;
     }
     return std::vector<std::optional<std::string>>();
 }
@@ -533,6 +662,13 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         os << "type: MEMORY, buffers: [";
         if (mem_data.buffer) {
             os << *mem_data.buffer;
+        }
+        os << "]";
+    } else if (replica.is_nof_replica()) {
+        const auto& nof_data = std::get<NoFReplicaData>(replica.data_);
+        os << "type: NOF_SSD, buffers: [";
+        if (nof_data.buffer) {
+            os << *nof_data.buffer;
         }
         os << "]";
     } else if (replica.is_disk_replica()) {

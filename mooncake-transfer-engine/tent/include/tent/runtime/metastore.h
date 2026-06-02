@@ -26,17 +26,6 @@ struct MetaStore {
     static std::shared_ptr<MetaStore> Create(const std::string &type,
                                              const std::string &servers);
 
-    static std::shared_ptr<MetaStore> Create(const std::string &type,
-                                             const std::string &servers,
-                                             const std::string &password,
-                                             uint8_t db_index);
-
-    static std::shared_ptr<MetaStore> Create(const std::string &type,
-                                             const std::string &servers,
-                                             const std::string &username,
-                                             const std::string &password,
-                                             uint8_t db_index);
-
     MetaStore() {}
 
     virtual ~MetaStore() {}

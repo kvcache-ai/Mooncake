@@ -68,6 +68,7 @@ This repository also hosts its technical report and the open-sourced traces.
 getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
+getting_started/observability
 getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
@@ -90,6 +91,7 @@ performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
 performance/allocation-strategy-benchmark-result
 performance/ssd-offload-benchmark-results
+performance/storage-benchmark
 :::
 
 % API Documentation
@@ -116,6 +118,7 @@ design/p2p-store
 design/transfer-engine/index
 design/hicache-design
 design/engram
+design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design

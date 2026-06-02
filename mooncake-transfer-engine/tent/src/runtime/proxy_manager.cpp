@@ -238,7 +238,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
-    const static size_t kStageBuffers = 4;
+    const size_t kStageBuffers =
+        std::min(chunk_count_, static_cast<size_t>(16));
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
@@ -318,6 +319,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                                    chunk.length, chunk.offset);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
+                    event_queue.push(id);
                 } else if (request.opcode == Request::READ && remote_staging) {
                     if (remote_locked.count(chunk.remote_buf)) {
                         event_queue.push(id);
@@ -329,10 +331,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
+                    event_queue.push(id);
                 } else {
                     chunk.state = StageState::CROSS;
+                    event_queue.push(id);
                 }
-                event_queue.push(id);
                 break;
             }
 
@@ -366,20 +369,23 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                                       remote_futures[id]);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT_REMOTE;
+                    event_queue.push(id);
                 } else if (request.opcode == Request::READ && local_staging) {
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
                     chunk.prev_state = chunk.state;
                     chunk.state = StageState::INFLIGHT;
                     event_queue.push(id);
+                } else {
+                    // No staging needed, mark as finished
+                    chunk.state = StageState::FINISH;
                 }
                 break;
             }
 
             case StageState::INFLIGHT: {
                 TransferStatus xfer_status;
-                CHECK_STATUS(
-                    impl_->getTransferStatus(chunk.batch, xfer_status));
+                CHECK_STATUS(impl_->progressBatch(chunk.batch, xfer_status));
                 if (xfer_status.s == PENDING) {
                     event_queue.push(id);
                     break;
@@ -416,6 +422,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             }
 
             case StageState::FAILED: {
+                // Drain the queue to avoid losing chunks
+                while (!event_queue.empty()) {
+                    event_queue.pop();
+                }
                 return Status::InternalError(
                     "Proxy event loop in failed state");
             }
@@ -424,6 +434,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 auto& fut = remote_futures[id];
                 if (!fut.valid()) {
                     chunk.state = StageState::FAILED;
+                    event_queue.push(id);
                     break;
                 }
                 if (fut.wait_for(std::chrono::seconds(0)) ==
@@ -431,6 +442,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                     Status rs = fut.get();
                     if (!rs.ok()) {
                         chunk.state = StageState::FAILED;
+                        event_queue.push(id);
                         break;
                     }
                     if (chunk.prev_state == StageState::PRE) {
@@ -442,6 +454,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                             remote_staging) {
                             remote_locked.erase(chunk.remote_buf);
                         }
+                        event_queue.push(id);
                     }
                 } else {
                     event_queue.push(id);

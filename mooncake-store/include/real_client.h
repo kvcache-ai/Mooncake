@@ -484,6 +484,9 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
         const UUID &client_id);
 
+    tl::expected<bool, ErrorCode> is_shm_mapped_internal(
+        uint64_t dummy_base_addr, const UUID &client_id);
+
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
@@ -683,6 +686,10 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects);
 
+    int64_t get_offload_rpc_read_count() const {
+        return offload_rpc_read_count_.load(std::memory_order_relaxed);
+    }
+
     /**
      * @brief Mount a shared memory file region and return segment ids.
      *        If size > max_mr_size, it will be split into multiple chunks
@@ -759,11 +766,22 @@ class RealClient : public PyClient {
         }
     };
 
+    struct UbSegmentDeleter {
+        size_t size = 0;
+        std::string protocol = "ub";
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -830,9 +848,13 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
+    // Counts every LOCAL_DISK read served via peer offload-RPC.
+    std::atomic<int64_t> offload_rpc_read_count_{0};
+
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
+    void stop_dummy_client_monitor();
     std::thread dummy_client_monitor_thread_;
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =

@@ -83,6 +83,7 @@ class UbEndpointStore {
     virtual std::shared_ptr<UbEndPoint> insertEndpoint(
         const std::string& peer_nic_path, UbContext* context) = 0;
     virtual int deleteEndpoint(const std::string& peer_nic_path) = 0;
+    virtual int deleteEndpointByPtr(UbEndPoint* point_ptr) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
@@ -102,6 +103,7 @@ class UbSIEVEEndpointStore : public UbEndpointStore {
     std::shared_ptr<UbEndPoint> insertEndpoint(const std::string& peer_nic_path,
                                                UbContext* context) override;
     int deleteEndpoint(const std::string& peer_nic_path) override;
+    int deleteEndpointByPtr(UbEndPoint* point_ptr) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -227,6 +229,10 @@ class UbContext {
 
     int deleteEndpoint(const std::string& peer_nic_path) {
         return endpoint_store_->deleteEndpoint(peer_nic_path);
+    }
+
+    int deleteEndpointByPtr(UbEndPoint* point_ptr) {
+        return endpoint_store_->deleteEndpointByPtr(point_ptr);
     }
 
     int disconnectAllEndpoints() { return endpoint_store_->disconnect(); }

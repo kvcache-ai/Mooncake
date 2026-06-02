@@ -34,13 +34,12 @@ Mooncake 目前仅支持 Linux 操作系统，并且依赖以下软件：
 
    首先按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 中的说明安装 cuda（需要勾选 nvidia-fs 选项, 以便于 cufile 的正常使用），之后：
 
-   1) 参考 https://docs.nvidia.com/cuda/gpudirect-rdma/ 的 3.7 节，安装 nvidia-peermem 以启用 gpu-direct RDMA:
-
-   2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH`，用于编译和运行时链接 cufile, cudart 等库：
+   1) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH`，用于编译和运行时链接 cufile, cudart 等库：
    ```bash
    export $LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
    export $LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
    ```
+   > **注意：** 默认情况下，Mooncake 使用 DMA-BUF 路径进行 GPU-Direct RDMA，**无需** `nvidia-peermem` 内核模块。如需使用依赖 `nvidia-peermem` 的传统 `ibv_reg_mr` 路径，请在启动 Mooncake 前设置运行时环境变量 `WITH_NVIDIA_PEERMEM=1`。安装 `nvidia-peermem` 的说明见 https://docs.nvidia.com/cuda/gpudirect-rdma/ 第 3.7 节。
 
 6. 编译 Mooncake 组件
    ```bash

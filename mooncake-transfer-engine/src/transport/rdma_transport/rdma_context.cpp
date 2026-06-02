@@ -29,6 +29,15 @@
 
 #include "config.h"
 #include "cuda_alike.h"
+#include "environ.h"
+#if defined(USE_HIP_DMABUF)
+#include <sys/utsname.h>
+
+#include <vector>
+
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+#endif
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -49,6 +58,89 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
     const auto region_length = static_cast<uintptr_t>(region.mr->length);
     return region_start <= addr && addr - region_start < region_length;
 }
+
+#if defined(USE_HIP_DMABUF)
+// Returns true when the kernel has CONFIG_PCI_P2PDMA and
+// CONFIG_DMABUF_MOVE_NOTIFY enabled, which are required for ibv_reg_dmabuf_mr
+// to produce working RDMA transfers (not just successful registration).
+// Result is cached after the first call.
+bool isKernelDmabufSupported() {
+    static const bool supported = []() {
+        if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
+            if (std::string(env) != "0") {
+                LOG(INFO)
+                    << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
+                return false;
+            }
+        }
+        struct utsname uts{};
+        std::string release;
+        if (uname(&uts) == 0) release = uts.release;
+
+        const char *needles[] = {"CONFIG_PCI_P2PDMA=y",
+                                 "CONFIG_DMABUF_MOVE_NOTIFY=y"};
+        std::vector<bool> found(2, false);
+
+        const std::vector<std::string> candidates = {
+            "/proc/config.gz",  // compressed; checked below via gzip-magic skip
+            "/boot/config-" + release,
+            "/usr/src/linux-" + release + "/.config",
+            "/usr/src/linux/.config",
+            "/usr/lib/modules/" + release + "/config",
+            "/usr/lib/ostree-boot/config-" + release,
+            "/usr/lib/kernel/config-" + release,
+            "/usr/src/linux-headers-" + release + "/.config",
+            "/lib/modules/" + release + "/build/.config",
+        };
+
+        for (const auto &path : candidates) {
+            std::ifstream f(path);
+            if (!f.good()) continue;
+            // /proc/config.gz is gzipped; we skip it here (the kallsyms
+            // fallback below covers that case in practice).
+            if (path.find(".gz") != std::string::npos) continue;
+            std::string line;
+            while (std::getline(f, line)) {
+                for (size_t i = 0; i < 2; ++i) {
+                    if (!found[i] && line.find(needles[i]) != std::string::npos)
+                        found[i] = true;
+                }
+                if (found[0] && found[1]) break;
+            }
+            if (found[0] && found[1]) break;
+        }
+
+        // Fallback: probe /proc/kallsyms for the corresponding kernel symbols.
+        if (!found[0] || !found[1]) {
+            std::ifstream f("/proc/kallsyms");
+            if (f.good()) {
+                std::string line;
+                while (std::getline(f, line)) {
+                    if (!found[0] &&
+                        line.find("pci_p2pdma") != std::string::npos)
+                        found[0] = true;
+                    if (!found[1] &&
+                        line.find("dma_buf_move_notify") != std::string::npos)
+                        found[1] = true;
+                    if (found[0] && found[1]) break;
+                }
+            }
+        }
+
+        bool ok = found[0] && found[1];
+        if (!ok) {
+            LOG(WARNING)
+                << "Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY "
+                << "(p2pdma=" << found[0] << " move_notify=" << found[1]
+                << "); HIP dmabuf MR registration disabled, falling back to "
+                << "ibv_reg_mr() (which requires an amdgpu peermem driver). "
+                << "Rebuild kernel with both options for GPU-direct RDMA.";
+        }
+        return ok;
+    }();
+    return supported;
+}
+#endif  // USE_HIP_DMABUF
 }  // namespace
 
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
@@ -149,8 +241,20 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     worker_pool_ = std::make_shared<WorkerPool>(*this, socketId());
 
+#ifdef USE_MLX5DV
+    {
+        mlx5dv_context dv_ctx = {};
+        dv_ctx.comp_mask = MLX5DV_CONTEXT_MASK_NUM_LAG_PORTS;
+        if (mlx5dv_query_device(context_, &dv_ctx) == 0)
+            num_lag_ports_ = dv_ctx.num_lag_ports;
+    }
+    LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
+              << ", GID: (GID_Index " << gid_index_ << ") " << gid()
+              << ", num_lag_ports: " << (int)num_lag_ports_;
+#else
     LOG(INFO) << "RDMA device: " << context_->device->name << ", LID: " << lid_
               << ", GID: (GID_Index " << gid_index_ << ") " << gid();
+#endif
 
     return 0;
 }
@@ -229,8 +333,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-#if defined(USE_MLU) || defined(USE_MACA) || \
-    (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
     // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
@@ -243,6 +346,14 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         mrMeta.addr = addr;
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#if defined(USE_CUDA)
+    } else if (memType == CU_MEMORYTYPE_DEVICE &&
+               Environ::Get().GetWithNvidiaPeermem()) {
+        // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
+        // GPU memory (requires the nvidia-peermem kernel module to be loaded).
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
 #if defined(USE_CUDA)
         // Ensure a CUDA context is current — worker threads or callers
@@ -317,6 +428,99 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #if defined(USE_CUDA)
         cuDevicePrimaryCtxRelease(cuDev);
 #endif
+    }
+#elif defined(USE_HIP_DMABUF)
+    hipPointerAttribute_t hipAttr{};
+    hipError_t hipRes = hipPointerGetAttributes(&hipAttr, addr);
+
+    if (hipRes != hipSuccess || hipAttr.type == hipMemoryTypeHost ||
+        hipAttr.type == hipMemoryTypeUnregistered) {
+        // Host memory — standard ibv_reg_mr() path.
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (hipAttr.type == hipMemoryTypeManaged) {
+        // Managed (unified) memory pages can migrate between host and device;
+        // hsa_amd_portable_export_dmabuf captures the device-side handle at
+        // export time only, making the dmabuf fd stale after migration. Fall
+        // back to ibv_reg_mr() for safety.
+        LOG(WARNING) << "HIP managed memory at " << (uintptr_t)addr
+                     << " — dmabuf export skipped (pages may migrate); "
+                        "falling back to ibv_reg_mr";
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (hipAttr.type == hipMemoryTypeDevice &&
+               !isKernelDmabufSupported()) {
+        // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
+        // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
+        // Fail at registration time instead.
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (hipAttr.type == hipMemoryTypeDevice) {
+        // Device memory + kernel support — export dmabuf fd and register.
+        // Pin to the owning device for the duration of the export calls.
+        struct HipDeviceGuard {
+            int prev_device = 0;
+            bool need_restore = false;
+            bool set_ok = false;
+            explicit HipDeviceGuard(int target_device) {
+                if (hipGetDevice(&prev_device) == hipSuccess) {
+                    need_restore = (prev_device != target_device);
+                }
+                set_ok = (hipSetDevice(target_device) == hipSuccess);
+            }
+            ~HipDeviceGuard() {
+                if (need_restore) {
+                    (void)hipSetDevice(prev_device);
+                }
+            }
+        } dev_guard(hipAttr.device);
+        if (!dev_guard.set_ok) {
+            LOG(ERROR) << "Failed to set HIP device to " << hipAttr.device
+                       << " for dmabuf export of " << (uintptr_t)addr;
+            return ERR_CONTEXT;
+        }
+
+        // Get the allocation base + size, since `addr` may sit at an offset
+        // within a larger hipMalloc block (caching allocators pack tensors).
+        hipDeviceptr_t allocBase = nullptr;
+        size_t allocSize = 0;
+        hipRes = hipMemGetAddressRange(&allocBase, &allocSize,
+                                       reinterpret_cast<hipDeviceptr_t>(addr));
+        if (hipRes != hipSuccess) {
+            LOG(ERROR) << "Failed to call hipMemGetAddressRange for "
+                       << (uintptr_t)addr
+                       << " hip error=" << hipGetErrorString(hipRes);
+            return ERR_CONTEXT;
+        }
+
+        int dmabuf_fd = -1;
+        uint64_t hsa_dmabuf_offset = 0;
+        hsa_status_t hsaRes = hsa_amd_portable_export_dmabuf(
+            allocBase, allocSize, &dmabuf_fd, &hsa_dmabuf_offset);
+        if (hsaRes != HSA_STATUS_SUCCESS) {
+            const char *hsaErr = nullptr;
+            hsa_status_string(hsaRes, &hsaErr);
+            LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
+                       << " base=" << (uintptr_t)allocBase
+                       << " size=" << allocSize
+                       << " hsa error=" << (hsaErr ? hsaErr : "unknown");
+            return ERR_CONTEXT;
+        }
+
+        mrMeta.addr = addr;
+        // Offset within the dmabuf-backed region: distance from the
+        // allocation base, plus any offset hsa returned for the export.
+        uint64_t reg_offset =
+            (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, reg_offset, length, (uintptr_t)addr,
+                                      dmabuf_fd, access);
+        const int regErrno = errno;
+        if (close(dmabuf_fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        if (!mrMeta.mr) {
+            errno = regErrno;
+        }
     }
 #else
     mrMeta.addr = addr;
@@ -458,7 +662,7 @@ size_t RdmaContext::getTotalQPNumber() const {
 }
 
 std::string RdmaContext::nicPath() const {
-    return MakeNicPath(engine_.local_server_name_, device_name_);
+    return MakeNicPath(engine_.rdma_server_name_, device_name_);
 }
 
 std::string RdmaContext::gid() const {
@@ -648,7 +852,7 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             return ERR_CONTEXT;
         }
 
-#if defined(USE_MACA) || (!defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA))
+#if defined(USE_MACA) || defined(USE_CUDA)
         // Verify DMA-BUF support against the GPU device(s) that the local
         // topology explicitly maps to this RNIC, rather than assuming the
         // verbs enumeration order matches GPU enumeration.
@@ -656,77 +860,84 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // not just GPUs listing it as preferred.  Runtime selection falls
         // back to avail_hca when a preferred NIC is disabled, so we must
         // validate both lists.
-        std::vector<int> mapped_gpu_devices;
-        if (engine_.local_topology_) {
-            const auto topology_matrix = engine_.local_topology_->getMatrix();
-            for (const auto &entry : topology_matrix) {
-                if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
-                bool in_preferred =
-                    std::find(entry.second.preferred_hca.begin(),
-                              entry.second.preferred_hca.end(),
-                              device_name) != entry.second.preferred_hca.end();
-                bool in_avail =
-                    std::find(entry.second.avail_hca.begin(),
-                              entry.second.avail_hca.end(),
-                              device_name) != entry.second.avail_hca.end();
-                if (!in_preferred && !in_avail) continue;
+        if (!Environ::Get().GetWithNvidiaPeermem()) {
+            std::vector<int> mapped_gpu_devices;
+            if (engine_.local_topology_) {
+                const auto topology_matrix =
+                    engine_.local_topology_->getMatrix();
+                for (const auto &entry : topology_matrix) {
+                    if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
+                    bool in_preferred =
+                        std::find(entry.second.preferred_hca.begin(),
+                                  entry.second.preferred_hca.end(),
+                                  device_name) !=
+                        entry.second.preferred_hca.end();
+                    bool in_avail =
+                        std::find(entry.second.avail_hca.begin(),
+                                  entry.second.avail_hca.end(),
+                                  device_name) != entry.second.avail_hca.end();
+                    if (!in_preferred && !in_avail) continue;
 
-                try {
-                    mapped_gpu_devices.push_back(
-                        std::stoi(entry.first.substr(GPU_PREFIX.size())));
-                } catch (const std::exception &e) {
-                    LOG(WARNING) << "Ignore malformed topology GPU entry "
-                                 << entry.first << ": " << e.what();
+                    try {
+                        mapped_gpu_devices.push_back(
+                            std::stoi(entry.first.substr(GPU_PREFIX.size())));
+                    } catch (const std::exception &e) {
+                        LOG(WARNING) << "Ignore malformed topology GPU entry "
+                                     << entry.first << ": " << e.what();
+                    }
                 }
             }
-        }
 
-        std::sort(mapped_gpu_devices.begin(), mapped_gpu_devices.end());
-        mapped_gpu_devices.erase(
-            std::unique(mapped_gpu_devices.begin(), mapped_gpu_devices.end()),
-            mapped_gpu_devices.end());
+            std::sort(mapped_gpu_devices.begin(), mapped_gpu_devices.end());
+            mapped_gpu_devices.erase(std::unique(mapped_gpu_devices.begin(),
+                                                 mapped_gpu_devices.end()),
+                                     mapped_gpu_devices.end());
 
-        if (mapped_gpu_devices.empty()) {
-            LOG(INFO) << "No GPU device is explicitly mapped to RNIC "
-                      << device_name << "; skip DMA-BUF affinity validation";
-        } else {
-            // cuInit is process-global and idempotent; call it once before
-            // the per-device loop, not per cuDeviceGet.
+            if (mapped_gpu_devices.empty()) {
+                LOG(INFO) << "No GPU device is explicitly mapped to RNIC "
+                          << device_name
+                          << "; skip DMA-BUF affinity validation";
+            } else {
+                // cuInit is process-global and idempotent; call it once before
+                // the per-device loop, not per cuDeviceGet.
 #if defined(USE_CUDA)
-            CUresult result = cuInit(0);
-            if (result != CUDA_SUCCESS) {
-                LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
-                           << device_name;
-                goto cleanup_context_and_devices;
-            }
-#endif
-            for (int gpu_device : mapped_gpu_devices) {
-                CUdevice cuDevice;
-                CUresult result = cuDeviceGet(&cuDevice, gpu_device);
+                CUresult result = cuInit(0);
                 if (result != CUDA_SUCCESS) {
-                    LOG(ERROR) << "Failed to query GPU device " << gpu_device
-                               << " for RNIC " << device_name;
-                    goto cleanup_context_and_devices;
-                }
-                int dmaBufSupported;
-                result = cuDeviceGetAttribute(
-                    &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
-                    cuDevice);
-                if (result != CUDA_SUCCESS) {
-                    LOG(ERROR) << "Failed to query GPU device attributes for "
-                               << "GPU device " << gpu_device << " and RNIC "
+                    LOG(ERROR) << "Failed to initialize CUDA driver for RNIC "
                                << device_name;
                     goto cleanup_context_and_devices;
                 }
-                if (!dmaBufSupported) {
-                    LOG(ERROR)
-                        << "DMA BUF supported required for GPU RDMA without "
-                           "nvidia-peermem on GPU device "
-                        << gpu_device << " mapped to RNIC " << device_name;
-                    goto cleanup_context_and_devices;
+#endif
+                for (int gpu_device : mapped_gpu_devices) {
+                    CUdevice cuDevice;
+                    CUresult result = cuDeviceGet(&cuDevice, gpu_device);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR) << "Failed to query GPU device "
+                                   << gpu_device << " for RNIC " << device_name;
+                        goto cleanup_context_and_devices;
+                    }
+                    int dmaBufSupported;
+                    result = cuDeviceGetAttribute(
+                        &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                        cuDevice);
+                    if (result != CUDA_SUCCESS) {
+                        LOG(ERROR)
+                            << "Failed to query GPU device attributes for "
+                            << "GPU device " << gpu_device << " and RNIC "
+                            << device_name;
+                        goto cleanup_context_and_devices;
+                    }
+                    if (!dmaBufSupported) {
+                        LOG(ERROR)
+                            << "DMA BUF supported required for GPU RDMA "
+                               "without "
+                               "nvidia-peermem on GPU device "
+                            << gpu_device << " mapped to RNIC " << device_name;
+                        goto cleanup_context_and_devices;
+                    }
                 }
             }
-        }
+        }  // !Environ::Get().GetWithNvidiaPeermem()
 #endif
 
         ibv_port_attr port_attr;

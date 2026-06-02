@@ -23,6 +23,20 @@ TEST(UtilsTest, ByteSizeToString) {
     EXPECT_EQ(byte_size_to_string(15 * 1024 * 1024 + 44048), "15.04 MB");
 }
 
+TEST(UtilsTest, StringToByteSize) {
+    auto parsed = try_string_to_byte_size("16 MB");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed.value(), 16ULL * 1024 * 1024);
+
+    parsed = try_string_to_byte_size("0");
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed.value(), 0);
+
+    EXPECT_FALSE(try_string_to_byte_size("-5").has_value());
+    EXPECT_FALSE(try_string_to_byte_size("16XB").has_value());
+    EXPECT_EQ(string_to_byte_size("-5"), 0);
+}
+
 TEST(UtilsTest, StringToBool) {
     EXPECT_EQ(string_to_bool("1"), true);
     EXPECT_EQ(string_to_bool("true"), true);
