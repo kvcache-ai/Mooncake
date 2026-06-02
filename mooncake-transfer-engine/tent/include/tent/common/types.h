@@ -52,7 +52,8 @@ struct Request {
     size_t length;
     int priority =
         PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
-    std::optional<std::string> policy_name;  // Optional: bind to specific policy by name
+    std::optional<std::string>
+        policy_name;  // Optional: bind to specific policy by name
 };
 
 enum TransferStatusEnum {

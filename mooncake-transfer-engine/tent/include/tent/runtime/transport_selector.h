@@ -80,7 +80,8 @@ struct SelectionContext {
         buffer_transports;  // Pointer to transports in buffer
     size_t transfer_size;   // Transfer size in bytes
     int priority_level;     // Request priority level (lower = more urgent)
-    std::optional<std::string> policy_name;  // Optional: bind to specific policy by name
+    std::optional<std::string>
+        policy_name;  // Optional: bind to specific policy by name
 };
 
 /**
