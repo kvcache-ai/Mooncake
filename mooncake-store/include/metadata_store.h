@@ -28,6 +28,8 @@ struct StandbyObjectMetadata {
     // old ones
     uint64_t last_sequence_id{
         0};  // Last OpLog sequence ID that modified this key
+    std::string group_id;                    // Tenant group identifier
+    ObjectDataType data_type{ObjectDataType::UNKNOWN};  // Data type classification
 
     StandbyObjectMetadata() = default;
 
@@ -51,6 +53,20 @@ struct StandbySegmentInfo {
 };
 
 /**
+ * @brief Standby object entry with tenant-aware key
+ *
+ * Replaces std::pair<std::string, StandbyObjectMetadata> for cleaner
+ * struct_pack serialization and explicit tenant_id support.
+ */
+struct StandbyObjectEntry {
+    std::string tenant_id{"default"};
+    std::string key;
+    StandbyObjectMetadata metadata;
+
+    YLT_REFL(StandbyObjectEntry, tenant_id, key, metadata);
+};
+
+/**
  * Complete snapshot exported from standby at promotion time.
  * Includes applied OpLog sequence ID, all object metadata,
  * and all registered segments.
@@ -58,7 +74,7 @@ struct StandbySegmentInfo {
 struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> objects;
+    std::vector<StandbyObjectEntry> objects;
 
     YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
 };
@@ -73,9 +89,10 @@ struct MetadataPayload {
     UUID client_id{0, 0};
     uint64_t size{0};
     std::vector<Replica::Descriptor> replicas;
-    // NOTE: Lease information removed - not needed by Standby
+    struct_pack::compatible<std::string, 1> group_id;       // Tenant group
+    struct_pack::compatible<ObjectDataType, 1> data_type;   // Data type
 
-    YLT_REFL(MetadataPayload, client_id, size, replicas);
+    YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
@@ -84,6 +101,8 @@ struct MetadataPayload {
         meta.size = size;
         meta.replicas = replicas;
         meta.last_sequence_id = sequence_id;
+        meta.group_id = group_id.value_or("");
+        meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
         return meta;
     }
 };
@@ -125,51 +144,40 @@ class MetadataStore {
    public:
     virtual ~MetadataStore() = default;
 
-    /**
-     * @brief Put or update metadata for a key with structured metadata
-     * @param key Object key
-     * @param metadata Structured metadata object
-     * @return true on success, false on failure
-     */
-    virtual bool PutMetadata(const std::string& key,
+    // NEW: tenant-aware methods (primary API)
+    virtual bool PutMetadata(const std::string& tenant_id,
+                             const std::string& key,
                              const StandbyObjectMetadata& metadata) = 0;
+    virtual std::optional<StandbyObjectMetadata> GetMetadata(
+        const std::string& tenant_id, const std::string& key) const = 0;
+    virtual bool Remove(const std::string& tenant_id,
+                        const std::string& key) = 0;
+    virtual bool Exists(const std::string& tenant_id,
+                        const std::string& key) const = 0;
+    virtual size_t GetKeyCountForTenant(const std::string& tenant_id) const = 0;
 
-    /**
-     * @brief Put or update metadata for a key (legacy interface for backward
-     * compatibility)
-     * @param key Object key
-     * @param payload Optional payload data (JSON serialized metadata)
-     * @return true on success, false on failure
-     */
+    // DEPRECATED: key-only overloads delegate to tenant-aware with "default"
+    virtual bool PutMetadata(const std::string& key,
+                             const StandbyObjectMetadata& metadata) {
+        return PutMetadata("default", key, metadata);
+    }
+    virtual std::optional<StandbyObjectMetadata> GetMetadata(
+        const std::string& key) const {
+        return GetMetadata("default", key);
+    }
+    virtual bool Remove(const std::string& key) {
+        return Remove("default", key);
+    }
+    virtual bool Exists(const std::string& key) const {
+        return Exists("default", key);
+    }
+
+    // NOTE: legacy Put(key, payload) remains as default-tenant delegate.
+    // StandbyMetadataStore and MockMetadataStore continue to implement it.
     virtual bool Put(const std::string& key,
                      const std::string& payload = std::string()) = 0;
 
-    /**
-     * @brief Get metadata for a key
-     * @param key Object key
-     * @return Copy of metadata if found, std::nullopt otherwise
-     */
-    virtual std::optional<StandbyObjectMetadata> GetMetadata(
-        const std::string& key) const = 0;
-
-    /**
-     * @brief Remove metadata for a key
-     * @param key Object key
-     * @return true if key was found and removed, false otherwise
-     */
-    virtual bool Remove(const std::string& key) = 0;
-
-    /**
-     * @brief Check if a key exists
-     * @param key Object key
-     * @return true if key exists, false otherwise
-     */
-    virtual bool Exists(const std::string& key) const = 0;
-
-    /**
-     * @brief Get the count of keys in the store
-     * @return Number of keys
-     */
+    // GetKeyCount semantics unchanged - returns total across ALL tenants
     virtual size_t GetKeyCount() const = 0;
 };
 

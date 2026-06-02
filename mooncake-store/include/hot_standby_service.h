@@ -157,7 +157,7 @@ class HotStandbyService {
     // This is used by MasterServiceSupervisor to initialize the new Primary
     // after leader election (fast recovery).
     bool ExportMetadataSnapshot(
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+        std::vector<StandbyObjectEntry>& out) const;
 
     /**
      * Export complete standby snapshot including:
@@ -244,25 +244,28 @@ class HotStandbyService {
     // Simple in-memory metadata store implementation
     class StandbyMetadataStore : public MetadataStore {
        public:
-        bool PutMetadata(const std::string& key,
+        bool PutMetadata(const std::string& tenant_id,
+                         const std::string& key,
                          const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
         std::optional<StandbyObjectMetadata> GetMetadata(
-            const std::string& key) const override;
-        bool Remove(const std::string& key) override;
-        bool Exists(const std::string& key) const override;
+            const std::string& tenant_id, const std::string& key) const override;
+        bool Remove(const std::string& tenant_id,
+                    const std::string& key) override;
+        bool Exists(const std::string& tenant_id,
+                    const std::string& key) const override;
+        size_t GetKeyCountForTenant(const std::string& tenant_id) const override;
         size_t GetKeyCount() const override;
         void Clear();
 
         // Snapshot for promotion/restore.
-        void Snapshot(
-            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out)
-            const;
+        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StandbyObjectMetadata> store_;
+        std::unordered_map<std::string,
+            std::unordered_map<std::string, StandbyObjectMetadata>> store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{

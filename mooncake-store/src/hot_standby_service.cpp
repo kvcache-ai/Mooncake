@@ -53,10 +53,13 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 
 // StandbyMetadataStore implementation
 bool HotStandbyService::StandbyMetadataStore::PutMetadata(
-    const std::string& key, const StandbyObjectMetadata& metadata) {
+    const std::string& tenant_id, const std::string& key,
+    const StandbyObjectMetadata& metadata) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
+    store_[normalized][key] = metadata;
+    VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
+            << ", key=" << key
             << ", replicas=" << metadata.replicas.size()
             << ", size=" << metadata.size;
     return true;
@@ -64,43 +67,64 @@ bool HotStandbyService::StandbyMetadataStore::PutMetadata(
 
 bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
                                                   const std::string& payload) {
-    // Legacy interface - create empty metadata
+    // Legacy interface - create empty metadata for default tenant
     StandbyObjectMetadata metadata;
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
+    store_["default"][key] = metadata;
     return true;
 }
 
 std::optional<StandbyObjectMetadata>
 HotStandbyService::StandbyMetadataStore::GetMetadata(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        return it->second;
-    }
-    return std::nullopt;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return std::nullopt;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return std::nullopt;
+    return it->second;
 }
 
-bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
+bool HotStandbyService::StandbyMetadataStore::Remove(
+    const std::string& tenant_id, const std::string& key) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        store_.erase(it);
-        return true;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return false;
+    tenant_it->second.erase(it);
+    if (tenant_it->second.empty()) {
+        store_.erase(tenant_it);
     }
-    return false;
+    return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Exists(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.find(key) != store_.end();
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    return tenant_it->second.find(key) != tenant_it->second.end();
 }
 
 size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.size();
+    size_t total = 0;
+    for (const auto& [tid, tenant_map] : store_) {
+        total += tenant_map.size();
+    }
+    return total;
+}
+
+size_t HotStandbyService::StandbyMetadataStore::GetKeyCountForTenant(
+    const std::string& tenant_id) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(normalized);
+    return it == store_.end() ? 0 : it->second.size();
 }
 
 void HotStandbyService::StandbyMetadataStore::Clear() {
@@ -109,12 +133,14 @@ void HotStandbyService::StandbyMetadataStore::Clear() {
 }
 
 void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     out.clear();
-    out.reserve(store_.size());
-    for (const auto& kv : store_) {
-        out.emplace_back(kv.first, kv.second);
+    for (const auto& [tenant_id, tenant_store] : store_) {
+        for (const auto& [key, metadata] : tenant_store) {
+            out.push_back(StandbyObjectEntry{
+                NormalizeTenantId(tenant_id), key, metadata});
+        }
     }
 }
 
@@ -290,8 +316,8 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    for (const auto& kv : snapshot.metadata) {
-        metadata_store_->PutMetadata(kv.first, kv.second);
+    for (const auto& entry : snapshot.metadata) {
+        metadata_store_->PutMetadata(entry.tenant_id, entry.key, entry.metadata);
     }
     // Load segment registry from snapshot
     if (oplog_applier_) {
@@ -724,7 +750,7 @@ uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!metadata_store_) {
         out.clear();
