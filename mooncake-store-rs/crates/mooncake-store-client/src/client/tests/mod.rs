@@ -123,6 +123,13 @@ struct CountingRouteDirectory {
     get_object_routes_calls: AtomicUsize,
 }
 
+struct EmptyConflictRouteDirectory {
+    inner: Arc<dyn RouteDirectory>,
+    conflict_key: ObjectKey,
+    bounded_reads: Arc<AtomicUsize>,
+    conflicted: Arc<AtomicBool>,
+}
+
 struct FinalizeFailureMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     fail_reservation_id: String,
@@ -210,6 +217,7 @@ struct BlockingCasMetadataBackend {
     inner: Arc<InMemoryMetadataBackend>,
     block_key: ObjectKey,
     gate: Arc<(StdMutex<BlockingCasGateState>, Condvar)>,
+    omit_current_on_conflict: AtomicBool,
 }
 
 struct RecoverableMetadataBackend {
@@ -308,6 +316,12 @@ impl CountingRouteDirectory {
     }
 }
 
+impl EmptyConflictRouteDirectory {
+    fn bounded_reads(&self) -> usize {
+        self.bounded_reads.load(Ordering::Relaxed)
+    }
+}
+
 impl RecoverableMetadataBackend {
     fn new(inner: Arc<InMemoryMetadataBackend>) -> Self {
         Self {
@@ -376,6 +390,7 @@ impl BlockingCasMetadataBackend {
                 }),
                 Condvar::new(),
             )),
+            omit_current_on_conflict: AtomicBool::new(false),
         }
     }
 
@@ -440,6 +455,10 @@ impl BlockingCasMetadataBackend {
         let mut state = lock.lock().expect("blocking CAS gate lock should succeed");
         state.released = true;
         condvar.notify_all();
+    }
+
+    fn omit_current_on_conflict(&self) {
+        self.omit_current_on_conflict.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1669,6 +1688,150 @@ impl RouteDirectory for CountingRouteDirectory {
     }
 }
 
+impl RouteDirectory for EmptyConflictRouteDirectory {
+    fn get_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        if self.conflicted.load(Ordering::Relaxed) {
+            return Err(StoreError::Unsupported(format!(
+                "unbounded route read is disabled for {}",
+                key.0
+            )));
+        }
+        self.inner.get_object_route(observer, key)
+    }
+
+    fn get_object_routes(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        if self.conflicted.load(Ordering::Relaxed) {
+            return Err(StoreError::Unsupported(
+                "unbounded route batch read is disabled after conflict".to_string(),
+            ));
+        }
+        self.inner.get_object_routes(observer, keys)
+    }
+
+    fn get_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<Option<ObjectRoute>>> {
+        self.bounded_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_object_routes_bounded(observer, keys)
+    }
+
+    fn contains_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<bool> {
+        self.inner.contains_object_route(observer, key)
+    }
+
+    fn contains_object_routes_bounded(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> mooncake_store_core::Result<Vec<bool>> {
+        self.inner.contains_object_routes_bounded(observer, keys)
+    }
+
+    fn compare_and_swap_object_route(
+        &self,
+        observer: &ClientLease,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<mooncake_store_core::CasResult> {
+        if *key == self.conflict_key {
+            self.conflicted.store(true, Ordering::Relaxed);
+            return Ok(mooncake_store_core::CasResult {
+                applied: false,
+                current: None,
+                version_floor: None,
+            });
+        }
+        self.inner
+            .compare_and_swap_object_route(observer, key, expected, next)
+    }
+
+    fn compare_and_swap_object_routes(
+        &self,
+        observer: &ClientLease,
+        requests: &[RouteCasRequest],
+    ) -> mooncake_store_core::Result<Vec<mooncake_store_core::Result<mooncake_store_core::CasResult>>>
+    {
+        if requests
+            .iter()
+            .any(|request| request.key == self.conflict_key)
+        {
+            self.conflicted.store(true, Ordering::Relaxed);
+            return Ok(requests
+                .iter()
+                .map(|request| {
+                    if request.key == self.conflict_key {
+                        Ok(mooncake_store_core::CasResult {
+                            applied: false,
+                            current: None,
+                            version_floor: None,
+                        })
+                    } else {
+                        self.inner.compare_and_swap_object_route(
+                            observer,
+                            &request.key,
+                            request.expected,
+                            request.next.as_ref(),
+                        )
+                    }
+                })
+                .collect());
+        }
+        self.inner
+            .compare_and_swap_object_routes(observer, requests)
+    }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        observer: &ClientLease,
+        owner: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_routes_by_replica_owner(observer, owner)
+    }
+
+    fn list_routes_in_scope(
+        &self,
+        observer: &ClientLease,
+        scope: &NamespaceScope,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_routes_in_scope(observer, scope)
+    }
+
+    fn list_reuse_candidates(
+        &self,
+        observer: &ClientLease,
+        reuse: &mooncake_store_core::ReuseIdentity,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        self.inner.list_reuse_candidates(observer, reuse)
+    }
+
+    fn get_version_floor(&self, observer: &ClientLease, key: &ObjectKey) -> Option<RouteVersion> {
+        self.inner.get_version_floor(observer, key)
+    }
+
+    fn get_version_floors(
+        &self,
+        observer: &ClientLease,
+        keys: &[ObjectKey],
+    ) -> Vec<Option<RouteVersion>> {
+        self.inner.get_version_floors(observer, keys)
+    }
+}
+
 impl MetadataBackend for FinalizeFailureMetadataBackend {
     fn route_namespace(&self) -> String {
         self.inner.route_namespace()
@@ -2064,8 +2227,17 @@ impl MetadataBackend for BlockingCasMetadataBackend {
                 state.armed = false;
             }
         }
-        self.inner
-            .compare_and_swap_object_route(key, expected, next)
+        let result = self
+            .inner
+            .compare_and_swap_object_route(key, expected, next)?;
+        if self.omit_current_on_conflict.load(Ordering::Relaxed) && !result.applied {
+            return Ok(mooncake_store_core::CasResult {
+                applied: false,
+                current: None,
+                version_floor: None,
+            });
+        }
+        Ok(result)
     }
 
     fn get_route_policy(
@@ -7836,6 +8008,254 @@ fn routed_batch_put_from_treats_route_conflicts_as_per_key_success() {
     assert!(
         value == source_a || value == source_b,
         "the authoritative route should point at one completed writer"
+    );
+}
+
+#[test]
+fn routed_batch_put_from_rechecks_active_route_when_conflict_omits_current() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let blocking = Arc::new(BlockingCasMetadataBackend::new(
+        inner,
+        "default::batch-put-from-conflict-key-omitted-current",
+    ));
+    blocking.omit_current_on_conflict();
+    let metadata: Arc<dyn MetadataBackend> = blocking.clone();
+    let store_transport = Arc::new(TestTransport::new(
+        "batch-put-conflict-omitted-store-segment",
+    ));
+    let writer_a_transport =
+        Arc::new(store_transport.peer("batch-put-conflict-omitted-writer-a-segment"));
+    let writer_b_transport =
+        Arc::new(store_transport.peer("batch-put-conflict-omitted-writer-b-segment"));
+    let reader_transport =
+        Arc::new(store_transport.peer("batch-put-conflict-omitted-reader-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let store = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-omitted-store")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(store_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("store build should succeed");
+    let writer_a = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-omitted-writer-a")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_a_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner.clone(), 1)
+        .build(test_future_expiry_ms())
+        .expect("writer-a build should succeed");
+    let writer_b = StoreClientBuilder::new(metadata.clone(), "batch-put-conflict-omitted-writer-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_b_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer-b build should succeed");
+    let reader = StoreClientBuilder::new(metadata, "batch-put-conflict-omitted-reader")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(reader_transport)
+        .local_memory(rw_only_config())
+        .build(test_future_expiry_ms())
+        .expect("reader build should succeed");
+
+    store
+        .register_local_memory()
+        .expect("store memory should register");
+    writer_a
+        .register_local_memory()
+        .expect("writer-a memory should register");
+    writer_b
+        .register_local_memory()
+        .expect("writer-b memory should register");
+    reader
+        .register_local_memory()
+        .expect("reader memory should register");
+    wait_for_membership_convergence(&[&store, &writer_a, &writer_b, &reader]);
+
+    let mut source_a = b"batch-put-conflict-payload-a".to_vec();
+    let mut source_b = b"batch-put-conflict-payload-b".to_vec();
+    writer_a
+        .register_buffer(source_a.as_mut_ptr().cast(), source_a.len())
+        .expect("writer-a source buffer should register");
+    writer_b
+        .register_buffer(source_b.as_mut_ptr().cast(), source_b.len())
+        .expect("writer-b source buffer should register");
+    let policy = ReplicationPolicy::new()
+        .replica_count(1)
+        .prefer_local(false)
+        .preferred_storage_owner(store.runtime_id().storage_key());
+
+    blocking.arm_blocked_cas();
+    std::thread::scope(|scope| {
+        let writer_a_result = scope.spawn(|| {
+            writer_a.batch_put_from(&[PutFromRequest::new(
+                "batch-put-from-conflict-key-omitted-current",
+                source_a.as_ptr().cast(),
+                source_a.len(),
+            )
+            .replication(policy.clone())])
+        });
+        assert!(
+            blocking.wait_until_blocked(Duration::from_secs(1)),
+            "writer-a should reach the blocked route publish point"
+        );
+        let writer_b_result = scope.spawn(|| {
+            writer_b.batch_put_from(&[PutFromRequest::new(
+                "batch-put-from-conflict-key-omitted-current",
+                source_b.as_ptr().cast(),
+                source_b.len(),
+            )
+            .replication(policy.clone())])
+        });
+        assert!(
+            blocking.wait_until_blocked_count(2, Duration::from_secs(1)),
+            "both writers should reach the blocked route publish point"
+        );
+        blocking.release_blocked_cas();
+
+        let routes_a = writer_a_result
+            .join()
+            .expect("writer-a thread should join")
+            .expect("writer-a conflict loser should still succeed after recheck");
+        let routes_b = writer_b_result
+            .join()
+            .expect("writer-b thread should join")
+            .expect("writer-b conflict loser should still succeed after recheck");
+        assert_eq!(routes_a.len(), 1);
+        assert_eq!(routes_b.len(), 1);
+        assert_eq!(routes_a[0].key, routes_b[0].key);
+        assert_eq!(routes_a[0].version, routes_b[0].version);
+    });
+
+    let value = reader
+        .get("batch-put-from-conflict-key-omitted-current")
+        .expect("reader should fetch the published payload");
+    assert!(
+        value == source_a || value == source_b,
+        "the authoritative route should point at one completed writer"
+    );
+}
+
+#[test]
+fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
+    let inner = Arc::new(InMemoryMetadataBackend::new());
+    let metadata: Arc<dyn MetadataBackend> = inner.clone();
+    let storage_transport = Arc::new(TestTransport::new(
+        "batch-put-empty-conflict-visible-store-segment",
+    ));
+    let writer_transport =
+        Arc::new(storage_transport.peer("batch-put-empty-conflict-visible-writer-segment"));
+    let planner = PlacementPlanner::new(metadata.clone()).require_label("storage", "true");
+
+    let storage =
+        StoreClientBuilder::new(metadata.clone(), "batch-put-empty-conflict-visible-store")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "true")
+            .route_control(RouteControlMode::MetadataOnly)
+            .live_client_sync_interval(fast_live_client_sync_interval())
+            .transport(storage_transport)
+            .local_memory(storage_config())
+            .build(test_future_expiry_ms())
+            .expect("storage build should succeed");
+    let mut writer = StoreClientBuilder::new(metadata, "batch-put-empty-conflict-visible-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .route_control(RouteControlMode::MetadataOnly)
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(rw_only_config())
+        .routed_writes(planner, 1)
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage memory should register");
+    writer
+        .register_local_memory()
+        .expect("writer memory should register");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let key = "batch-put-empty-conflict-visible-key";
+    let object_id = LogicalObjectId::new(NamespaceScope::default(), key);
+    let segment = storage
+        .segment_name()
+        .expect("storage segment should exist");
+    let mut route = ObjectRoute {
+        key: ObjectKey::from_logical_id(&object_id),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: storage.lease().compatibility,
+        replicas: vec![ReplicaRoute {
+            owner: storage.runtime_id().clone(),
+            segment_name: segment,
+            offset: Some(0),
+            segment_offset: 0,
+            length: 32,
+            checksum: None,
+            tier: mooncake_store_core::ReplicaTier::Dram,
+            priority: 0,
+        }],
+    };
+    mooncake_store_core::apply_route_identity(&mut route, &object_id);
+    inner
+        .compare_and_swap_object_route(&route.key, None, Some(&route))
+        .expect("seed route publish should succeed");
+
+    let empty_conflict_route_directory = Arc::new(EmptyConflictRouteDirectory {
+        inner: writer.route_directory.clone(),
+        conflict_key: route.key.clone(),
+        bounded_reads: Arc::new(AtomicUsize::new(0)),
+        conflicted: Arc::new(AtomicBool::new(false)),
+    });
+    writer.route_directory = empty_conflict_route_directory.clone();
+
+    let mut source = b"batch-put-empty-conflict-visible".to_vec();
+    writer
+        .register_buffer(source.as_mut_ptr().cast(), source.len())
+        .expect("writer source buffer should register");
+    let routes = writer
+        .batch_put_from(&[
+            PutFromRequest::new(key, source.as_ptr().cast(), source.len()).replication(
+                ReplicationPolicy::new()
+                    .replica_count(1)
+                    .prefer_local(false)
+                    .preferred_storage_owner(storage.runtime_id().storage_key()),
+            ),
+        ])
+        .expect("empty conflict should use bounded recheck to find active route");
+
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].version, RouteVersion(1));
+    assert_eq!(empty_conflict_route_directory.bounded_reads(), 1);
+    assert!(
+        writer
+            .batch_is_exist(&[ObjectRef::new(key)])
+            .expect("exist check should succeed")[0],
+        "active route found by bounded conflict recheck must stay visible"
     );
 }
 

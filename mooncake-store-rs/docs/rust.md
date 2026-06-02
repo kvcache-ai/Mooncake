@@ -211,7 +211,7 @@ Behavior boundary:
 
 - `put_from` and `batch_put_from` send remote writes from the registered source buffer directly
 - `batch_get_into` reads remote payloads directly into registered destination buffers
-- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when an active route is already published, releases its own temporary reservation, and returns the published route for that key
+- routed `batch_put_from` treats per-key route CAS conflicts as successful cache insert races when an active route is already published, releases its own temporary reservation, and returns the published route for that key; when the CAS response omits that active route, the client does one exact bounded recheck for the conflicted key before failing
 - `ReplicaRoute::offset` is the transport target address for the payload; `segment_offset` is allocator bookkeeping, so writers translate allocator reservations through the segment announcement's published storage target chunks, and local reads plus drain migration translate `offset` back through the same storage target map before copying from local storage
 - unregistered `get_into` targets and `batch_put_from_multi_buffers` still fall back to the staged copy paths
 
