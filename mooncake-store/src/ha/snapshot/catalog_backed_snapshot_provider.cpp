@@ -223,8 +223,7 @@ DeserializeStandbyObjectMetadata(
     }
 }
 
-tl::expected<std::vector<std::pair<std::string, StandbyObjectMetadata>>,
-             ErrorCode>
+tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                                    const SegmentView& segment_view,
                                    uint64_t snapshot_sequence_id) {
@@ -245,7 +244,7 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     const auto now = std::chrono::system_clock::now();
     for (uint32_t i = 0; i < shards->via.map.size; ++i) {
         const auto& shard_blob = shards->via.map.ptr[i].val;
@@ -286,23 +285,45 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
 
         for (uint32_t j = 0; j < metadata_entries->via.array.size; ++j) {
             const auto& item = metadata_entries->via.array.ptr[j];
-            if (item.type != msgpack::type::ARRAY || item.via.array.size != 2) {
+            if (item.type != msgpack::type::ARRAY) {
                 LOG(ERROR) << "Snapshot metadata item has invalid shape";
                 return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
             }
 
             try {
-                const std::string key = item.via.array.ptr[0].as<std::string>();
+                std::string tenant_id = "default";
+                std::string key;
+                size_t metadata_index;
+
+                if (item.via.array.size == 2) {
+                    // Old format: [key, metadata]
+                    key = item.via.array.ptr[0].as<std::string>();
+                    metadata_index = 1;
+                } else if (item.via.array.size == 3) {
+                    // New format: [tenant_id, key, metadata]
+                    tenant_id = item.via.array.ptr[0].as<std::string>();
+                    key = item.via.array.ptr[1].as<std::string>();
+                    metadata_index = 2;
+                } else {
+                    LOG(ERROR) << "Snapshot metadata item has invalid array size: "
+                               << item.via.array.size;
+                    return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+                }
+
+                const auto normalized_tenant = NormalizeTenantId(tenant_id);
+
                 auto metadata_result = DeserializeStandbyObjectMetadata(
-                    item.via.array.ptr[1], segment_view, snapshot_sequence_id,
-                    now);
+                    item.via.array.ptr[metadata_index], segment_view,
+                    snapshot_sequence_id, now);
                 if (!metadata_result) {
                     return tl::make_unexpected(metadata_result.error());
                 }
                 if (!metadata_result->has_value()) {
                     continue;
                 }
-                snapshot.emplace_back(key, std::move(metadata_result->value()));
+                snapshot.push_back(StandbyObjectEntry{
+                    normalized_tenant, key,
+                    std::move(metadata_result->value())});
             } catch (const std::exception& ex) {
                 LOG(ERROR) << "Failed to parse snapshot metadata item: "
                            << ex.what();

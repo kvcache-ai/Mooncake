@@ -225,7 +225,7 @@ class WrappedMasterService {
 
     // Internal method called by supervisor during promotion; NOT an RPC endpoint.
     void RestoreFromStandby(
-        const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+        const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments);
 

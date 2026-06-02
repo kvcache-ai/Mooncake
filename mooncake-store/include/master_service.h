@@ -785,7 +785,7 @@ class MasterService {
      * Called once at promotion time before serving requests.
      */
     void RestoreFromStandbySnapshot(
-        const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+        const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments);
 

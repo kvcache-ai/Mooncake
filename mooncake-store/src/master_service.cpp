@@ -1197,7 +1197,7 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 }
 
 void MasterService::RestoreFromStandbySnapshot(
-    const std::vector<std::pair<std::string, StandbyObjectMetadata>>& objects,
+    const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments) {
     // 1. Set OpLogManager initial sequence.
@@ -1224,7 +1224,9 @@ void MasterService::RestoreFromStandbySnapshot(
     }
 
     // 3. Restore object metadata.
-    for (const auto& [key, standby_meta] : objects) {
+    for (const auto& entry : objects) {
+        const auto& key = entry.key;
+        const auto& standby_meta = entry.metadata;
         std::vector<Replica> replicas;
         replicas.reserve(standby_meta.replicas.size());
 
