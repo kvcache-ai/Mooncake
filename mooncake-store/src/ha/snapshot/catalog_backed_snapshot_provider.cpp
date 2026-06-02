@@ -156,12 +156,11 @@ DeserializeStandbyObjectMetadata(
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
         }
 
-        // Skip the optional data_type; the standby restore path does not use
-        // it. A leading positive integer is data_type, whereas a replica is
-        // serialized as an array.
+        // Read data_type if present (8+ or 10+ format)
+        ObjectDataType data_type = ObjectDataType::UNKNOWN;
         if (index < total_elements &&
             array[index].type == msgpack::type::POSITIVE_INTEGER) {
-            ++index;  // data_type
+            data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
         }
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
@@ -211,11 +210,26 @@ DeserializeStandbyObjectMetadata(
             return std::optional<StandbyObjectMetadata>();
         }
 
+        // Read hard_pinned and group_id if present. Standby does not need
+        // hard_pinned, but promotion needs group_id to rebuild group indexes.
+        if (index < total_elements &&
+            array[index].type == msgpack::type::BOOLEAN) {
+            ++index;  // hard_pinned
+        }
+
+        std::string group_id;
+        if (index < total_elements &&
+            array[index].type == msgpack::type::STR) {
+            group_id = array[index++].as<std::string>();
+        }
+
         StandbyObjectMetadata metadata;
         metadata.client_id = client_id;
         metadata.size = size;
         metadata.replicas = std::move(replicas);
         metadata.last_sequence_id = snapshot_sequence_id;
+        metadata.data_type = data_type;
+        metadata.group_id = std::move(group_id);
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();
