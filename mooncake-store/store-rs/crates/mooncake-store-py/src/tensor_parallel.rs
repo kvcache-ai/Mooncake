@@ -4,10 +4,11 @@
 //! metadata tagging, and cross-TP scatter-gather reconstruction.
 
 use mooncake_tensor::{
-    calculate_shard_range, calculate_strided_shard_ranges, get_parallelism_key_name,
-    get_parallelism_manifest_key, get_writer_partition_key_name, parallelism_matches_metadata,
-    ParallelAxisKind, ParallelAxisSpec, ReadTargetMode, ReadTargetSpec, TensorDtype,
-    TensorMetadata, TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
+    build_raw_shard_write_plan, calculate_shard_range, calculate_strided_shard_ranges,
+    get_parallelism_key_name, get_parallelism_manifest_key, get_writer_partition_key_name,
+    parallelism_matches_metadata, validate_uniform_shard, ParallelAxisKind, ParallelAxisSpec,
+    RawShardWritePlan, ReadTargetMode, ReadTargetSpec, TensorDtype, TensorMetadata,
+    TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -222,19 +223,6 @@ fn extract_tensor_info(tensor: &Bound<'_, PyAny>) -> PyResult<TensorInfo> {
     })
 }
 
-// ─── Shard calculation helpers ─────────────────────────────────────────────
-
-fn compute_global_shape(local_shape: &[i64], spec: &TensorParallelismSpec) -> Vec<i64> {
-    let mut global = local_shape.to_vec();
-    if let Some(tp) = spec.tp_axis() {
-        let dim = tp.split_dim as usize;
-        if dim < global.len() && tp.size > 0 {
-            global[dim] = global[dim] * tp.size as i64;
-        }
-    }
-    global
-}
-
 // ─── Write route ───────────────────────────────────────────────────────────
 
 enum WriteRoute {
@@ -314,25 +302,52 @@ impl PyMooncakeDistributedStore {
                 let spec = par_spec
                     .as_ref()
                     .expect("parallelism routes must have par_spec");
+
+                // Auto-slice: if TP axis present, narrow the full tensor to the TP shard
+                let (shard_info, global_shape) = if let Some(tp) = spec.tp_axis() {
+                    let dim = tp.split_dim as usize;
+                    if dim >= info.shape.len() {
+                        return Err(PyValueError::new_err(
+                            "split_dim out of range for tensor shape",
+                        ));
+                    }
+                    validate_uniform_shard(info.shape[dim], tp.size)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let chunk = info.shape[dim] / tp.size as i64;
+                    let start = tp.rank as i64 * chunk;
+                    let shard_tensor = tensor
+                        .call_method1("narrow", (dim as i64, start, chunk))?
+                        .call_method0("contiguous")?;
+                    let shard_info = extract_tensor_info(&shard_tensor)?;
+                    (shard_info, info.shape.clone())
+                } else {
+                    // No TP axis (pure DP/PP/EP): store as-is
+                    let global = info.shape.clone();
+                    (info, global)
+                };
+
                 let storage_key = get_parallelism_key_name(key, spec);
-                let global_shape = compute_global_shape(&info.shape, spec);
                 let metadata = TensorMetadata::build_shard(
-                    info.dtype as i32,
+                    shard_info.dtype as i32,
                     &global_shape,
-                    &info.shape,
+                    &shard_info.shape,
                     &spec.canonicalize().axes,
-                    info.data_bytes as u64,
+                    shard_info.data_bytes as u64,
                 );
-                let status =
-                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                let status = self.put_tensor_object(
+                    &storage_key,
+                    &metadata,
+                    &shard_info,
+                    tenant,
+                    replica_count,
+                )?;
                 if status != 0 {
                     return Ok(status);
                 }
 
-                let tp = spec.tp_axis();
-                if let Some(tp_axis) = tp {
+                if let Some(tp_axis) = spec.tp_axis() {
                     let manifest = WriterShardManifest::new(
-                        info.dtype as i32,
+                        shard_info.dtype as i32,
                         global_shape.len() as i32,
                         tp_axis.split_dim,
                         tp_axis.size,
@@ -357,29 +372,46 @@ impl PyMooncakeDistributedStore {
             }
             WriteRoute::WriterPartition => {
                 let wp = wp_spec.expect("WriterPartition route must have wp_spec");
+                let dim = wp.split_dim as usize;
+                if dim >= info.shape.len() {
+                    return Err(PyValueError::new_err(
+                        "writer_partition split_dim out of range for tensor shape",
+                    ));
+                }
+                validate_uniform_shard(info.shape[dim], wp.size)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                // Auto-slice: narrow the full tensor to the writer's shard
+                let global_shape = info.shape.clone();
+                let chunk = info.shape[dim] / wp.size as i64;
+                let start = wp.rank as i64 * chunk;
+                let shard_tensor = tensor
+                    .call_method1("narrow", (dim as i64, start, chunk))?
+                    .call_method0("contiguous")?;
+                let shard_info = extract_tensor_info(&shard_tensor)?;
+
                 let storage_key =
                     get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
-
-                let mut global_shape = info.shape.clone();
-                let dim = wp.split_dim as usize;
-                if dim < global_shape.len() {
-                    global_shape[dim] = global_shape[dim] * wp.size as i64;
-                }
                 let metadata = TensorMetadata::build_shard(
-                    info.dtype as i32,
+                    shard_info.dtype as i32,
                     &global_shape,
-                    &info.shape,
+                    &shard_info.shape,
                     &[],
-                    info.data_bytes as u64,
+                    shard_info.data_bytes as u64,
                 );
-                let status =
-                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                let status = self.put_tensor_object(
+                    &storage_key,
+                    &metadata,
+                    &shard_info,
+                    tenant,
+                    replica_count,
+                )?;
                 if status != 0 {
                     return Ok(status);
                 }
 
                 let manifest = WriterShardManifest::new(
-                    info.dtype as i32,
+                    shard_info.dtype as i32,
                     global_shape.len() as i32,
                     wp.split_dim,
                     wp.size,
@@ -791,9 +823,7 @@ impl PyMooncakeDistributedStore {
         let mut results = Vec::with_capacity(keys.len());
         for i in 0..keys.len() {
             let target = targets.as_ref().and_then(|v| v[i].clone());
-            let tensor = tensors
-                .as_ref()
-                .and_then(|v| v[i].as_ref().map(|t| t.clone()));
+            let tensor = tensors.as_ref().and_then(|v| v[i].clone());
             let result =
                 self.get_tensor_with_parallelism(py, &keys[i], target, tensor.as_ref(), tenant)?;
             results.push(result);
@@ -803,8 +833,8 @@ impl PyMooncakeDistributedStore {
 
     /// Batch get tensors into pre-registered buffers with parallelism.
     ///
-    /// Builds scatter-gather plans for all keys, then issues a single
-    /// merged `get_into_ranges` call to minimize round trips.
+    /// Builds read plans for all keys, then issues a single merged
+    /// `get_into_ranges` call to minimize round trips.
     #[pyo3(signature = (keys, buffer_ptrs, sizes, *, targets = None, tenant = None))]
     fn batch_get_tensor_with_parallelism_into(
         &self,
@@ -827,19 +857,157 @@ impl PyMooncakeDistributedStore {
                 ));
             }
         }
-        let mut results = Vec::with_capacity(keys.len());
-        for i in 0..keys.len() {
-            let target = targets.as_ref().and_then(|v| v[i].clone());
-            let result = self.get_tensor_with_parallelism_into(
-                &keys[i],
-                buffer_ptrs[i],
-                sizes[i],
-                target,
+
+        let n = keys.len();
+        let mut results: Vec<Option<TensorReadResult>> = vec![None; n];
+
+        // Phase 1: Resolve primary read keys for each item
+        #[derive(Clone)]
+        enum BatchReadPlan {
+            Direct(String),
+            Shard(String, TensorParallelismSpec),
+            Full(String),
+        }
+
+        let mut plans = Vec::with_capacity(n);
+        for i in 0..n {
+            let target_spec = match targets.as_ref().and_then(|v| v[i].clone()) {
+                Some(t) => t.to_spec()?,
+                None => ReadTargetSpec::as_stored(),
+            };
+            match target_spec.mode {
+                ReadTargetMode::AsStored => {
+                    plans.push(BatchReadPlan::Direct(keys[i].clone()));
+                }
+                ReadTargetMode::Shard => {
+                    let par = target_spec.parallelism.ok_or_else(|| {
+                        PyValueError::new_err("SHARD mode requires parallelism spec")
+                    })?;
+                    let par_key = get_parallelism_key_name(&keys[i], &par);
+                    plans.push(BatchReadPlan::Shard(par_key, par));
+                }
+                ReadTargetMode::Full => {
+                    plans.push(BatchReadPlan::Full(keys[i].clone()));
+                }
+            }
+        }
+
+        // Phase 2: Batch-read all direct/shard items with one get_into_ranges call
+        let mut batch_indices: Vec<usize> = Vec::new();
+        let mut batch_buffer_ptrs: Vec<usize> = Vec::new();
+        let mut batch_all_keys: Vec<Vec<String>> = Vec::new();
+        let mut batch_dst_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut batch_src_offsets: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut batch_sizes: Vec<Vec<Vec<usize>>> = Vec::new();
+        let mut batch_buffer_sizes: Vec<usize> = Vec::new();
+
+        for i in 0..n {
+            let read_key = match &plans[i] {
+                BatchReadPlan::Direct(k) | BatchReadPlan::Shard(k, _) => k.clone(),
+                BatchReadPlan::Full(_) => continue,
+            };
+            let _ = pointer_from_usize(buffer_ptrs[i])?;
+            batch_indices.push(i);
+            batch_buffer_ptrs.push(buffer_ptrs[i]);
+            batch_all_keys.push(vec![read_key]);
+            batch_dst_offsets.push(vec![vec![0]]);
+            batch_src_offsets.push(vec![vec![0]]);
+            batch_sizes.push(vec![vec![sizes[i]]]);
+            batch_buffer_sizes.push(sizes[i]);
+        }
+
+        if !batch_indices.is_empty() {
+            let batch_results = self.get_into_ranges(
+                batch_buffer_ptrs,
+                batch_all_keys,
+                batch_dst_offsets,
+                batch_src_offsets,
+                batch_sizes,
+                Some(batch_buffer_sizes),
                 tenant,
             )?;
-            results.push(result);
+
+            for (batch_idx, &orig_idx) in batch_indices.iter().enumerate() {
+                let bytes_read = batch_results[batch_idx][0][0];
+                if bytes_read <= 0 {
+                    continue;
+                }
+                let bytes_read = bytes_read as usize;
+                let buf_ptr = buffer_ptrs[orig_idx];
+                let data = unsafe { std::slice::from_raw_parts(buf_ptr as *const u8, bytes_read) };
+                let parsed = match TensorMetadata::parse(data) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let valid = match &plans[orig_idx] {
+                    BatchReadPlan::Direct(_) => true,
+                    BatchReadPlan::Shard(_, par) => {
+                        parallelism_matches_metadata(par, &parsed.metadata)
+                    }
+                    BatchReadPlan::Full(_) => unreachable!(),
+                };
+
+                if valid {
+                    results[orig_idx] = Some(TensorReadResult {
+                        data_ptr: buf_ptr + parsed.data_offset,
+                        data_bytes: parsed.data_bytes,
+                        shape: parsed
+                            .metadata
+                            .layout
+                            .local_shape
+                            .to_vec(parsed.metadata.header.ndim as usize),
+                        dtype: parsed.metadata.header.dtype,
+                        total_bytes_read: bytes_read,
+                    });
+                }
+            }
         }
-        Ok(pyo3::types::PyList::new(py, results)?.into_any().unbind())
+
+        // Phase 3: Handle items that failed in phase 2
+        // Try writer-partition shortcut for Shard misses, then reconstruction.
+        // Full reads also handled here.
+        for i in 0..n {
+            if results[i].is_some() {
+                continue;
+            }
+            match &plans[i] {
+                BatchReadPlan::Shard(_, par) => {
+                    if let Some(shortcut_result) = self.try_writer_partition_shortcut_into(
+                        &keys[i],
+                        buffer_ptrs[i],
+                        sizes[i],
+                        par,
+                        tenant,
+                    ) {
+                        results[i] = Some(shortcut_result?);
+                    } else {
+                        results[i] = Some(self.read_shard_via_reconstruction(
+                            &keys[i],
+                            buffer_ptrs[i],
+                            sizes[i],
+                            par,
+                            tenant,
+                        )?);
+                    }
+                }
+                BatchReadPlan::Full(k) => {
+                    results[i] = Some(self.read_full_into(k, buffer_ptrs[i], sizes[i], tenant)?);
+                }
+                BatchReadPlan::Direct(_) => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "batch_get_into: direct read failed for key={}",
+                        keys[i]
+                    )));
+                }
+            }
+        }
+
+        let final_results: Vec<TensorReadResult> =
+            results.into_iter().map(|r| r.unwrap()).collect();
+        Ok(pyo3::types::PyList::new(py, final_results)?
+            .into_any()
+            .unbind())
     }
 }
 
@@ -847,11 +1015,14 @@ impl PyMooncakeDistributedStore {
 
 // ─── Batch validation helpers ─────────────────────────────────────────────
 
+type OptionalParallelisms = Option<Vec<Option<PyTensorParallelism>>>;
+type OptionalWriterPartitions = Option<Vec<Option<(i32, i32, i32)>>>;
+
 fn validate_batch_write_args(
     keys: &[String],
     tensor_count: usize,
-    parallelisms: &Option<Vec<Option<PyTensorParallelism>>>,
-    writer_partitions: &Option<Vec<Option<(i32, i32, i32)>>>,
+    parallelisms: &OptionalParallelisms,
+    writer_partitions: &OptionalWriterPartitions,
 ) -> PyResult<()> {
     if keys.len() != tensor_count {
         return Err(PyValueError::new_err(
@@ -884,8 +1055,8 @@ fn validate_batch_from_args(
     keys: &[String],
     buffer_ptrs: &[usize],
     sizes: &[usize],
-    parallelisms: &Option<Vec<Option<PyTensorParallelism>>>,
-    writer_partitions: &Option<Vec<Option<(i32, i32, i32)>>>,
+    parallelisms: &OptionalParallelisms,
+    writer_partitions: &OptionalWriterPartitions,
 ) -> PyResult<()> {
     if keys.len() != buffer_ptrs.len() || keys.len() != sizes.len() {
         return Err(PyValueError::new_err(
@@ -947,6 +1118,24 @@ fn extract_tensor_info_from_buffer(
     Ok((info, parsed.metadata))
 }
 
+/// Extract shard bytes from a raw data buffer using a shard write plan.
+/// `data_start` points to the beginning of the data section (after metadata).
+fn extract_shard_data_from_buffer(data_start: usize, plan: &RawShardWritePlan) -> Vec<u8> {
+    let mut shard_data = vec![0u8; plan.shard_bytes];
+    let mut dst_offset = 0usize;
+    for &(src_offset, range_size) in &plan.data_ranges {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (data_start + src_offset) as *const u8,
+                shard_data.as_mut_ptr().add(dst_offset),
+                range_size,
+            );
+        }
+        dst_offset += range_size;
+    }
+    shard_data
+}
+
 impl PyMooncakeDistributedStore {
     fn put_tensor_object(
         &self,
@@ -985,6 +1174,66 @@ impl PyMooncakeDistributedStore {
             false,
             false,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_tensor_object_from_vec(
+        &self,
+        storage_key: &str,
+        metadata: &TensorMetadata,
+        shard_data: Vec<u8>,
+        tenant: Option<&str>,
+        replica_count: Option<usize>,
+        base_key: &str,
+        spec: &TensorParallelismSpec,
+        global_shape: &[i64],
+    ) -> PyResult<i32> {
+        let total_size = TensorMetadata::WIRE_SIZE + shard_data.len();
+        let mut buffer = vec![0u8; total_size];
+        buffer[..TensorMetadata::WIRE_SIZE].copy_from_slice(metadata.as_bytes());
+        buffer[TensorMetadata::WIRE_SIZE..].copy_from_slice(&shard_data);
+
+        let status = self.put(
+            storage_key,
+            buffer,
+            tenant,
+            replica_count,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            false,
+        )?;
+        if status != 0 {
+            return Ok(status);
+        }
+
+        if let Some(tp_axis) = spec.tp_axis() {
+            let manifest = WriterShardManifest::new(
+                metadata.header.dtype,
+                global_shape.len() as i32,
+                tp_axis.split_dim,
+                tp_axis.size,
+                global_shape,
+            );
+            let manifest_key = get_parallelism_manifest_key(base_key);
+            self.put(
+                &manifest_key,
+                manifest.as_bytes().to_vec(),
+                tenant,
+                replica_count,
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )?;
+        }
+        Ok(status)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1048,25 +1297,74 @@ impl PyMooncakeDistributedStore {
                 let spec = par_spec
                     .as_ref()
                     .expect("parallelism routes must have par_spec");
+
+                let (shard_info, global_shape) = if let Some(tp) = spec.tp_axis() {
+                    let dim = tp.split_dim as usize;
+                    if dim >= info.shape.len() {
+                        return Err(PyValueError::new_err(
+                            "_from: split_dim out of range for tensor shape",
+                        ));
+                    }
+                    validate_uniform_shard(info.shape[dim], tp.size)
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let plan = build_raw_shard_write_plan(
+                        &info.shape,
+                        dim,
+                        tp.rank as usize,
+                        tp.size as usize,
+                        info.dtype.element_size(),
+                    )
+                    .ok_or_else(|| {
+                        PyValueError::new_err("_from: failed to build shard write plan")
+                    })?;
+                    let shard_data = extract_shard_data_from_buffer(
+                        buffer_ptr + TensorMetadata::WIRE_SIZE,
+                        &plan,
+                    );
+                    let global = info.shape.clone();
+                    return self.put_tensor_object_from_vec(
+                        &get_parallelism_key_name(key, spec),
+                        &TensorMetadata::build_shard(
+                            info.dtype as i32,
+                            &global,
+                            &plan.shard_shape,
+                            &spec.canonicalize().axes,
+                            plan.shard_bytes as u64,
+                        ),
+                        shard_data,
+                        tenant,
+                        replica_count,
+                        key,
+                        spec,
+                        &global,
+                    );
+                } else {
+                    let shape = info.shape.clone();
+                    (info, shape)
+                };
+
                 let storage_key = get_parallelism_key_name(key, spec);
-                let global_shape = compute_global_shape(&info.shape, spec);
                 let metadata = TensorMetadata::build_shard(
-                    info.dtype as i32,
+                    shard_info.dtype as i32,
                     &global_shape,
-                    &info.shape,
+                    &shard_info.shape,
                     &spec.canonicalize().axes,
-                    info.data_bytes as u64,
+                    shard_info.data_bytes as u64,
                 );
-                let status =
-                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+                let status = self.put_tensor_object(
+                    &storage_key,
+                    &metadata,
+                    &shard_info,
+                    tenant,
+                    replica_count,
+                )?;
                 if status != 0 {
                     return Ok(status);
                 }
 
-                let tp = spec.tp_axis();
-                if let Some(tp_axis) = tp {
+                if let Some(tp_axis) = spec.tp_axis() {
                     let manifest = WriterShardManifest::new(
-                        info.dtype as i32,
+                        shard_info.dtype as i32,
                         global_shape.len() as i32,
                         tp_axis.split_dim,
                         tp_axis.size,
@@ -1091,23 +1389,58 @@ impl PyMooncakeDistributedStore {
             }
             WriteRoute::WriterPartition => {
                 let wp = wp_spec.expect("WriterPartition route must have wp_spec");
+                let dim = wp.split_dim as usize;
+                if dim >= info.shape.len() {
+                    return Err(PyValueError::new_err(
+                        "_from: writer_partition split_dim out of range",
+                    ));
+                }
+                validate_uniform_shard(info.shape[dim], wp.size)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+                let global_shape = info.shape.clone();
+                let plan = build_raw_shard_write_plan(
+                    &global_shape,
+                    dim,
+                    wp.rank as usize,
+                    wp.size as usize,
+                    info.dtype.element_size(),
+                )
+                .ok_or_else(|| {
+                    PyValueError::new_err("_from: failed to build writer shard write plan")
+                })?;
+
+                let shard_data =
+                    extract_shard_data_from_buffer(buffer_ptr + TensorMetadata::WIRE_SIZE, &plan);
+
                 let storage_key =
                     get_writer_partition_key_name(key, wp.rank, wp.size, wp.split_dim);
-
-                let mut global_shape = info.shape.clone();
-                let dim = wp.split_dim as usize;
-                if dim < global_shape.len() {
-                    global_shape[dim] = global_shape[dim] * wp.size as i64;
-                }
                 let metadata = TensorMetadata::build_shard(
                     info.dtype as i32,
                     &global_shape,
-                    &info.shape,
+                    &plan.shard_shape,
                     &[],
-                    info.data_bytes as u64,
+                    plan.shard_bytes as u64,
                 );
-                let status =
-                    self.put_tensor_object(&storage_key, &metadata, &info, tenant, replica_count)?;
+
+                let total_size = TensorMetadata::WIRE_SIZE + plan.shard_bytes;
+                let mut buffer = vec![0u8; total_size];
+                buffer[..TensorMetadata::WIRE_SIZE].copy_from_slice(metadata.as_bytes());
+                buffer[TensorMetadata::WIRE_SIZE..].copy_from_slice(&shard_data);
+
+                let status = self.put(
+                    &storage_key,
+                    buffer,
+                    tenant,
+                    replica_count,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                )?;
                 if status != 0 {
                     return Ok(status);
                 }
@@ -1237,6 +1570,12 @@ impl PyMooncakeDistributedStore {
             }
         }
 
+        if let Some(result) =
+            self.try_writer_partition_shortcut_into(base_key, buffer_ptr, buffer_size, par, tenant)
+        {
+            return result;
+        }
+
         self.read_shard_via_reconstruction(base_key, buffer_ptr, buffer_size, par, tenant)
     }
 
@@ -1260,7 +1599,87 @@ impl PyMooncakeDistributedStore {
             }
         }
 
+        if let Some(result) = self.try_writer_partition_shortcut_bytes(base_key, par, tenant) {
+            return result;
+        }
+
         self.reconstruct_shard_bytes(base_key, par, tenant)
+    }
+
+    fn try_writer_partition_shortcut_into(
+        &self,
+        base_key: &str,
+        buffer_ptr: usize,
+        buffer_size: usize,
+        par: &TensorParallelismSpec,
+        tenant: Option<&str>,
+    ) -> Option<PyResult<TensorReadResult>> {
+        if !par.is_single_tp() {
+            return None;
+        }
+        let tp = par.tp_axis()?;
+        let wp_key = get_writer_partition_key_name(base_key, tp.rank, tp.size, tp.split_dim);
+        if let Ok(result) = self.get_tensor_into_internal(&wp_key, buffer_ptr, buffer_size, tenant)
+        {
+            let data = unsafe {
+                std::slice::from_raw_parts(buffer_ptr as *const u8, result.total_bytes_read)
+            };
+            if let Some(parsed) = TensorMetadata::parse(data) {
+                let local_shape = parsed
+                    .metadata
+                    .layout
+                    .local_shape
+                    .to_vec(parsed.metadata.header.ndim as usize);
+                let global_shape = parsed
+                    .metadata
+                    .layout
+                    .global_shape
+                    .to_vec(parsed.metadata.header.ndim as usize);
+                let dim = tp.split_dim as usize;
+                if dim < global_shape.len() && dim < local_shape.len() {
+                    let expected_local = global_shape[dim] / tp.size as i64;
+                    if local_shape[dim] == expected_local {
+                        return Some(Ok(result));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn try_writer_partition_shortcut_bytes(
+        &self,
+        base_key: &str,
+        par: &TensorParallelismSpec,
+        tenant: Option<&str>,
+    ) -> Option<PyResult<Vec<u8>>> {
+        if !par.is_single_tp() {
+            return None;
+        }
+        let tp = par.tp_axis()?;
+        let wp_key = get_writer_partition_key_name(base_key, tp.rank, tp.size, tp.split_dim);
+        if let Ok(data) = self.get_raw_bytes(&wp_key, tenant) {
+            if let Some(parsed) = TensorMetadata::parse(&data) {
+                let local_shape = parsed
+                    .metadata
+                    .layout
+                    .local_shape
+                    .to_vec(parsed.metadata.header.ndim as usize);
+                let global_shape = parsed
+                    .metadata
+                    .layout
+                    .global_shape
+                    .to_vec(parsed.metadata.header.ndim as usize);
+                let dim = tp.split_dim as usize;
+                if dim < global_shape.len() && dim < local_shape.len() {
+                    let expected_local = global_shape[dim] / tp.size as i64;
+                    if local_shape[dim] == expected_local {
+                        return Some(Ok(data));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn read_shard_via_reconstruction(
@@ -1293,7 +1712,7 @@ impl PyMooncakeDistributedStore {
         if let Some(tp) = target_tp {
             let dim = tp.split_dim as usize;
             if dim < local_shape.len() && tp.size > 0 {
-                local_shape[dim] = local_shape[dim] / tp.size as i64;
+                local_shape[dim] /= tp.size as i64;
             }
         }
 
@@ -1448,7 +1867,7 @@ impl PyMooncakeDistributedStore {
         if let Some(tp) = target_tp {
             let dim = tp.split_dim as usize;
             if dim < local_shape.len() && tp.size > 0 {
-                local_shape[dim] = local_shape[dim] / tp.size as i64;
+                local_shape[dim] /= tp.size as i64;
             }
         }
 
