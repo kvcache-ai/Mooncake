@@ -21,7 +21,7 @@ namespace ha {
  */
 struct PromotionContext {
     uint64_t applied_seq_id{0};
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> objects;
+    std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
 };
 
