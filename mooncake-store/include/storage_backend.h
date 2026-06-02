@@ -155,7 +155,12 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
-enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
+enum class StorageBackendType {
+    kFilePerKey,
+    kBucket,
+    kOffsetAllocator,
+    kNvmeKv,
+};
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
