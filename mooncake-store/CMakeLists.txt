@@ -1,5 +1,8 @@
 project(MooncakeStore VERSION 2.0.0)
 
+option(ENABLE_KV_EVENTS
+       "Build master KV events ZMQ publisher (requires libzmq when ON)" ON)
+
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 

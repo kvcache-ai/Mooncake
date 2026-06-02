@@ -19,8 +19,6 @@ struct KvEventConfig {
     uint32_t dp_rank{0};
     // Emit legacy vLLM/SGLang field names alongside RFC #1527 fields.
     bool emit_legacy_compat_fields{true};
-    // Bounded queue capacity; additional events are dropped.
-    uint32_t queue_capacity{65536};
 };
 
 }  // namespace mooncake

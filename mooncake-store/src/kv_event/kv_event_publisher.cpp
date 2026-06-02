@@ -1,11 +1,14 @@
 #include "kv_event/kv_event_publisher.h"
 
+#if defined(MOONCAKE_ENABLE_KV_EVENTS) && MOONCAKE_ENABLE_KV_EVENTS
+
 #include <glog/logging.h>
 #include <msgpack.hpp>
 #include <zmq.h>
 
 #include <chrono>
 #include <cstring>
+#include <endian.h>
 #include <vector>
 
 namespace mooncake {
@@ -38,35 +41,30 @@ void PackOptionalU32(msgpack::packer<msgpack::sbuffer>& packer,
     }
 }
 
-}  // namespace
-
-std::optional<uint64_t> KvEventPublisher::ParseSeqHashFromObjectKey(
-    const std::string& object_key) {
-    if (object_key.empty()) {
-        return std::nullopt;
+size_t ComputeEventMapSize(bool is_stored, bool emit_legacy) {
+    // Base envelope: event_id, timestamp, event_type, model_name, block_size,
+    // additional_salt, lora_name, tenant_id, backend_id, medium, dp_rank,
+    // seq_hashes.
+    constexpr size_t kBaseFields = 12;
+    size_t map_size = kBaseFields;
+    if (emit_legacy) {
+        map_size += 2;  // type, block_hashes
     }
-    try {
-        size_t idx = 0;
-        if (object_key.size() >= 2 &&
-            (object_key[0] == '0' &&
-             (object_key[1] == 'x' || object_key[1] == 'X'))) {
-            uint64_t value = std::stoull(object_key, &idx, 16);
-            if (idx == object_key.size()) {
-                return value;
-            }
-            return std::nullopt;
+    if (is_stored) {
+        map_size += 3;  // base_block_idx, parent_hash, token_ids
+        if (emit_legacy) {
+            map_size += 1;  // parent_block_hash
         }
-        uint64_t value = std::stoull(object_key, &idx, 10);
-        if (idx == object_key.size()) {
-            return value;
-        }
-    } catch (const std::exception&) {
-        return std::nullopt;
+    } else {
+        map_size += 1;  // base_block_idx
     }
-    return std::nullopt;
+    return map_size;
 }
 
-KvEventPublisher::KvEventPublisher(KvEventConfig config) : config_(std::move(config)) {
+}  // namespace
+
+KvEventPublisher::KvEventPublisher(KvEventConfig config)
+    : config_(std::move(config)) {
     if (!config_.enabled) {
         return;
     }
@@ -170,13 +168,26 @@ KvEventPublisher::Stats KvEventPublisher::GetStats() const {
 void KvEventPublisher::Enqueue(PendingEvent event) {
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (queue_.size() >= config_.queue_capacity) {
-            dropped_events_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
         queue_.push_back(std::move(event));
     }
     queue_cv_.notify_one();
+}
+
+void KvEventPublisher::DrainRemainingQueue(std::vector<PendingEvent>& batch) {
+    while (true) {
+        batch.clear();
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (queue_.empty()) {
+                break;
+            }
+            while (!queue_.empty() && batch.size() < kMaxBatchSize) {
+                batch.push_back(std::move(queue_.front()));
+                queue_.pop_front();
+            }
+        }
+        PublishBatch(batch);
+    }
 }
 
 void KvEventPublisher::WorkerLoop() {
@@ -185,7 +196,7 @@ void KvEventPublisher::WorkerLoop() {
     while (!stop_.load()) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait_for(lock, std::chrono::milliseconds(5), [this] {
+            queue_cv_.wait(lock, [this] {
                 return stop_.load() || !queue_.empty();
             });
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
@@ -198,16 +209,7 @@ void KvEventPublisher::WorkerLoop() {
             batch.clear();
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        while (!queue_.empty() && batch.size() < kMaxBatchSize) {
-            batch.push_back(std::move(queue_.front()));
-            queue_.pop_front();
-        }
-    }
-    if (!batch.empty()) {
-        PublishBatch(batch);
-    }
+    DrainRemainingQueue(batch);
 }
 
 void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
@@ -250,9 +252,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             is_stored ? "BlockStored" : "BlockRemoved";
 
         const size_t map_size =
-            is_stored
-                ? (config_.emit_legacy_compat_fields ? 17 : 14)
-                : (config_.emit_legacy_compat_fields ? 15 : 12);
+            ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields);
 
         packer.pack_map(map_size);
         packer.pack("event_id");
@@ -314,12 +314,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     packer.pack(config_.dp_rank);
 
     const uint64_t seq = next_zmq_sequence_.fetch_add(1);
-    uint64_t seq_be = 0;
-    const auto* in = reinterpret_cast<const unsigned char*>(&seq);
-    auto* out = reinterpret_cast<unsigned char*>(&seq_be);
-    for (int i = 0; i < 8; ++i) {
-        out[i] = in[7 - i];
-    }
+    const uint64_t seq_be = htobe64(seq);
 
     zmq_msg_t topic_msg;
     zmq_msg_t seq_msg;
@@ -334,8 +329,11 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     const int rc = zmq_sendmsg(zmq_socket_, &topic_msg, ZMQ_SNDMORE);
     if (rc >= 0) {
         if (zmq_sendmsg(zmq_socket_, &seq_msg, ZMQ_SNDMORE) >= 0) {
-            zmq_sendmsg(zmq_socket_, &payload_msg, 0);
+            if (zmq_sendmsg(zmq_socket_, &payload_msg, 0) < 0) {
+                zmq_msg_close(&payload_msg);
+            }
         } else {
+            zmq_msg_close(&seq_msg);
             zmq_msg_close(&payload_msg);
         }
     } else {
@@ -348,3 +346,5 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
 }
 
 }  // namespace mooncake
+
+#endif  // MOONCAKE_ENABLE_KV_EVENTS

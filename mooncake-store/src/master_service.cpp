@@ -1529,7 +1529,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
-        PublishKvRemoved(key, metadata);
         accessor.Erase();
     }
     return {};
@@ -4514,11 +4513,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
-    auto evict_replicas = [](ObjectMetadata& metadata) {
+    auto evict_memory_replicas = [](ObjectMetadata& metadata) -> size_t {
         return metadata.EraseReplicas([](const Replica& replica) {
             return replica.is_memory_replica() && replica.is_completed() &&
                    replica.get_refcnt() == 0;
         });
+    };
+    auto evict_replicas = [&evict_memory_replicas](ObjectMetadata& metadata) {
+        return metadata.size * evict_memory_replicas(metadata);
     };
 
     // --- Offload-on-evict support ---
@@ -4542,12 +4544,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   MetadataShardAccessorRW& shard) -> uint64_t {
         if (!offload_on_evict_) {
             // Original behavior
-            return metadata.size * evict_replicas(metadata);
+            return evict_replicas(metadata);
         }
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
-            return metadata.size * evict_replicas(metadata);
+            return evict_replicas(metadata);
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -4555,7 +4557,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // flooding.
         if (offload_force_evict_ && offload_queued_this_cycle >= offload_cap) {
             offload_cap_forced_count++;
-            return metadata.size * evict_replicas(metadata);
+            return evict_replicas(metadata);
         }
 
         // Queue one MEMORY replica for offload; others will be evicted below.
@@ -4582,7 +4584,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
-            return metadata.size * evict_replicas(metadata);
+            return evict_replicas(metadata);
         }
 
         // PushOffloadingQueue failed. Default (data-preserving) behavior is to
@@ -4591,7 +4593,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // prevent silent data loss when the queue is unavailable.
         if (offload_force_evict_) {
             offload_push_failed_forced++;
-            return metadata.size * evict_replicas(metadata);
+            return evict_replicas(metadata);
         }
         return 0;
     };
@@ -4672,8 +4674,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     uint64_t freed =
                         try_evict_or_offload(it->first, it->second, shard);
                     total_freed_size += freed;
+                    PublishKvRemovedAfterEvict(it->first, freed, it->second);
                     if (it->second.IsValid() == false) {
-                        PublishKvRemoved(it->first, it->second);
                         it = shard->metadata.erase(it);
                     } else {
                         ++it;
@@ -4736,8 +4738,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
+                        PublishKvRemovedAfterEvict(it->first, freed,
+                                                   it->second);
                         if (it->second.IsValid() == false) {
-                            PublishKvRemoved(it->first, it->second);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -4790,8 +4793,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         uint64_t freed =
                             try_evict_or_offload(it->first, it->second, shard);
                         total_freed_size += freed;
+                        PublishKvRemovedAfterEvict(it->first, freed,
+                                                   it->second);
                         if (it->second.IsValid() == false) {
-                            PublishKvRemoved(it->first, it->second);
                             it = shard->metadata.erase(it);
                         } else {
                             ++it;
@@ -6639,7 +6643,6 @@ KvEventConfig MasterService::BuildKvEventConfig(
     kv_config.block_size = config.kv_events_block_size;
     kv_config.dp_rank = config.kv_events_dp_rank;
     kv_config.emit_legacy_compat_fields = config.kv_events_emit_legacy_compat;
-    kv_config.queue_capacity = config.kv_events_queue_capacity;
     return kv_config;
 }
 
@@ -6683,11 +6686,32 @@ void MasterService::PublishKvStored(const std::string& key,
 }
 
 void MasterService::PublishKvRemoved(const std::string& key,
-                                     const ObjectMetadata& metadata) {
+                                     const std::string& medium) {
     if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
         return;
     }
-    kv_event_publisher_->PublishRemoved(key, MediumForMetadata(metadata));
+    kv_event_publisher_->PublishRemoved(key, medium);
+}
+
+void MasterService::PublishKvRemoved(const std::string& key,
+                                     const ObjectMetadata& metadata) {
+    PublishKvRemoved(key, MediumForMetadata(metadata));
+}
+
+void MasterService::PublishKvRemovedAfterEvict(const std::string& key,
+                                               uint64_t freed_bytes,
+                                               const ObjectMetadata& metadata) {
+    if (!kv_event_publisher_ || !kv_event_publisher_->enabled()) {
+        return;
+    }
+    bool published = false;
+    if (freed_bytes > 0) {
+        PublishKvRemoved(key, "cpu");
+        published = true;
+    }
+    if (!metadata.IsValid() && !published) {
+        PublishKvRemoved(key, metadata);
+    }
 }
 
 bool MasterService::KvEventsEnabled() const {

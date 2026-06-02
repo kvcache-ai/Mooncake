@@ -57,7 +57,6 @@ set(MOONCAKE_STORE_SOURCES
     ha_metric_manager.cpp
     store_c.cpp
     engram/engram_store.cpp
-    kv_event/kv_event_publisher.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -101,16 +100,22 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
-find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
-                                            /usr/lib64)
-find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
-if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
-  message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
-  list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
-  list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
-else()
-  message(FATAL_ERROR
-          "libzmq not found. Install libzmq3-dev to build mooncake_store.")
+if(ENABLE_KV_EVENTS)
+  find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
+                                              /usr/lib64)
+  find_path(ZMQ_INCLUDE_DIR NAMES zmq.h PATHS /usr/include /usr/local/include)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+    list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
+    list(APPEND MOONCAKE_STORE_SOURCES kv_event/kv_event_publisher.cpp)
+  else()
+    message(
+      WARNING
+        "libzmq not found; KV events publisher disabled. Install libzmq3-dev "
+        "or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+    set(ENABLE_KV_EVENTS OFF)
+  endif()
 endif()
 
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
@@ -163,6 +168,9 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+if(ENABLE_KV_EVENTS)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
