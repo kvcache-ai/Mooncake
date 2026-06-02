@@ -193,6 +193,7 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
 
     LOG(INFO) << "EFA device (libfabric): " << device_name_
               << ", domain: " << fi_info_->domain_attr->name
+              << ", fabric: " << fi_info_->fabric_attr->name
               << ", provider: " << fi_info_->fabric_attr->prov_name
               << " (shared endpoint, max_wr=" << max_wr_depth_ << ")";
 
