@@ -2977,7 +2977,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadata(tenant_state, it, normalized_tenant);
+                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -3053,7 +3053,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 tenant_state.replication_tasks.erase(key);
                 tenant_state.offloading_tasks.erase(key);
                 ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadata(tenant_state, it, "default", &shard);
+                EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
                 }
@@ -3093,7 +3093,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
             // Remove object metadata
             ErasePromotionTaskIfPresent(tenant_state, key);
-            EraseMetadata(tenant_state, it, "default", &shard);
+            EraseMetadata(tenant_state, it, normalized_tenant, &shard);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
