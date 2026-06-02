@@ -342,7 +342,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     // Post entire cleanup to ensure it runs after callback
                     // returns
                     asio::post(socket_->get_executor(),
-                               [this, self, addr, dram_buffer, is_cuda_memory,
+                               [this, self, dram_buffer, is_cuda_memory,
                                 on_finalize = std::move(on_finalize_),
                                 on_complete = std::move(on_complete_)]() {
                                    if (on_finalize)
@@ -464,7 +464,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     // Post entire cleanup to ensure it runs after callback
                     // returns
                     asio::post(socket_->get_executor(),
-                               [this, self, addr, dram_buffer,
+                               [this, self,
                                 on_finalize = std::move(on_finalize_),
                                 on_complete = std::move(on_complete_)]() {
                                    if (on_finalize)
