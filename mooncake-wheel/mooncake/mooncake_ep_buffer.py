@@ -4,7 +4,9 @@ import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
 _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+_USE_MACA = bool(getattr(torch.version, "maca", None))
 _DEVICE = "musa" if _USE_MUSA else "cuda"
+_FORCE_SPLIT_KERNEL = _USE_MUSA or _USE_MACA
 
 
 class EventOverlap:
@@ -263,15 +265,13 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
-        # MUSA does not support cooperative kernel launches, so mc_grid_sync()
+        # MUSA/MACA do not support cooperative kernel launches, so mc_grid_sync()
         # is a no-op.  When both SEND and RECV run in one kernel, the RECV
         # phase can start before all SMs finish the SEND phase, causing illegal
-        # memory access.  Force split-kernel mode on MUSA.
+        # memory access.  Force split-kernel mode on these platforms.
         # Note: return_recv_hook and async_finish are mutually exclusive
         # (C++ assertion), so also force async_finish=False.
-        # Additionally, P2P writes via MTLink may not be visible to peer
-        # devices without an explicit host-side barrier between SEND and RECV.
-        if _USE_MUSA and not return_recv_hook:
+        if _FORCE_SPLIT_KERNEL and not return_recv_hook:
             return_recv_hook = True
             async_finish = False
 
@@ -340,7 +340,7 @@ class Buffer:
             packed_recv_count,
             handle,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            self._wrap_hook_musa(hook) if (_USE_MUSA and hook) else hook,
+            self._wrap_hook_split(hook) if (_FORCE_SPLIT_KERNEL and hook) else hook,
         )
 
     # noinspection PyTypeChecker
@@ -357,8 +357,8 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
-        # Same MUSA split-kernel fix as dispatch()
-        if _USE_MUSA and not return_recv_hook:
+        # Same split-kernel fix as dispatch()
+        if _FORCE_SPLIT_KERNEL and not return_recv_hook:
             return_recv_hook = True
             async_finish = False
 
@@ -416,22 +416,26 @@ class Buffer:
         return (
             combined_x,
             EventOverlap(event, tensors_to_record if async_finish else None),
-            self._wrap_hook_musa(hook) if (_USE_MUSA and hook) else hook,
+            self._wrap_hook_split(hook) if (_FORCE_SPLIT_KERNEL and hook) else hook,
         )
 
-    def _wrap_hook_musa(self, hook):
-        """On MUSA, wrap the RECV hook to add a host-side barrier + device sync.
+    def _wrap_hook_split(self, hook):
+        """On MUSA/MACA, wrap the RECV hook to add a host-side barrier + device sync.
 
         This ensures all ranks' SEND kernels are complete and P2P writes are
-        visible before any rank starts its RECV kernel.  Without this, MTLink
-        P2P writes may not be visible to peer devices because MUSA has no
-        cooperative launch / grid sync.
+        visible before any rank starts its RECV kernel.  Without this, P2P
+        writes may not be visible to peer devices because these platforms have
+        no cooperative launch / grid sync.
         """
-        import torch_musa
+        if _USE_MUSA:
+            import torch_musa
+            _sync = torch_musa.synchronize
+        else:
+            _sync = torch.cuda.synchronize
 
         def wrapped():
             # Synchronize the device to ensure SEND kernel is complete
-            torch_musa.synchronize()
+            _sync()
             # Barrier so all ranks finish SEND before any starts RECV
             dist.barrier(self.group)
             hook()
