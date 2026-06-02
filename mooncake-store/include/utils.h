@@ -171,14 +171,15 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 }
 
 /**
- * @brief Convert a string representation of size to bytes
+ * @brief Parse a string representation of size to bytes
  * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
  * "1048576")
- * @return uint64_t Number of bytes, or 0 if parsing fails
+ * @return Parsed byte size, or std::nullopt if parsing fails
  */
-[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+[[nodiscard]] inline std::optional<uint64_t> try_string_to_byte_size(
+    const std::string& str) {
     if (str.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Create a copy for manipulation
@@ -189,7 +190,7 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
 
     if (s.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Handle special case for "infinite"
@@ -204,7 +205,10 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     try {
         value = std::stod(s, &pos);
     } catch (const std::exception&) {
-        return 0;  // Failed to parse number
+        return std::nullopt;  // Failed to parse number
+    }
+    if (value < 0) {
+        return std::nullopt;
     }
 
     if (pos >= s.length()) {
@@ -238,8 +242,19 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
         return static_cast<uint64_t>(value);
     } else {
         // Unknown unit
-        return 0;
+        return std::nullopt;
     }
+}
+
+/**
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
+ */
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    auto parsed = try_string_to_byte_size(str);
+    return parsed.value_or(0);
 }
 
 /**
@@ -294,7 +309,8 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {

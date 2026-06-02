@@ -20,6 +20,12 @@ target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+add_executable(tent_ip_utils_test ip_utils_test.cpp)
+target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(tent_ip_utils_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)
@@ -96,6 +102,14 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
+# Transport Selector Unit Test
+add_executable(tent_transport_selector_test transport_selector_test.cpp)
+target_link_libraries(tent_transport_selector_test PRIVATE gtest gtest_main
+                                                            tent_link_group)
+target_include_directories(tent_transport_selector_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
+
 # End-to-end failover test: drives real TransferEngineImpl with
 # FaultProxyTransport-wrapped fakes to exercise resubmitTransferTask.
 add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
@@ -108,3 +122,16 @@ target_include_directories(tent_engine_failover_e2e_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_engine_failover_e2e_test
          COMMAND tent_engine_failover_e2e_test)
+
+# ProgressWorker skeleton test: covers default-off behavior, event-driven
+# progress without poll-failover, and freeBatch races (issue #2116).
+add_executable(tent_progress_worker_test progress_worker_test.cpp)
+target_link_libraries(tent_progress_worker_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_progress_worker_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_progress_worker_test
+         COMMAND tent_progress_worker_test)

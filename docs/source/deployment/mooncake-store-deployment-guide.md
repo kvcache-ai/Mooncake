@@ -54,10 +54,10 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
   - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
   - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
-  - `--snapshot_backend_type` (str, required when snapshot enabled): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
+  - `--snapshot_object_store_type` (str, required when snapshot enabled): Snapshot object store type: `local` for local filesystem, `s3` for S3 storage.
   - `--snapshot_backup_dir` (str, default empty): Optional local directory for snapshot backup. If empty (default), local backup is disabled. When set, it serves two purposes: (1) during snapshot persistence, data will be saved locally as a fallback if uploading to the backend fails; (2) during restore, downloaded metadata will also be saved to this directory as a local backup.
   - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
-  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_backend_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
+  - **Environment variable** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (**required** when `--snapshot_object_store_type=local`): Persistent directory path for local snapshot storage. This variable **must** be set before starting the master; there is no default value. Example: `export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots`.
 
   > **Warning: Managed Directory**
   >
@@ -125,6 +125,21 @@ Examples:
 curl -s http://<master_host>:9003/metrics
 curl -s http://<master_host>:9003/metrics/summary
 ```
+
+Mooncake Store can report Store-observed cache reuse signals, such as
+completed `GetReplicaList` results served from memory/SSD and current cached
+object counts. These signals help operators understand reuse inside the Store,
+but they are not the final request-level or token-level cache hit ratio for an
+inference system. That end-to-end hit ratio should be calculated by Conductor or
+the inference engine, which can observe the full request path across GPU, CPU,
+and Mooncake tiers.
+
+For `CalcCacheStats()`, prefer the `MEMORY_CURRENT_CACHED_OBJECTS`,
+`SSD_CURRENT_CACHED_OBJECTS`, and `*_HITS_PER_CURRENT_CACHED_OBJECT` enum
+aliases when consuming Store-side values. The older `*_TOTAL` and `*_HIT_RATE`
+names are retained for compatibility. The `*_HIT_RATE` values divide cumulative
+Store-observed hits by current cached object counts, so they are not bounded
+request-level hit ratios and may exceed `1.0`.
 
 ## Client/Engine Tuning (Env Vars, with defaults)
 

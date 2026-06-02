@@ -38,6 +38,7 @@ struct tent_request {
     tent_segment_id_t target_id;
     uint64_t target_offset;
     uint64_t length;
+    int priority; /* Request priority (0=HIGH, 1=MEDIUM, 2=LOW) */
 };
 
 typedef struct tent_request tent_request_t;
@@ -306,6 +307,14 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Drive one progress step on a batch and return its aggregated status.
+    // Unlike getTransferStatus, this always allows internal failover/resubmit
+    // regardless of enable_auto_failover_on_poll. The call is non-blocking and
+    // performs at most one state-machine step per task; callers that want to
+    // wait for completion must invoke it in a loop. PENDING means "make
+    // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
+    Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;

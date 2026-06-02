@@ -25,6 +25,8 @@ For a complete deployment guide with step-by-step instructions, see:
 
 👉 **[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](vllm-integration/vllmv1-lmcache-integration.md)**
 
+👉 **[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache \[MP\]](vllm-integration/vllmv1-lmcache-mp-integration.md)**
+
 ## Performance Benchmarking and Results
 
 To illustrate the benefits of this collaboration, a comprehensive performance evaluation of the integrated vLLM, LMCache, and Mooncake Store was conducted. The selected experimental conditions simulate realistic LLM deployment scenarios, specifically comparing the initial cold start with subsequent cache-hit performance to demonstrate the advantages of KVCache reuse.

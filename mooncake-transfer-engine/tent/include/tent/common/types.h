@@ -28,6 +28,11 @@ namespace tent {
 using BatchID = uint64_t;
 using SegmentID = uint64_t;
 
+// QoS priority levels
+static constexpr uint8_t PRIO_HIGH = 0;
+static constexpr uint8_t PRIO_MEDIUM = 1;
+static constexpr uint8_t PRIO_LOW = 2;
+
 struct Notification {
     std::string name;
     std::string msg;
@@ -44,6 +49,8 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    int priority =
+        PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
 };
 
 enum TransferStatusEnum {

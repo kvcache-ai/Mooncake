@@ -85,11 +85,32 @@ void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     mooncakeBackend->joinGroup();
 }
 
+/// Python-facing wrapper that extracts the raw TransferEngine* from a
+/// mooncake.engine.TransferEngine Python object and passes it to
+/// MooncakeBackend::setExternalEngine().  The caller must ensure the
+/// TransferEnginePy object outlives all MooncakeBackend instances.
+void setTransferEnginePy(pybind11::object engine_obj) {
+    if (engine_obj.is_none()) {
+        MooncakeBackend::setExternalEngine(nullptr);
+        return;
+    }
+    auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
+    uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
+    auto* engine = reinterpret_cast<TransferEngine*>(ptr);
+    MooncakeBackend::setExternalEngine(engine);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
+    m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
+          "Set an external TransferEngine to be used by MooncakeBackend. "
+          "Must be called before init_process_group(). The engine must already "
+          "be initialized. Pass None to reset to default behavior. "
+          "The caller must ensure the TransferEngine object outlives all "
+          "MooncakeBackend instances.");
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
