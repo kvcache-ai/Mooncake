@@ -2859,7 +2859,43 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 }
 
 long MasterService::RemoveAll(bool force) {
-    return RemoveAll("default", force);
+    long removed_count = 0;
+    uint64_t total_freed_size = 0;
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto now = std::chrono::system_clock::now();
+
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.begin();
+            while (it != tenant_state.metadata.end()) {
+                if ((force || it->second.IsLeaseExpired(now)) &&
+                    it->second.AllReplicas(&Replica::fn_is_completed) &&
+                    !tenant_state.replication_tasks.contains(it->first)) {
+                    auto mem_rep_count = it->second.CountReplicas(
+                        &Replica::fn_is_memory_replica);
+                    total_freed_size += it->second.size * mem_rep_count;
+                    ErasePromotionTaskIfPresent(tenant_state, it->first);
+                    it = EraseMetadata(tenant_state, it, tenant_it->first);
+                    removed_count++;
+                } else {
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+
+    VLOG(1) << "action=remove_all_objects"
+            << ", removed_count=" << removed_count
+            << ", total_freed_size=" << total_freed_size;
+    return removed_count;
 }
 
 long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
@@ -2899,6 +2935,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     }
 
     VLOG(1) << "action=remove_all_objects"
+            << ", tenant_id=" << normalized_tenant
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;

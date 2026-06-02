@@ -512,11 +512,18 @@ class MasterService {
                        bool force = false) -> tl::expected<long, ErrorCode>;
 
     /**
-     * @brief Remove all objects and their replicas
+     * @brief Remove all objects and their replicas across all tenants.
      * @param force If true, skip lease and replication task checks.
      * @return return the number of objects removed
      */
     long RemoveAll(bool force = false);
+
+    /**
+     * @brief Remove all objects and their replicas for a single tenant.
+     * @param tenant_id The tenant whose objects should be removed.
+     * @param force If true, skip lease and replication task checks.
+     * @return return the number of objects removed
+     */
     long RemoveAll(const std::string& tenant_id, bool force = false);
 
     /**

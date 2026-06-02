@@ -1499,6 +1499,36 @@ TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
     EXPECT_FALSE(svc->GetReplicaList(shared_key).has_value());
 }
 
+TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "legacy_remove_all_shared_key";
+    const std::string tenant_a = "legacy_remove_all_a";
+    const std::string tenant_b = "legacy_remove_all_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(svc->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_b, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 3);
+    EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 0);
+}
+
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     // For backward compatibility, test the deprecated single preferred_segment
     std::unique_ptr<MasterService> service_(new MasterService());
