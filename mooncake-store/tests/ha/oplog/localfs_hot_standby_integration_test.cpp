@@ -171,13 +171,13 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestPrimaryStandbySync) {
         << "Standby failed to sync within timeout";
 
     // 4. Verify metadata snapshot
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
     LOG(INFO) << "Standby metadata snapshot size: " << snapshot.size();
 
     std::set<std::string> snapshot_keys;
     for (const auto& kv : snapshot) {
-        snapshot_keys.insert(kv.first);
+        snapshot_keys.insert(kv.key);
     }
     for (const auto& key : test_keys) {
         EXPECT_NE(snapshot_keys.end(), snapshot_keys.find(key))
@@ -230,12 +230,12 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestStandbyPromotion) {
     EXPECT_GE(standby.GetLatestAppliedSequenceId(), last_seq_id);
 
     // 6. Verify metadata preserved
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
 
     std::set<std::string> snapshot_keys;
     for (const auto& kv : snapshot) {
-        snapshot_keys.insert(kv.first);
+        snapshot_keys.insert(kv.key);
     }
     for (const auto& key : test_keys) {
         EXPECT_NE(snapshot_keys.end(), snapshot_keys.find(key))
@@ -278,12 +278,12 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestFailoverScenario) {
     primary.reset();
 
     // 4. Verify standby data integrity
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
 
     std::set<std::string> snapshot_keys;
     for (const auto& kv : snapshot) {
-        snapshot_keys.insert(kv.first);
+        snapshot_keys.insert(kv.key);
     }
     for (const auto& key : test_keys) {
         EXPECT_NE(snapshot_keys.end(), snapshot_keys.find(key))
@@ -349,12 +349,12 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestDataConsistency) {
     ASSERT_TRUE(WaitForSync(standby, last_seq_id));
 
     // 4. Verify consistency
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     ASSERT_TRUE(standby.ExportMetadataSnapshot(snapshot));
 
     std::set<std::string> actual_keys;
     for (const auto& kv : snapshot) {
-        actual_keys.insert(kv.first);
+        actual_keys.insert(kv.key);
     }
 
     for (const auto& kv : expected_keys) {
