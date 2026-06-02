@@ -69,12 +69,12 @@ getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
 getting_started/observability
-getting_started/plugin-usage/3FS-USRBIO-Plugin
-getting_started/examples/lmcache-integration
-getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
+getting_started/examples/lmcache-integration
+getting_started/examples/lmdeploy-integration-v0.9
+getting_started/plugin-usage/3FS-USRBIO-Plugin
 :::
 
 % Making the most out of Mooncake
@@ -175,5 +175,4 @@ getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
 getting_started/examples/vllm-integration/vllm-integration-v0.2
 getting_started/examples/vllm-integration/vllm-integration-v0.3
 getting_started/examples/vllm-integration/vllm-integration-v1.0
-getting_started/examples/vllm-integration/vllmv1-lmcache-integration
 :::
