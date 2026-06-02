@@ -695,6 +695,7 @@ impl StoreClient {
 
 impl MooncakeCompatibilityFacade for StoreClient {
     fn heartbeat(&mut self, expires_at_ms: u64) -> Result<()> {
+        let _ = self.flush_due_reclaims();
         let result = self.prepare_heartbeat(expires_at_ms).publish();
         match result {
             Ok(()) => {
@@ -1180,6 +1181,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
         let object_id = mooncake_store_core::scoped_logical_object_id(tenant, key);
         let object_key = mooncake_store_core::ObjectKey::from_logical_id(&object_id);
         let result = self.remove_object_route_with_retry(&object_id, &object_key, force);
+        let _ = self.flush_due_reclaims();
         tracker.finish(&result, 0);
         result
     }
@@ -1206,6 +1208,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 return Err(error);
             }
         }
+        let _ = self.flush_due_reclaims();
         let result = Ok(());
         tracker.finish(&result, 0);
         result
@@ -1881,6 +1884,7 @@ impl Drop for StoreClient {
         self.membership_sync.shutdown();
         self.async_replica_tracking.shutdown();
         self.async_route_hit_reporting.shutdown();
+        let _ = self.flush_all_reclaims();
         self.control_client.clear_channels();
         self._control_plane.shutdown();
         let Some(transport) = self.transport.as_deref() else {

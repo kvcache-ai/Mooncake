@@ -9776,6 +9776,77 @@ fn remove_defers_reclaim_until_grace_deadline() {
 }
 
 #[test]
+fn drop_after_remove_flushes_pending_reclaims_to_remote_storage() {
+    // Verify that Drop flushes pending_reclaims so a subsequent writer
+    // can reuse the freed remote storage capacity.
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = Arc::new(TestTransport::new("drop-flush-remote-seg"));
+    let _remote_owner = publish_storage_node_with_capacity(
+        &metadata,
+        &transport,
+        "storage-drop-flush",
+        "seg-drop-flush",
+        "pool-a",
+        128,
+        1,
+    );
+
+    // Writer A: fill remote storage → remove all → drop
+    {
+        let writer_a = StoreClientBuilder::new(metadata.clone(), "writer-drop-flush-a")
+            .state(ClientLifecycleState::Active)
+            .label("pool", "pool-a")
+            .label("storage", "false")
+            .transport(transport.clone())
+            .local_memory(
+                LocalMemoryConfig::new()
+                    .numa_aware(false)
+                    .storage_bytes(0)
+                    .scratch_bytes(4096)
+                    .reclaim_grace_ms(5000),
+            )
+            .build(test_future_expiry_ms())
+            .expect("writer A build should succeed");
+
+        for i in 0..16 {
+            writer_a
+                .put(&format!("fill-{i}"), b"abcdefgh")
+                .unwrap_or_else(|e| panic!("writer A put fill-{i} should succeed: {e}"));
+        }
+
+        for i in 0..16 {
+            writer_a
+                .remove(&format!("fill-{i}"), true)
+                .unwrap_or_else(|e| panic!("writer A remove fill-{i} should succeed: {e}"));
+        }
+        // writer_a drops here — Drop must flush_all_reclaims before
+        // closing RPC channels so the storage node releases the space.
+    }
+
+    // Writer B: write to the same remote storage node — must succeed.
+    let writer_b = StoreClientBuilder::new(metadata, "writer-drop-flush-b")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .transport(transport)
+        .local_memory(
+            LocalMemoryConfig::new()
+                .numa_aware(false)
+                .storage_bytes(0)
+                .scratch_bytes(4096)
+                .reclaim_grace_ms(0),
+        )
+        .build(test_future_expiry_ms())
+        .expect("writer B build should succeed");
+
+    for i in 0..16 {
+        writer_b
+            .put(&format!("fresh-{i}"), b"ABCDEFGH")
+            .unwrap_or_else(|e| panic!("writer B put fresh-{i} should succeed: {e}"));
+    }
+}
+
+#[test]
 fn replication_policy_prefers_local_before_remote_replica() {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let transport = Arc::new(TestTransport::new("writer-segment"));
