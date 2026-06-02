@@ -61,6 +61,25 @@ class WorkerPool {
     void handlePathFailure(const std::string &peer_nic_path,
                            RdmaEndPoint *endpoint = nullptr);
 
+    // Context-level health tracking for catastrophic hardware failure.
+    // When all rails through a local RNIC are unavailable, increment the
+    // failure counter. Reset on any success. Mark context inactive after
+    // consecutive failures exceed threshold.
+    bool contextHealthy() const {
+        return context_failure_count_ < kContextFailureThreshold;
+    }
+    void markContextSuccess() { context_failure_count_ = 0; }
+    void markContextFailure() {
+        context_failure_count_++;
+        if (context_failure_count_ >= kContextFailureThreshold) {
+            LOG(WARNING) << "All rails failed for context "
+                         << context_.deviceName() << " for "
+                         << context_failure_count_
+                         << " consecutive attempts, marking inactive";
+            context_.set_active(false);
+        }
+    }
+
    private:
     RdmaContext &context_;
     const int numa_socket_id_;
@@ -93,6 +112,11 @@ class WorkerPool {
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;            // Errors before pause
     const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
+
+    // Context-level health tracking
+    int context_failure_count_ = 0;
+    const static int kContextFailureThreshold =
+        32;  // consecutive all-rails-failed
 };
 }  // namespace mooncake
 

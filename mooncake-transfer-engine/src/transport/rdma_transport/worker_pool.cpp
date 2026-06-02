@@ -97,6 +97,7 @@ int WorkerPool::submitPostSend(
 
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
+    int all_rails_failed_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto &slice : slice_list) {
         if (failed_target_ids.count(slice->target_id)) {
@@ -166,6 +167,7 @@ int WorkerPool::submitPostSend(
             }
             if (!found) {
                 slice->markFailed();  // All rails unavailable
+                all_rails_failed_count++;
                 continue;
             }
         }
@@ -192,10 +194,38 @@ int WorkerPool::submitPostSend(
         cond_var_.notify_all();
     }
 
+    // Context-level health tracking: if all slices failed due to no available
+    // rails, increment the context failure counter. This detects catastrophic
+    // local RNIC hardware failure where all paths through the RNIC are down.
+    if (submitted_slice_count == 0 &&
+        all_rails_failed_count == (int)slice_list.size()) {
+        markContextFailure();
+    }
+
     return 0;
 }
 
 void WorkerPool::performPostSend(int thread_id) {
+    // Fast-fail if context is unhealthy due to catastrophic hardware failure
+    if (!contextHealthy()) {
+        auto &local_slice_queue = collective_slice_queue_[thread_id];
+        for (int shard_id = thread_id; shard_id < kShardCount;
+             shard_id += kTransferWorkerCount) {
+            if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) ==
+                0)
+                continue;
+            slice_queue_lock_[shard_id].lock();
+            for (auto &entry : slice_queue_[shard_id]) {
+                for (auto &slice : entry.second) slice->markFailed();
+                processed_slice_count_ += entry.second.size();
+            }
+            slice_queue_[shard_id].clear();
+            slice_queue_count_[shard_id].store(0, std::memory_order_relaxed);
+            slice_queue_lock_[shard_id].unlock();
+        }
+        return;
+    }
+
     auto &local_slice_queue = collective_slice_queue_[thread_id];
     for (int shard_id = thread_id; shard_id < kShardCount;
          shard_id += kTransferWorkerCount) {
@@ -313,22 +343,33 @@ void WorkerPool::performPollCq(int thread_id) {
                 qp_depth_set[slice->rdma.qp_depth] = 1;
             // __sync_fetch_and_sub(slice->rdma.qp_depth, 1);
             if (wc[i].status != IBV_WC_SUCCESS) {
-                // All WC errors indicate path failure and should trigger
-                // redispatch to an alternate path (or fail if retry exhausted)
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR ||
-                    globalConfig().trace) {
-                    LOG(ERROR)
-                        << "Worker: Process failed for slice (opcode: "
-                        << slice->opcode
-                        << ", source_addr: " << slice->source_addr
-                        << ", length: " << slice->length
-                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
-                        << ", local_nic: " << context_.deviceName()
-                        << ", peer_nic: " << slice->peer_nic_path
-                        << ", dest_rkey: " << slice->rdma.dest_rkey
-                        << ", retry_cnt: " << slice->rdma.retry_cnt
-                        << "): " << ibv_wc_status_str(wc[i].status);
+                // Flush errors are generated when QPs transition to ERR state
+                // during normal endpoint destruction (beginDestroy). They are
+                // not real network errors and should not trigger rail failure
+                // handling or endpoint deletion.
+                if (wc[i].status == IBV_WC_WR_FLUSH_ERR) {
+                    if (globalConfig().trace)
+                        LOG(INFO) << "Worker: WR flush error (peer_nic: "
+                                  << slice->peer_nic_path
+                                  << "), marking failed without retry";
+                    slice->markFailed();
+                    processed_slice_count++;
+                    continue;
                 }
+
+                // All other WC errors indicate real path/network failures and
+                // should trigger redispatch to an alternate path (or fail if
+                // retry exhausted)
+                LOG(ERROR) << "Worker: Process failed for slice (opcode: "
+                           << slice->opcode
+                           << ", source_addr: " << slice->source_addr
+                           << ", length: " << slice->length
+                           << ", dest_addr: " << (void *)slice->rdma.dest_addr
+                           << ", local_nic: " << context_.deviceName()
+                           << ", peer_nic: " << slice->peer_nic_path
+                           << ", dest_rkey: " << slice->rdma.dest_rkey
+                           << ", retry_cnt: " << slice->rdma.retry_cnt
+                           << "): " << ibv_wc_status_str(wc[i].status);
                 // Unified path failure handling
                 handlePathFailure(slice->peer_nic_path, slice->rdma.endpoint);
                 if (shouldRetrySlice(slice)) {
@@ -350,8 +391,10 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
 
-    if (processed_slice_count)
+    if (processed_slice_count) {
         processed_slice_count_.fetch_add(processed_slice_count);
+        markContextSuccess();
+    }
 
     if (!failed_slice_list.empty()) {
         redispatch(failed_slice_list, thread_id);
@@ -489,6 +532,7 @@ int WorkerPool::doProcessContextEvents() {
                   << " is now inactive";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
         context_.set_active(true);
+        markContextSuccess();  // Reset failure counter on port recovery
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now active";
     }
@@ -507,6 +551,7 @@ void WorkerPool::monitorWorker() {
         auto current_ts = getCurrentTimeInNano();
         if (current_ts - last_reset_ts > 1000000000ll) {
             context_.set_active(true);
+            markContextSuccess();  // Reset failure counter periodically
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
             // from RdmaContext::endpoint() and the waiting list grows
