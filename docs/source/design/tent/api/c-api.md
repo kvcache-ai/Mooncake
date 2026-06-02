@@ -1077,8 +1077,8 @@ Common error scenarios:
 
 ## See Also
 
-- [TENT Overview](overview.md) - Conceptual introduction to TENT
+- [TENT Overview](../overview.md) - Conceptual introduction to TENT
 - [C++ API Reference](cpp-api.md) - C++ API documentation
-- [Configuration Reference](configuration.md) - Configuration file reference
+- [Configuration Reference](../configuration/configuration.md) - Configuration file reference
 - [Transport Selector](../features/transport-selector.md) - Transport selection policies
-- [Failover](failover.md) - Failure handling and recovery
+- [Failover](../features/failover.md) - Failure handling and recovery
