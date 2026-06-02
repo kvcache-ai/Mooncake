@@ -1,4 +1,4 @@
-file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp")
+file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp" "ub_allocator.cpp")
 
 # Check if liburma.so exists
 find_library(URMA_LIBRARY urma PATHS /usr/lib64)

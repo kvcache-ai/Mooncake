@@ -18,6 +18,9 @@
 namespace mooncake {
 void TransferMetadata::SegmentDesc::dump() const {
     LOG(INFO) << "  segment name: " << name;
+    if (!rdma_server_name.empty() && rdma_server_name != name) {
+        LOG(INFO) << "  rdma server name: " << rdma_server_name;
+    }
     LOG(INFO) << "  protocol: " << protocol;
     LOG(INFO) << "  topology: " << topology.toString();
     LOG(INFO) << "  devices: ";

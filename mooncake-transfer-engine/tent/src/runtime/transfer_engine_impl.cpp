@@ -26,7 +26,6 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
-#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -43,6 +42,11 @@
 
 namespace mooncake {
 namespace tent {
+
+namespace {
+constexpr uint8_t kRedisMaxDbIndex = 255;
+constexpr uint8_t kRedisDefaultDbIndex = 0;
+}  // namespace
 
 struct Batch {
     Batch() : max_size(0) { sub_batch.fill(nullptr); }
@@ -318,14 +322,14 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(topology_->discover({loader}));
 
     // Validate redis_db_index range (0-255)
-    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
+    uint8_t db_index = kRedisDefaultDbIndex;
     if (redis_db_index_config >= 0 &&
-        redis_db_index_config <= REDIS_MAX_DB_INDEX) {
+        redis_db_index_config <= kRedisMaxDbIndex) {
         db_index = static_cast<uint8_t>(redis_db_index_config);
     } else {
         LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
                      << ", using default "
-                     << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
+                     << static_cast<int>(kRedisDefaultDbIndex);
     }
 
     metadata_ = std::make_shared<ControlService>(

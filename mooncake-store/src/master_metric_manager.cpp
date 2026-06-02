@@ -292,18 +292,23 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
-      // Initialize cache hit rate metrics
+      // Initialize Store-observed cache reuse metrics. These are not
+      // end-to-end request/token-level cache hit ratio metrics.
       mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
+                          "Total number of GetReplicaList results served from "
+                          "the memory pool"),
       file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
+                           "Total number of GetReplicaList results served from "
+                           "the SSD cache"),
       mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
+                      "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
+                       "Current number of cached values in the SSD cache"),
       valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
+                      "Total number of GetReplicaList operations that returned "
+                      "at least one completed replica"),
+      total_get_nums_("total_get_nums_",
+                      "Total number of GetReplicaList operations"),
 
       // Initialize Eviction Counters
       // total eviction
@@ -347,6 +352,46 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
+
+      // Promotion-on-hit Metrics
+      promotion_in_flight_metric_(
+          "master_promotion_in_flight",
+          "Current number of in-flight L2->L1 promotion tasks"),
+      promotion_admitted_(
+          "master_promotion_admitted_total",
+          "Total promotion tasks admitted past all gates and enqueued"),
+      promotion_completed_(
+          "master_promotion_completed_total",
+          "Total promotion tasks committed via NotifyPromotionSuccess"),
+      promotion_completed_bytes_(
+          "master_promotion_completed_bytes_total",
+          "Total bytes promoted from LOCAL_DISK to MEMORY"),
+      promotion_expired_("master_promotion_expired_total",
+                         "Total promotion tasks expired via the reaper "
+                         "(put_start_release_timeout_sec)"),
+      promotion_failed_(
+          "master_promotion_failed_total",
+          "Total promotion tasks aborted by holder via "
+          "NotifyPromotionFailure (holder reported a downstream failure)"),
+      promotion_cancelled_(
+          "master_promotion_cancelled_total",
+          "Total promotion tasks removed because the prerequisite went "
+          "away: object removal mid-flight (Remove / UpsertStart / etc.), "
+          "holder-client expiry (ClearInvalidHandles), or staged replica "
+          "lost (NotifyPromotionSuccess committed=false)"),
+      promotion_rejected_frequency_(
+          "master_promotion_rejected_frequency_total",
+          "Promotion attempts rejected because CountMinSketch frequency "
+          "was below promotion_admission_threshold"),
+      promotion_rejected_watermark_(
+          "master_promotion_rejected_watermark_total",
+          "Promotion attempts rejected because DRAM was at or above the "
+          "eviction high watermark"),
+      promotion_rejected_cap_(
+          "master_promotion_rejected_cap_total",
+          "Promotion attempts rejected because promotion_in_flight was at "
+          "promotion_queue_limit"),
+
       // Snapshot Metrics
       snapshot_duration_ms_(
           "master_snapshot_duration_ms",
@@ -439,8 +484,18 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
+    promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    promotion_admitted_.inc(0);
+    promotion_completed_.inc(0);
+    promotion_completed_bytes_.inc(0);
+    promotion_expired_.inc(0);
+    promotion_failed_.inc(0);
+    promotion_cancelled_.inc(0);
+    promotion_rejected_frequency_.inc(0);
+    promotion_rejected_watermark_.inc(0);
+    promotion_rejected_cap_.inc(0);
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
@@ -533,7 +588,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_items_.inc(0);
     batch_put_revoke_failed_items_.inc(0);
 
-    // Update cache hit rate metrics
+    // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
     valid_get_nums_.inc(0);
@@ -849,14 +904,14 @@ int64_t MasterMetricManager::get_allocated_file_size() {
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return std::numeric_limits<int64_t>::max();
     }
     return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
-    if (dfs_capacity_unlimited_) {
+    if (dfs_capacity_unlimited_ && file_total_capacity_.value() == 0) {
         return 0.0;
     }
     double allocated = file_allocated_size_.value();
@@ -901,7 +956,7 @@ int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
 }
 
-// cache hit rate metrics
+// Store-observed cache reuse metrics
 void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
     mem_cache_hit_nums_.inc(val);
 }
@@ -1156,6 +1211,41 @@ void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
                                                     int64_t size) {
     put_start_release_cnt_.inc(count);
     put_start_discarded_staging_size_.dec(size);
+}
+
+// --- Promotion-on-hit Metrics ---
+void MasterMetricManager::inc_promotion_in_flight(int64_t val) {
+    promotion_in_flight_metric_.inc(val);
+}
+void MasterMetricManager::dec_promotion_in_flight(int64_t val) {
+    promotion_in_flight_metric_.dec(val);
+}
+void MasterMetricManager::inc_promotion_admitted(int64_t val) {
+    promotion_admitted_.inc(val);
+}
+void MasterMetricManager::inc_promotion_completed(int64_t val) {
+    promotion_completed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_completed_bytes(int64_t bytes) {
+    promotion_completed_bytes_.inc(bytes);
+}
+void MasterMetricManager::inc_promotion_expired(int64_t val) {
+    promotion_expired_.inc(val);
+}
+void MasterMetricManager::inc_promotion_failed(int64_t val) {
+    promotion_failed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_cancelled(int64_t val) {
+    promotion_cancelled_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_frequency(int64_t val) {
+    promotion_rejected_frequency_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
+    promotion_rejected_watermark_.inc(val);
+}
+void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
+    promotion_rejected_cap_.inc(val);
 }
 
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
@@ -1510,6 +1600,38 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
+// --- Promotion-on-hit Metrics Getters ---
+int64_t MasterMetricManager::get_promotion_in_flight() {
+    return promotion_in_flight_metric_.value();
+}
+int64_t MasterMetricManager::get_promotion_admitted() {
+    return promotion_admitted_.value();
+}
+int64_t MasterMetricManager::get_promotion_completed() {
+    return promotion_completed_.value();
+}
+int64_t MasterMetricManager::get_promotion_completed_bytes() {
+    return promotion_completed_bytes_.value();
+}
+int64_t MasterMetricManager::get_promotion_expired() {
+    return promotion_expired_.value();
+}
+int64_t MasterMetricManager::get_promotion_failed() {
+    return promotion_failed_.value();
+}
+int64_t MasterMetricManager::get_promotion_cancelled() {
+    return promotion_cancelled_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_frequency() {
+    return promotion_rejected_frequency_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_watermark() {
+    return promotion_rejected_watermark_.value();
+}
+int64_t MasterMetricManager::get_promotion_rejected_cap() {
+    return promotion_rejected_cap_.value();
+}
+
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
 void MasterMetricManager::inc_copy_start_requests(int64_t val) {
     copy_start_requests_.inc(val);
@@ -1790,6 +1912,18 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
 
+    // Serialize Promotion-on-hit Metrics
+    serialize_metric(promotion_in_flight_metric_);
+    serialize_metric(promotion_admitted_);
+    serialize_metric(promotion_completed_);
+    serialize_metric(promotion_completed_bytes_);
+    serialize_metric(promotion_expired_);
+    serialize_metric(promotion_failed_);
+    serialize_metric(promotion_cancelled_);
+    serialize_metric(promotion_rejected_frequency_);
+    serialize_metric(promotion_rejected_watermark_);
+    serialize_metric(promotion_rejected_cap_);
+
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
@@ -1812,25 +1946,33 @@ MasterMetricManager::calculate_cache_stats() {
     int64_t valid_get_nums = valid_get_nums_.value();
     int64_t total_get_nums = total_get_nums_.value();
 
-    double mem_hit_rate = 0.0;
+    // These values divide cumulative Store-observed hits by the current cached
+    // object count. They are not bounded request/token-level hit ratios; that
+    // end-to-end metric belongs to Conductor or the inference engine.
+    double mem_hits_per_current_cached_object = 0.0;
     if (mem_total_cache > 0) {
-        mem_hit_rate = static_cast<double>(mem_cache_hits) /
-                       static_cast<double>(mem_total_cache);
-        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+        mem_hits_per_current_cached_object =
+            static_cast<double>(mem_cache_hits) /
+            static_cast<double>(mem_total_cache);
+        mem_hits_per_current_cached_object =
+            std::round(mem_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double ssd_hit_rate = 0.0;
+    double ssd_hits_per_current_cached_object = 0.0;
     if (ssd_total_cache > 0) {
-        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
-                       static_cast<double>(ssd_total_cache);
-        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+        ssd_hits_per_current_cached_object =
+            static_cast<double>(ssd_cache_hits) /
+            static_cast<double>(ssd_total_cache);
+        ssd_hits_per_current_cached_object =
+            std::round(ssd_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
-    double total_hit_rate = 0.0;
+    double overall_hits_per_current_cached_object = 0.0;
     if (total_cache > 0) {
-        total_hit_rate =
+        overall_hits_per_current_cached_object =
             static_cast<double>(total_hits) / static_cast<double>(total_cache);
-        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+        overall_hits_per_current_cached_object =
+            std::round(overall_hits_per_current_cached_object * 100.0) / 100.0;
     }
 
     double valid_get_rate = 0.0;
@@ -1844,10 +1986,12 @@ MasterMetricManager::calculate_cache_stats() {
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
     add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
     add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE,
+                     mem_hits_per_current_cached_object);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE,
+                     ssd_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
-                     total_hit_rate);
+                     overall_hits_per_current_cached_object);
     add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
     return stats_dict;
 }
@@ -2185,9 +2329,7 @@ std::string MasterMetricManager::get_summary_string(
         ss << " (" << std::fixed << std::setprecision(1)
            << ((double)cxl_allocated / (double)cxl_capacity * 100.0) << "%)";
     }
-    int64_t file_display_capacity = dfs_capacity_unlimited_
-                                        ? std::numeric_limits<int64_t>::max()
-                                        : file_capacity;
+    int64_t file_display_capacity = get_total_file_capacity();
     ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
        << byte_size_to_string(nof_capacity);
     if (nof_capacity > 0) {
@@ -2427,6 +2569,21 @@ std::string MasterMetricManager::get_summary_string(
     ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
+
+    // Promotion-on-hit summary (counters are cumulative, not deltas; the
+    // gauge is current-state).
+    ss << " | Promotion: "
+       << "in_flight=" << promotion_in_flight_metric_.value() << ", "
+       << "admitted=" << promotion_admitted_.value() << ", "
+       << "completed=" << promotion_completed_.value() << ", "
+       << "failed=" << promotion_failed_.value() << ", "
+       << "cancelled=" << promotion_cancelled_.value() << ", "
+       << "expired=" << promotion_expired_.value() << ", "
+       << "bytes=" << byte_size_to_string(promotion_completed_bytes_.value())
+       << ", "
+       << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
+       << "/" << promotion_rejected_watermark_.value() << "/"
+       << promotion_rejected_cap_.value();
 
     // Snapshot summary
     ss << " | Snapshots: "

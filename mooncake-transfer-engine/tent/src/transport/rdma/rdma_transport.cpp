@@ -22,11 +22,13 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <future>
 #include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
+#include "tent/common/utils/ip.h"
 #include "tent/transport/rdma/buffers.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
@@ -213,6 +215,22 @@ Status RdmaTransport::install(std::string& local_segment_name,
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
+
+    // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
+    // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
+    // while local_segment_name_ keeps the TCP-reachable address for P2P.
+    const char *rdma_bind_addr = std::getenv("MC_RDMA_BIND_ADDRESS");
+    if (rdma_bind_addr && rdma_bind_addr[0] != '\0') {
+        auto [host_name, port] = parseHostNameWithPort(local_segment_name);
+        rdma_server_name_ =
+            std::string(rdma_bind_addr) + ":" + std::to_string(port);
+        LOG(INFO) << "RdmaTransport(TENT): using RDMA bind address "
+                  << rdma_server_name_
+                  << " (TCP address: " << local_segment_name_ << ")";
+    } else {
+        rdma_server_name_ = local_segment_name_;
+    }
+
     local_buffer_manager_.setTopology(local_topology);
     context_set_.clear();
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
@@ -488,6 +506,11 @@ Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
     auto segment = manager.getLocal();
     assert(segment);
+    // Store RDMA server name for dual-NIC setups; when it differs from
+    // local_segment_name_ the peer will use it for NIC path construction.
+    if (rdma_server_name_ != local_segment_name_) {
+        segment->rdma_server_name = rdma_server_name_;
+    }
     auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     for (auto& context : context_set_) {
         if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
@@ -576,7 +599,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    std::string peer_name = MakeNicPath(segment_desc->name, target_dev_name);
+    std::string peer_name = MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;

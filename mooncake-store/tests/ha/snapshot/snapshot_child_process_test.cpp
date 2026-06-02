@@ -159,7 +159,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
         size_t shard_idx = svc->getShardIndex(key);
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        return shard.metadata.find(key) != shard.metadata.end();
+        auto tenant_it = shard.tenants.find("default");
+        return tenant_it != shard.tenants.end() &&
+               tenant_it->second.metadata.find(key) !=
+                   tenant_it->second.metadata.end();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -175,9 +178,13 @@ class SnapshotChildProcessTest : public ::testing::Test {
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
         auto& shard = service_->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto it = shard.metadata.find(key);
-        EXPECT_NE(it, shard.metadata.end());
-        return it != shard.metadata.end() && it->second.IsGrouped();
+        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+            auto it = tenant_state.metadata.find(key);
+            if (it != tenant_state.metadata.end()) {
+                return it->second.IsGrouped();
+            }
+        }
+        return false;
     }
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,

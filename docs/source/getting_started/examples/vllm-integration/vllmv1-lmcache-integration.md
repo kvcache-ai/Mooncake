@@ -2,150 +2,163 @@
 
 ## Overview
 
-This guide shows a single-machine 1-prefill/1-decode deployment using vLLM V1,
-LMCache's multiprocess server, and Mooncake Store as the LMCache L2 backend.
+This guide shows a two-machine 1-prefill/1-decode deployment using vLLM V1,
+LMCache's non-MP `LMCacheConnectorV1`, and Mooncake Store as LMCache's remote
+storage backend.
 
-In this setup, one machine runs Mooncake master, one LMCache MP server, the
-disaggregated proxy, the prefiller vLLM instance, and the decoder vLLM
-instance. The prefiller and decoder should use different GPUs.
+LMCache supports both non-MP mode and MP mode with Mooncake Store. This page
+covers the non-MP path, where each vLLM instance loads an LMCache YAML config
+through `LMCACHE_CONFIG_FILE` and connects directly to Mooncake Store with
+`remote_url: "mooncakestore://..."`. For the LMCache multiprocess server path,
+see [vLLM V1 Disaggregated Serving with Mooncake Store and LMCache \[MP\]](vllmv1-lmcache-mp-integration.md).
 
-This example uses `"metadata_server":"P2PHANDSHAKE"` for Mooncake transfer
-metadata, so the Mooncake HTTP metadata server is not needed. If you switch to
-HTTP metadata, remember that Mooncake's HTTP metadata server also defaults to
-`8080`, which conflicts with LMCache's HTTP API on a single host.
+The examples below use:
+
+- Machine A: Mooncake master and vLLM decoder
+- Machine B: vLLM prefiller
+- Mooncake master RPC address: `{IP of Machine A}:50051`
+- Mooncake HTTP metadata endpoint: `http://{IP of Machine A}:8080/metadata`
+- RDMA device: `{RDMA device}`
+
+Replace these placeholders with the IP addresses, hostname, and RDMA device for
+your environment.
 
 ## Prerequisites
 
-Install Mooncake, vLLM, and LMCache on the machine. The example assumes an RDMA
-deployment and uses:
+Install Mooncake, vLLM, and LMCache on both machines. For installation details,
+refer to the official documentation of each project:
 
-- local host address: `{IP of Machine}`
-- RDMA device: `{RDMA device}`
-- LMCache checkout path: `/path/to/LMCache`
-
-Replace these values with the local hostname/IP, RDMA device, and LMCache checkout path for your environment.
-
-The `mooncake_store` MP L2 adapter requires LMCache's `lmcache_mooncake` C++
-extension. When building LMCache from source, enable Mooncake support, for
-example:
-
-```bash
-BUILD_MOONCAKE=1 \
-MOONCAKE_INCLUDE_DIR=/path/to/mooncake/include \
-MOONCAKE_LIB_DIR=/path/to/mooncake/lib \
-pip install -e /path/to/LMCache --verbose
-```
+- [Mooncake build guide](../../build.md)
+- [LMCache installation](https://docs.lmcache.ai/getting_started/installation.html)
+- [vLLM installation](https://docs.vllm.ai/en/latest/getting_started/installation/)
 
 ## Deployment
 
-### 1. Start Mooncake Master
+### 1. Start Mooncake Master on Machine A
 
 ```bash
 mooncake_master -v=1 \
   --rpc_port=50051 \
-  --metrics_port=9003
+  --metrics_port=9003 \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_host=0.0.0.0 \
+  --http_metadata_server_port=8080
 ```
 
-### 2. Start the LMCache Multiprocess Server
+### 2. Configure and Start the vLLM Decoder on Machine A
 
-Start one LMCache MP server and configure Mooncake Store as the L2 adapter.
+Modify the vLLM disaggregated prefill launcher to use a Mooncake-backed LMCache
+config for the decoder.
 
-```bash
-lmcache server \
-  --host 127.0.0.1 \
-  --port 5555 \
-  --http-host 127.0.0.1 \
-  --http-port 8080 \
-  --l1-size-gb 32 \
-  --eviction-policy LRU \
-  --no-l1-use-lazy \
-  --l2-adapter '{
-    "type": "mooncake_store",
-    "local_hostname": "{IP of Machine}",
-    "metadata_server": "P2PHANDSHAKE",
-    "protocol": "rdma",
-    "rdma_devices": "{RDMA device}",
-    "global_segment_size": "32212254720",
-    "local_buffer_size": "1073741824",
-    "master_server_addr": "127.0.0.1:50051"
-  }'
+The decoder should continue to use `LMCacheConnectorV1` with `kv_role` set to
+`kv_consumer`.
+
+```diff
+diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
+--- a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
++++ b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
+@@
+ elif [[ $1 == "decoder" ]]; then
+     # Decoder listens on port 8200
+-    decode_config_file=$SCRIPT_DIR/configs/lmcache-decoder-config.yaml
++    decode_config_file=$SCRIPT_DIR/configs/mooncake-decoder-config.yaml
 ```
 
-### 3. Start the Disaggregated Proxy
+Create `configs/mooncake-decoder-config.yaml`:
 
-The proxy receives client requests, sends prefill requests to the prefiller,
-sends decode requests to the decoder, and receives LMCache request telemetry
-from the prefiller.
+```yaml
+chunk_size: 256
+remote_url: "mooncakestore://{IP of Machine A}:50051/"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 100
+
+extra_config:
+  local_hostname: "{IP of Machine A}"
+  metadata_server: "http://{IP of Machine A}:8080/metadata"
+  protocol: "rdma"
+  device_name: "{RDMA device}"
+  master_server_address: "{IP of Machine A}:50051"
+  global_segment_size: 32212254720 # 30GB
+  local_buffer_size: 1073741824 # 1GB
+  transfer_timeout: 1
+  save_chunk_meta: False
+```
+
+Launch the decoder:
 
 ```bash
-python /path/to/LMCache/examples/disagg_prefill_mp/disagg_proxy_server.py \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --prefiller-host 127.0.0.1 \
+bash disagg_vllm_launcher.sh decoder Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+```
+
+### 3. Configure and Start the vLLM Prefiller on Machine B
+
+Modify the launcher to use a Mooncake-backed LMCache config for the prefiller.
+
+The prefiller should continue to use `LMCacheConnectorV1` with `kv_role` set to
+`kv_producer`.
+
+```diff
+diff --git a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
+--- a/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
++++ b/examples/lmcache/disagg_prefill_lmcache_v1/disagg_vllm_launcher.sh
+@@
+ if [[ $1 == "prefiller" ]]; then
+     # Prefiller listens on port 8100
+-    prefill_config_file=$SCRIPT_DIR/configs/lmcache-prefiller-config.yaml
++    prefill_config_file=$SCRIPT_DIR/configs/mooncake-prefiller-config.yaml
+```
+
+Create `configs/mooncake-prefiller-config.yaml`:
+
+```yaml
+chunk_size: 256
+remote_url: "mooncakestore://{IP of Machine A}:50051/"
+remote_serde: "naive"
+local_cpu: False
+max_local_cpu_size: 100
+
+extra_config:
+  local_hostname: "{IP of Machine B}"
+  metadata_server: "http://{IP of Machine A}:8080/metadata"
+  protocol: "rdma"
+  device_name: "{RDMA device}"
+  master_server_address: "{IP of Machine A}:50051"
+  global_segment_size: 32212254720 # 30GB
+  local_buffer_size: 1073741824 # 1GB
+  transfer_timeout: 1
+  save_chunk_meta: False
+```
+
+Launch the prefiller:
+
+```bash
+bash disagg_vllm_launcher.sh prefiller Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4
+```
+
+### 4. Start the Disaggregated Proxy
+
+Use the LMCache [`disagg_proxy_server.py`](https://github.com/LMCache/LMCache/blob/dev/examples/disagg_prefill/disagg_proxy_server.py) to route requests between the prefiller and decoder. According to [LMCache/LMCache#1342](https://github.com/LMCache/LMCache/issues/1342), when using Mooncake Store as the backend, comment out the `wait_decode_kv_ready(...)` call in the proxy before starting it.
+
+```bash
+python3 disagg_proxy_server.py \
+  --host 0.0.0.0 \
+  --port 9000 \
+  --prefiller-host {IP of Machine B} \
   --prefiller-port 8100 \
-  --decoder-host 127.0.0.1 \
-  --decoder-port 8200 \
-  --telemetry-port 5768
+  --decoder-host {IP of Machine A} \
+  --decoder-port 8200
 ```
 
-### 4. Start the vLLM Prefiller
-
-The prefiller reports request telemetry back to the proxy so the proxy knows
-when KV cache storage has completed.
-
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-LMCACHE_REQUEST_TELEMETRY_TYPE=fastapi \
-LMCACHE_REQUEST_TELEMETRY_ENDPOINT=http://127.0.0.1:5768/api/v1/telemetry \
-vllm serve Qwen/Qwen3-4B \
-  --host 127.0.0.1 \
-  --port 8100 \
-  --gpu-memory-utilization 0.8 \
-  --no-enable-log-requests \
-  --no-enable-prefix-caching \
-  --kv-transfer-config '{
-    "kv_connector": "LMCacheMPConnector",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-      "lmcache.mp.host": "tcp://127.0.0.1",
-      "lmcache.mp.port": 5555
-    }
-  }'
-```
-
-### 5. Start the vLLM Decoder
-
-The decoder connects to the same local LMCache MP server. It does not need
-request telemetry environment variables; only the prefiller reports the "KV
-cache is stored" event back to the proxy.
-
-```bash
-CUDA_VISIBLE_DEVICES=1 \
-vllm serve Qwen/Qwen3-4B \
-  --host 127.0.0.1 \
-  --port 8200 \
-  --gpu-memory-utilization 0.8 \
-  --no-enable-log-requests \
-  --no-enable-prefix-caching \
-  --kv-transfer-config '{
-    "kv_connector": "LMCacheMPConnector",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-      "lmcache.mp.host": "tcp://127.0.0.1",
-      "lmcache.mp.port": 5555
-    }
-  }'
-```
-
-### 6. Send a Test Request
+### 5. Send a Test Request
 
 Send traffic to the proxy, not directly to either vLLM instance.
 
 ```bash
-curl -N http://127.0.0.1:8000/v1/chat/completions \
+curl -N http://{Proxy IP}:9000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Qwen/Qwen3-4B",
+    "model": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
     "messages": [
       {
         "role": "user",
@@ -162,20 +175,17 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 When changing ports away from these defaults, update all dependent settings
 together:
 
-- Mooncake master `--rpc_port` must match LMCache `master_server_addr`.
-- The vLLM prefiller and decoder should connect to the local LMCache MP server
-  via `kv_connector_extra_config.lmcache.mp.host` and
-  `kv_connector_extra_config.lmcache.mp.port`.
+- Mooncake master `--rpc_port` must match `remote_url` and
+  `extra_config.master_server_address`.
+- `extra_config.metadata_server` must point to the Mooncake HTTP metadata
+  endpoint when HTTP metadata is used.
+- Decoder and prefiller `device_name`, `protocol`, `global_segment_size`, and
+  `local_buffer_size` should be set for the local hardware and workload.
 - Proxy `--prefiller-port` and `--decoder-port` must match the two vLLM
-  `--port` values.
-- `LMCACHE_REQUEST_TELEMETRY_ENDPOINT` on the prefiller must point to the proxy
-  telemetry endpoint.
-- If `metadata_server` is changed from `P2PHANDSHAKE` to an HTTP metadata URL,
-  enable Mooncake HTTP metadata server and make sure its port does not conflict
-  with LMCache `--http-port`.
+  instance ports.
 
 ## Additional Resources
 
-* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../../../getting_started/examples/lmcache-integration.md)
-* [LMCache MP `mooncake_store` L2 adapter](https://docs.lmcache.ai/mp/l2_storage.html#mooncake-store-mooncake-store-native-connector)
-* [LMCache multiprocess disaggregated prefill example](https://github.com/LMCache/LMCache/tree/dev/examples/disagg_prefill_mp)
+* [Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System](../lmcache-integration.md)
+* [Using Mooncake in LMCache](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html)
+* [Using LMCache in vLLM](https://github.com/vllm-project/vllm/tree/main/examples/others/lmcache)
