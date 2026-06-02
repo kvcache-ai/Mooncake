@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +52,7 @@ struct Request {
     size_t length;
     int priority =
         PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
+    std::optional<std::string> policy_name;  // Optional: bind to specific policy by name
 };
 
 enum TransferStatusEnum {
