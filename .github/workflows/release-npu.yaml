@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'kvcache-ai/Mooncake'
+    if: ${{ github.repository == 'kvcache-ai/Mooncake' && !contains(github.ref_name, '-') }}
 
     runs-on: self-hosted
 
@@ -194,6 +194,7 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi

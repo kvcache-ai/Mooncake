@@ -340,7 +340,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         }
 
         local_desc.local_nic_path =
-            MakeNicPath(transport.local_segment_name_, context_->name());
+            MakeNicPath(transport.rdma_server_name_, context_->name());
         local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
         qp_num = qpNum();
         local_desc.qp_num = qp_num;
@@ -350,7 +350,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
         same_nic = (local_desc.local_nic_path == local_desc.peer_nic_path);
         is_self =
-            (!same_nic && peer_server_name == transport.local_segment_name_);
+            (!same_nic && (peer_server_name == transport.local_segment_name_ ||
+                           peer_server_name == transport.rdma_server_name_));
     }
 
     // ===== Phase 2: Bootstrap (unlocked) =====
@@ -463,7 +464,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                       << " (duplicate bootstrap, reusing connection)";
             auto& transport = context_->transport_;
             local_desc.local_nic_path =
-                MakeNicPath(transport.local_segment_name_, context_->name());
+                MakeNicPath(transport.rdma_server_name_, context_->name());
             local_desc.peer_nic_path = peer_desc.local_nic_path;
             local_desc.qp_num = qpNum();
             local_desc.local_lid = context_->lid();
@@ -495,7 +496,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         return mooncake::tent::Status::InvalidArgument(
             "Invalid peer path" LOC_MARK);
     local_desc.local_nic_path =
-        MakeNicPath(transport.local_segment_name_, context_->name());
+        MakeNicPath(transport.rdma_server_name_, context_->name());
     local_desc.peer_nic_path = peer_nic_path;
     local_desc.qp_num = qpNum();
     local_desc.local_lid = context_->lid();

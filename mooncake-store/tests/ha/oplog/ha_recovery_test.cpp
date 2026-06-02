@@ -259,6 +259,7 @@ TEST_F(HaRecoveryTest, GC_NoSnapshot_IncompleteRecovery) {
     // This demonstrates data incompleteness without snapshot protection:
     // the applier sees a gap it cannot fill (seq 1~9 are GC'd).
     size_t applied = applier_->ApplyOpLogEntries(entries);
+    EXPECT_EQ(applied, 0);
 
     // Wait for gap timeout so pending entries eventually drain
     std::this_thread::sleep_for(std::chrono::seconds(4));

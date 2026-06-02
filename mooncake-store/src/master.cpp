@@ -134,6 +134,12 @@ DEFINE_uint32(promotion_admission_threshold, 2,
               "(set 1 to disable second-touch gating)");
 DEFINE_uint32(promotion_queue_limit, 50000,
               "Max in-flight promotion tasks across all shards");
+DEFINE_uint32(promotion_max_per_heartbeat, 1,
+              "Max promotion tasks returned to a single client per "
+              "PromotionObjectHeartbeat call. Each task is a synchronous "
+              "SSD-read + RDMA-write on the client; serializing them avoids "
+              "blocking past the client-liveness window. Default 1 is "
+              "conservative.");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -153,7 +159,7 @@ DEFINE_uint32(kv_events_dp_rank, 0, "dp_rank for published KV events");
 DEFINE_bool(kv_events_emit_legacy_compat, true,
             "Include vLLM/SGLang-compatible type/block_hashes fields");
 DEFINE_uint32(kv_events_queue_capacity, 65536,
-              "Bounded queue capacity for async KV event publishing");
+              "Deprecated; ignored (event queue is unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -378,6 +384,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_queue_limit",
                              &master_config.promotion_queue_limit,
                              FLAGS_promotion_queue_limit);
+    default_config.GetUInt32("promotion_max_per_heartbeat",
+                             &master_config.promotion_max_per_heartbeat,
+                             FLAGS_promotion_max_per_heartbeat);
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -688,6 +697,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.promotion_queue_limit = FLAGS_promotion_queue_limit;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_max_per_heartbeat", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_max_per_heartbeat =
+            FLAGS_promotion_max_per_heartbeat;
     }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||

@@ -38,6 +38,46 @@ def get_client(store, local_buffer_size_param=None):
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
+
+def get_config_dict(global_segment_size, local_buffer_size):
+    """Build a config dictionary for the MooncakeDistributedStore setup wrapper."""
+    return {
+        "local_hostname": os.getenv("LOCAL_HOSTNAME", "localhost"),
+        "metadata_server": os.getenv(
+            "MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata"
+        ),
+        "global_segment_size": global_segment_size,
+        "local_buffer_size": local_buffer_size,
+        "protocol": os.getenv("PROTOCOL", "tcp"),
+        "rdma_devices": os.getenv("DEVICE_NAME", "ibp6s0"),
+        "master_server_addr": os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+    }
+
+
+class TestConfigDictSetup(unittest.TestCase):
+    """Test configuration-dictionary setup through the Python store wrapper."""
+
+    def test_human_readable_sizes(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+
+        retcode = store.setup(get_config_dict("16MB", "16 MB"))
+        self.assertEqual(retcode, 0)
+
+        test_data = b"test_config_dict_human_readable_value"
+        key = f"test_config_dict_human_readable_key_{os.getpid()}"
+
+        self.assertEqual(store.put(key, test_data), 0)
+        self.assertEqual(store.get(key), test_data)
+
+    def test_unsupported_percentage_size(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+
+        retcode = store.setup(get_config_dict("50%", "16MB"))
+        self.assertNotEqual(retcode, 0)
+
+
 class TestZeroLocalBufferSize(unittest.TestCase):
     """Test class for zero local buffer size scenarios."""
     

@@ -75,7 +75,7 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> OffloadObjects(
-        const std::unordered_map<std::string, int64_t>& offloading_objects);
+        const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
@@ -107,7 +107,7 @@ class FileStorage {
         std::unordered_map<std::string, Slice>& batch_object);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
-        const std::vector<std::string>& keys,
+        const std::vector<std::string>& keys, const std::string& tenant_id,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();

@@ -385,8 +385,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
 
             case StageState::INFLIGHT: {
                 TransferStatus xfer_status;
-                CHECK_STATUS(
-                    impl_->getTransferStatus(chunk.batch, xfer_status));
+                CHECK_STATUS(impl_->progressBatch(chunk.batch, xfer_status));
                 if (xfer_status.s == PENDING) {
                     event_queue.push(id);
                     break;

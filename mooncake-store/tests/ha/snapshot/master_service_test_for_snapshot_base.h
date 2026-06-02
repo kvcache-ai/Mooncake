@@ -72,8 +72,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // LocalDiskSegment state for comparison
     struct LocalDiskSegmentState {
         bool enable_offloading = false;
-        std::map<std::string, int64_t>
-            offloading_objects;  // key -> timestamp (sorted)
+        std::map<std::string, OffloadTaskItem>
+            offloading_objects;  // storage key -> task (sorted)
     };
 
     // Task state for comparison
@@ -247,9 +247,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 seg_state.enable_offloading = segment->enable_offloading;
                 // Copy offloading_objects to sorted map
                 std::lock_guard<Mutex> lock(segment->offloading_mutex_);
-                for (const auto& [key, timestamp] :
-                     segment->offloading_objects) {
-                    seg_state.offloading_objects[key] = timestamp;
+                for (const auto& [key, task] : segment->offloading_objects) {
+                    seg_state.offloading_objects[key] = task;
                 }
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }

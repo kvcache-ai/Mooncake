@@ -83,6 +83,7 @@ getting_started/examples/vllm-integration/index
 :caption: Performance
 :maxdepth: 1
 
+performance/vllm/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
@@ -91,6 +92,7 @@ performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result
 performance/allocation-strategy-benchmark-result
 performance/ssd-offload-benchmark-results
+performance/storage-benchmark
 :::
 
 % API Documentation
@@ -117,6 +119,7 @@ design/p2p-store
 design/transfer-engine/index
 design/hicache-design
 design/engram
+design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
@@ -149,4 +152,17 @@ deployment/mooncake-store-deployment-guide
 :maxdepth: 1
 
 community/governance
+:::
+
+% Archived content
+
+:::{toctree}
+:caption: Archived
+:maxdepth: 1
+
+getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
+getting_started/examples/vllm-integration/vllm-integration-v0.2
+getting_started/examples/vllm-integration/vllm-integration-v0.3
+getting_started/examples/vllm-integration/vllm-integration-v1.0
+getting_started/examples/vllm-integration/vllmv1-lmcache-integration
 :::

@@ -82,7 +82,8 @@ class RealClient : public PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
-        const std::string &ssd_offload_path = "");
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default");
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -503,7 +504,8 @@ class RealClient : public PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
-        const std::string &ssd_offload_path = "");
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -766,11 +768,22 @@ class RealClient : public PyClient {
         }
     };
 
+    struct UbSegmentDeleter {
+        size_t size = 0;
+        std::string protocol = "ub";
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

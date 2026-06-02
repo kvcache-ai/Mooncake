@@ -22,6 +22,7 @@
 
 #include "real_client.h"
 #include "client_buffer.hpp"
+#include "common.h"
 #include "config.h"
 #include "mutex.h"
 #include "types.h"
@@ -32,6 +33,9 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -287,6 +291,7 @@ inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
     const Replica::Descriptor *first_memory = nullptr;
+    const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -296,9 +301,17 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local MEMORY — best case
             }
             if (!first_memory) first_memory = &r;
+        } else if (r.is_nof_replica()) {
+            if (local_endpoints.count(
+                    r.get_nof_descriptor()
+                        .buffer_descriptor.transport_endpoint_)) {
+                return &r;  // local NOF_SSD — also good
+            }
+            if (!first_nof) first_nof = &r;
         }
     }
     if (first_memory) return first_memory;
+    if (first_nof) return first_nof;
 
     const Replica::Descriptor *best = nullptr;
     for (const auto &r : replicas) {
@@ -620,7 +633,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -636,6 +649,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
+#ifdef USE_NOF
+    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
+        LOG(ERROR) << "spdk env init fail";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+#endif
+
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
@@ -648,17 +668,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     // Check if hostname already contains a port
     const std::string &hostname = local_hostname;
-    size_t colon_pos = hostname.find(':');
-    bool user_specified_port = (colon_pos != std::string::npos);
+    bool user_specified_port = hasExplicitPort(hostname);
 
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        this->local_rpc_addr =
-            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
-            master_server_addr, transfer_engine, {{"client_mode", "real"}});
+            master_server_addr, transfer_engine, {{"client_mode", "real"}},
+            tenant_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -688,12 +708,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 continue;
             }
 
-            this->local_hostname = hostname + ":" + std::to_string(port);
+            this->local_hostname = buildHostNameWithPort(hostname, port);
             this->local_rpc_addr =
-                hostname + ":" + std::to_string(local_rpc_port);
+                buildHostNameWithPort(hostname, local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine, {{"client_mode", "real"}});
+                master_server_addr, transfer_engine, {{"client_mode", "real"}},
+                tenant_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -722,8 +743,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
+    bool use_spdk_dma_for_client_buffer = false;
+#ifdef USE_NOF
+    use_spdk_dma_for_client_buffer = true;
+#endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
+        local_buffer_size, this->protocol, should_use_hugepage,
+        use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -826,6 +852,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
+            } else if (this->protocol == "ub") {
+                ub_segment_ptrs_.emplace_back(ptr,
+                                              UbSegmentDeleter{mapped_size});
             } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
@@ -876,13 +905,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
 
         // Build local_rpc_addr from hostname + auto-allocated port
-        std::string rpc_host = this->local_hostname;
-        auto pos = rpc_host.find(':');
-        if (pos != std::string::npos) {
-            rpc_host = rpc_host.substr(0, pos);
-        }
-        this->local_rpc_addr =
-            rpc_host + ":" + std::to_string(offload_rpc_port_);
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
     if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
@@ -917,11 +941,12 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        tenant_id));
 }
 
 namespace {
@@ -932,30 +957,21 @@ inline std::string get_config(const ConfigDict &config, const std::string &key,
     return (it != config.end()) ? it->second : default_value;
 }
 
-inline size_t get_config_size(const ConfigDict &config, const std::string &key,
-                              size_t default_value) {
+inline std::optional<size_t> get_config_size(const ConfigDict &config,
+                                             const std::string &key,
+                                             size_t default_value) {
     auto it = config.find(key);
     if (it == config.end()) {
         return default_value;
     }
-    const std::string &value = it->second;
-    // Check for negative numbers (stoull incorrectly parses "-1" as large val)
-    if (!value.empty() && value[0] == '-') {
-        LOG(WARNING) << "Invalid negative value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
+
+    auto parsed_size_opt = try_string_to_byte_size(it->second);
+    if (!parsed_size_opt.has_value()) {
+        LOG(ERROR) << "Invalid size value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
     }
-    try {
-        return std::stoull(value);
-    } catch (const std::invalid_argument &e) {
-        LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    } catch (const std::out_of_range &e) {
-        LOG(WARNING) << "Value out of range for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    }
+    return static_cast<size_t>(parsed_size_opt.value());
 }
 }  // namespace
 
@@ -977,10 +993,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Extract optional parameters with defaults
-    size_t global_segment_size = get_config_size(
+    auto global_segment_size_opt = get_config_size(
         config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
-    size_t local_buffer_size = get_config_size(
+    if (!global_segment_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto local_buffer_size_opt = get_config_size(
         config, CONFIG_KEY_LOCAL_BUFFER_SIZE, DEFAULT_LOCAL_BUFFER_SIZE);
+    if (!local_buffer_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t global_segment_size = global_segment_size_opt.value();
+    size_t local_buffer_size = local_buffer_size_opt.value();
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
@@ -989,19 +1013,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
-    // Validate size parameters are within acceptable ranges
-    if (global_segment_size < MIN_SEGMENT_SIZE ||
-        global_segment_size > MAX_SEGMENT_SIZE) {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_GLOBAL_SEGMENT_SIZE << ": "
-                   << global_segment_size << ", must be between "
-                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (local_buffer_size < MIN_SEGMENT_SIZE ||
-        local_buffer_size > MAX_SEGMENT_SIZE) {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_LOCAL_BUFFER_SIZE << ": "
-                   << local_buffer_size << ", must be between "
-                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
+    // A size of 0 keeps the pure client/server setup semantics.
+    auto validate_size = [](const char *key, size_t value) {
+        if ((value != 0 && value < MIN_SEGMENT_SIZE) ||
+            value > MAX_SEGMENT_SIZE) {
+            LOG(ERROR) << "Invalid " << key << ": " << value
+                       << ", must be 0 or between " << MIN_SEGMENT_SIZE
+                       << " and " << MAX_SEGMENT_SIZE;
+            return false;
+        }
+        return true;
+    };
+    if (!validate_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE, global_segment_size) ||
+        !validate_size(CONFIG_KEY_LOCAL_BUFFER_SIZE, local_buffer_size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1013,6 +1037,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
+    std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
 
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
@@ -1022,10 +1047,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload =
         (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1082,6 +1107,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_buffer_allocator_.reset();
     port_binder_.reset();
     hugepage_segment_ptrs_.clear();
+    ub_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -5457,15 +5483,18 @@ RealClient::batch_get_into_offload_object_internal(
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
+    std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
+        storage_keys.emplace_back(
+            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();

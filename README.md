@@ -110,7 +110,7 @@ Mooncake supports heterogeneous accelerators, NICs, and specialized transport pa
       <td align="center"><img src="image/partners/nvidia_logo.png" alt="NVIDIA" height="26" /><br/><sub>NVIDIA</sub></td>
       <td align="center"><img src="image/partners/amd_logo.png" alt="AMD" height="26" /><br/><sub>AMD</sub></td>
       <td align="center"><img src="image/partners/aliyun_logo.png" alt="Alibaba Cloud" height="24" /><br/><sub>Alibaba Cloud</sub></td>
-      <td align="center"><img src="https://cdn.simpleicons.org/amazonwebservices/FF9900" alt="AWS" height="24" /><br/><sub>AWS</sub></td>
+      <td align="center"><img src="image/partners/aws-logo.png" alt="AWS" height="24" /><br/><sub>AWS</sub></td>
     </tr>
   </table>
 </div>
@@ -381,7 +381,7 @@ Please kindly cite our papers if you find the papers or the traces are useful:
 
 ```bibtex
 @article{sun2026survivingpartialrankfailures,
-  title     = {Surviving Partial Rank Failures in Wide Expert-Parallel MoE Inference}, 
+  title     = {Surviving Partial Rank Failures in Wide Expert-Parallel MoE Inference},
   author    = {Xun Sun and Shaoyuan Chen and Pingchuan Ma and Yue Chen and Ziwei Yuan and Zhanhao Cao and Han Han and Shangming Cai and Teng Ma and Xuchun Shang and Xinpeng Zhao and Ke Yang and Junlin Wei and Lianzhi Lin and Yuji Liu and Feng Ren and Haoran Hu and Cheng Wan and Yingdi Shan and Yongwei Wu and Mingxing Zhang},
   year      = {2026},
   url       = {https://arxiv.org/abs/2605.10670},

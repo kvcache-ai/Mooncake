@@ -18,6 +18,26 @@ using gpu_staging::CopyDeviceToHost;
 using gpu_staging::IsDevicePointer;
 using gpu_staging::SetDevice;
 
+namespace {
+
+std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
+    const std::vector<std::string>& storage_keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(storage_keys.size());
+    for (size_t i = 0; i < storage_keys.size(); ++i) {
+        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
+        const int64_t size =
+            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
+        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                                        .key = std::move(key),
+                                        .size = size});
+    }
+    return tasks;
+}
+
+}  // namespace
+
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
@@ -264,8 +284,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
+            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
             auto add_object_result =
-                client_->NotifyOffloadSuccess(keys, metadatas);
+                client_->NotifyOffloadSuccess(tasks, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -339,15 +360,26 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
-    const std::unordered_map<std::string, int64_t>& offloading_objects) {
+    const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
         return {};
     }
+    std::unordered_map<std::string, int64_t> storage_object_sizes;
+    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
+    storage_object_sizes.reserve(offloading_objects.size());
+    task_by_storage_key.reserve(offloading_objects.size());
+    for (const auto& task : offloading_objects) {
+        const auto storage_key =
+            MakeTenantScopedStorageKey(task.tenant_id, task.key);
+        storage_object_sizes.emplace(storage_key, task.size);
+        task_by_storage_key.emplace(storage_key, task);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            offloading_objects, buckets_keys);
+            storage_object_sizes, buckets_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -355,21 +387,32 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     } else {
         std::vector<std::string> keys;
-        keys.reserve(offloading_objects.size());
-        for (const auto& it : offloading_objects) {
+        keys.reserve(storage_object_sizes.size());
+        for (const auto& it : storage_object_sizes) {
             keys.emplace_back(it.first);
         }
         buckets_keys.emplace_back(std::move(keys));
     }
 
     auto complete_handler =
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        [this, &task_by_storage_key](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }
-        auto result = client_->NotifyOffloadSuccess(keys, metadatas);
+        std::vector<OffloadTaskItem> tasks;
+        tasks.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto it = task_by_storage_key.find(key);
+            if (it == task_by_storage_key.end()) {
+                LOG(ERROR) << "Offload task not found for storage key";
+                return ErrorCode::INVALID_KEY;
+            }
+            tasks.push_back(it->second);
+        }
+        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
             LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
                        << result.error();
@@ -380,24 +423,63 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     for (const auto& keys : buckets_keys) {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        auto query_result = BatchQuerySegmentSlices(keys, batch_object);
-        if (!query_result) {
-            LOG(ERROR) << "BatchQuerySlices failed with error: "
-                       << query_result.error();
+        std::unordered_map<std::string, std::vector<std::string>>
+            storage_keys_by_tenant;
+        for (const auto& storage_key : keys) {
+            const auto it = task_by_storage_key.find(storage_key);
+            if (it != task_by_storage_key.end()) {
+                storage_keys_by_tenant[it->second.tenant_id].push_back(
+                    storage_key);
+            }
+        }
+        for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
+            std::vector<std::string> user_keys;
+            user_keys.reserve(storage_keys.size());
+            for (const auto& storage_key : storage_keys) {
+                user_keys.push_back(task_by_storage_key[storage_key].key);
+            }
+            std::unordered_map<std::string, std::vector<Slice>>
+                user_batch_object;
+            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
+                                                        user_batch_object);
+            if (!query_result) {
+                LOG(ERROR) << "BatchQuerySlices failed with error: "
+                           << query_result.error();
+                continue;
+            }
+            for (size_t i = 0; i < storage_keys.size(); ++i) {
+                auto it = user_batch_object.find(user_keys[i]);
+                if (it != user_batch_object.end()) {
+                    batch_object.emplace(storage_keys[i],
+                                         std::move(it->second));
+                }
+            }
+        }
+        if (batch_object.empty()) {
             continue;
         }
 
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
-            auto results = client_->BatchEvictDiskReplica(
-                evicted_keys, ReplicaType::LOCAL_DISK);
-            for (size_t i = 0; i < results.size(); ++i) {
-                if (!results[i]) {
-                    LOG(WARNING)
-                        << "Failed to notify master about evicted local disk "
-                           "key: "
-                        << evicted_keys[i] << ", error: " << results[i].error();
+            std::unordered_map<std::string, std::vector<std::string>>
+                keys_by_tenant;
+            for (const auto& storage_key : evicted_keys) {
+                auto [tenant_id, key] =
+                    ParseTenantScopedStorageKey(storage_key);
+                keys_by_tenant[tenant_id].push_back(key);
+            }
+            for (const auto& [tenant_id, keys] : keys_by_tenant) {
+                auto results = client_->BatchEvictDiskReplica(
+                    keys, tenant_id, ReplicaType::LOCAL_DISK);
+                for (size_t i = 0; i < results.size(); ++i) {
+                    if (!results[i]) {
+                        LOG(WARNING)
+                            << "Failed to notify master about evicted local "
+                               "disk key: "
+                            << keys[i] << ", tenant_id=" << tenant_id
+                            << ", error: " << results[i].error();
+                    }
                 }
             }
         };
@@ -521,7 +603,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         });
     }
 
-    std::unordered_map<std::string, int64_t>
+    std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 
     // === STEP 1: Send heartbeat and get offloading decisions ===
@@ -605,7 +687,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::unordered_map<std::string, int64_t> promotion_objects;
+    std::vector<PromotionTaskItem> promotion_objects;
     auto heartbeat_result =
         client_->PromotionObjectHeartbeat(promotion_objects);
     if (!heartbeat_result) {
@@ -636,7 +718,11 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     // work stays queued in the master's promotion_objects map and is
     // returned on subsequent heartbeats; we process whatever we received
     // here without a second client-side cap.
-    for (const auto& [key, size] : promotion_objects) {
+    for (const auto& task : promotion_objects) {
+        const auto& key = task.key;
+        const auto& tenant_id = task.tenant_id;
+        const int64_t size = task.size;
+        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;
@@ -644,7 +730,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         }
 
         auto alloc_result = client_->PromotionAllocStart(
-            key, static_cast<uint64_t>(size), preferred_segments);
+            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
         if (!alloc_result) {
             // AllocStart failed (typically NO_AVAILABLE_HANDLE under
             // DRAM pressure). No staged buffer to release, but the
@@ -657,7 +743,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             VLOG(1) << "PromotionAllocStart failed for key=" << key
                     << ", error=" << alloc_result.error()
                     << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key);
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -673,8 +759,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // throttling or RDMA flakes saturate promotion_queue_limit_
         // for the full reaper TTL. NotifyPromotionFailure is
         // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key]() {
-            auto release = client_->NotifyPromotionFailure(key);
+        auto release_master_state = [this, &key, &tenant_id]() {
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -686,7 +772,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // from the local SSD backend into it. AllocateBatch returns a
         // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
         // staging space when the local goes out of scope.
-        std::vector<std::string> single_key{key};
+        std::vector<std::string> single_key{storage_key};
         std::vector<int64_t> single_size{size};
         auto allocate_res = AllocateBatch(single_key, single_size);
         if (!allocate_res) {
@@ -707,7 +793,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // (b) TE-write from the staging slice into the freshly-allocated
         // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
         // correction in BatchLoad, so re-read it from the slice map.
-        auto slice_it = staging->slices.find(key);
+        auto slice_it = staging->slices.find(storage_key);
         if (slice_it == staging->slices.end()) {
             LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
             release_master_state();
@@ -725,7 +811,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
         // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
         // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key);
+        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
         if (!notify_res) {
             // The write landed but the commit failed. We can't retry the
             // commit (the success path is one-shot via alloc_id), and we
@@ -775,9 +861,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
-    const std::vector<std::string>& keys,
+    const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys);
+    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty())
         return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
@@ -822,6 +908,11 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
+    if (keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
+                   << ", sizes=" << sizes.size();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
@@ -833,7 +924,11 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
-        assert(sizes[i] <= kMaxSliceSize);
+        if (sizes[i] < 0 || sizes[i] > config_.local_buffer_size) {
+            LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
+                       << " (limit: " << config_.local_buffer_size << ")";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         // Allocate oversized buffer for O_DIRECT alignment:
         //   +4096 for aligning the ptr to 4096 boundary
@@ -949,8 +1044,9 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = local_rpc_addr_;
                 }
+                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(keys, metadatas);
+                    client_->NotifyOffloadSuccess(tasks, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)

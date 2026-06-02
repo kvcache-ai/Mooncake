@@ -6,7 +6,7 @@ Mooncake Store is a high-performance **distributed key-value (KV) cache storage 
 
 Unlike traditional caching systems such as Redis or Memcached, Mooncake Store is positioned as **a distributed KV cache rather than a generic caching system**. The key difference is that in the latter, the key is derived from the value through hashing, so value is immutable after inserting (although the key/value pair may be evicted).
 
-Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offers high memory efficiency and is specifically designed to accelerate LLM inference performance.
+Mooncake Store provides low-level object storage and management capabilities, including configurable caching and eviction strategies that offer high memory efficiency and is specifically designed to accelerate LLM inference performance.
 
 Key features of Mooncake Store include:
 - **Object-level storage operations**: Mooncake Store provides simple and easy-to-use object-level APIs, including `Put`, `Get`, and `Remove` operations.
@@ -836,7 +836,7 @@ The HTTP metadata server can be configured using the following parameters:
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 #### Environment Variables
-- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake_cluster'.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
@@ -968,7 +968,7 @@ retcode = store.setup(
 The absence of error messages indicates successful data transfer.
 
 ### Starting the Client as Standalone Process and accessing via RPC
-To start a RPC type **real** `Client` as a standalone process, you can use the following command:
+To start an RPC type **real** `Client` as a standalone process, you can use the following command:
 
 ```bash
 ./build/mooncake-store/src/mooncake_client \
@@ -1037,15 +1037,15 @@ Available log levels: trace, debug, info, warn (or warning), error, and critical
 
 ## Example Code
 
-#### Python Usage Example
+### Python Usage Example
 We provide a reference example `distributed_object_store_provider.py`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) in the background on the same server, and then execute this Python program in the foreground. It should output a successful test result.
 
-#### C++ Usage Example
+### C++ Usage Example
 The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
 
 ## Version Management Policy
 
-The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](gh-file:mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
 
 When to bump the version:
 

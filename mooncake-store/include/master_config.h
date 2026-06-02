@@ -109,6 +109,12 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Max promotion tasks PromotionObjectHeartbeat returns to a single
+    // client per call. Each task is a synchronous SSD-read + RDMA-write
+    // on the client; serializing them avoids blocking past the client-
+    // liveness window. Default 1 is conservative; small-object or RDMA-
+    // rich clusters may safely raise it.
+    uint32_t promotion_max_per_heartbeat = 1;
 
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
@@ -121,7 +127,7 @@ struct MasterConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
-    uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
 };
 
 class MasterServiceSupervisorConfig {
@@ -195,6 +201,7 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -205,7 +212,7 @@ class MasterServiceSupervisorConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
-    uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -233,6 +240,7 @@ class MasterServiceSupervisorConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -385,6 +393,7 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -395,7 +404,7 @@ class WrappedMasterServiceConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
-    uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -463,6 +472,7 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -559,6 +569,7 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -954,6 +965,7 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -964,7 +976,7 @@ class MasterServiceConfig {
     uint32_t kv_events_block_size = 0;
     uint32_t kv_events_dp_rank = 0;
     bool kv_events_emit_legacy_compat = true;
-    uint32_t kv_events_queue_capacity = 65536;
+    uint32_t kv_events_queue_capacity = 65536;  // deprecated, ignored
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1028,6 +1040,7 @@ class MasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
