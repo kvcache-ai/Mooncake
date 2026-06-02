@@ -281,6 +281,10 @@ class StorageBackendInterface {
         // Default: no-op (no test failures injected)
     }
 
+    // Remove all persisted objects from disk. Called during RemoveAll to
+    // clean up physical SSD files alongside master metadata deletion.
+    virtual void RemoveAll() {}
+
     FileStorageConfig file_storage_config_;
 };
 
@@ -675,6 +679,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         test_failure_predicate_ = std::move(predicate);
     }
 
+    void RemoveAll() override;
+
    private:
     const FilePerKeyConfig file_per_key_config_;
 
@@ -798,6 +804,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * - On failure: 返回错误码（例如 IO/内部错误）。
      */
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    void RemoveAll() override;
 
     /**
      * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
@@ -1085,6 +1093,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::function<bool(const std::string& key)> predicate) override {
         test_failure_predicate_ = std::move(predicate);
     }
+
+    void RemoveAll() override;
 
    private:
     // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)

@@ -600,6 +600,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     return {};
 }
 
+void FileStorage::RemoveAll() {
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+}
+
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     if (client_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

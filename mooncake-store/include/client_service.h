@@ -794,6 +794,10 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
 
+    // Callback for additional cleanup during RemoveAll (e.g. SSD offload
+    // files). Set by RealClient during setup when SSD offload is enabled.
+    std::function<void()> on_remove_all_cleanup_;
+
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
     std::mutex leader_switch_mutex_;

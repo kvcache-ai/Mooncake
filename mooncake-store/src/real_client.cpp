@@ -922,6 +922,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+        // Register SSD offload cleanup callback so that Client::RemoveAll
+        // can clean up both fsdir files and SSD offload files in one call.
+        client_->on_remove_all_cleanup_ = [this]() {
+            if (file_storage_) {
+                file_storage_->RemoveAll();
+            }
+        };
     }
     client_requester_ = std::make_shared<ClientRequester>();
     if (FLAGS_enable_http_server) {

@@ -1232,6 +1232,12 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     return {};
 }
 
+void StorageBackendAdaptor::RemoveAll() {
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+}
+
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
@@ -2427,6 +2433,30 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     return {};
 }
 
+void BucketStorageBackend::RemoveAll() {
+    namespace fs = std::filesystem;
+
+    // Collect all bucket IDs under exclusive lock, then release.
+    std::vector<int64_t> bucket_ids;
+    {
+        SharedMutexLocker lock(&mutex_);
+        bucket_ids.reserve(buckets_.size());
+        for (const auto& [id, _] : buckets_) {
+            bucket_ids.push_back(id);
+        }
+    }
+
+    for (int64_t id : bucket_ids) {
+        auto result = DeleteBucket(id);
+        if (!result) {
+            LOG(WARNING) << "RemoveAll: DeleteBucket failed for bucket_id="
+                         << id << ", error=" << toString(result.error());
+        }
+    }
+
+    LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path_res = GetBucketMetadataPath(id);
@@ -3192,6 +3222,50 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     }
 
     return {};
+}
+
+void OffsetAllocatorStorageBackend::RemoveAll() {
+    // Clear all shard maps and reset counters under exclusive locks.
+    {
+        std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+        shard_locks.reserve(kNumShards);
+        for (size_t i = 0; i < kNumShards; ++i) {
+            shard_locks.emplace_back(
+                std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+            shards_[i].map.clear();
+        }
+        total_size_.store(0, std::memory_order_relaxed);
+        total_keys_.store(0, std::memory_order_relaxed);
+    }
+
+    // Truncate the data file and rebuild the allocator so the backend
+    // is ready for new writes (same logic as Init's fresh-start path).
+    if (data_file_) {
+        data_file_.reset();
+    }
+    if (!data_file_path_.empty()) {
+        int fd = open(data_file_path_.c_str(),
+                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+#ifdef USE_URING
+            if (file_storage_config_.use_uring) {
+                data_file_ =
+                    std::make_unique<UringFile>(data_file_path_, fd, 32, true);
+            } else
+#endif
+            {
+                data_file_ = std::make_unique<PosixFile>(data_file_path_, fd);
+            }
+        } else {
+            LOG(WARNING) << "RemoveAll: failed to truncate data file: "
+                         << data_file_path_;
+        }
+    }
+    if (capacity_ > 0) {
+        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+    }
+
+    LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
 }
 
 //-----------------------------------------------------------------------------

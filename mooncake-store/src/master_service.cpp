@@ -2856,7 +2856,6 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
-    uint64_t total_freed_size = 0;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
@@ -2870,9 +2869,18 @@ long MasterService::RemoveAll(bool force) {
                 if ((force || it->second.IsLeaseExpired(now)) &&
                     it->second.AllReplicas(&Replica::fn_is_completed) &&
                     !tenant_state.replication_tasks.contains(it->first)) {
-                    auto mem_rep_count = it->second.CountReplicas(
-                        &Replica::fn_is_memory_replica);
-                    total_freed_size += it->second.size * mem_rep_count;
+                    // Decrement metric counters for all completed replicas
+                    // before erasing (same pattern as BatchReplicaClear).
+                    it->second.VisitReplicas(
+                        &Replica::fn_is_completed, [](Replica& replica) {
+                            if (replica.is_memory_replica()) {
+                                MasterMetricManager::instance()
+                                    .dec_mem_cache_nums();
+                            } else if (replica.is_disk_replica()) {
+                                MasterMetricManager::instance()
+                                    .dec_file_cache_nums();
+                            }
+                        });
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first);
                     removed_count++;
@@ -2889,16 +2897,12 @@ long MasterService::RemoveAll(bool force) {
     }
 
     VLOG(1) << "action=remove_all_objects"
-            << ", removed_count=" << removed_count
-            << ", total_freed_size=" << total_freed_size;
+            << ", removed_count=" << removed_count;
     return removed_count;
 }
 
 long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
     long removed_count = 0;
-    uint64_t total_freed_size = 0;
-    // Store the current time to avoid repeatedly
-    // calling std::chrono::steady_clock::now()
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
@@ -2915,9 +2919,17 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
             if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !tenant_state.replication_tasks.contains(it->first)) {
-                auto mem_rep_count =
-                    it->second.CountReplicas(&Replica::fn_is_memory_replica);
-                total_freed_size += it->second.size * mem_rep_count;
+                // Decrement metric counters before erasing metadata.
+                it->second.VisitReplicas(
+                    &Replica::fn_is_completed, [](Replica& replica) {
+                        if (replica.is_memory_replica()) {
+                            MasterMetricManager::instance()
+                                .dec_mem_cache_nums();
+                        } else if (replica.is_disk_replica()) {
+                            MasterMetricManager::instance()
+                                .dec_file_cache_nums();
+                        }
+                    });
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
                 it = EraseMetadata(tenant_state, it, normalized_tenant);
                 removed_count++;
@@ -2932,8 +2944,7 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
 
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant
-            << ", removed_count=" << removed_count
-            << ", total_freed_size=" << total_freed_size;
+            << ", removed_count=" << removed_count;
     return removed_count;
 }
 
