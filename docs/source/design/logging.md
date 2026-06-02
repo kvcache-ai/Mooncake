@@ -1,48 +1,47 @@
 # Logging
 
-Mooncake uses a single primary logging stack for C++ application code: [Google glog](https://github.com/google/glog).
+Mooncake uses **[Google glog](https://github.com/google/glog)** as the single C++ logging system. `LOG` and `VLOG` are both glog APIs (not separate libraries).
 
-## LOG vs VLOG (both are glog)
+## LOG vs VLOG
 
-| API | When it prints | Typical use |
-|-----|----------------|-------------|
-| `LOG(INFO)` | When severity ≥ `FLAGS_minloglevel` (set via `MC_LOG_LEVEL`) | Startup, rare state changes, successful one-off operations |
-| `LOG(WARNING)` / `LOG(ERROR)` | Same threshold | Recoverable issues, failures |
-| `VLOG(n)` | Only when `FLAGS_v >= n` | Per-request traces, hot-path diagnostics, eviction details |
+| API | When it prints | Use for |
+|-----|----------------|---------|
+| `LOG(INFO)` | Severity ≥ `FLAGS_minloglevel` | Startup, configuration, rare operational events |
+| `LOG(WARNING)` / `LOG(ERROR)` | Same | Problems and failures |
+| `VLOG(n)` | Only when `FLAGS_v >= n` | Per-request traces, eviction, hot paths |
 
-`LOG` and `VLOG` are not different libraries. `VLOG` is glog's verbose channel on the same backend. The recent store log-noise change moved high-volume `LOG(INFO)` lines to `VLOG(1)` so default deployments stay quiet while `MC_LOG_LEVEL=TRACE` or `MC_VLOG_LEVEL=1` still enables them.
+Enable verbose output with:
 
-## Environment variables
+```bash
+export MC_LOG_LEVEL=TRACE   # sets min level INFO and FLAGS_v≥1
+# or
+export MC_VLOG_LEVEL=1
+```
 
-| Variable | Affects | Values |
-|----------|---------|--------|
-| `MC_LOG_LEVEL` | glog `FLAGS_minloglevel`; `TRACE` also sets `FLAGS_v≥1` | `TRACE`, `INFO`, `WARNING`, `ERROR` |
-| `MC_VLOG_LEVEL` | glog `FLAGS_v` (verbose depth) | Non-negative integer |
-| `MC_LOG_DIR` | glog file output directory | Path |
-| `MC_YLT_LOG_LEVEL` | yalantinglibs **easylog** (coro_rpc stack) | `trace`, `debug`, `info`, `warn`, `error`, `critical` |
+## One knob: `MC_LOG_LEVEL`
 
-If `MC_YLT_LOG_LEVEL` is unset, it is derived from `MC_LOG_LEVEL` so RPC and application logs stay aligned.
+| Variable | Purpose |
+|----------|---------|
+| **`MC_LOG_LEVEL`** | **Primary control** for C++ glog, Python `logging`, and ylt easylog (RPC) |
+| `MC_VLOG_LEVEL` | Optional glog verbose depth (`FLAGS_v`) |
+| `MC_LOG_DIR` | glog log file directory |
+| `MC_YLT_LOG_LEVEL` | *Deprecated override* for RPC easylog only; if unset, derived from `MC_LOG_LEVEL` |
+
+Supported `MC_LOG_LEVEL` values: `TRACE`, `INFO`, `WARNING`, `ERROR` (case-insensitive).
 
 ## Initialization
 
-Call once per process entry point (after `gflags::ParseCommandLineFlags` if used):
+All binaries and Python extensions call `InitMooncakeLogging()` once (see `mooncake-common/include/mooncake_log.h`):
 
-```cpp
-#include "mooncake_log.h"
+- `mooncake_master`, `mooncake_client`
+- pybind modules `store` and `engine`
+- transfer-engine `loadGlobalConfig()` (applies env to glog)
 
-mooncake::InitMooncakeLogging(argv[0]);
-```
+Python packages call `configure_logging_from_env()` from `mooncake.logging_config` on import (see `mooncake-wheel/mooncake/__init__.py`).
 
-Used by `mooncake_master`, `mooncake_client`, and transfer-engine config loading (`ApplyGlogEnvironment`).
+## Guidelines
 
-## Python
-
-Python bindings and `mooncake-integration` use the standard library `logging` module. Set levels via normal Python APIs or framework env vars (e.g. `VLLM_LOGGING_LEVEL`); C++ glog is controlled separately via `MC_LOG_LEVEL`.
-
-## Guidelines for contributors
-
-1. Prefer **glog** (`LOG` / `VLOG`) in C++; do not add new `printf` / `std::cerr` in production paths.
-2. Use **`LOG(INFO)`** for messages operators should see at default verbosity.
-3. Use **`VLOG(1)`** (or higher) for per-operation or high-frequency messages.
-4. Use **`LOG(ERROR)`** / **`LOG(WARNING)`** for failures; do not downgrade errors to `VLOG`.
-5. RPC framework noise: tune with `MC_YLT_LOG_LEVEL`, not glog.
+1. Use **glog only** in C++ (`LOG` / `VLOG`). Do not add `printf`, `std::cerr`, or new logging libraries.
+2. Default verbosity: **`LOG(INFO)`** for operator-visible events; **`VLOG(1)`** for repetitive paths.
+3. Do not log secrets or full payload buffers at INFO.
+4. Prefer `MC_LOG_LEVEL` over `MC_YLT_LOG_LEVEL`.

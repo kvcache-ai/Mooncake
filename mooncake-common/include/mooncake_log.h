@@ -19,42 +19,27 @@
 namespace mooncake {
 
 /**
- * Mooncake C++ services use Google glog as the primary application logger.
+ * Mooncake standard logging: Google glog for all C++ application code.
  *
- * LOG(severity)  — Standard severity-based logging (INFO, WARNING, ERROR,
- *                  FATAL). A message is emitted when its severity is >=
- *                  FLAGS_minloglevel (controlled by MC_LOG_LEVEL).
+ *   LOG(INFO|WARNING|ERROR|FATAL)  — severity channel (MC_LOG_LEVEL)
+ *   VLOG(n)                        — verbose channel (MC_LOG_LEVEL=TRACE or MC_VLOG_LEVEL)
  *
- * VLOG(level)    — Verbose / debug logging on the same glog backend. A message
- *                  is emitted only when FLAGS_v >= level (enable with
- *                  MC_LOG_LEVEL=TRACE or MC_VLOG_LEVEL=N). Use VLOG for
- *                  high-volume or per-request traces; use LOG for lifecycle,
- *                  errors, and rare operational events.
+ * yalantinglibs coro_rpc emits through easylog internally; InitMooncakeLogging()
+ * maps MC_LOG_LEVEL to easylog so RPC and application logs share one env knob.
  *
- * yalantinglibs coro_rpc uses easylog (MC_YLT_LOG_LEVEL). InitMooncakeLogging
- * configures both from the same environment when possible.
- *
- * Environment variables:
- *   MC_LOG_LEVEL   — TRACE | INFO | WARNING | ERROR (glog min level; TRACE
- *                    also sets FLAGS_v>=1 for VLOG(1))
- *   MC_VLOG_LEVEL  — Optional integer FLAGS_v (verbose depth for VLOG(n))
- *   MC_LOG_DIR     — glog log directory (falls back to stderr if invalid)
- *   MC_YLT_LOG_LEVEL — easylog level for RPC stack (trace/debug/info/warn/...)
- *                    If unset, derived from MC_LOG_LEVEL.
+ * Environment (use MC_LOG_LEVEL as the single control):
+ *   MC_LOG_LEVEL    — TRACE | INFO | WARNING | ERROR
+ *   MC_VLOG_LEVEL   — optional FLAGS_v for VLOG depth
+ *   MC_LOG_DIR      — glog file directory
+ *   MC_YLT_LOG_LEVEL — optional override for RPC easylog only (deprecated)
  */
 
-// Call once per process after parsing gflags (if any). Idempotent.
 void InitMooncakeLogging(const char* argv0);
 
-// Apply MC_LOG_LEVEL / MC_VLOG_LEVEL / MC_LOG_DIR without calling
-// InitGoogleLogging. Returns true when MC_LOG_LEVEL=TRACE (transfer-engine
-// trace mode).
 bool ApplyGlogEnvironment(bool* enable_transfer_trace = nullptr);
 
-// Configure ylt easylog only (safe to call without glog init).
 void InitYltLogLevelFromEnv();
 
-// Apply a log directory (e.g. from gflags --log_dir) after InitMooncakeLogging.
 void SetGlogLogDir(const char* log_dir_path);
 
 }  // namespace mooncake

@@ -2075,7 +2075,7 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
         for (const auto &shm : context_it->second.mapped_shms) {
             if (shm.dummy_base_addr ==
                 static_cast<uintptr_t>(dummy_base_addr)) {
-                LOG(INFO) << "Segment already mapped: " << shm_name;
+                VLOG(1) << "Segment already mapped: " << shm_name;
                 if (fd >= 0) close(fd);
                 return {};
             }
@@ -5511,7 +5511,7 @@ RealClient::batch_get_into_offload_object_internal(
         std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
                                                               start_time)
             .count());
-    LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
+    VLOG(1) << "Time taken for batch_get_into_offload_object_internal: "
               << elapsed_time
               << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
               << ", key size: " << objects.size()
