@@ -83,7 +83,8 @@ jobs:
           -DBUILD_BENCHMARK=ON \
           -DUSE_CUDA=ON \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project

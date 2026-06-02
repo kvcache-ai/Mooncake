@@ -633,7 +633,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -677,7 +677,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
-            master_server_addr, transfer_engine, {{"client_mode", "real"}});
+            master_server_addr, transfer_engine, {{"client_mode", "real"}},
+            tenant_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -712,7 +713,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 buildHostNameWithPort(hostname, local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine, {{"client_mode", "real"}});
+                master_server_addr, transfer_engine, {{"client_mode", "real"}},
+                tenant_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -939,11 +941,12 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path) {
+    const std::string &ssd_offload_path, const std::string &tenant_id) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
-        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path));
+        ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
+        tenant_id));
 }
 
 namespace {
@@ -954,30 +957,21 @@ inline std::string get_config(const ConfigDict &config, const std::string &key,
     return (it != config.end()) ? it->second : default_value;
 }
 
-inline size_t get_config_size(const ConfigDict &config, const std::string &key,
-                              size_t default_value) {
+inline std::optional<size_t> get_config_size(const ConfigDict &config,
+                                             const std::string &key,
+                                             size_t default_value) {
     auto it = config.find(key);
     if (it == config.end()) {
         return default_value;
     }
-    const std::string &value = it->second;
-    // Check for negative numbers (stoull incorrectly parses "-1" as large val)
-    if (!value.empty() && value[0] == '-') {
-        LOG(WARNING) << "Invalid negative value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
+
+    auto parsed_size_opt = try_string_to_byte_size(it->second);
+    if (!parsed_size_opt.has_value()) {
+        LOG(ERROR) << "Invalid size value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
     }
-    try {
-        return std::stoull(value);
-    } catch (const std::invalid_argument &e) {
-        LOG(WARNING) << "Invalid non-numeric value for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    } catch (const std::out_of_range &e) {
-        LOG(WARNING) << "Value out of range for config key '" << key
-                     << "': " << value << ", using default: " << default_value;
-        return default_value;
-    }
+    return static_cast<size_t>(parsed_size_opt.value());
 }
 }  // namespace
 
@@ -999,10 +993,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     // Extract optional parameters with defaults
-    size_t global_segment_size = get_config_size(
+    auto global_segment_size_opt = get_config_size(
         config, CONFIG_KEY_GLOBAL_SEGMENT_SIZE, DEFAULT_GLOBAL_SEGMENT_SIZE);
-    size_t local_buffer_size = get_config_size(
+    if (!global_segment_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto local_buffer_size_opt = get_config_size(
         config, CONFIG_KEY_LOCAL_BUFFER_SIZE, DEFAULT_LOCAL_BUFFER_SIZE);
+    if (!local_buffer_size_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    size_t global_segment_size = global_segment_size_opt.value();
+    size_t local_buffer_size = local_buffer_size_opt.value();
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
@@ -1011,19 +1013,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string ipc_socket_path =
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
-    // Validate size parameters are within acceptable ranges
-    if (global_segment_size < MIN_SEGMENT_SIZE ||
-        global_segment_size > MAX_SEGMENT_SIZE) {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_GLOBAL_SEGMENT_SIZE << ": "
-                   << global_segment_size << ", must be between "
-                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (local_buffer_size < MIN_SEGMENT_SIZE ||
-        local_buffer_size > MAX_SEGMENT_SIZE) {
-        LOG(ERROR) << "Invalid " << CONFIG_KEY_LOCAL_BUFFER_SIZE << ": "
-                   << local_buffer_size << ", must be between "
-                   << MIN_SEGMENT_SIZE << " and " << MAX_SEGMENT_SIZE;
+    // A size of 0 keeps the pure client/server setup semantics.
+    auto validate_size = [](const char *key, size_t value) {
+        if ((value != 0 && value < MIN_SEGMENT_SIZE) ||
+            value > MAX_SEGMENT_SIZE) {
+            LOG(ERROR) << "Invalid " << key << ": " << value
+                       << ", must be 0 or between " << MIN_SEGMENT_SIZE
+                       << " and " << MAX_SEGMENT_SIZE;
+            return false;
+        }
+        return true;
+    };
+    if (!validate_size(CONFIG_KEY_GLOBAL_SEGMENT_SIZE, global_segment_size) ||
+        !validate_size(CONFIG_KEY_LOCAL_BUFFER_SIZE, local_buffer_size)) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1035,6 +1037,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
+    std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
 
     std::string enable_ssd_offload_str =
         get_config(config, "enable_ssd_offload", "false");
@@ -1044,10 +1047,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload =
         (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path);
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -5480,15 +5483,18 @@ RealClient::batch_get_into_offload_object_internal(
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
     std::vector<std::string> keys;
+    std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
+        storage_keys.emplace_back(
+            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
     }
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, keys, sizes);
+        target_rpc_service_addr, storage_keys, sizes);
     if (!batchGetResp) {
         LOG(ERROR) << "Batch get offload object failed with error: "
                    << batchGetResp.error();

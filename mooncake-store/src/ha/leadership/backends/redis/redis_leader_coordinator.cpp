@@ -11,6 +11,8 @@
 #include <thread>
 
 #include <glog/logging.h>
+
+#include "types.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -665,7 +667,7 @@ ClusterNamespace RedisLeaderCoordinator::ResolveClusterNamespace(
     if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
         resolved_namespace = env_cluster_id;
     } else {
-        resolved_namespace = "mooncake";
+        resolved_namespace = DEFAULT_CLUSTER_ID;
     }
     return resolved_namespace;
 }

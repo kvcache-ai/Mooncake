@@ -665,9 +665,9 @@ int EfaContext::submitPostSend(
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
 
-        std::string peer_nic_path =
-            peer_segment_desc->nicPathServerName() + "@" +
-            peer_segment_desc->devices[device_id].name;
+        std::string peer_nic_path = peer_segment_desc->nicPathServerName() +
+                                    "@" +
+                                    peer_segment_desc->devices[device_id].name;
         slice->peer_nic_path = peer_nic_path;
         slices_by_peer[peer_nic_path].push_back(slice);
     }
