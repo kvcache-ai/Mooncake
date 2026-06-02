@@ -20,6 +20,11 @@ bool HasAllocator(const AllocatorManager& allocator_manager,
            allocators->end();
 }
 
+bool IsMsgpackInteger(const msgpack::object& object) {
+    return object.type == msgpack::type::POSITIVE_INTEGER ||
+           object.type == msgpack::type::NEGATIVE_INTEGER;
+}
+
 }  // namespace
 
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
@@ -946,6 +951,19 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 const auto& task_obj = client_value.via.array.ptr[task_idx];
                 if (task_obj.type == msgpack::type::ARRAY &&
                     task_obj.via.array.size == 3) {
+                    if (task_obj.via.array.ptr[0].type != msgpack::type::STR ||
+                        task_obj.via.array.ptr[1].type != msgpack::type::STR) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments offloading task "
+                            "fields are not strings"));
+                    }
+                    if (!IsMsgpackInteger(task_obj.via.array.ptr[2])) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments offloading task "
+                            "size is not integer"));
+                    }
                     OffloadTaskItem task;
                     task.tenant_id =
                         task_obj.via.array.ptr[0].as<std::string>();
@@ -955,6 +973,12 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 } else {
                     // Backward compatibility for snapshots whose
                     // offloading_objects value was key -> size.
+                    if (!IsMsgpackInteger(task_obj)) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments legacy "
+                            "offloading size is not integer"));
+                    }
                     auto [tenant_id, user_key] =
                         ParseTenantScopedStorageKey(key);
                     segment->offloading_objects[key] =
