@@ -943,7 +943,11 @@ impl RouteDirectory for EmbeddedWrhRouteDirectory {
         if !resolved.iter().all(|r| *r) {
             let fallback_candidates = {
                 let mut baseline = self.baseline.lock();
-                if baseline.created_at.elapsed() >= BASELINE_TTL {
+                let has_removed_members = baseline
+                    .member_ids
+                    .iter()
+                    .any(|id| !candidates.iter().any(|c| c.runtime.stable_id.0 == *id));
+                if baseline.created_at.elapsed() >= BASELINE_TTL || has_removed_members {
                     baseline.member_ids = candidates
                         .iter()
                         .map(|c| c.runtime.stable_id.0.clone())
