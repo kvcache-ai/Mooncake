@@ -143,15 +143,14 @@ def test_full_tensor_roundtrip(store, tenant):
 
 
 def test_tp_shard_exact_match(store, tenant):
-    """Write TP=4 shards, read back with exact same TP=4."""
+    """Write TP=4 shards (auto-sliced from full), read back with exact same TP=4."""
     full_weight = generate_weight([256, 128], seed=3)
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_tp_exact.weight", shard, parallelism=par, tenant=tenant
+            "test_tp_exact.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(tp_size):
@@ -187,10 +186,9 @@ def test_tp_split_4to8(store, tenant):
     rollouter_tp = 8
 
     for rank in range(trainer_tp):
-        shard = compute_tp_shard(full_weight, rank, trainer_tp)
         par = TensorParallelism([TP(rank, trainer_tp)])
         store.put_tensor_with_parallelism(
-            "test_split.weight", shard, parallelism=par, tenant=tenant
+            "test_split.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(rollouter_tp):
@@ -211,10 +209,9 @@ def test_tp_merge_8to4(store, tenant):
     rollouter_tp = 4
 
     for rank in range(trainer_tp):
-        shard = compute_tp_shard(full_weight, rank, trainer_tp)
         par = TensorParallelism([TP(rank, trainer_tp)])
         store.put_tensor_with_parallelism(
-            "test_merge.weight", shard, parallelism=par, tenant=tenant
+            "test_merge.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(rollouter_tp):
@@ -229,15 +226,14 @@ def test_tp_merge_8to4(store, tenant):
 
 
 def test_full_reconstruction(store, tenant):
-    """Write TP=4 shards, reconstruct full tensor with ReadTarget(FULL)."""
+    """Write TP=4 shards (auto-sliced), reconstruct full tensor with ReadTarget(FULL)."""
     full_weight = generate_weight([128, 64], seed=7)
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_full_recon.weight", shard, parallelism=par, tenant=tenant
+            "test_full_recon.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     result = store.get_tensor_with_parallelism(
@@ -249,7 +245,7 @@ def test_full_reconstruction(store, tenant):
 
 
 def test_dp_tp_shard_roundtrip(store, tenant):
-    """Write DP=2 TP=4 shards, read back with exact match.
+    """Write DP=2 TP=4 shards (auto-sliced from full), read back with exact match.
 
     Note: all DP ranks store the same TP shard data here because this test
     validates multi-axis key naming and retrieval, not DP data semantics.
@@ -260,10 +256,9 @@ def test_dp_tp_shard_roundtrip(store, tenant):
 
     for dp_rank in range(dp_size):
         for tp_rank in range(tp_size):
-            shard = compute_tp_shard(full_weight, tp_rank, tp_size)
             par = TensorParallelism([DP(dp_rank, dp_size), TP(tp_rank, tp_size)])
             store.put_tensor_with_parallelism(
-                "test_dp_tp.weight", shard, parallelism=par, tenant=tenant
+                "test_dp_tp.weight", full_weight, parallelism=par, tenant=tenant
             )
 
     for dp_rank in range(dp_size):
@@ -291,7 +286,7 @@ def test_dp_tp_key_format(store, tenant):
 
 
 def test_upsert_overwrites(store, tenant):
-    """Upsert should overwrite existing data."""
+    """Upsert should overwrite existing data (auto-sliced from full)."""
     weight_v1 = generate_weight([32, 16], seed=10)
     weight_v2 = generate_weight([32, 16], seed=11)
     par = TensorParallelism([TP(0, 2)])
@@ -308,7 +303,8 @@ def test_upsert_overwrites(store, tenant):
         target=ReadTarget(READ_MODE_SHARD, parallelism=par),
         tenant=tenant,
     )
-    assert_tensor_equal(result, weight_v2, "upsert should be v2")
+    expected = compute_tp_shard(weight_v2, 0, 2)
+    assert_tensor_equal(result, expected, "upsert should be v2 shard")
 
 
 def test_shard_read_into_buffer(store, allocator, tenant):
@@ -317,10 +313,9 @@ def test_shard_read_into_buffer(store, allocator, tenant):
     tp_size = 2
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_into_buf.weight", shard, parallelism=par, tenant=tenant
+            "test_into_buf.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     shard_0 = compute_tp_shard(full_weight, 0, tp_size)
@@ -382,10 +377,9 @@ def test_rl_weight_sync_e2e(store, tenant):
     trainer_tp = 4
 
     for tp_rank in range(trainer_tp):
-        shard = compute_tp_shard(full_weight, tp_rank, trainer_tp)
         par = TensorParallelism([TP(tp_rank, trainer_tp)])
         store.put_tensor_with_parallelism(
-            "rl_sync.layers.0.weight", shard, parallelism=par, tenant=tenant
+            "rl_sync.layers.0.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     # Rollouter: TP=8 reads (split)
@@ -430,11 +424,10 @@ def test_rl_weight_sync_multi_layer(store, tenant):
     for layer_idx, shape in enumerate(shapes):
         weight = generate_weight(shape, seed=100 + layer_idx)
         for tp_rank in range(trainer_tp):
-            shard = compute_tp_shard(weight, tp_rank, trainer_tp)
             par = TensorParallelism([TP(tp_rank, trainer_tp)])
             store.put_tensor_with_parallelism(
                 f"multi_layer.layers.{layer_idx}.weight",
-                shard,
+                weight,
                 parallelism=par,
                 tenant=tenant,
             )
@@ -463,10 +456,9 @@ def test_tp_split_dim1(store, tenant):
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size, split_dim=1)
         par = TensorParallelism([TP(rank, tp_size, split_dim=1)])
         store.put_tensor_with_parallelism(
-            "test_sd1.weight", shard, parallelism=par, tenant=tenant
+            "test_sd1.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(tp_size):
@@ -481,20 +473,20 @@ def test_tp_split_dim1(store, tenant):
 
 
 def test_dtype_bfloat16(store, tenant):
-    """bfloat16 tensor round-trip through parallelism API."""
+    """bfloat16 tensor round-trip through parallelism API (auto-sliced)."""
     gen = torch.Generator().manual_seed(21)
     weight = torch.randn([64, 32], dtype=torch.bfloat16, generator=gen)
     par = TensorParallelism([TP(0, 2)])
-    shard = compute_tp_shard(weight, 0, 2)
     store.put_tensor_with_parallelism(
-        "test_bf16.weight", shard, parallelism=par, tenant=tenant
+        "test_bf16.weight", weight, parallelism=par, tenant=tenant
     )
     result = store.get_tensor_with_parallelism(
         "test_bf16.weight",
         target=ReadTarget(READ_MODE_SHARD, parallelism=par),
         tenant=tenant,
     )
-    assert_tensor_equal(result, shard, "bfloat16 roundtrip")
+    expected = compute_tp_shard(weight, 0, 2)
+    assert_tensor_equal(result, expected, "bfloat16 roundtrip")
 
 
 def test_dtype_float16(store, tenant):
@@ -513,15 +505,14 @@ def test_dtype_float16(store, tenant):
 
 
 def test_1d_tensor_tp(store, tenant):
-    """1D tensor [1024] with TP=4 sharding."""
+    """1D tensor [1024] with TP=4 sharding (auto-sliced)."""
     full_weight = generate_weight([1024], seed=23)
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_1d.weight", shard, parallelism=par, tenant=tenant
+            "test_1d.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(tp_size):
@@ -608,10 +599,9 @@ def test_tp_split_2to16(store, tenant):
     reader_tp = 16
 
     for rank in range(writer_tp):
-        shard = compute_tp_shard(full_weight, rank, writer_tp)
         par = TensorParallelism([TP(rank, writer_tp)])
         store.put_tensor_with_parallelism(
-            "test_2to16.weight", shard, parallelism=par, tenant=tenant
+            "test_2to16.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(reader_tp):
@@ -652,10 +642,9 @@ def test_tp_split_dim1_cross_tp(store, tenant):
     reader_tp = 4
 
     for rank in range(writer_tp):
-        shard = compute_tp_shard(full_weight, rank, writer_tp, split_dim=1)
         par = TensorParallelism([TP(rank, writer_tp, split_dim=1)])
         store.put_tensor_with_parallelism(
-            "test_sd1_cross.weight", shard, parallelism=par, tenant=tenant
+            "test_sd1_cross.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(reader_tp):
@@ -676,10 +665,9 @@ def test_tp_split_dim1_merge_cross_tp(store, tenant):
     reader_tp = 2
 
     for rank in range(writer_tp):
-        shard = compute_tp_shard(full_weight, rank, writer_tp, split_dim=1)
         par = TensorParallelism([TP(rank, writer_tp, split_dim=1)])
         store.put_tensor_with_parallelism(
-            "test_sd1_merge.weight", shard, parallelism=par, tenant=tenant
+            "test_sd1_merge.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     for rank in range(reader_tp):
@@ -699,10 +687,9 @@ def test_tp_split_dim1_full_reconstruction(store, tenant):
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size, split_dim=1)
         par = TensorParallelism([TP(rank, tp_size, split_dim=1)])
         store.put_tensor_with_parallelism(
-            "test_sd1_full.weight", shard, parallelism=par, tenant=tenant
+            "test_sd1_full.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     result = store.get_tensor_with_parallelism(
@@ -714,16 +701,15 @@ def test_tp_split_dim1_full_reconstruction(store, tenant):
 
 
 def test_writer_partition_roundtrip(store, tenant):
-    """Writer partition: 4 writers each put their shard, reader gets FULL."""
+    """Writer partition: 4 writers each put full tensor (auto-sliced), reader gets FULL."""
     full_weight = generate_weight([256, 128], seed=40)
     num_writers = 4
     split_dim = 0
 
     for rank in range(num_writers):
-        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
         store.put_tensor_with_parallelism(
             "test_wp_rt.weight",
-            shard,
+            full_weight,
             writer_partition=(rank, num_writers, split_dim),
             tenant=tenant,
         )
@@ -743,10 +729,9 @@ def test_writer_partition_to_tp_read(store, tenant):
     split_dim = 0
 
     for rank in range(num_writers):
-        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
         store.put_tensor_with_parallelism(
             "test_wp_tp.weight",
-            shard,
+            full_weight,
             writer_partition=(rank, num_writers, split_dim),
             tenant=tenant,
         )
@@ -770,10 +755,9 @@ def test_writer_partition_split_dim1(store, tenant):
     split_dim = 1
 
     for rank in range(num_writers):
-        shard = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
         store.put_tensor_with_parallelism(
             "test_wp_sd1.weight",
-            shard,
+            full_weight,
             writer_partition=(rank, num_writers, split_dim),
             tenant=tenant,
         )
@@ -787,26 +771,24 @@ def test_writer_partition_split_dim1(store, tenant):
 
 
 def test_writer_partition_upsert(store, tenant):
-    """Upsert correctness for writer_partition."""
+    """Upsert correctness for writer_partition (auto-sliced)."""
     weight_v1 = generate_weight([64, 32], seed=43)
     weight_v2 = generate_weight([64, 32], seed=44)
     num_writers = 2
     split_dim = 0
 
     for rank in range(num_writers):
-        shard = compute_tp_shard(weight_v1, rank, num_writers, split_dim=split_dim)
         store.put_tensor_with_parallelism(
             "test_wp_upsert.weight",
-            shard,
+            weight_v1,
             writer_partition=(rank, num_writers, split_dim),
             tenant=tenant,
         )
 
     for rank in range(num_writers):
-        shard = compute_tp_shard(weight_v2, rank, num_writers, split_dim=split_dim)
         store.upsert_tensor_with_parallelism(
             "test_wp_upsert.weight",
-            shard,
+            weight_v2,
             writer_partition=(rank, num_writers, split_dim),
             tenant=tenant,
         )
@@ -870,15 +852,15 @@ def build_raw_buffer(tensor: torch.Tensor) -> tuple:
 
 
 def test_batch_put_get_tp(store, tenant):
-    """Batch put 3 TP shards + batch get them back."""
+    """Batch put full tensors (auto-sliced) + batch get shards back."""
     full_weight = generate_weight([128, 64], seed=50)
     tp_size = 4
     keys = ["batch_tp.weight"] * tp_size
-    shards = [compute_tp_shard(full_weight, r, tp_size) for r in range(tp_size)]
+    tensors = [full_weight] * tp_size
     pars = [TensorParallelism([TP(r, tp_size)]) for r in range(tp_size)]
 
     store.batch_put_tensor_with_parallelism(
-        keys, shards, parallelisms=pars, tenant=tenant
+        keys, tensors, parallelisms=pars, tenant=tenant
     )
 
     targets = [ReadTarget(READ_MODE_SHARD, parallelism=p) for p in pars]
@@ -887,19 +869,20 @@ def test_batch_put_get_tp(store, tenant):
     )
     assert len(results) == tp_size, f"expected {tp_size} results, got {len(results)}"
     for rank in range(tp_size):
-        assert_tensor_equal(results[rank], shards[rank], f"batch tp rank {rank}")
+        expected = compute_tp_shard(full_weight, rank, tp_size)
+        assert_tensor_equal(results[rank], expected, f"batch tp rank {rank}")
 
 
 def test_batch_put_get_writer_partition(store, tenant):
-    """Batch put via writer_partitions, read back via batch_get FULL."""
+    """Batch put via writer_partitions (auto-sliced), read back via batch_get FULL."""
     full_weight = generate_weight([128, 64], seed=51)
     num_writers = 4
     keys = ["batch_wp.weight"] * num_writers
-    shards = [compute_tp_shard(full_weight, r, num_writers) for r in range(num_writers)]
+    tensors = [full_weight] * num_writers
     wps = [(r, num_writers, 0) for r in range(num_writers)]
 
     store.batch_put_tensor_with_parallelism(
-        keys, shards, writer_partitions=wps, tenant=tenant
+        keys, tensors, writer_partitions=wps, tenant=tenant
     )
 
     result = store.get_tensor_with_parallelism(
@@ -911,20 +894,20 @@ def test_batch_put_get_writer_partition(store, tenant):
 
 
 def test_batch_upsert(store, tenant):
-    """Batch upsert overwrites previously written data."""
+    """Batch upsert overwrites previously written data (auto-sliced)."""
     weight_v1 = generate_weight([64, 32], seed=52)
     weight_v2 = generate_weight([64, 32], seed=53)
     tp_size = 2
     keys = ["batch_upsert.weight"] * tp_size
-    shards_v1 = [compute_tp_shard(weight_v1, r, tp_size) for r in range(tp_size)]
-    shards_v2 = [compute_tp_shard(weight_v2, r, tp_size) for r in range(tp_size)]
+    tensors_v1 = [weight_v1] * tp_size
+    tensors_v2 = [weight_v2] * tp_size
     pars = [TensorParallelism([TP(r, tp_size)]) for r in range(tp_size)]
 
     store.batch_put_tensor_with_parallelism(
-        keys, shards_v1, parallelisms=pars, tenant=tenant
+        keys, tensors_v1, parallelisms=pars, tenant=tenant
     )
     store.batch_upsert_tensor_with_parallelism(
-        keys, shards_v2, parallelisms=pars, tenant=tenant
+        keys, tensors_v2, parallelisms=pars, tenant=tenant
     )
 
     targets = [ReadTarget(READ_MODE_SHARD, parallelism=p) for p in pars]
@@ -932,7 +915,8 @@ def test_batch_upsert(store, tenant):
         keys, targets=targets, tenant=tenant
     )
     for rank in range(tp_size):
-        assert_tensor_equal(results[rank], shards_v2[rank], f"batch upsert rank {rank}")
+        expected = compute_tp_shard(weight_v2, rank, tp_size)
+        assert_tensor_equal(results[rank], expected, f"batch upsert rank {rank}")
 
 
 def test_batch_mixed_routing_rejected(store, tenant):
@@ -999,10 +983,9 @@ def test_parallelism_manifest_discovery(store, tenant):
     tp_size = 4
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_par_manifest.weight", shard, parallelism=par, tenant=tenant
+            "test_par_manifest.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     manifest_raw = store.get(
@@ -1058,10 +1041,9 @@ def test_batch_get_into_tp(store, allocator, tenant):
     tp_size = 2
 
     for rank in range(tp_size):
-        shard = compute_tp_shard(full_weight, rank, tp_size)
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism(
-            "test_batch_into.weight", shard, parallelism=par, tenant=tenant
+            "test_batch_into.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     shard_0 = compute_tp_shard(full_weight, 0, tp_size)
@@ -1105,10 +1087,9 @@ def test_batch_get_cross_tp_reconstruction(store, tenant):
     reader_tp = 4
 
     for rank in range(writer_tp):
-        shard = compute_tp_shard(full_weight, rank, writer_tp)
         par = TensorParallelism([TP(rank, writer_tp)])
         store.put_tensor_with_parallelism(
-            "test_batch_cross.weight", shard, parallelism=par, tenant=tenant
+            "test_batch_cross.weight", full_weight, parallelism=par, tenant=tenant
         )
 
     keys = ["test_batch_cross.weight"] * reader_tp
@@ -1148,6 +1129,90 @@ def test_batch_from_put_get(store, tenant):
         )
         assert_tensor_equal(result, weights[i], f"batch_from key {i}")
     del buf_refs
+
+
+def test_uniform_shard_validation(store, tenant):
+    """Non-uniform shard request should be rejected."""
+    weight = generate_weight([30, 16], seed=70)
+    par = TensorParallelism([TP(0, 4)])  # 30 not divisible by 4
+    try:
+        store.put_tensor_with_parallelism(
+            "test_uniform_reject.weight", weight, parallelism=par, tenant=tenant
+        )
+        raise AssertionError("should have raised for non-uniform shard")
+    except ValueError:
+        pass
+
+
+def test_writer_partition_shortcut_read(store, tenant):
+    """Write via writer_partition, read via TP shard with same size (shortcut path)."""
+    full_weight = generate_weight([128, 64], seed=71)
+    num_writers = 4
+    split_dim = 0
+
+    for rank in range(num_writers):
+        store.put_tensor_with_parallelism(
+            "test_wp_shortcut.weight",
+            full_weight,
+            writer_partition=(rank, num_writers, split_dim),
+            tenant=tenant,
+        )
+
+    for rank in range(num_writers):
+        par = TensorParallelism([TP(rank, num_writers)])
+        result = store.get_tensor_with_parallelism(
+            "test_wp_shortcut.weight",
+            target=ReadTarget(READ_MODE_SHARD, parallelism=par),
+            tenant=tenant,
+        )
+        expected = compute_tp_shard(full_weight, rank, num_writers, split_dim=split_dim)
+        assert_tensor_equal(result, expected, f"wp shortcut rank {rank}")
+
+
+def test_from_put_with_parallelism(store, tenant):
+    """put_tensor_with_parallelism_from with TP auto-slicing from raw buffer."""
+    full_weight = generate_weight([64, 32], seed=72)
+    buf_ptr, buf_size, buf_ref = build_raw_buffer(full_weight)
+    tp_size = 2
+
+    for rank in range(tp_size):
+        par = TensorParallelism([TP(rank, tp_size)])
+        store.put_tensor_with_parallelism_from(
+            "test_from_tp.weight", buf_ptr, buf_size,
+            parallelism=par, tenant=tenant
+        )
+
+    for rank in range(tp_size):
+        par = TensorParallelism([TP(rank, tp_size)])
+        result = store.get_tensor_with_parallelism(
+            "test_from_tp.weight",
+            target=ReadTarget(READ_MODE_SHARD, parallelism=par),
+            tenant=tenant,
+        )
+        expected = compute_tp_shard(full_weight, rank, tp_size)
+        assert_tensor_equal(result, expected, f"from tp rank {rank}")
+    del buf_ref
+
+
+def test_from_put_with_writer_partition(store, tenant):
+    """put_tensor_with_parallelism_from with writer_partition auto-slicing."""
+    full_weight = generate_weight([64, 32], seed=73)
+    buf_ptr, buf_size, buf_ref = build_raw_buffer(full_weight)
+    num_writers = 2
+
+    for rank in range(num_writers):
+        store.put_tensor_with_parallelism_from(
+            "test_from_wp.weight", buf_ptr, buf_size,
+            writer_partition=(rank, num_writers, 0), tenant=tenant
+        )
+
+    result = store.get_tensor_with_parallelism(
+        "test_from_wp.weight",
+        target=ReadTarget(READ_MODE_FULL),
+        tenant=tenant,
+    )
+    assert_tensor_equal(result, full_weight, "from wp full roundtrip")
+    del buf_ref
 
 
 def main():
@@ -1252,6 +1317,14 @@ def main():
 
     print("\n  --- Batch into buffer ---")
     run_test("batch get into tp", test_batch_get_into_tp, store, allocator, tenant)
+
+    print("\n  --- Auto-slicing validation ---")
+    run_test("uniform shard validation", test_uniform_shard_validation, store, tenant)
+    run_test("writer partition shortcut read", test_writer_partition_shortcut_read, store, tenant)
+
+    print("\n  --- _from with parallelism ---")
+    run_test("from put with tp", test_from_put_with_parallelism, store, tenant)
+    run_test("from put with writer_partition", test_from_put_with_writer_partition, store, tenant)
 
     store.close()
 
