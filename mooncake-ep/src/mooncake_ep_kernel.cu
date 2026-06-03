@@ -26,15 +26,13 @@ using mooncake::device::mc_ld_acquire;
 using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
 
+template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 #ifdef MOONCAKE_EP_USE_MUSA
-template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ void
-dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #else
-template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
-dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #endif
+dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
          void* mxa_buffer,
@@ -49,11 +47,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int64_t timeout_ticks,
-         int phases
-#ifdef MOONCAKE_EP_USE_MUSA
-         , int expert_group_offset
-#endif
-         ) {
+         int phases) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -62,11 +56,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
-#ifdef MOONCAKE_EP_USE_MUSA
-    const auto responsible_expert_idx = expert_group_offset + warp_group_id;
-#else
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
-#endif
 
     // FP8 staffs
     constexpr int kNumPerChannels = 128;
@@ -115,11 +105,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
             // Overlap top-k index read and source token index write
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
-#ifdef MOONCAKE_EP_USE_MUSA
-            // Single-block: only process experts in this expert group
-            if (dst_expert_idx >= 0 && (dst_expert_idx < expert_group_offset || dst_expert_idx >= expert_group_offset + kNumWarpGroups))
-                dst_expert_idx = -1;
-#endif
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
             // FP8 cast
@@ -207,47 +192,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     } else if (warp_id == num_warps - 1) {
-#ifdef MOONCAKE_EP_USE_MUSA
-        // Single-block: only SM 0 exists, cleanup only on first expert group
-        if (expert_group_offset == 0) {
-            #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
-                next_clean_buffer[i] = 0;
-        }
-
-        // Notify before executing `int_p`
-        // Only add FINISHED_SUM_TAG to experts in this group
-        __syncwarp();
-        #pragma unroll
-        for (int i = lane_id; i < kNumWarpGroups; i += 32) {
-            int expert_idx = expert_group_offset + i;
-            if (expert_idx < num_experts)
-                mc_atomic_add_release(atomic_finish_counter_per_expert + expert_idx, FINISHED_SUM_TAG);
-        }
-
-        // This SM should be responsible for some destination experts, read `topk_idx` for them
-        int expert_count[kNumWarpGroups] = {0};
-        const auto expert_begin_idx = expert_group_offset;
-        const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
-
-        // Per lane count
-        #pragma unroll 8
-        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
-            auto idx = static_cast<int>(__ldg(topk_idx + i));
-            if (idx >= expert_begin_idx and idx < expert_end_idx)
-                expert_count[idx - expert_begin_idx] ++;
-        }
-
-        // Warp reduce
-        #pragma unroll
-        for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
-            auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
-            if (lane_id == 0) {
-                shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
-            }
-        }
-#else
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
@@ -284,7 +228,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
             }
         }
-#endif
     }
     __syncthreads();
 
@@ -292,11 +235,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
         const auto dst_rank = responsible_expert_idx / num_local_experts;
         const auto dst_expert_local_idx = responsible_expert_idx % num_local_experts;
-#ifdef MOONCAKE_EP_USE_MUSA
-        const auto num_tokens_sent = shared_num_tokens_sent_per_expert[warp_group_id];
-#else
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
-#endif
 
         // Wait local sends issued and send expert counts
         while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
@@ -453,13 +392,13 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 #endif
 
 #ifdef MOONCAKE_EP_USE_MUSA
-// Single-block: split send/recv phases to avoid interleaving deadlock.
-// All ranks complete all sends before any rank starts recv.
+// Multi-block: split send/recv phases with device sync between them.
+// This tests whether MUSA IPC supports concurrent multi-block writes
+// to peer memory (with proper fences).
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
                                dispatch<false, kNumWarpGroups, kNumWarpsPerGroup, hidden>; \
 if (phases & LOW_LATENCY_SEND_PHASE) { \
-for (int eg = 0; eg < num_experts; eg += kNumWarpGroups) { \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
@@ -475,11 +414,10 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, \
-              LOW_LATENCY_SEND_PHASE, eg); \
+              LOW_LATENCY_SEND_PHASE); \
 musaDeviceSynchronize(); \
-} } \
+} \
 if (phases & LOW_LATENCY_RECV_PHASE) { \
-for (int eg = 0; eg < num_experts; eg += kNumWarpGroups) { \
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
@@ -495,12 +433,12 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, timeout_ticks, \
-              LOW_LATENCY_RECV_PHASE, eg); \
+              LOW_LATENCY_RECV_PHASE); \
 musaDeviceSynchronize(); \
-} } \
+} \
 } break
 
-    SETUP_LAUNCH_CONFIG(1, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
 #else
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup, hidden> : \
@@ -548,11 +486,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int64_t timeout_ticks,
-        int phases, bool zero_copy
-#ifdef MOONCAKE_EP_USE_MUSA
-        , int expert_group_offset
-#endif
-        ) {
+        int phases, bool zero_copy) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -561,11 +495,7 @@ combine(void* combined_x, int32_t* active_ranks,
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
-#ifdef MOONCAKE_EP_USE_MUSA
-    const auto responsible_expert_idx = expert_group_offset + warp_group_id;
-#else
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
-#endif
 
     // Data type staffs
     constexpr int kNumElemsPerInt4 = sizeof(int4) / sizeof(nv_bfloat16);
@@ -589,13 +519,8 @@ combine(void* combined_x, int32_t* active_ranks,
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
 
-#ifdef MOONCAKE_EP_USE_MUSA
-    // Clean up next buffer (only on first expert group)
-    if (warp_group_id == 0 and sub_warp_id == 0 and expert_group_offset == 0) {
-#else
     // Clean up next buffer
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
-#endif
         #pragma unroll
         for (int i = lane_id; i < num_experts; i += 32)
             next_clean_buffer[i] = 0;
@@ -787,11 +712,10 @@ void combine(void* combined_x, int32_t* active_ranks,
     EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
 #ifdef MOONCAKE_EP_USE_MUSA
-// Single-block: do all sends first, then all recvs, to avoid interleaving deadlock
+// Multi-block: split send/recv phases with device sync between them.
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 if (phases & LOW_LATENCY_SEND_PHASE) { \
-for (int eg = 0; eg < num_experts; eg += kNumWarpGroups) { \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, active_ranks, \
               mxa_buffer, \
@@ -806,11 +730,10 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, LOW_LATENCY_SEND_PHASE, zero_copy, eg); \
+              timeout_ticks, LOW_LATENCY_SEND_PHASE, zero_copy); \
 musaDeviceSynchronize(); \
-} } \
+} \
 if (phases & LOW_LATENCY_RECV_PHASE) { \
-for (int eg = 0; eg < num_experts; eg += kNumWarpGroups) { \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, active_ranks, \
               mxa_buffer, \
@@ -825,12 +748,12 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, LOW_LATENCY_RECV_PHASE, zero_copy, eg); \
+              timeout_ticks, LOW_LATENCY_RECV_PHASE, zero_copy); \
 musaDeviceSynchronize(); \
-} } \
+} \
 } break
 
-    SETUP_LAUNCH_CONFIG(1, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
 #else
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
