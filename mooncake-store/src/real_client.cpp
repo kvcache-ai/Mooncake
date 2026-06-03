@@ -603,6 +603,19 @@ long RealClient::removeAllLocal() {
     return to_py_ret(removeAllLocal_internal());
 }
 
+tl::expected<void, ErrorCode> RealClient::removeLocal_internal(
+    const std::string& key) {
+    if (!client_service_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_service_->RemoveLocal(key);
+}
+
+int RealClient::removeLocal(const std::string& key) {
+    return to_py_ret(removeLocal_internal(key));
+}
+
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string& key) {
     if (!client_service_) {

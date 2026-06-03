@@ -100,6 +100,8 @@ class PyClient {
 
     virtual long removeAllLocal() = 0;
 
+    virtual int removeLocal(const std::string& key) = 0;
+
     virtual int isExist(const std::string& key) = 0;
 
     virtual std::vector<int> batchIsExist(

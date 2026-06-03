@@ -250,6 +250,8 @@ class RealClient : public PyClient {
 
     long removeAllLocal() override;
 
+    int removeLocal(const std::string& key) override;
+
     int tearDownAll() override;
 
     /**
@@ -428,6 +430,8 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAllLocal_internal();
+
+    tl::expected<void, ErrorCode> removeLocal_internal(const std::string& key);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 

@@ -48,21 +48,33 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
 }
 
 ClientService::ClientService(const std::string& metadata_connstring,
-                             uint16_t metrics_port, bool enable_metrics_http,
+                             uint16_t http_port, bool enable_http_server,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
       metadata_connstring_(metadata_connstring),
-      metrics_port_(metrics_port),
-      enable_metrics_http_(enable_metrics_http) {
+      http_port_(http_port) {
     LOG(INFO) << "client_id=" << client_id_;
-    metrics_port_ = StartMetricsHttpServer(enable_metrics_http_, metrics_port_);
+    if (enable_http_server) {
+        try {
+            http_server_ =
+                std::make_unique<coro_http::coro_http_server>(1, http_port_);
+            LOG(INFO) << "Client HTTP server created on port " << http_port_;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to create client HTTP server: " << e.what();
+            http_server_.reset();
+            http_port_ = 0;
+        }
+    } else {
+        LOG(INFO) << "Client HTTP server disabled";
+        http_port_ = 0;
+    }
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
-        config.metadata_connstring, config.protocol, config.metrics_port,
-        config.enable_metrics_http, config.labels);
+        config.metadata_connstring, config.protocol, config.http_port,
+        config.enable_http_server, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -77,8 +89,8 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
-        config.metadata_connstring, config.metrics_port,
-        config.enable_metrics_http, config.labels);
+        config.metadata_connstring, config.http_port, config.enable_http_server,
+        config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -96,7 +108,7 @@ ClientService::~ClientService() {
 }
 
 void ClientService::Stop() {
-    StopMetricsHttpServer();
+    StopHttpServer();
     StopHeartbeat();
 }
 
@@ -710,82 +722,69 @@ bool ClientService::ReconnectToMaster(bool is_ha_mode,
     }
 }
 
-uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
-                                               uint16_t metrics_port) {
-    // Check if metrics HTTP is disabled
-    if (!enable_metrics_http) {
-        LOG(INFO) << "Client metrics HTTP server disabled";
-        return 0;
-    }
+void ClientService::RegisterHttpMethods() {
+    if (!http_server_) return;
 
+    using namespace coro_http;
+
+    // Prometheus-style metrics endpoint
+    http_server_->set_http_handler<GET>(
+        "/metrics", [this](coro_http_request& req, coro_http_response& resp) {
+            ClientMetric* metrics = GetMetrics();
+            if (!metrics) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "Metrics not available");
+                return;
+            }
+            std::string metrics_str;
+            metrics->serialize(metrics_str);
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok,
+                                        std::move(metrics_str));
+        });
+
+    // Human-readable summary endpoint
+    http_server_->set_http_handler<GET>(
+        "/metrics/summary",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            ClientMetric* metrics = GetMetrics();
+            if (!metrics) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "Metrics not available");
+                return;
+            }
+            std::string summary = metrics->summary_metrics();
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(summary));
+        });
+
+    // Health check endpoint
+    http_server_->set_http_handler<GET>(
+        "/health", [this](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, GetHealthStatus());
+        });
+}
+
+void ClientService::StartHttpServer() {
+    if (!http_server_) return;
     try {
-        // Create HTTP server with 1 thread for metrics
-        metrics_http_server_ =
-            std::make_unique<coro_http::coro_http_server>(1, metrics_port);
-
-        using namespace coro_http;
-
-        // Prometheus-style metrics endpoint
-        metrics_http_server_->set_http_handler<GET>(
-            "/metrics",
-            [this](coro_http_request& req, coro_http_response& resp) {
-                ClientMetric* metrics = GetMetrics();
-                if (!metrics) {
-                    resp.set_status_and_content(
-                        status_type::service_unavailable,
-                        "Metrics not available");
-                    return;
-                }
-                std::string metrics_str;
-                metrics->serialize(metrics_str);
-                resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::ok,
-                                            std::move(metrics_str));
-            });
-
-        // Human-readable summary endpoint
-        metrics_http_server_->set_http_handler<GET>(
-            "/metrics/summary",
-            [this](coro_http_request& req, coro_http_response& resp) {
-                ClientMetric* metrics = GetMetrics();
-                if (!metrics) {
-                    resp.set_status_and_content(
-                        status_type::service_unavailable,
-                        "Metrics not available");
-                    return;
-                }
-                std::string summary = metrics->summary_metrics();
-                resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::ok,
-                                            std::move(summary));
-            });
-
-        // Health check endpoint
-        metrics_http_server_->set_http_handler<GET>(
-            "/health",
-            [this](coro_http_request& req, coro_http_response& resp) {
-                resp.add_header("Content-Type", "text/plain; version=0.0.4");
-                resp.set_status_and_content(status_type::ok, GetHealthStatus());
-            });
-
-        metrics_http_server_->async_start();
-        uint16_t actual_port = metrics_http_server_->port();
-        LOG(INFO) << "Client metrics HTTP server started on port "
-                  << actual_port;
-        return actual_port;
+        RegisterHttpMethods();
+        http_server_->async_start();
+        http_port_ = http_server_->port();
+        LOG(INFO) << "Client HTTP server started on port " << http_port_;
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to start client metrics HTTP server: "
-                   << e.what();
-        return 0;
+        LOG(ERROR) << "Failed to start client HTTP server: " << e.what();
+        http_server_.reset();
+        http_port_ = 0;
     }
 }
 
-void ClientService::StopMetricsHttpServer() {
-    if (metrics_http_server_) {
-        LOG(INFO) << "Stopping client metrics HTTP server on port "
-                  << metrics_port_;
-        metrics_http_server_->stop();
-        metrics_http_server_.reset();
+void ClientService::StopHttpServer() {
+    if (http_server_) {
+        LOG(INFO) << "Stopping client HTTP server on port " << http_port_;
+        http_server_->stop();
+        http_server_.reset();
     }
 }
 

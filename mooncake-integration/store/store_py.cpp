@@ -1164,7 +1164,7 @@ PYBIND11_MODULE(store, m) {
                uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
                const std::string& local_transfer_mode = "te",
                size_t local_memcpy_async_worker_num = 32,
-               uint16_t metrics_port = 9003, bool enable_metrics_http = true,
+               uint16_t http_port = 9003, bool enable_http_server = true,
                size_t async_sender_thread_count = 0,
                size_t async_max_batch_size = 2000,
                size_t async_route_queue_size = 0,
@@ -1190,7 +1190,7 @@ PYBIND11_MODULE(store, m) {
                     client_rpc_thread_num, lock_shard_count,
                     route_cache_max_memory, route_cache_ttl_ms,
                     local_transfer_mode, local_memcpy_async_worker_num,
-                    metrics_port, enable_metrics_http, {},
+                    http_port, enable_http_server, {},
                     async_sender_thread_count, async_max_batch_size,
                     async_route_queue_size, p2p_key_lease_duration_ms,
                     p2p_key_lease_scan_interval_ms,
@@ -1209,8 +1209,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("route_cache_ttl_ms") = 5 * 60 * 1000,
             py::arg("local_transfer_mode") = "te",
             py::arg("local_memcpy_async_worker_num") = 32,
-            py::arg("metrics_port") = 9003,
-            py::arg("enable_metrics_http") = true,
+            py::arg("http_port") = 9003, py::arg("enable_http_server") = true,
             py::arg("async_sender_thread_count") = 0,
             py::arg("async_max_batch_size") = 2000,
             py::arg("async_route_queue_size") = 0,
@@ -1229,8 +1228,8 @@ PYBIND11_MODULE(store, m) {
                const std::string& rdma_devices = "",
                const std::string& master_server_addr = "127.0.0.1:50051",
                const py::object& engine = py::none(),
-               bool enable_offload = false, uint16_t metrics_port = 9003,
-               bool enable_metrics_http = true) {
+               bool enable_offload = false, uint16_t http_port = 9003,
+               bool enable_http_server = true) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1246,7 +1245,7 @@ PYBIND11_MODULE(store, m) {
                             : std::optional<std::string>(rdma_devices),
                         master_server_addr, global_segment_size,
                         local_buffer_size, transfer_engine, "", enable_offload,
-                        metrics_port, enable_metrics_http, {});
+                        http_port, enable_http_server, {});
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1255,8 +1254,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
-            py::arg("enable_offload") = false, py::arg("metrics_port") = 9003,
-            py::arg("enable_metrics_http") = true)
+            py::arg("enable_offload") = false, py::arg("http_port") = 9003,
+            py::arg("enable_http_server") = true)
         .def(
             "setup",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
@@ -1429,6 +1428,16 @@ PYBIND11_MODULE(store, m) {
             },
             "Remove all objects from THIS client's local tiered storage. Only "
             "supported in P2P deployment mode; returns NOT_IMPLEMENTED "
+            "otherwise.")
+        .def(
+            "remove_local",
+            [](MooncakeStorePyWrapper& self, const std::string& key) {
+                py::gil_scoped_release release;
+                return self.store_->removeLocal(key);
+            },
+            py::arg("key"),
+            "Remove a single object from THIS client's local tiered storage. "
+            "Only supported in P2P deployment mode; returns NOT_IMPLEMENTED "
             "otherwise.")
         .def("is_exist",
              [](MooncakeStorePyWrapper& self, const std::string& key) {
