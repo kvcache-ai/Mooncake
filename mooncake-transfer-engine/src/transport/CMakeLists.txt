@@ -73,7 +73,7 @@ if (USE_EFA)
   target_link_libraries(transport PRIVATE fabric)
 endif()
 
-if(USE_CUDA OR USE_MUSA)
+if(USE_CUDA OR USE_MUSA OR USE_MACA)
   add_subdirectory(device)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   target_link_libraries(transport PRIVATE ibgda)

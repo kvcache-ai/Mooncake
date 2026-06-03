@@ -14,6 +14,8 @@ abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+use_maca = bool(getattr(torch.version, "maca", None)) or \
+           bool(getattr(torch._C, "_MACA_VERSION", None))
 
 if use_musa:
     from torch_musa.utils.musa_extension import MUSAExtension
@@ -46,6 +48,25 @@ if use_musa:
     ]
     extra_compile_args = {"cxx": cxx_flags, "mcc": musa_flags}
     # Device transport symbols come from engine.so at runtime
+    extra_link_args = [
+        "-Wl,-rpath,$ORIGIN",
+        "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+        "-l:engine.so",
+    ]
+elif use_maca:
+    ExtensionClass = CUDAExtension
+    BuildClass = BuildExtension
+    libraries = ["glog"]
+    library_dirs = []
+    sources = [
+        "src/ep_py.cpp",
+        "src/mooncake_ep_buffer.cpp",
+        "src/mooncake_ep_kernel.cu",
+    ]
+    extra_compile_args = {
+        "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_MACA", "-std=c++20", "-O3", "-g0"],
+        "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_MACA", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+    }
     extra_link_args = [
         "-Wl,-rpath,$ORIGIN",
         "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),

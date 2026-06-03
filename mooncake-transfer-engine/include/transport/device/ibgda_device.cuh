@@ -80,10 +80,7 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
         if (opcode == 0xD)
             printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
                    qp->cq->timestamp >> 56);
-        if (!(opcode == 0x0 || opcode == 0xF)) {
-            printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
-            __trap();
-        }
+        if (!(opcode == 0x0 || opcode == 0xF)) __trap();
         wq_tail = mc_bswap16(cq_be) + 1;
     }
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;

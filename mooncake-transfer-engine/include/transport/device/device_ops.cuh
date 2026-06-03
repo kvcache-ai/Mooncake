@@ -7,6 +7,8 @@
 
 #ifdef MOONCAKE_EP_USE_MUSA
 #include "transport/device/musa/musa_ops.cuh"
+#elif defined(USE_MACA)
+#include "transport/device/maca/maca_ops.cuh"
 #else
 #include "transport/device/cuda/cuda_ops.cuh"
 #endif

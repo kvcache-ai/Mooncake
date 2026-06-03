@@ -48,6 +48,11 @@ if(WITH_TE)
                       transfer_engine/transfer_engine_py.cpp)
   set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
+  # EP/PG extensions link against engine.so and need C++ symbols from it.
+  # pybind11_add_module defaults to hidden visibility; override so those
+  # symbols are exported for dependent shared libraries.
+  set_target_properties(engine PROPERTIES CXX_VISIBILITY_PRESET "default")
+
   # Propagate EFA compile definition to engine target
   if(USE_EFA)
     target_compile_definitions(engine PRIVATE USE_EFA)

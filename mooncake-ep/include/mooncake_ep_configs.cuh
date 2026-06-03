@@ -62,6 +62,11 @@ __device__ __forceinline__ __nv_fp8x2_storage_t __nv_cvt_float2_to_fp8x2(float2,
                                                                          int) {
     return 0;
 }
+#elif defined(USE_MACA)
+#include "cuda_alike.h"
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #else
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
