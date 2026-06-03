@@ -1,8 +1,6 @@
-// mooncake_worker_host.cpp — Host-side code for MUSA PG build.
-// Compiled by g++ (not mcc). Uses kernel launch wrappers from
-// mooncake_worker_kernels.cuh instead of <<<>>> syntax.
-//
-// This file is the MUSA equivalent of the host portions of mooncake_worker.cu.
+// mooncake_worker_host.cpp — Host-side code for PG collectives.
+// Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
+// from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
 #include <mooncake_backend.h>
 #include <cstdio>
@@ -11,6 +9,9 @@
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 #include <mooncake_pg_gpu_utils.h>
+#ifndef MOONCAKE_EP_USE_MUSA
+#include <ATen/cuda/CUDAGraphsUtils.cuh>
+#endif
 
 #include "pg_utils.h"
 
@@ -52,8 +53,17 @@ class MooncakeWorkCuda : public ::c10d::Work {
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        bool submitted =
+        bool submitted = true;
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (at::cuda::currentStreamCaptureStatus() ==
+            c10::cuda::CaptureStatus::None) {
+            submitted =
+                worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+        }
+#else
+        submitted =
             worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+#endif
         if (!submitted) return false;
 
         auto current_stream = getCurrentGPUStream();
@@ -73,6 +83,15 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
+#ifndef MOONCAKE_EP_USE_MUSA
+        if (at::cuda::currentStreamCaptureStatus() !=
+            c10::cuda::CaptureStatus::None) {
+            auto current_stream = getCurrentGPUStream();
+            event_->block(current_stream);
+            return true;
+        }
+#endif
+
         if (timeout == kNoTimeout) {
             event_->synchronize();
             return true;
@@ -92,47 +111,51 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
-    auto musa_stream = (musaStream_t)stream;
+#ifdef MOONCAKE_EP_USE_MUSA
+    auto gpu_stream = (musaStream_t)stream;
+#else
+    auto gpu_stream = stream;
+#endif
 
     switch (dst.scalar_type()) {
         case c10::kByte:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     musa_stream);
+                                     gpu_stream);
             break;
         case c10::kChar:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
-                                    (int)op, activeRanks, musa_stream);
+                                    (int)op, activeRanks, gpu_stream);
             break;
         case c10::kShort:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     musa_stream);
+                                     gpu_stream);
             break;
         case c10::kInt:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
-                                     (int)op, activeRanks, musa_stream);
+                                     (int)op, activeRanks, gpu_stream);
             break;
         case c10::kLong:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     musa_stream);
+                                     gpu_stream);
             break;
         case c10::kFloat:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
-                                     (int)op, activeRanks, musa_stream);
+                                     (int)op, activeRanks, gpu_stream);
             break;
         case c10::kDouble:
             launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
-                                      (int)op, activeRanks, musa_stream);
+                                      (int)op, activeRanks, gpu_stream);
             break;
         case c10::kBool:
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
-                                    (int)op, activeRanks, musa_stream);
+                                    (int)op, activeRanks, gpu_stream);
             break;
         case c10::kBFloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
-                                    activeRanks, musa_stream);
+                                    activeRanks, gpu_stream);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -220,10 +243,12 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
+#ifdef MOONCAKE_EP_USE_MUSA
 void preloadReduceKernels() {
-    // MUSA: preloading not supported (mcc has no cudaFuncGetAttributes).
-    // Kernels are JIT-compiled on first use.
+    // MUSA: mcc has no cudaFuncGetAttributes, kernels are JIT-compiled on
+    // first use. CUDA preloading is done in mooncake_worker.cu (nvcc).
 }
+#endif
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
     : cuda_device_index_(cuda_device_index) {
@@ -233,7 +258,7 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
         cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
         cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
     } else {
-        LOG(WARNING) << "No MUSA device found. Only the `mooncake-cpu` backend "
+        LOG(WARNING) << "No GPU device found. Only the `mooncake-cpu` backend "
                         "can be used.";
         tasks_ = new Task[kNumTasks_];
     }
