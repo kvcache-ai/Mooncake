@@ -12,10 +12,8 @@
   <br />
   <br />
 
-  [![PyPI](https://img.shields.io/pypi/v/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
-  [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
-  [![CUDA <=12.9](https://img.shields.io/static/v1?label=CUDA&message=%3C%3D12.9&color=76B900)](https://pypi.org/project/mooncake-transfer-engine)
-  [![CUDA 13.0/13.1](https://img.shields.io/static/v1?label=CUDA&message=13.0%2F13.1&color=76B900)](https://pypi.org/project/mooncake-transfer-engine-cuda13)
+  [![PyPI CUDA <=12.9](https://img.shields.io/static/v1?label=CUDA&message=%3C%3D12.9&color=76B900)](https://pypi.org/project/mooncake-transfer-engine)
+  [![PyPI CUDA 13.0/13.1](https://img.shields.io/static/v1?label=CUDA&message=13.0%2F13.1&color=76B900)](https://pypi.org/project/mooncake-transfer-engine-cuda13)
   [![PyPI - Downloads](https://static.pepy.tech/badge/mooncake?period=month)](https://pypi.org/project/mooncake-transfer-engine)
   [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
   [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
