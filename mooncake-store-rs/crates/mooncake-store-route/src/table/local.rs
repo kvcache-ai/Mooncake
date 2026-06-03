@@ -146,6 +146,9 @@ impl LocalRouteTable {
     }
 
     pub(crate) fn replace(&mut self, key: &ObjectKey, next: Option<&ObjectRoute>) {
+        if self.version_floor_blocks_insert(key, None, next) {
+            return;
+        }
         self.apply_update(key, next);
     }
 
@@ -228,5 +231,72 @@ fn remove_index_key<K: Eq + Hash>(
     keys.remove(key);
     if keys.is_empty() {
         index.remove(identity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mooncake_store_core::{
+        ClientEpoch, CompatibilityDescriptor, ReplicaRoute, ReplicaTier, RouteState, SegmentName,
+    };
+
+    fn test_route(key: &ObjectKey, version: u64) -> ObjectRoute {
+        ObjectRoute {
+            key: key.clone(),
+            namespace: None,
+            logical_key: None,
+            canonical_key: None,
+            sharing_scope: None,
+            qos_tier: None,
+            version: RouteVersion(version),
+            state: RouteState::Active,
+            compatibility: CompatibilityDescriptor::mooncake_v1(),
+            replicas: vec![ReplicaRoute {
+                owner: ClientRuntimeId::new("owner", ClientEpoch(1)),
+                segment_name: SegmentName::new("seg".to_string()),
+                segment_offset: 0,
+                length: 100,
+                checksum: Some(42),
+                offset: Some(0),
+                tier: ReplicaTier::Dram,
+                priority: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn replace_ignores_stale_route_at_version_floor() {
+        let key = ObjectKey::new("key-a".to_string());
+        let old = test_route(&key, 3);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&old));
+        table.replace(&key, None);
+        table.replace(&key, Some(&old));
+
+        assert!(
+            table.get(&key).is_none(),
+            "delayed mirror replace must not resurrect an evicted route"
+        );
+        assert_eq!(table.version_floor(&key), Some(RouteVersion(3)));
+    }
+
+    #[test]
+    fn replace_accepts_newer_route_above_version_floor() {
+        let key = ObjectKey::new("key-a".to_string());
+        let old = test_route(&key, 3);
+        let new = test_route(&key, 4);
+        let mut table = LocalRouteTable::default();
+
+        table.replace(&key, Some(&old));
+        table.replace(&key, None);
+        table.replace(&key, Some(&new));
+
+        assert_eq!(
+            table.get(&key).as_ref().map(|route| route.version),
+            Some(RouteVersion(4))
+        );
+        assert_eq!(table.version_floor(&key), None);
     }
 }
