@@ -16,6 +16,7 @@ current_dir = os.path.abspath(os.path.dirname(__file__))
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 use_maca = bool(getattr(torch.version, "maca", None)) or \
            bool(getattr(torch._C, "_MACA_VERSION", None))
+standalone = os.getenv("MOONCAKE_EP_STANDALONE", "").upper() in {"1", "ON", "TRUE", "YES"}
 
 if use_musa:
     from torch_musa.utils.musa_extension import MUSAExtension
@@ -56,18 +57,42 @@ if use_musa:
 elif use_maca:
     ExtensionClass = CUDAExtension
     BuildClass = BuildExtension
-    libraries = ["glog"]
+    libraries = [] if standalone else ["glog"]
     library_dirs = []
     sources = [
         "src/ep_py.cpp",
         "src/mooncake_ep_buffer.cpp",
         "src/mooncake_ep_kernel.cu",
     ]
+    if standalone:
+        sources.extend([
+            "../mooncake-transfer-engine/src/transport/device/p2p_device_transport.cpp",
+            "../mooncake-transfer-engine/src/transport/device/ibgda_device_transport_maca_stub.cpp",
+        ])
+    cxx_flags = [
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+        "-DUSE_MACA",
+        "-std=c++20",
+        "-O3",
+        "-g0",
+    ]
+    nvcc_flags = [
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+        "-DUSE_MACA",
+        "-std=c++20",
+        "-Xcompiler",
+        "-O3",
+        "-Xcompiler",
+        "-g0",
+    ]
+    if standalone:
+        cxx_flags.append("-DMOONCAKE_EP_STANDALONE=1")
+        nvcc_flags.append("-DMOONCAKE_EP_STANDALONE=1")
     extra_compile_args = {
-        "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_MACA", "-std=c++20", "-O3", "-g0"],
-        "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-DUSE_MACA", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+        "cxx": cxx_flags,
+        "nvcc": nvcc_flags,
     }
-    extra_link_args = [
+    extra_link_args = [] if standalone else [
         "-Wl,-rpath,$ORIGIN",
         "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
         "-l:engine.so",

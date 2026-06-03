@@ -19,7 +19,7 @@
 
 #include "transport/device/device_transport.h"
 
-#include <glog/logging.h>
+#include "transport/device/device_logging.h"
 #include <algorithm>
 #include <cstring>
 

@@ -89,11 +89,7 @@ __device__ __forceinline__ int64_t mc_ld_nc_s64(const int64_t* ptr) {
 // Non-temporal stores — plain volatile store (no nt hint available)
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_st_na(const int4* ptr, const int4& val) {
-    volatile int* vp = reinterpret_cast<volatile int*>(const_cast<int4*>(ptr));
-    vp[0] = val.x;
-    vp[1] = val.y;
-    vp[2] = val.z;
-    vp[3] = val.w;
+    *const_cast<int4*>(ptr) = val;
 }
 
 // ---------------------------------------------------------------------------

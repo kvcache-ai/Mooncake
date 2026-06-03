@@ -6,8 +6,11 @@
 #include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
 #include <torch/torch.h>
+#ifndef MOONCAKE_EP_STANDALONE
 #include <transfer_engine.h>
+#endif
 #include <cstdint>
+#include <stdexcept>
 
 namespace py = pybind11;
 
@@ -18,8 +21,16 @@ namespace mooncake {
 // This avoids cross-module pybind11 type registration issues.
 MooncakeEpBuffer* make_buffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
                               uint64_t engine_ptr) {
+#ifdef MOONCAKE_EP_STANDALONE
+    if (engine_ptr != 0) {
+        throw std::invalid_argument(
+            "MOONCAKE_EP_STANDALONE does not accept a TransferEngine pointer");
+    }
+    return new MooncakeEpBuffer(rank, num_ranks, num_ep_buffer_bytes, nullptr);
+#else
     auto* engine = reinterpret_cast<TransferEngine*>(engine_ptr);
     return new MooncakeEpBuffer(rank, num_ranks, num_ep_buffer_bytes, engine);
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

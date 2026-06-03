@@ -1,7 +1,9 @@
 #include <mooncake_ep_buffer.h>
-#include <glog/logging.h>
+#include "transport/device/device_logging.h"
 #include <sstream>
+#ifndef MOONCAKE_EP_STANDALONE
 #include <transfer_engine.h>
+#endif
 
 namespace mooncake {
 
@@ -48,12 +50,16 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 #endif
 
     // P2P transport — owns GDR buffer allocation and IPC handle exchange.
+#ifndef MOONCAKE_EP_STANDALONE
     if (engine) {
         p2p_transport_ = engine->getOrCreateP2pTransport(num_ranks);
     } else {
+#endif
         owned_p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
         p2p_transport_ = owned_p2p_transport_.get();
+#ifndef MOONCAKE_EP_STANDALONE
     }
+#endif
 
     gdr_buffer = p2p_transport_->allocateBuffer(num_ep_buffer_bytes);
     if (!gdr_buffer) {
@@ -66,6 +72,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 #endif
 
     // RDMA transport — optional; disabled if init fails.
+#ifndef MOONCAKE_EP_STANDALONE
     if (engine) {
         rdma_transport_ = engine->getOrCreateRdmaTransport();
         if (rdma_transport_) {
@@ -80,6 +87,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
             ibgda_disabled_ = true;
         }
     } else {
+#endif
         // Read optional NIC whitelist from env var (same convention as PG tests).
         std::vector<std::string> device_filter;
         if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
@@ -100,7 +108,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(
             ibgda_disabled_ = true;
             LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
         }
+#ifndef MOONCAKE_EP_STANDALONE
     }
+#endif
 
     // Workspace
 #ifdef MOONCAKE_EP_USE_MUSA
