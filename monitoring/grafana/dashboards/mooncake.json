@@ -335,13 +335,13 @@
       ]
     },
     {
-      "title": "Eviction",
+      "title": "Eviction Count Rate",
       "type": "timeseries",
       "datasource": "Prometheus",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 22 },
       "id": 31,
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": { "unit": "ops" }
       },
       "targets": [
         {
@@ -350,19 +350,31 @@
           "refId": "A"
         },
         {
-          "expr": "rate(master_evicted_size_bytes[5m])",
-          "legendFormat": "Evicted Bytes/s",
+          "expr": "rate(master_successful_evictions_total[5m])",
+          "legendFormat": "Success/s",
           "refId": "B"
         },
         {
-          "expr": "rate(master_successful_evictions_total[5m])",
-          "legendFormat": "Eviction Success/s",
-          "refId": "C"
-        },
-        {
           "expr": "rate(master_attempted_evictions_total[5m])",
-          "legendFormat": "Eviction Attempts/s",
-          "refId": "D"
+          "legendFormat": "Attempts/s",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Eviction Throughput",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 22 },
+      "id": 33,
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      },
+      "targets": [
+        {
+          "expr": "rate(master_evicted_size_bytes[5m])",
+          "legendFormat": "Evicted Bytes/s",
+          "refId": "A"
         }
       ]
     },
