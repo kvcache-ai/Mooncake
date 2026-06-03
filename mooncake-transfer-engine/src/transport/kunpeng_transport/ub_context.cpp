@@ -402,6 +402,11 @@ void UbWorkerPool::performPoll(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
     std::unordered_map<volatile int*, int> jetty_depth_set;
+    // markSuccess()/markFailed() publish completion, after which the main thread
+    // may recycle the slice. Defer them until after all reads and depth
+    // bookkeeping below, so a recycled slice is never dereferenced here.
+    std::vector<UbTransport::Slice*> success_slices;
+    std::vector<UbTransport::Slice*> failed_slices;
     for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
          jfc_index += kTransferWorkerCount) {
         UbTransport::Slice* cr[kPollCount];
@@ -427,20 +432,14 @@ void UbWorkerPool::performPoll(int thread_id) {
                 }
                 slice->ub.retry_cnt++;
                 if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
-                    if (slice->ub.endpoint) {
-                        auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
-                        context_.deleteEndpointByPtr(ptr);
-                    }
-                    slice->markFailed();
-                    processed_slice_count_++;
+                    failed_slices.push_back(slice);
                 } else {
                     collective_slice_queue_[thread_id][slice->peer_nic_path]
                         .push_back(slice);
                     redispatch_counter_++;
                 }
             } else {
-                // slice->markSuccess();
-                processed_slice_count++;
+                success_slices.push_back(slice);
                 success_nr_polls++;
             }
         }
@@ -450,6 +449,20 @@ void UbWorkerPool::performPoll(int thread_id) {
 
     for (auto& entry : jetty_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
+
+    // Reads and bookkeeping done; publish completion last (see note above).
+    for (auto& slice : failed_slices) {
+        if (slice->ub.endpoint) {
+            auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
+            context_.deleteEndpointByPtr(ptr);
+        }
+        slice->markFailed();
+        processed_slice_count_++;
+    }
+    for (auto& slice : success_slices) {
+        slice->markSuccess();
+        processed_slice_count++;
+    }
 
     if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
