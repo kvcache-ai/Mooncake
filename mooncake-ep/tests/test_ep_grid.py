@@ -10,10 +10,7 @@ import faulthandler
 import traceback
 
 from mooncake.mooncake_ep_buffer import Buffer
-try:
-    import mooncake.pg as pg
-except (ModuleNotFoundError, ImportError):
-    pg = None
+import mooncake.pg as pg
 
 _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 if _USE_MUSA:
@@ -209,6 +206,16 @@ def worker(rank, world_size, config_dict):
     _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
 
+    # Device filter: constrain to a single HCA to avoid cross-NIC
+    # address-resolution failures on multi-NIC hosts (e.g. MT S5000).
+    device_filter = [
+        f
+        for f in os.getenv("DEVICE_FILTER", "mlx5_2").split(",")
+        if f
+    ]
+    if device_filter:
+        pg.set_device_filter(device_filter)
+
     backend = "mooncake"
     cpu_backend = "mooncake-cpu"
 
@@ -240,6 +247,12 @@ class TestMooncakeEPBuffer(unittest.TestCase):
         self.world_size = _device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
+        # Constrain EP to a single HCA to avoid cross-NIC address-resolution
+        # failures on multi-NIC hosts (e.g. MT S5000).
+        if "MOONCAKE_EP_DEVICE_FILTER" not in os.environ:
+            os.environ["MOONCAKE_EP_DEVICE_FILTER"] = os.getenv(
+                "DEVICE_FILTER", "mlx5_2"
+            )
 
     def run_single_config(self, config_dict):
         mp.spawn(
