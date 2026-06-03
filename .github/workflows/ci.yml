@@ -98,10 +98,6 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Configure project with coverage support
       run: |
         sudo apt update -y
@@ -117,6 +113,10 @@ jobs:
         cmake --build .
         sudo cmake --install .
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Build nvlink_allocator.so
       run: |
@@ -531,10 +531,6 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Install dependencies
       run: |
         sudo apt update -y
@@ -654,6 +650,10 @@ jobs:
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Generate Python version tag
       id: generate_tag_flags
