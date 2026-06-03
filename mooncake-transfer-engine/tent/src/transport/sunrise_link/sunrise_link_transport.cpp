@@ -44,6 +44,12 @@ namespace {
 
 // Default matches typical Tang RT install; override root and/or arch via env.
 static std::string TangRtSharedObjectPath(const char* soname) {
+    const char* lib_dir = std::getenv("MC_TANGRT_LIB_DIR");
+    if (lib_dir && lib_dir[0]) {
+        std::string d(lib_dir);
+        while (!d.empty() && d.back() == '/') d.pop_back();
+        return d + "/" + soname;
+    }
     const char* root = std::getenv("MC_TANGRT_ROOT");
     std::string r = (root && root[0]) ? std::string(root)
                                       : std::string("/usr/local/tangrt");

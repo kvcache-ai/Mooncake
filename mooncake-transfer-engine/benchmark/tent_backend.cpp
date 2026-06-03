@@ -20,6 +20,8 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#elif defined(USE_SUNRISE)
+#include "cuda_alike.h"
 #endif
 
 #ifdef USE_HIP
@@ -110,6 +112,20 @@ int TENTBenchRunner::allocateBuffers() {
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << gpu_count << ")";
         }
+#elif defined(USE_SUNRISE)
+    } else if (seg_type == "VRAM") {
+        device_prefix = GPU_PREFIX.substr(0, GPU_PREFIX.size() - 1);
+        int gpu_count = 0;
+        cudaGetDeviceCount(&gpu_count);
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
 #elif defined(USE_HIP)
     } else if (seg_type == "VRAM") {
         device_prefix = "rocm";
@@ -135,6 +151,12 @@ int TENTBenchRunner::allocateBuffers() {
     for (int i = 0; i < num_buffers; ++i) {
         auto location = device_prefix + ":" + std::to_string(start_idx + i);
         MemoryOptions options;
+#ifdef USE_SUNRISE
+        if (seg_type == "VRAM") {
+            options.type = SUNRISE_LINK;
+            options.location = location;
+        }
+#endif
         if (!xport_type.empty()) {
             options.type = getTransportType(xport_type);
         }
@@ -150,6 +172,15 @@ int TENTBenchRunner::allocateBuffers() {
         }
         auto t1 = getCurrentTimeInNano();
 
+#ifdef USE_SUNRISE
+        if (seg_type == "VRAM") {
+            auto err = cudaSetDevice(start_idx + i);
+            CHECK_FAIL(err == cudaSuccess ? Status::OK()
+                                          : Status::InternalError(
+                                                "Failed to set Sunrise device "
+                                                "before registerLocalMemory"));
+        }
+#endif
         CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
                                                 total_buffer_size, options));
         auto t2 = getCurrentTimeInNano();
@@ -239,6 +270,17 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
     for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
+#elif defined(USE_SUNRISE)
+static inline int getGpuDeviceNumaID(int gpu_id) {
+    char pci_bus_id[20];
+    auto err = tangDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
+    if (err != tangSuccess) {
+        LOG(WARNING) << "tangDeviceGetPCIBusId: " << tangGetErrorString(err);
+        return 0;
+    }
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+}
 #elif defined(USE_HIP)
 static inline int getGpuDeviceNumaID(int gpu_id) {
     hipDeviceProp_t prop;
@@ -253,6 +295,20 @@ static inline int getGpuDeviceNumaID(int gpu_id) { return 0; }
 #endif
 
 void TENTBenchRunner::pinThread(int thread_id) {
+#ifdef USE_SUNRISE
+    if (XferBenchConfig::seg_type == "VRAM" && !pinned_buffer_list_.empty()) {
+        int base_gpu = std::max(0, XferBenchConfig::local_gpu_id);
+        int device_id =
+            base_gpu +
+            (thread_id % static_cast<int>(pinned_buffer_list_.size()));
+        auto err = cudaSetDevice(device_id);
+        LOG_ASSERT(err == cudaSuccess)
+            << "tangSetDevice failed before getLocation: "
+            << cudaGetErrorString(err) << " device_id=" << device_id;
+        bindToSocket(getGpuDeviceNumaID(device_id));
+        return;
+    }
+#endif
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
