@@ -44,19 +44,21 @@ static bool isIpv4Mapped(const struct in6_addr* a) {
             a->s6_addr32[2] == htonl(0x0000ffff));
 }
 
-// Find the best GID index: RoCE v2 + IPv4-mapped, or IB.
 static int findBestGidIndex(ibv_context* ctx, uint8_t port,
                             const ibv_port_attr& port_attr) {
     for (int i = 0; i < port_attr.gid_tbl_len; ++i) {
         ibv_gid_entry entry;
         if (ibv_query_gid_ex(ctx, port, i, &entry, 0)) continue;
-        bool v4mapped = isIpv4Mapped(
-            reinterpret_cast<const struct in6_addr*>(entry.gid.raw));
-        if ((v4mapped && entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
-            entry.gid_type == IBV_GID_TYPE_IB) {
+
+        if (entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+            bool v4mapped = isIpv4Mapped(
+                reinterpret_cast<const struct in6_addr*>(entry.gid.raw));
+            if (v4mapped) return i;
+        } else if (entry.gid_type == IBV_GID_TYPE_IB) {
             return i;
         }
     }
+
     return -1;
 }
 
@@ -193,15 +195,16 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                        << cudaGetErrorString(err);
             return -1;
         }
+
         ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
                                                IBV_ACCESS_LOCAL_WRITE);
         if (!ctrl_buf_umem_) {
-            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed. "
-                       << "GPU may not support GPUDirect RDMA.";
-            cudaFree(ctrl_buf_);
-            ctrl_buf_ = nullptr;
+            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
+                       << errno << ")";
             return -1;
         }
+        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
+
         ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
         if (!ctrl_buf_heap_) {
             LOG(ERROR) << "[EP IBGDA] memheap_create failed";
@@ -254,7 +257,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return createQueuePairs(stream_ptr);
     }
 
-    int connectPeers(bool is_roce,
+    int connectPeers(int local_rank, bool is_roce,
                      const std::vector<int64_t>& remote_addrs,
                      const std::vector<int32_t>& remote_keys,
                      const std::vector<int32_t>& remote_qpns,
@@ -274,7 +277,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 ah_attr.is_global = 1;
                 ah_attr.grh.dgid = remote_gid;
                 ah_attr.grh.sgid_index = gid_index_;
-                ah_attr.grh.hop_limit = 1;
+                // Match the legacy IBGDA path.  mlx5gda previously hard-coded
+                // QPC hop_limit=255 and ignored this field; after moving QP
+                // setup into the device transport this value reaches hardware.
+                ah_attr.grh.hop_limit = 255;
                 ah_attr.port_num = 1;
                 ah_attr.dlid = qps_[i]->port_attr.lid | 0xC000;
             } else {
@@ -284,7 +290,13 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
             if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr,
                                                remote_qpns[i], IBV_MTU_4096)) {
-                LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i;
+                LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i
+                           << " (roce=" << is_roce
+                           << " gid_idx=" << gid_index_
+                           << " remote_qpn=" << remote_qpns[i]
+                           << " udp_sport=" << ah_attr.dlid
+                           << " hop_limit=" << (int)ah_attr.grh.hop_limit
+                           << ")";
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rtr2rts(qps_[i])) {
@@ -297,7 +309,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         for (int i = 0; i < num_ranks_; ++i) {
             if (active_ranks_mask[i] == 0) continue;
             uint64_t raddr = static_cast<uint64_t>(remote_addrs[i]);
-            uint32_t rkey = static_cast<uint32_t>(remote_keys[i]);
+            uint32_t rkey = (i == local_rank)
+                                ? static_cast<uint32_t>(mr_->lkey)
+                                : static_cast<uint32_t>(remote_keys[i]);
             cudaMemcpy(static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
                        &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
             cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t),
@@ -309,7 +323,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     RdmaLocalMetadata localMetadata() const override {
         RdmaLocalMetadata meta;
         meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
-        meta.rkey = mr_ ? static_cast<int32_t>(mr_->lkey) : 0;
+        meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
         meta.subnet_prefix =
             static_cast<int64_t>(gid_.global.subnet_prefix);
         meta.interface_id =
@@ -370,7 +384,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     std::vector<std::string> device_filter_;
 
     // Control buffer
-    void* ctrl_buf_ = nullptr;
+    void* ctrl_buf_ = nullptr;          // GPU VA
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 

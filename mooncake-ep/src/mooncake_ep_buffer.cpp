@@ -59,6 +59,11 @@ MooncakeEpBuffer::MooncakeEpBuffer(
     if (!gdr_buffer) {
         throw std::runtime_error("[EP] Failed to allocate GDR buffer");
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    CUDA_CHECK(musaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
+#else
+    CUDA_CHECK(cudaMemset(gdr_buffer, 0, num_ep_buffer_bytes));
+#endif
 
     // RDMA transport — optional; disabled if init fails.
     if (engine) {
@@ -443,9 +448,13 @@ void MooncakeEpBuffer::sync_ibgda_peers(
         }
     }
 
-    rdma_transport_->connectPeers(
-        rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
+    int ret = rdma_transport_->connectPeers(
+        rank, rdma_transport_->isRoce(), remote_addrs, remote_keys, flat_qpns,
         flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
+    if (ret != 0) {
+        ibgda_disabled_ = true;
+        LOG(WARNING) << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
+    }
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {

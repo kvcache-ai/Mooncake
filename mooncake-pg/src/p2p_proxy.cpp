@@ -1,8 +1,12 @@
 #include <memory>
 #include <mutex>
 #include <p2p_proxy.h>
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAContext.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#endif
+#include <cuda_alike.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>

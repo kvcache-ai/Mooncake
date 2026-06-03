@@ -12,9 +12,8 @@ import traceback
 from mooncake.mooncake_ep_buffer import Buffer
 try:
     import mooncake.pg as pg
-    _HAS_PG = True
 except (ModuleNotFoundError, ImportError):
-    _HAS_PG = False
+    pg = None
 
 _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 if _USE_MUSA:
@@ -63,13 +62,13 @@ def run_test_iteration(
     num_tokens = int(max_tokens * scale)
 
     # Prepare test data
-    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
-    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=_DEVICE)
+    scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device=_DEVICE)
     topk_idx = torch.topk(scores, top_k, dim=-1)[1]
     topk_weights = torch.softmax(
-        torch.rand(num_tokens, top_k, dtype=torch.float32), dim=-1
+        torch.rand(num_tokens, top_k, dtype=torch.float32, device=_DEVICE), dim=-1
     )
-    active_ranks = torch.ones((num_ranks,), dtype=torch.int32)
+    active_ranks = torch.ones((num_ranks,), dtype=torch.int32, device=_DEVICE)
 
     # Prepare expected result
     def get_mock_factor(expert_id):
@@ -100,7 +99,12 @@ def run_test_iteration(
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         max_tokens, hidden, num_ranks, num_experts
     )
-    buf = Buffer(group, num_ep_buffer_bytes)
+    buf = Buffer(group, num_ep_buffer_bytes, cpu_group=cpu_group)
+
+    # Avoid changing torch_musa's process-wide default device; all tensors in
+    # this test already pass device explicitly.
+    if not _USE_MUSA:
+        torch.set_default_device(_DEVICE)
 
     if use_fallback:
         buf._use_fallback = True
@@ -126,7 +130,7 @@ def run_test_iteration(
         return_recv_hook=return_recv_hook,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -182,7 +186,7 @@ def run_test_iteration(
         out=out_tensor,
     )
 
-    if return_recv_hook:
+    if return_recv_hook or hook is not None:
         hook()
     if async_finish:
         event.current_stream_wait()
@@ -204,14 +208,9 @@ def run_test_iteration(
 def worker(rank, world_size, config_dict):
     _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device(_DEVICE)
 
-    if _USE_MUSA or not _HAS_PG:
-        backend = "gloo"
-        cpu_backend = "gloo"
-    else:
-        backend = "mooncake"
-        cpu_backend = "mooncake-cpu"
+    backend = "mooncake"
+    cpu_backend = "mooncake-cpu"
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
@@ -229,12 +228,10 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    # torch_musa registers the musa device globally; gloo doesn't have a musa
-    # backend, so destroy_process_group raises.  Ignore the error on MUSA.
     try:
         dist.destroy_process_group()
-    except RuntimeError:
-        if not _USE_MUSA:
+    except RuntimeError as e:
+        if not _USE_MUSA or "No backend type associated with device type musa" not in str(e):
             raise
 
 

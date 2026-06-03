@@ -162,6 +162,7 @@ if (WITH_EP)
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
       DEPENDS engine mooncake_ep_ext
