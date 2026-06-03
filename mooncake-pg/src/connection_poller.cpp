@@ -1,10 +1,5 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <ATen/musa/MUSAContext.h>
-#else
-#include <ATen/cuda/CUDAContext.h>
-#endif
 #include <cuda_alike.h>
 #include <torch/torch.h>
 #include <atomic>

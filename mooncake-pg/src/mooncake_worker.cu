@@ -4,9 +4,7 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #if !defined(__MUSA__)
-#ifndef MOONCAKE_EP_USE_MUSA
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
-#endif
 
 #include <mooncake_pg_gpu_utils.h>
 #include "pg_utils.h"
@@ -50,16 +48,11 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
     bool wait(std::chrono::milliseconds timeout) override {
         bool submitted = true;
-#ifdef MOONCAKE_EP_USE_MUSA
-        submitted =
-            worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
-#else
         if (at::cuda::currentStreamCaptureStatus() ==
             c10::cuda::CaptureStatus::None) {
             submitted =
                 worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
         }
-#endif
         if (!submitted) return false;
 
         auto current_stream = getCurrentGPUStream();
@@ -79,16 +72,12 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
-#ifdef MOONCAKE_EP_USE_MUSA
-        // MUSA does not support CUDA Graph capture; always take the normal path.
-#else
         if (at::cuda::currentStreamCaptureStatus() !=
             c10::cuda::CaptureStatus::None) {
             auto current_stream = getCurrentGPUStream();
             event_->block(current_stream);
             return true;
         }
-#endif
 
         if (timeout == kNoTimeout) {
             event_->synchronize();
@@ -321,7 +310,6 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 }
 
 void preloadReduceKernels() {
-#ifndef MOONCAKE_EP_USE_MUSA
     preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
     preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
     preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
@@ -331,7 +319,6 @@ void preloadReduceKernels() {
     preload_reduce_kernel<double>("reduceKernel<double>");
     preload_reduce_kernel<bool>("reduceKernel<bool>");
     preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
-#endif
 }
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
