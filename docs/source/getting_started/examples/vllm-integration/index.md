@@ -41,17 +41,6 @@ Distributed KV cache storage via `MooncakeStore` / `MooncakeStoreConnector` for 
 kv-cache-storage
 ::::
 
-### LMCache-Based Disaggregated Serving
-
-Disaggregated prefill-decode using LMCache with Mooncake Store as the remote storage backend. Supports both non-MP (`LMCacheConnectorV1`) and MP (`LMCacheMPConnector`) paths.
-
-::::{toctree}
-:maxdepth: 1
-
-vllmv1-lmcache-integration
-vllmv1-lmcache-mp-integration
-::::
-
 ---
 
 ## Archived Documentation
