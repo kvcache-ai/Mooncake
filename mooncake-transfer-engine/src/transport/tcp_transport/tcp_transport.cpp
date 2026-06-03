@@ -59,12 +59,17 @@ static bool isCudaMemory(void* addr) {
 // Forward declaration
 class TcpTransport;
 
+using ValidateAddrFn = std::function<bool(uint64_t, uint64_t)>;
+
 // Server-side session: handles one transfer request on a persistent connection
 struct ServerSession : public std::enable_shared_from_this<ServerSession> {
-    explicit ServerSession(std::shared_ptr<tcpsocket> socket)
-        : socket_(std::move(socket)) {}
+    explicit ServerSession(std::shared_ptr<tcpsocket> socket,
+                           ValidateAddrFn validate_addr)
+        : socket_(std::move(socket)),
+          validate_addr_(std::move(validate_addr)) {}
 
     std::shared_ptr<tcpsocket> socket_;
+    ValidateAddrFn validate_addr_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
@@ -84,8 +89,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code& ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    // If client closed connection (EOF), this is normal - don't
-                    // log
                     if (ec.value() != asio::error::eof) {
                         LOG(WARNING)
                             << "ServerSession::readHeader failed. Error: "
@@ -93,10 +96,21 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ", bytes read: " << len;
                     }
                     session_mutex_.unlock();
-                    return;  // Don't continue, socket will be closed
+                    return;
                 }
 
                 local_buffer_ = (char*)(le64toh(header_.addr));
+                uint64_t size = le64toh(header_.size);
+                if (validate_addr_ &&
+                    !validate_addr_((uint64_t)local_buffer_, size)) {
+                    LOG(ERROR)
+                        << "ServerSession: remote-supplied address 0x"
+                        << std::hex << (uint64_t)local_buffer_ << std::dec
+                        << " with size " << size
+                        << " is not within any registered buffer";
+                    session_mutex_.unlock();
+                    return;
+                }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
                     readBody();
                 else
@@ -481,7 +495,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 };
 
 struct TcpContext {
-    TcpContext(short port) : acceptor(io_context) {
+    TcpContext(short port, ValidateAddrFn validate_addr)
+        : acceptor(io_context),
+          validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -511,11 +527,13 @@ struct TcpContext {
     void doAccept() {
         acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
             if (!ec) {
+                asio::error_code nodelay_ec;
+                socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                 auto socket_ptr =
                     std::make_shared<tcpsocket>(std::move(socket));
-                auto session = std::make_shared<ServerSession>(socket_ptr);
-                session->start();  // Start processing requests on this
-                                   // persistent connection
+                auto session = std::make_shared<ServerSession>(
+                    socket_ptr, validate_addr_);
+                session->start();
             }
             doAccept();
         });
@@ -523,6 +541,7 @@ struct TcpContext {
 
     asio::io_context io_context;
     asio::ip::tcp::acceptor acceptor;
+    ValidateAddrFn validate_addr_;
 };
 
 TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
@@ -599,7 +618,10 @@ int TcpTransport::install(std::string& local_server_name,
 
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
-    context_ = new TcpContext(tcp_port);
+    context_ = new TcpContext(tcp_port,
+                              [this](uint64_t addr, uint64_t size) {
+                                  return validateAddress(addr, size);
+                              });
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
@@ -748,6 +770,7 @@ void TcpTransport::worker() {
             LOG(ERROR) << "TcpTransport::worker encountered an exception "
                           "during doAccept/run: "
                        << e.what();
+            context_->io_context.restart();
         }
     }
 }
@@ -763,6 +786,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
             auto socket_ptr =
                 std::make_shared<asio::ip::tcp::socket>(context_->io_context);
             asio::connect(*socket_ptr, endpoint_iterator);
+            socket_ptr->set_option(asio::ip::tcp::no_delay(true));
             return socket_ptr;
         } catch (std::exception& e) {
             LOG(ERROR)
@@ -815,6 +839,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
         new_socket =
             std::make_shared<asio::ip::tcp::socket>(context_->io_context);
         asio::connect(*new_socket, endpoint_iterator);
+        new_socket->set_option(asio::ip::tcp::no_delay(true));
     } catch (std::exception& e) {
         LOG(ERROR)
             << "TcpTransport::getConnection failed to create connection to "
@@ -889,9 +914,8 @@ void TcpTransport::cleanupIdleConnections() {
     for (auto it = connection_pool_.begin(); it != connection_pool_.end();) {
         auto& queue = it->second;
 
-        // Remove idle connections that exceed timeout
-        while (!queue.empty()) {
-            auto& entry = queue.back();
+        for (auto entry_it = queue.begin(); entry_it != queue.end();) {
+            auto& entry = *entry_it;
             if (!entry->in_use) {
                 auto idle_duration =
                     std::chrono::duration_cast<std::chrono::seconds>(
@@ -902,22 +926,34 @@ void TcpTransport::cleanupIdleConnections() {
                         asio::error_code ec;
                         entry->socket->close(ec);
                     }
-                    queue.pop_back();
-                } else {
-                    break;
+                    entry_it = queue.erase(entry_it);
+                    continue;
                 }
-            } else {
-                break;
             }
+            ++entry_it;
         }
 
-        // Remove empty endpoint queues
         if (queue.empty()) {
             it = connection_pool_.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+bool TcpTransport::validateAddress(uint64_t addr, uint64_t size) const {
+    if (size == 0) return false;
+    if (addr + size < addr) return false;
+
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc) return false;
+
+    for (const auto& buffer : desc->buffers) {
+        if (buffer.addr + buffer.length < buffer.addr) continue;
+        if (buffer.addr <= addr && addr + size <= buffer.addr + buffer.length)
+            return true;
+    }
+    return false;
 }
 
 void TcpTransport::startTransfer(Slice* slice) {
