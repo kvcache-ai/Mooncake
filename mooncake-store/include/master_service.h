@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <boost/functional/hash.hpp>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,6 +13,7 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "master_config.h"
+#include "utils.h"
 
 namespace mooncake {
 class ClientManager;
@@ -83,10 +86,10 @@ class MasterService {
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
      */
-    auto ExistKey(const std::string& key) -> tl::expected<bool, ErrorCode>;
+    auto ExistKey(std::string_view key) -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string_view>& keys);
 
     /**
      * @brief Fetch all keys
@@ -160,31 +163,37 @@ class MasterService {
      * @return An expected object containing the replica list on success, or an
      * ErrorCode on failure.
      */
-    virtual auto GetReplicaList(const std::string& key,
+    virtual auto GetReplicaList(std::string_view key,
                                 const GetReplicaListRequestConfig& config =
                                     GetReplicaListRequestConfig())
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Remove an object and its replicas
+     * @param key The key to remove.
+     * @param force If true, skip lease and replication task checks.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto Remove(std::string_view key, bool force = false)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks.
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegex(std::string_view str, bool force = false)
+        -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
+     * @param force If true, skip lease and replication task checks.
      * @return return the number of objects removed
      */
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     /**
      * @brief Get the count of keys
@@ -207,7 +216,121 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return !replicas_.empty() && size_ > 0; }
+        virtual bool IsValid() const {
+            return CountReplicas() > 0 && size_ > 0;
+        }
+
+        void AddReplicas(std::vector<Replica>&& replicas) {
+            replicas_.insert(replicas_.end(),
+                             std::move_iterator(replicas.begin()),
+                             std::move_iterator(replicas.end()));
+        }
+
+        std::vector<Replica> PopReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto partition_point =
+                std::partition(replicas_.begin(), replicas_.end(),
+                               [&pred_fn](const Replica& replica) {
+                                   return !pred_fn(replica);
+                               });
+
+            std::vector<Replica> popped_replicas;
+            if (partition_point != replicas_.end()) {
+                popped_replicas.reserve(
+                    std::distance(partition_point, replicas_.end()));
+                std::move(partition_point, replicas_.end(),
+                          std::back_inserter(popped_replicas));
+                replicas_.erase(partition_point, replicas_.end());
+            }
+            return popped_replicas;
+        }
+
+        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+
+        size_t EraseReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto erased_replicas = PopReplicas(pred_fn);
+            return erased_replicas.size();
+        }
+
+        size_t EraseReplicas() {
+            auto erased_replicas = PopReplicas();
+            return erased_replicas.size();
+        }
+
+        size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
+                             const std::function<void(Replica&)>& visit_fn) {
+            size_t num_visited = 0;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    ++num_visited;
+                }
+            }
+            return num_visited;
+        }
+
+        size_t VisitReplicas(
+            const std::function<bool(const Replica&)>& pred_fn,
+            const std::function<void(const Replica&)>& visit_fn) const {
+            size_t num_visited = 0;
+
+            for (const auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    ++num_visited;
+                }
+            }
+            return num_visited;
+        }
+
+        bool HasReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        bool AllReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas() const { return replicas_.size(); }
+
+        Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
+        Replica* GetReplicaByID(const ReplicaID& id) {
+            return GetFirstReplica(
+                [&id](const Replica& replica) { return replica.id() == id; });
+        }
+
+        bool EraseReplicaByID(const ReplicaID& id) {
+            auto num_erased = EraseReplicas(
+                [&id](const Replica& replica) { return replica.id() == id; });
+            return num_erased > 0;
+        }
+
+        Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto names = replica.get_segment_names();
+                for (auto& name_opt : names) {
+                    if (name_opt == segment_name) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
 
        public:
         // Attention:
@@ -220,12 +343,7 @@ class MasterService {
          * @return true if the object is readable, false otherwise
          */
         virtual bool IsObjectAccessible() const {
-            for (const auto& replica : replicas_) {
-                if (IsReplicaAccessible(replica)) {
-                    return true;
-                }
-            }
-            return false;
+            return HasReplica(&Replica::fn_is_completed);
         }
 
         /**
@@ -233,7 +351,8 @@ class MasterService {
          * @return ErrorCode::OK if removable, otherwise return error specific
          * to the reason
          */
-        virtual tl::expected<void, ErrorCode> IsObjectRemovable() const {
+        virtual tl::expected<void, ErrorCode> IsObjectRemovable(
+            bool force = false) const {
             return {};
         }
 
@@ -270,8 +389,9 @@ class MasterService {
     //    from `metadata`, when removing an entry from `metadata`, you MUST
     //    first remove the corresponding key from `segment_key_index`.
     struct MetadataShard {
-        mutable Mutex mutex;
-        std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>>
+        mutable SharedMutex mutex;
+        std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
+                           StringHash, std::equal_to<>>
             metadata GUARDED_BY(mutex);
 
         // segment_id -> { key -> replica_reference_count }.
@@ -279,10 +399,43 @@ class MasterService {
                            boost::hash<UUID>>
             segment_key_index GUARDED_BY(mutex);
     };
+
+    // For accessing a metadata shard with exclusive (read-write) lock
+    class MetadataShardAccessorRW {
+       public:
+        MetadataShardAccessorRW(MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->GetShard(shard_index)),
+              lock_(&shard_.mutex) {}
+
+        MetadataShard* operator->() { return &shard_; }
+        const MetadataShard* operator->() const { return &shard_; }
+        MetadataShard& GetRef() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
+
+       private:
+        MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // For accessing a metadata shard with shared (read-only) lock
+    class MetadataShardAccessorRO {
+       public:
+        MetadataShardAccessorRO(const MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->GetShard(shard_index)),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const MetadataShard* operator->() const { return &shard_; }
+
+       private:
+        const MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
     // Virtual function to access shards
     virtual MetadataShard& GetShard(size_t idx) = 0;
     virtual const MetadataShard& GetShard(size_t idx) const = 0;
-    virtual size_t GetShardIndex(const std::string& key) const = 0;
+    virtual size_t GetShardIndex(std::string_view key) const = 0;
     virtual size_t GetShardCount() const = 0;
 
     // Helpers for maintaining per-shard segment_key_index.
@@ -301,24 +454,21 @@ class MasterService {
 
    protected:
     // Helper class for accessing metadata with automatic locking
-    class MetadataAccessor {
+    class MetadataAccessorRW {
        public:
-        MetadataAccessor(MasterService* service, const std::string& key)
+        MetadataAccessorRW(MasterService* service, std::string_view key)
             : service_(service),
-              key_(key),
               shard_idx_(service_->GetShardIndex(key)),
-              shard_(service_->GetShard(shard_idx_)),
-              lock_(&shard_.mutex),
-              it_(shard_.metadata.find(key)) {}
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)) {}
 
-        virtual ~MetadataAccessor() = default;
+        virtual ~MetadataAccessorRW() = default;
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_.metadata.end();
+            return it_ != shard_guard_->metadata.end() &&
+                   it_->second->IsValid();
         }
-
-        MetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
 
         const std::string& GetKey() const NO_THREAD_SAFETY_ANALYSIS {
             return it_->first;
@@ -327,32 +477,65 @@ class MasterService {
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return *it_->second; }
 
+        MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+            return shard_guard_;
+        }
+
         // Delete current metadata.
         // To prevent dangling string_views in segment_key_index, segment index
         // should be cleaned up before erasing the metadata entry.
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            if (it_ != shard_.metadata.end()) {
-                service_->RemoveReplicaFromSegmentIndex(shard_, it_->first,
-                                                        it_->second->replicas_);
-                shard_.metadata.erase(it_);
-                it_ = shard_.metadata.end();
+            if (it_ != shard_guard_->metadata.end()) {
+                service_->RemoveReplicaFromSegmentIndex(
+                    shard_guard_.GetRef(), it_->first, it_->second->replicas_);
+                shard_guard_->metadata.erase(it_);
+                it_ = shard_guard_->metadata.end();
             }
         }
 
        protected:
         MasterService* service_;
-        std::string key_;
         size_t shard_idx_;
-        MetadataShard& shard_;
-        MutexLocker lock_;
-        std::unordered_map<std::string,
-                           std::unique_ptr<ObjectMetadata>>::iterator it_;
+        MetadataShardAccessorRW shard_guard_;
+        using MetadataMap =
+            std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
+                               StringHash, std::equal_to<>>;
+        MetadataMap::iterator it_;
     };
 
-    virtual std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
-        const std::string& key) {
-        return std::make_unique<MetadataAccessor>(this, key);
-    }
+    // Key-level read-only accessor
+    class MetadataAccessorRO {
+       public:
+        MetadataAccessorRO(const MasterService* service, std::string_view key)
+            : service_(service),
+              shard_idx_(service_->GetShardIndex(key)),
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)) {}
+
+        // Check if metadata exists
+        bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_ != shard_guard_->metadata.end() &&
+                   it_->second->IsValid();
+        }
+
+        // Get metadata (only call when Exists() is true)
+        const ObjectMetadata& Get() const NO_THREAD_SAFETY_ANALYSIS {
+            return *it_->second;
+        }
+
+        const std::string& GetKey() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_->first;
+        }
+
+       private:
+        const MasterService* service_;
+        const size_t shard_idx_;
+        MetadataShardAccessorRO shard_guard_;
+        using MetadataMap =
+            std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
+                               StringHash, std::equal_to<>>;
+        MetadataMap::const_iterator it_;
+    };
 
    protected:
     virtual ClientManager& GetClientManager() = 0;
@@ -366,7 +549,7 @@ class MasterService {
     // The following methods are hooks function to handle special events
 
     // Triggered when the metadata of an object is accessed (e.g. Get or Exist)
-    virtual void OnObjectAccessed(ObjectMetadata& metadata) = 0;
+    virtual void OnObjectAccessed(const ObjectMetadata& metadata) = 0;
 
     // Triggered when the object is removed
     virtual void OnObjectRemoved(ObjectMetadata& metadata);
@@ -389,7 +572,8 @@ class MasterService {
     const bool enable_ha_;
     ViewVersionId view_version_;
 
-    friend class MetadataAccessor;
+    friend class MetadataAccessorRW;
+    friend class MetadataAccessorRO;
 };
 
 }  // namespace mooncake

@@ -3,14 +3,36 @@
 
 #include <glog/logging.h>
 
+#include "master_metric_manager.h"
+
 namespace mooncake {
 CentralizedClientManager::CentralizedClientManager(
     const int64_t client_live_ttl_sec, const int64_t client_crashed_ttl_sec,
     const BufferAllocatorType memory_allocator_type,
-    const ViewVersionId view_version)
+    const ViewVersionId view_version, bool enable_cxl,
+    const std::string& cxl_path, size_t cxl_size)
     : ClientManager(client_live_ttl_sec, client_crashed_ttl_sec, view_version),
-      memory_allocator_type_(memory_allocator_type),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {}
+      memory_allocator_type_(memory_allocator_type) {
+    if (enable_cxl) {
+        cxl_path_ = cxl_path;
+        cxl_size_ = cxl_size;
+        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
+            cxl_path_, DEFAULT_CXL_BASE, cxl_size_, cxl_path_, generate_uuid());
+        MasterMetricManager::instance().inc_total_mem_capacity(cxl_path_,
+                                                               cxl_size_);
+        VLOG(1) << "CXL global allocator initialized";
+    } else {
+        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
+    }
+}
+
+CentralizedClientManager::~CentralizedClientManager() {
+    if (cxl_global_allocator_) {
+        MasterMetricManager::instance().dec_total_mem_capacity(cxl_path_,
+                                                               cxl_size_);
+    }
+}
 
 auto CentralizedClientManager::MountLocalDiskSegment(const UUID& client_id,
                                                      bool enable_offloading)
@@ -102,17 +124,26 @@ std::shared_ptr<ClientMeta> CentralizedClientManager::CreateClientMeta(
         meta->GetSegmentManager());
     if (seg_mgr) {
         seg_mgr->SetAllocatorChangeCallback(
-            [this](const std::string& segment_name,
-                   const std::shared_ptr<BufferAllocatorBase>& allocator,
+            [this](const Segment& seg,
+                   std::shared_ptr<BufferAllocatorBase>& allocator,
                    bool is_add) -> tl::expected<void, ErrorCode> {
+                if (!allocator) {
+                    if (!cxl_global_allocator_ || !seg.IsCentralizedSegment() ||
+                        seg.GetCentralizedExtra().protocol != "cxl") {
+                        LOG(ERROR)
+                            << "Resolve mode only valid for CXL segments, "
+                            << "segment=" << seg.name << " protocol="
+                            << seg.GetCentralizedExtra().protocol;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    allocator = cxl_global_allocator_;
+                }
                 SharedMutexLocker lock(&global_allocator_mutex_);
                 if (is_add) {
-                    global_allocator_manager_.addAllocator(segment_name,
-                                                           allocator);
+                    global_allocator_manager_.addAllocator(seg.name, allocator);
                 } else if (!global_allocator_manager_.removeAllocator(
-                               segment_name, allocator)) {
-                    LOG(WARNING)
-                        << "Failed to remove allocator: " << segment_name;
+                               seg.name, allocator)) {
+                    LOG(WARNING) << "Failed to remove allocator: " << seg.name;
                 }
                 return {};
             });
@@ -141,6 +172,21 @@ auto CentralizedClientManager::Allocate(
         LOG(WARNING) << "No available replicas"
                      << ", slice_length=" << slice_length
                      << ", replica_num=" << replica_num;
+    }
+    return result;
+}
+
+auto CentralizedClientManager::AllocateFrom(const uint64_t slice_length,
+                                            const std::string& segment_name)
+    -> tl::expected<Replica, ErrorCode> {
+    // See Allocate() for lock ordering notes.
+    SharedMutexLocker lock(&global_allocator_mutex_, shared_lock);
+    auto result = allocation_strategy_->AllocateFrom(
+        global_allocator_manager_, slice_length, segment_name);
+    if (!result.has_value()) {
+        LOG(WARNING) << "AllocateFrom failed"
+                     << ", slice_length=" << slice_length
+                     << ", segment_name=" << segment_name;
     }
     return result;
 }

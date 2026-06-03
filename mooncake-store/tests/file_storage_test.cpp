@@ -49,7 +49,7 @@ class FileStorageTest : public ::testing::Test {
                                 batch_data, buckets);
     }
 
-    tl::expected<FileStorage::AllocatedBatch, ErrorCode>
+    tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
     FileStorageAllocateBatch(FileStorage& fileStorage,
                              const std::vector<std::string>& keys,
                              const std::vector<int64_t>& sizes) {
@@ -108,7 +108,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
-    FileStorage fileStorage1(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage1(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage1, keys, sizes, batch_data));
     auto enable_offloading_result1 =
         FileStorageIsEnableOffloading(fileStorage1);
@@ -121,7 +121,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     // Case 2: total_keys_limit < bucket_keys_limit => cannot offload
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
     file_storage_config.total_keys_limit = 9;
-    FileStorage fileStorage2(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage2(file_storage_config, nullptr, "localhost:9003");
     auto enable_offloading_result2 =
         FileStorageIsEnableOffloading(fileStorage2);
     ASSERT_TRUE(enable_offloading_result2 &&
@@ -131,7 +131,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "969");
     file_storage_config.total_keys_limit = 10'000'000;
     file_storage_config.total_size_limit = 100;
-    FileStorage fileStorage3(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage3(file_storage_config, nullptr, "localhost:9003");
     auto enable_offloading_result3 =
         FileStorageIsEnableOffloading(fileStorage3);
     ASSERT_TRUE(enable_offloading_result3 &&
@@ -144,7 +144,7 @@ TEST_F(FileStorageTest, BatchLoad) {
     std::unordered_map<std::string, std::string> batch_data;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     std::unordered_map<std::string, Slice> batch_slice;
     std::vector<BufferHandle> buff;
@@ -152,7 +152,8 @@ TEST_F(FileStorageTest, BatchLoad) {
     auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
     ASSERT_TRUE(allocate_res);
 
-    ASSERT_TRUE(FileStorageBatchLoad(fileStorage, allocate_res.value().slices));
+    ASSERT_TRUE(
+        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices));
     for (auto& slice_it : batch_slice) {
         std::string data(static_cast<char*>(slice_it.second.ptr),
                          slice_it.second.size);
@@ -171,7 +172,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.scanmeta_iterator_keys_limit = 969;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     ASSERT_EQ(buckets_keys.size(), 3);
@@ -198,7 +199,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "10");
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     ASSERT_EQ(buckets_keys.size(), 3);
@@ -227,7 +228,7 @@ TEST_F(FileStorageTest,
     file_storage_config.storage_filepath = data_path;
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "9");
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "496");
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     for (size_t i = 0; i < buckets_keys.size(); i++) {
@@ -252,7 +253,7 @@ TEST_F(FileStorageTest,
     std::vector<std::vector<std::string>> buckets_keys;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     offloading_objects.clear();
@@ -399,7 +400,7 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     auto total_path = fs::path(data_path) / file_per_key_config.fsdir;
     fs::create_directories(total_path);
 
-    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
 
     auto offload_res =
         FileStorageBatchOffload(fileStorage, keys, sizes, batch_data);
@@ -410,10 +411,10 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
 
     auto batch = std::move(allocate_res.value());
 
-    auto load_res = FileStorageBatchLoad(fileStorage, batch.slices);
+    auto load_res = FileStorageBatchLoad(fileStorage, batch->slices);
     ASSERT_TRUE(load_res) << "FileStorageBatchLoad failed";
 
-    for (const auto& it : batch.slices) {
+    for (const auto& it : batch->slices) {
         const std::string& key = it.first;
         const Slice& slice = it.second;
         std::string data(static_cast<char*>(slice.ptr), slice.size);

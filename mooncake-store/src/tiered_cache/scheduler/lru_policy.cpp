@@ -48,7 +48,7 @@ tl::expected<std::vector<SchedAction>, ErrorCode> LRUPolicy::Decide(
     const double usage_ratio = static_cast<double>(stats.used_capacity_bytes) /
                                static_cast<double>(stats.total_capacity_bytes);
     const bool above_high = usage_ratio > config_.high_watermark;
-    const bool pre_demote_window = usage_ratio > config_.low_watermark &&
+    const bool pre_demote_window = usage_ratio >= config_.low_watermark &&
                                    usage_ratio <= config_.high_watermark;
 
     std::optional<UUID> slow_id;

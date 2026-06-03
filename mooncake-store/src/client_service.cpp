@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <csignal>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include "types.h"
 #include "p2p_client_service.h"
 #include "centralized_client_service.h"
+#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
 
@@ -45,36 +47,22 @@ size_t ClientService::CalculateSliceSize(std::span<const Slice> slices) {
     return slice_size;
 }
 
-ClientService::ClientService(const std::string& local_ip, uint16_t te_port,
-                             const std::string& metadata_connstring,
+ClientService::ClientService(const std::string& metadata_connstring,
+                             uint16_t metrics_port, bool enable_metrics_http,
                              const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      metrics_(ClientMetric::Create(merge_labels(labels))),
-      local_ip_(local_ip),
-      te_port_(te_port),
-      metadata_connstring_(metadata_connstring) {
+      metadata_connstring_(metadata_connstring),
+      metrics_port_(metrics_port),
+      enable_metrics_http_(enable_metrics_http) {
     LOG(INFO) << "client_id=" << client_id_;
-
-    if (metrics_) {
-        if (metrics_->GetReportingInterval() > 0) {
-            LOG(INFO) << "Client metrics enabled with reporting thread started "
-                         "(interval: "
-                      << metrics_->GetReportingInterval() << "s)";
-        } else {
-            LOG(INFO)
-                << "Client metrics enabled but reporting disabled (interval=0)";
-        }
-    } else {
-        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
-                     "enable)";
-    }
+    metrics_port_ = StartMetricsHttpServer(enable_metrics_http_, metrics_port_);
 }
 
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
-        config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metadata_connstring, config.protocol, config.metrics_port,
+        config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -89,8 +77,8 @@ std::optional<std::shared_ptr<ClientService>> ClientService::Create(
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const P2PClientConfig& config) {
     auto client = std::make_shared<P2PClientService>(
-        config.local_ip, config.te_port, config.metadata_connstring,
-        config.labels);
+        config.metadata_connstring, config.metrics_port,
+        config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
     if (err != ErrorCode::OK) {
@@ -107,7 +95,10 @@ ClientService::~ClientService() {
     Destroy();
 }
 
-void ClientService::Stop() { StopHeartbeat(); }
+void ClientService::Stop() {
+    StopMetricsHttpServer();
+    StopHeartbeat();
+}
 
 void ClientService::StopHeartbeat() {
     // Stop ping thread only after no need to contact master anymore
@@ -123,11 +114,7 @@ void ClientService::StopHeartbeat() {
     }
 }
 
-void ClientService::Destroy() {
-    // Free global segment memory
-    segment_ptrs_.clear();
-    ascend_segment_ptrs_.clear();
-}
+void ClientService::Destroy() {}
 
 void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     if (heartbeat_running_) {
@@ -139,24 +126,28 @@ void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     std::string current_master_address;
 
     if (is_ha_mode) {
-        // For HA mode, resolve the actual address from etcd
+        // For HA mode, try to resolve the actual address from etcd.
+        // If etcd is unavailable, start heartbeat thread anyway - it will
+        // retry and recover when etcd/master becomes available.
         ViewVersionId master_version = 0;
         auto err = master_view_helper_.GetMasterView(current_master_address,
                                                      master_version);
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to get master address for heartbeat";
-            return;
+            LOG(WARNING) << "Failed to get master address from etcd, "
+                         << "starting heartbeat thread in degraded mode "
+                         << "(will retry): " << err;
+            // Don't return - Let heartbeat thread handle reconnection
         }
     } else {
         current_master_address = master_server_entry;
     }
 
     heartbeat_running_ = true;
-    heartbeat_thread_ =
-        std::thread([this, is_ha_mode, current_master_address]() mutable {
-            this->HeartbeatThreadMain(is_ha_mode,
-                                      std::move(current_master_address));
-        });
+    heartbeat_thread_ = std::thread([this, is_ha_mode, current_master_address,
+                                     master_server_entry]() mutable {
+        this->HeartbeatThreadMain(is_ha_mode, std::move(current_master_address),
+                                  master_server_entry);
+    });
 }
 
 ErrorCode ClientService::ConnectToMaster(
@@ -272,49 +263,134 @@ tl::expected<void, ErrorCode> ClientService::CheckRegisterMemoryParams(
 }
 
 ErrorCode ClientService::InitTransferEngine(
-    const std::string& endpoint, const std::string& metadata_connstring,
-    const std::string& protocol,
+    const std::string& local_ip, uint16_t te_port,
+    const std::string& metadata_connstring, const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    if (!transfer_engine_) {
-        LOG(ERROR) << "Transfer engine pointer is null";
-        return ErrorCode::INVALID_PARAMS;
+    local_ip_ = local_ip;
+    te_port_ = te_port;
+    // this only performs RPC calls
+    if (protocol == "rpc_only") {
+        LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
+        return ErrorCode::OK;
     }
 
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
+
     bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
-    } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
+    if (!use_tent) {
+        // Get auto_discover and filters from env (non-TENT only)
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
+        }
+        if (!auto_discover) {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
+                LOG(WARNING)
+                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                    << "ignoring whitelist: " << env_filters;
+            }
         }
     }
-    transfer_engine_->setAutoDiscover(auto_discover);
 
-    // Honor filters when auto-discovery is enabled; otherwise warn once
+    if (protocol == "ascend") {
+        const char* ascend_use_fabric_mem =
+            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        if (ascend_use_fabric_mem) {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
+
+    const bool is_auto_port = (te_port_ == 0);
+    ErrorCode err = ErrorCode::OK;
+
+    const int kMaxRetries =
+        is_auto_port ? GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20) : 1;
+
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        if (attempt > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            int new_port = port_binder_->rebind();
+            if (new_port < 0) {
+                LOG(WARNING)
+                    << "Failed to rebind port"
+                    << ", port=" << std::to_string(new_port)
+                    << ", retry=" << (attempt + 1) << "/" << kMaxRetries;
+                continue;
+            }
+            te_port_ = static_cast<uint16_t>(new_port);
+        } else if (is_auto_port) {
+            port_binder_ = std::make_unique<AutoPortBinder>();
+            int new_port = port_binder_->getPort();
+            if (new_port < 0) {
+                LOG(ERROR) << "Failed to bind available port"
+                           << ", port=" << std::to_string(new_port);
+                continue;
+            }
+            te_port_ = static_cast<uint16_t>(new_port);
+        }
+
+        err = InnerInitTransferEngine(auto_discover, protocol, device_names);
+        if (err == ErrorCode::OK) {
+            // TENT mode: Skip manual transport installation - TENT handles this
+            // internally
+            if (use_tent) {
+                LOG(INFO) << "Using TENT mode - transport configuration "
+                             "handled internally";
+                if (device_names.has_value()) {
+                    LOG(INFO) << "Note: device_names parameter is ignored in "
+                                 "TENT mode. "
+                              << "Configure devices via TENT config file or "
+                                 "environment "
+                                 "variables.";
+                }
+                return ErrorCode::OK;
+            }
+            if (attempt > 0) {
+                LOG(INFO) << "TE init succeeded on port " << te_port_
+                          << " after " << (attempt + 1) << " attempt(s)";
+            }
+            return ErrorCode::OK;
+        }
+
+        if (is_auto_port) {
+            LOG(WARNING) << "TE init failed on port " << te_port_ << ", retry "
+                         << (attempt + 1) << "/" << kMaxRetries;
+        }
+    }
+
+    LOG(ERROR) << "Failed to initialize transfer engine"
+               << (is_auto_port ? " after all retries" : "") << ", err=" << err;
+    return err;
+}
+
+ErrorCode ClientService::InnerInitTransferEngine(
+    bool auto_discover, const std::string& protocol,
+    const std::optional<std::string>& device_names) {
+    transfer_engine_ = std::make_shared<TransferEngine>();
+    transfer_engine_->setAutoDiscover(auto_discover);
     if (auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
                   << protocol;
         auto filters = get_auto_discover_filters();
         transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
-        const char* env_filters = std::getenv("MC_MS_FILTERS");
-        if (env_filters && *env_filters != '\0') {
-            LOG(WARNING)
-                << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                << "ignoring whitelist: " << env_filters;
-        }
     }
 
-    auto [hostname, port] = parseHostNameWithPort(endpoint);
-    int rc =
-        transfer_engine_->init(metadata_connstring, endpoint, hostname, port);
+    int rc = transfer_engine_->init(metadata_connstring_, local_endpoint(),
+                                    local_ip_, te_port_);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
@@ -390,6 +466,23 @@ ErrorCode ClientService::InitTransferEngine(
                 LOG(ERROR) << "Failed to install Ascend transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "cxl") {
+            if (device_names.has_value()) {
+                LOG(WARNING) << "CXL protocol does not use device "
+                                "names, ignoring";
+            }
+            try {
+                transport = transfer_engine_->installTransport("cxl", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXL transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -445,10 +538,11 @@ tl::expected<void, ErrorCode> ClientService::unregisterLocalMemory(
     return {};
 }
 
-void ClientService::HeartbeatThreadMain(bool is_ha_mode,
-                                        std::string current_master_address) {
+void ClientService::HeartbeatThreadMain(
+    bool is_ha_mode, std::string current_master_address,
+    const std::string& master_server_entry) {
     // How many failed heartbeats before getting latest master view from etcd
-    const int max_heartbeat_fail_count = 3;
+    const int max_heartbeat_fail_count = 10;
     // How long to wait for next heartbeat after success
     const int success_heartbeat_interval_ms = 1000;
     // How long to wait for next heartbeat after failure
@@ -468,6 +562,7 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
             LOG(INFO) << "Client registered successfully"
                       << ", client_id=" << client_id_
                       << ", view_version=" << res.value().view_version;
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
         }
     };
     // Use another thread to register client to avoid blocking the heartbeat
@@ -497,7 +592,11 @@ void ClientService::HeartbeatThreadMain(bool is_ha_mode,
                 // just retry
                 LOG(ERROR) << "Failed to send heartbeat to master";
             } else {
-                // Exceeded failure threshold, attempt reconnect
+                if (!connection_interrupted_) {
+                    OnHAEvent(HAEvent::MASTER_UNREACHABLE);
+                    connection_interrupted_ = true;
+                }
+                // Attempt reconnect
                 if (ReconnectToMaster(is_ha_mode, current_master_address)) {
                     heartbeat_fail_count = 0;
                     // Do NOT sleep here, immediately loop back to send
@@ -527,18 +626,25 @@ bool ClientService::HandleHeartbeatResponse(
     const std::string& current_master_address,
     const std::function<void()>& register_client,
     std::future<void>& register_client_future) {
-    if (response.view_version != view_version_) {
+    if (response.view_version != view_version_.load()) {
         LOG(WARNING) << "Master view_version changed"
                      << ", client status in master: " << (int)response.status
                      << ", master address: " << current_master_address
                      << ", Master version: " << response.view_version
-                     << ", Client version: " << view_version_;
+                     << ", Client version: " << view_version_.load();
     }
     for (auto& task_result : response.task_results) {
         HandleHeartbeatTaskResult(task_result);
     }
-    if (response.status == ClientStatus::UNDEFINED &&
-        !register_client_future.valid()) {
+    if (response.status == ClientStatus::HEALTH) {
+        // Heartbeat recovered after a connection interruption: master still
+        // knows this client. Fire MASTER_RECONNECTED once to trigger re-sync.
+        if (connection_interrupted_) {
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
+            connection_interrupted_ = false;
+        }
+    } else if (response.status == ClientStatus::UNDEFINED &&
+               !register_client_future.valid()) {
         // Ensure at most one register client thread is running
         register_client_future =
             std::async(std::launch::async, register_client);
@@ -602,6 +708,111 @@ bool ClientService::ReconnectToMaster(bool is_ha_mode,
         LOG(INFO) << "Reconnected to master " << current_master_address;
         return true;
     }
+}
+
+uint16_t ClientService::StartMetricsHttpServer(bool enable_metrics_http,
+                                               uint16_t metrics_port) {
+    // Check if metrics HTTP is disabled
+    if (!enable_metrics_http) {
+        LOG(INFO) << "Client metrics HTTP server disabled";
+        return 0;
+    }
+
+    try {
+        // Create HTTP server with 1 thread for metrics
+        metrics_http_server_ =
+            std::make_unique<coro_http::coro_http_server>(1, metrics_port);
+
+        using namespace coro_http;
+
+        // Prometheus-style metrics endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string metrics_str;
+                metrics->serialize(metrics_str);
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(metrics_str));
+            });
+
+        // Human-readable summary endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/metrics/summary",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                ClientMetric* metrics = GetMetrics();
+                if (!metrics) {
+                    resp.set_status_and_content(
+                        status_type::service_unavailable,
+                        "Metrics not available");
+                    return;
+                }
+                std::string summary = metrics->summary_metrics();
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok,
+                                            std::move(summary));
+            });
+
+        // Health check endpoint
+        metrics_http_server_->set_http_handler<GET>(
+            "/health",
+            [this](coro_http_request& req, coro_http_response& resp) {
+                resp.add_header("Content-Type", "text/plain; version=0.0.4");
+                resp.set_status_and_content(status_type::ok, GetHealthStatus());
+            });
+
+        metrics_http_server_->async_start();
+        uint16_t actual_port = metrics_http_server_->port();
+        LOG(INFO) << "Client metrics HTTP server started on port "
+                  << actual_port;
+        return actual_port;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to start client metrics HTTP server: "
+                   << e.what();
+        return 0;
+    }
+}
+
+void ClientService::StopMetricsHttpServer() {
+    if (metrics_http_server_) {
+        LOG(INFO) << "Stopping client metrics HTTP server on port "
+                  << metrics_port_;
+        metrics_http_server_->stop();
+        metrics_http_server_.reset();
+    }
+}
+
+tl::expected<UUID, ErrorCode> ClientService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<UUID, ErrorCode> ClientService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> ClientService::QueryTask(
+    const UUID& task_id) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> ClientService::FetchTasks(
+    size_t batch_size) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<void, ErrorCode> ClientService::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
 }
 
 }  // namespace mooncake

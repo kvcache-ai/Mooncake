@@ -163,6 +163,24 @@ class AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>()) = 0;
+
+    /**
+     * @brief Allocate one replica from the specified segment.
+     *
+     * @param allocator_manager The allocator manager that manages the
+     *                          allocators to use
+     * @param slice_length Length of the slice to be allocated
+     * @param segment_name The name of the segment to allocate the replica from
+     * @return tl::expected<Replica, ErrorCode> containing the allocated replica
+     *         on success, or ErrorCode specifying the failure reason:
+     *         - ErrorCode::SEGMENT_NOT_FOUND if the segment does not exist
+     *         - ErrorCode::NO_AVAILABLE_HANDLE if the segment does not have
+     *           enough space
+     *         - ErrorCode::INVALID_PARAMS if configuration invalid
+     */
+    virtual tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) = 0;
 };
 
 /**
@@ -284,6 +302,31 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return replicas;
     }
 
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) {
+        // Random number generator.
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        // Validate input parameters
+        if (slice_length == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Check segment existence
+        if (allocator_manager.getAllocators(segment_name) == nullptr) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+
+        auto buffer = allocateSingle(allocator_manager, segment_name,
+                                     slice_length, generator);
+        if (buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        return Replica{std::move(buffer), ReplicaStatus::PROCESSING};
+    }
+
     std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
         const size_t slice_length, std::mt19937& generator) {
@@ -314,6 +357,65 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+};
+
+class CxlAllocationStrategy : public AllocationStrategy {
+   public:
+    CxlAllocationStrategy() = default;
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>()) {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (preferred_segments.empty()) {
+            LOG(ERROR) << "Preferred_segments is empty.";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const std::string& cxl_segment_name = preferred_segments[0];
+
+        VLOG(1) << "Do cxl allocate, overwritten segment=" << cxl_segment_name;
+
+        const auto cxl_allocators =
+            allocator_manager.getAllocators(cxl_segment_name);
+
+        if (cxl_allocators == nullptr || cxl_allocators->size() == 0) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        std::shared_ptr<BufferAllocatorBase> cxl_allocator =
+            (*cxl_allocators)[0];
+        if (!cxl_allocator) {
+            LOG(ERROR) << "No CXL allocator in preferred_segment";
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+
+        auto buffer = cxl_allocator->allocate(slice_length);
+        if (!buffer) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        buffer->change_to_cxl(cxl_segment_name);
+        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
+
+        VLOG(1) << "Successfully allocated " << replicas.size()
+                << " CXL replica.";
+        return replicas;
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
 };
 
 }  // namespace mooncake

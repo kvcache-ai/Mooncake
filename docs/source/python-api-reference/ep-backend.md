@@ -52,14 +52,14 @@ Basic usage:
 ```python
 import torch
 import torch.distributed as dist
-from mooncake import ep
+from mooncake import pg
 
 active_ranks = torch.ones((world_size,), dtype=torch.int32, device="cuda")
 dist.init_process_group(
     backend="mooncake",
     rank=rank,
     world_size=world_size,
-    pg_options=ep.MooncakeBackendOptions(active_ranks),
+    pg_options=pg.MooncakeBackendOptions(active_ranks),
 )
 
 dist.all_gather(...)           # Standard API usage
@@ -76,16 +76,16 @@ Recover usage (e.g., wants to recover rank #2):
 # For the healthy processes, execute:
 import torch
 import torch.distributed as dist
-from mooncake import ep
+from mooncake import pg
 
 ...
 
 broken_rank = 2
 backend = dist.group.WORLD._get_backend(torch.device("cpu"))
 while True:
-    (peer_state,) = ep.get_peer_state(backend, [broken_rank])
+    (peer_state,) = pg.get_peer_state(backend, [broken_rank])
     if peer_state:
-        ep.recover_ranks(backend, [broken_rank])
+        pg.recover_ranks(backend, [broken_rank])
         break
     else:
         # Handle ongoing logic, like inference
@@ -96,7 +96,7 @@ dist.init_process_group(
     backend="mooncake-cpu",
     rank=broken_rank,
     world_size=num_processes,
-    pg_options=ep.MooncakeBackendOptions(
+    pg_options=pg.MooncakeBackendOptions(
         torch.ones((num_processes,), dtype=torch.int32),
         is_extension=True,  # Must set this option to True
     ),

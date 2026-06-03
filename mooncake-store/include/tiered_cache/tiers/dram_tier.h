@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 #include <optional>
+#include <functional>
 
 #include "allocator.h"
 #include "tiered_cache/tiers/cache_tier.h"
@@ -40,7 +41,7 @@ class DramCacheTier : public CacheTier {
     BufferAllocatorType allocator_type_;
     std::shared_ptr<BufferAllocatorBase> allocator_;
     TransferEngine* engine_;
-    std::unique_ptr<char[], void (*)(char*)> memory_buffer_{
+    std::unique_ptr<char[], std::function<void(char*)>> memory_buffer_{
         nullptr, [](char* p) { delete[] p; }};
 };
 

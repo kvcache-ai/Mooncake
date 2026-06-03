@@ -9,10 +9,13 @@
 #include <stop_token>
 
 #include <cstdlib>  // for atexit
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <vector>
 
 #include "real_client.h"
+#include "centralized_client_service.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "types.h"
@@ -179,19 +182,9 @@ template <typename ConfigT>
 tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     this->protocol = config.protocol;
     this->ipc_socket_path_ = config.ipc_socket_path;
-
-    if (config.te_port == 0) {
-        // Create port binder to hold a port
-        port_binder_ = std::make_unique<AutoPortBinder>();
-        int port = port_binder_->getPort();
-        if (port < 0) {
-            LOG(ERROR) << "Failed to bind available port";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        config.te_port = static_cast<uint16_t>(port);
-    }
-    this->local_ip = config.local_ip;
-    this->te_port = config.te_port;
+    const bool should_use_hugepage =
+        (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr) &&
+        this->protocol != "ascend";
 
     auto client_opt = mooncake::ClientService::Create(config);
     if (!client_opt) {
@@ -205,8 +198,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     // Dummy Client can create shm and share it with Real Client.
     // Moreover, invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(config.local_buffer_size, this->protocol);
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        config.local_buffer_size, this->protocol, should_use_hugepage);
     if (config.local_buffer_size > 0) {
         LOG(INFO) << "Registering local memory: " << config.local_buffer_size
                   << " bytes";
@@ -278,14 +271,23 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     // Gracefully stop accepting new requests and drain in-flight operations
     client_service_->Stop();
+
+    // Unregister local memory after stopping the service
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+        auto unregister_result = client_service_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!unregister_result) {
+            LOG(WARNING)
+                << "Failed to unregister client local buffer on tear down: "
+                << toString(unregister_result.error());
+        }
+    }
+
     client_service_->Destroy();
 
     // Reset all resources
     client_service_.reset();
     client_buffer_allocator_.reset();
-    port_binder_.reset();
-    local_ip = "";
-    te_port = 0;
     device_name = "";
     protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -548,44 +550,46 @@ int RealClient::put_parts(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
-    const std::string& key) {
+    const std::string& key, bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto remove_result = client_service_->Remove(key);
+    auto remove_result = client_service_->Remove(key, force);
     if (!remove_result) {
         return tl::unexpected(remove_result.error());
     }
     return {};
 }
 
-int RealClient::remove(const std::string& key) {
-    return to_py_ret(remove_internal(key));
+int RealClient::remove(const std::string& key, bool force) {
+    return to_py_ret(remove_internal(key, force));
 }
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
-    const std::string& str) {
+    const std::string& str, bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_service_->RemoveByRegex(str);
+    return client_service_->RemoveByRegex(str, force);
 }
 
-long RealClient::removeByRegex(const std::string& str) {
-    return to_py_ret(removeByRegex_internal(str));
+long RealClient::removeByRegex(const std::string& str, bool force) {
+    return to_py_ret(removeByRegex_internal(str, force));
 }
 
-tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal() {
+tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     if (!client_service_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_service_->RemoveAll();
+    return client_service_->RemoveAll(force);
 }
 
-long RealClient::removeAll() { return to_py_ret(removeAll_internal()); }
+long RealClient::removeAll(bool force) {
+    return to_py_ret(removeAll_internal(force));
+}
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
     const std::string& key) {
@@ -737,29 +741,36 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
 
     auto& context = it->second;
     context.client_buffer_allocator.reset();
 
+    bool had_error = false;
     for (auto& shm : context.mapped_shms) {
-        if (shm.shm_buffer) {
+        if (!shm.shm_buffer) continue;
+        if (shm.shm_size > 0) {
             auto rc = client_service_->unregisterLocalMemory(shm.shm_buffer,
                                                              shm.shm_size);
             if (!rc) {
-                LOG(ERROR) << "Failed to unregister memory";
-                munmap(shm.shm_buffer, shm.shm_size);
-                context.mapped_shms.clear();
-                shm_contexts_.erase(it);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                LOG(WARNING)
+                    << "Failed to unregister memory for " << shm.shm_name
+                    << ", error=" << toString(rc.error())
+                    << ", proceeding with cleanup";
+                had_error = true;
             }
-            munmap(shm.shm_buffer, shm.shm_size);
+        }
+        if (munmap(shm.shm_buffer, shm.shm_size) != 0) {
+            LOG(WARNING) << "munmap failed for " << shm.shm_name << ": "
+                         << strerror(errno);
+            had_error = true;
         }
     }
     context.mapped_shms.clear();
     shm_contexts_.erase(it);
+    if (had_error) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     return {};
 }
 
@@ -768,8 +779,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO) << "client_id=" << client_id << ", shm already unmapped";
+        return {};
     }
     auto& context = it->second;
 
@@ -995,7 +1006,7 @@ int64_t RealClient::get_into(const std::string& key, void* buffer, size_t size,
 }
 
 std::string RealClient::get_hostname() const {
-    return local_ip + ":" + std::to_string(te_port);
+    return client_service_ ? client_service_->local_endpoint() : "";
 }
 
 std::vector<int> RealClient::batch_put_from(
@@ -1707,4 +1718,32 @@ RealClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
     return replica_map;
 }
 
+tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return client_service_->CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_move_task(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return client_service_->CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
+    const UUID& task_id) {
+    return client_service_->QueryTask(task_id);
+}
+
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+RealClient::batch_get_offload_object(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& sizes) {
+    auto* centralized =
+        dynamic_cast<CentralizedClientService*>(client_service_.get());
+    if (!centralized) {
+        LOG(ERROR)
+            << "batch_get_offload_object requires CentralizedClientService";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return centralized->BatchGetOffloadObjectFromStorage(keys, sizes);
+}
 }  // namespace mooncake

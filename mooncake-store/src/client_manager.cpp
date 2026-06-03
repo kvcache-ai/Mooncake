@@ -156,6 +156,27 @@ tl::expected<std::pair<size_t, size_t>, ErrorCode> ClientManager::QuerySegments(
     return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
 }
 
+// TODO: wanyue-wy
+// To ensure the compatibility of the code,
+// currently we assume that segment_name is globally unique among all clients.
+// However, the actual code does not guarantee this premise
+// In the future, we need to impose constraints on this premise,
+// or replace segment name with segment id
+tl::expected<UUID, ErrorCode> ClientManager::GetClientIdBySegmentName(
+    const std::string& segment_name) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    for (const auto& [client_id, meta] : client_metas_) {
+        auto segs = meta->GetSegments();
+        if (!segs.has_value()) continue;
+        for (const auto& seg : segs.value()) {
+            if (seg.name == segment_name) return client_id;
+        }
+    }
+    LOG(WARNING) << "GetClientIdBySegmentName: segment not found"
+                 << ", segment_name=" << segment_name;
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 tl::expected<std::vector<std::string>, ErrorCode> ClientManager::QueryIp(
     const UUID& client_id) {
     SharedMutexLocker lock(&clients_mutex_, shared_lock);
@@ -217,6 +238,8 @@ auto ClientManager::RegisterClient(const RegisterClientRequest& req)
             return tl::make_unexpected(result.error());
         }
     }
+
+    OnClientRegistered(meta);
 
     SharedMutexLocker lock(&clients_mutex_);
     // Write to client_metas_ (overwrites if re-registering after crash)

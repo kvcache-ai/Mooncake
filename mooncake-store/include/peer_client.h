@@ -2,6 +2,7 @@
 
 #include "client_rpc_types.h"
 #include "types.h"
+#include <csignal>
 #include <vector>
 #include <string>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
@@ -17,17 +18,45 @@ class PeerClient {
     tl::expected<void, ErrorCode> Connect(const std::string& endpoint);
 
     // --- Async single-key interfaces ---
+    // LIFETIME: `request` of sync read and write must remain valid
+    // until the returned Lazy coroutine completes.
+    // Otherwise, the string_view of `request` might be UAF.
+
     async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncReadRemoteData(
         const RemoteReadRequest& request);
 
     async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
     AsyncWriteRemoteData(const RemoteWriteRequest& request);
 
+    async_simple::coro::Lazy<tl::expected<PreWriteResponse, ErrorCode>>
+    AsyncPreWrite(const PreWriteRequest& request);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncWriteCommit(
+        const WriteCommitRequest& request);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncWriteRevoke(
+        const WriteRevokeRequest& request);
+
+    async_simple::coro::Lazy<tl::expected<PinKeyResponse, ErrorCode>>
+    AsyncPinKey(const PinKeyRequest& request);
+
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AsyncUnPinKey(
+        const UnPinKeyRequest& request);
+
     // --- Sync single-key interfaces ---
     tl::expected<void, ErrorCode> ReadRemoteData(
         const RemoteReadRequest& request);
     tl::expected<UUID, ErrorCode> WriteRemoteData(
         const RemoteWriteRequest& request);
+    tl::expected<PreWriteResponse, ErrorCode> PreWrite(
+        const PreWriteRequest& request);
+    tl::expected<void, ErrorCode> WriteCommit(
+        const WriteCommitRequest& request);
+    tl::expected<void, ErrorCode> WriteRevoke(
+        const WriteRevokeRequest& request);
+    tl::expected<PinKeyResponse, ErrorCode> PinKey(
+        const PinKeyRequest& request);
+    tl::expected<void, ErrorCode> UnPinKey(const UnPinKeyRequest& request);
 
    private:
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>

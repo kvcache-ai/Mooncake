@@ -21,6 +21,8 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
         {ErrorCode::INVALID_PARAMS, "INVALID_PARAMS"},
         {ErrorCode::ILLEGAL_CLIENT, "ILLEGAL_CLIENT"},
+        {ErrorCode::NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED,
+         "NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED"},
         {ErrorCode::INVALID_WRITE, "INVALID_WRITE"},
         {ErrorCode::INVALID_READ, "INVALID_READ"},
         {ErrorCode::INVALID_REPLICA, "INVALID_REPLICA"},
@@ -29,9 +31,15 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::OBJECT_ALREADY_EXISTS, "OBJECT_ALREADY_EXISTS"},
         {ErrorCode::OBJECT_HAS_LEASE, "OBJECT_HAS_LEASE"},
         {ErrorCode::LEASE_EXPIRED, "LEASE_EXPIRED"},
+        {ErrorCode::OBJECT_HAS_REPLICATION_TASK, "OBJECT_HAS_REPLICATION_TASK"},
+        {ErrorCode::OBJECT_NO_REPLICATION_TASK, "OBJECT_NO_REPLICATION_TASK"},
+        {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
+        {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
+        {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
         {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
         {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
         {ErrorCode::REPLICA_NUM_EXCEEDED, "REPLICA_NUM_EXCEEDED"},
+        {ErrorCode::REPLICA_IS_PROCESSING, "REPLICA_IS_PROCESSING"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
@@ -56,7 +64,9 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
         {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
-        {ErrorCode::SHUTTING_DOWN, "SHUTTING_DOWN"}};
+        {ErrorCode::SHUTTING_DOWN, "SHUTTING_DOWN"},
+        {ErrorCode::ASYNC_ENQUEUE_FAILED, "ASYNC_ENQUEUE_FAILED"},
+        {ErrorCode::INACCESSIBLE_MASTER, "INACCESSIBLE_MASTER"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <string_view>
+#include <optional>
 #include <vector>
 
 #include "replica.h"
@@ -46,7 +48,8 @@ inline std::ostream& operator<<(std::ostream& os,
  * @brief Request structure for getting write route.
  */
 struct WriteRouteRequest {
-    std::string key;  // used for pre-filter with limitation of replica number
+    // used for pre-filter with limitation of replica number
+    std::string_view key;
     UUID client_id;
     size_t size = 0;
     WriteRouteRequestConfig config;
@@ -72,20 +75,43 @@ struct WriteRouteResponse {
 YLT_REFL(WriteRouteResponse, candidates);
 
 /**
- * @brief Request to add a replica
+ * @brief Request for batch write route lookup.
+ */
+struct BatchGetWriteRouteRequest {
+    UUID client_id;
+    std::vector<std::string_view> keys;
+    std::vector<size_t> sizes;
+    WriteRouteRequestConfig config;  // shared config for all keys
+};
+YLT_REFL(BatchGetWriteRouteRequest, client_id, keys, sizes, config);
+
+/**
+ * @brief Response for batch write route lookup.
+ *        responses[i] and error_codes[i] correspond to keys[i] in the request.
+ */
+struct BatchGetWriteRouteResponse {
+    std::vector<WriteRouteResponse> responses;  // valid when error_codes[i]==OK
+    std::vector<ErrorCode> error_codes;
+};
+YLT_REFL(BatchGetWriteRouteResponse, responses, error_codes);
+
+/**
+ * @brief Request to add a replica.
+ *        Master resolves ip_address/rpc_port from registered client info.
  */
 struct AddReplicaRequest {
-    std::string key;
+    std::string_view key;
     size_t size;
-    P2PProxyDescriptor replica;
+    UUID client_id;
+    UUID segment_id;
 };
-YLT_REFL(AddReplicaRequest, key, size, replica);
+YLT_REFL(AddReplicaRequest, key, size, client_id, segment_id);
 
 /**
  * @brief Request to remove a replica
  */
 struct RemoveReplicaRequest {
-    std::string key;
+    std::string_view key;
     UUID client_id;
     UUID segment_id;
 };
@@ -95,10 +121,36 @@ YLT_REFL(RemoveReplicaRequest, key, client_id, segment_id);
  * @brief Request to remove replicas from multiple segments in one call
  */
 struct BatchRemoveReplicaRequest {
-    std::string key;
+    std::string_view key;
     UUID client_id;
     std::vector<UUID> segment_ids;
 };
 YLT_REFL(BatchRemoveReplicaRequest, key, client_id, segment_ids);
+
+/**
+ * @brief Request to batch sync replicas (mixed ADD and REMOVE ops).
+ *        Master only needs client_id + segment_id to identify replicas
+ */
+struct BatchSyncReplicaRequest {
+    UUID client_id;
+    // ADD operations
+    std::vector<std::string_view> add_keys;
+    std::vector<size_t> add_sizes;
+    std::vector<UUID> add_segment_ids;
+    // REMOVE operations
+    std::vector<std::string_view> remove_keys;
+    std::vector<UUID> remove_segment_ids;
+};
+YLT_REFL(BatchSyncReplicaRequest, client_id, add_keys, add_sizes,
+         add_segment_ids, remove_keys, remove_segment_ids);
+
+/**
+ * @brief Response for batch sync replicas.
+ */
+struct BatchSyncReplicaResponse {
+    std::vector<ErrorCode> add_results;
+    std::vector<ErrorCode> remove_results;
+};
+YLT_REFL(BatchSyncReplicaResponse, add_results, remove_results);
 
 }  // namespace mooncake

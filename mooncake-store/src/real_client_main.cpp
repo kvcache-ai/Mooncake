@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include <variant>
@@ -16,20 +17,46 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
-DEFINE_int32(threads, 1, "Number of threads for client service");
+DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
-DEFINE_string(tiered_backend_config, "",
-              "Tiered backend config json. Empty means load from env "
-              "MOONCAKE_TIERED_CONFIG");
+DEFINE_string(tiered_backend_config, "conf/tiered_backend.json",
+              "Tiered backend config: accepts a JSON string or a path to a "
+              "JSON config file.");
 DEFINE_string(deployment_mode, "Centralization",
               "Client type: 'Centralization' or 'P2P'");
 DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
 DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
 DEFINE_uint64(lock_shard_count, 1024,
-              "Number of key lock shards for DataManager");
+              "Number of metadata shards in TieredBackend (and matching "
+              "pending-write/pinned-key lease shards in DataManager)");
 DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
 DEFINE_uint64(route_cache_ttl_ms, 5 * 60 * 1000,
               "TTL for RouteCache entries in ms");
+DEFINE_uint64(async_sender_thread_count, 0,
+              "Async route notifier sender thread count. "
+              "0=disabled (sync RPCs), >0=enable async notifier");
+DEFINE_uint64(async_max_batch_size, 2000,
+              "Max ops per batch in async route notifier.");
+DEFINE_uint64(async_route_queue_size, 0,
+              "Async route notifier queue size when async is enabled "
+              "(min='async_max_batch_size * async_sender_thread_count').");
+DEFINE_string(p2p_local_transfer_mode, "te",
+              "Local transfer mode for P2P local Get/Put path: memcpy|te");
+DEFINE_string(p2p_transfer_direction_mode, "reverse",
+              "Cross-node transfer direction for P2P: reverse|forward");
+DEFINE_uint64(local_memcpy_async_worker_num, 32,
+              "If set p2p_local_transfer_mode=memcpy, Worker number for async "
+              "local memcpy executor (P2P), 0 means forbid async memcpy");
+DEFINE_uint32(metrics_port, 9003, "Port for HTTP metrics server");
+DEFINE_bool(enable_metrics_http, true, "Enable HTTP metrics endpoint");
+DEFINE_uint32(
+    p2p_key_lease_duration_ms, 0,
+    "Maximum time (ms) a key may remain in PreWrite or PinKey "
+    "lease-protected intermediate state. 0 uses the built-in default (5000).");
+DEFINE_uint32(
+    p2p_key_lease_scan_interval_ms, 0,
+    "Interval (ms) for background scanning of expired key leases (PreWrite / "
+    "PinKey). 0 uses the built-in default (1000).");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -55,6 +82,11 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::create_copy_task>(&real_client);
+    server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::query_task>(&real_client);
+    server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
 }
 }  // namespace mooncake
 
@@ -90,7 +122,14 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(FLAGS_rpc_thread_num),
                 FLAGS_lock_shard_count,
                 string_to_byte_size(FLAGS_route_cache_max_memory),
-                FLAGS_route_cache_ttl_ms);
+                FLAGS_route_cache_ttl_ms, FLAGS_p2p_local_transfer_mode,
+                static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+                static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http, {},  // labels
+                FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
+                FLAGS_async_route_queue_size, FLAGS_p2p_key_lease_duration_ms,
+                FLAGS_p2p_key_lease_scan_interval_ms,
+                FLAGS_p2p_transfer_direction_mode);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -105,7 +144,9 @@ int main(int argc, char* argv[]) {
                 FLAGS_master_server_address, global_segment_size,
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-                FLAGS_enable_offload);
+                FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_metrics_port),
+                FLAGS_enable_metrics_http, {},
+                static_cast<uint16_t>(FLAGS_port));
         }
     }();
 

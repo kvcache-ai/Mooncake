@@ -25,6 +25,13 @@ class P2PMasterService : public MasterService {
         -> tl::expected<WriteRouteResponse, ErrorCode>;
 
     /**
+     * @brief Batch get write routes for multiple keys.
+     *        Reuses GetWriteRoute logic per key.
+     */
+    auto BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
+        -> BatchGetWriteRouteResponse;
+
+    /**
      * @brief Add a route replica to master
      */
     auto AddReplica(const AddReplicaRequest& req)
@@ -41,6 +48,17 @@ class P2PMasterService : public MasterService {
      */
     auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;
+
+    /**
+     * @brief Batch sync replicas with mixed ADD and REMOVE ops
+     */
+    auto BatchSyncReplica(const BatchSyncReplicaRequest& req)
+        -> BatchSyncReplicaResponse;
+
+    /**
+     * @brief Client notifies Master that metadata sync is complete
+     */
+    auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
 
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
@@ -61,22 +79,30 @@ class P2PMasterService : public MasterService {
     }
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
     // Helper to get shard index from key
-    size_t GetShardIndex(const std::string& key) const override {
-        return std::hash<std::string>{}(key) % kNumShards;
+    size_t GetShardIndex(std::string_view key) const override {
+        return std::hash<std::string_view>{}(key) % kNumShards;
     }
     size_t GetShardCount() const override { return kNumShards; }
 
    protected:
     // Hooks
-    void OnObjectAccessed(ObjectMetadata& metadata) override;
+    void OnObjectAccessed(const ObjectMetadata& metadata) override;
     void OnObjectHit(const ObjectMetadata& metadata) override;
     void OnReplicaRemoved(const Replica& replica) override;
     void OnReplicaAdded(const Replica& replica) override;
 
    private:
     static auto CollectReplicaOwnerClients(const ObjectMetadata& metadata,
-                                           const std::string& key)
+                                           std::string_view key)
         -> tl::expected<std::set<UUID>, ErrorCode>;
+
+    tl::expected<void, ErrorCode> InnerAddReplica(
+        MetadataShard& shard, std::string_view key, const UUID& client_id,
+        const UUID& segment_id, size_t size,
+        const std::shared_ptr<P2PClientMeta>& client) NO_THREAD_SAFETY_ANALYSIS;
+    tl::expected<void, ErrorCode> InnerRemoveReplica(
+        MetadataShard& shard, std::string_view key, const UUID& client_id,
+        const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
 
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;

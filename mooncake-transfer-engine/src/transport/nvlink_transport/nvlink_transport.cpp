@@ -41,48 +41,6 @@ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
     return true;
 }
 
-static bool detectMemoryBackend() {
-    CUdevice dev;
-    int cudaDev;
-    cudaError_t err = cudaGetDevice(&cudaDev);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "cudaGetDevice failed: " << cudaGetErrorString(err);
-        return false;
-    }
-
-    CUresult result = cuDeviceGet(&dev, cudaDev);
-    if (result != CUDA_SUCCESS) {
-        LOG(ERROR) << "cuDeviceGet failed: " << result;
-        return false;
-    }
-
-    int supports_pools = 0;
-    result = cuDeviceGetAttribute(
-        &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
-    if (result != CUDA_SUCCESS || !supports_pools) {
-        LOG(INFO) << "Device does not support memory pools";
-        return false;
-    }
-
-    CUmemAllocationProp prop = {};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = dev;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-
-    CUmemGenericAllocationHandle handle;
-    size_t alloc_size = 4096;
-    result = cuMemCreate(&handle, alloc_size, &prop, 0);
-    if (result != CUDA_SUCCESS) {
-        LOG(INFO)
-            << "cuMemCreate(FABRIC) failed: " << result
-            << ", falling back to CudaMalloc and use CudaIPC to share handle";
-        return false;
-    }
-    cuMemRelease(handle);
-    return true;
-}
-
 namespace mooncake {
 static int getNumDevices() {
     static int cached_num_devices = -1;
@@ -120,9 +78,9 @@ static bool supportFabricMem() {
         if (!device_support_fabric_mem) {
             return false;
         }
-        return detectMemoryBackend();
     }
 #endif
+    return true;
 }
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
@@ -558,16 +516,8 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;
-        cudaError_t res = cudaMalloc(&ptr, size);
-        if (res == cudaSuccess) {
-            LOG(INFO) << "NvlinkTransport: Falling back to cudaMalloc for "
-                      << size << " bytes (memory will NOT be exportable)";
-            return ptr;
-        } else {
-            LOG(ERROR) << "NvlinkTransport: cudaMalloc failed during fallback: "
-                       << cudaGetErrorString(res);
-            return nullptr;
-        }
+        cudaMalloc(&ptr, size);
+        return ptr;
     }
     size_t granularity = 0;
     CUdevice currentDev;

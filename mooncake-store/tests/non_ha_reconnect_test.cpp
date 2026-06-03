@@ -9,6 +9,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <csignal>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog.hpp>

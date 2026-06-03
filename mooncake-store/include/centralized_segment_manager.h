@@ -44,14 +44,14 @@ class CentralizedSegmentManager : public SegmentManager {
      * Registered by CentralizedClientManager to sync allocators with its
      * global_allocator_manager_, enabling global Allocate() without
      * iterating per-client segment managers.
-     * @param segment_name Name of the segment
+     * @param segment the segment
      * @param allocator The allocator being added or removed
      * @param is_add true if allocator is being added, false if removed
      * @return ErrorCode::OK on success
      */
     using AllocatorChangeCallback = std::function<tl::expected<void, ErrorCode>(
-        const std::string& segment_name,
-        const std::shared_ptr<BufferAllocatorBase>& allocator, bool is_add)>;
+        const Segment& segment, std::shared_ptr<BufferAllocatorBase>& allocator,
+        bool is_add)>;
 
     void SetAllocatorChangeCallback(AllocatorChangeCallback cb);
 

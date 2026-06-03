@@ -2,6 +2,7 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
+    async_memcpy_executor.cpp
     replica.cpp
     allocator.cpp
     master_service.cpp
@@ -9,6 +10,7 @@ set(MOONCAKE_STORE_SOURCES
     client_service.cpp
     centralized_client_service.cpp
     p2p_client_service.cpp
+    p2p_client_metric.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
@@ -48,6 +50,8 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/tiered_backend.cpp
     data_manager.cpp
     route_cache.cpp
+    async_metadata_notifier.cpp
+    ha_recovery_manager.cpp
     client_rpc_service.cpp
     peer_client.cpp
     tiered_cache/tiers/dram_tier.cpp
@@ -55,6 +59,7 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/scheduler/simple_policy.cpp
     tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
+    task_manager.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -87,7 +92,9 @@ target_link_libraries(mooncake_store
         ${ETCD_WRAPPER_LIB}
         glog::glog
         gflags::gflags
+        JsonCpp::JsonCpp
         ${EXTRA_LIBS}
+        asio_shared
     PRIVATE
         transfer_engine
 )
@@ -124,6 +131,21 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
+if (USE_ASCEND_DIRECT)
+    set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
+    if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
+        file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
+        if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
+            message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
+            add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
+        else()
+            message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
+        endif()
+    else()
+        message(WARNING "Acl runtime header file is not exist")
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
@@ -150,6 +172,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_common
     ${ETCD_WRAPPER_LIB}
     ${MASTER_EXTRA_LIBS}
+    asio_shared
 )
 
 if (STORE_USE_ETCD)
@@ -162,7 +185,7 @@ target_link_options(mooncake_master PRIVATE -Os -s)
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine)
+target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 

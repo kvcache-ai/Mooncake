@@ -15,7 +15,6 @@
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
 #endif
-
 namespace mooncake {
 
 // Constants
@@ -32,18 +31,30 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;       // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;     // in seconds
 static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;  // in seconds
-static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
-static const std::string DEFAULT_ROOT_FS_DIR = "";
+constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
+static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
+static const size_t DEFAULT_CXL_SIZE = 8ULL * 1024 * 1024 * 1024;
+constexpr const char* DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
     std::numeric_limits<int64_t>::max();
-static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
+constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
+
+// Task manager constants
+static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -123,20 +134,31 @@ enum class ErrorCode : int32_t {
     // Parameter errors (Range: -600 to -699)
     INVALID_PARAMS = -600,  ///< Invalid parameters.
     ILLEGAL_CLIENT = -601,  ///< Illegal client to do the operation.
+    NON_CONTIGUOUS_BUFFER_NOT_SUPPORTED =
+        -602,  ///< Non-contiguous buffer not supported in forward transfer
+               ///< mode.
 
-    // Engine operation errors (Range: -700 to -710)
+    // Engine operation errors (Range: -700 to -711)
     INVALID_WRITE = -700,    ///< Invalid write operation.
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
+    // Object errors (Range: -703 to -750)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
     LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
-    REPLICA_ALREADY_EXISTS = -708,  ///< Replica already exists.
-    REPLICA_NOT_FOUND = -709,       ///< Replica not found.
-    REPLICA_NUM_EXCEEDED = -710,    ///< Replica number exceeded.
+    OBJECT_HAS_REPLICATION_TASK =
+        -708,  ///< Object has ongoing replication task.
+    OBJECT_NO_REPLICATION_TASK =
+        -709,  ///< Object does not have ongoing replication task.
+    REPLICA_NOT_FOUND = -710,       ///< Replica not found.
+    REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
+    REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
+    REPLICA_NUM_EXCEEDED = -713,    ///< Replica number exceeded.
+    REPLICA_IS_PROCESSING =
+        -714,  ///< Replica is processing an in-flight write.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -170,13 +192,21 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
-    // Tiered backend errors (Range: -1400 to -1499)
-    EMPTY_REPLICAS = -1400,
-    TIER_NOT_FOUND = -1401,
-    DATA_COPY_FAILED = -1402,
+    // Task errors (Range: -1400 to -1499)
+    TASK_NOT_FOUND = -1400,  ///< Task not found.
+    TASK_PENDING_LIMIT_EXCEEDED =
+        -1401,  ///< Total pending tasks exceed the limit.
 
-    // Store errors (Range: -1500 to -1599)
-    SHUTTING_DOWN = -1500,  ///< Store is shutting down, rejecting new requests.
+    // Tiered backend errors (Range: -1500 to -1599)
+    EMPTY_REPLICAS = -1500,
+    TIER_NOT_FOUND = -1501,
+    DATA_COPY_FAILED = -1502,
+
+    // Store errors (Range: -1600 to -1699)
+    SHUTTING_DOWN = -1600,  ///< Store is shutting down, rejecting new requests.
+    ASYNC_ENQUEUE_FAILED = -1601,  ///< Async metadata notifier enqueue failed
+                                   ///< (queue full/stopped).
+    INACCESSIBLE_MASTER = -1602
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -226,7 +256,9 @@ const static uint64_t kMaxSliceSize =
 struct CentralizedSegmentExtraData {
     uintptr_t base{0};
     std::string te_endpoint;
-    YLT_REFL(CentralizedSegmentExtraData, base, te_endpoint);
+    std::string protocol;
+
+    YLT_REFL(CentralizedSegmentExtraData, base, te_endpoint, protocol);
 };
 
 /**
@@ -340,6 +372,74 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+/**
+ * @enum HAClientState
+ * @brief Client-side HA state for Master crash recovery.
+ *        FULL: normal operation
+ *        DEGRADED: Master unreachable, local-only mode
+ *        SYNCING: re-syncing metadata to restarted Master
+ */
+enum class HAClientState : int32_t {
+    FULL = 0,
+    DEGRADED = 1,
+    SYNCING = 2,
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const HAClientState& state) noexcept {
+    switch (state) {
+        case HAClientState::FULL:
+            os << "FULL";
+            break;
+        case HAClientState::DEGRADED:
+            os << "DEGRADED";
+            break;
+        case HAClientState::SYNCING:
+            os << "SYNCING";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
+    return os;
+}
+
+inline const char* toString(HAClientState state) noexcept {
+    switch (state) {
+        case HAClientState::FULL:
+            return "FULL";
+        case HAClientState::DEGRADED:
+            return "DEGRADED";
+        case HAClientState::SYNCING:
+            return "SYNCING";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/**
+ * @enum HAEvent
+ * @brief Events that drive client-side HA state transitions.
+ */
+enum class HAEvent {
+    MASTER_UNREACHABLE,  // Consecutive heartbeat failures exceeded threshold
+    MASTER_RECONNECTED,  // Master connection restored. Triggered on:
+                         // 1. RegisterClient succeeded (Master restarted or
+                         //    client re-registered after reconnection)
+                         // 2. Heartbeat recovered with HEALTH status after
+                         //    a prior MASTER_UNREACHABLE event
+};
+
+/**
+ * @struct ReplicaLocation
+ * @brief Describes a single replica's key, tier and size.
+ */
+struct ReplicaLocation {
+    std::string key;
+    UUID tier_id;
+    size_t size;
+};
+
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator
     OFFSET = 1,    // OffsetBufferAllocator
@@ -393,6 +493,31 @@ inline std::ostream& operator<<(
 
     os << (strategy_strings.count(strategy) ? strategy_strings.at(strategy)
                                             : "UNKNOWN");
+    return os;
+}
+
+// Who initiates the cross-node transfer for the data plane: REVERSE matches the
+// historical target-initiated path and is the conventional default when unset
+// optional or client-level config omits an explicit override.
+enum class TransferDirectionMode : uint8_t {
+    REVERSE = 0,
+    FORWARD = 1,
+};
+
+// Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
+inline std::ostream& operator<<(std::ostream& os,
+                                const TransferDirectionMode& mode) noexcept {
+    switch (mode) {
+        case TransferDirectionMode::REVERSE:
+            os << "REVERSE";
+            break;
+        case TransferDirectionMode::FORWARD:
+            os << "FORWARD";
+            break;
+        default:
+            os << "UNKNOWN";
+            break;
+    }
     return os;
 }
 

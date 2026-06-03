@@ -2,10 +2,15 @@
 
 #include <cstddef>
 #include <cstdlib>
-#include <string>
+#include <functional>
 #include <limits>
+#include <linux/memfd.h>
+#include <linux/mman.h>
+#include <string>
+#include <string_view>
 #include <ylt/util/tl/expected.hpp>
 
+#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {
@@ -103,6 +108,16 @@ void to_stream(std::ostream& os, const std::pair<T1, T2>& p) {
     os << "}";
 }
 
+// Specialization for std::optional
+template <typename T>
+void to_stream(std::ostream& os, const std::optional<T>& opt) {
+    if (opt.has_value()) {
+        to_stream(os, opt.value());
+    } else {
+        os << "nullopt";
+    }
+}
+
 template <typename T>
 std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     std::ostringstream oss;
@@ -119,17 +134,13 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     return oss.str();
 }
 
-/*
-    @brief Allocates memory for the `BufferAllocator` class.
-    @param total_size The total size of the memory to allocate.
-    @return A pointer to the allocated memory.
-*/
-void* allocate_buffer_allocator_memory(
-    size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+// String utility functions
 
-void free_memory(const std::string& protocol, void* ptr);
-
+/**
+ * @brief Convert a byte size to a human-readable string
+ * @param bytes Number of bytes
+ * @return std::string Human-readable string representation of size
+ */
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;
     const double MB = KB * 1024.0;
@@ -230,8 +241,6 @@ void free_memory(const std::string& protocol, void* ptr);
     }
 }
 
-// String utility functions
-
 /**
  * @brief Split a string by delimiter into a vector of strings
  * @param str The string to split
@@ -244,6 +253,108 @@ std::vector<std::string> splitString(const std::string& str,
                                      char delimiter = ',',
                                      bool trim_spaces = true,
                                      bool keep_empty = false);
+
+/// @brief Transparent hasher enabling heterogeneous string_view lookup
+/// in unordered containers keyed by std::string.
+/// std::string implicitly converts to string_view, so one overload suffices.
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+
+/** @brief Returns true if the UUID is the all-zero sentinel value. */
+[[nodiscard]] inline bool IsZeroUUID(const UUID& uuid) noexcept {
+    return uuid.first == 0 && uuid.second == 0;
+}
+
+// Buffer allocator functions
+
+constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+
+/**
+ * @brief Allocates memory for the `BufferAllocator` class.
+ * @param total_size The total size of the memory to allocate.
+ * @return A pointer to the allocated memory.
+ */
+void* allocate_buffer_allocator_memory(
+    size_t total_size, const std::string& protocol = "",
+    size_t alignment = facebook::cachelib::Slab::kSize);
+
+inline size_t align_up(size_t size, size_t alignment) {
+    if (alignment == 0) {
+        return size;
+    }
+    return ((size + alignment - 1) / alignment) * alignment;
+}
+
+/**
+ * @brief Get hugepage size from env and optionally set the corresponding memfd
+ * flags.
+ * * @param out_flags Optional pointer to an int. If provided,
+ * MAP_HUGETLB and MAP_HUGE_2MB/1GB will be OR-ed into it.
+ * @return size_t Hugepage size in bytes, or 0 if disabled.
+ */
+[[nodiscard]] inline size_t get_hugepage_size_from_env(
+    unsigned int* out_flags = nullptr, bool use_memfd = false) {
+    const char* use_hp_env = std::getenv("MC_STORE_USE_HUGEPAGE");
+    if (use_hp_env == nullptr) {
+        return 0;
+    }
+
+    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+
+    size_t size = SZ_2MB;  // Default to 2MB
+
+    const char* size_env = std::getenv("MC_STORE_HUGEPAGE_SIZE");
+    if (size_env != nullptr) {
+        size_t parsed_size = string_to_byte_size(size_env);
+
+        if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
+            size = parsed_size;
+        } else {
+            LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
+                         << "'. Supported: 2MB, 1GB. Fallback to 2MB.";
+            size = SZ_2MB;
+        }
+    }
+
+    if (out_flags != nullptr) {
+        if (use_memfd) {
+            *out_flags |= MFD_HUGETLB;
+        } else {
+            *out_flags |= MAP_HUGETLB;
+        }
+
+        // Add size specific flag
+        if (size == SZ_2MB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_2MB;
+            } else {
+                *out_flags |= MAP_HUGE_2MB;
+            }
+        } else if (size == SZ_1GB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_1GB;
+            } else {
+                *out_flags |= MAP_HUGE_1GB;
+            }
+        }
+        LOG(INFO) << "Using hugepage size: "
+                  << (size == SZ_2MB ? "2MB" : "1GB");
+    }
+
+    return size;
+}
+
+// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+void free_buffer_mmap_memory(void* ptr, size_t total_size);
+
+void free_memory(const std::string& protocol, void* ptr);
 
 // Network utility functions
 
@@ -272,9 +383,15 @@ class AutoPortBinder {
 
     int getPort() const { return port_; }
 
+    int rebind();
+
    private:
+    int tryBindPort();
+
     int socket_fd_;
     int port_;
+    int min_port_;
+    int max_port_;
 };
 
 // HTTP utility: simple GET, returns body on 200, otherwise error code
@@ -305,5 +422,4 @@ T GetEnvOr(const char* name, T default_value) {
 }
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);
-
 }  // namespace mooncake

@@ -61,6 +61,41 @@ curl "http://localhost:8080/query_key?key=my_object"
 }
 ```
 
+#### `/batch_query_keys`
+Retrieve replica information for multiple keys in a single request, including memory locations and transport endpoints for each key.
+
+**Method**: `GET`
+**Parameters**: `keys` (query parameter) - Comma-separated list of object keys to query (format: key1,key2,key3)
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON-formatted mapping of keys to their respective replica descriptors
+
+**Example**:
+```bash
+curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
+```
+
+**Response Format**:
+```json
+{
+  "success": true,
+  "data": {
+    "key1": {
+      "ok": true,
+      "values": [
+        {
+          "transport_endpoint_": "hostname:port",
+          "buffer_descriptor": {...}
+        }
+      ]
+    },
+    "key2": {
+      "ok": false,
+      "error": "error message"
+    }
+  }
+}
+```
+
 #### `/get_all_keys`
 List all keys currently stored in the distributed system.
 

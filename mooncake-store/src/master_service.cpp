@@ -80,8 +80,8 @@ void MasterService::OnObjectRemoved(ObjectMetadata& metadata) {
 // 2. remove the replica in metadata about the segment
 void MasterService::OnSegmentRemoved(const UUID& segment_id) {
     for (size_t i = 0; i < GetShardCount(); ++i) {
-        auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, i);
+        auto& shard = shard_rw.GetRef();
 
         auto idx_it = shard.segment_key_index.find(segment_id);
         if (idx_it == shard.segment_key_index.end()) {
@@ -193,15 +193,15 @@ auto MasterService::QueryClientStatus(const QueryClientStatusRequest& req)
     return GetClientManager().QueryClientStatus(req);
 }
 
-auto MasterService::ExistKey(const std::string& key)
+auto MasterService::ExistKey(std::string_view key)
     -> tl::expected<bool, ErrorCode> {
-    auto accessor = GetMetadataAccessor(key);
-    if (!accessor->Exists()) {
+    MetadataAccessorRO accessor(this, key);
+    if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
     }
 
-    auto& metadata = accessor->Get();
+    const auto& metadata = accessor.Get();
     if (metadata.IsObjectAccessible()) {
         OnObjectAccessed(metadata);
         return true;
@@ -211,7 +211,7 @@ auto MasterService::ExistKey(const std::string& key)
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string_view>& keys) {
     std::vector<tl::expected<bool, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
@@ -224,9 +224,8 @@ auto MasterService::GetAllKeys()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
     for (size_t i = 0; i < GetShardCount(); i++) {
-        auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
-        for (const auto& item : shard.metadata) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& item : shard->metadata) {
             all_keys.push_back(item.first);
         }
     }
@@ -309,10 +308,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     }
 
     for (size_t i = 0; i < GetShardCount(); ++i) {
-        auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRO shard(this, i);
 
-        for (auto& [key, metadata] : shard.metadata) {
+        for (const auto& [key, metadata] : shard->metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 replica_list.reserve(metadata->replicas_.size());
@@ -338,18 +336,18 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     return results;
 }
 
-auto MasterService::GetReplicaList(const std::string& key,
+auto MasterService::GetReplicaList(std::string_view key,
                                    const GetReplicaListRequestConfig& config)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    auto accessor = GetMetadataAccessor(std::string(key));
+    MetadataAccessorRO accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
 
-    if (!accessor->Exists()) {
+    if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    auto& metadata = accessor->Get();
+    const auto& metadata = accessor.Get();
 
     std::vector<Replica::Descriptor> replica_list =
         FilterReplicas(config, metadata);
@@ -373,34 +371,36 @@ auto MasterService::GetReplicaList(const std::string& key,
     return resp;
 }
 
-auto MasterService::Remove(const std::string& key)
+auto MasterService::Remove(std::string_view key, bool force)
     -> tl::expected<void, ErrorCode> {
-    auto accessor = GetMetadataAccessor(key);
-    if (!accessor->Exists()) {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    auto& metadata = accessor->Get();
+    auto& metadata = accessor.Get();
 
-    if (auto res = metadata.IsObjectRemovable(); !res) {
+    if (auto res = metadata.IsObjectRemovable(force); !res) {
         VLOG(1) << "key=" << key << ", error=" << res.error();
         return tl::make_unexpected(res.error());
     }
 
     // Remove object metadata
     OnObjectRemoved(metadata);
-    accessor->Erase();
+    accessor.Erase();
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern)
+auto MasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 
     try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+        pattern = std::regex(regex_pattern.data(),
+                             regex_pattern.data() + regex_pattern.size(),
+                             std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
         LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
                    << ", error: " << e.what();
@@ -408,12 +408,11 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     }
 
     for (size_t i = 0; i < GetShardCount(); ++i) {
-        auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard(this, i);
 
-        for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
+        for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second->IsObjectRemovable()) {
+                if (!it->second->IsObjectRemovable(force)) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but object is not removable";
                     ++it;
@@ -423,9 +422,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
                 OnObjectRemoved(*it->second);
-                RemoveReplicaFromSegmentIndex(shard, it->first,
+                RemoveReplicaFromSegmentIndex(shard.GetRef(), it->first,
                                               it->second->replicas_);
-                it = shard.metadata.erase(it);
+                it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
@@ -438,19 +437,26 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     return removed_count;
 }
 
-long MasterService::RemoveAll() {
+long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
+    uint64_t total_freed_size = 0;
 
     for (size_t i = 0; i < GetShardCount(); ++i) {
-        auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
-        auto it = shard.metadata.begin();
-        while (it != shard.metadata.end()) {
-            if (it->second->IsObjectRemovable()) {
+        MetadataShardAccessorRW shard(this, i);
+        if (shard->metadata.empty()) {
+            continue;
+        }
+
+        auto it = shard->metadata.begin();
+        while (it != shard->metadata.end()) {
+            if (it->second->IsObjectRemovable(force)) {
+                auto mem_rep_count =
+                    it->second->CountReplicas(&Replica::fn_is_memory_replica);
+                total_freed_size += it->second->size_ * mem_rep_count;
                 OnObjectRemoved(*it->second);
-                RemoveReplicaFromSegmentIndex(shard, it->first,
+                RemoveReplicaFromSegmentIndex(shard.GetRef(), it->first,
                                               it->second->replicas_);
-                it = shard.metadata.erase(it);
+                it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
@@ -459,16 +465,16 @@ long MasterService::RemoveAll() {
     }
 
     VLOG(1) << "action=remove_all_objects"
-            << ", removed_count=" << removed_count;
+            << ", removed_count=" << removed_count
+            << ", total_freed_size=" << total_freed_size;
     return removed_count;
 }
 
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
     for (size_t i = 0; i < GetShardCount(); ++i) {
-        const auto& shard = GetShard(i);
-        MutexLocker lock(&shard.mutex);
-        total += shard.metadata.size();
+        MetadataShardAccessorRO shard(this, i);
+        total += shard->metadata.size();
     }
     return total;
 }

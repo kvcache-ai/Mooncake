@@ -142,7 +142,7 @@ class CacheTier {
      * Registers the key and finalizes the storage.
      * For Storage Tiers, this triggers the actual persistence (or buffering).
      */
-    virtual tl::expected<void, ErrorCode> Commit(const std::string& key,
+    virtual tl::expected<void, ErrorCode> Commit(std::string_view key,
                                                  const DataSource& data) {
         return {};
     }

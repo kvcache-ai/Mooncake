@@ -89,7 +89,7 @@ Status TransferEngine::freeLocalMemory(void* addr) {
 
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            Permission permission) {
-    return registerLocalMemory({addr}, {size}, permission);
+    return impl_->registerLocalMemory({addr}, {size}, permission);
 }
 
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
@@ -132,6 +132,12 @@ Status TransferEngine::freeBatch(BatchID batch_id) {
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     return impl_->submitTransfer(batch_id, request_list);
+}
+
+Status TransferEngine::submitTransfer(BatchID batch_id,
+                                      const std::vector<Request>& request_list,
+                                      const Notification& notifi) {
+    return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
 Status TransferEngine::sendNotification(SegmentID target_id,

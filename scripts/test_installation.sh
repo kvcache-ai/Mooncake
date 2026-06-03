@@ -37,7 +37,7 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
-pip install torch numpy
+pip install torch==2.10.0 numpy
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."

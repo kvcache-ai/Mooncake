@@ -1,4 +1,5 @@
 #include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <ylt/easylog/record.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
@@ -6,9 +7,11 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <cstdlib>
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
 #include "types.h"
@@ -31,7 +34,10 @@ ShmHelper* ShmHelper::getInstance() {
     return &instance;
 }
 
-ShmHelper::ShmHelper() {}
+ShmHelper::ShmHelper() {
+    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
+    use_hugepage_ = (hp != nullptr);
+}
 
 ShmHelper::~ShmHelper() { cleanup(); }
 
@@ -59,10 +65,20 @@ bool ShmHelper::cleanup() {
 void* ShmHelper::allocate(size_t size) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
 
+    unsigned int flags = MFD_CLOEXEC;
+    if (use_hugepage_) {
+        bool use_memfd = true;
+        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
+        LOG(INFO) << "Using huge pages for shared memory, size: " << size;
+    }
+
     // Create memfd
-    int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, MFD_CLOEXEC);
+    int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
     if (fd == -1) {
-        throw std::runtime_error("Failed to create anonymous shared memory: " +
+        std::string extra_msg =
+            use_hugepage_ ? " (Check /proc/sys/vm/nr_hugepages?)" : "";
+        throw std::runtime_error("Failed to create anonymous shared memory" +
+                                 extra_msg + ": " +
                                  std::string(strerror(errno)));
     }
 
@@ -74,8 +90,8 @@ void* ShmHelper::allocate(size_t size) {
     }
 
     // Map memory
-    void* base_addr =
-        mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_POPULATE, fd, 0);
     if (base_addr == MAP_FAILED) {
         close(fd);
         throw std::runtime_error("Failed to map shared memory: " +
@@ -413,14 +429,17 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         LOG(ERROR) << "Buffer is not in any registered shared memory";
         return -1;
     }
+    if (shm_helper_->is_hugepage()) {
+        size = align_up(size, get_hugepage_size_from_env());
+    }
     // Check bounds
     if (reinterpret_cast<uint8_t*>(buffer) !=
             reinterpret_cast<uint8_t*>(shm->base_addr) ||
         size != shm->size) {
-        LOG(ERROR)
-            << "Invalid buffer address or size for registration: Buffer addr: "
-            << buffer << ", need addr: " << shm->base_addr
-            << ", buffer size: " << size << ", need size: " << shm->size;
+        LOG(ERROR) << "Invalid buffer address or size for registration: "
+                      "Buffer addr: "
+                   << buffer << ", need addr: " << shm->base_addr
+                   << ", buffer size: " << size << ", need size: " << shm->size;
         return -1;
     }
 
@@ -494,17 +513,19 @@ int DummyClient::put_parts(const std::string& key,
         key, values, config, client_id_));
 }
 
-int DummyClient::remove(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::remove_internal, void>(key));
-}
-
-long DummyClient::removeByRegex(const std::string& str) {
+int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::removeByRegex_internal, long>(str));
+        invoke_rpc<&RealClient::remove_internal, void>(key, force));
 }
 
-long DummyClient::removeAll() {
-    return to_py_ret(invoke_rpc<&RealClient::removeAll_internal, int64_t>());
+long DummyClient::removeByRegex(const std::string& str, bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeByRegex_internal, long>(str, force));
+}
+
+long DummyClient::removeAll(bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
 int DummyClient::isExist(const std::string& key) {
@@ -679,6 +700,22 @@ std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
     }
     replica_list = std::move(result.value());
     return replica_list;
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return invoke_rpc<&RealClient::create_copy_task, UUID>(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
+    const UUID& task_id) {
+    return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
 }
 
 void DummyClient::ping_thread_main() {

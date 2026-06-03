@@ -208,8 +208,8 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
     void verifyAllocation(uint64_t begin, uint64_t end) const {
         // Check bounds
         ASSERT_TRUE(begin >= m_base && end <= m_base + m_buffer_size)
-            << "Allocation is out of bounds: " << "Begin: " << begin
-            << ", End: " << end << ", Base: " << m_base
+            << "Allocation is out of bounds: "
+            << "Begin: " << begin << ", End: " << end << ", Base: " << m_base
             << ", Buffer Size: " << m_buffer_size;
 
         // Check for overlap with existing allocations using O(log(N)) algorithm
@@ -408,13 +408,15 @@ class OffsetAllocatorTest : public ::testing::Test {
             return false;
 
         // Compare Node arrays
-        if (memcmp(a->m_allocator->m_nodes, b->m_allocator->m_nodes,
+        if (memcmp(a->m_allocator->m_nodes.data(),
+                   b->m_allocator->m_nodes.data(),
                    a->m_allocator->m_current_capacity *
                        sizeof(a->m_allocator->m_nodes[0])) != 0)
             return false;
 
         // Compare freeNodes array
-        if (memcmp(a->m_allocator->m_freeNodes, b->m_allocator->m_freeNodes,
+        if (memcmp(a->m_allocator->m_freeNodes.data(),
+                   b->m_allocator->m_freeNodes.data(),
                    a->m_allocator->m_current_capacity *
                        sizeof(a->m_allocator->m_freeNodes[0])) != 0)
             return false;

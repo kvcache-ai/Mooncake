@@ -18,7 +18,7 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
 }
 
 auto P2PMasterService::CollectReplicaOwnerClients(
-    const ObjectMetadata& metadata, const std::string& key)
+    const ObjectMetadata& metadata, std::string_view key)
     -> tl::expected<std::set<UUID>, ErrorCode> {
     std::set<UUID> owner_clients;
     for (const auto& replica : metadata.replicas_) {
@@ -76,7 +76,8 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
         // 1.2 priority filter
         auto priority_opt = replica.get_p2p_priority();
         if (!priority_opt) {
-            LOG(ERROR) << "invalid priority" << ", replica: " << replica;
+            LOG(ERROR) << "invalid priority"
+                       << ", replica: " << replica;
             continue;
         }
         if (*priority_opt < p2p_config.priority_limit) continue;
@@ -117,9 +118,9 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     std::set<UUID> owner_clients;
     bool filter_to_owner_clients = false;
     if (!req.key.empty() && max_replicas_per_key_ > 0) {
-        auto accessor = GetMetadataAccessor(req.key);
-        if (accessor->Exists()) {
-            auto& metadata = accessor->Get();
+        MetadataAccessorRO accessor(this, req.key);
+        if (accessor.Exists()) {
+            auto& metadata = accessor.Get();
             auto owner_clients_res =
                 CollectReplicaOwnerClients(metadata, req.key);
             if (!owner_clients_res.has_value()) {
@@ -157,150 +158,172 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
                    << ", client_id: " << req.client_id
                    << ", size: " << req.size;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    } else if (req.config.max_candidates ==
-                   WriteRouteRequestConfig::RETURN_ALL_CANDIDATES ||
-               candidates.size() <= req.config.max_candidates) {
-        // return all candidates
-        response.candidates = std::move(candidates);
     } else {
-        // return top max_candidates candidates
         std::sort(candidates.begin(), candidates.end(),
                   [](const auto& a, const auto& b) {
                       return a.priority > b.priority;
                   });
-        candidates.resize(req.config.max_candidates);
+        if (req.config.max_candidates !=
+                WriteRouteRequestConfig::RETURN_ALL_CANDIDATES &&
+            candidates.size() > req.config.max_candidates) {
+            candidates.resize(req.config.max_candidates);
+        }
         response.candidates = std::move(candidates);
+    }
+    return response;
+}
+
+auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
+    -> BatchGetWriteRouteResponse {
+    const size_t n = req.keys.size();
+    BatchGetWriteRouteResponse response;
+    response.responses.resize(n);
+    response.error_codes.resize(n, ErrorCode::OK);
+
+    if (req.keys.size() != req.sizes.size()) {
+        std::fill(response.error_codes.begin(), response.error_codes.end(),
+                  ErrorCode::INVALID_PARAMS);
+        return response;
+    }
+
+    WriteRouteRequest single_req;
+    single_req.client_id = req.client_id;
+    single_req.config = req.config;
+    for (size_t i = 0; i < n; ++i) {
+        single_req.key = req.keys[i];
+        single_req.size = req.sizes[i];
+        auto result = GetWriteRoute(single_req);
+        if (result.has_value()) {
+            response.responses[i] = std::move(*result);
+        } else {
+            response.error_codes[i] = result.error();
+        }
     }
     return response;
 }
 
 auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
-    auto accessor = GetMetadataAccessor(req.key);
+    MetadataAccessorRW accessor(this, req.key);
     auto client = std::static_pointer_cast<P2PClientMeta>(
-        client_manager_->GetClient(req.replica.client_id));
+        client_manager_->GetClient(req.client_id));
     if (!client) {
         LOG(ERROR) << "client not found"
-                   << ", client_id: " << req.replica.client_id;
+                   << ", client_id: " << req.client_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
-    auto segment_res = client->QuerySegment(req.replica.segment_id);
+    return InnerAddReplica(accessor.GetShard().GetRef(), req.key, req.client_id,
+                           req.segment_id, req.size, client);
+}
+
+tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
+    MetadataShard& shard, std::string_view key, const UUID& client_id,
+    const UUID& segment_id, size_t size,
+    const std::shared_ptr<P2PClientMeta>& client) {
+    auto segment_res = client->QuerySegment(segment_id);
     if (!segment_res.has_value()) {
         LOG(ERROR) << "fail to query segment"
-                   << ", client_id: " << req.replica.client_id
-                   << ", segment_id: " << req.replica.segment_id;
+                   << ", client_id: " << client_id
+                   << ", segment_id: " << segment_id;
         return tl::make_unexpected(segment_res.error());
     }
 
-    // Construct Replica from resolved pointers
-    Replica new_replica(
-        P2PProxyReplicaData(client, segment_res.value(), req.size),
-        ReplicaStatus::COMPLETE);
+    Replica new_replica(P2PProxyReplicaData(client, segment_res.value(), size),
+                        ReplicaStatus::COMPLETE);
 
-    if (accessor->Exists()) {
-        auto& metadata = accessor->Get();
-        auto owner_clients_res = CollectReplicaOwnerClients(metadata, req.key);
+    auto it = shard.metadata.find(key);
+    if (it != shard.metadata.end()) {
+        auto& metadata = *it->second;
+        auto owner_clients_res = CollectReplicaOwnerClients(metadata, key);
         if (!owner_clients_res.has_value()) {
             return tl::make_unexpected(owner_clients_res.error());
         }
         const auto& owner_clients = owner_clients_res.value();
-        // Skip duplicate
-        bool exist = false;
         for (const auto& replica : metadata.replicas_) {
             auto seg_id = replica.get_segment_id();
             auto cli_id = replica.get_p2p_client_id();
-            if (cli_id && seg_id && *cli_id == req.replica.client_id &&
-                *seg_id == req.replica.segment_id) {
-                exist = true;
-                break;
+            if (cli_id && seg_id && *cli_id == client_id &&
+                *seg_id == segment_id) {
+                LOG(WARNING) << "replica has existed"
+                             << ", key: " << key << ", client_id: " << client_id
+                             << ", segment_id: " << segment_id;
+                return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
         }
-        if (exist) {
-            LOG(WARNING) << "replica has existed" << ", key: " << req.key
-                         << ", client_id: " << req.replica.client_id
-                         << ", segment_id: " << req.replica.segment_id;
-            return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
-        } else if (max_replicas_per_key_ > 0 &&
-                   owner_clients.find(req.replica.client_id) ==
-                       owner_clients.end() &&
-                   owner_clients.size() >= max_replicas_per_key_) {
+        if (max_replicas_per_key_ > 0 &&
+            owner_clients.find(client_id) == owner_clients.end() &&
+            owner_clients.size() >= max_replicas_per_key_) {
             LOG(WARNING) << "replica owner client num exceeded"
-                         << ", key: " << req.key
-                         << ", client_id: " << req.replica.client_id
-                         << ", segment_id: " << req.replica.segment_id
+                         << ", key: " << key << ", client_id: " << client_id
+                         << ", segment_id: " << segment_id
                          << ", current owner client num:"
                          << owner_clients.size()
                          << ", max owner client num: " << max_replicas_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
-        } else {
-            AddReplicaToSegmentIndex(accessor->GetShard(), req.key,
-                                     new_replica);
-            OnReplicaAdded(new_replica);
-            metadata.replicas_.push_back(std::move(new_replica));
         }
+        AddReplicaToSegmentIndex(shard, it->first, new_replica);
+        OnReplicaAdded(new_replica);
+        metadata.replicas_.push_back(std::move(new_replica));
     } else {
         std::vector<Replica> replicas;
         replicas.push_back(std::move(new_replica));
-
         auto new_meta =
-            std::make_unique<ObjectMetadata>(req.size, std::move(replicas));
-
-        auto& shard = accessor->GetShard();
-        auto it = shard.metadata.emplace(req.key, std::move(new_meta)).first;
-        AddReplicaToSegmentIndex(shard, it->first, it->second->replicas_[0]);
-        OnReplicaAdded(it->second->replicas_[0]);
+            std::make_unique<ObjectMetadata>(size, std::move(replicas));
+        auto emplace_it =
+            shard.metadata.emplace(std::string(key), std::move(new_meta)).first;
+        AddReplicaToSegmentIndex(shard, emplace_it->first,
+                                 emplace_it->second->replicas_[0]);
+        OnReplicaAdded(emplace_it->second->replicas_[0]);
     }
-
     return {};
 }
 
 auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
     -> tl::expected<void, ErrorCode> {
-    auto accessor = GetMetadataAccessor(req.key);
-    if (!accessor->Exists()) {
-        LOG(WARNING) << "object not found" << ", key: " << req.key
-                     << ", client_id: " << req.client_id
-                     << ", segment_id: " << req.segment_id;
+    MetadataAccessorRW accessor(this, req.key);
+    return InnerRemoveReplica(accessor.GetShard().GetRef(), req.key,
+                              req.client_id, req.segment_id);
+}
+
+tl::expected<void, ErrorCode> P2PMasterService::InnerRemoveReplica(
+    MetadataShard& shard, std::string_view key, const UUID& client_id,
+    const UUID& segment_id) {
+    auto it = shard.metadata.find(key);
+    if (it == shard.metadata.end()) {
+        LOG(WARNING) << "object not found"
+                     << ", key: " << key << ", client_id: " << client_id
+                     << ", segment_id: " << segment_id;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    auto& metadata = accessor->Get();
-
-    bool removed = false;
-    for (auto it = metadata.replicas_.begin(); it != metadata.replicas_.end();
-         ++it) {
-        if (!it->is_p2p_proxy_replica()) {
-            LOG(ERROR) << "unexpected replica type" << ", key: " << req.key
-                       << ", client_id: " << req.client_id
-                       << ", segment_id: " << req.segment_id
-                       << ", replica: " << *it;
+    auto& metadata = *it->second;
+    for (auto rit = metadata.replicas_.begin(); rit != metadata.replicas_.end();
+         ++rit) {
+        if (!rit->is_p2p_proxy_replica()) {
+            LOG(ERROR) << "unexpected replica type"
+                       << ", key: " << key << ", client_id: " << client_id
+                       << ", segment_id: " << segment_id
+                       << ", replica: " << *rit;
             return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-        } else {
-            auto seg_id = it->get_segment_id();
-            auto cli_id = it->get_p2p_client_id();
-            if (cli_id && seg_id && cli_id == req.client_id &&
-                *seg_id == req.segment_id) {
-                RemoveReplicaFromSegmentIndex(accessor->GetShard(), req.key,
-                                              *it);
-                OnReplicaRemoved(*it);
-                metadata.replicas_.erase(it);
-                removed = true;
-                break;
+        }
+        auto seg_id = rit->get_segment_id();
+        auto cli_id = rit->get_p2p_client_id();
+        if (cli_id && seg_id && cli_id == client_id && *seg_id == segment_id) {
+            RemoveReplicaFromSegmentIndex(shard, it->first, *rit);
+            OnReplicaRemoved(*rit);
+            metadata.replicas_.erase(rit);
+            if (metadata.replicas_.empty()) {
+                OnObjectRemoved(metadata);
+                shard.metadata.erase(it);
             }
+            return {};
         }
     }
 
-    if (!removed) {
-        LOG(WARNING) << "replica not found" << ", key: " << req.key
-                     << ", client_id: " << req.client_id
-                     << ", segment_id: " << req.segment_id;
-        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
-    } else if (metadata.replicas_.empty()) {
-        OnObjectRemoved(metadata);
-        accessor->Erase();
-    }
-
-    return {};
+    LOG(WARNING) << "replica not found"
+                 << ", key: " << key << ", client_id: " << client_id
+                 << ", segment_id: " << segment_id;
+    return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
 }
 
 auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
@@ -330,7 +353,8 @@ auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
                           << ", segment_id: " << segment_id;
                 results.push_back({});
             } else {
-                LOG(ERROR) << "failed to remove replica" << ", key: " << req.key
+                LOG(ERROR) << "failed to remove replica"
+                           << ", key: " << req.key
                            << ", client_id: " << req.client_id
                            << ", segment_id: " << segment_id
                            << ", error: " << toString(result.error());
@@ -343,7 +367,106 @@ auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
     return results;
 }
 
-void P2PMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
+auto P2PMasterService::BatchSyncReplica(const BatchSyncReplicaRequest& req)
+    -> BatchSyncReplicaResponse {
+    // Validate SoA array lengths are consistent
+    if (req.add_keys.size() != req.add_sizes.size() ||
+        req.add_keys.size() != req.add_segment_ids.size() ||
+        req.remove_keys.size() != req.remove_segment_ids.size()) {
+        LOG(ERROR) << "BatchSyncReplica: mismatched array sizes"
+                   << ", add_keys=" << req.add_keys.size()
+                   << ", add_sizes=" << req.add_sizes.size()
+                   << ", add_segment_ids=" << req.add_segment_ids.size()
+                   << ", remove_keys=" << req.remove_keys.size()
+                   << ", remove_segment_ids=" << req.remove_segment_ids.size();
+        BatchSyncReplicaResponse err_resp;
+        err_resp.add_results.assign(req.add_keys.size(),
+                                    ErrorCode::INVALID_PARAMS);
+        err_resp.remove_results.assign(req.remove_keys.size(),
+                                       ErrorCode::INVALID_PARAMS);
+        return err_resp;
+    }
+
+    BatchSyncReplicaResponse response;
+    response.add_results.resize(req.add_keys.size(), ErrorCode::OK);
+    response.remove_results.resize(req.remove_keys.size(), ErrorCode::OK);
+
+    // Resolve client once for all operations
+    auto client = std::static_pointer_cast<P2PClientMeta>(
+        client_manager_->GetClient(req.client_id));
+    if (!client) {
+        LOG(ERROR) << "BatchSyncReplica: client not found"
+                   << ", client_id=" << req.client_id;
+        std::fill(response.add_results.begin(), response.add_results.end(),
+                  ErrorCode::CLIENT_NOT_FOUND);
+        std::fill(response.remove_results.begin(),
+                  response.remove_results.end(), ErrorCode::CLIENT_NOT_FOUND);
+        return response;
+    }
+
+    // Group operations by shard index.
+    // Each entry: (original_index, is_add=true/false)
+    std::unordered_map<size_t, std::vector<std::pair<size_t, bool>>>
+        shard_groups;
+
+    for (size_t i = 0; i < req.add_keys.size(); ++i) {
+        size_t shard_idx = GetShardIndex(req.add_keys[i]);
+        shard_groups[shard_idx].emplace_back(i, true);
+    }
+    for (size_t i = 0; i < req.remove_keys.size(); ++i) {
+        size_t shard_idx = GetShardIndex(req.remove_keys[i]);
+        shard_groups[shard_idx].emplace_back(i, false);
+    }
+
+    // Process each shard group with one lock acquisition
+    for (auto& [shard_idx, ops] : shard_groups) {
+        MetadataShardAccessorRW shard_rw(this, shard_idx);
+        auto& shard = shard_rw.GetRef();
+
+        for (auto& [idx, is_add] : ops) {
+            if (is_add) {
+                auto result = InnerAddReplica(
+                    shard, req.add_keys[idx], req.client_id,
+                    req.add_segment_ids[idx], req.add_sizes[idx], client);
+                if (!result.has_value()) {
+                    response.add_results[idx] = result.error();
+                }
+            } else {
+                auto result = InnerRemoveReplica(shard, req.remove_keys[idx],
+                                                 req.client_id,
+                                                 req.remove_segment_ids[idx]);
+                if (!result.has_value() &&
+                    result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                    result.error() != ErrorCode::REPLICA_NOT_FOUND) {
+                    response.remove_results[idx] = result.error();
+                }
+            }
+        }
+    }
+
+    return response;
+}
+
+auto P2PMasterService::SetSyncCompleted(UUID client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto client = client_manager_->GetClient(client_id);
+    if (!client) {
+        LOG(WARNING) << "SetSyncCompleted: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    if (!p2p_client) {
+        LOG(ERROR) << "SetSyncCompleted: client is not P2PClientMeta"
+                   << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    p2p_client->SetSyncing(false);
+    LOG(INFO) << "SetSyncCompleted: client_id=" << client_id;
+    return {};
+}
+
+void P2PMasterService::OnObjectAccessed(const ObjectMetadata& metadata) {
     // do nothing
 }
 

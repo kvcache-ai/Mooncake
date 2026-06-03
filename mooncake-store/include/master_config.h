@@ -46,6 +46,16 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+
+    // Task manager configuration
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
+    std::string cxl_path;
+    size_t cxl_size;
+    bool enable_cxl = false;
     uint64_t max_replicas_per_key;
 
     std::string deployment_mode;
@@ -84,9 +94,19 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t max_replicas_per_key = 1;
     DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
 
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -128,6 +148,12 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
         max_replicas_per_key = config.max_replicas_per_key;
         if (config.deployment_mode == "Centralization") {
             deployment_mode = DeploymentMode::CENTRALIZATION;
@@ -135,6 +161,9 @@ class MasterServiceSupervisorConfig {
             deployment_mode = DeploymentMode::P2P;
         }
 
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
         validate();
     }
 
@@ -210,6 +239,17 @@ class WrappedMasterServiceConfig {
     uint64_t quota_bytes = 0;
     uint64_t max_replicas_per_key = 1;
 
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -247,6 +287,15 @@ class WrappedMasterServiceConfig {
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -278,6 +327,15 @@ class WrappedMasterServiceConfig {
         max_replicas_per_key = config.max_replicas_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
+
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 };
 
@@ -311,6 +369,15 @@ class MasterServiceConfigBuilder {
     uint64_t max_replicas_per_key_ = 1;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
+    uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
+
+    std::string cxl_path_ = DEFAULT_CXL_PATH;
+    size_t cxl_size_ = DEFAULT_CXL_SIZE;
+    bool enable_cxl_ = false;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -407,7 +474,59 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_total_finished_tasks(
+        uint32_t max_total_finished_tasks) {
+        max_total_finished_tasks_ = max_total_finished_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_pending_tasks(
+        uint32_t max_total_pending_tasks) {
+        max_total_pending_tasks_ = max_total_pending_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_processing_tasks(
+        uint32_t max_total_processing_tasks) {
+        max_total_processing_tasks_ = max_total_processing_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_pending_task_timeout_sec(uint64_t sec) {
+        pending_task_timeout_sec_ = sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_processing_task_timeout_sec(uint64_t sec) {
+        processing_task_timeout_sec_ = sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
+        cxl_path_ = path;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_cxl_size(size_t size) {
+        cxl_size_ = size;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_cxl(bool enable) {
+        enable_cxl_ = enable;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
+};
+
+// Configuration for Task manager
+struct TaskManagerConfig {
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
 };
 
 class MasterServiceConfig {
@@ -432,12 +551,25 @@ class MasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+
+    TaskManagerConfig task_manager_config = {
+        .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
+        .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
+        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
+        .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
+        .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
+    };
     uint64_t max_replicas_per_key = 1;
 
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
+        auto cxl_allocator_type = BufferAllocatorType::CACHELIB;
+
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -452,12 +584,26 @@ class MasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
-        memory_allocator = config.memory_allocator;
+        memory_allocator =
+            config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         max_replicas_per_key = config.max_replicas_per_key;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        task_manager_config.max_total_finished_tasks =
+            config.max_total_finished_tasks;
+        task_manager_config.max_total_pending_tasks =
+            config.max_total_pending_tasks;
+        task_manager_config.max_total_processing_tasks =
+            config.max_total_processing_tasks;
+        task_manager_config.pending_task_timeout_sec =
+            config.pending_task_timeout_sec;
+        task_manager_config.processing_task_timeout_sec =
+            config.processing_task_timeout_sec;
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 
     // Static factory method to create a builder
@@ -485,6 +631,19 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.task_manager_config.max_total_finished_tasks =
+        max_total_finished_tasks_;
+    config.task_manager_config.max_total_pending_tasks =
+        max_total_pending_tasks_;
+    config.task_manager_config.max_total_processing_tasks =
+        max_total_processing_tasks_;
+    config.task_manager_config.pending_task_timeout_sec =
+        pending_task_timeout_sec_;
+    config.task_manager_config.processing_task_timeout_sec =
+        processing_task_timeout_sec_;
+    config.cxl_path = cxl_path_;
+    config.cxl_size = cxl_size_;
+    config.enable_cxl = enable_cxl_;
     config.max_replicas_per_key = max_replicas_per_key_;
 
     // Logic for client_crashed_ttl_sec
@@ -513,6 +672,9 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_cxl;
+    std::optional<std::string> cxl_path;
+    std::optional<size_t> cxl_size;
     std::optional<int64_t> client_live_ttl_sec;
     std::optional<int64_t> client_crashed_ttl_sec;
 };
@@ -524,6 +686,9 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_cxl_ = std::nullopt;
+    std::optional<std::string> cxl_path_ = std::nullopt;
+    std::optional<size_t> cxl_size_ = std::nullopt;
     std::optional<int64_t> client_live_ttl_sec_ = std::nullopt;
     std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
 
@@ -550,6 +715,21 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_cxl(bool enable) {
+        enable_cxl_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_cxl_path(const std::string& path) {
+        cxl_path_ = path;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_cxl_size(size_t size) {
+        cxl_size_ = size;
+        return *this;
+    }
+
     InProcMasterConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
         client_live_ttl_sec_ = ttl;
         return *this;
@@ -570,6 +750,9 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_cxl = enable_cxl_;
+    config.cxl_path = cxl_path_;
+    config.cxl_size = cxl_size_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
     return config;

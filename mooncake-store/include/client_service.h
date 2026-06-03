@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
 #include <functional>
@@ -18,9 +19,11 @@
 #include "transfer_engine.h"
 #include "types.h"
 #include "p2p_rpc_types.h"
+#include "rpc_types.h"
 #include "replica.h"
 #include "master_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
 #include "client_buffer.hpp"
 
@@ -203,24 +206,28 @@ class ClientService {
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
+     * @param force If true, skip lease and replication task checks
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> Remove(const ObjectKey& key) = 0;
+    virtual tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                                 bool force = false) = 0;
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    virtual tl::expected<long, ErrorCode> RemoveByRegex(
-        const ObjectKey& str) = 0;
+    virtual tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                        bool force = false) = 0;
 
     /**
      * @brief Removes all objects and all its replicas
+     * @param force If true, skip lease and replication task checks
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    virtual tl::expected<long, ErrorCode> RemoveAll() = 0;
+    virtual tl::expected<long, ErrorCode> RemoveAll(bool force = false) = 0;
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -228,8 +235,9 @@ class ClientService {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    virtual tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                                       size_t size) = 0;
+    virtual tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size,
+        const std::string& protocol = "tcp") = 0;
 
     /**
      * @brief Unregisters a memory segment from master
@@ -277,12 +285,62 @@ class ClientService {
     virtual std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys) = 0;
 
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    virtual tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    virtual tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    virtual tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    virtual tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    virtual tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
+
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
-        if (metrics_ == nullptr) {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return metrics_->summary_metrics();
+        return metrics->summary_metrics();
     }
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
@@ -297,15 +355,37 @@ class ClientService {
 
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
-        if (metrics_ == nullptr) {
+        ClientMetric* metrics = GetMetrics();
+        if (metrics == nullptr) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         std::string str;
-        metrics_->serialize(str);
+        metrics->serialize(str);
         return str;
     }
 
+    /**
+     * @brief Gets the metrics HTTP server port.
+     * @return The port number, or 0 if metrics server is disabled.
+     */
+    uint16_t GetMetricsPort() const { return metrics_port_; }
+
+    /**
+     * @brief Checks if metrics HTTP server is enabled.
+     * @return True if enabled, false otherwise.
+     */
+    bool IsMetricsHttpEnabled() const { return enable_metrics_http_; }
+
+    /**
+     * @brief Gets the health status for the /health endpoint.
+     * @return A string representing the health status.
+     */
+    virtual std::string GetHealthStatus() const { return "OK"; }
+
    public:
+    std::string local_endpoint() const {
+        return local_ip_ + ":" + std::to_string(te_port_);
+    }
     /**
      * @brief Gets the local transport endpoint (IP and port).
      * @return The transport endpoint string.
@@ -314,7 +394,7 @@ class ClientService {
         return transfer_engine_->getLocalIpAndPort();
     }
     UUID GetClientID() const { return client_id_; }
-    ViewVersionId GetViewVersion() const { return view_version_; }
+    ViewVersionId GetViewVersion() const { return view_version_.load(); }
 
    public:
     /**
@@ -346,8 +426,8 @@ class ClientService {
     /**
      * @brief Private constructor to enforce creation through Create() method
      */
-    ClientService(const std::string& local_ip, uint16_t te_port,
-                  const std::string& metadata_connstring,
+    ClientService(const std::string& metadata_connstring,
+                  uint16_t metrics_port = 9003, bool enable_metrics_http = true,
                   const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -355,6 +435,12 @@ class ClientService {
      * @return Reference to MasterClient
      */
     virtual MasterClient& GetMasterClient() = 0;
+
+    /**
+     * @brief Get the metrics object for this client.
+     * @return Pointer to ClientMetric, or nullptr if metrics are disabled.
+     */
+    virtual ClientMetric* GetMetrics() = 0;
 
     /**
      * @brief Connects to the master server.
@@ -372,11 +458,14 @@ class ClientService {
      * @return ErrorCode indicating success or failure.
      */
     ErrorCode InitTransferEngine(
-        const std::string& endpoint, const std::string& metadata_connstring,
-        const std::string& protocol,
+        const std::string& local_ip, uint16_t te_port,
+        const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
 
    protected:
+    ErrorCode InnerInitTransferEngine(
+        bool auto_discover, const std::string& protocol,
+        const std::optional<std::string>& device_names);
     // Heartbeat-related function
 
     /**
@@ -386,11 +475,13 @@ class ClientService {
     void StartHeartbeat(const std::string& master_server_entry);
 
     void HeartbeatThreadMain(bool is_ha_mode,
-                             std::string current_master_address);
+                             std::string current_master_address,
+                             const std::string& master_server_entry);
 
     /**
      * @brief Handles a successful heartbeat response.
      * Triggers async RegisterClient if master reports UNDEFINED status.
+     * Fires MASTER_RECONNECTED if connection_interrupted_ was set.
      * @return true if heartbeat was successfully processed.
      */
     bool HandleHeartbeatResponse(const HeartbeatResponse& response,
@@ -407,7 +498,10 @@ class ClientService {
     /**
      * @brief Attempts to reconnect to master after heartbeat failures.
      * For HA mode, fetches the latest master address from etcd.
-     * For non-HA mode, reconnects to the same address.
+     * For non-HA mode, reconnects to the current_master_address.
+     * @param is_ha_mode Whether HA mode is enabled.
+     * @param current_master_address Current master address, may be updated
+     * after successful reconnection in HA mode.
      * @return true if reconnect succeeded, false otherwise.
      */
     bool ReconnectToMaster(bool is_ha_mode,
@@ -421,11 +515,31 @@ class ClientService {
     virtual HeartbeatRequest build_heartbeat_request() = 0;
 
     /**
+     * @brief Starts the metrics HTTP server.
+     * @param enable_metrics_http Whether to enable the HTTP server.
+     * @param metrics_port Port to use.
+     * @return The actual port number, or 0 if disabled.
+     */
+    uint16_t StartMetricsHttpServer(bool enable_metrics_http,
+                                    uint16_t metrics_port);
+
+    /**
+     * @brief Stops the metrics HTTP server.
+     */
+    void StopMetricsHttpServer();
+
+    /**
      * @brief Registers the client into the master server.
      * @return An ErrorCode indicating success or failure.
      */
     virtual tl::expected<RegisterClientResponse, ErrorCode>
     RegisterClient() = 0;
+
+    /**
+     * @brief Single hook for all HA-related events from the heartbeat loop.
+     * Subclasses override to handle state transitions.
+     */
+    virtual void OnHAEvent(HAEvent event) { (void)event; }
 
    protected:
     /**
@@ -481,41 +595,17 @@ class ClientService {
     // Client identification
     const UUID client_id_;
 
-    // Client-side metrics
-    std::unique_ptr<ClientMetric> metrics_;
-
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
-    // Global segment pointers
-    struct SegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free(ptr);
-            }
-        }
-    };
-
-    struct AscendSegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free_memory("ascend", ptr);
-            }
-        }
-    };
-    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
-    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
-        ascend_segment_ptrs_;
 
     // Configuration
-    const std::string local_ip_;
-    const uint16_t te_port_;
-    std::string local_endpoint() const {
-        return local_ip_ + ":" + std::to_string(te_port_);
-    }
+    std::string local_ip_;
+    uint16_t te_port_ = 0;
 
     // The segment endpoint that the transfer engine registered with the
     // metadata backend.
     std::string te_endpoint_;
+    std::unique_ptr<AutoPortBinder> port_binder_;
     void initTeEndpoint();
     const std::string& get_te_endpoint() const { return te_endpoint_; }
 
@@ -526,11 +616,21 @@ class ClientService {
     std::atomic<bool> heartbeat_running_{false};
     std::condition_variable heartbeat_cv_;
     std::mutex heartbeat_mtx_;
-    ViewVersionId view_version_{0};
+    /// View version from master. Updated by async registration thread,
+    /// read by heartbeat thread.
+    std::atomic<ViewVersionId> view_version_{0};
+    /// True after MASTER_UNREACHABLE fires; cleared when MASTER_RECONNECTED
+    /// fires. Only accessed from the heartbeat thread — no locking required.
+    bool connection_interrupted_ = false;
 
     // Shutdown protection
     SharedMutex running_rw_mtx_;
     bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
+
+    // Metrics HTTP server
+    std::unique_ptr<coro_http::coro_http_server> metrics_http_server_;
+    uint16_t metrics_port_ = 0;  // 0 means disabled
+    bool enable_metrics_http_ = true;
 };
 
 }  // namespace mooncake

@@ -5,11 +5,19 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
+#include <fstream>
+#include <sstream>
 
 #include <glog/logging.h>
 #include <json/json.h>
+#include <unordered_map>
 #include "common.h"
+#include "types.h"
 
+#include "types.h"
 namespace mooncake {
 
 class TransferEngine;
@@ -95,6 +103,15 @@ struct RealClientConfigBase {
     // The IPC socket path between dummy and real clients.
     // If use integrated deployment, this could be empty.
     std::string ipc_socket_path;
+
+    // Port for metrics HTTP server.
+    // Only used when enable_metrics_http is true.
+    uint16_t metrics_port = 9003;
+
+    // Whether to enable metrics HTTP server.
+    // The metrics server exposes /metrics, /metrics/summary, and /health
+    // endpoints.
+    bool enable_metrics_http = true;
 };
 
 /**
@@ -108,6 +125,14 @@ struct CentralizedClientConfig : RealClientConfigBase {
 
     // Whether to enable file storage offloading.
     bool enable_offload = false;
+
+    // RPC port for inter-client communication (used for offload data serving)
+    uint16_t local_rpc_port = 50052;
+};
+
+enum class LocalTransferMode {
+    MEMCPY = 0,
+    TE = 1,
 };
 
 /**
@@ -125,8 +150,8 @@ struct P2PClientConfig : RealClientConfigBase {
     // Parsed custom tiered backend configuration
     Json::Value tiered_backend_config;
 
-    // Number of key lock shards for DataManager.
-    // Higher values reduce contention of key.
+    // Number of TieredBackend metadata index shards (and matching DataManager
+    // pending-write/pinned-key lease shards). Higher values reduce contention.
     size_t lock_shard_count = 1024;
 
     // RouteCache configuration
@@ -135,6 +160,36 @@ struct P2PClientConfig : RealClientConfigBase {
     // + P2PRouteData(each item is 96B and count is 8B)
     size_t route_cache_max_memory_bytes = 300 * 1024 * 1024;  // 300MB
     uint64_t route_cache_ttl_ms = 5 * 60 * 1000;              // 5min
+
+    // Async route notification.
+    // async_sender_thread_count > 0 enables async notifier.
+    // async_route_queue_size controls queue capacity
+    // (minimum async_max_batch_size * async_sender_thread_count).
+    size_t async_sender_thread_count = 0;
+    size_t async_max_batch_size = 2000;
+    size_t async_route_queue_size = 0;
+
+    // Local transfer mode for P2P local Get/Put path.
+    // - MEMCPY: copy through local CPU memory path
+    // - TE: transfer through local TransferEngine path
+    LocalTransferMode local_transfer_mode = LocalTransferMode::TE;
+
+    // When local_transfer_mode == MEMCPY, the following parameter is used:
+    // 0 means forbid async memcpy (fall back to synchronous).
+    size_t local_memcpy_async_worker_num = 32;
+
+    // PreWrite / PinKey key lease: maximum time (ms) a key may stay in
+    // intermediate (lease-protected) state before expiring.
+    static constexpr uint32_t kP2pDefaultKeyLeaseDurationMs = 5000;
+    // Interval (ms) for the background scanner that removes expired leases.
+    static constexpr uint32_t kP2pDefaultKeyLeaseScanIntervalMs = 1000;
+    uint32_t p2p_key_lease_duration_ms = kP2pDefaultKeyLeaseDurationMs;
+    uint32_t p2p_key_lease_scan_interval_ms = kP2pDefaultKeyLeaseScanIntervalMs;
+
+    // Cross-node transfer direction (reverse = owner TE, forward = accessor
+    // TE). Configured at client startup only.
+    TransferDirectionMode transfer_direction_mode =
+        TransferDirectionMode::REVERSE;
 };
 
 // ============================================================================
@@ -146,6 +201,9 @@ struct P2PClientConfig : RealClientConfigBase {
  */
 class ClientConfigBuilder {
    public:
+    static constexpr const char* kDefaultTieredBackendConfigPath =
+        "conf/tiered_backend.json";
+
     static DummyClientConfig build_dummy(size_t mem_pool_size,
                                          size_t local_buffer_size,
                                          const std::string& real_client_addr,
@@ -167,15 +225,50 @@ class ClientConfigBuilder {
         uint64_t global_segment_size = 0, uint64_t local_buffer_size = 0,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "", bool enable_offload = false,
-        const std::map<std::string, std::string>& labels = {}) {
+        uint16_t metrics_port = 9003, bool enable_metrics_http = true,
+        const std::map<std::string, std::string>& labels = {},
+        uint16_t local_rpc_port = 50052) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, labels);
+            ipc_socket_path, metrics_port, enable_metrics_http, labels);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
+        config.local_rpc_port = local_rpc_port;
         return config;
+    }
+
+    static CentralizedClientConfig build_centralized_real_client(
+        const std::unordered_map<std::string, std::string>& config) {
+        std::string local_hostname =
+            get_config_str(config, DictCommon::kLocalHostname);
+        std::string metadata_server =
+            get_config_str(config, DictCommon::kMetadataServer);
+        std::string protocol = get_config_str(config, DictCommon::kProtocol,
+                                              DictCommon::kDefaultProtocol);
+        std::string rdma_devices_str =
+            get_config_str(config, DictCommon::kRdmaDevices);
+        std::optional<std::string> rdma_devices =
+            rdma_devices_str.empty()
+                ? std::nullopt
+                : std::optional<std::string>(rdma_devices_str);
+        std::string master_server_addr =
+            get_config_str(config, DictCommon::kMasterServerAddr,
+                           DictCommon::kDefaultMasterServerAddr);
+        size_t global_segment_size =
+            get_config_size(config, DictCentralized::kGlobalSegmentSize,
+                            DictCentralized::kDefaultGlobalSegmentSize);
+        size_t local_buffer_size =
+            get_config_size(config, DictCommon::kLocalBufferSize,
+                            DictCommon::kDefaultLocalBufferSize);
+        std::string ipc_socket_path =
+            get_config_str(config, DictCommon::kIpcSocketPath);
+
+        return build_centralized_real_client(
+            local_hostname, metadata_server, protocol, rdma_devices,
+            master_server_addr, global_segment_size, local_buffer_size, nullptr,
+            ipc_socket_path);
     }
 
     static P2PClientConfig build_p2p_real_client(
@@ -184,7 +277,8 @@ class ClientConfigBuilder {
         const std::string& protocol = "tcp",
         const std::optional<std::string>& rdma_devices = std::nullopt,
         const std::string& master_server_entry = "127.0.0.1:50051",
-        const std::string& tiered_backend_config_json = "",
+        const std::string& tiered_backend_config_json =
+            kDefaultTieredBackendConfigPath,
         uint64_t local_buffer_size = 0,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "",
@@ -192,59 +286,269 @@ class ClientConfigBuilder {
         size_t lock_shard_count = 1024,
         size_t route_cache_max_memory_bytes = 300 * 1024 * 1024,
         uint64_t route_cache_ttl_ms = 5 * 60 * 1000,
-        const std::map<std::string, std::string>& labels = {}) {
+        const std::string& local_transfer_mode = "te",
+        size_t local_memcpy_async_worker_num = 32, uint16_t metrics_port = 9003,
+        bool enable_metrics_http = true,
+        const std::map<std::string, std::string>& labels = {},
+        size_t async_sender_thread_count = 0,
+        size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
+        uint32_t p2p_key_lease_duration_ms = 0,
+        uint32_t p2p_key_lease_scan_interval_ms = 0,
+        const std::string& p2p_transfer_direction_mode = "reverse") {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, labels);
+            ipc_socket_path, metrics_port, enable_metrics_http, labels);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
         config.lock_shard_count = lock_shard_count;
         config.route_cache_max_memory_bytes = route_cache_max_memory_bytes;
         config.route_cache_ttl_ms = route_cache_ttl_ms;
-
-        Json::Value tiered_config;
-        std::string actual_json = tiered_backend_config_json;
-        if (actual_json.empty()) {
-            if (const char* env_p = std::getenv("MOONCAKE_TIERED_CONFIG")) {
-                actual_json = env_p;
-            }
+        config.local_transfer_mode =
+            parse_p2p_local_transfer_mode(local_transfer_mode);
+        if (config.local_transfer_mode == LocalTransferMode::MEMCPY) {
+            config.local_memcpy_async_worker_num =
+                local_memcpy_async_worker_num;
         }
+        config.async_sender_thread_count = async_sender_thread_count;
+        config.async_max_batch_size = async_max_batch_size;
+        config.async_route_queue_size = async_route_queue_size;
 
-        if (!actual_json.empty()) {
-            Json::CharReaderBuilder builder;
-            auto reader =
-                std::unique_ptr<Json::CharReader>(builder.newCharReader());
-            std::string errors;
-            if (!reader->parse(actual_json.data(),
-                               actual_json.data() + actual_json.length(),
-                               &tiered_config, &errors)) {
-                LOG(ERROR) << "Failed to parse tiered config: " << errors;
-            }
-        }
+        Json::Value tiered_config =
+            LoadTieredConfig(tiered_backend_config_json);
 
         if (tiered_config.isNull() || !tiered_config.isMember("tiers") ||
             tiered_config["tiers"].empty()) {
             throw std::runtime_error(
-                "Tiered backend configuration is missing. Please provide "
-                "tiered_backend_config_json or set MOONCAKE_TIERED_CONFIG "
-                "environment variable.");
+                "Tiered backend configuration is missing or invalid. Please "
+                "provide a valid JSON string or a path to a JSON config file "
+                "via tiered_backend_config_json parameter.");
         }
         config.tiered_backend_config = tiered_config;
+
+        if (p2p_key_lease_duration_ms > 0) {
+            config.p2p_key_lease_duration_ms = p2p_key_lease_duration_ms;
+        }
+        if (p2p_key_lease_scan_interval_ms > 0) {
+            config.p2p_key_lease_scan_interval_ms =
+                p2p_key_lease_scan_interval_ms;
+        }
+        config.transfer_direction_mode =
+            parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
         return config;
     }
 
+    static P2PClientConfig build_p2p_real_client(
+        const std::unordered_map<std::string, std::string>& config) {
+        std::string local_hostname =
+            get_config_str(config, DictCommon::kLocalHostname);
+        std::string metadata_server =
+            get_config_str(config, DictCommon::kMetadataServer);
+        std::string protocol = get_config_str(config, DictCommon::kProtocol,
+                                              DictCommon::kDefaultProtocol);
+        std::string rdma_devices_str =
+            get_config_str(config, DictCommon::kRdmaDevices);
+        std::optional<std::string> rdma_devices =
+            rdma_devices_str.empty()
+                ? std::nullopt
+                : std::optional<std::string>(rdma_devices_str);
+        std::string master_server_addr =
+            get_config_str(config, DictCommon::kMasterServerAddr,
+                           DictCommon::kDefaultMasterServerAddr);
+        std::string tiered_backend_config =
+            get_config_str(config, DictP2P::kTieredBackendConfig,
+                           kDefaultTieredBackendConfigPath);
+        size_t local_buffer_size =
+            get_config_size(config, DictCommon::kLocalBufferSize,
+                            DictCommon::kDefaultLocalBufferSize);
+        uint16_t client_rpc_port = static_cast<uint16_t>(get_config_size(
+            config, DictP2P::kClientRpcPort, DictP2P::kDefaultClientRpcPort));
+        uint32_t rpc_thread_num = static_cast<uint32_t>(get_config_size(
+            config, DictP2P::kRpcThreadNum, DictP2P::kDefaultRpcThreadNum));
+        size_t lock_shard_count = get_config_size(
+            config, DictP2P::kLockShardCount, DictP2P::kDefaultLockShardCount);
+        size_t route_cache_max_memory =
+            get_config_size(config, DictP2P::kRouteCacheMaxMemoryBytes,
+                            DictP2P::kDefaultRouteCacheMaxMemoryBytes);
+        uint64_t route_cache_ttl_ms =
+            get_config_size(config, DictP2P::kRouteCacheTtlMs,
+                            DictP2P::kDefaultRouteCacheTtlMs);
+        std::string local_transfer_mode =
+            get_config_str(config, DictP2P::kLocalTransferMode,
+                           DictP2P::kDefaultLocalTransferMode);
+        size_t memcpy_async_worker_num =
+            get_config_size(config, DictP2P::kLocalMemcpyAsyncWorkerNum,
+                            DictP2P::kDefaultLocalMemcpyAsyncWorkerNum);
+        size_t async_sender_thread_count =
+            get_config_size(config, DictP2P::kAsyncSenderThreadCount,
+                            DictP2P::kDefaultAsyncSenderThreadCount);
+        size_t async_max_batch_size =
+            get_config_size(config, DictP2P::kAsyncMaxBatchSize,
+                            DictP2P::kDefaultAsyncMaxBatchSize);
+        size_t async_route_queue_size =
+            get_config_size(config, DictP2P::kAsyncRouteQueueSize,
+                            DictP2P::kDefaultAsyncRouteQueueSize);
+
+        return build_p2p_real_client(
+            local_hostname, metadata_server, protocol, rdma_devices,
+            master_server_addr, tiered_backend_config, local_buffer_size,
+            nullptr, "", client_rpc_port, rpc_thread_num, lock_shard_count,
+            route_cache_max_memory, route_cache_ttl_ms, local_transfer_mode,
+            memcpy_async_worker_num, 9003, true, {}, async_sender_thread_count,
+            async_max_batch_size, async_route_queue_size);
+    }
+
    private:
+    // Dict key constants and defaults, grouped by deployment mode
+    struct DictCommon {
+        // Keys
+        static constexpr const char* kLocalHostname = "local_hostname";
+        static constexpr const char* kMetadataServer = "metadata_server";
+        static constexpr const char* kLocalBufferSize = "local_buffer_size";
+        static constexpr const char* kProtocol = "protocol";
+        static constexpr const char* kRdmaDevices = "rdma_devices";
+        static constexpr const char* kMasterServerAddr = "master_server_addr";
+        static constexpr const char* kIpcSocketPath = "ipc_socket_path";
+        // Defaults
+        static constexpr size_t kDefaultLocalBufferSize = 1024 * 1024 * 16;
+        static constexpr const char* kDefaultProtocol = "tcp";
+        static constexpr const char* kDefaultMasterServerAddr =
+            "127.0.0.1:50051";
+        // Limits
+        static constexpr size_t kMinSegmentSize = 1024;
+        static constexpr size_t kMaxSegmentSize = 1024ULL * 1024 * 1024 * 1024;
+    };
+
+    struct DictCentralized {
+        // Keys
+        static constexpr const char* kGlobalSegmentSize = "global_segment_size";
+        // Defaults
+        static constexpr size_t kDefaultGlobalSegmentSize = 1024 * 1024 * 16;
+    };
+
+    struct DictP2P {
+        // Keys
+        static constexpr const char* kTieredBackendConfig =
+            "tiered_backend_config";
+        static constexpr const char* kClientRpcPort = "client_rpc_port";
+        static constexpr const char* kRpcThreadNum = "rpc_thread_num";
+        static constexpr const char* kLockShardCount = "lock_shard_count";
+        static constexpr const char* kRouteCacheMaxMemoryBytes =
+            "route_cache_max_memory_bytes";
+        static constexpr const char* kRouteCacheTtlMs = "route_cache_ttl_ms";
+        static constexpr const char* kLocalTransferMode = "local_transfer_mode";
+        static constexpr const char* kLocalMemcpyAsyncWorkerNum =
+            "local_memcpy_async_worker_num";
+        static constexpr const char* kAsyncSenderThreadCount =
+            "async_sender_thread_count";
+        static constexpr const char* kAsyncMaxBatchSize =
+            "async_max_batch_size";
+        static constexpr const char* kAsyncRouteQueueSize =
+            "async_route_queue_size";
+        // Defaults
+        static constexpr uint16_t kDefaultClientRpcPort = 12345;
+        static constexpr uint32_t kDefaultRpcThreadNum = 2;
+        static constexpr size_t kDefaultLockShardCount = 1024;
+        static constexpr size_t kDefaultRouteCacheMaxMemoryBytes =
+            300ULL * 1024 * 1024;
+        static constexpr uint64_t kDefaultRouteCacheTtlMs = 5ULL * 60 * 1000;
+        static constexpr const char* kDefaultLocalTransferMode = "te";
+        static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
+        static constexpr size_t kDefaultAsyncSenderThreadCount = 0;
+        static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
+        static constexpr size_t kDefaultAsyncRouteQueueSize = 0;
+    };
+
+    static std::string get_config_str(
+        const std::unordered_map<std::string, std::string>& config,
+        const std::string& key, const std::string& default_value = "") {
+        auto it = config.find(key);
+        return (it != config.end()) ? it->second : default_value;
+    }
+
+    static size_t get_config_size(
+        const std::unordered_map<std::string, std::string>& config,
+        const std::string& key, size_t default_value) {
+        auto it = config.find(key);
+        if (it == config.end()) {
+            return default_value;
+        }
+        const std::string& value = it->second;
+        // Check for negative numbers (stoull incorrectly parses "-1" as large
+        // val)
+        if (!value.empty() && value[0] == '-') {
+            LOG(WARNING) << "Invalid negative value for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        }
+        try {
+            return std::stoull(value);
+        } catch (const std::invalid_argument&) {
+            LOG(WARNING) << "Invalid non-numeric value for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        } catch (const std::out_of_range&) {
+            LOG(WARNING) << "Value out of range for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        }
+    }
+
+   private:
+    static Json::Value LoadTieredConfig(const std::string& json_or_path) {
+        Json::Value config;
+        std::string json_content;
+
+        // Determine if input is a JSON string or a file path
+        std::string trimmed = json_or_path;
+        size_t start = trimmed.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            trimmed = trimmed.substr(start);
+        }
+
+        if (!trimmed.empty() && trimmed[0] == '{') {
+            // Treat as JSON string
+            json_content = json_or_path;
+        } else {
+            // Treat as file path
+            std::ifstream file(json_or_path);
+            if (!file.is_open()) {
+                LOG(ERROR) << "Failed to open tiered backend config file: "
+                           << json_or_path;
+                return config;  // Returns null Json::Value
+            }
+            std::ostringstream ss;
+            ss << file.rdbuf();
+            json_content = ss.str();
+        }
+
+        // Parse JSON
+        Json::CharReaderBuilder builder;
+        auto reader =
+            std::unique_ptr<Json::CharReader>(builder.newCharReader());
+        std::string errors;
+        if (!reader->parse(json_content.data(),
+                           json_content.data() + json_content.length(), &config,
+                           &errors)) {
+            LOG(ERROR) << "Failed to parse tiered config: " << errors;
+        }
+        return config;
+    }
+
     static void fill_real_client_config_base(
         RealClientConfigBase& config, const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& rdma_devices,
         const std::string& master_server_entry, uint64_t local_buffer_size,
         const std::shared_ptr<TransferEngine>& transfer_engine,
-        const std::string& ipc_socket_path,
-        const std::map<std::string, std::string>& labels) {
+        const std::string& ipc_socket_path, uint16_t metrics_port = 9003,
+        bool enable_metrics_http = true,
+        const std::map<std::string, std::string>& labels = {}) {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).
@@ -278,7 +582,39 @@ class ClientConfigBuilder {
         config.local_buffer_size = local_buffer_size;
         config.transfer_engine = transfer_engine;
         config.ipc_socket_path = ipc_socket_path;
+        config.metrics_port = metrics_port;
+        config.enable_metrics_http = enable_metrics_http;
         config.labels = labels;
+    }
+
+    static LocalTransferMode parse_p2p_local_transfer_mode(std::string mode) {
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "memcpy") {
+            return LocalTransferMode::MEMCPY;
+        }
+        if (mode == "te") {
+            return LocalTransferMode::TE;
+        }
+        throw std::runtime_error(
+            "Invalid p2p local transfer mode. Expected 'memcpy' or 'te'.");
+    }
+
+    static TransferDirectionMode parse_p2p_transfer_direction_mode(
+        std::string mode) {
+        std::transform(
+            mode.begin(), mode.end(), mode.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "reverse") {
+            return TransferDirectionMode::REVERSE;
+        }
+        if (mode == "forward") {
+            return TransferDirectionMode::FORWARD;
+        }
+        throw std::runtime_error(
+            "Invalid p2p transfer direction mode. Expected 'reverse' or "
+            "'forward'.");
     }
 };
 

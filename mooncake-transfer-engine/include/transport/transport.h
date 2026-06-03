@@ -41,6 +41,7 @@ class TransferMetadata;
 /// failure.
 class Transport {
     friend class TransferEngine;
+    friend class TransferEngineImpl;
     friend class MultiTransport;
 
    public:
@@ -144,7 +145,12 @@ class Transport {
             } hccl;
             struct {
                 uint64_t dest_addr;
+                void *handle;
+                int64_t start_time;
             } ascend_direct;
+            struct {
+                uint64_t dest_addr;
+            } ubshmem;
         };
 
        public:
@@ -279,6 +285,10 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+#ifdef WITH_METRICS
+        std::chrono::steady_clock::time_point start_time;
+#endif
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;

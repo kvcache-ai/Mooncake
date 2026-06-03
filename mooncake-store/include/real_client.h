@@ -242,11 +242,11 @@ class RealClient : public PyClient {
         const std::vector<std::string>& keys,
         const ReadRouteConfig& config = {}) override;
 
-    int remove(const std::string& key) override;
+    int remove(const std::string& key, bool force = false) override;
 
-    long removeByRegex(const std::string& str) override;
+    long removeByRegex(const std::string& str, bool force = false) override;
 
-    long removeAll() override;
+    long removeAll(bool force = false) override;
 
     int tearDownAll() override;
 
@@ -272,6 +272,40 @@ class RealClient : public PyClient {
      * exist
      */
     int64_t getSize(const std::string& key) override;
+
+    /**
+     * @brief Create a copy task to replicate an object's data to target
+     * segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string& key,
+        const std::vector<std::string>& targets) override;
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string& key, const std::string& source,
+        const std::string& target) override;
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(
+        const UUID& task_id) override;
 
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
@@ -383,12 +417,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> remove_internal(const std::string& key);
+    tl::expected<void, ErrorCode> remove_internal(const std::string& key,
+                                                  bool force = false);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(
-        const std::string& str);
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string& str,
+                                                         bool force = false);
 
-    tl::expected<int64_t, ErrorCode> removeAll_internal();
+    tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
@@ -415,12 +450,12 @@ class RealClient : public PyClient {
 
     tl::expected<HeartbeatResponse, ErrorCode> ping(const UUID& client_id);
 
-    std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes);
 
     std::string protocol;
     std::string device_name;
-    std::string local_ip;
-    uint16_t te_port = 0;
 
     struct MappedShm {
         std::string shm_name;

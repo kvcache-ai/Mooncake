@@ -27,12 +27,14 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include "error.h"
@@ -40,6 +42,8 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #define PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define PAUSE() __asm__ __volatile__("yield")
 #else
 #define PAUSE()
 #endif
@@ -361,10 +365,44 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     return 0;
 }
 
+// Constants for handshake max length configuration
+constexpr size_t kDefaultHandshakeMaxLength = 1ULL << 20;  // 1MB (also minimum)
+constexpr size_t kMaxHandshakeMaxLength = 128ULL << 20;    // 128MB
+
+// Load handshake max length from environment variable.
+static inline size_t loadHandshakeMaxLength() {
+    const char *env = std::getenv("MC_HANDSHAKE_MAX_LENGTH");
+    if (env != nullptr) {
+        std::string_view env_sv(env);
+        size_t val = 0;
+        auto [ptr, ec] =
+            std::from_chars(env_sv.data(), env_sv.data() + env_sv.size(), val);
+        if (ec == std::errc() && ptr == env_sv.data() + env_sv.size() &&
+            val >= kDefaultHandshakeMaxLength &&
+            val <= kMaxHandshakeMaxLength) {
+            LOG(INFO) << "MC_HANDSHAKE_MAX_LENGTH set to " << val << " bytes ("
+                      << (val >> 20) << " MB)";
+            return val;
+        }
+        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_LENGTH value: " << env
+                     << ", valid range: " << kDefaultHandshakeMaxLength
+                     << " to " << kMaxHandshakeMaxLength << ", using default "
+                     << (kDefaultHandshakeMaxLength >> 20) << "MB";
+    }
+    return kDefaultHandshakeMaxLength;
+}
+
+// Get the maximum handshake message length.
+// Loaded once from MC_HANDSHAKE_MAX_LENGTH environment variable at first call.
+static inline size_t getHandshakeMaxLength() {
+    static size_t max_length = loadHandshakeMaxLength();
+    return max_length;
+}
+
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
     HandShakeRequestType type = HandShakeRequestType::Connection;
 
-    const static size_t kMaxLength = 1ull << 20;
+    const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {

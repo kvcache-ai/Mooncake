@@ -1,4 +1,5 @@
 #include "centralized_segment_manager.h"
+#include "master_metric_manager.h"
 #include <unordered_set>
 #include <glog/logging.h>
 
@@ -21,7 +22,7 @@ tl::expected<void, ErrorCode> CentralizedSegmentManager::SetGlobalVisibility(
             std::static_pointer_cast<MountedCentralizedSegment>(entry.second);
         if (mounted_seg->buf_allocator) {
             auto ret = allocator_change_cb_(
-                mounted_seg->name, mounted_seg->buf_allocator, visible);
+                *mounted_seg, mounted_seg->buf_allocator, visible);
             if (!ret.has_value()) {
                 LOG(ERROR) << "SetGlobalVisibility failed for segment="
                            << mounted_seg->name << " visible=" << visible
@@ -56,6 +57,7 @@ ErrorCode CentralizedSegmentManager::InnerCheckMountSegment(
     }
 
     if (memory_allocator_ == BufferAllocatorType::CACHELIB &&
+        segment.GetCentralizedExtra().protocol != "cxl" &&
         (buffer % facebook::cachelib::Slab::kSize ||
          size % facebook::cachelib::Slab::kSize)) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
@@ -83,58 +85,71 @@ tl::expected<void, ErrorCode> CentralizedSegmentManager::InnerMountSegment(
                    << ", segment_name=" << segment.name << ", ret=" << ret;
         return tl::make_unexpected(ret);
     }
-    const uintptr_t buffer = segment.GetCentralizedExtra().base;
-    const size_t size = segment.size;
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    // CachelibBufferAllocator may throw an exception if the size or base is
-    // invalid for the slab allocator.
-    try {
-        // Create allocator based on the configured type
-        switch (memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size,
-                    segment.GetCentralizedExtra().te_endpoint, segment.id);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size,
-                    segment.GetCentralizedExtra().te_endpoint, segment.id);
-                break;
-            default:
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(memory_allocator_);
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
 
-        if (!allocator) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
+    std::shared_ptr<BufferAllocatorBase> allocator;
+
+    // CXL path: pass nullptr to callback to request pre-configured allocator
+    if (segment.GetCentralizedExtra().protocol == "cxl") {
+        LOG(INFO) << "Start Mounting CXL Segment.";
+        if (!allocator_change_cb_) {
+            LOG(ERROR) << "allocator_change_cb_ is required for CXL segments";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-    } catch (...) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto ret = allocator_change_cb_(segment, allocator, true);
+        if (!ret.has_value()) {
+            return tl::make_unexpected(ret.error());
+        }
+    } else {
+        // Non-CXL path: create per-segment allocator
+        const uintptr_t buffer = segment.GetCentralizedExtra().base;
+        const size_t size = segment.size;
+        try {
+            switch (memory_allocator_) {
+                case BufferAllocatorType::CACHELIB:
+                    allocator = std::make_shared<CachelibBufferAllocator>(
+                        segment.name, buffer, size,
+                        segment.GetCentralizedExtra().te_endpoint, segment.id);
+                    break;
+                case BufferAllocatorType::OFFSET:
+                    allocator = std::make_shared<OffsetBufferAllocator>(
+                        segment.name, buffer, size,
+                        segment.GetCentralizedExtra().te_endpoint, segment.id);
+                    break;
+                default:
+                    LOG(ERROR) << "segment_name=" << segment.name
+                               << ", error=unknown_memory_allocator="
+                               << static_cast<int>(memory_allocator_);
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            if (!allocator) {
+                LOG(ERROR) << "segment_name=" << segment.name
+                           << ", error=failed_to_create_allocator";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        } catch (...) {
+            LOG(ERROR) << "segment_name=" << segment.name
+                       << ", error=exception_during_allocator_creation";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (allocator_change_cb_) {
+            auto ret = allocator_change_cb_(segment, allocator, true);
+            if (!ret.has_value()) {
+                LOG(ERROR) << "Failed to add allocator to global manager. "
+                              "Rolling back mount operation. "
+                           << "segment=" << segment.name
+                           << " error=" << ret.error();
+                return tl::make_unexpected(ret.error());
+            }
+        }
+        MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                               size);
     }
 
     auto mounted_segment = std::make_shared<MountedCentralizedSegment>();
     static_cast<Segment&>(*mounted_segment) = segment;
     mounted_segment->buf_allocator = allocator;
-
-    if (allocator_change_cb_) {
-        // Callback to add the allocator to the global manager
-        auto ret = allocator_change_cb_(mounted_segment->name,
-                                        mounted_segment->buf_allocator, true);
-        if (!ret.has_value()) {
-            LOG(ERROR) << "Failed to add allocator to global manager. "
-                          "Rolling back mount operation. "
-                       << "segment=" << mounted_segment->name
-                       << " error=" << ret.error();
-            return tl::make_unexpected(ret.error());
-        }
-    }
     mounted_segments_[mounted_segment->id] = mounted_segment;
 
     return {};
@@ -256,7 +271,8 @@ CentralizedSegmentManager::QuerySegments(const std::string& segment) {
             }
         }
     }
-    LOG(WARNING) << "the segment doesn't exist" << ", segment=" << segment;
+    LOG(WARNING) << "the segment doesn't exist"
+                 << ", segment=" << segment;
     return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
 }
 
@@ -265,12 +281,14 @@ auto CentralizedSegmentManager::OnUnmountSegment(
     auto mounted_seg =
         std::static_pointer_cast<MountedCentralizedSegment>(segment);
 
-    // Remove allocator from upper-level global_allocator_manager_ via callback
-    if (mounted_seg->buf_allocator) {
-        if (allocator_change_cb_) {
-            allocator_change_cb_(segment->name, mounted_seg->buf_allocator,
-                                 /*is_add=*/false);
-        }
+    if (mounted_seg->buf_allocator && allocator_change_cb_) {
+        allocator_change_cb_(*segment, mounted_seg->buf_allocator,
+                             /*is_add=*/false);
+    }
+
+    if (segment->GetCentralizedExtra().protocol != "cxl") {
+        MasterMetricManager::instance().dec_total_mem_capacity(segment->name,
+                                                               segment->size);
     }
 
     return {};

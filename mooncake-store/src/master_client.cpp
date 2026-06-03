@@ -1,6 +1,11 @@
 #include "master_client.h"
 
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -136,7 +141,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
 }
 
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
-    const std::string& object_key) {
+    std::string_view object_key) {
     ScopedVLogTimer timer(1, "MasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
 
@@ -146,7 +151,7 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
-    const std::vector<std::string>& object_keys) {
+    const std::vector<std::string_view>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
 
@@ -157,7 +162,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
-    const std::string& key, const GetReplicaListRequestConfig& config) {
+    std::string_view key, const GetReplicaListRequestConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", key);
 
@@ -167,8 +172,17 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     return result;
 }
 
+async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::AsyncGetReplicaList(std::string_view key,
+                                  const GetReplicaListRequestConfig& config) {
+    auto result =
+        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
+                                  GetReplicaListResponse>(key, config);
+    co_return result;
+}
+
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterClient::BatchGetReplicaList(const std::vector<std::string>& keys,
+MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
                                   const GetReplicaListRequestConfig& config) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("requests_count=", keys.size());
@@ -223,30 +237,32 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::Remove(std::string_view key,
+                                                   bool force) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", key, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key);
+    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
-    const std::string& str) {
+tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(std::string_view str,
+                                                          bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
-    timer.LogRequest("key=", str);
+    timer.LogRequest("key=", str, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str);
+    auto result =
+        invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
+tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>();
+    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(force);
     timer.LogResponseExpected(result);
     return result;
 }

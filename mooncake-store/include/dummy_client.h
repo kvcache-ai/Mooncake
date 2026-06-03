@@ -1,7 +1,7 @@
 #pragma once
 
 #include "client_config_builder.h"
-
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
@@ -35,6 +35,8 @@ class ShmHelper {
         return shms_;
     }
 
+    bool is_hugepage() const { return use_hugepage_; }
+
     ShmHelper(const ShmHelper&) = delete;
     ShmHelper& operator=(const ShmHelper&) = delete;
 
@@ -44,6 +46,7 @@ class ShmHelper {
 
     std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
+    bool use_hugepage_ = false;
 };
 
 class DummyClient : public PyClient {
@@ -128,11 +131,11 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const override;
 
-    int remove(const std::string& key) override;
+    int remove(const std::string& key, bool force = false) override;
 
-    long removeByRegex(const std::string& str) override;
+    long removeByRegex(const std::string& str, bool force = false) override;
 
-    long removeAll() override;
+    long removeAll(bool force = false) override;
 
     int isExist(const std::string& key) override;
 
@@ -146,6 +149,17 @@ class DummyClient : public PyClient {
     std::vector<Replica::Descriptor> get_replica_desc(const std::string& key);
 
     int tearDownAll() override;
+
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string& key,
+        const std::vector<std::string>& targets) override;
+
+    tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string& key, const std::string& source,
+        const std::string& target) override;
+
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(
+        const UUID& task_id) override;
 
    private:
     ErrorCode connect(const std::string& server_address);

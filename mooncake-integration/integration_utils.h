@@ -30,6 +30,7 @@ enum class TensorDtype : int32_t {
     BFLOAT16 = 12,
     FLOAT8_E4M3 = 13,
     FLOAT8_E5M2 = 14,
+    NR_DTYPES = 15,
     UNKNOWN = -1
 };
 

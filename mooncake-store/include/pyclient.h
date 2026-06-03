@@ -92,11 +92,11 @@ class PyClient {
 
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
-    virtual int remove(const std::string& key) = 0;
+    virtual int remove(const std::string& key, bool force = false) = 0;
 
-    virtual long removeByRegex(const std::string& str) = 0;
+    virtual long removeByRegex(const std::string& str, bool force = false) = 0;
 
-    virtual long removeAll() = 0;
+    virtual long removeAll(bool force = false) = 0;
 
     virtual int isExist(const std::string& key) = 0;
 
@@ -111,6 +111,16 @@ class PyClient {
         const std::string& key) = 0;
 
     virtual int tearDownAll() = 0;
+
+    virtual tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string& key, const std::vector<std::string>& targets) = 0;
+
+    virtual tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string& key, const std::string& source,
+        const std::string& target) = 0;
+
+    virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
+        const UUID& task_id) = 0;
 
     std::shared_ptr<mooncake::ClientService> client_service_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;

@@ -2,9 +2,11 @@
 
 #include <cassert>
 #include <cstdint>
+#include <random>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
+#include "mutex.h"
 #include "types.h"
 
 namespace mooncake {
@@ -25,7 +27,8 @@ CentralizedMasterService::CentralizedObjectMetadata::CentralizedObjectMetadata(
       owner_client_id_(client_id),
       put_start_time_(put_start_time),
       lease_timeout_(),
-      soft_pin_timeout_(std::nullopt) {
+      soft_pin_timeout_(std::nullopt),
+      replication_task_cnt_(0) {
     if (enable_soft_pin) {
         soft_pin_timeout_.emplace();
         MasterMetricManager::instance().inc_soft_pin_key_count(1);
@@ -44,7 +47,8 @@ CentralizedMasterService::CentralizedObjectMetadata::HasDiffRepStatus(
 }
 
 void CentralizedMasterService::CentralizedObjectMetadata::GrantLease(
-    const uint64_t ttl, const uint64_t soft_ttl) {
+    const uint64_t ttl, const uint64_t soft_ttl) const {
+    SpinLocker locker(&lock_);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     lease_timeout_ =
@@ -55,94 +59,44 @@ void CentralizedMasterService::CentralizedObjectMetadata::GrantLease(
     }
 }
 
-void CentralizedMasterService::CentralizedObjectMetadata::EraseReplica(
-    ReplicaType replica_type) {
-    replicas_.erase(std::remove_if(replicas_.begin(), replicas_.end(),
-                                   [replica_type](const Replica& replica) {
-                                       return replica.type() == replica_type;
-                                   }),
-                    replicas_.end());
-}
-
-bool CentralizedMasterService::CentralizedObjectMetadata::HasMemReplica()
-    const {
-    return std::any_of(replicas_.begin(), replicas_.end(),
-                       [](const Replica& replica) {
-                           return replica.type() == ReplicaType::MEMORY;
-                       });
-}
-
-int CentralizedMasterService::CentralizedObjectMetadata::GetMemReplicaCount()
-    const {
-    return std::count_if(replicas_.begin(), replicas_.end(),
-                         [](const Replica& replica) {
-                             return replica.type() == ReplicaType::MEMORY;
-                         });
-}
-
 bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired()
     const {
+    SpinLocker locker(&lock_);
     return std::chrono::steady_clock::now() >= lease_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired(
     const std::chrono::steady_clock::time_point& now) const {
+    SpinLocker locker(&lock_);
     return now >= lease_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned() const {
+    SpinLocker locker(&lock_);
     return soft_pin_timeout_ &&
            std::chrono::steady_clock::now() < *soft_pin_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned(
     const std::chrono::steady_clock::time_point& now) const {
+    SpinLocker locker(&lock_);
     return soft_pin_timeout_ && now < *soft_pin_timeout_;
-}
-
-bool CentralizedMasterService::CentralizedObjectMetadata::
-    IsAllReplicasComplete() const {
-    return std::all_of(replicas_.begin(), replicas_.end(),
-                       [](const Replica& replica) {
-                           return replica.status() == ReplicaStatus::COMPLETE;
-                       });
-}
-
-bool CentralizedMasterService::CentralizedObjectMetadata::HasCompletedReplicas()
-    const {
-    return std::any_of(replicas_.begin(), replicas_.end(),
-                       [](const Replica& replica) {
-                           return replica.status() == ReplicaStatus::COMPLETE;
-                       });
-}
-
-std::vector<Replica> CentralizedMasterService::CentralizedObjectMetadata::
-    DiscardProcessingReplicas() {
-    auto partition_point = std::partition(
-        replicas_.begin(), replicas_.end(), [](const Replica& replica) {
-            return replica.status() != ReplicaStatus::PROCESSING;
-        });
-
-    std::vector<Replica> discarded_replicas;
-    if (partition_point != replicas_.end()) {
-        discarded_replicas.reserve(
-            std::distance(partition_point, replicas_.end()));
-        std::move(partition_point, replicas_.end(),
-                  std::back_inserter(discarded_replicas));
-        replicas_.erase(partition_point, replicas_.end());
-    }
-
-    return discarded_replicas;
 }
 
 // Hook Implementations
 tl::expected<void, ErrorCode>
-CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable() const {
-    if (!IsLeaseExpired()) {
+CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable(
+    bool force) const {
+    if (!force && !IsLeaseExpired()) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
-    if (!IsAllReplicasComplete()) {
+
+    if (!AllReplicas(&Replica::fn_is_completed)) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    if (replication_task_cnt_ > 0) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
     return {};
 }
@@ -192,10 +146,12 @@ CentralizedMasterService::CentralizedMasterService(
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       client_manager_(config.client_live_ttl_sec, config.client_crashed_ttl_sec,
-                      config.memory_allocator, view_version_),
+                      config.memory_allocator, view_version_, config.enable_cxl,
+                      config.cxl_path, config.cxl_size),
       memory_allocator_type_(config.memory_allocator),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
-      put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
+      put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
+      task_manager_(config.task_manager_config) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -224,6 +180,11 @@ CentralizedMasterService::CentralizedMasterService(
         std::thread(&CentralizedMasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
 
+    task_cleanup_running_ = true;
+    task_cleanup_thread_ =
+        std::thread(&CentralizedMasterService::TaskCleanupThreadFunc, this);
+    VLOG(1) << "action=start_task_cleanup_thread";
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -236,10 +197,17 @@ CentralizedMasterService::CentralizedMasterService(
 }
 
 CentralizedMasterService::~CentralizedMasterService() {
-    // Stop and join the threads
     eviction_running_ = false;
+    task_cleanup_running_ = false;
+
+    // Wake sleepers so join() doesn't block for long sleep intervals.
+    task_cleanup_cv_.notify_all();
+
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
+    }
+    if (task_cleanup_thread_.joinable()) {
+        task_cleanup_thread_.join();
     }
 }
 
@@ -291,26 +259,28 @@ auto CentralizedMasterService::BatchReplicaClear(
         } else {
             // Clear only replicas on the specified segment_name
             bool has_replica_on_segment = false;
-            std::vector<size_t> replicas_to_remove;
-
-            for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
-                const auto& replica = metadata.replicas_[i];
+            const auto match_replica_on_segment =
+                [&](const Replica& replica) -> bool {
                 if (auto res = metadata.IsReplicaRemovable(replica); !res) {
-                    LOG(WARNING)
-                        << "BatchReplicaClear: key=" << key
-                        << " cannot be removed, reason=" << res.error();
-                    continue;
+                    return false;
                 }
-                auto segment_names = replica.get_segment_names();
+                const auto segment_names = replica.get_segment_names();
                 for (const auto& seg_name : segment_names) {
                     if (seg_name.has_value() &&
                         seg_name.value() == segment_name) {
-                        has_replica_on_segment = true;
-                        replicas_to_remove.emplace_back(i);
-                        break;
+                        return true;
                     }
                 }
-            }
+                return false;
+            };
+
+            auto& shard = accessor.GetShard().GetRef();
+            metadata.VisitReplicas(
+                match_replica_on_segment, [&](Replica& replica) {
+                    has_replica_on_segment = true;
+                    RemoveReplicaFromSegmentIndex(shard, key, replica);
+                    OnReplicaRemoved(replica);
+                });
 
             if (!has_replica_on_segment) {
                 LOG(WARNING)
@@ -320,17 +290,9 @@ auto CentralizedMasterService::BatchReplicaClear(
                 continue;
             }
 
-            // Remove replicas in reverse order to keep indices valid
-            auto& shard = accessor.GetShard();
-            for (auto it = replicas_to_remove.rbegin();
-                 it != replicas_to_remove.rend(); ++it) {
-                auto& replica = metadata.replicas_[*it];
-                RemoveReplicaFromSegmentIndex(shard, key, replica);
-                OnReplicaRemoved(replica);
-                metadata.replicas_.erase(metadata.replicas_.begin() + *it);
-            }
+            metadata.EraseReplicas(match_replica_on_segment);
 
-            if (metadata.replicas_.empty()) {
+            if (!metadata.IsValid()) {
                 accessor.Erase();
             }
 
@@ -344,8 +306,10 @@ auto CentralizedMasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
-void CentralizedMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
-    auto& c_metadata = static_cast<CentralizedObjectMetadata&>(metadata);
+void CentralizedMasterService::OnObjectAccessed(
+    const ObjectMetadata& metadata) {
+    const auto& c_metadata =
+        static_cast<const CentralizedObjectMetadata&>(metadata);
     c_metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 }
 
@@ -380,7 +344,7 @@ void CentralizedMasterService::OnReplicaAdded(const Replica& replica) {
 }
 
 auto CentralizedMasterService::GetReplicaList(
-    const std::string& key, const GetReplicaListRequestConfig& config)
+    std::string_view key, const GetReplicaListRequestConfig& config)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     auto res = MasterService::GetReplicaList(key, config);
     if (!res) {
@@ -460,9 +424,8 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = GetShardIndex(key);
-    auto& shard = GetCentralizedShard(shard_idx);
-    MutexLocker lock(&shard.mutex);
+    MetadataShardAccessorRW shard_rw(this, GetShardIndex(key));
+    auto& shard = static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
     const auto now = std::chrono::steady_clock::now();
     auto it = shard.metadata.find(key);
@@ -472,9 +435,9 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
         // go.
-        if (!metadata->HasCompletedReplicas() &&
+        if (!metadata->HasReplica(&Replica::fn_is_completed) &&
             metadata->put_start_time_ + put_start_discard_timeout_sec_ < now) {
-            auto replicas = metadata->DiscardProcessingReplicas();
+            auto replicas = metadata->PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 MutexLocker lock(&discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
@@ -495,6 +458,8 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
         }
         auto allocation_result = client_manager_.Allocate(
             slice_length, config.replica_num, preferred_segments);
@@ -558,33 +523,27 @@ auto CentralizedMasterService::PutEnd(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    for (auto& replica : metadata.replicas_) {
-        if (replica.type() == replica_type) {  // find the replica to complete
-            // Check that the segment of this replica is still valid.
-            if (replica.type() == ReplicaType::MEMORY) {
-                // Currently, PutEnd() uses replica_type to identify replica,
-                // which means each replica_type only has one replica.
-                // If there are multiple replicas with same type,
-                // here must be modified.
-                if (replica.has_invalid_mem_handle()) {
-                    LOG(ERROR) << "segment allocator expired"
-                               << ", the segment might be unmounted"
-                               << ", key=" << key << ", replica=" << replica;
-                    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-                }
-            }
+    metadata.VisitReplicas(
+        [replica_type](const Replica& replica) {
+            return replica.type() == replica_type;
+        },
+        [&](Replica& replica) {
             replica.mark_complete();
-            AddReplicaToSegmentIndex(accessor.GetShard(), accessor.GetKey(),
-                                     replica);
+            AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                     accessor.GetKey(), replica);
             OnReplicaAdded(replica);
-        }
-        if (enable_offload_) {
-            PushOffloadingQueue(key, replica);
-        }
+        });
+
+    if (enable_offload_) {
+        metadata.VisitReplicas(&Replica::fn_is_completed,
+                               [this, &key](const Replica& replica) {
+                                   PushOffloadingQueue(key, replica);
+                               });
     }
 
     // If the object is completed, remove it from the processing set.
-    if (metadata.IsAllReplicasComplete() && accessor.InProcessing()) {
+    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+        accessor.InProcessing()) {
         accessor.EraseFromProcessing();
     }
 
@@ -624,17 +583,23 @@ auto CentralizedMasterService::PutRevoke(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING,
-                                                replica_type)) {
-        LOG(ERROR) << "key=" << key << ", status=" << *status
+    auto non_processing =
+        metadata.GetFirstReplica([replica_type](const Replica& replica) {
+            return replica.type() == replica_type && !replica.is_processing();
+        });
+    if (non_processing != nullptr) {
+        LOG(ERROR) << "key=" << key << ", status=" << non_processing->status()
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
-    metadata.EraseReplica(replica_type);
+    metadata.EraseReplicas([replica_type](const Replica& replica) {
+        return replica.type() == replica_type;
+    });
 
     // If the object is completed, remove it from the processing set.
-    if (metadata.IsAllReplicasComplete() && accessor.InProcessing()) {
+    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
+        accessor.InProcessing()) {
         accessor.EraseFromProcessing();
     }
 
@@ -661,8 +626,10 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -670,33 +637,36 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    bool update = false;
-    for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
-        if (metadata.replicas_[i].type() == ReplicaType::LOCAL_DISK) {
+    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        metadata.AddReplicas(std::move(replicas));
+        return {};
+    }
+
+    metadata.VisitReplicas(
+        [&client_id](const Replica& rep) {
+            return rep.type() == ReplicaType::LOCAL_DISK &&
+                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                       client_id;
+        },
+        [&replica](Replica& rep) {
             // TODO: wanyue-wy
             // The modification of `descriptor` could not take effect in the
             // `metadata.replicas_`.
             // The bug also exists in the main branch of Mooncake.
             // When merge the P2P development branch to the main branch,
             // we should check whether this bug is fixed.
-            auto& descriptor = metadata.replicas_[i]
-                                   .get_descriptor()
-                                   .get_local_disk_descriptor();
-            if (descriptor.client_id == client_id) {
-                update = true;
-                descriptor.transport_endpoint = replica.get_descriptor()
-                                                    .get_local_disk_descriptor()
-                                                    .transport_endpoint;
-                descriptor.object_size = replica.get_descriptor()
-                                             .get_local_disk_descriptor()
-                                             .object_size;
-                break;
-            }
-        }
-    }
-    if (!update) {
-        metadata.replicas_.emplace_back(std::move(replica));
-    }
+            rep.get_descriptor()
+                .get_local_disk_descriptor()
+                .transport_endpoint = replica.get_descriptor()
+                                          .get_local_disk_descriptor()
+                                          .transport_endpoint;
+            rep.get_descriptor().get_local_disk_descriptor().object_size =
+                replica.get_descriptor()
+                    .get_local_disk_descriptor()
+                    .object_size;
+        });
     return {};
 }
 
@@ -804,7 +774,9 @@ tl::expected<void, ErrorCode> CentralizedMasterService::PushOffloadingQueue(
 void CentralizedMasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
+    auto last_discard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        const auto now = std::chrono::steady_clock::now();
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -816,6 +788,18 @@ void CentralizedMasterService::EvictionThreadFunc() {
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            last_discard_time = now;
+        } else if (now - last_discard_time > put_start_release_timeout_sec_) {
+            // Try discarding expired processing keys and ongoing replication
+            // tasks if we have not done this for a long time.
+            for (size_t i = 0; i < kNumShards; ++i) {
+                MetadataShardAccessorRW shard_rw(this, i);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
+                DiscardExpiredProcessingReplicas(shard, now);
+            }
+            ReleaseExpiredDiscardedReplicas(now);
+            last_discard_time = now;
         }
 
         std::this_thread::sleep_for(
@@ -825,11 +809,12 @@ void CentralizedMasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_stopped";
 }
 
-void CentralizedMasterService::DiscardExpiredProcessingKeys(
+void CentralizedMasterService::DiscardExpiredProcessingReplicas(
     CentralizedMetadataShard& shard,
     const std::chrono::steady_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
+    // Part 1: Discard expired PutStart operations.
     auto& processing_set = shard.processing_keys;
     for (auto key_it = processing_set.begin();
          key_it != processing_set.end();) {
@@ -847,7 +832,8 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
             static_cast<CentralizedObjectMetadata*>(it->second.get());
         // If the object is not valid or not in processing state, just
         // remove it from the processing set.
-        if (!metadata->IsValid() || metadata->IsAllReplicasComplete()) {
+        if (!metadata->IsValid() ||
+            metadata->AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata->IsValid()) {
                 shard.metadata.erase(it);
             }
@@ -863,7 +849,7 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
         const auto ttl =
             metadata->put_start_time_ + put_start_release_timeout_sec_;
         if (ttl < now) {
-            auto replicas = metadata->DiscardProcessingReplicas();
+            auto replicas = metadata->PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
@@ -879,6 +865,57 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
         }
 
         key_it++;
+    }
+
+    // Part 2: Discard expired CopyStart/MoveStart operations.
+    for (auto task_it = shard.replication_tasks.begin();
+         task_it != shard.replication_tasks.end();) {
+        auto meta_it = shard.metadata.find(task_it->first);
+        if (meta_it == shard.metadata.end()) {
+            // The key has been removed from metadata. This should be
+            // impossible.
+            LOG(ERROR) << "Key " << task_it->first
+                       << " was removed with ongoing replication task";
+            task_it = shard.replication_tasks.erase(task_it);
+            continue;
+        }
+
+        const auto ttl =
+            task_it->second.start_time + put_start_release_timeout_sec_;
+        if (ttl > now) {
+            ++task_it;
+            continue;
+        }
+
+        auto* metadata =
+            static_cast<CentralizedObjectMetadata*>(meta_it->second.get());
+
+        // Release source refcnt.
+        auto source = metadata->GetReplicaByID(task_it->second.source_id);
+        if (source != nullptr) {
+            source->dec_refcnt();
+        }
+
+        // Discard allocated target replicas.
+        const auto& replica_ids = task_it->second.replica_ids;
+        auto replicas =
+            metadata->PopReplicas([&replica_ids](const Replica& replica) {
+                auto it = std::find(replica_ids.begin(), replica_ids.end(),
+                                    replica.id());
+                return it != replica_ids.end();
+            });
+        if (!replicas.empty()) {
+            discarded_replicas.emplace_back(std::move(replicas), ttl);
+        }
+
+        // Decrement counter before erasing task.
+        metadata->replication_task_cnt_--;
+
+        if (!metadata->IsValid()) {
+            shard.metadata.erase(meta_it);
+        }
+
+        task_it = shard.replication_tasks.erase(task_it);
     }
 
     if (!discarded_replicas.empty()) {
@@ -958,6 +995,33 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::chrono::steady_clock::time_point> no_pin_objects;
     std::vector<std::chrono::steady_clock::time_point> soft_pin_objects;
 
+    auto can_evict_replicas = [](const CentralizedObjectMetadata& metadata) {
+        return metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() && replica.is_completed() &&
+                   replica.get_refcnt() == 0;
+        });
+    };
+
+    // Evict qualifying replicas, removing from segment index first.
+    // Returns count of evicted replicas.
+    auto evict_replicas = [this](CentralizedObjectMetadata& metadata,
+                                 CentralizedMetadataShard& shard,
+                                 const std::string& key) -> size_t {
+        auto could_remove = [](const Replica& replica) {
+            return replica.is_memory_replica() && replica.is_completed() &&
+                   replica.get_refcnt() == 0;
+        };
+        for (const auto& replica : metadata.replicas_) {
+            if (could_remove(replica)) {
+                RemoveReplicaFromSegmentIndex(shard, key, replica);
+                OnReplicaRemoved(replica);
+            }
+        }
+        return metadata.EraseReplicas([&could_remove](const Replica& replica) {
+            return could_remove(replica);
+        });
+    };
+
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % GetShardCount();
@@ -965,12 +1029,12 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
     // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < GetShardCount(); i++) {
         size_t current_idx = (start_idx + i) % GetShardCount();
-        auto& shard = GetCentralizedShard(current_idx);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, current_idx);
+        auto& shard = static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
         // Discard expired processing keys first so that they won't be counted
         // in later evictions.
-        DiscardExpiredProcessingKeys(shard, now);
+        DiscardExpiredProcessingReplicas(shard, now);
 
         // object_count must be updated at beginning as it will be used later
         // to compute ideal_evict_num
@@ -987,10 +1051,9 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
              it++) {
             auto* metadata =
                 static_cast<CentralizedObjectMetadata*>(it->second.get());
-            // Skip objects that are not expired or have incomplete replicas
+            // Skip objects that are not expired or have no evictable replicas
             if (!metadata->IsLeaseExpired(now) ||
-                metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                           ReplicaType::MEMORY)) {
+                !can_evict_replicas(*metadata)) {
                 continue;
             }
             if (!metadata->IsSoftPinned(now)) {
@@ -1026,20 +1089,15 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                 // pass
                 if (!metadata->IsLeaseExpired(now) ||
                     metadata->IsSoftPinned(now) ||
-                    metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                               ReplicaType::MEMORY) ||
-                    !metadata->HasMemReplica()) {
+                    !can_evict_replicas(*metadata)) {
                     ++it;
                     continue;
                 }
                 if (metadata->lease_timeout_ <= target_timeout) {
                     // Evict this object
                     total_freed_size +=
-                        metadata->size_ * metadata->GetMemReplicaCount();
-                    RemoveReplicaFromSegmentIndex(shard, it->first,
-                                                  metadata->replicas_);
-                    metadata->EraseReplica(
-                        ReplicaType::MEMORY);  // Erase memory replicas
+                        metadata->size_ *
+                        evict_replicas(*metadata, shard, it->first);
                     if (metadata->IsValid() == false) {
                         it = shard.metadata.erase(it);
                     } else {
@@ -1090,24 +1148,21 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
                  i++) {
                 size_t current_idx = (start_idx + i) % GetShardCount();
-                auto& shard = GetCentralizedShard(current_idx);
-                MutexLocker lock(&shard.mutex);
+                MetadataShardAccessorRW shard_rw(this, current_idx);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
                     auto* metadata = static_cast<CentralizedObjectMetadata*>(
                         it->second.get());
                     if (metadata->lease_timeout_ <= target_timeout &&
                         !metadata->IsSoftPinned(now) &&
-                        !metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                    ReplicaType::MEMORY) &&
-                        metadata->HasMemReplica()) {
+                        can_evict_replicas(*metadata)) {
                         // Evict this object
                         total_freed_size +=
-                            metadata->size_ * metadata->GetMemReplicaCount();
-                        RemoveReplicaFromSegmentIndex(shard, it->first,
-                                                      metadata->replicas_);
-                        metadata->EraseReplica(
-                            ReplicaType::MEMORY);  // Erase memory replicas
+                            metadata->size_ *
+                            evict_replicas(*metadata, shard,
+                                           it->first);  // Erase memory replicas
                         if (metadata->IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
@@ -1139,19 +1194,18 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
                  i++) {
                 size_t current_idx = (start_idx + i) % GetShardCount();
-                auto& shard = GetCentralizedShard(current_idx);
-                MutexLocker lock(&shard.mutex);
+                MetadataShardAccessorRW shard_rw(this, current_idx);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
                     auto* metadata = static_cast<CentralizedObjectMetadata*>(
                         it->second.get());
-                    // Skip objects that are not expired or have incomplete
+                    // Skip objects that are not expired or have no evictable
                     // replicas
                     if (!metadata->IsLeaseExpired(now) ||
-                        metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                   ReplicaType::MEMORY) ||
-                        !metadata->HasMemReplica()) {
+                        !can_evict_replicas(*metadata)) {
                         ++it;
                         continue;
                     }
@@ -1160,11 +1214,9 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                     if (!metadata->IsSoftPinned(now) ||
                         metadata->lease_timeout_ <= soft_target_timeout) {
                         total_freed_size +=
-                            metadata->size_ * metadata->GetMemReplicaCount();
-                        RemoveReplicaFromSegmentIndex(shard, it->first,
-                                                      metadata->replicas_);
-                        metadata->EraseReplica(
-                            ReplicaType::MEMORY);  // Erase memory replicas
+                            metadata->size_ *
+                            evict_replicas(*metadata, shard,
+                                           it->first);  // Erase memory replicas
                         if (metadata->IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
@@ -1211,12 +1263,23 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
     // 1. Call base implementation to clean up metadata references
     MasterService::OnSegmentRemoved(segment_id);
 
-    // 2. Clean up dangling processing keys
     for (size_t i = 0; i < kNumShards; ++i) {
-        auto& shard = GetShard(i);
-        auto& c_shard = static_cast<CentralizedMetadataShard&>(shard);
-        MutexLocker lock(&c_shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, i);
+        auto& c_shard =
+            static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
+        // 2. Clean up dangling replication tasks
+        for (auto task_it = c_shard.replication_tasks.begin();
+             task_it != c_shard.replication_tasks.end();) {
+            if (c_shard.metadata.find(task_it->first) ==
+                c_shard.metadata.end()) {
+                task_it = c_shard.replication_tasks.erase(task_it);
+            } else {
+                ++task_it;
+            }
+        }
+
+        // 3. Clean up dangling processing keys
         auto it = c_shard.processing_keys.begin();
         while (it != c_shard.processing_keys.end()) {
             auto meta_it = c_shard.metadata.find(*it);
@@ -1239,6 +1302,7 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
 
                 if (replicas.empty()) {
                     OnObjectRemoved(metadata);
+                    c_shard.replication_tasks.erase(meta_it->first);
                     c_shard.metadata.erase(meta_it);
                     it = c_shard.processing_keys.erase(it);
                 } else {
@@ -1247,6 +1311,545 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
             }
         }
     }
+}
+
+void CentralizedMasterService::TaskCleanupThreadFunc() {
+    LOG(INFO) << "Task cleanup thread started";
+    while (task_cleanup_running_) {
+        // Wait for the next cleanup interval, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(task_cleanup_mutex_);
+            task_cleanup_cv_.wait_for(
+                lk, std::chrono::milliseconds(kTaskCleanupThreadSleepMs),
+                [&] { return !task_cleanup_running_.load(); });
+        }
+
+        if (!task_cleanup_running_) {
+            break;
+        }
+
+        auto write_access = task_manager_.get_write_access();
+        write_access.prune_expired_tasks();
+        write_access.prune_finished_tasks();
+    }
+    LOG(INFO) << "Task cleanup thread stopped";
+}
+
+tl::expected<UUID, ErrorCode> CentralizedMasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=empty_targets";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    for (const auto& target : targets) {
+        if (!client_manager_.QuerySegments(target).has_value()) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto& metadata = accessor.Get();
+    const auto segment_names = metadata.GetReplicaSegmentNames();
+    if (segment_names.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
+    const auto& source_name = segment_names[dis(gen)];
+
+    auto client_id_res = client_manager_.GetClientIdBySegmentName(source_name);
+    if (!client_id_res.has_value()) {
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source_name
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            client_id_res.value(), {.key = key, .targets = targets});
+}
+
+tl::expected<UUID, ErrorCode> CentralizedMasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (source == target) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", target_segment=" << target
+                   << ", error=source_target_segments_are_same";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (!client_manager_.QuerySegments(target).has_value()) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_mounted";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    const auto segment_names = metadata.GetReplicaSegmentNames();
+    if (std::find(segment_names.begin(), segment_names.end(), source) ==
+        segment_names.end()) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto client_id_res = client_manager_.GetClientIdBySegmentName(source);
+    if (!client_id_res.has_value()) {
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_MOVE>(
+            client_id_res.value(),
+            {.key = key, .source = source, .target = target});
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> CentralizedMasterService::QueryTask(
+    const UUID& task_id) {
+    const auto& task_option =
+        task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!task_option.has_value()) {
+        LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    return QueryTaskResponse(task_option.value());
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+CentralizedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
+    const auto& tasks =
+        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    std::vector<TaskAssignment> assignments;
+    for (const auto& task : tasks) {
+        assignments.emplace_back(task);
+    }
+    return assignments;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    auto write_access = task_manager_.get_write_access();
+    ErrorCode err = write_access.complete_task(client_id, request.id,
+                                               request.status, request.message);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "task_id=" << request.id
+                   << ", error=complete_task_failed";
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+tl::expected<CopyStartResponse, ErrorCode> CentralizedMasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    if (accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << " already has an ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source = metadata.GetReplicaBySegmentName(src_segment);
+    if (source == nullptr || !source->is_completed() ||
+        source->has_invalid_mem_handle()) {
+        LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
+                   << ", replica not found or not valid";
+        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+
+    std::vector<Replica> replicas;
+    replicas.reserve(tgt_segments.size());
+    for (const auto& tgt_segment : tgt_segments) {
+        if (metadata.GetReplicaBySegmentName(tgt_segment) != nullptr) {
+            // Skip used segments.
+            continue;
+        }
+        auto result = client_manager_.AllocateFrom(metadata.size_, tgt_segment);
+        if (!result.has_value()) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", failed to allocate replica";
+            return tl::make_unexpected(result.error());
+        }
+        replicas.push_back(std::move(*result));
+    }
+
+    CopyStartResponse response;
+    response.targets.reserve(replicas.size());
+    std::vector<ReplicaID> replica_ids;
+    replica_ids.reserve(replicas.size());
+
+    response.source = source->get_descriptor();
+    for (const auto& replica : replicas) {
+        replica_ids.push_back(replica.id());
+        response.targets.emplace_back(replica.get_descriptor());
+    }
+
+    // Create replication task for tracking.
+    accessor.AddReplicationTask(client_id, ReplicationTask::Type::COPY,
+                                source->id(), std::move(replica_ids));
+
+    // Increase source refcnt to protect it from eviction.
+    source->inc_refcnt();
+
+    // Add replicas to the object.
+    // DO NOT ACCESS source AFTER THIS - replicas_ reallocation may invalidate.
+    metadata.AddReplicas(std::move(replicas));
+
+    return response;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::CopyEnd(
+    const UUID& client_id, const std::string& key) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (!accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=object has no ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+    }
+
+    auto& task = accessor.GetReplicationTask();
+    if (task.client_id != client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to CopyEnd key "
+                   << key << ", was CopyStart-ed by " << task.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    if (task.type != ReplicationTask::Type::COPY) {
+        LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source_id = task.source_id;
+    auto source = metadata.GetReplicaByID(source_id);
+    if (source == nullptr || !source->is_completed() ||
+        source->has_invalid_mem_handle()) {
+        LOG(ERROR) << "key=" << key << ", source_id=" << source_id
+                   << ", status=" << (source == nullptr ? "nullptr" : "invalid")
+                   << ", copy source becomes invalid during data transfer";
+        // Discard target replicas and clear the replication task.
+        metadata.EraseReplicas([&task](const Replica& replica) {
+            return std::find(task.replica_ids.begin(), task.replica_ids.end(),
+                             replica.id()) != task.replica_ids.end();
+        });
+        accessor.EraseReplicationTask();
+        if (!metadata.IsValid()) {
+            // Remove the object if it does not have any replicas.
+            accessor.Erase();
+        }
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+    }
+
+    // Decrement source reference count.
+    source->dec_refcnt();
+
+    // Mark all replica_ids as complete
+    bool all_complete = true;
+    for (const auto& replica_id : task.replica_ids) {
+        auto replica = metadata.GetReplicaByID(replica_id);
+        if (replica == nullptr || replica->has_invalid_mem_handle()) {
+            LOG(WARNING)
+                << "key=" << key << ", replica_id=" << replica_id
+                << ", copy target becomes invalid during data transfer";
+            all_complete = false;
+        } else {
+            replica->mark_complete();
+            AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                     accessor.GetKey(), *replica);
+            OnReplicaAdded(*replica);
+        }
+    }
+
+    accessor.EraseReplicationTask();
+
+    return all_complete ? tl::expected<void, ErrorCode>{}
+                        : tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (!accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=object has no ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+    }
+
+    auto& task = accessor.GetReplicationTask();
+    if (task.client_id != client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to CopyRevoke key "
+                   << key << ", was CopyStart-ed by " << task.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    if (task.type != ReplicationTask::Type::COPY) {
+        LOG(ERROR) << "Ongoing replication task type is MOVE instead of COPY";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source_id = task.source_id;
+    auto source = metadata.GetReplicaByID(source_id);
+    if (source == nullptr) {
+        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
+                     << ", copy source not found during revoke";
+    } else {
+        // Decrement source reference count
+        source->dec_refcnt();
+    }
+
+    // Erase all replica_ids
+    for (const auto& rid : task.replica_ids) {
+        metadata.EraseReplicaByID(rid);
+    }
+
+    accessor.EraseReplicationTask();
+
+    if (!metadata.IsValid()) {
+        // Remove the object if it does not have any replicas.
+        accessor.Erase();
+    }
+    return {};
+}
+
+tl::expected<MoveStartResponse, ErrorCode> CentralizedMasterService::MoveStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment, const std::string& tgt_segment) {
+    if (src_segment == tgt_segment) {
+        LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
+                   << " cannot be the same as move_src=" << src_segment;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", object not found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << " already has an ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source = metadata.GetReplicaBySegmentName(src_segment);
+    if (source == nullptr || !source->is_completed() ||
+        source->has_invalid_mem_handle()) {
+        LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
+                   << ", replica not found or not completed";
+        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+
+    std::vector<Replica> replicas;
+    if (metadata.GetReplicaBySegmentName(tgt_segment) == nullptr) {
+        auto result = client_manager_.AllocateFrom(metadata.size_, tgt_segment);
+        if (!result.has_value()) {
+            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                       << ", failed to allocate replica";
+            return tl::make_unexpected(result.error());
+        }
+        replicas.push_back(std::move(*result));
+    }
+
+    MoveStartResponse response;
+    std::vector<ReplicaID> replica_ids;
+
+    response.source = source->get_descriptor();
+    if (!replicas.empty()) {
+        replica_ids.push_back(replicas[0].id());
+        response.target = replicas[0].get_descriptor();
+    } else {
+        response.target = std::nullopt;
+    }
+
+    // Create replication task for tracking.
+    accessor.AddReplicationTask(client_id, ReplicationTask::Type::MOVE,
+                                source->id(), std::move(replica_ids));
+
+    // Increase source refcnt to protect it from eviction.
+    source->inc_refcnt();
+
+    // Add replicas to the object.
+    // DO NOT ACCESS source AFTER THIS - replicas_ reallocation may invalidate.
+    metadata.AddReplicas(std::move(replicas));
+
+    return response;
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::MoveEnd(
+    const UUID& client_id, const std::string& key) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (!accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=object has no ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+    }
+
+    auto& task = accessor.GetReplicationTask();
+    if (task.client_id != client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to MoveEnd key "
+                   << key << ", was MoveStart-ed by " << task.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    if (task.type != ReplicationTask::Type::MOVE) {
+        LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source_id = task.source_id;
+    auto source = metadata.GetReplicaByID(source_id);
+    if (source == nullptr || !source->is_completed() ||
+        source->has_invalid_mem_handle()) {
+        LOG(ERROR) << "key=" << key << ", source_id=" << source_id
+                   << ", status=" << (source == nullptr ? "nullptr" : "invalid")
+                   << ", move source becomes invalid during data transfer";
+        // Discard target replica and clear the replication task.
+        metadata.EraseReplicas([&task](const Replica& replica) {
+            return std::find(task.replica_ids.begin(), task.replica_ids.end(),
+                             replica.id()) != task.replica_ids.end();
+        });
+        accessor.EraseReplicationTask();
+        if (!metadata.IsValid()) {
+            // Remove the object if it does not have any replicas.
+            accessor.Erase();
+        }
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+    }
+
+    // Decrement source reference count.
+    source->dec_refcnt();
+
+    // If the move target has already existed on MoveStart, task.replica_ids
+    // will be empty. Thus we need to check whether we have replica_ids to
+    // process.
+    if (!task.replica_ids.empty()) {
+        auto replica_id = task.replica_ids[0];
+        auto replica = metadata.GetReplicaByID(replica_id);
+        if (replica == nullptr || replica->has_invalid_mem_handle()) {
+            LOG(WARNING)
+                << "key=" << key << ", replica_id=" << replica_id
+                << ", move target becomes invalid during data transfer";
+            accessor.EraseReplicationTask();
+            return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
+        }
+        replica->mark_complete();
+        AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                 accessor.GetKey(), *replica);
+        OnReplicaAdded(*replica);
+    }
+
+    // Remove source replica: remove from segment index first, then erase.
+    RemoveReplicaFromSegmentIndex(accessor.GetShard().GetRef(),
+                                  accessor.GetKey(), *source);
+    OnReplicaRemoved(*source);
+    auto source_replica =
+        metadata.PopReplicas([&source_id](const Replica& replica) {
+            return replica.id() == source_id;
+        });
+    if (!source_replica.empty()) {
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.emplace_back(
+            std::move(source_replica),
+            std::chrono::steady_clock::now() + put_start_release_timeout_sec_);
+    }
+
+    accessor.EraseReplicationTask();
+    return {};
+}
+
+tl::expected<void, ErrorCode> CentralizedMasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key) {
+    CentralizedMetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (!accessor.HasReplicationTask()) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=object has no ongoing replication task";
+        return tl::make_unexpected(ErrorCode::OBJECT_NO_REPLICATION_TASK);
+    }
+
+    auto& task = accessor.GetReplicationTask();
+    if (task.client_id != client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to MoveRevoke key "
+                   << key << ", was MoveStart-ed by " << task.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    if (task.type != ReplicationTask::Type::MOVE) {
+        LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    auto source_id = task.source_id;
+    auto source = metadata.GetReplicaByID(source_id);
+    if (source == nullptr) {
+        LOG(WARNING) << "key=" << key << ", source_id=" << source_id
+                     << ", move source not found during revoke";
+    } else {
+        // Decrement source reference count
+        source->dec_refcnt();
+    }
+
+    // Erase all replica_ids (in MOVE operation, there should be at most one)
+    for (const auto& rid : task.replica_ids) {
+        metadata.EraseReplicaByID(rid);
+    }
+
+    accessor.EraseReplicationTask();
+
+    if (!metadata.IsValid()) {
+        // Remove the object if it does not have any replicas.
+        accessor.Erase();
+    }
+    return {};
 }
 
 }  // namespace mooncake

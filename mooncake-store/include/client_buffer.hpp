@@ -28,7 +28,8 @@ class ClientBufferAllocator
    public:
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
-        size_t size, const std::string& protocol = "");
+        size_t size, const std::string& protocol = "",
+        bool use_hugepage = false);
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
@@ -52,7 +53,8 @@ class ClientBufferAllocator
 
    private:
     // Private constructors for different memory types
-    ClientBufferAllocator(size_t size, const std::string& protocol);
+    ClientBufferAllocator(size_t size, const std::string& protocol,
+                          bool use_hugepage);
     ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
@@ -61,6 +63,7 @@ class ClientBufferAllocator
     void* buffer_;
     size_t buffer_size_;
     bool is_external_memory_ = false;
+    bool use_hugepage_ = false;
 };
 
 /**
@@ -115,8 +118,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
 /**
  * @brief Build slices from user-provided buffers, trimmed to total_size.
@@ -125,9 +127,8 @@ int allocateSlices(std::vector<Slice>& slices,
  * @param total_size Maximum total bytes across all slices.
  * @return Vector of slices whose combined size equals total_size.
  */
-std::vector<Slice> BuildSlicesFromBuffers(
-    const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes,
-    uint64_t total_size);
+std::vector<Slice> BuildSlicesFromBuffers(const std::vector<void*>& buffers,
+                                          const std::vector<size_t>& sizes,
+                                          uint64_t total_size);
 
 }  // namespace mooncake

@@ -4,11 +4,14 @@
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,6 +23,7 @@
 #include "master_service.h"
 #include "mutex.h"
 #include "centralized_client_manager.h"
+#include "task_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -44,7 +48,7 @@ class CentralizedMasterService final : public MasterService {
     explicit CentralizedMasterService(const MasterServiceConfig& config);
     ~CentralizedMasterService() override;
 
-    auto GetReplicaList(const std::string& key,
+    auto GetReplicaList(std::string_view key,
                         const GetReplicaListRequestConfig& config =
                             GetReplicaListRequestConfig())
         -> tl::expected<GetReplicaListResponse, ErrorCode> override;
@@ -120,6 +124,91 @@ class CentralizedMasterService final : public MasterService {
                     Replica& replica) -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Start a copy operation
+     *
+     * This will allocate replica buffers to copy to.
+     *
+     * @param client_id the client that submit the CopyStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to copy from
+     * @param tgt_segments target segment names of the replicas to copy to
+     *
+     * @return allocated replicas on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    /**
+     * @brief Start a move operation
+     *
+     * This will allocate replica buffer to move to
+     *
+     * @param client_id the client that submit the MoveStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to move from
+     * @param tgt_segment target segment name of the replica to move to
+     *
+     * @return allocated replica on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @return Copy task ID on success, ErrorCode on failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source to
+     * target segment.
+     * @return Move task ID on success, ErrorCode on failure.
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    /**
+     * @brief Query the status of a task.
+     * @return Task basic info on success, ErrorCode on failure.
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client.
+     * @return List of task assignments on success, ErrorCode on failure.
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param client_id Client ID
+     * @param request Task complete request
+     * @return ErrorCode::OK on success, ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
+    /**
      * @brief Get the master service cluster ID to use as subdirectory name
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID
      * is not set
@@ -175,7 +264,7 @@ class CentralizedMasterService final : public MasterService {
         const ObjectMetadata& metadata) override;
 
     // Hooks implementation
-    void OnObjectAccessed(ObjectMetadata& metadata) override;
+    void OnObjectAccessed(const ObjectMetadata& metadata) override;
     void OnObjectHit(const ObjectMetadata& metadata) override;
     void OnReplicaRemoved(const Replica& replica) override;
     void OnReplicaAdded(const Replica& replica) override;
@@ -198,9 +287,9 @@ class CentralizedMasterService final : public MasterService {
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     /**
-     * @brief Helper to discard expired processing keys.
+     * @brief Helper to discard expired processing keys and replication tasks.
      */
-    void DiscardExpiredProcessingKeys(
+    void DiscardExpiredProcessingReplicas(
         CentralizedMetadataShard& shard,
         const std::chrono::steady_clock::time_point& now);
 
@@ -216,6 +305,27 @@ class CentralizedMasterService final : public MasterService {
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       const Replica& replica);
+
+    // We need to clean up finished tasks periodically to avoid memory leak
+    // And also we can add some task ttl mechanism in the future
+    void TaskCleanupThreadFunc();
+
+   private:
+    struct ReplicationTask {
+        UUID client_id;
+        std::chrono::steady_clock::time_point start_time;
+        enum class Type { COPY, MOVE } type;
+        ReplicaID source_id;
+        std::vector<ReplicaID> replica_ids;
+
+        ReplicationTask(const UUID& c, std::chrono::steady_clock::time_point t,
+                        Type tp, ReplicaID src, std::vector<ReplicaID>&& rids)
+            : client_id(c),
+              start_time(t),
+              type(tp),
+              source_id(src),
+              replica_ids(std::move(rids)) {}
+    };
 
    private:
     /**
@@ -247,16 +357,7 @@ class CentralizedMasterService final : public MasterService {
 
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
-        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl);
-
-        // Erase all replicas of the given type
-        void EraseReplica(ReplicaType type);
-
-        // Check if there is a memory replica
-        bool HasMemReplica() const;
-
-        // Get the count of memory replicas
-        int GetMemReplicaCount() const;
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) const;
 
         // Check if the lease has expired
         bool IsLeaseExpired() const;
@@ -272,18 +373,29 @@ class CentralizedMasterService final : public MasterService {
         bool IsSoftPinned(
             const std::chrono::steady_clock::time_point& now) const;
 
-        // Check if all replicas are complete
-        bool IsAllReplicasComplete() const;
+        virtual bool IsValid() const override {
+            return ObjectMetadata::IsValid() &&
+                   HasReplica([](const Replica& replica) {
+                       return !replica.is_memory_replica() ||
+                              !replica.has_invalid_mem_handle();
+                   });
+        }
 
-        // Check if has any completed replicas
-        bool HasCompletedReplicas() const;
-
-        // Discard all processing replicas and return them
-        std::vector<Replica> DiscardProcessingReplicas();
+        // Return names of all segments referenced by replicas
+        std::vector<std::string> GetReplicaSegmentNames() const {
+            std::vector<std::string> names;
+            for (const auto& replica : replicas_) {
+                for (const auto& opt : replica.get_segment_names()) {
+                    if (opt.has_value()) names.push_back(opt.value());
+                }
+            }
+            return names;
+        }
 
        public:
         // Hook functions
-        tl::expected<void, ErrorCode> IsObjectRemovable() const override;
+        tl::expected<void, ErrorCode> IsObjectRemovable(
+            bool force = false) const override;
         bool IsReplicaAccessible(const Replica& replica) const override;
         tl::expected<void, ErrorCode> IsReplicaRemovable(
             const Replica& replica) const override;
@@ -292,8 +404,12 @@ class CentralizedMasterService final : public MasterService {
         // The client that created this object (via PutStart).
         const UUID owner_client_id_;
         const std::chrono::steady_clock::time_point put_start_time_;
-        std::chrono::steady_clock::time_point lease_timeout_;
-        std::optional<std::chrono::steady_clock::time_point> soft_pin_timeout_;
+        mutable SpinLock lock_;
+        mutable std::chrono::steady_clock::time_point lease_timeout_
+            GUARDED_BY(lock_);
+        mutable std::optional<std::chrono::steady_clock::time_point>
+            soft_pin_timeout_ GUARDED_BY(lock_);
+        int32_t replication_task_cnt_;
     };
 
    private:
@@ -301,7 +417,12 @@ class CentralizedMasterService final : public MasterService {
     struct CentralizedMetadataShard : public MetadataShard {
         // Keys currently being written (PutStart called, but not yet PutEnd)
         // Protected by the inherited mutex from MetadataShard
-        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+        std::unordered_set<std::string, StringHash, std::equal_to<>>
+            processing_keys GUARDED_BY(mutex);
+        // Keys with ongoing Copy/Move operations
+        std::unordered_map<std::string, const ReplicationTask, StringHash,
+                           std::equal_to<>>
+            replication_tasks GUARDED_BY(mutex);
     };
 
     // Override GetShard to return our extended shard type
@@ -321,28 +442,46 @@ class CentralizedMasterService final : public MasterService {
     }
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
     // Helper to get shard index from key
-    size_t GetShardIndex(const std::string& key) const override {
-        return std::hash<std::string>{}(key) % kNumShards;
+    size_t GetShardIndex(std::string_view key) const override {
+        return std::hash<std::string_view>{}(key) % kNumShards;
     }
     size_t GetShardCount() const override { return kNumShards; }
 
    private:
     class CentralizedMetadataAccessor final
-        : public MasterService::MetadataAccessor {
+        : public MasterService::MetadataAccessorRW {
        public:
         CentralizedMetadataAccessor(CentralizedMasterService* service,
-                                    const std::string& key)
-            : MasterService::MetadataAccessor(service, key),
-              c_shard_(static_cast<CentralizedMetadataShard&>(shard_)),
-              processing_it_(c_shard_.processing_keys.find(key)) {}
-
-        CentralizedObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
-            return static_cast<CentralizedObjectMetadata&>(
-                MasterService::MetadataAccessor::Get());
+                                    std::string_view key)
+            : MasterService::MetadataAccessorRW(service, key),
+              c_shard_(static_cast<CentralizedMetadataShard&>(
+                  shard_guard_.GetRef())),
+              processing_it_(c_shard_.processing_keys.end()),
+              replication_task_it_(c_shard_.replication_tasks.end()) {
+            processing_it_ = c_shard_.processing_keys.find(key);
+            replication_task_it_ = c_shard_.replication_tasks.find(key);
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
             return processing_it_ != c_shard_.processing_keys.end();
+        }
+
+        bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_ != c_shard_.replication_tasks.end();
+        }
+
+        CentralizedMetadataShard& GetCentralizedShard()
+            NO_THREAD_SAFETY_ANALYSIS {
+            return c_shard_;
+        }
+
+        CentralizedObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
+            return static_cast<CentralizedObjectMetadata&>(
+                MasterService::MetadataAccessorRW::Get());
+        }
+
+        const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_->second;
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
@@ -350,18 +489,45 @@ class CentralizedMasterService final : public MasterService {
             processing_it_ = c_shard_.processing_keys.end();
         }
 
-        // Access the extended shard directly (for inserting processing keys)
-        CentralizedMetadataShard& GetCentralizedShard() { return c_shard_; }
+        void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            c_shard_.replication_tasks.erase(replication_task_it_);
+            replication_task_it_ = c_shard_.replication_tasks.end();
+            Get().replication_task_cnt_--;
+        }
+
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas,
+                    bool enable_soft_pin) NO_THREAD_SAFETY_ANALYSIS {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            auto metadata = std::make_unique<CentralizedObjectMetadata>(
+                client_id, now, total_length, std::move(replicas),
+                enable_soft_pin);
+            it_ = c_shard_.metadata
+                      .emplace(std::string(GetKey()), std::move(metadata))
+                      .first;
+        }
+
+        void AddReplicationTask(
+            const UUID& client_id, ReplicationTask::Type type, ReplicaID id,
+            std::vector<ReplicaID> replica_ids) NO_THREAD_SAFETY_ANALYSIS {
+            c_shard_.replication_tasks.emplace(
+                std::piecewise_construct, std::forward_as_tuple(GetKey()),
+                std::forward_as_tuple(client_id,
+                                      std::chrono::steady_clock::now(), type,
+                                      id, std::move(replica_ids)));
+            Get().replication_task_cnt_++;
+        }
 
        private:
         CentralizedMetadataShard& c_shard_;
-        std::unordered_set<std::string>::iterator processing_it_;
+        std::unordered_set<std::string, StringHash, std::equal_to<>>::iterator
+            processing_it_;
+        std::unordered_map<std::string, const ReplicationTask, StringHash,
+                           std::equal_to<>>::iterator replication_task_it_;
     };
-
-    std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
-        const std::string& key) override {
-        return std::make_unique<CentralizedMetadataAccessor>(this, key);
-    }
 
    private:
     class DiscardedReplicas {
@@ -418,6 +584,16 @@ class CentralizedMasterService final : public MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
+    // Task cleanup thread related members
+    std::thread task_cleanup_thread_;
+    std::atomic<bool> task_cleanup_running_{false};
+    static constexpr uint64_t kTaskCleanupThreadSleepMs =
+        30000;  // 30000 ms sleep between task cleanup checks
+
+    // Used to wake task cleanup thread immediately during shutdown.
+    std::mutex task_cleanup_mutex_;
+    std::condition_variable task_cleanup_cv_;
+
     const bool enable_offload_;
 
     // cluster id for persistent sub directory
@@ -439,6 +615,10 @@ class CentralizedMasterService final : public MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+
+    // Task manager
+    ClientTaskManager task_manager_;
+
     friend class CentralizedMetadataAccessor;
     friend class test::MasterServiceTest;
 };

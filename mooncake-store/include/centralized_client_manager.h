@@ -1,5 +1,6 @@
 #pragma once
 
+#include "allocator.h"
 #include "client_manager.h"
 #include "allocation_strategy.h"
 
@@ -19,7 +20,12 @@ class CentralizedClientManager final : public ClientManager {
     CentralizedClientManager(const int64_t client_live_ttl_sec,
                              const int64_t client_crashed_ttl_sec,
                              const BufferAllocatorType memory_allocator_type,
-                             const ViewVersionId view_version);
+                             const ViewVersionId view_version,
+                             bool enable_cxl = false,
+                             const std::string& cxl_path = "",
+                             size_t cxl_size = 0);
+
+    ~CentralizedClientManager() override;
 
     auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
         -> tl::expected<void, ErrorCode>;
@@ -32,6 +38,10 @@ class CentralizedClientManager final : public ClientManager {
     auto Allocate(const uint64_t slice_length, const size_t replica_num,
                   const std::vector<std::string>& preferred_segments)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    auto AllocateFrom(const uint64_t slice_length,
+                      const std::string& segment_name)
+        -> tl::expected<Replica, ErrorCode>;
 
    protected:
     DeploymentMode GetDeploymentMode() const override {
@@ -53,6 +63,9 @@ class CentralizedClientManager final : public ClientManager {
     AllocatorManager global_allocator_manager_
         GUARDED_BY(global_allocator_mutex_);
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
+    std::string cxl_path_;
+    size_t cxl_size_ = 0;
 
     friend class SegmentTest;
     friend class test::MasterServiceTest;

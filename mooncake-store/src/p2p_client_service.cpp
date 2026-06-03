@@ -2,22 +2,47 @@
 
 #include <glog/logging.h>
 
+#include <csignal>
 #include <algorithm>
+#include <coroutine>
 #include <cstdlib>
-#include <cstring>
+#include <exception>
+#include <future>
 #include <thread>
 
+#include <async_simple/Try.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+
+#include "utils/scoped_vlog_timer.h"
+
 namespace mooncake {
+
+namespace {
+
+// Max retries when AsyncWriteRevoke or AsyncUnPinKey fails on the forward path
+// (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
+// success; a missing owner record is already OK (idempotent).
+constexpr int kRevokeRetryMaxCnt = 3;
+
+inline bool IsAlreadyExistsError(ErrorCode err) {
+    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
+}  // namespace
 
 // ============================================================================
 // Construction / Destruction
 // ============================================================================
 
 P2PClientService::P2PClientService(
-    const std::string& local_ip, uint16_t te_port,
-    const std::string& metadata_connstring,
-    const std::map<std::string, std::string>& labels)
-    : ClientService(local_ip, te_port, metadata_connstring, labels),
+    const std::string& metadata_connstring, uint16_t metrics_port,
+    bool enable_metrics_http, const std::map<std::string, std::string>& labels)
+    : ClientService(metadata_connstring, metrics_port, enable_metrics_http,
+                    labels),
+      metrics_(P2PClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr) {}
 
@@ -28,12 +53,22 @@ void P2PClientService::Stop() {
 
     LOG(INFO) << "P2PClientService::Stop() — begin";
 
+    // Stop HA recovery thread first
+    if (ha_manager_) {
+        ha_manager_->Stop();
+    }
+
     // Stop RPC server so no new requests arrive.
     if (client_rpc_server_) {
         client_rpc_server_->stop();
     }
     if (client_rpc_server_thread_.joinable()) {
         client_rpc_server_thread_.join();
+    }
+
+    // Stop async notifier before data_manager to drain pending ops
+    if (async_route_notifier_) {
+        async_route_notifier_->Stop();
     }
 
     // Stop tier scheduler of tierd_backend
@@ -56,6 +91,8 @@ void P2PClientService::Destroy() {
     }
 
     client_rpc_service_.reset();
+    ha_manager_.reset();
+    async_route_notifier_.reset();
     if (data_manager_.has_value()) {
         data_manager_->Destroy();
     }
@@ -73,19 +110,54 @@ P2PClientService::~P2PClientService() {
 
 ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     client_rpc_port_ = config.client_rpc_port;
+    transfer_direction_mode_ = config.transfer_direction_mode;
 
-    // 1. Connect to master
+    // 1. Try to connect to master (allow failure for degraded startup)
+    bool master_connected = false;
     ErrorCode err = ConnectToMaster(config.master_server_entry);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to connect to master in P2P mode";
-        return err;
+    if (err == ErrorCode::OK) {
+        master_connected = true;
+        LOG(INFO) << "Connected to master successfully";
+    } else {
+        LOG(WARNING)
+            << "Failed to connect to master, starting in DEGRADED mode: "
+            << err;
     }
 
-    // 2. Initialize transfer engine
+    // 2. Try to register with master (allow failure for degraded startup)
+    //    Note: RegisterClient before InitStorage sends empty segments.
+    //    Segment info will be updated via MountSegment during InitStorage
+    //    (if connected) or during recovery (if degraded).
+    bool client_registered = false;
+    if (master_connected) {
+        auto reg = RegisterClient();
+        if (reg) {
+            client_registered = true;
+            LOG(INFO) << "Registered with master successfully";
+        } else {
+            LOG(WARNING) << "Failed to register with master: " << reg.error()
+                         << ", starting in DEGRADED mode";
+        }
+    }
+
+    // 3. Initialize HA recovery manager with appropriate initial state.
+    //    FULL: master connected and client registered.
+    //    DEGRADED: connection or registration failed.
+    HAClientState initial_state =
+        client_registered ? HAClientState::FULL : HAClientState::DEGRADED;
+    ha_manager_ = std::make_unique<HARecoveryManager>(
+        client_id_, master_client_, data_manager_, async_route_notifier_,
+        view_version_, initial_state);
+
+    // 4. Start heartbeat immediately after registration so master does not
+    //    consider this client disconnected during a lengthy initialization.
+    StartHeartbeat(config.master_server_entry);
+
+    // 5. Initialize transfer engine (local operation, no master dependency)
     if (config.transfer_engine == nullptr) {
-        transfer_engine_ = std::make_shared<TransferEngine>();
-        err = InitTransferEngine(local_endpoint(), metadata_connstring_,
-                                 config.protocol, config.rdma_devices);
+        err = InitTransferEngine(config.local_ip, config.te_port,
+                                 metadata_connstring_, config.protocol,
+                                 config.rdma_devices);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return err;
@@ -97,31 +169,53 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
     initTeEndpoint();
 
-    // 3. Register with master BEFORE InitStorage, because InitStorage
-    //    triggers TieredBackend::MountSegment which requires the client to
-    //    be already registered on the master side.
-    auto reg = RegisterClient();
-    if (!reg) {
-        LOG(ERROR) << "Failed to register P2P client with master";
-        return reg.error();
-    }
-
-    // 4. Initialize TieredBackend + DataManager
+    // 6. Initialize TieredBackend + DataManager.
+    //    SegmentSyncCallback will check degraded state and skip MountSegment.
     err = InitStorage(config);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize TieredBackend";
         return err;
     }
 
-    // 5. Start P2P client RPC service
-    client_rpc_service_.emplace(*data_manager_);
+    // 7. Initialize async route notifier if enabled
+    if (config.async_sender_thread_count > 0) {
+        // When async ADD is rejected by Master, delete the local replica
+        // since Master won't track it.
+        SyncFailureCallback failure_cb = [this](std::string_view key,
+                                                const UUID& segment_id,
+                                                ErrorCode error) {
+            LOG(WARNING) << "Async ADD rejected by Master, deleting local"
+                         << ", key=" << key << ", error=" << error;
+            if (data_manager_.has_value()) {
+                auto r = data_manager_->Delete(key, segment_id,
+                                               /*notify_master=*/false);
+                if (!r) {
+                    LOG(ERROR) << "Failed to delete local replica"
+                               << ", key=" << key << ", error=" << r.error();
+                }
+            }
+        };
+        async_route_notifier_ = std::make_unique<AsyncMetadataNotifier>(
+            master_client_, client_id_, config.async_sender_thread_count,
+            config.async_max_batch_size, config.async_route_queue_size,
+            std::move(failure_cb));
+        async_route_notifier_->Start();
+        LOG(INFO) << "Async route notifier enabled, thread_count="
+                  << config.async_sender_thread_count
+                  << ", queue_size=" << config.async_route_queue_size;
+    }
+
+    // 8. Start P2P client RPC service
+    client_rpc_service_.emplace(*data_manager_, metrics_.get());
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
 
-    client_rpc_server_thread_ = std::thread([this]() {
+    auto rpc_start_failed = std::make_shared<std::atomic<bool>>(false);
+    client_rpc_server_thread_ = std::thread([this, rpc_start_failed]() {
         auto ec = client_rpc_server_->start();
         if (ec) {
+            rpc_start_failed->store(true);
             LOG(ERROR) << "P2P RPC server failed to start on port "
                        << client_rpc_port_ << ": " << ec.message();
         }
@@ -131,16 +225,32 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     // Give RPC server a moment to start
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (rpc_start_failed->load()) {
+        LOG(ERROR) << "P2P RPC server could not bind on port "
+                   << client_rpc_port_ << "; aborting service initialization.";
+        return ErrorCode::INTERNAL_ERROR;
+    }
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
 
-    // 6. Start heartbeat AFTER everything is fully initialized
-    StartHeartbeat(config.master_server_entry);
+    // 9. If started in FULL state, notify master that sync is complete.
+    //    If in DEGRADED state, heartbeat will recover later.
+    if (!ha_manager_->IsDegraded()) {
+        ha_manager_->SetSyncCompleted();
+    } else {
+        LOG(INFO) << "P2P client started in DEGRADED mode, heartbeat will "
+                  << "establish master connection when available";
+    }
+
+    // 10. Mark service as ready for recovery. HA recovery thread can now
+    // proceed.
+    ha_manager_->SetReadyForRecovery();
 
     return ErrorCode::OK;
 }
 
 ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
-    auto tiered_backend = std::make_unique<TieredBackend>();
+    auto tiered_backend =
+        std::make_unique<TieredBackend>(config.lock_shard_count);
 
     auto add_replica_callback = BuildAddReplicaCallback();
     auto remove_replica_callback = BuildRemoveReplicaCallback();
@@ -154,12 +264,43 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
         return init_result.error();
     }
 
-    data_manager_ = DataManager(std::move(tiered_backend), transfer_engine_,
-                                config.lock_shard_count);
+    LocalTransferConfig local_transfer_config;
+    local_transfer_config.mode = config.local_transfer_mode;
+    if (config.local_transfer_mode == LocalTransferMode::TE) {
+        local_transfer_config.te_endpoint = get_te_endpoint();
+    } else {
+        local_transfer_config.local_memcpy_async_worker_num =
+            config.local_memcpy_async_worker_num;
+    }
+    KeyLeaseConfig key_lease_config;
+    key_lease_config.duration_ms = config.p2p_key_lease_duration_ms;
+    key_lease_config.scan_interval_ms = config.p2p_key_lease_scan_interval_ms;
+
+    data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
+                          config.lock_shard_count, local_transfer_config,
+                          key_lease_config);
     // Set rectify callback on DataManager to remove stale replicas from master
-    data_manager_->SetRectifyCallback(
-        [this](const std::string& key, std::optional<UUID> tier_id) {
-            if (!tier_id) {
+    data_manager_->SetRectifyCallback([this](std::string_view key,
+                                             std::optional<UUID> tier_id) {
+        if (async_route_notifier_) {
+            if (!tier_id.has_value()) {
+                auto tier_views = data_manager_->GetTierViews();
+                for (const auto& tv : tier_views) {
+                    auto r = async_route_notifier_->EnqueueRemove(key, tv.id);
+                    if (!r) {
+                        LOG(WARNING) << "Failed to enqueue rectify remove"
+                                     << ", key=" << key;
+                    }
+                }
+            } else {
+                auto r = async_route_notifier_->EnqueueRemove(key, *tier_id);
+                if (!r) {
+                    LOG(WARNING) << "Failed to enqueue rectify remove"
+                                 << ", key=" << key;
+                }
+            }
+        } else {
+            if (!tier_id.has_value()) {
                 auto tier_views = data_manager_->GetTierViews();
                 std::vector<UUID> segment_ids;
                 segment_ids.reserve(tier_views.size());
@@ -170,7 +311,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
             } else {
                 SyncRemoveReplica(key, *tier_id);
             }
-        });
+        }
+    });
 
     // Initialize route cache
     if (config.route_cache_max_memory_bytes > 0 &&
@@ -183,8 +325,17 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 }
 
 AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
-    return [this](const std::string& key, const UUID& tier_id,
+    return [this](std::string_view key, const UUID& tier_id,
                   size_t size) -> tl::expected<void, ErrorCode> {
+        // In degraded mode, skip metadata notification to Master.
+        // The data is stored locally; the recovery pipeline will re-sync
+        // all local metadata to Master when the connection is restored.
+        if (ha_manager_ && ha_manager_->IsDegraded()) {
+            return {};
+        }
+        if (async_route_notifier_) {
+            return async_route_notifier_->EnqueueAdd(key, tier_id, size);
+        }
         return SyncAddReplica(key, tier_id, size);
     };
 }
@@ -192,9 +343,19 @@ AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
 RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
     return
         [this](
-            const std::string& key, const UUID& tier_id,
+            std::string_view key, const UUID& tier_id,
             enum REMOVE_CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
+            // In degraded mode, skip metadata notification to Master.
+            // The recovery pipeline will re-sync all local metadata,
+            // and Master will discard routes for keys that no longer
+            // exist locally.
+            if (ha_manager_ && ha_manager_->IsDegraded()) {
+                return {};
+            }
             if (type == REMOVE_CALLBACK_TYPE::DELETE) {
+                if (async_route_notifier_) {
+                    return async_route_notifier_->EnqueueRemove(key, tier_id);
+                }
                 return SyncRemoveReplica(key, tier_id);
             } else if (type == REMOVE_CALLBACK_TYPE::DELETE_ALL) {
                 // TODO:
@@ -212,14 +373,12 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
 }
 
 tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
-    const std::string& key, const UUID& tier_id, size_t size) {
+    std::string_view key, const UUID& tier_id, size_t size) {
     AddReplicaRequest req;
     req.key = key;
     req.size = size;
-    req.replica.client_id = client_id_;
-    req.replica.segment_id = tier_id;
-    req.replica.rpc_port = client_rpc_port_;
-    req.replica.ip_address = local_ip_;
+    req.client_id = client_id_;
+    req.segment_id = tier_id;
     auto result = master_client_.AddReplica(req);
     if (!result) {
         LOG(ERROR) << "Failed to add replica for key: " << key
@@ -230,7 +389,7 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
 }
 
 tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
-    const std::string& key, const UUID& tier_id) {
+    std::string_view key, const UUID& tier_id) {
     RemoveReplicaRequest req;
     req.key = key;
     req.client_id = client_id_;
@@ -245,7 +404,7 @@ tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-P2PClientService::SyncBatchRemoveReplica(const std::string& key,
+P2PClientService::SyncBatchRemoveReplica(std::string_view key,
                                          std::vector<UUID> segment_ids) {
     BatchRemoveReplicaRequest req;
     req.key = key;
@@ -266,6 +425,25 @@ SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
     return [this](const Segment& segment,
                   bool mount) -> tl::expected<void, ErrorCode> {
         if (mount) {
+            // Skip MountSegment in degraded mode (master not connected).
+            // Registration during heartbeat recovery will include segment info.
+            if (ha_manager_ && ha_manager_->IsDegraded()) {
+                LOG(INFO) << "Skipping MountSegment in DEGRADED mode: id="
+                          << segment.id << ", name=" << segment.name;
+                return {};
+            }
+            // TODO: There is a race window between the IsDegraded() check above
+            // and the MountSegment() call below. During this window, the system
+            // could transition to degraded mode (e.g., due to master connection
+            // loss), causing the MountSegment RPC to fail. This would result in
+            // segment initialization failure even though the segment could be
+            // registered later during heartbeat recovery.
+            //
+            // Future improvement: Remove BuildSegmentSyncCallback function to
+            // decouple storage layer initialization from master interaction.
+            // The P2PClientService will manage this logic instead, and can
+            // directly convert ha_status to degraded upon RPC failure during
+            // initialization.
             LOG(INFO) << "Mounting segment with Master: id=" << segment.id
                       << ", name=" << segment.name << ", size=" << segment.size;
             auto result = master_client_.MountSegment(segment);
@@ -357,344 +535,564 @@ P2PClientService::RegisterClient() {
 }
 
 // ============================================================================
-// Put Operations
+// HA Recovery — delegate to HARecoveryManager
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::PutLocal(
-    const std::string& key, std::vector<Slice>& slices) {
-    if (!data_manager_.has_value()) {
-        LOG(ERROR) << "DataManager not initialized";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    if (slices.size() != 1) {
-        LOG(ERROR) << "PutLocal currently only supports a single slice, "
-                      "but received slice size = "
-                   << slices.size();
-        return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
-    }
-
-    auto result = data_manager_->Put(key, slices[0]);
-    if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
-        result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
-        VLOG(1) << "Local put failed for key: " << key
-                << " error: " << result.error();
-        return tl::unexpected(result.error());
-    }
-    return {};
+void P2PClientService::OnHAEvent(HAEvent event) {
+    if (ha_manager_) ha_manager_->HandleEvent(event);
 }
 
-tl::expected<void, ErrorCode> P2PClientService::PutViaRoute(
-    const std::string& key, std::vector<Slice>& slices,
-    const WriteRouteRequestConfig& config) {
-    size_t total_size = ClientService::CalculateSliceSize(slices);
-
-    // 1. Get write route from master
-    WriteRouteRequest route_req;
-    route_req.key = key;
-    route_req.client_id = client_id_;
-    route_req.size = total_size;
-    route_req.config = config;
-
-    auto route_result = master_client_.GetWriteRoute(route_req);
-    if (!route_result) {
-        LOG(WARNING) << "Failed to get write route for key: " << key
-                     << " error: " << route_result.error();
-        return tl::unexpected(route_result.error());
+std::string P2PClientService::GetHealthStatus() const {
+    if (ha_manager_) {
+        return toString(ha_manager_->GetState());
     }
-
-    auto& candidates = route_result.value().candidates;
-    if (candidates.empty()) {
-        LOG(ERROR) << "No write candidates for key: " << key;
-        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-
-    // 2. Try candidates in order
-    tl::expected<void, ErrorCode> result;
-    for (auto& candidate : candidates) {
-        auto& proxy = candidate.replica;
-        // Check if locality: is this our own client?
-        if (proxy.client_id == client_id_) {
-            // Write locally via DataManager
-            result = PutLocal(key, slices);
-            if (!result && result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
-                result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
-                LOG(WARNING)
-                    << "Local write failed despite local route, trying "
-                       "next candidate, error: "
-                    << result.error();
-                continue;  // write failed, attempt next candidate
-            } else {
-                // ErrorCode::REPLICA_NUM_EXCEEDED or
-                // ErrorCode::REPLICA_ALREADY_EXISTS means the key exists.
-                // Currently, we think this is a normal case,
-                // just ignore the error and return success.
-                return {};  // write success
-            }
-        }
-
-        // Remote write via PeerClient
-        std::string endpoint =
-            proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-        try {
-            auto& peer = GetOrCreatePeerClient(endpoint);
-
-            // Build remote write request:
-            // We need to provide the src_buffers (our local registered
-            // memory) and let the remote side pull data.
-            RemoteWriteRequest write_req;
-            write_req.key = key;
-            for (const auto& slice : slices) {
-                RemoteBufferDesc buf;
-                buf.segment_endpoint = get_te_endpoint();
-                buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
-                buf.size = slice.size;
-                write_req.src_buffers.push_back(buf);
-            }
-
-            auto write_result = peer.WriteRemoteData(write_req);
-            if (!write_result) {
-                if (write_result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
-                    write_result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
-                    LOG(WARNING) << "Remote write to " << endpoint
-                                 << " failed: " << write_result.error();
-                    result = tl::unexpected(write_result.error());
-                    continue;  // write failed, attempt next candidate
-                } else {
-                    // ErrorCode::REPLICA_NUM_EXCEEDED or
-                    // ErrorCode::REPLICA_ALREADY_EXISTS means the key exists.
-                    // Currently, we think this is a normal case,
-                    // just ignore the error and return success.
-                    return {};  // write success
-                }
-            } else {
-                // Write success — cache the route for future reads
-                if (route_cache_) {
-                    P2PProxyDescriptor new_proxy = proxy;
-                    new_proxy.segment_id = write_result.value();
-                    route_cache_->Upsert(key, {new_proxy});
-                }
-                return {};  // write success
-            }
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Exception during remote write to " << endpoint
-                       << ": " << e.what();
-            result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-    }  // end for
-
-    return result;
+    return "OK";
 }
+
+// ============================================================================
+// Put Operations
+// ============================================================================
 
 tl::expected<void, ErrorCode> P2PClientService::Put(const ObjectKey& key,
                                                     std::vector<Slice>& slices,
                                                     const WriteConfig& config) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    std::vector<std::vector<Slice>> batched_slices{std::move(slices)};
+    auto result = BatchPut({key}, batched_slices, config);
+    if (result.empty()) {
+        LOG(ERROR) << "BatchPut returned empty result for key: " << key;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    const auto* route_config = std::get_if<WriteRouteRequestConfig>(&config);
-    if (!route_config) {
-        LOG(ERROR) << "P2PClientService currently only supports "
-                      "WriteRouteRequestConfig";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto result = PutViaRoute(key, slices, *route_config);
-    if (!result) {
-        if (result.error() != ErrorCode::REPLICA_NUM_EXCEEDED &&
-            result.error() != ErrorCode::REPLICA_ALREADY_EXISTS) {
-            LOG(ERROR) << "Failed to put key: " << key
-                       << " error: " << result.error();
-            return result;
-        }
-        // REPLICA_NUM_EXCEEDED / REPLICA_ALREADY_EXISTS: object already
-        // stored, treat as success so callers don't retry needlessly.
-    }
-
-    return {};
+    slices = std::move(batched_slices[0]);  // restore original slices
+    return result[0];
 }
 
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteConfig& config) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
+    timer.LogRequest("batch_size=", keys.size());
+
+    Stopwatch stopwatch;
+    if (metrics_) {
+        metrics_->local_request.put_requests.inc(keys.size());
+    }
+
     auto guard = AcquireInflightGuard();
+    const auto* route_cfg_ptr = std::get_if<WriteRouteRequestConfig>(&config);
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::make_unexpected(ErrorCode::SHUTTING_DOWN));
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else if (keys.size() != batched_slices.size()) {
+        LOG(ERROR) << "BatchPut input size mismatch";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else if (!route_cfg_ptr) {
+        LOG(ERROR) << "P2PClientService expects WriteRouteRequestConfig";
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::INVALID_PARAMS));
+    } else {
+        results = InnerBatchPut(keys, batched_slices, *route_cfg_ptr);
     }
-    std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
+
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+            success_count++;
+        }
+    }
+
+    if (metrics_) {
+        const auto elapsed = stopwatch.elapsed_us();
+        const double avg_latency =
+            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                metrics_->local_request.put_bytes.inc(
+                    ClientService::CalculateSliceSize(batched_slices[i]));
+                metrics_->local_request.put_latency_success.observe(
+                    avg_latency);
+            } else {
+                metrics_->local_request.put_latency_failure.observe(
+                    avg_latency);
+            }
+        }
+        const size_t failure_count = keys.size() - success_count;
+        if (failure_count > 0) {
+            metrics_->local_request.put_failures.inc(failure_count);
+        }
+    }
+
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const WriteRouteRequestConfig& route_config) {
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return InnerBatchPutDegraded(keys, batched_slices);
+    }
+    return InnerBatchPutNormal(keys, batched_slices, route_config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+P2PClientService::InnerBatchPutDegraded(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices) {
+    // Phase 1: dispatch all local writes.
+    std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
+        handles;
+    handles.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results.push_back(Put(keys[i], batched_slices[i], config));
+        handles.push_back(CreatePutHandleFromLocal(keys[i], batched_slices[i]));
+    }
+
+    // Phase 2: wait each handle and collect results.
+    return CollectResults(handles, keys);
+}
+
+tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
+P2PClientService::CreatePutHandleFromLocal(std::string_view key,
+                                           std::vector<Slice>& slices) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Data manager not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto local_handle = data_manager_->Put(key, slices);
+
+    if (local_handle) {
+        return std::move(local_handle.value());
+    } else if (!IsAlreadyExistsError(local_handle.error())) {
+        LOG(ERROR) << "Local write failed for key: " << key
+                   << ", error: " << local_handle.error();
+    }
+
+    return tl::unexpected(local_handle.error());
+}
+
+std::vector<tl::expected<void, ErrorCode>> P2PClientService::CollectResults(
+    std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>&
+        handles,
+    const std::vector<ObjectKey>& keys) {
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    for (size_t i = 0; i < handles.size(); ++i) {
+        if (!handles[i]) {
+            if (!IsAlreadyExistsError(handles[i].error())) {
+                LOG(ERROR) << "Failed to put key: " << keys[i]
+                           << ", error: " << handles[i].error();
+                results[i] = tl::unexpected(handles[i].error());
+            } else {
+                results[i] = {};
+            }
+        } else if (!handles[i].value()) {
+            LOG(ERROR) << "put task handle is null for key: " << keys[i];
+            results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        } else {
+            auto wait_result = handles[i].value()->Wait();
+
+            if (wait_result || IsAlreadyExistsError(wait_result.error())) {
+                results[i] = {};
+            } else {
+                LOG(ERROR) << "Failed to put key: " << keys[i]
+                           << ", error: " << wait_result.error();
+                results[i] = tl::unexpected(wait_result.error());
+            }
+        }
     }
     return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+P2PClientService::InnerBatchPutNormal(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const WriteRouteRequestConfig& route_config) {
+    // Phase 1: fetch write routes from master.
+    auto batch_routes =
+        BatchFetchWriteRoutes(keys, batched_slices, route_config);
+    if (!batch_routes) {
+        LOG(ERROR) << "BatchGetWriteRoute RPC failed: " << batch_routes.error();
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(batch_routes.error()));
+    }
+
+    // Phase 2:
+    // 2.1: async dispatch first-candidate writes for each key
+    // 2.2: wrap each key in a retry chain based on rotute
+    auto handles = CreatePutHandlesFromRoute(keys, batched_slices, route_config,
+                                             batch_routes.value());
+
+    // Phase 3: wait every retry chain and collect results.
+    return CollectResults(handles, keys);
+}
+
+tl::expected<BatchGetWriteRouteResponse, ErrorCode>
+P2PClientService::BatchFetchWriteRoutes(
+    const std::vector<ObjectKey>& keys,
+    const std::vector<std::vector<Slice>>& batched_slices,
+    const WriteRouteRequestConfig& config) {
+    BatchGetWriteRouteRequest req;
+    req.client_id = client_id_;
+    req.config = config;
+    req.keys.reserve(keys.size());
+    req.sizes.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        req.keys.push_back(keys[i]);
+        req.sizes.push_back(
+            ClientService::CalculateSliceSize(batched_slices[i]));
+    }
+    auto batch_route_result = master_client_.BatchGetWriteRoute(req);
+    if (!batch_route_result) {
+        LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
+                   << batch_route_result.error();
+        return batch_route_result;
+    }
+    return batch_route_result;
+}
+
+std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
+P2PClientService::CreatePutHandlesFromRoute(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const WriteRouteRequestConfig& route_config,
+    BatchGetWriteRouteResponse& batch_resp) {
+    struct WriteTask {
+        std::unique_ptr<TaskHandle<void>> first_task;
+        std::string first_route;
+        std::vector<std::unique_ptr<WriteOp>> retry_op_list;
+    };
+
+    // Step 1: dispatch first candidate for each key so all writes are
+    // in-flight before we build retry chain.
+    std::vector<tl::expected<WriteTask, ErrorCode>> tasks;
+    tasks.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (batch_resp.error_codes[i] != ErrorCode::OK) {
+            tasks.push_back(tl::unexpected(batch_resp.error_codes[i]));
+            continue;
+        }
+        auto ops = BuildWriteOps(keys[i], batched_slices[i], route_config,
+                                 std::move(batch_resp.responses[i].candidates));
+        if (!ops) {
+            LOG(ERROR) << "fail to build write ops"
+                       << ", key=" << keys[i] << ", error=" << ops.error();
+            tasks.push_back(tl::unexpected(ops.error()));
+            continue;
+        }
+        std::string first_route(ops->front()->route());
+        std::unique_ptr<TaskHandle<void>> first_task;
+        try {
+            // start a async write task and generate a wait handle
+            first_task = ops->front()->Dispatch();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "First-candidate dispatch threw, key: " << keys[i]
+                       << ", route: " << first_route << ", what: " << e.what();
+            tasks.push_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+            continue;
+        } catch (...) {
+            LOG(ERROR) << "First-candidate dispatch threw unknown, key: "
+                       << keys[i] << ", route: " << first_route;
+            tasks.push_back(tl::unexpected(ErrorCode::INTERNAL_ERROR));
+            continue;
+        }
+        tasks.push_back(WriteTask{std::move(first_task),
+                                  std::move(first_route),
+                                  {std::make_move_iterator(ops->begin() + 1),
+                                   std::make_move_iterator(ops->end())}});
+    }
+
+    // Step 2: build a retry chain for each key and wrap it in task_handle
+    using Handle = tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>;
+    std::vector<Handle> handles;
+    handles.reserve(keys.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (!tasks[i]) {
+            handles.push_back(tl::unexpected(tasks[i].error()));
+            continue;
+        }
+        auto& task = *tasks[i];
+        auto promise = std::make_shared<
+            async_simple::Promise<tl::expected<void, ErrorCode>>>();
+        auto future = promise->getFuture();
+        RunWriteWithRetry(std::move(promise), std::move(task.first_task),
+                          std::move(task.first_route),
+                          std::move(task.retry_op_list), keys[i])
+            .start([](auto&&) {});
+        handles.push_back(FutureHandle<void>::Create(std::shared_ptr<void>{},
+                                                     std::move(future)));
+    }
+    return handles;
+}
+
+auto P2PClientService::BuildWriteOps(std::string_view key,
+                                     std::vector<Slice>& slices,
+                                     const WriteRouteRequestConfig& config,
+                                     std::vector<WriteCandidate> candidates)
+    -> tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode> {
+    if (candidates.empty()) {
+        LOG(ERROR) << "No write candidates for key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto write_req = std::make_shared<RemoteWriteRequest>();
+    write_req->key = key;
+    for (const auto& slice : slices) {
+        RemoteBufferDesc buf;
+        buf.segment_endpoint = get_te_endpoint();
+        buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
+        buf.size = slice.size;
+        write_req->src_buffers.push_back(buf);
+    }
+
+    std::vector<std::unique_ptr<WriteOp>> write_ops;
+    for (auto& candidate : candidates) {
+        auto& proxy = candidate.replica;
+        if (proxy.client_id == client_id_) {
+            // Defensive check: master should not return local candidates when
+            // allow_local=false, but if it does, just skip it.
+            if (!config.allow_local) {
+                LOG(WARNING) << "Master returned local candidate but "
+                                "allow_local=false, skipping";
+                continue;
+            } else if (!data_manager_.has_value()) {
+                LOG(ERROR) << "Data manager not initialized";
+                continue;
+            }
+            write_ops.push_back(
+                std::make_unique<LocalWriteOp>(&*data_manager_, key, &slices));
+        } else {
+            std::string endpoint =
+                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+            auto* peer = &GetOrCreatePeerClient(endpoint);
+            if (transfer_direction_mode_ == TransferDirectionMode::FORWARD) {
+                if (!data_manager_.has_value()) {
+                    LOG(ERROR) << "Data manager not initialized";
+                    continue;
+                }
+                DataManager* dm = &*data_manager_;
+                RemoteForwardWriteOp::TeTransferFn te_transfer =
+                    [dm](void* local_base, size_t size,
+                         const std::vector<RemoteBufferDesc>& dest_buffers)
+                    -> tl::expected<void, ErrorCode> {
+                    return dm->TransferData(local_base, size, dest_buffers,
+                                            Transport::TransferRequest::WRITE);
+                };
+                write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
+                    peer, write_req, endpoint, &slices,
+                    std::move(te_transfer)));
+            } else {
+                write_ops.push_back(std::make_unique<RemoteReverseWriteOp>(
+                    peer, write_req, std::move(proxy),
+                    route_cache_ ? &*route_cache_ : nullptr, endpoint));
+            }
+        }
+    }
+
+    if (write_ops.empty()) {
+        LOG(ERROR) << "No valid candidates for key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    return write_ops;
+}
+
+// TODO (TE mode blocking):
+// When local_transfer_mode == TE, data_manager->Put() returns a
+// CallableTaskHandle whose WaitAsync() falls back to the base class synchronous
+// Wait() — there is no true coroutine suspension point.
+// As a result, co_await current_task->WaitAsync() inside RunWriteWithRetry will
+// block the coroutine worker thread for the full duration of the TE transfer
+// instead of yielding it.
+// The retry chain can only advance after that blocking wait returns.
+// See the TODO in DataManager::PutViaTe for planned async improvements.
+std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
+    if (!data_manager) {
+        LOG(ERROR) << "Data manager not initialized";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    auto handle = data_manager->Put(key, *slices);
+    if (!handle) {
+        if (!IsAlreadyExistsError(handle.error())) {
+            LOG(ERROR) << "Local write failed (dispatch), key: " << key
+                       << ", error: " << handle.error();
+        }
+        return CallableTaskHandle<void>::Create(
+            [e = handle.error()]() -> tl::expected<void, ErrorCode> {
+                return tl::make_unexpected(e);
+            });
+    }
+    return std::move(handle.value());
+}
+
+std::unique_ptr<TaskHandle<void>>
+P2PClientService::RemoteForwardWriteOp::Dispatch() {
+    if (!peer_ptr || !te_transfer || !write_req || !slices) {
+        LOG(ERROR) << "Forward remote write missing peer, transfer callback, "
+                      "request, or slices";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    auto promise = std::make_shared<WritePromise>();
+    auto future = promise->getFuture();
+    RemoteForwardWriteOp::RunForwardRemotePut(std::move(promise), peer_ptr,
+                                              te_transfer, write_req, slices)
+        .start([](auto&&) {});
+    return FutureHandle<void>::Create(write_req, std::move(future));
+}
+
+std::unique_ptr<TaskHandle<void>>
+P2PClientService::RemoteReverseWriteOp::Dispatch() {
+    if (!peer_ptr || !write_req) {
+        LOG(ERROR) << "Reverse remote write missing peer or request";
+        return CallableTaskHandle<void>::Create(
+            []() -> tl::expected<void, ErrorCode> {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            });
+    }
+    auto promise = std::make_shared<
+        async_simple::Promise<tl::expected<void, ErrorCode>>>();
+    auto future = promise->getFuture();
+
+    auto req = write_req;
+    auto cached_proxy = proxy;
+    auto* cache = route_cache;
+
+    peer_ptr->AsyncWriteRemoteData(*write_req)
+        .start([promise, req, cached_proxy,
+                cache](async_simple::Try<tl::expected<UUID, ErrorCode>>&&
+                           remote_res) mutable {
+            tl::expected<void, ErrorCode> out;
+            try {
+                auto& result = remote_res.value();
+                if (result.has_value()) {
+                    if (cache) {
+                        P2PProxyDescriptor desc = cached_proxy;
+                        desc.segment_id = result.value();
+                        cache->Upsert(req->key, {desc});
+                    }
+                } else {
+                    if (!IsAlreadyExistsError(result.error())) {
+                        LOG(ERROR)
+                            << "Failed to write to remote, key: " << req->key
+                            << ", error: " << result.error();
+                    }
+                    out = tl::make_unexpected(result.error());
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Remote write threw, key: " << req->key
+                           << ", what: " << e.what();
+                out = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            } catch (...) {
+                LOG(ERROR) << "Remote write threw unknown, key: " << req->key;
+                out = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            promise->setValue(std::move(out));
+        });
+
+    return FutureHandle<void>::Create(req, std::move(future));
+}
+
+async_simple::coro::Lazy<void> P2PClientService::RunWriteWithRetry(
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise,
+    std::unique_ptr<TaskHandle<void>> current_task, std::string current_route,
+    std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string_view key) {
+    size_t retry_cnt = 0;
+    tl::expected<void, ErrorCode> result;
+    while (current_task) {
+        try {
+            result = co_await current_task->WaitAsync();
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Wait threw, key: " << key
+                       << ", route: " << current_route
+                       << ", what: " << e.what();
+            result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        } catch (...) {
+            LOG(ERROR) << "Wait threw unknown, key: " << key
+                       << ", route: " << current_route;
+            result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (result.has_value() || IsAlreadyExistsError(result.error())) {
+            promise->setValue(std::move(result));
+            co_return;
+        }
+        LOG(ERROR) << "Write candidate failed, key: " << key
+                   << ", route: " << current_route
+                   << ", retry_cnt: " << retry_cnt
+                   << ", error: " << result.error();
+        current_task.reset();
+        while (retry_cnt < retry_op_list.size() && !current_task) {
+            auto& op = retry_op_list[retry_cnt];
+            current_route = std::string(op->route());
+            try {
+                current_task = op->Dispatch();
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Dispatch threw, key: " << key
+                           << ", route: " << current_route
+                           << ", retry_cnt: " << retry_cnt
+                           << ", what: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Dispatch threw unknown, key: " << key
+                           << ", retry_cnt: " << retry_cnt
+                           << ", route: " << current_route;
+            }
+            retry_cnt++;
+        }
+    }
+    if (result.has_value()) {
+        result = tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    LOG(ERROR) << "write failed with all retry list"
+               << ", key:" << key << ", error: " << result.error();
+    promise->setValue(std::move(result));
 }
 
 // ============================================================================
 // Get Operations
 // ============================================================================
 
-tl::expected<std::pair<std::vector<Replica::Descriptor>, uint64_t>, ErrorCode>
-P2PClientService::QueryReplicaSize(const std::string& key,
-                                   const ReadRouteConfig& config) {
-    auto replica_result = master_client_.GetReplicaList(key, config);
-    if (!replica_result) {
-        return tl::unexpected(replica_result.error());
-    }
+tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
+    const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config) {
+    return std::move(BatchGet({key}, allocator, config)[0]);
+}
 
-    auto& replicas = replica_result.value().replicas;
-    if (replicas.empty()) {
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    uint64_t total_size = 0;
-    for (auto& replica : replicas) {
-        if (replica.is_p2p_proxy_replica()) {
-            total_size = calculate_total_size(replica);
-            break;
-        }
-    }
-    if (total_size == 0) {
-        LOG(ERROR) << "Cannot determine size for key: " << key;
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    return std::make_pair(std::move(replicas), total_size);
+tl::expected<int64_t, ErrorCode> P2PClientService::Get(
+    const std::string& key, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+    return std::move(BatchGet({key}, {buffers}, {sizes}, config)[0]);
 }
 
 std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
 P2PClientService::BatchGet(const std::vector<std::string>& keys,
                            std::shared_ptr<ClientBufferAllocator> allocator,
                            const ReadRouteConfig& config) {
-    std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>> results(
-        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
-
     if (!allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
-        for (auto& r : results) {
-            r = tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        return results;
+        return std::vector<
+            tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    // Process each key: try local first, then batch remote
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = Get(keys[i], allocator, config);
-    }
+    auto create_handles = [&] {
+        return BatchCreateGetHandles(keys, allocator, config);
+    };
+    auto extract_buf = [](ReadTaskHandle& h) { return h.read_buf; };
 
-    return results;
-}
-
-tl::expected<std::shared_ptr<BufferHandle>, ErrorCode> P2PClientService::Get(
-    const std::string& key, std::shared_ptr<ClientBufferAllocator> allocator,
-    const ReadRouteConfig& config) {
-    auto guard = AcquireInflightGuard();
-    if (!guard.is_valid()) {
-        LOG(ERROR) << "client is shutting down";
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
-    }
-
-    if (!allocator) {
-        LOG(ERROR) << "Client buffer allocator is not provided";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Try local first — avoids Query RPC on hit
-    if (data_manager_.has_value()) {
-        auto handle = data_manager_->Get(key);
-        if (handle) {
-            auto& loc = handle.value()->loc;
-            if (loc.data.buffer) {
-                size_t local_size = loc.data.buffer->size();
-
-                auto alloc_result = allocator->allocate(local_size);
-                if (!alloc_result) {
-                    LOG(ERROR) << "Failed to allocate buffer for local get, "
-                                  "key: "
-                               << key;
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-                }
-
-                auto buffer_handle = std::move(*alloc_result);
-                const char* src =
-                    reinterpret_cast<const char*>(loc.data.buffer->data());
-                std::memcpy(buffer_handle.ptr(), src, local_size);
-                return std::make_shared<BufferHandle>(std::move(buffer_handle));
-            }
-        }
-    }
-
-    // Step 1.5: Try RouteCache before querying Master
-    std::vector<P2PProxyDescriptor> cached_proxies;
-    if (route_cache_) {
-        auto cached = route_cache_->Get(key);
-        for (const auto& item : cached.items()) {
-            P2PProxyDescriptor proxy;
-            proxy.client_id = item.client_id;
-            proxy.segment_id = item.segment_id;
-            proxy.ip_address = item.ip_address;
-            proxy.rpc_port = item.rpc_port;
-            proxy.object_size = item.object_size;
-            cached_proxies.push_back(proxy);
-        }
-    }
-
-    std::optional<BufferHandle> buffer_handle;
-    if (!cached_proxies.empty()) {
-        uint64_t cached_size = cached_proxies[0].object_size;
-        auto alloc_result = allocator->allocate(cached_size);
-        if (alloc_result) {
-            buffer_handle = std::move(*alloc_result);
-            // Build slices and do remote get (1 key = 1 slice in P2P)
-            std::vector<Slice> slices = {{buffer_handle->ptr(), cached_size}};
-
-            if (GetRemoteViaRoute(key, slices, cached_proxies, true)) {
-                return std::make_shared<BufferHandle>(
-                    std::move(*buffer_handle));
-            }
-        }
-    }
-
-    // Local miss and Cache miss/fail — query Master for replicas and size
-    auto size_result = QueryReplicaSize(key, config);
-    if (!size_result) {
-        return tl::unexpected(size_result.error());
-    }
-    auto& [replicas, total_size] = size_result.value();
-
-    if (!buffer_handle || buffer_handle->size() != total_size) {
-        auto alloc_result = allocator->allocate(total_size);
-        if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate buffer for get, key: " << key;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        buffer_handle = std::move(*alloc_result);
-    }
-
-    // Build slices and do remote get (1 key = 1 slice in P2P)
-    std::vector<Slice> slices = {{buffer_handle->ptr(), total_size}};
-
-    std::vector<P2PProxyDescriptor> master_proxies;
-    for (const auto& replica : replicas) {
-        if (!replica.is_p2p_proxy_replica()) {
-            LOG(ERROR) << "Invalid replica type for key: " << key
-                       << ", replica: " << replica;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        } else {
-            master_proxies.push_back(replica.get_p2p_proxy_descriptor());
-        }
-    }
-
-    auto remote_result = GetRemoteViaRoute(key, slices, master_proxies, false);
-    if (!remote_result) {
-        LOG(ERROR) << "Failed to get remote data for key: " << key;
-        return tl::unexpected(remote_result.error());
-    }
-
-    return std::make_shared<BufferHandle>(std::move(*buffer_handle));
+    return BatchGetImpl<std::shared_ptr<BufferHandle>>(keys, create_handles,
+                                                       extract_buf);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
@@ -708,226 +1106,655 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
-    results.reserve(keys.size());
+    std::vector<std::vector<Slice>> all_slices(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results.push_back(Get(keys[i], all_buffers[i], all_sizes[i], config));
+        all_slices[i].reserve(all_buffers[i].size());
+        for (size_t j = 0; j < all_buffers[i].size(); ++j) {
+            all_slices[i].emplace_back(
+                Slice{all_buffers[i][j], all_sizes[i][j]});
+        }
     }
-    return results;
+
+    auto create_handles = [&] {
+        return BatchCreateGetHandles(keys, all_slices, config);
+    };
+    auto extract_size = [](ReadTaskHandle& h) { return h.data_size; };
+
+    return BatchGetImpl<int64_t>(keys, create_handles, extract_size);
 }
 
-tl::expected<int64_t, ErrorCode> P2PClientService::Get(
-    const std::string& key, const std::vector<void*>& buffers,
-    const std::vector<size_t>& sizes, const ReadRouteConfig& config) {
+template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
+std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
+    const std::vector<std::string>& keys, CreateHandlesFn&& create_handles,
+    ExtractFn&& extract) {
+    ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
+    timer.LogRequest("batch_size=", keys.size());
+
+    if (metrics_) {
+        metrics_->local_request.get_requests.inc(keys.size());
+    }
+
+    std::vector<tl::expected<ResultT, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
+
+    Stopwatch stopwatch;
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
-        return tl::unexpected(ErrorCode::SHUTTING_DOWN);
+        std::fill(results.begin(), results.end(),
+                  tl::unexpected(ErrorCode::SHUTTING_DOWN));
+    } else {
+        handles = create_handles();
+        if (handles.size() != keys.size()) {
+            LOG(ERROR) << "handles size mismatch";
+            std::fill(results.begin(), results.end(),
+                      tl::unexpected(ErrorCode::INTERNAL_ERROR));
+        } else {
+            for (size_t i = 0; i < handles.size(); ++i) {
+                if (!handles[i]) {
+                    if (handles[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                        LOG(ERROR)
+                            << "Failed to create get handle for key: "
+                            << keys[i] << ", error: " << handles[i].error();
+                    }
+                    results[i] = tl::unexpected(handles[i].error());
+                } else {
+                    auto wait_result = handles[i]->task_handle->Wait();
+                    if (!wait_result) {
+                        LOG(ERROR) << "Failed to get key: " << keys[i]
+                                   << ", error: " << wait_result.error();
+                        results[i] = tl::unexpected(wait_result.error());
+                    } else {
+                        results[i] = extract(handles[i].value());
+                    }
+                }
+            }  // end for
+        }
     }
 
-    // Attention:
-    // if Slice's size is larger than actual data size:
-    // 1. in local scene, the memcpy() could run normally
-    // 2. in remote scene, TE will return error code
-    // (currently, TE simplythinks the Slices's size is data size)
-    // Step 1: Try local first via GetLocal
-    if (data_manager_.has_value()) {
-        std::vector<Slice> local_slices;
-        for (size_t i = 0; i < buffers.size(); ++i) {
-            local_slices.emplace_back(Slice{buffers[i], sizes[i]});
+    size_t success_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i].has_value()) {
+            success_count++;
         }
-        auto local_result = GetLocal(key, local_slices);
-        if (local_result) {
-            return static_cast<int64_t>(local_result.value());
-        }
-        // GetLocal returns OBJECT_NOT_FOUND on miss — continue to remote;
-        // other errors are also non-fatal here, fall through to remote path.
     }
 
-    // Step 1.5: Try RouteCache before querying Master
-    std::vector<P2PProxyDescriptor> cached_proxies;
+    if (metrics_) {
+        const auto elapsed = stopwatch.elapsed_us();
+        const double avg_latency =
+            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                metrics_->local_request.get_bytes.inc(handles[i]->data_size);
+                metrics_->local_request.get_latency_success.observe(
+                    avg_latency);
+            } else {
+                metrics_->local_request.get_latency_failure.observe(
+                    avg_latency);
+            }
+        }
+        const size_t failure_count = keys.size() - success_count;
+        if (failure_count > 0) {
+            metrics_->local_request.get_failures.inc(failure_count);
+        }
+    }
+
+    timer.LogResponse("success=", success_count,
+                      " fail=", keys.size() - success_count);
+    return results;
+}
+
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandles(
+    const std::vector<std::string>& keys,
+    std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config) {
+    auto local_get = [&](std::string_view key,
+                         size_t) -> tl::expected<ReadTaskHandle, ErrorCode> {
+        if (!data_manager_.has_value()) {
+            LOG(ERROR) << "Data manager is not initialized";
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return data_manager_->Get(key, allocator);
+    };
+    auto remote_get = [&](std::string_view key, size_t,
+                          std::vector<ResolvedRoute> routes) {
+        return CreateRemoteGetHandle(key, allocator, config, std::move(routes));
+    };
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+}
+
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandles(
+    const std::vector<std::string>& keys,
+    std::vector<std::vector<Slice>>& all_slices,
+    const ReadRouteConfig& config) {
+    auto local_get = [&](std::string_view key,
+                         size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
+        if (!data_manager_.has_value()) {
+            LOG(ERROR) << "Data manager is not initialized";
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        return data_manager_->Get(key, all_slices[i]);
+    };
+    auto remote_get = [&](std::string_view key, size_t i,
+                          std::vector<ResolvedRoute> routes) {
+        return CreateRemoteGetHandle(key, all_slices[i], config,
+                                     std::move(routes));
+    };
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+}
+
+template <typename LocalGetFn, typename RemoteGetFn>
+std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
+P2PClientService::BatchCreateGetHandlesImpl(
+    const std::vector<std::string>& keys, const ReadRouteConfig& config,
+    LocalGetFn&& local_get, RemoteGetFn&& remote_get) {
+    std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
+    handles.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        handles.emplace_back(tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    }
+
+    // Phase A: try local for all keys; collect indices that need remote fetch.
+    std::vector<size_t> miss_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto local = local_get(keys[i], i);
+        if (local.has_value()) {
+            handles[i] = std::move(local.value());
+            // Count local cache hits
+            if (metrics_) {
+                metrics_->local_request.get_hits.inc();
+            }
+        } else if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to get from local, key: " << keys[i]
+                       << ", error: " << local.error();
+            handles[i] = tl::unexpected(local.error());
+        } else {
+            miss_indices.push_back(i);
+            // Count local cache misses
+            if (metrics_) {
+                metrics_->local_request.get_misses.inc();
+            }
+        }
+    }
+
+    if (miss_indices.empty() || (ha_manager_ && ha_manager_->IsDegraded())) {
+        // case 1: All keys are found locally
+        // case 2: DEGRADED: master is unreachable
+        return handles;
+    }
+
+    // Phase B: batch-fetch routes for local-miss keys
+    std::vector<std::string_view> miss_key_views;
+    miss_key_views.reserve(miss_indices.size());
+    for (size_t i : miss_indices) {
+        miss_key_views.emplace_back(keys[i]);
+    }
+    auto routes = BatchFetchReadRoutes(miss_key_views, config);
+
+    // Phase C: remote get for each miss
+    for (size_t j = 0; j < miss_indices.size(); ++j) {
+        const size_t i = miss_indices[j];
+        if (!routes[j]) {
+            handles[i] = tl::unexpected(routes[j].error());
+        } else {
+            handles[i] = remote_get(keys[i], i, std::move(routes[j].value()));
+        }
+    }
+    return handles;
+}
+
+std::vector<
+    tl::expected<std::vector<P2PClientService::ResolvedRoute>, ErrorCode>>
+P2PClientService::BatchFetchReadRoutes(
+    const std::vector<std::string_view>& keys, const ReadRouteConfig& config) {
+    std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>> result(
+        keys.size(), std::vector<ResolvedRoute>{});
+
+    // check route cache, collect misses
+    std::vector<std::string_view> miss_keys;
+    std::vector<size_t> miss_pos;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto cached = LoadCachedRoutes(keys[i]);
+        if (!cached.empty()) {
+            result[i] = std::move(cached);
+        } else {
+            miss_keys.push_back(keys[i]);
+            miss_pos.push_back(i);
+        }
+    }
+    if (miss_keys.empty()) {
+        // all keys are found in route cache
+        return result;
+    }
+
+    // Single batch RPC to master
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> responses;
+    responses = master_client_.BatchGetReplicaList(miss_keys, config);
+    for (size_t k = 0; k < responses.size(); ++k) {
+        if (!responses[k]) {
+            if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "BatchFetchReadRoutes failed: "
+                           << responses[k].error();
+            }
+            result[miss_pos[k]] = tl::unexpected(responses[k].error());
+            continue;
+        }
+        auto routes = ReplicasToRoutes(responses[k].value().replicas);
+        if (routes.empty()) {
+            LOG(ERROR) << "invalid route, key=" << miss_keys[k];
+            result[miss_pos[k]] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            continue;
+        }
+        if (route_cache_) {
+            std::vector<P2PProxyDescriptor> descriptors;
+            descriptors.reserve(routes.size());
+            for (const auto& r : routes) {
+                descriptors.push_back(r.proxy);
+            }
+            route_cache_->Upsert(miss_keys[k], std::move(descriptors));
+        }
+        result[miss_pos[k]] = std::move(routes);
+    }
+    return result;
+}
+
+std::vector<P2PClientService::ResolvedRoute> P2PClientService::LoadCachedRoutes(
+    std::string_view key) {
+    std::vector<ResolvedRoute> routes;
     if (route_cache_) {
-        auto cached = route_cache_->Get(key);
-        for (const auto& item : cached.items()) {
+        for (const auto& item : route_cache_->Get(key).items()) {
             P2PProxyDescriptor proxy;
             proxy.client_id = item.client_id;
             proxy.segment_id = item.segment_id;
             proxy.ip_address = item.ip_address;
             proxy.rpc_port = item.rpc_port;
             proxy.object_size = item.object_size;
-            cached_proxies.push_back(proxy);
+            std::string endpoint =
+                proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
+            auto& peer = GetOrCreatePeerClient(endpoint);
+            routes.push_back(
+                {&peer, proxy.object_size, /*is_cached=*/true, proxy});
         }
     }
+    return routes;
+}
 
-    if (!cached_proxies.empty()) {
-        uint64_t total_size = cached_proxies[0].object_size;
-        auto slices = BuildSlicesFromBuffers(buffers, sizes, total_size);
-        size_t provided_size = ClientService::CalculateSliceSize(slices);
-        if (provided_size >= total_size) {
-            if (GetRemoteViaRoute(key, slices, cached_proxies, true)) {
-                return static_cast<int64_t>(total_size);
-            }
-        }
+std::vector<P2PClientService::ResolvedRoute> P2PClientService::ReplicasToRoutes(
+    const std::vector<Replica::Descriptor>& replicas) {
+    std::vector<ResolvedRoute> routes;
+    if (replicas.empty()) {
+        LOG(WARNING) << "replicas is empty";
+        return routes;
     }
-
-    // Step 2: Local miss and cache miss — query Master for replicas and size
-    auto size_result = QueryReplicaSize(key, config);
-    if (!size_result) {
-        return tl::unexpected(size_result.error());
-    }
-    auto& [replicas, total_size] = size_result.value();
-
-    size_t provided_size = 0;
-    for (auto s : sizes) provided_size += s;
-    if (provided_size < total_size) {
-        LOG(ERROR) << "Buffer too small for key '" << key
-                   << "': required=" << total_size
-                   << ", provided=" << provided_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::vector<P2PProxyDescriptor> master_proxies;
+    uint64_t total_size = 0;
     for (const auto& replica : replicas) {
         if (!replica.is_p2p_proxy_replica()) {
-            LOG(ERROR) << "Invalid replica type for key: " << key
-                       << ", replica: " << replica;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        } else {
-            master_proxies.push_back(replica.get_p2p_proxy_descriptor());
+            LOG(ERROR) << "invalid replica, not p2p proxy replica";
+            return routes;
         }
     }
-
-    // Step 3: Build correctly-sized slices and remote get
-    auto slices = BuildSlicesFromBuffers(buffers, sizes, total_size);
-    auto remote_result = GetRemoteViaRoute(key, slices, master_proxies, false);
-    if (!remote_result) {
-        return tl::unexpected(remote_result.error());
+    total_size = calculate_total_size(replicas[0]);
+    if (total_size == 0) {
+        LOG(ERROR) << "invalid replica, total size is 0";
+        return routes;
     }
 
-    return static_cast<int64_t>(total_size);
-}
-
-tl::expected<size_t, ErrorCode> P2PClientService::GetLocal(
-    const std::string& key, std::vector<Slice>& slices) {
-    if (!data_manager_.has_value()) {
-        LOG(ERROR) << "DataManager not initialized";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    auto handle = data_manager_->Get(key);
-    if (!handle) {
-        VLOG(1) << "Local get miss for key: " << key;
-        return tl::unexpected(handle.error());
-    }
-
-    // Copy data from handle to slices
-    auto& loc = handle.value()->loc;
-    if (!loc.data.buffer) {
-        LOG(ERROR) << "Allocation handle has null buffer for key: " << key;
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    const char* src = reinterpret_cast<const char*>(loc.data.buffer->data());
-    size_t src_size = loc.data.buffer->size();
-
-    // Verify provided slices are large enough
-    size_t provided_size = ClientService::CalculateSliceSize(slices);
-    if (provided_size < src_size) {
-        LOG(ERROR) << "Buffer too small for local key '" << key
-                   << "': required=" << src_size
-                   << ", provided=" << provided_size;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    size_t offset = 0;
-    for (auto& slice : slices) {
-        size_t copy_size = std::min(slice.size, src_size - offset);
-        if (copy_size > 0) {
-            std::memcpy(slice.ptr, src + offset, copy_size);
-            offset += copy_size;
-        }
-        if (offset >= src_size) break;
-    }
-    return src_size;
-}
-
-tl::expected<void, ErrorCode> P2PClientService::GetRemoteViaRoute(
-    const std::string& key, std::vector<Slice>& slices,
-    const std::vector<P2PProxyDescriptor>& proxies, bool is_cached_proxies) {
-    if (proxies.empty()) {
-        LOG(ERROR) << "No proxies found for key: " << key;
-        return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    std::vector<P2PProxyDescriptor> failed_proxies;
-
-    auto recycle_failed = [&]() {
-        if (!failed_proxies.empty() && is_cached_proxies && route_cache_) {
-            route_cache_->RemoveReplica(key, failed_proxies);
-        }
-    };
-
-    for (size_t i = 0; i < proxies.size(); ++i) {
-        const auto& proxy = proxies[i];
-
-        // Check if locality (no need to use route cache)
-        if (proxy.client_id == client_id_) {
-            auto local_result = GetLocal(key, slices);
-            if (!local_result) {
-                LOG(WARNING)
-                    << "fail to get local via route"
-                    << ", key: " << key << ", error: " << local_result.error();
-                // Rectify stale local route
-                if (data_manager_.has_value()) {
-                    data_manager_->RectifyReadRoute(key, proxy.segment_id);
-                }
-                failed_proxies.push_back(proxy);
-                continue;  // get failed, attempt next replica
-            } else {
-                recycle_failed();
-                return {};
-            }
-        }
-
-        // Remote read
+    for (const auto& replica : replicas) {
+        auto proxy = replica.get_p2p_proxy_descriptor();
         std::string endpoint =
             proxy.ip_address + ":" + std::to_string(proxy.rpc_port);
-        try {
-            auto& peer = GetOrCreatePeerClient(endpoint);
-            RemoteReadRequest read_req;
-            read_req.key = key;
-            for (const auto& slice : slices) {
-                RemoteBufferDesc buf;
-                buf.segment_endpoint = get_te_endpoint();
-                buf.addr = reinterpret_cast<uintptr_t>(slice.ptr);
-                buf.size = slice.size;
-                read_req.dest_buffers.push_back(buf);
-            }
+        auto& peer = GetOrCreatePeerClient(endpoint);
+        routes.push_back({&peer, total_size, /*is_cached=*/false, proxy});
+    }
+    return routes;
+}
 
-            auto read_result = peer.ReadRemoteData(read_req);
-            if (!read_result) {
-                LOG(WARNING) << "Remote read from " << endpoint
-                             << " failed for key: " << key
-                             << " error: " << read_result.error();
-                failed_proxies.push_back(proxy);
-                continue;
-            } else {
-                if (!is_cached_proxies && route_cache_) {
-                    std::vector<P2PProxyDescriptor> remaining_proxies(
-                        proxies.begin() + i, proxies.end());
-                    route_cache_->Replace(key, remaining_proxies);
-                }
-                recycle_failed();
-                return {};
-            }
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Exception during remote read from " << endpoint
-                       << ": " << e.what();
-            failed_proxies.push_back(proxy);
-        }
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
+    std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    if (!iter) {
+        LOG(ERROR) << "Failed to build route iterator, key=" << key
+                   << ", error=" << iter.error();
+        return tl::unexpected(iter.error());
     }
 
-    recycle_failed();
-    return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    const uint64_t object_size = iter->object_size();
+    auto alloc_result = allocator->allocate(object_size);
+    if (!alloc_result) {
+        LOG(ERROR) << "Failed to allocate buffer for get, key: " << key;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    auto read_buf = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    std::vector<Slice> slices = {{read_buf->ptr(), object_size}};
+
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
+    if (!result) {
+        LOG(ERROR) << "Failed to get via route, key=" << key
+                   << ", error=" << result.error();
+        return tl::unexpected(result.error());
+    } else {
+        // the read_buf is allocated in this function,
+        // so we need to guarantee the lifetime of read_buf
+        result->read_buf = std::move(read_buf);
+    }
+    return result;
+}
+
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
+    std::string_view key, std::vector<Slice>& slices,
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    if (!iter) {
+        if (iter.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to build route iterator, key=" << key
+                       << ", error=" << iter.error();
+        }
+        return tl::unexpected(iter.error());
+    }
+    auto result = InnerGetViaRoute(key, slices, std::move(*iter));
+    if (!result) {
+        LOG(ERROR) << "Failed to get via route, key=" << key
+                   << ", error=" << result.error();
+        return tl::unexpected(result.error());
+    }
+    return result;
+}
+
+tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::InnerGetViaRoute(
+    std::string_view key, std::vector<Slice>& slices, RouteIterator iter) {
+    auto req = std::make_shared<RemoteReadRequest>();
+    req->key = key;
+    for (const auto& s : slices) {
+        RemoteBufferDesc buf;
+        buf.segment_endpoint = get_te_endpoint();
+        buf.addr = reinterpret_cast<uintptr_t>(s.ptr);
+        buf.size = s.size;
+        req->dest_buffers.push_back(buf);
+    }
+
+    auto promise = std::make_shared<
+        async_simple::Promise<tl::expected<void, ErrorCode>>>();
+    auto future = promise->getFuture();
+
+    const uint64_t object_size = iter.object_size();
+    RunReadWithRetry(std::move(iter), req, promise).start([](auto&&) {});
+
+    ReadTaskHandle res;
+    res.data_size = object_size;
+    res.task_handle =
+        FutureHandle<void>::Create(std::move(req), std::move(future));
+    return res;
+}
+
+async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
+    const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Forward transfer read requires DataManager";
+        co_return ErrorCode::INTERNAL_ERROR;
+    }
+    if (req->dest_buffers.size() != 1) {
+        LOG(ERROR)
+            << "Forward transfer read supports a single dest buffer only, key="
+            << req->key << ", buffer_count=" << req->dest_buffers.size();
+        co_return ErrorCode::NOT_IMPLEMENTED;
+    }
+    PinKeyRequest pin_req;
+    pin_req.key = req->key;
+    auto pin = co_await route.peer->AsyncPinKey(pin_req);
+    if (!pin) {
+        if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
+                       << ", error=" << pin.error();
+        }
+        co_return pin.error();
+    }
+    void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
+    const size_t total = req->dest_buffers[0].size;
+    auto tr =
+        data_manager_->TransferData(base, total, {pin.value().remote_buffer},
+                                    Transport::TransferRequest::READ);
+    if (!tr) {
+        LOG(ERROR) << "Forward TE read failed, key=" << req->key
+                   << ", error=" << tr.error();
+        UnPinKeyRequest cleanup;
+        cleanup.key = req->key;
+        cleanup.read_operation_id = pin.value().read_operation_id;
+        tl::expected<void, ErrorCode> cleanup_unpin;
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
+            if (cleanup_unpin) {
+                break;
+            }
+            if (cleanup_unpin.error() == ErrorCode::LEASE_EXPIRED) {
+                cleanup_unpin = tl::expected<void, ErrorCode>{};
+                break;
+            }
+            if (attempt + 1 < kRevokeRetryMaxCnt) {
+                LOG(WARNING)
+                    << "AsyncUnPinKey retry after TE failure, key=" << req->key
+                    << ", attempt=" << (attempt + 1)
+                    << ", error=" << cleanup_unpin.error();
+            }
+        }
+        if (!cleanup_unpin) {
+            LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
+                       << req->key << ", error=" << cleanup_unpin.error();
+        }
+        co_return tr.error();
+    }
+    // Success: skip UnPinKey to save RPC latency; owner lease / scanner
+    // releases pin.
+    tl::expected<void, ErrorCode> ok;
+    promise->setValue(std::move(ok));
+    co_return ErrorCode::OK;
+}
+
+// Coroutine iterates route candidates and retries on failure.
+async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
+    RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
+    std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
+        promise) {
+    ErrorCode final_result = ErrorCode::OBJECT_NOT_FOUND;
+    try {
+        while (auto route = co_await iter.AsyncNext()) {
+            try {
+                const bool forward_read =
+                    transfer_direction_mode_ == TransferDirectionMode::FORWARD;
+                ErrorCode route_result;
+                if (forward_read) {
+                    route_result =
+                        co_await RunForwardReadOnRoute(*route, req, promise);
+                } else {
+                    auto result =
+                        co_await route->peer->AsyncReadRemoteData(*req);
+                    route_result =
+                        result.has_value() ? ErrorCode::OK : result.error();
+                }
+
+                if (route_result == ErrorCode::OK) {
+                    if (!forward_read) {
+                        tl::expected<void, ErrorCode> ok;
+                        promise->setValue(std::move(ok));
+                    }
+                    co_return;
+                } else if (route_result != ErrorCode::OBJECT_NOT_FOUND) {
+                    LOG(ERROR)
+                        << (forward_read ? "Forward read failed, key: "
+                                         : "Failed to get from remote, key: ")
+                        << req->key << ", error: " << route_result
+                        << ", route: " << route->proxy.ip_address << ":"
+                        << route->proxy.rpc_port
+                        << ", client_id: " << route->proxy.client_id
+                        << ", segment_id: " << route->proxy.segment_id
+                        << ", is_cached: " << route->is_cached;
+                    // Request/local constraint errors; another route cannot
+                    // help.
+                    if (route_result == ErrorCode::INVALID_PARAMS ||
+                        route_result == ErrorCode::NOT_IMPLEMENTED) {
+                        promise->setValue(tl::expected<void, ErrorCode>(
+                            tl::unexpected(route_result)));
+                        co_return;
+                    }
+                }
+
+                final_result = route_result;
+            } catch (const std::exception& e) {
+                final_result = ErrorCode::INTERNAL_ERROR;
+                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                           << ", exception: " << e.what()
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
+            } catch (...) {
+                final_result = ErrorCode::INTERNAL_ERROR;
+                LOG(ERROR) << "Failed to get from remote, key: " << req->key
+                           << ", unknown exception"
+                           << ", route: " << route->proxy.ip_address << ":"
+                           << route->proxy.rpc_port
+                           << ", client_id: " << route->proxy.client_id
+                           << ", segment_id: " << route->proxy.segment_id
+                           << ", is_cached: " << route->is_cached;
+            }
+            iter.Evict(*route);
+        }
+        tl::expected<void, ErrorCode> err = tl::make_unexpected(final_result);
+        promise->setValue(std::move(err));
+    } catch (...) {
+        tl::expected<void, ErrorCode> internal_err =
+            tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        promise->setValue(std::move(internal_err));
+    }
+}
+
+// ============================================================================
+// P2PClientService::RouteIterator
+// ============================================================================
+
+P2PClientService::RouteIterator::RouteIterator(
+    std::string_view key, std::vector<ResolvedRoute> initial,
+    uint64_t object_size, RouteCache* route_cache, MasterFetch master_fetch)
+    : key_(key),
+      routes_(std::move(initial)),
+      object_size_(object_size),
+      route_cache_(route_cache),
+      master_fetch_(std::move(master_fetch)) {}
+
+void P2PClientService::RouteIterator::Prime() {
+    if (!routes_.empty() || master_queried_) {
+        return;
+    }
+    master_queried_ = true;
+    // syncAwait is safe here: Prime() is always called from the user thread,
+    // not an IO/RPC callback thread.
+    auto master_routes = async_simple::coro::syncAwait(master_fetch_());
+    if (master_routes.empty()) {
+        return;
+    }
+    UpsertToCache(master_routes);
+    routes_.insert(routes_.end(),
+                   std::make_move_iterator(master_routes.begin()),
+                   std::make_move_iterator(master_routes.end()));
+    if (!routes_.empty()) {
+        object_size_ = routes_.front().object_size;
+    }
+}
+
+auto P2PClientService::RouteIterator::AsyncNext()
+    -> async_simple::coro::Lazy<std::optional<ResolvedRoute>> {
+    if (idx_ < routes_.size()) {
+        co_return routes_[idx_++];
+    }
+    if (master_queried_) {
+        co_return std::nullopt;
+    }
+    master_queried_ = true;
+    auto master_routes = co_await master_fetch_();
+    if (master_routes.empty()) {
+        co_return std::nullopt;
+    }
+    UpsertToCache(master_routes);
+    routes_.insert(routes_.end(),
+                   std::make_move_iterator(master_routes.begin()),
+                   std::make_move_iterator(master_routes.end()));
+    if (object_size_ == 0) {
+        object_size_ = routes_[idx_].object_size;
+    }
+    if (idx_ < routes_.size()) {
+        co_return routes_[idx_++];
+    }
+    co_return std::nullopt;
+}
+
+void P2PClientService::RouteIterator::UpsertToCache(
+    const std::vector<ResolvedRoute>& routes) {
+    if (!route_cache_ || routes.empty()) {
+        return;
+    }
+    std::vector<P2PProxyDescriptor> ps;
+    ps.reserve(routes.size());
+    for (const auto& r : routes) {
+        ps.push_back(r.proxy);
+    }
+    route_cache_->Upsert(key_, ps);
+}
+
+void P2PClientService::RouteIterator::Evict(const ResolvedRoute& route) {
+    if (route.is_cached && route_cache_) {
+        route_cache_->RemoveReplica(key_, {route.proxy});
+    }
+}
+
+tl::expected<P2PClientService::RouteIterator, ErrorCode>
+P2PClientService::BuildRouteIter(std::string_view key,
+                                 const ReadRouteConfig& config) {
+    return BuildRouteIter(key, config, LoadCachedRoutes(key));
+}
+
+tl::expected<P2PClientService::RouteIterator, ErrorCode>
+P2PClientService::BuildRouteIter(std::string_view key,
+                                 const ReadRouteConfig& config,
+                                 std::vector<ResolvedRoute> pre_fetched) {
+    auto routes = std::move(pre_fetched);
+    uint64_t object_size = routes.empty() ? 0 : routes.front().object_size;
+    RouteIterator iter(key, std::move(routes), object_size,
+                       route_cache_ ? &(*route_cache_) : nullptr,
+                       [this, key, config]() {
+                           return AsyncResolveRoutesFromMaster(key, config);
+                       });
+    if (iter.empty()) {
+        iter.Prime();
+        if (iter.empty()) {
+            return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+    }
+    return iter;
+}
+
+async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
+P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
+                                               const ReadRouteConfig& config) {
+    auto replica_result =
+        co_await master_client_.AsyncGetReplicaList(key, config);
+    if (!replica_result) {
+        if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to query replica list, key=" << key
+                       << ", error=" << replica_result.error();
+        }
+        co_return std::vector<ResolvedRoute>{};
+    }
+    auto routes = ReplicasToRoutes(replica_result.value().replicas);
+    if (routes.empty()) {
+        LOG(ERROR) << "Cannot determine size for key: " << key;
+    }
+    co_return routes;
 }
 
 // ============================================================================
@@ -943,11 +1770,13 @@ tl::expected<bool, ErrorCode> P2PClientService::IsExist(
     }
 
     // Check local first
-    if (data_manager_.has_value()) {
-        auto handle = data_manager_->Get(key);
-        if (handle) {
-            return true;
-        }
+    if (data_manager_.has_value() && data_manager_->Exist(key)) {
+        return true;
+    }
+
+    // DEGRADED: skip Master fallback, return local-only result
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        return false;
     }
 
     // Fallback to master
@@ -965,22 +1794,17 @@ std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
 
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     std::vector<size_t> miss_indices;
-    std::vector<std::string> miss_keys;
+    std::vector<std::string_view> miss_keys;
 
     // Batch local check
     for (size_t i = 0; i < keys.size(); ++i) {
-        bool local_hit = false;
-        if (data_manager_.has_value()) {
-            auto handle = data_manager_->Get(keys[i]);
-            if (handle) {
-                local_hit = true;
-            }
-        }
+        const bool local_hit =
+            data_manager_.has_value() && data_manager_->Exist(keys[i]);
         if (local_hit) {
             results[i] = true;
         } else {
             miss_indices.push_back(i);
-            miss_keys.push_back(keys[i]);
+            miss_keys.emplace_back(keys[i]);
         }
     }
 
@@ -1006,9 +1830,19 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
+
+    // DEGRADED: return empty result (local-only, no Master query)
+    if (ha_manager_ && ha_manager_->IsDegraded()) {
+        LOG(WARNING) << "fail to access master"
+                     << ", key=" << object_key;
+        return tl::make_unexpected(ErrorCode::INACCESSIBLE_MASTER);
+    }
+
     // Query master for replica list
     auto result = master_client_.GetReplicaList(object_key, config);
     if (!result) {
+        LOG(WARNING) << "fail to get replica list"
+                     << ", key=" << object_key << ", error=" << result.error();
         return tl::unexpected(result.error());
     }
 
@@ -1029,7 +1863,9 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
         }
         return results;
     }
-    auto responses = master_client_.BatchGetReplicaList(object_keys, config);
+    std::vector<std::string_view> key_views(object_keys.begin(),
+                                            object_keys.end());
+    auto responses = master_client_.BatchGetReplicaList(key_views, config);
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>> results;
     results.reserve(responses.size());
     for (size_t i = 0; i < responses.size(); ++i) {
@@ -1052,7 +1888,8 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
 // The external active remove call is not allowed currently
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key) {
+tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key,
+                                                       bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1063,7 +1900,7 @@ tl::expected<void, ErrorCode> P2PClientService::Remove(const ObjectKey& key) {
 }
 
 tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
-    const ObjectKey& str) {
+    const ObjectKey& str, bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1073,7 +1910,7 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveByRegex(
     return {};  // return ok for ut
 }
 
-tl::expected<long, ErrorCode> P2PClientService::RemoveAll() {
+tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1087,8 +1924,8 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll() {
 // MountSegment / UnmountSegment (Not Supported)
 // ============================================================================
 
-tl::expected<void, ErrorCode> P2PClientService::MountSegment(const void* buffer,
-                                                             size_t size) {
+tl::expected<void, ErrorCode> P2PClientService::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1138,6 +1975,86 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 
     auto [inserted_it, _] = peer_clients_.emplace(endpoint, std::move(client));
     return *inserted_it->second;
+}
+
+async_simple::coro::Lazy<void>
+P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
+    std::shared_ptr<WritePromise> promise, PeerClient* peer,
+    TeTransferFn te_transfer, std::shared_ptr<RemoteWriteRequest> write_req,
+    std::vector<Slice>* slices) {
+    if (!peer || !te_transfer || !write_req || !slices) {
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::INTERNAL_ERROR)));
+        co_return;
+    }
+    if (slices->size() != 1) {
+        LOG(ERROR)
+            << "Forward transfer write supports a single slice only, key="
+            << write_req->key << ", slice_count=" << slices->size();
+        promise->setValue(tl::expected<void, ErrorCode>(
+            tl::unexpected(ErrorCode::NOT_IMPLEMENTED)));
+        co_return;
+    }
+    PreWriteRequest pre_req;
+    pre_req.key = write_req->key;
+    pre_req.size_bytes = slices->front().size;
+    pre_req.target_tier_id = write_req->target_tier_id;
+
+    auto pre = co_await peer->AsyncPreWrite(pre_req);
+    if (!pre) {
+        if (!IsAlreadyExistsError(pre.error())) {
+            LOG(ERROR) << "AsyncPreWrite failed, key=" << write_req->key
+                       << ", error=" << pre.error();
+        }
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(pre.error())));
+        co_return;
+    }
+
+    std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
+    void* base = slices->front().ptr;
+    auto te = te_transfer(base, slices->front().size, dest);
+    if (!te) {
+        LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
+                   << ", error=" << te.error();
+        WriteRevokeRequest revoke_req;
+        revoke_req.key = write_req->key;
+        revoke_req.write_operation_id = pre.value().write_operation_id;
+        tl::expected<void, ErrorCode> revoke_res;
+        for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
+            if (revoke_res) {
+                break;
+            }
+            if (revoke_res.error() == ErrorCode::LEASE_EXPIRED) {
+                revoke_res = tl::expected<void, ErrorCode>{};
+                break;
+            }
+            if (attempt + 1 < kRevokeRetryMaxCnt) {
+                LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
+                             << write_req->key << ", attempt=" << (attempt + 1)
+                             << ", error=" << revoke_res.error();
+            }
+        }
+        if (!revoke_res) {
+            LOG(ERROR) << "AsyncWriteRevoke failed after TE failure, key="
+                       << write_req->key << ", error=" << revoke_res.error();
+        }
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(te.error())));
+        co_return;
+    }
+
+    WriteCommitRequest commit;
+    commit.key = write_req->key;
+    commit.write_operation_id = pre.value().write_operation_id;
+    auto cm = co_await peer->AsyncWriteCommit(commit);
+    if (!cm) {
+        promise->setValue(
+            tl::expected<void, ErrorCode>(tl::unexpected(cm.error())));
+        co_return;
+    }
+    promise->setValue(tl::expected<void, ErrorCode>{});
 }
 
 }  // namespace mooncake
