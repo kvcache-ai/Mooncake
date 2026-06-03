@@ -741,6 +741,11 @@ mod tests {
         }
     }
 
+    fn build_compat_setup_args(args: CompatSetupArgs) -> Result<CompatBuildPlan> {
+        let _guard = env_test_lock().lock();
+        args.build()
+    }
+
     #[test]
     fn normalize_etcd_endpoint_adds_http_scheme() {
         assert_eq!(
@@ -1016,7 +1021,7 @@ mod tests {
 
     #[test]
     fn build_plan_defaults_storage_false_when_storage_bytes_is_zero() {
-        let plan = CompatSetupArgs {
+        let plan = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1041,8 +1046,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build()
+        })
         .expect("build plan should succeed");
         assert_eq!(
             plan.labels.get("storage").map(String::as_str),
@@ -1054,7 +1058,7 @@ mod tests {
 
     #[test]
     fn build_plan_rejects_storage_true_without_storage_bytes() {
-        let result = CompatSetupArgs {
+        let result = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1079,8 +1083,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build();
+        });
         let error = match result {
             Ok(_) => panic!("build plan should reject storage=true without storage bytes"),
             Err(error) => error,
@@ -1090,7 +1093,7 @@ mod tests {
 
     #[test]
     fn build_plan_rejects_route_topk_below_two() {
-        let result = CompatSetupArgs {
+        let result = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1115,8 +1118,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build();
+        });
         let error = match result {
             Ok(_) => panic!("build plan should reject route_topk < 2"),
             Err(error) => error,
@@ -1126,7 +1128,7 @@ mod tests {
 
     #[test]
     fn compat_setup_build_supports_etcd_metadata_and_defaults() {
-        let plan = CompatSetupArgs {
+        let plan = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "node-a".to_string(),
             transport_metadata_url: "redis://cache.local:6381/4".to_string(),
             metadata_url: "etcd://127.0.0.1:2379,https://etcd.example:32379".to_string(),
@@ -1151,8 +1153,7 @@ mod tests {
             use_hugepage: Some(true),
             hugepage_size_bytes: Some(2 * 1024 * 1024),
             timeouts: None,
-        }
-        .build()
+        })
         .expect("compat build plan should succeed");
 
         assert!(plan.stable_id.starts_with("py-store-"));
@@ -1183,7 +1184,7 @@ mod tests {
 
     #[test]
     fn compat_setup_can_build_classic_te_plan() {
-        let plan = CompatSetupArgs {
+        let plan = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "node-a:17112".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1208,8 +1209,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build()
+        })
         .expect("classic plan should build");
 
         assert_eq!(plan.transport_backend, TransportBackend::ClassicTe);
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn compat_setup_defaults_storage_label_to_false_for_rw_only_clients() {
-        let plan = CompatSetupArgs {
+        let plan = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "node-a".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1253,8 +1253,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build()
+        })
         .expect("rw-only plan should build");
 
         assert_eq!(plan.storage_bytes, 0);
@@ -1267,7 +1266,7 @@ mod tests {
 
     #[test]
     fn compat_setup_keeps_explicit_route_true_for_rw_only_clients() {
-        let plan = CompatSetupArgs {
+        let plan = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "node-a".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: "redis://127.0.0.1:6379/0".to_string(),
@@ -1292,8 +1291,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build()
+        })
         .expect("rw-only explicit-route plan should build");
 
         assert_eq!(
@@ -1334,7 +1332,7 @@ mod tests {
 
     #[test]
     fn compat_setup_rejects_missing_metadata_url() {
-        let result = CompatSetupArgs {
+        let result = build_compat_setup_args(CompatSetupArgs {
             local_hostname: "127.0.0.1".to_string(),
             transport_metadata_url: "P2PHANDSHAKE".to_string(),
             metadata_url: String::new(),
@@ -1359,8 +1357,7 @@ mod tests {
             use_hugepage: None,
             hugepage_size_bytes: None,
             timeouts: None,
-        }
-        .build();
+        });
         let error = match result {
             Ok(_) => panic!("missing metadata_url must fail"),
             Err(error) => error,
