@@ -1,18 +1,24 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#if !defined(__MUSA__)
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <ATen/musa/MUSAContext.h>
-#include <musa_bf16.h>
 #else
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
 #endif
-#include <cuda_alike.h>
-#include <torch/torch.h>
+#include <ATen/ATen.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+#else
+// MUSA device compilation: minimal includes to avoid mcc compiler crash
+#include <cstddef>
+#include <cstdint>
+#endif
+
+#include <cuda_alike.h>
 #include <transfer_engine.h>
 
 #include <memory>
@@ -39,10 +45,12 @@
 
 namespace mooncake {
 
+#if !defined(__MUSA__)
 #ifdef MOONCAKE_EP_USE_MUSA
 using GPUStream = at::musa::MUSAStream;
 #else
 using GPUStream = at::cuda::CUDAStream;
+#endif
 #endif
 
 static constexpr size_t kBufferSize = 1u << 24;
@@ -57,25 +65,32 @@ struct SegmentInfo {
 
 struct TransferGroupMeta {
     int rank;
-    int size;        // capacity: number of slots allocated (incl. inactive)
-    int activeSize;  // visible group size: number of ranks that participate
+    int size;
+    int activeSize;
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
+#if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
+#endif
     bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
+#if !defined(__MUSA__)
     c10::intrusive_ptr<::c10d::Store> store;
+#endif
     int bufferBaseIndex;
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };
 
-__global__ struct Task {
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+struct Task {
     volatile bool active = false;
-    c10d::OpType opType = c10d::OpType::UNKNOWN;
-    size_t tensorSize;  // In bytes
+    int opType = 0;  // c10d::OpType as int, for ABI compatibility with kernel code
+    size_t tensorSize;
     int64_t broadcastRoot;
     int bufferOffset;
     uint64_t submitSequence = 0;
@@ -83,6 +98,7 @@ __global__ struct Task {
     void* transferGroupMeta;
 };
 
+#if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
@@ -124,18 +140,6 @@ class MooncakeWorker {
 
     void Start();
 
-    /**
-     * @brief Waits for all active collective tasks for the given backend to
-     * complete.
-     *
-     * Used during graceful shutdown to ensure no pending collective operations
-     * are active before releasing resources. Blocks until all tasks complete
-     * or the timeout expires.
-     *
-     * @param meta The transfer group metadata identifying the backend.
-     * @return True if all tasks completed within the timeout; false if timed
-     * out.
-     */
     bool drainTasks(const TransferGroupMeta* meta) const;
 
     bool waitUntilTasksSubmitted(
@@ -148,7 +152,7 @@ class MooncakeWorker {
     static constexpr size_t kNumTasks_ = 4;
 
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
-    static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
+    static constexpr size_t kDrainTasksTimeoutMs = 5000;
 
     bool running_ = false;
     std::atomic<bool> started_{false};
@@ -169,7 +173,6 @@ class MooncakeWorker {
 class MooncakeWorkerManager {
    public:
     static MooncakeWorkerManager& GetInstance() {
-        // leaky singleton to avoid destructor fiasco problem
         static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
         return *manager;
     }
@@ -181,10 +184,9 @@ class MooncakeWorkerManager {
     std::shared_ptr<MooncakeWorker> GetWorker(int worker_id);
     static constexpr int CPUWorkerID = -1;
     std::mutex manager_mutex_;
-    // Keep workers alive for the entire process lifetime because their
-    // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
+#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 

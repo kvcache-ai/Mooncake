@@ -33,6 +33,7 @@ if use_musa:
                     "src/mooncake_backend.cpp",
                     "src/p2p_proxy.cpp",
                     "src/mooncake_worker.mu",
+                    "src/mooncake_worker_host.cpp",
                     "src/mooncake_worker_thread.cpp",
                     "src/connection_poller.cpp",
                 ],

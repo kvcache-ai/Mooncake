@@ -1,14 +1,17 @@
+// mooncake_worker_host.cpp — Host-side code for MUSA PG build.
+// Compiled by g++ (not mcc). Uses kernel launch wrappers from
+// mooncake_worker_kernels.cuh instead of <<<>>> syntax.
+//
+// This file is the MUSA equivalent of the host portions of mooncake_worker.cu.
+
 #include <mooncake_backend.h>
 #include <cstdio>
 #include <memory>
 #include <thread>
 #include <mooncake_worker.cuh>
-#if !defined(__MUSA__)
-#ifndef MOONCAKE_EP_USE_MUSA
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
-#endif
-
+#include <mooncake_worker_kernels.cuh>
 #include <mooncake_pg_gpu_utils.h>
+
 #include "pg_utils.h"
 
 namespace mooncake {
@@ -49,17 +52,8 @@ class MooncakeWorkCuda : public ::c10d::Work {
     bool isCompleted() override { return event_->query(); }
 
     bool wait(std::chrono::milliseconds timeout) override {
-        bool submitted = true;
-#ifdef MOONCAKE_EP_USE_MUSA
-        submitted =
+        bool submitted =
             worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
-#else
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
-            submitted =
-                worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
-        }
-#endif
         if (!submitted) return false;
 
         auto current_stream = getCurrentGPUStream();
@@ -79,17 +73,6 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
-#ifdef MOONCAKE_EP_USE_MUSA
-        // MUSA does not support CUDA Graph capture; always take the normal path.
-#else
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
-            auto current_stream = getCurrentGPUStream();
-            event_->block(current_stream);
-            return true;
-        }
-#endif
-
         if (timeout == kNoTimeout) {
             event_->synchronize();
             return true;
@@ -100,89 +83,6 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
         return waiter.wait_for(timeout, [this] { return event_->query(); });
     }
 };
-#endif  // !defined(__MUSA__)
-
-// Kernel functions — compiled by nvcc (CUDA build only)
-__global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
-                                  int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, void* meta,
-                                  Task* tasks, int numRanks,
-                                  const bool* activeRanks,
-                                  int* activeRanksTensor, size_t taskId) {
-    tasks[taskId].opType = (int)opType;
-    tasks[taskId].tensorSize = tensorSize;
-    tasks[taskId].broadcastRoot = broadcastRoot;
-    tasks[taskId].bufferOffset = bufferOffset;
-    tasks[taskId].submitSequence = submitSequence;
-    tasks[taskId].transferGroupMeta = meta;
-
-    __threadfence_system();
-    tasks[taskId].active = true;
-
-    while (tasks[taskId].active) {
-        __threadfence_system();
-    }
-    for (int i = 0; i < numRanks; ++i) {
-        activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
-    }
-}
-
-template <typename scalar_t>
-__global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
-                             size_t numElements, size_t numRanks,
-                             c10d::ReduceOp::RedOpType op, bool* activeRanks) {
-    size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
-    for (size_t elem_idx = thread_idx; elem_idx < numElements;
-         elem_idx += stride) {
-        bool valid = false;
-        scalar_t acc = 0;
-        for (size_t rank = 0; rank < numRanks; ++rank) {
-            if (activeRanks[rank]) {
-                if (!valid) {
-                    acc = src[rank * numElements + elem_idx];
-                    valid = true;
-                } else {
-                    switch (op) {
-                        case c10d::ReduceOp::SUM:
-                            acc += src[rank * numElements + elem_idx];
-                            break;
-                        case c10d::ReduceOp::MIN:
-                            acc = std::min(src[rank * numElements + elem_idx],
-                                           acc);
-                            break;
-                        case c10d::ReduceOp::MAX:
-                            acc = std::max(src[rank * numElements + elem_idx],
-                                           acc);
-                            break;
-                        case c10d::ReduceOp::PRODUCT:
-                            acc *= src[rank * numElements + elem_idx];
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
-        }
-        dst[elem_idx] = acc;
-    }
-}
-
-#if !defined(__MUSA__)
-namespace mooncake {
-
-namespace {
-
-template <typename scalar_t>
-void preload_reduce_kernel(const char* name) {
-    cudaFuncAttributes attr{};
-    auto err = cudaFuncGetAttributes(
-        &attr, reinterpret_cast<const void*>(reduceKernel<scalar_t>));
-    TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
-                cudaGetErrorString(err));
-}
-
-}  // namespace
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
@@ -192,47 +92,47 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
+    auto musa_stream = (musaStream_t)stream;
 
     switch (dst.scalar_type()) {
         case c10::kByte:
-            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*)ptr, (uint8_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
+            launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
+                                     numRanks, (int)op, activeRanks,
+                                     musa_stream);
             break;
         case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (int8_t*)ptr, (int8_t*)src, num, numRanks, op.op_, activeRanks);
+            launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
+                                    (int)op, activeRanks, musa_stream);
             break;
         case c10::kShort:
-            reduceKernel<<<64, 256, 0, stream>>>((int16_t*)ptr, (int16_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
+            launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
+                                     numRanks, (int)op, activeRanks,
+                                     musa_stream);
             break;
         case c10::kInt:
-            reduceKernel<<<64, 256, 0, stream>>>((int*)ptr, (int*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+            launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
+                                     (int)op, activeRanks, musa_stream);
             break;
         case c10::kLong:
-            reduceKernel<<<64, 256, 0, stream>>>((int64_t*)ptr, (int64_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
+            launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
+                                     numRanks, (int)op, activeRanks,
+                                     musa_stream);
             break;
         case c10::kFloat:
-            reduceKernel<<<64, 256, 0, stream>>>((float*)ptr, (float*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+            launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
+                                     (int)op, activeRanks, musa_stream);
             break;
         case c10::kDouble:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (double*)ptr, (double*)src, num, numRanks, op.op_, activeRanks);
+            launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
+                                      (int)op, activeRanks, musa_stream);
             break;
         case c10::kBool:
-            reduceKernel<<<64, 256, 0, stream>>>((bool*)ptr, (bool*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+            launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
+                                    (int)op, activeRanks, musa_stream);
             break;
         case c10::kBFloat16:
-            reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)ptr,
-                                                 (at::BFloat16*)src, num,
-                                                 numRanks, op.op_, activeRanks);
+            launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
+                                    activeRanks, musa_stream);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -321,17 +221,8 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 }
 
 void preloadReduceKernels() {
-#ifndef MOONCAKE_EP_USE_MUSA
-    preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
-    preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
-    preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
-    preload_reduce_kernel<int>("reduceKernel<int>");
-    preload_reduce_kernel<int64_t>("reduceKernel<int64_t>");
-    preload_reduce_kernel<float>("reduceKernel<float>");
-    preload_reduce_kernel<double>("reduceKernel<double>");
-    preload_reduce_kernel<bool>("reduceKernel<bool>");
-    preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
-#endif
+    // MUSA: preloading not supported (mcc has no cudaFuncGetAttributes).
+    // Kernels are JIT-compiled on first use.
 }
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
@@ -342,7 +233,7 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
         cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
         cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
     } else {
-        LOG(WARNING) << "No CUDA device found. Only the `mooncake-cpu` backend "
+        LOG(WARNING) << "No MUSA device found. Only the `mooncake-cpu` backend "
                         "can be used.";
         tasks_ = new Task[kNumTasks_];
     }
@@ -458,7 +349,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
-        size_t realSize = min(tensorSize, pos + chunkSize) - pos;
+        size_t realSize = std::min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
         int bufferOffset = meta->taskCount % 2;
         const uint64_t taskSequence =
@@ -470,10 +361,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
-        enqueueTaskKernel<<<1, 1, 0, enq_stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, taskSequence,
+        launchEnqueueTaskKernel(
+            (int)opType, realSize, broadcastRoot, bufferOffset, taskSequence,
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
-            meta->activeRanksTensor.data_ptr<int>(), taskId);
+            meta->activeRanksTensor.data_ptr<int>(), taskId,
+            enq_stream.stream());
         bufferToTensor(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
             pos, realSize, enq_stream);
@@ -494,4 +386,3 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
 }
 
 }  // namespace mooncake
-#endif  // !defined(__MUSA__)
