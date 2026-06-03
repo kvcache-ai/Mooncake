@@ -5272,20 +5272,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 DiscardExpiredProcessingReplicas(shard, now);
 
                 size_t shard_metadata_count = 0;
+                size_t shard_evictable_count = 0;
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
-                }
-                local_object_count[t] += shard_metadata_count;
-                long eviction_base =
-                    shard_metadata_count - shard->disk_object_count;
-                if (eviction_base <= 0) continue;
-
-                for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end(); ++it) {
                         if (it->second.IsHardPinned()) continue;
-                        if (!it->second.IsLeaseExpired(now) ||
-                            !can_evict_replicas(it->second))
+                        bool has_evictable = can_evict_replicas(it->second);
+                        if (has_evictable) shard_evictable_count++;
+                        if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
                             local_candidates[t].push_back(
@@ -5297,7 +5292,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                     }
                 }
-                local_eviction_base[t] += eviction_base;
+                local_object_count[t] += shard_metadata_count;
+                local_eviction_base[t] += shard_evictable_count;
             }
         });
     }
@@ -5348,9 +5344,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (total_eviction_base == 0) {
         need_mem_eviction_ = false;
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
-                << " disk_object_count=" << (object_count - total_eviction_base)
-                << " eviction_base=0 shards=0/" << kNumShards
-                << " (no evictable memory objects)";
+                << " eviction_base=0 (no evictable memory objects)";
         return;
     }
 
@@ -5528,13 +5522,16 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0 ||
-        offload_deferred_count > 0) {
+    if (evicted_count > 0 || released_discarded_cnt > 0) {
         need_mem_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
         MasterMetricManager::instance().inc_mem_eviction_success(
             evicted_count, total_freed_size);
+    } else if (offload_deferred_count > 0) {
+        need_mem_eviction_ = false;
+        MasterMetricManager::instance().inc_eviction_success(0, 0);
+        MasterMetricManager::instance().inc_mem_eviction_success(0, 0);
     } else {
         if (total_eviction_base == 0) {
             need_mem_eviction_ = false;
