@@ -141,7 +141,7 @@ We will soon release the new vLLM integration based on Mooncake Store, which sup
 **_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllm-integration-v0.2.html)) that is based on vLLM's main branch._**
 
 #### Performance
-By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, Mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
+By supporting Topology-Aware Path Selection and multi-card bandwidth aggregation, the mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
 In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy.
 
 | Backend/Setting                                         | Output Token Throughput (tok/s) | Total Token Throughput (tok/s) | Mean TTFT (ms) | Median TTFT (ms) | P99 TTFT (ms)|
