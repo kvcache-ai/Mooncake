@@ -549,6 +549,39 @@ TEST_F(P2PClientIntegrationTest, RemoveAllLocalIdempotent) {
 }
 
 // ============================================================================
+// RemoveLocal (single-key)
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, RemoveLocalAfterPut) {
+    const std::string key = "p2p_remove_local_after_put";
+    const std::string data = "to_be_removed";
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put.has_value())
+        << "Put failed: " << static_cast<int>(put.error());
+
+    auto removed = client_->RemoveLocal(key);
+    ASSERT_TRUE(removed.has_value())
+        << "RemoveLocal failed: " << static_cast<int>(removed.error());
+
+    std::vector<char> buf(data.size(), 0);
+    auto get = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_FALSE(get.has_value())
+        << "Get unexpectedly succeeded after RemoveLocal";
+    EXPECT_EQ(get.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveLocalNonExistent) {
+    const std::string key = "p2p_remove_local_never_put_xyz";
+    auto removed = client_->RemoveLocal(key);
+    ASSERT_FALSE(removed.has_value())
+        << "RemoveLocal unexpectedly succeeded for non-existent key";
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+// ============================================================================
 // Remove / RemoveAll / RemoveByRegex should return NOT_IMPLEMENTED
 // ============================================================================
 
