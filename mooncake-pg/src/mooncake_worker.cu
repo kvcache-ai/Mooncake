@@ -3,11 +3,35 @@
 #include <memory>
 #include <thread>
 #include <mooncake_worker.cuh>
+#ifndef MOONCAKE_EP_USE_MUSA
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
+#endif
 
 #include "pg_utils.h"
 
 namespace mooncake {
+
+#ifdef MOONCAKE_EP_USE_MUSA
+static inline GPUStream getCurrentGPUStream(int device_index = -1) {
+    return at::musa::getCurrentMUSAStream(device_index);
+}
+static inline GPUStream getGPUStreamFromPool(bool non_blocking = false,
+                                             int device_index = -1) {
+    return at::musa::getStreamFromPool(non_blocking, device_index);
+}
+static inline constexpr auto kGPUDevice = c10::DeviceType::PrivateUse1;
+static inline constexpr auto kGPUDeviceType = at::musa::kMUSA;
+#else
+static inline GPUStream getCurrentGPUStream(int device_index = -1) {
+    return at::cuda::getCurrentCUDAStream(device_index);
+}
+static inline GPUStream getGPUStreamFromPool(bool non_blocking = false,
+                                             int device_index = -1) {
+    return at::cuda::getStreamFromPool(non_blocking, device_index);
+}
+static inline constexpr auto kGPUDevice = torch::kCUDA;
+static inline constexpr auto kGPUDeviceType = c10::DeviceType::CUDA;
+#endif
 
 class MooncakeWorkCpu : public ::c10d::Work {
    public:
@@ -88,6 +112,12 @@ class MooncakeWorkCuda : public ::c10d::Work {
         // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
         // uniform behavior to avoid invasive changes to TE/TENT.
         bool submitted = true;
+#ifdef MOONCAKE_EP_USE_MUSA
+        // MUSA does not support CUDA Graph capture; always take the normal
+        // (blocking) path.
+        submitted =
+            worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
+#else
         if (at::cuda::currentStreamCaptureStatus() ==
             c10::cuda::CaptureStatus::None) {
             // Normal execution: block until tasks are submitted.
@@ -105,6 +135,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
             // are not ordered with the graph execution. This may trigger the
             // same deadlock described above.
         }
+#endif
         if (!submitted) return false;
 
         // Once all tasks have been submitted, use the event to synchronize
@@ -117,7 +148,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
         //    until the operation is completed. In the case of CUDA collectives,
         //    will block the currently active CUDA stream until the operation
         //    is completed (but will not block the CPU)."
-        auto current_stream = at::cuda::getCurrentCUDAStream();
+        auto current_stream = getCurrentGPUStream();
         event_->block(current_stream);
         return true;
     }
@@ -136,15 +167,20 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     bool wait(std::chrono::milliseconds timeout) override {
         // Skip host-side synchronization during CUDA graph capture.
         // cudaEventSynchronize is not permitted while a stream is capturing.
+#ifdef MOONCAKE_EP_USE_MUSA
+        // MUSA does not support CUDA Graph capture; always take the normal
+        // path.
+#else
         if (at::cuda::currentStreamCaptureStatus() !=
             c10::cuda::CaptureStatus::None) {
             // We still need stream-level synchronization so that subsequent
             // operations on the capture stream are ordered after the barrier
             // task on the enqueue stream.
-            auto current_stream = at::cuda::getCurrentCUDAStream();
+            auto current_stream = getCurrentGPUStream();
             event_->block(current_stream);
             return true;
         }
+#endif
 
         if (timeout == kNoTimeout) {
             event_->synchronize();
@@ -216,7 +252,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                             acc *= src[rank * numElements + elem_idx];
                             break;
                         default:
-                            // never
+                            break; // never
                     }
                 }
             }
@@ -375,6 +411,7 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 }
 
 void preloadReduceKernels() {
+#ifndef MOONCAKE_EP_USE_MUSA
     preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
     preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
     preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
@@ -384,6 +421,7 @@ void preloadReduceKernels() {
     preload_reduce_kernel<double>("reduceKernel<double>");
     preload_reduce_kernel<bool>("reduceKernel<bool>");
     preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
+#endif
 }
 
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
@@ -492,11 +530,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& issue_stream,
+    const GPUStream& issue_stream,
     const std::function<void(void* dst, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& tensorToBuffer,
+                             const GPUStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& bufferToTensor) {
+                             const GPUStream&)>& bufferToTensor) {
     connection_ctx->waitUntilNewRanksConnected();
 
     // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
@@ -507,11 +545,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     //   The incoming `issue_stream` may be the Null Stream, which enforces
     //   implicit synchronization semantics. Launching a spin-wait kernel
     //   (enqueueTaskKernel) on such a stream can introduce potential deadlock.
-    at::cuda::CUDAStream enq_stream =
-        at::cuda::getStreamFromPool(false, issue_stream.device_index());
+    GPUStream enq_stream =
+        getGPUStreamFromPool(false, issue_stream.device_index());
 
     // Synchronize: enq_stream waits for issue_stream
-    auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
+    auto event_start = std::make_shared<torch::Event>(kGPUDevice);
     event_start->record(issue_stream);
     event_start->block(enq_stream);
 
@@ -542,7 +580,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         ++meta->taskCount;
     }
 
-    auto event_end = std::make_shared<torch::Event>(torch::kCUDA);
+    auto event_end = std::make_shared<torch::Event>(kGPUDevice);
     event_end->record(enq_stream);
 
     if (opType == c10d::OpType::BARRIER) {

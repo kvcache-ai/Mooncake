@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <glog/logging.h>

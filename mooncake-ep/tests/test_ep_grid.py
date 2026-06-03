@@ -12,9 +12,8 @@ import traceback
 from mooncake.mooncake_ep_buffer import Buffer
 try:
     import mooncake.pg as pg
-    _HAS_PG = True
 except (ModuleNotFoundError, ImportError):
-    _HAS_PG = False
+    pg = None
 
 _USE_MUSA = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 if _USE_MUSA:
@@ -96,15 +95,16 @@ def run_test_iteration(
     expected_out = x * sum_weights
     expected_out = expected_out.to(torch.bfloat16)
 
-    # Initialize the buffer.  This triggers IBGDA initialization which
-    # must complete BEFORE torch.set_default_device("musa") on MUSA.
+    # Initialize the buffer.
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         max_tokens, hidden, num_ranks, num_experts
     )
-    buf = Buffer(group, num_ep_buffer_bytes)
+    buf = Buffer(group, num_ep_buffer_bytes, cpu_group=cpu_group)
 
-    # Safe to set default device now — IBGDA init is done.
-    torch.set_default_device(_DEVICE)
+    # Avoid changing torch_musa's process-wide default device; all tensors in
+    # this test already pass device explicitly.
+    if not _USE_MUSA:
+        torch.set_default_device(_DEVICE)
 
     if use_fallback:
         buf._use_fallback = True
@@ -208,18 +208,9 @@ def run_test_iteration(
 def worker(rank, world_size, config_dict):
     _set_device(rank)
     torch.set_default_dtype(torch.bfloat16)
-    # NOTE: On MUSA, torch.set_default_device("musa") must be called
-    # AFTER IBGDA initialization (inside Buffer()).  Setting it before
-    # corrupts the MUSA runtime's float32 fill path, causing all
-    # subsequent torch.float32 zeros/ones operations to fail with
-    # "illegal memory access".  We set it after Buffer creation below.
 
-    if _USE_MUSA or not _HAS_PG:
-        backend = "gloo"
-        cpu_backend = "gloo"
-    else:
-        backend = "mooncake"
-        cpu_backend = "mooncake-cpu"
+    backend = "mooncake"
+    cpu_backend = "mooncake-cpu"
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     group = dist.group.WORLD
@@ -237,12 +228,10 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    # torch_musa registers the musa device globally; gloo doesn't have a musa
-    # backend, so destroy_process_group raises.  Ignore the error on MUSA.
     try:
         dist.destroy_process_group()
-    except RuntimeError:
-        if not _USE_MUSA:
+    except RuntimeError as e:
+        if not _USE_MUSA or "No backend type associated with device type musa" not in str(e):
             raise
 
 
