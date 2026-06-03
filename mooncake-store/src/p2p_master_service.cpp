@@ -19,8 +19,8 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
 
 auto P2PMasterService::CollectReplicaOwnerClients(
     const ObjectMetadata& metadata, std::string_view key)
-    -> tl::expected<std::set<UUID>, ErrorCode> {
-    std::set<UUID> owner_clients;
+    -> tl::expected<std::unordered_set<UUID, boost::hash<UUID>>, ErrorCode> {
+    std::unordered_set<UUID, boost::hash<UUID>> owner_clients;
     for (const auto& replica : metadata.replicas_) {
         if (!replica.is_p2p_proxy_replica()) {
             LOG(ERROR) << "unexpected replica type" << ", key: " << key
@@ -115,7 +115,7 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     // Pre-filter candidate clients when the key already reached owner limit.
     // it might happen that concurrent write for same key.
     // for this case, we will finally check it when add route replica.
-    std::set<UUID> owner_clients;
+    std::unordered_set<UUID, boost::hash<UUID>> owner_clients;
     bool filter_to_owner_clients = false;
     if (!req.key.empty() && max_replicas_per_key_ > 0) {
         MetadataAccessorRO accessor(this, req.key);

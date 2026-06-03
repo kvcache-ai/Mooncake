@@ -1,6 +1,6 @@
 #pragma once
 
-#include <set>
+#include <unordered_set>
 
 #include "master_service.h"
 #include "p2p_client_manager.h"
@@ -94,7 +94,7 @@ class P2PMasterService : public MasterService {
    private:
     static auto CollectReplicaOwnerClients(const ObjectMetadata& metadata,
                                            std::string_view key)
-        -> tl::expected<std::set<UUID>, ErrorCode>;
+        -> tl::expected<std::unordered_set<UUID, boost::hash<UUID>>, ErrorCode>;
 
     tl::expected<void, ErrorCode> InnerAddReplica(
         MetadataShard& shard, std::string_view key, const UUID& client_id,
