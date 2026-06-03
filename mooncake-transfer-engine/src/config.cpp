@@ -17,8 +17,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <dirent.h>
 #include <sstream>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace mooncake {
@@ -270,7 +270,8 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (opendir(log_dir_path) == NULL) {
+        struct stat st;
+        if (stat(log_dir_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";
