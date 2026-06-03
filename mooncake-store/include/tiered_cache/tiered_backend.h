@@ -233,6 +233,12 @@ class TieredBackend {
         std::string_view key, std::optional<UUID> tier_id = std::nullopt,
         bool notify_master = true);
 
+    /**
+     * @brief Remove ALL keys (and all replicas) from the local tiered storage.
+     * @return Number of distinct keys removed, or ErrorCode on shutdown.
+     */
+    tl::expected<long, ErrorCode> RemoveAll();
+
     // --- Composite Operations ---
 
     tl::expected<void, ErrorCode> CopyData(

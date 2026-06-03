@@ -177,6 +177,12 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<long, ErrorCode> RemoveAll(bool force = false) override;
 
+    /**
+     * @brief Removes all objects from THIS client's local tiered storage
+     * @return Number of removed objects, or ErrorCode on failure.
+     */
+    tl::expected<long, ErrorCode> RemoveAllLocal() override;
+
     MasterClient& GetMasterClient() override { return master_client_; }
 
     ClientMetric* GetMetrics() override { return metrics_.get(); }

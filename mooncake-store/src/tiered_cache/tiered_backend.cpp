@@ -822,6 +822,68 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     return tl::expected<void, ErrorCode>{};
 }
 
+tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
+    if (is_shutting_down_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "TieredBackend is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+
+    long total_removed = 0;
+
+    for (size_t s = 0; s < metadata_shard_count_; ++s) {
+        auto& shard = *metadata_shards_[s];
+
+        std::unordered_map<std::string, std::shared_ptr<MetadataEntry>,
+                           StringHash, std::equal_to<>>
+            drained;
+        {
+            std::unique_lock<std::shared_mutex> shard_write_lock(shard.mutex);
+            if (shard.index.empty()) continue;
+            drained.swap(shard.index);
+        }
+
+        for (auto& [key, entry] : drained) {
+            // Drain replicas under the entry lock; they live in the local
+            // `replicas` vector and are destructed when this iteration ends.
+            std::vector<std::pair<UUID, AllocationHandle>> replicas;
+            {
+                std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+                replicas.swap(entry->replicas);
+                entry->version++;
+            }
+
+            // Notify master per (key, segment_id) via DELETE callback.
+            // Failures are logged only; do not abort local cleanup.
+            if (remove_replica_callback_) {
+                for (const auto& [tier_id, handle] : replicas) {
+                    UUID segment_id = tier_id;
+                    if (handle && handle->loc.tier) {
+                        segment_id = handle->loc.tier->GetTierId();
+                    }
+                    auto result =
+                        remove_replica_callback_(key, segment_id, DELETE);
+                    if (!result.has_value()) {
+                        LOG(WARNING)
+                            << "RemoveAll: notify master failed"
+                            << ", key=" << key << ", segment_id=" << segment_id
+                            << ", error_code=" << result.error();
+                    }
+                }
+            }
+
+            if (scheduler_) {
+                scheduler_->OnDelete(key, std::nullopt);
+            }
+
+            ++total_removed;
+            // `replicas` destructs here -> AllocationHandle ref_count drops
+        }
+        // `drained` destructs here, releasing MetadataEntry shared_ptrs.
+    }
+
+    return total_removed;
+}
+
 tl::expected<void, ErrorCode> TieredBackend::CopyData(
     std::string_view key, const DataSource& source, UUID dest_tier_id,
     std::optional<uint64_t> expected_version, bool record_access) {

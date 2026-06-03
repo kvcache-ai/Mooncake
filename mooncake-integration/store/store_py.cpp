@@ -1421,6 +1421,15 @@ PYBIND11_MODULE(store, m) {
             py::arg("force") = false,
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
+        .def(
+            "remove_all_local",
+            [](MooncakeStorePyWrapper& self) {
+                py::gil_scoped_release release;
+                return self.store_->removeAllLocal();
+            },
+            "Remove all objects from THIS client's local tiered storage. Only "
+            "supported in P2P deployment mode; returns NOT_IMPLEMENTED "
+            "otherwise.")
         .def("is_exist",
              [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;

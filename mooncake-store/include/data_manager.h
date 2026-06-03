@@ -167,6 +167,12 @@ class DataManager {
         bool notify_master = true);
 
     /**
+     * @brief Remove ALL local objects (delegates to TieredBackend::RemoveAll).
+     * @return Number of distinct keys removed, or ErrorCode on failure.
+     */
+    tl::expected<long, ErrorCode> RemoveAll();
+
+    /**
      * @brief Get tier views from underlying tiered storage
      */
     std::vector<TierView> GetTierViews() const;

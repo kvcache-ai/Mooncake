@@ -528,6 +528,11 @@ long DummyClient::removeAll(bool force) {
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
+long DummyClient::removeAllLocal() {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeAllLocal_internal, int64_t>());
+}
+
 int DummyClient::isExist(const std::string& key) {
     auto result = invoke_rpc<&RealClient::isExist_internal, bool>(key);
 
