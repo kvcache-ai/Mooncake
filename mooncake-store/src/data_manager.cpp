@@ -1856,6 +1856,28 @@ bool DataManager::Exist(std::string_view key,
     return tiered_backend_->Exist(key, tier_id);
 }
 
+tl::expected<long, ErrorCode> DataManager::RemoveAll() {
+    ScopedVLogTimer timer(1, "DataManager::RemoveAll");
+
+    if (!tiered_backend_) {
+        LOG(ERROR) << "RemoveAll: tiered_backend_ is null";
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = tiered_backend_->RemoveAll();
+    if (!result.has_value()) {
+        LOG(ERROR) << "tiered_backend_->RemoveAll failed"
+                   << ", error_code=" << result.error();
+        timer.LogResponse("error_code=", result.error());
+        return tl::make_unexpected(result.error());
+    }
+
+    timer.LogResponse("error_code=", ErrorCode::OK,
+                      "removed_keys=", result.value());
+    return result.value();
+}
+
 void DataManager::ForEachKeyBatch(
     const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
     if (tiered_backend_) {

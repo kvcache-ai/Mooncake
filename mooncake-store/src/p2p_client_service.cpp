@@ -1920,6 +1920,27 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll(bool force) {
     return {};  // return ok for ut
 }
 
+tl::expected<long, ErrorCode> P2PClientService::RemoveAllLocal() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = data_manager_->RemoveAll();
+    if (!result.has_value()) {
+        LOG(ERROR) << "fail to call RemoveAll"
+                   << ", error_code=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    LOG(INFO) << "RemoveAllLocal: removed " << result.value() << " local keys";
+    return result.value();
+}
+
 // ============================================================================
 // MountSegment / UnmountSegment (Not Supported)
 // ============================================================================

@@ -248,6 +248,8 @@ class RealClient : public PyClient {
 
     long removeAll(bool force = false) override;
 
+    long removeAllLocal() override;
+
     int tearDownAll() override;
 
     /**
@@ -424,6 +426,8 @@ class RealClient : public PyClient {
                                                          bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
+
+    tl::expected<int64_t, ErrorCode> removeAllLocal_internal();
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 

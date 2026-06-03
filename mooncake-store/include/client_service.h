@@ -230,6 +230,14 @@ class ClientService {
     virtual tl::expected<long, ErrorCode> RemoveAll(bool force = false) = 0;
 
     /**
+     * @brief Removes all objects from this Client's LOCAL tiered storage.
+     * @return Number of removed objects, or ErrorCode on failure.
+     */
+    virtual tl::expected<long, ErrorCode> RemoveAllLocal() {
+        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+    }
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
