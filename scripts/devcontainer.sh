@@ -21,6 +21,7 @@ CONTAINER_WORKDIR="${MOONCAKE_DEV_WORKDIR:-/workspaces/Mooncake}"
 DOCKERFILE_PATH="${MOONCAKE_DEV_DOCKERFILE:-${REPO_ROOT}/.devcontainer/Dockerfile}"
 BUILD_CONTEXT="${MOONCAKE_DEV_BUILD_CONTEXT:-${REPO_ROOT}}"
 HOST_NETWORK="${MOONCAKE_DEV_HOST_NETWORK:-0}"
+HOME_CONFIG_MOUNTS="${MOONCAKE_DEV_HOME_CONFIG_MOUNTS:-1}"
 
 usage() {
     cat <<EOF
@@ -43,6 +44,8 @@ Environment overrides:
   MOONCAKE_DEV_WORKSPACE     Host repo path to mount (default: ${WORKSPACE_MOUNT})
   MOONCAKE_DEV_WORKDIR       Container workspace path (default: ${CONTAINER_WORKDIR})
   MOONCAKE_DEV_HOST_NETWORK  Set to 1 to add --network=host
+  MOONCAKE_DEV_HOME_CONFIG_MOUNTS
+                              Set to 0 to skip read-only Git/SSH config mounts
 
 Examples:
   ./scripts/devcontainer.sh up
@@ -108,10 +111,23 @@ run_container() {
         --cap-add=NET_ADMIN
         --security-opt seccomp=unconfined
         -v "${WORKSPACE_MOUNT}:${CONTAINER_WORKDIR}"
-        -v "${HOME}:${HOME}"
         -w "${CONTAINER_WORKDIR}"
         -e "SRCDIR=${CONTAINER_WORKDIR}"
     )
+
+    if [[ "${HOME_CONFIG_MOUNTS}" == "1" ]]; then
+        local mount_spec
+        for mount_spec in \
+            ".gitconfig:/root/.gitconfig" \
+            ".ssh:/root/.ssh" \
+            ".config/git:/root/.config/git"; do
+            local host_path="${HOME}/${mount_spec%%:*}"
+            local container_path="${mount_spec#*:}"
+            if [[ -e "${host_path}" ]]; then
+                cmd+=(-v "${host_path}:${container_path}:ro")
+            fi
+        done
+    fi
 
     if [[ -n "${PLATFORM}" ]]; then
         cmd+=(--platform "${PLATFORM}")
