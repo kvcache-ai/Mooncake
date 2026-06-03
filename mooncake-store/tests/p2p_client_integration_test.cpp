@@ -457,6 +457,98 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
 }
 
 // ============================================================================
+// RemoveAllLocal
+// ============================================================================
+
+TEST_F(P2PClientIntegrationTest, RemoveAllLocalEmpty) {
+    // Establish a clean baseline first.
+    auto baseline = client_->RemoveAllLocal();
+    ASSERT_TRUE(baseline.has_value()) << "Baseline RemoveAllLocal failed: "
+                                      << static_cast<int>(baseline.error());
+
+    // On a clean local cache, RemoveAllLocal should succeed and return 0.
+    auto result = client_->RemoveAllLocal();
+    ASSERT_TRUE(result.has_value())
+        << "RemoveAllLocal failed: " << static_cast<int>(result.error());
+    EXPECT_EQ(result.value(), 0);
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveAllLocalRemovesPutKeys) {
+    // Clean baseline.
+    auto baseline = client_->RemoveAllLocal();
+    ASSERT_TRUE(baseline.has_value()) << "Baseline RemoveAllLocal failed: "
+                                      << static_cast<int>(baseline.error());
+
+    const int kNumKeys = 3;
+    std::vector<std::string> keys;
+    std::vector<std::string> payloads;
+    keys.reserve(kNumKeys);
+    payloads.reserve(kNumKeys);
+    for (int i = 0; i < kNumKeys; ++i) {
+        keys.push_back("p2p_remove_all_local_basic_" + std::to_string(i));
+        payloads.push_back("payload_basic_" + std::to_string(i));
+    }
+
+    // Put several keys to populate local tiered cache.
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::vector<Slice> slices;
+        slices.emplace_back(
+            Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()});
+        auto put = client_->Put(keys[i], slices, WriteRouteRequestConfig{});
+        ASSERT_TRUE(put.has_value()) << "Put failed for " << keys[i] << ": "
+                                     << static_cast<int>(put.error());
+    }
+
+    // RemoveAllLocal should remove at least the kNumKeys we just put.
+    auto removed = client_->RemoveAllLocal();
+    ASSERT_TRUE(removed.has_value())
+        << "RemoveAllLocal failed: " << static_cast<int>(removed.error());
+    EXPECT_EQ(removed.value(), static_cast<long>(kNumKeys));
+
+    // After RemoveAllLocal, local Get for each key must return
+    // OBJECT_NOT_FOUND, confirming local tiered cache has been cleared.
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::vector<char> buf(payloads[i].size(), 0);
+        auto get = client_->Get(keys[i], {(void*)buf.data()}, {buf.size()});
+        ASSERT_FALSE(get.has_value())
+            << "Get unexpectedly succeeded after RemoveAllLocal for "
+            << keys[i];
+        EXPECT_EQ(get.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+}
+
+TEST_F(P2PClientIntegrationTest, RemoveAllLocalIdempotent) {
+    // Clean baseline.
+    auto baseline = client_->RemoveAllLocal();
+    ASSERT_TRUE(baseline.has_value()) << "Baseline RemoveAllLocal failed: "
+                                      << static_cast<int>(baseline.error());
+
+    const int kNumKeys = 4;
+    for (int i = 0; i < kNumKeys; ++i) {
+        std::string key = "p2p_remove_all_local_idem_" + std::to_string(i);
+        std::string data = "idem_payload_" + std::to_string(i);
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+        auto put = client_->Put(key, slices, WriteRouteRequestConfig{});
+        ASSERT_TRUE(put.has_value()) << "Put failed for " << key << ": "
+                                     << static_cast<int>(put.error());
+    }
+
+    // First call should report N > 0 keys removed.
+    auto first = client_->RemoveAllLocal();
+    ASSERT_TRUE(first.has_value())
+        << "First RemoveAllLocal failed: " << static_cast<int>(first.error());
+    EXPECT_EQ(first.value(), 4);
+
+    // Second consecutive call should succeed and report 0 (idempotent path,
+    // also exercises the empty-collection branch).
+    auto second = client_->RemoveAllLocal();
+    ASSERT_TRUE(second.has_value())
+        << "Second RemoveAllLocal failed: " << static_cast<int>(second.error());
+    EXPECT_EQ(second.value(), 0);
+}
+
+// ============================================================================
 // Remove / RemoveAll / RemoveByRegex should return NOT_IMPLEMENTED
 // ============================================================================
 
