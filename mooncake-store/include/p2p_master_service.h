@@ -1,5 +1,7 @@
 #pragma once
 
+#include <set>
+
 #include "master_service.h"
 #include "p2p_client_manager.h"
 #include "p2p_rpc_types.h"
@@ -72,11 +74,15 @@ class P2PMasterService : public MasterService {
     void OnReplicaAdded(const Replica& replica) override;
 
    private:
+    static auto CollectReplicaOwnerClients(const ObjectMetadata& metadata,
+                                           const std::string& key)
+        -> tl::expected<std::set<UUID>, ErrorCode>;
+
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
-    // for the number of replicas of a key:
+    // for the number of clients owning a key:
     // 1. max_replicas_per_key_ == 0 means no limitation
-    // 2. max_replicas_per_key_ > 0 means the max replica number of a key
+    // 2. max_replicas_per_key_ > 0 means the max client owner count
     uint64_t max_replicas_per_key_;
 };
 
