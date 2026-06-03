@@ -36,9 +36,16 @@ target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest gtest_main
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
 # This test verifies endpoint re-establishment in RDMATransport.
-# Intended for manual testing only.
 add_executable(rdma_endpoint_reestablish_test ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
 target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine gtest gtest_main )
+if (UNIX AND NOT APPLE)
+    target_link_options(rdma_endpoint_reestablish_test PRIVATE
+        "-Wl,--wrap=ibv_modify_qp"
+        "-Wl,--wrap=ibv_query_gid"
+        "-Wl,--wrap=_ibv_query_gid_ex")
+endif()
+add_test(NAME rdma_endpoint_reestablish_test COMMAND rdma_endpoint_reestablish_test)
+set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")
 
 if (USE_CXL)
     add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
@@ -97,6 +104,18 @@ endif()
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
+
+add_executable(config_test ${WORKSPACE}/config_test.cpp)
+target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME config_test COMMAND config_test)
+
+add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
+target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME rdma_gid_probe_test COMMAND rdma_gid_probe_test)
+
+add_executable(rdma_context_reprobe_test ${WORKSPACE}/rdma_context_reprobe_test.cpp)
+target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
