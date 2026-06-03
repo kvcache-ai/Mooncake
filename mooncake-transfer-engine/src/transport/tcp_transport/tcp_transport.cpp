@@ -278,9 +278,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << "ClientSession::writeHeader failed. Error: "
                         << ec.message() << " (value: " << ec.value() << ")"
                         << ", bytes written: " << len;
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    session_mutex_.unlock();
-                    if (on_complete_) on_complete_();
+                    asio::post(
+                        socket_->get_executor(),
+                        [this, self, on_finalize = std::move(on_finalize_),
+                         on_complete = std::move(on_complete_)]() {
+                            if (on_finalize)
+                                on_finalize(TransferStatusEnum::FAILED);
+                            session_mutex_.unlock();
+                            if (on_complete) on_complete();
+                        });
                     return;
                 }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
@@ -298,9 +304,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(kDefaultBufferSize, size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            if (on_complete_) on_complete_();
+            asio::post(socket_->get_executor(),
+                       [this, self, on_finalize = std::move(on_finalize_),
+                        on_complete = std::move(on_complete_)]() {
+                           if (on_finalize)
+                               on_finalize(TransferStatusEnum::COMPLETED);
+                           session_mutex_.unlock();
+                           if (on_complete) on_complete();
+                       });
             return;
         }
 
@@ -328,14 +339,22 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    if (on_complete_) on_complete_();
+                    // Post entire cleanup to ensure it runs after callback
+                    // returns
+                    asio::post(socket_->get_executor(),
+                               [this, self, dram_buffer, is_cuda_memory,
+                                on_finalize = std::move(on_finalize_),
+                                on_complete = std::move(on_complete_)]() {
+                                   if (on_finalize)
+                                       on_finalize(TransferStatusEnum::FAILED);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                    if (is_cuda_memory) delete[] dram_buffer;
+                                   if (is_cuda_memory) delete[] dram_buffer;
 #endif
-                    session_mutex_.unlock();
+                                   session_mutex_.unlock();
+                                   if (on_complete) on_complete();
+                               });
                     return;
                 }
 
@@ -351,11 +370,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        if (on_finalize_)
-                            on_finalize_(TransferStatusEnum::FAILED);
-                        if (on_complete_) on_complete_();
-                        delete[] dram_buffer;
-                        session_mutex_.unlock();
+                        // Post entire cleanup to ensure it runs after callback
+                        // returns
+                        asio::post(
+                            socket_->get_executor(),
+                            [this, self, dram_buffer,
+                             on_finalize = std::move(on_finalize_),
+                             on_complete = std::move(on_complete_)]() {
+                                if (on_finalize)
+                                    on_finalize(TransferStatusEnum::FAILED);
+                                delete[] dram_buffer;
+                                session_mutex_.unlock();
+                                if (on_complete) on_complete();
+                            });
                         return;
                     }
                     delete[] dram_buffer;
@@ -374,9 +401,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(kDefaultBufferSize, size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            if (on_complete_) on_complete_();
+            // Post cleanup to ensure it runs after callback returns
+            asio::post(socket_->get_executor(),
+                       [this, self, on_finalize = std::move(on_finalize_),
+                        on_complete = std::move(on_complete_)]() {
+                           if (on_finalize)
+                               on_finalize(TransferStatusEnum::COMPLETED);
+                           session_mutex_.unlock();
+                           if (on_complete) on_complete();
+                       });
             return;
         }
 
@@ -394,10 +427,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                if (on_complete_) on_complete_();
-                session_mutex_.unlock();
-                delete[] dram_buffer;
+                // Post entire cleanup to ensure it runs after callback returns
+                asio::post(socket_->get_executor(),
+                           [this, self, dram_buffer,
+                            on_finalize = std::move(on_finalize_),
+                            on_complete = std::move(on_complete_)]() {
+                               if (on_finalize)
+                                   on_finalize(TransferStatusEnum::FAILED);
+                               delete[] dram_buffer;
+                               session_mutex_.unlock();
+                               if (on_complete) on_complete();
+                           });
                 return;
             }
         }
@@ -421,9 +461,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    if (on_complete_) on_complete_();
-                    session_mutex_.unlock();
+                    // Post entire cleanup to ensure it runs after callback
+                    // returns
+                    asio::post(
+                        socket_->get_executor(),
+                        [this, self, on_finalize = std::move(on_finalize_),
+                         on_complete = std::move(on_complete_)]() {
+                            if (on_finalize)
+                                on_finalize(TransferStatusEnum::FAILED);
+                            session_mutex_.unlock();
+                            if (on_complete) on_complete();
+                        });
                     return;
                 }
                 total_transferred_bytes_ += transferred_bytes;
