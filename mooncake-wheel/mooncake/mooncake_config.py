@@ -53,17 +53,17 @@ from typing import Optional
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
-_SIZE_SUFFIXES = {
-    "kb": 1024,
-    "k": 1024,
-    "mb": 1024 ** 2,
-    "m": 1024 ** 2,
-    "gb": 1024 ** 3,
-    "g": 1024 ** 3,
-    "tb": 1024 ** 4,
-    "t": 1024 ** 4,
-    "b": 1,
-}
+_SIZE_SUFFIXES = [
+    ("kb", 1024),
+    ("mb", 1024 ** 2),
+    ("gb", 1024 ** 3),
+    ("tb", 1024 ** 4),
+    ("k", 1024),
+    ("m", 1024 ** 2),
+    ("g", 1024 ** 3),
+    ("t", 1024 ** 4),
+    ("b", 1),
+]
 
 def _parse_segment_size(value) -> int:
     if isinstance(value, (int, float)):
@@ -72,9 +72,7 @@ def _parse_segment_size(value) -> int:
         s = value.strip().lower()
         if not s:
             raise ValueError("Invalid segment size: empty string")
-        for suffix, multiplier in sorted(
-            _SIZE_SUFFIXES.items(), key=lambda x: -len(x[0])
-        ):
+        for suffix, multiplier in _SIZE_SUFFIXES:
             if s.endswith(suffix):
                 num = s[: -len(suffix)].strip()
                 if not num:
