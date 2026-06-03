@@ -52,8 +52,11 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
  */
 class MasterClient {
    public:
-    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)
-        : client_id_(client_id), metrics_(metrics) {
+    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
+                 std::string tenant_id = "default")
+        : client_id_(client_id),
+          tenant_id_(NormalizeTenantId(std::move(tenant_id))),
+          metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
 
@@ -72,6 +75,8 @@ class MasterClient {
                 pool_conf);
     }
     ~MasterClient();
+
+    const std::string& tenant_id() const { return tenant_id_; }
 
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
@@ -143,6 +148,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaList(const std::string& object_key, const std::string& tenant_id);
 
     /**
      * @brief Retrieves replica lists for object keys that match a regex
@@ -164,6 +171,9 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys,
+                        const std::string& tenant_id);
 
     /**
      * @brief Starts a put operation
@@ -403,8 +413,7 @@ class MasterClient {
      * @param enable_offloading Indicates whether persistence is enabled for
      * this segment.
      */
-    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
-                               ErrorCode>
+    [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
@@ -420,15 +429,17 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
-     * client. Returns key->size pairs the caller should read from local
+     * client. Returns tenant-scoped tasks the caller should read from local
      * SSD and stage as MEMORY replicas via PromotionAllocStart +
      * NotifyPromotionSuccess.
      */
-    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
-                               ErrorCode>
+    [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
     /**
@@ -440,6 +451,10 @@ class MasterClient {
     PromotionAllocStart(const UUID& client_id, const std::string& key,
                         uint64_t size,
                         const std::vector<std::string>& preferred_segments);
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const UUID& client_id, const std::string& key,
+                        const std::string& tenant_id, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
 
     /**
      * @brief Release master-side promotion task state after a client-side
@@ -448,6 +463,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
@@ -455,6 +473,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     /**
      * @brief Start a copy operation
@@ -467,6 +488,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const std::string& key, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
 
     /**
      * @brief End a copy operation
@@ -474,6 +499,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Revoke a copy operation
@@ -482,6 +509,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Start a move operation
@@ -494,6 +523,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const std::string& key, const std::string& src_segment,
         const std::string& tgt_segment);
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& src_segment, const std::string& tgt_segment);
 
     /**
      * @brief End a move operation
@@ -501,6 +533,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Revoke a move operation
@@ -509,6 +543,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
         const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Create a task to copy an object's replica to target segments
@@ -519,6 +555,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a task to move an object's replica from source segment to
@@ -532,6 +571,9 @@ class MasterClient {
     [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
         const std::string& key, const std::string& source,
         const std::string& target);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::string& target);
 
     /**
      * @brief Query a task by task id
@@ -567,6 +609,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
         const std::string& key, ReplicaType replica_type);
+    [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type);
 
     /**
      * @brief Batch notify master that disk replicas were evicted locally.
@@ -577,6 +622,10 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
+                          ReplicaType replica_type);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplica(const std::vector<std::string>& keys,
+                          const std::string& tenant_id,
                           ReplicaType replica_type);
 
    private:
@@ -634,6 +683,9 @@ class MasterClient {
 
     // The client identification.
     const UUID client_id_;
+
+    // Tenant identity for this client instance.
+    const std::string tenant_id_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;

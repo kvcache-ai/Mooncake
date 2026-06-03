@@ -272,11 +272,13 @@ FinalizeDecision DetermineFinalizeDecision(
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
-               const std::map<std::string, std::string>& labels)
+               const std::map<std::string, std::string>& labels,
+               const std::string& tenant_id)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr),
+                     metrics_ ? &metrics_->master_client_metric : nullptr,
+                     tenant_id),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
@@ -784,6 +786,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ub") {
+            auto deviceName = device_names.value_or("bonding_dev_0");
+            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
+            auto devices = splitString(deviceName, ',', true);
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
+            transport = transfer_engine_->installTransport("ub", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ub transport with specified "
+                              "devices";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -815,9 +834,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels) {
-    auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, protocol, labels));
+    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    auto client = std::shared_ptr<Client>(new Client(
+        local_hostname, metadata_connstring, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -995,9 +1014,14 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
+    return BatchQuery(object_keys, master_client_.tenant_id());
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys);
+    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -2511,10 +2535,11 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveAll();
-    // }
-    return master_client_.RemoveAll(force);
+    auto result = master_client_.RemoveAll(force);
+    if (result && storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
@@ -2527,9 +2552,21 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     return master_client_.EvictDiskReplica(key, replica_type);
 }
 
+tl::expected<void, ErrorCode> Client::EvictDiskReplica(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type) {
+    return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
     return master_client_.BatchEvictDiskReplica(keys, replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    ReplicaType replica_type) {
+    return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
 }
 
 std::vector<int> Client::GetNicNumaNodes() const {
@@ -2855,8 +2892,7 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
 }
 
 tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
-    bool enable_offloading,
-    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    bool enable_offloading, std::vector<OffloadTaskItem>& offloading_objects) {
     auto response =
         master_client_.OffloadObjectHeartbeat(client_id_, enable_offloading);
     if (!response) {
@@ -2908,8 +2944,14 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
-    std::unordered_map<std::string, int64_t>& promotion_objects) {
+    std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);
     if (!response) {
         return tl::make_unexpected(response.error());
@@ -2926,14 +2968,32 @@ Client::PromotionAllocStart(
                                               preferred_segments);
 }
 
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStart(
+    const std::string& key, const std::string& tenant_id, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStart(client_id_, key, tenant_id, size,
+                                              preferred_segments);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     const std::string& key) {
     return master_client_.NotifyPromotionSuccess(client_id_, key);
 }
 
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key, const std::string& tenant_id) {
+    return master_client_.NotifyPromotionSuccess(client_id_, key, tenant_id);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key) {
     return master_client_.NotifyPromotionFailure(client_id_, key);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key, const std::string& tenant_id) {
+    return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
@@ -2946,10 +3006,22 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     return master_client_.CreateCopyTask(key, targets);
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
+    const std::string& key, const std::string& tenant_id,
+    const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, tenant_id, targets);
+}
+
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::string& target) {
+    return master_client_.CreateMoveTask(key, tenant_id, source, target);
 }
 
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
@@ -3012,11 +3084,18 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
+    return Copy(key, master_client_.tenant_id(), source, targets);
+}
+
+tl::expected<void, ErrorCode> Client::Copy(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::vector<std::string>& targets) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
-    auto start_result = master_client_.CopyStart(key, source, targets);
+    auto start_result =
+        master_client_.CopyStart(key, tenant_id, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -3030,7 +3109,7 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
                   << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key);
+        auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -3041,9 +3120,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key); },
-        [&]() { return master_client_.CopyRevoke(key); }, response.source,
-        response.targets);
+        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
+        [&]() { return master_client_.CopyRevoke(key, tenant_id); },
+        response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -3056,12 +3135,20 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
+    return Move(key, master_client_.tenant_id(), source, target);
+}
+
+tl::expected<void, ErrorCode> Client::Move(const std::string& key,
+                                           const std::string& tenant_id,
+                                           const std::string& source,
+                                           const std::string& target) {
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
-    auto move_start_result = master_client_.MoveStart(key, source, target);
+    auto move_start_result =
+        master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
         LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
@@ -3075,7 +3162,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
                   << ", info=target_replica_already_exists";
         // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key);
+        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
@@ -3088,9 +3175,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key); },
-        [&]() { return master_client_.MoveRevoke(key); }, response.source,
-        targets);
+        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
+        [&]() { return master_client_.MoveRevoke(key, tenant_id); },
+        response.source, targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -3363,8 +3450,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result =
-                    Copy(payload.key, payload.source, payload.targets);
+                auto copy_result = Copy(payload.key, payload.tenant_id,
+                                        payload.source, payload.targets);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -3375,8 +3462,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result =
-                    Move(payload.key, payload.source, payload.target);
+                auto move_result = Move(payload.key, payload.tenant_id,
+                                        payload.source, payload.target);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

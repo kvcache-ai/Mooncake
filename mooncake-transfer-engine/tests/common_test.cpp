@@ -112,6 +112,27 @@ TEST(ParseHostNameWithPort, HostWithoutPort) {
     EXPECT_EQ(port, kDefaultPort);
 }
 
+TEST(HostPortHelpers, DetectsExplicitPort) {
+    EXPECT_TRUE(hasExplicitPort("8.8.8.8:4321"));
+    EXPECT_TRUE(hasExplicitPort("example.com:4321"));
+    EXPECT_TRUE(hasExplicitPort("[2001:db8::1]:4321"));
+    EXPECT_FALSE(hasExplicitPort("2001:db8::1"));
+    EXPECT_FALSE(hasExplicitPort("[2001:db8::1]"));
+}
+
+TEST(HostPortHelpers, ExtractsHostWithoutPort) {
+    EXPECT_EQ(getHostNameWithoutPort("8.8.8.8:4321"), "8.8.8.8");
+    EXPECT_EQ(getHostNameWithoutPort("example.com:4321"), "example.com");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]:4321"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("2001:db8::1"), "2001:db8::1");
+}
+
+TEST(HostPortHelpers, BuildsBracketedIpv6Endpoint) {
+    EXPECT_EQ(buildHostNameWithPort("2001:db8::1", 4321), "[2001:db8::1]:4321");
+    EXPECT_EQ(buildHostNameWithPort("8.8.8.8", 4321), "8.8.8.8:4321");
+}
+
 //------------------------------------------------------------------------------
 // parsePortAndDevice
 //------------------------------------------------------------------------------

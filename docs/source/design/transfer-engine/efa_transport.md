@@ -80,6 +80,34 @@ cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
 pip install -e ../mooncake-wheel --no-build-isolation
 ```
 
+### 3. Building a Distributable Wheel (optional)
+
+To produce a relocatable wheel for distribution (instead of the editable
+install above), use `scripts/build_wheel.sh`, which runs `auditwheel
+repair` to bundle non-system dependencies:
+
+```bash
+# After the cmake/make build above completes:
+PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+pip install dist/mooncake_transfer_engine-*.whl
+```
+
+> **Important (EFA builds):** `auditwheel repair` excludes `libfabric`
+> and `libefa` from the wheel so they resolve to the system EFA
+> installation (`/opt/amazon/efa/lib`) at runtime. This is required
+> because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the
+> **same** system `libfabric`. If the wheel bundled its own copy, the
+> process would load two independent libfabric instances — Mooncake's
+> bundled one and NCCL's system one — and whichever initializes first
+> claims the EFA device, leaving the other with an empty provider list
+> (`fi_getinfo: provider efa output empty list`). NCCL then silently
+> falls back to the TCP provider and cross-node collectives such as
+> `all_gather_object` hang. Excluding libfabric/libefa (see
+> `scripts/build_wheel.sh`) keeps a single shared libfabric in the
+> process. If you are on an older Mooncake build whose wheel still bundles
+> libfabric, force the system copy with
+> `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+
 ## Verification
 
 Test EFA transport initialization:
@@ -495,9 +523,9 @@ SGLang's PD-disaggregation Mooncake integration reads the transport from `MOONCA
 
 ### 1. Apply EFA Patch (only if SGLang version predates PR #25083)
 
-Older SGLang releases hardcode `"rdma"` in the transfer engine init. Since [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) the protocol is read from `MOONCAKE_PROTOCOL`, so once that PR is in your build (or upstream `main`) **this step is unnecessary** — skip to step 2.
+Older SGLang releases hardcode `"rdma"` in the transfer engine init. [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) has been **merged into SGLang `main`**, so the protocol is now read from `MOONCAKE_PROTOCOL`. If your SGLang build includes that PR (any recent `main` or release built after it), **this step is unnecessary** — skip to step 2.
 
-If you are pinned to an older release, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
+Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
 
 ```bash
 bash patch_sglang_efa.sh
@@ -522,6 +550,15 @@ export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
 
 > **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
+
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. Default is `1`, which reaches 99.93% of peak GPU-to-GPU throughput while saving CPU for other workloads. Set to `0` to disable the cap (one poller per EFA context — the legacy behavior). Higher values (e.g., `MC_EFA_CQ_THREADS=4`) are available as an escape hatch for throughput tuning but rarely help in practice.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # default: single CQ poller (recommended)
+> export MC_EFA_CQ_THREADS=0   # disable cap: one poller per EFA context (legacy)
+> ```
+>
+> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
 
 ### 3. Prefill Instance
 
