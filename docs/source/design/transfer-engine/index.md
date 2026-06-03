@@ -316,11 +316,6 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 
 For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
 
-:::{toctree}
-:maxdepth: 1
-:hidden:
-:::
-
 ## EFA Transport (AWS)
 
 :::{toctree}

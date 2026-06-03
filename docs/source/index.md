@@ -95,18 +95,6 @@ performance/ssd-offload-benchmark-results
 performance/storage-benchmark
 :::
 
-% API Documentation
-
-:::{toctree}
-:caption: Python API Reference
-:maxdepth: 1
-
-python-api-reference/mooncake-store
-python-api-reference/transfer-engine
-http-api-reference/http-service
-python-api-reference/ep-backend
-:::
-
 % Explanation of Mooncake internals
 
 :::{toctree}

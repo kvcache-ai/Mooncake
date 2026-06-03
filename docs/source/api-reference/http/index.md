@@ -10,5 +10,4 @@
 :hidden:
 
 ../../http-api-reference/http-service
-../../design/conductor/indexer-api-design
 :::
