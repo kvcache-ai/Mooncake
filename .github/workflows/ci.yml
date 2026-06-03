@@ -114,10 +114,6 @@ jobs:
         sudo cmake --install .
       shell: bash
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Build nvlink_allocator.so
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
@@ -125,6 +121,10 @@ jobs:
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Start Metadata Server
       run: |
