@@ -138,6 +138,31 @@ struct HttpSegmentStatusResponse {
 YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
          error_code, error_message);
 
+struct HttpSegmentDetailItem {
+    std::string segment_name;
+    std::string segment_id;
+    std::string client_id;
+    std::string base_address;
+    uint64_t size_bytes{0};
+    std::string size_human;
+    std::string te_endpoint;
+    std::string protocol;
+    std::string status;
+    uint64_t allocator_used_bytes{0};
+    uint64_t allocator_capacity_bytes{0};
+    double allocator_usage_percent{0.0};
+};
+YLT_REFL(HttpSegmentDetailItem, segment_name, segment_id, client_id,
+         base_address, size_bytes, size_human, te_endpoint, protocol, status,
+         allocator_used_bytes, allocator_capacity_bytes,
+         allocator_usage_percent);
+
+struct HttpSegmentsDetailResponse {
+    uint64_t total_segments{0};
+    std::vector<HttpSegmentDetailItem> segments;
+};
+YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
+
 template <typename T>
 void WriteJsonResponse(coro_http::coro_http_response& resp,
                        coro_http::status_type status, const T& payload) {
@@ -505,6 +530,56 @@ void MasterAdminServer::InitHttpServer() {
                 body += "\n";
             }
             resp.set_status_and_content(status_type::ok, std::move(body));
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/get_segments_detail",
+        [this](coro_http_request&, coro_http_response& resp) {
+            auto service = GetActiveService();
+            if (!service) {
+                SetServiceUnavailable(resp, "service plane is not active");
+                return;
+            }
+
+            auto result = service->GetSegmentsDetailForAdmin();
+            if (!result) {
+                WriteErrorResponse(resp, status_type::internal_server_error,
+                                   result.error(),
+                                   "Failed to get segments detail");
+                return;
+            }
+
+            HttpSegmentsDetailResponse payload;
+            payload.total_segments = result.value().size();
+            for (const auto& info : result.value()) {
+                HttpSegmentDetailItem item;
+                item.segment_name = info.segment_name;
+                item.segment_id = UuidToString(info.segment_id);
+                item.client_id = UuidToString(info.client_id);
+
+                std::ostringstream addr_oss;
+                addr_oss << "0x" << std::hex << info.base_address;
+                item.base_address = addr_oss.str();
+
+                item.size_bytes = info.size_bytes;
+                std::ostringstream size_oss;
+                size_oss << (info.size_bytes / 1024.0 / 1024.0 / 1024.0)
+                         << " GiB";
+                item.size_human = size_oss.str();
+
+                item.te_endpoint = info.te_endpoint;
+                item.protocol = info.protocol;
+                item.status = EnumToString(info.status);
+                item.allocator_used_bytes = info.allocator_used_bytes;
+                item.allocator_capacity_bytes = info.allocator_capacity_bytes;
+                item.allocator_usage_percent =
+                    info.allocator_capacity_bytes > 0
+                        ? (static_cast<double>(info.allocator_used_bytes) /
+                           info.allocator_capacity_bytes * 100.0)
+                        : 0.0;
+                payload.segments.push_back(std::move(item));
+            }
+            WriteJsonResponse(resp, status_type::ok, payload);
         });
 
     http_server_.set_http_handler<GET>(
@@ -1799,6 +1874,11 @@ WrappedMasterService::GetAllKeysForAdmin() {
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllSegmentsForAdmin() {
     return master_service_.GetAllSegments();
+}
+
+tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+WrappedMasterService::GetSegmentsDetailForAdmin() {
+    return master_service_.GetSegmentsDetail();
 }
 
 tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode>
