@@ -121,6 +121,11 @@ TEST_F(EnvironTest, GetSizeTNegativeValue) {
     EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
 }
 
+TEST_F(EnvironTest, GetSizeTNegativeWithLeadingSpace) {
+    setenv("MC_TEST_SIZET", " -1", 1);
+    EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);
+}
+
 TEST_F(EnvironTest, GetSizeTOverflow) {
     setenv("MC_TEST_SIZET", "99999999999999999999999999", 1);
     EXPECT_EQ(Environ::GetSizeT("MC_TEST_SIZET", 4096), 4096u);

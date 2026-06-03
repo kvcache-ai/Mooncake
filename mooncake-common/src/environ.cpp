@@ -33,16 +33,12 @@ int Environ::GetInt(const char* name, int default_value) {
 size_t Environ::GetSizeT(const char* name, size_t default_value) {
     const char* val = std::getenv(name);
     if (val) {
-        if (val[0] == '-') {
-            std::cerr << "[Mooncake] Warning: invalid value '" << val
-                      << "' for env " << name << ", using default "
-                      << default_value << std::endl;
-            return default_value;
-        }
         char* endptr = nullptr;
         errno = 0;
-        unsigned long long result = std::strtoull(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE) {
+        long long result = std::strtoll(val, &endptr, 10);
+        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
+            result < 0 ||
+            static_cast<unsigned long long>(result) > SIZE_MAX) {
             std::cerr << "[Mooncake] Warning: invalid value '" << val
                       << "' for env " << name << ", using default "
                       << default_value << std::endl;
