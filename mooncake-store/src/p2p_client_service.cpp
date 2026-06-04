@@ -176,6 +176,18 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         return err;
     }
 
+    // 6.5. Initialize shared buffer allocator (TE-registered pool for
+    //      HTTP handlers and any caller that needs temp registered memory).
+    //      If local_buffer_size is 0 but HTTP is enabled, use a default
+    //      64 MiB pool so HTTP /get and /put can still function.
+    {
+        constexpr size_t kDefaultHttpPoolSize = 64ULL * 1024 * 1024;
+        size_t pool_size = config.local_buffer_size > 0
+                               ? config.local_buffer_size
+                               : kDefaultHttpPoolSize;
+        InitBufferAllocator(pool_size, config.protocol);
+    }
+
     // 7. Initialize async route notifier if enabled
     if (config.async_sender_thread_count > 0) {
         // When async ADD is rejected by Master, delete the local replica
@@ -1817,14 +1829,43 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
 
-    // DEGRADED: return empty result (local-only, no Master query)
+    // 1) Local first via DataManager — DataManager owns only data-plane
+    //    info (segment_id + object_size); the service layer attaches its
+    //    own identity (client_id / ip / rpc_port) to assemble the final
+    //    descriptor. Nothing is mocked.
+    if (data_manager_.has_value()) {
+        auto local = data_manager_->Query(object_key);
+        if (local.has_value()) {
+            P2PProxyDescriptor proxy;
+            proxy.client_id = client_id_;
+            proxy.segment_id = local.value().first;
+            proxy.ip_address = local_ip_;
+            proxy.rpc_port = client_rpc_port_;
+            proxy.object_size = local.value().second;
+
+            Replica::Descriptor desc;
+            desc.descriptor_variant = std::move(proxy);
+            desc.status = ReplicaStatus::COMPLETE;
+
+            std::vector<Replica::Descriptor> replicas;
+            replicas.push_back(std::move(desc));
+            return std::make_unique<QueryResult>(std::move(replicas));
+        }
+        if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "fail to query local object"
+                       << ", key=" << object_key << ", error=" << local.error();
+            return tl::make_unexpected(local.error());
+        }
+    }
+
+    // 2) Local miss + DEGRADED: master unreachable, treat as not found.
     if (ha_manager_ && ha_manager_->IsDegraded()) {
         LOG(WARNING) << "fail to access master"
                      << ", key=" << object_key;
-        return tl::make_unexpected(ErrorCode::INACCESSIBLE_MASTER);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    // Query master for replica list
+    // 3) Local miss + healthy: fall back to master.
     auto result = master_client_.GetReplicaList(object_key, config);
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
@@ -2115,14 +2156,6 @@ void P2PClientService::RegisterHttpMethods() {
 
     using namespace coro_http;
 
-    // Lazily create a heap-backed allocator for /get responses (no TE
-    // registration needed — the bytes are copied out into the HTTP body).
-    constexpr size_t kHttpAllocatorBytes = 64ULL * 1024 * 1024;  // 64 MiB
-    if (!http_buffer_allocator_) {
-        http_buffer_allocator_ = ClientBufferAllocator::create(
-            kHttpAllocatorBytes, /*protocol=*/"", /*use_hugepage=*/false);
-    }
-
     // GET /get?key=<key>
     http_server_->set_http_handler<GET>(
         "/get", [this](coro_http_request& req, coro_http_response& resp) {
@@ -2134,14 +2167,20 @@ void P2PClientService::RegisterHttpMethods() {
             }
             std::string key(key_view);
 
-            auto result = Get(key, http_buffer_allocator_, {});
+            if (!buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            }
+
+            auto result = Get(key, buffer_allocator_, {});
             if (!result) {
                 resp.set_status_and_content(
                     ErrorToHttpStatus(result.error()),
                     std::string(toString(result.error())));
                 return;
             }
-            auto& buffer = result.value();
+            const auto& buffer = result.value();
             resp.add_header("Content-Type", "application/octet-stream");
             resp.set_status_and_content(
                 status_type::ok,
@@ -2161,9 +2200,25 @@ void P2PClientService::RegisterHttpMethods() {
             std::string key(key_view);
             auto body = req.get_body();
 
-            Slice slice{const_cast<char*>(body.data()), body.size()};
+            if (!buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            }
+
+            auto alloc_result = buffer_allocator_->allocate(body.size());
+            if (!alloc_result) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer pool exhausted");
+                return;
+            }
+            auto& buf_handle = *alloc_result;
+            memcpy(buf_handle.ptr(), body.data(), body.size());
+
+            Slice slice{static_cast<char*>(buf_handle.ptr()), body.size()};
             std::vector<Slice> slices{slice};
             auto result = Put(key, slices, WriteRouteRequestConfig{});
+
             if (!result) {
                 resp.set_status_and_content(
                     ErrorToHttpStatus(result.error()),

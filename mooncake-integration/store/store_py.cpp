@@ -714,7 +714,8 @@ class MooncakeStorePyWrapper {
                 size_t total_size =
                     sizeof(TensorMetadata) + infos[i].tensor_size;
                 auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
+                    store_->client_service_->GetBufferAllocator()->allocate(
+                        total_size);
 
                 if (!alloc_result) {
                     LOG(ERROR)

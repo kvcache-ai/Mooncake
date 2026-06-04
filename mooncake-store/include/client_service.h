@@ -395,6 +395,14 @@ class ClientService {
     bool IsHttpServerEnabled() const { return http_server_ != nullptr; }
 
     /**
+     * @brief Returns the shared buffer allocator (TE-registered pool).
+     *        May be nullptr if local_buffer_size was 0.
+     */
+    std::shared_ptr<ClientBufferAllocator> GetBufferAllocator() const {
+        return buffer_allocator_;
+    }
+
+    /**
      * @brief Gets the health status for the /health endpoint.
      * @return A string representing the health status.
      */
@@ -549,6 +557,16 @@ class ClientService {
     void StopHttpServer();
 
     /**
+     * @brief Creates and TE-registers a shared buffer pool. Called during
+     *        Init after TransferEngine is ready.
+     * @param pool_size Size in bytes (0 = skip, buffer_allocator_ stays null).
+     * @param protocol Transport protocol for memory allocation.
+     * @param use_hugepage Whether to allocate with huge pages.
+     */
+    void InitBufferAllocator(size_t pool_size, const std::string& protocol,
+                             bool use_hugepage = false);
+
+    /**
      * @brief Registers the client into the master server.
      * @return An ErrorCode indicating success or failure.
      */
@@ -651,6 +669,10 @@ class ClientService {
     // registered by subclasses via RegisterHttpMethods).
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     uint16_t http_port_ = 0;  // 0 means disabled
+
+    // Shared TE-registered buffer pool for Get/Put operations (HTTP handlers,
+    // RealClient put/get_buffer, etc.). Created by InitBufferAllocator().
+    std::shared_ptr<ClientBufferAllocator> buffer_allocator_;
 };
 
 }  // namespace mooncake

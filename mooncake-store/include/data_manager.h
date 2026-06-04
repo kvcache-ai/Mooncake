@@ -156,6 +156,12 @@ class DataManager {
         std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator);
 
     /**
+     * @brief Query local object metadata
+     */
+    tl::expected<std::pair<UUID, uint64_t>, ErrorCode> Query(
+        std::string_view key);
+
+    /**
      * @brief Query the size of an object.
      * @param key Object key
      * @return Object size in bytes, or ErrorCode on failure

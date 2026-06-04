@@ -306,8 +306,7 @@ TEST_F(HAIntegrationTest, DegradedModeLocalOps) {
     ForceRecover(client1_);
 }
 
-// A3: Degraded mode — remote Get returns OBJECT_NOT_FOUND; Query fails with
-//     INACCESSIBLE_MASTER.
+// A3: Degraded mode — remote Get returns OBJECT_NOT_FOUND;
 TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     // Write on client2 — client1's route cache not populated
     auto put = PutData(client2_, "a3_client2_key", "remote_val");
@@ -330,10 +329,10 @@ TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     EXPECT_FALSE(get.has_value());
     EXPECT_EQ(get.error(), ErrorCode::OBJECT_NOT_FOUND);
 
-    // Query: requires master → fails with INACCESSIBLE_MASTER
+    // Query: local-first + master fallback; degraded + local miss → 404.
     auto query = client1_->Query("a3_client1_query_key");
     EXPECT_FALSE(query.has_value());
-    EXPECT_EQ(query.error(), ErrorCode::INACCESSIBLE_MASTER);
+    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
 
     ForceRecover(client1_);
 }

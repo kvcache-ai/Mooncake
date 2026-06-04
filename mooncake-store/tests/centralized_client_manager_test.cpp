@@ -47,6 +47,7 @@ class CentralizedClientManagerTest : public ::testing::Test {
         seg.extra = CentralizedSegmentExtraData{
             .base = 0x100000000 + id.first * 0x100000000,
             .te_endpoint = "",
+            .protocol = "",
         };
         return seg;
     }
@@ -359,6 +360,7 @@ TEST_F(CentralizedClientManagerTest, QueryIpSuccess) {
     seg.extra = CentralizedSegmentExtraData{
         .base = 0x100000000,
         .te_endpoint = "127.0.0.1:1234",
+        .protocol = "",
     };
 
     RegisterClientRequest req =

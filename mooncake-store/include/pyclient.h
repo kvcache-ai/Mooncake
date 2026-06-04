@@ -127,7 +127,6 @@ class PyClient {
         const UUID& task_id) = 0;
 
     std::shared_ptr<mooncake::ClientService> client_service_ = nullptr;
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
 
 }  // namespace mooncake

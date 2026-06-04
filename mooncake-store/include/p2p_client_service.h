@@ -203,6 +203,7 @@ class P2PClientService final : public ClientService {
      *        3. init tiered backend and data manager
      */
     ErrorCode InitStorage(const P2PClientConfig& config);
+
     /**
      * @brief build add replica callback.
      *        when tier add replica, call master to update metadata
@@ -525,8 +526,6 @@ class P2PClientService final : public ClientService {
     // Cross-node transfer direction from P2PClientConfig at Init().
     TransferDirectionMode transfer_direction_mode_ =
         TransferDirectionMode::REVERSE;
-
-    std::shared_ptr<ClientBufferAllocator> http_buffer_allocator_;
 };
 
 }  // namespace mooncake
