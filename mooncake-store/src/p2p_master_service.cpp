@@ -112,11 +112,9 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
 
 auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     -> tl::expected<WriteRouteResponse, ErrorCode> {
-    // Pre-filter candidate clients when the key already reached owner limit.
-    // it might happen that concurrent write for same key.
-    // for this case, we will finally check it when add route replica.
-    std::unordered_set<UUID, boost::hash<UUID>> owner_clients;
-    bool filter_to_owner_clients = false;
+    // GetWriteRoute represents an external write request. In-client tier
+    // migration updates metadata through AddReplica directly, so once the
+    // owner limit is reached no client can accept another routed write.
     if (!req.key.empty() && max_replicas_per_key_ > 0) {
         MetadataAccessorRO accessor(this, req.key);
         if (accessor.Exists()) {
@@ -124,11 +122,19 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
             auto owner_clients_res =
                 CollectReplicaOwnerClients(metadata, req.key);
             if (!owner_clients_res.has_value()) {
+                LOG(ERROR) << "failed to collect replica owner clients"
+                           << ", key: " << req.key
+                           << ", error: " << owner_clients_res.error();
                 return tl::make_unexpected(owner_clients_res.error());
             }
-            owner_clients = std::move(owner_clients_res.value());
+            const auto& owner_clients = owner_clients_res.value();
             if (owner_clients.size() >= max_replicas_per_key_) {
-                filter_to_owner_clients = true;
+                LOG(WARNING)
+                    << "replica owner client num exceeded"
+                    << ", key: " << req.key << ", client_id: " << req.client_id
+                    << ", current owner client num: " << owner_clients.size()
+                    << ", max owner client num: " << max_replicas_per_key_;
+                return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
             }
         }
     }
@@ -143,11 +149,6 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
             if (!p2p_client) {
                 LOG(ERROR) << "unexpected client meta type";
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            if (filter_to_owner_clients &&
-                owner_clients.find(p2p_client->get_client_id()) ==
-                    owner_clients.end()) {
-                return false;
             }
             return p2p_client->CollectWriteRouteCandidates(req, candidates);
         });
@@ -236,6 +237,9 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
         auto& metadata = *it->second;
         auto owner_clients_res = CollectReplicaOwnerClients(metadata, key);
         if (!owner_clients_res.has_value()) {
+            LOG(ERROR) << "failed to collect replica owner clients"
+                       << ", key: " << key
+                       << ", error: " << owner_clients_res.error();
             return tl::make_unexpected(owner_clients_res.error());
         }
         const auto& owner_clients = owner_clients_res.value();
@@ -250,6 +254,9 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
                 return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
         }
+        // AddReplica is also used by in-client tier migration to publish a new
+        // physical replica. Existing owner clients may add replicas, but a new
+        // owner client must still honor max_replicas_per_key_.
         if (max_replicas_per_key_ > 0 &&
             owner_clients.find(client_id) == owner_clients.end() &&
             owner_clients.size() >= max_replicas_per_key_) {

@@ -287,12 +287,11 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
     EXPECT_EQ(3, res.value().candidates.size());
 }
 
-TEST_F(P2PMasterServiceTest, GetWriteRouteRespectsOwnerClientLimit) {
+TEST_F(P2PMasterServiceTest, GetWriteRouteRejectsWhenOwnerClientLimitReached) {
     auto service = CreateService(/* max_replicas_per_key= */ 2);
     auto owner_seg1 = MakeP2PSegment("owner_seg1", kDefaultSegmentSize, {}, 1);
     auto owner_seg2 = MakeP2PSegment("owner_seg2", kDefaultSegmentSize, {}, 2);
-    auto new_owner_seg =
-        MakeP2PSegment("new_owner_seg", kDefaultSegmentSize, {}, 100);
+    auto new_owner_seg = MakeP2PSegment("new_owner_seg", kDefaultSegmentSize);
     auto owner1 = generate_uuid();
     auto owner2 = generate_uuid();
     auto new_owner = generate_uuid();
@@ -311,10 +310,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteRespectsOwnerClientLimit) {
     req.config.early_return = false;
 
     auto res = service->GetWriteRoute(req);
-    ASSERT_TRUE(res.has_value());
-    ASSERT_EQ(1, res.value().candidates.size());
-    EXPECT_NE(new_owner, res.value().candidates[0].replica.client_id);
-    EXPECT_EQ(owner2, res.value().candidates[0].replica.client_id);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
 }
 
 // ============================================================
