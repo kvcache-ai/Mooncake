@@ -47,10 +47,17 @@ struct SessionHeader {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
+static bool isCudaMemory(void* addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return false;
+    return attributes.type == cudaMemoryTypeDevice;
+}
+
 // Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
-// Uses cudaPointerGetAttributes which requires a current CUDA context; callers
-// must call cudaSetDevice before any cudaMemcpy to avoid implicit GPU0 init.
-static int getCudaDevice(void* addr) {
+// Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
+// GPU 0 context creation.
+static int getCudaDeviceId(void* addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
     if (status != cudaSuccess) return -1;
@@ -127,7 +134,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDevice(addr);
+        cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
             cudaSetDevice(cuda_device);
@@ -191,7 +198,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDevice(addr);
+        cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
@@ -323,7 +330,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDevice(addr);
+        cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
@@ -421,7 +428,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDevice(addr);
+        cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
             cudaSetDevice(cuda_device);
