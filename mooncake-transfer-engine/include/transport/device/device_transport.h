@@ -18,7 +18,8 @@
 // communication paths used by the EP kernel:
 //
 //   P2pTransport   — intra-node GPU-initiated P2P (NVLink on CUDA, MTLink on
-//                    MUSA).  Manages IPC handle exchange and peer pointer table.
+//                    MUSA).  Manages IPC handle exchange and peer pointer
+//                    table.
 //   RdmaTransport  — inter-node GPU-initiated RDMA (IBGDA / mlx5gda).
 //                    Manages QP lifecycle, MR, and device context table.
 //
@@ -127,22 +128,21 @@ class RdmaTransport {
 
     // Connect QPs to peers using exchanged metadata.
     // is_roce: true for RoCE, false for IB.
-    virtual int connectPeers(
-        int local_rank, bool is_roce,
-        const std::vector<int64_t>& remote_addrs,
-        const std::vector<int32_t>& remote_keys,
-        const std::vector<int32_t>& remote_qpns,
-        const std::vector<int32_t>& remote_lids,
-        const std::vector<int64_t>& subnet_prefixes,
-        const std::vector<int64_t>& interface_ids,
-        const std::vector<int>& active_ranks_mask) = 0;
+    virtual int connectPeers(int local_rank, bool is_roce,
+                             const std::vector<int64_t>& remote_addrs,
+                             const std::vector<int32_t>& remote_keys,
+                             const std::vector<int32_t>& remote_qpns,
+                             const std::vector<int32_t>& remote_lids,
+                             const std::vector<int64_t>& subnet_prefixes,
+                             const std::vector<int64_t>& interface_ids,
+                             const std::vector<int>& active_ranks_mask) = 0;
 
     // Metadata for this rank, to be exchanged with peers.
     virtual RdmaLocalMetadata localMetadata() const = 0;
 
     // Device pointers to the tables consumed by the EP kernel.
-    virtual void* raddrsPtr() = 0;   // uint64_t[num_ranks]
-    virtual void* rkeysPtr() = 0;    // uint32_t[num_ranks]
+    virtual void* raddrsPtr() = 0;     // uint64_t[num_ranks]
+    virtual void* rkeysPtr() = 0;      // uint32_t[num_ranks]
     virtual void* qpDevCtxsPtr() = 0;  // mlx5gda_qp_devctx[num_qps]
 
     virtual bool isRoce() const = 0;

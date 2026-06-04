@@ -32,11 +32,11 @@ namespace device {
 // ---------------------------------------------------------------------------
 
 struct IbgdaContext {
-    mlx5gda_qp_devctx* qp_devctxs;  // device ptr: [num_qps]
-    const uint64_t* raddrs;         // device ptr: [num_ranks] remote GDR base
-    const uint32_t* rkeys;          // device ptr: [num_ranks] remote rkey
-    const void* local_atomic_base;  // local scratch base for atomic responses
-    const void* remote_atomic_base; // symmetric remote signal base
+    mlx5gda_qp_devctx* qp_devctxs;   // device ptr: [num_qps]
+    const uint64_t* raddrs;          // device ptr: [num_ranks] remote GDR base
+    const uint32_t* rkeys;           // device ptr: [num_ranks] remote rkey
+    const void* local_atomic_base;   // local scratch base for atomic responses
+    const void* remote_atomic_base;  // symmetric remote signal base
 };
 
 // ---------------------------------------------------------------------------
@@ -142,9 +142,9 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     wqe->ctrl = {};
     wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 4);
     wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
-    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
-        MLX5_OPCODE_ATOMIC_MASKED_FA |
-        (static_cast<uint32_t>(qp->wq_head) << 8) | 0x08000000);
+    wqe->ctrl.opmod_idx_opcode =
+        mc_bswap32(MLX5_OPCODE_ATOMIC_MASKED_FA |
+                   (static_cast<uint32_t>(qp->wq_head) << 8) | 0x08000000);
 
     wqe->raddr.raddr = mc_bswap64(raddr);
     wqe->raddr.rkey = rkey;
@@ -195,10 +195,9 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     int32_t value) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
-    mc_ibgda_write_rdma_atomic_add_wqe(qp, value, laddr,
-                                       mc_bswap32(ctx.rkeys[src_rank]),
-                                       recv_raddr,
-                                       mc_bswap32(ctx.rkeys[dst_rank]));
+    mc_ibgda_write_rdma_atomic_add_wqe(
+        qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+        mc_bswap32(ctx.rkeys[dst_rank]));
     mc_ibgda_post_send_db(qp);
     mc_ibgda_unlock(qp);
 }

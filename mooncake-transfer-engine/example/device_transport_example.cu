@@ -44,8 +44,10 @@
 DEFINE_int32(rank, -1, "Rank of this process (0 or 1)");
 DEFINE_int32(world_size, 2, "Total number of ranks");
 DEFINE_int32(gpu_id, -1, "GPU ID (defaults to rank)");
-DEFINE_string(metadata_server, "P2PHANDSHAKE", "Metadata server (P2PHANDSHAKE for no external deps)");
-DEFINE_string(local_server_name, "", "Local server name (default: 127.0.0.1:<port>)");
+DEFINE_string(metadata_server, "P2PHANDSHAKE",
+              "Metadata server (P2PHANDSHAKE for no external deps)");
+DEFINE_string(local_server_name, "",
+              "Local server name (default: 127.0.0.1:<port>)");
 DEFINE_string(ipc_dir, "/tmp", "Directory for IPC handle exchange files");
 DEFINE_int32(kDataBytes, 4096, "Bytes to transfer in the P2P write");
 DEFINE_int32(kSignalOffset, 0, "Offset within buffer for the signal word");
@@ -63,7 +65,8 @@ static void checkCuda(cudaError_t err, const char* msg) {
 // ---------------------------------------------------------------------------
 
 static std::string ipcFilePath(int rank) {
-    return FLAGS_ipc_dir + "/device_api_ex_rank_" + std::to_string(rank) + ".bin";
+    return FLAGS_ipc_dir + "/device_api_ex_rank_" + std::to_string(rank) +
+           ".bin";
 }
 
 static void writeIpcHandle(int rank, const std::vector<int32_t>& handle) {
@@ -87,7 +90,8 @@ static std::vector<int32_t> readIpcHandle(int rank) {
         if (ifs) {
             uint32_t size = 0;
             ifs.read(reinterpret_cast<char*>(&size), sizeof(size));
-            CHECK(size > 0 && size <= 256) << "Invalid IPC handle size: " << size;
+            CHECK(size > 0 && size <= 256)
+                << "Invalid IPC handle size: " << size;
             std::vector<int32_t> handle(size);
             ifs.read(reinterpret_cast<char*>(handle.data()),
                      size * sizeof(int32_t));
@@ -112,8 +116,8 @@ static std::vector<int32_t> readIpcHandle(int rank) {
 static constexpr int kSignalWordOffset = 4096;  // must match kDataBytes default
 
 // Rank 0: P2P-write data to rank 1, then signal.
-__global__ void senderKernel(mooncake::device::CommCtx ctx,
-                             int dst_rank, int data_bytes) {
+__global__ void senderKernel(mooncake::device::CommCtx ctx, int dst_rank,
+                             int data_bytes) {
     using namespace mooncake::device;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -133,20 +137,20 @@ __global__ void senderKernel(mooncake::device::CommCtx ctx,
     // Use 16-byte non-temporal stores for the bulk copy.
     for (int i = 0; i < data_bytes; i += 16) {
         int4 val = mc_ld_nc(reinterpret_cast<const int4*>(local_data + i));
-        mc_st_na(reinterpret_cast<int4*>(reinterpret_cast<char*>(peer_data) + i),
-                 val);
+        mc_st_na(
+            reinterpret_cast<int4*>(reinterpret_cast<char*>(peer_data) + i),
+            val);
     }
 
     // Signal: write 1 to the peer's signal word.
     int* local_sig = reinterpret_cast<int*>(local_data + kSignalWordOffset);
     *local_sig = 1;
-    mc_signal(ctx, dst_rank, 0 /*channel*/, 1 /*qps_per_rank*/,
-              local_sig, 1);
+    mc_signal(ctx, dst_rank, 0 /*channel*/, 1 /*qps_per_rank*/, local_sig, 1);
 }
 
 // Rank 1: wait for signal from rank 0, then verify data.
-__global__ void receiverKernel(mooncake::device::CommCtx ctx,
-                               int src_rank, int data_bytes) {
+__global__ void receiverKernel(mooncake::device::CommCtx ctx, int src_rank,
+                               int data_bytes) {
     using namespace mooncake::device;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -154,8 +158,8 @@ __global__ void receiverKernel(mooncake::device::CommCtx ctx,
     int* local_sig = reinterpret_cast<int*>(local_data + kSignalWordOffset);
 
     // Spin-wait for the signal.
-    // The sender writes the signal via P2P store (mc_p2p_signal → mc_st_release).
-    // We use ld_acquire to observe it.
+    // The sender writes the signal via P2P store (mc_p2p_signal →
+    // mc_st_release). We use ld_acquire to observe it.
     while (mc_ld_acquire(local_sig) == 0) {
         __threadfence_block();
     }
@@ -186,8 +190,7 @@ int main(int argc, char** argv) {
     int world_size = FLAGS_world_size;
     CHECK(rank == 0 || rank == 1) << "--rank must be 0 or 1";
     CHECK_EQ(world_size, 2) << "This example requires exactly 2 ranks";
-    CHECK_EQ(FLAGS_kDataBytes % 16, 0)
-        << "kDataBytes must be a multiple of 16";
+    CHECK_EQ(FLAGS_kDataBytes % 16, 0) << "kDataBytes must be a multiple of 16";
     CHECK_LE(FLAGS_kDataBytes, kSignalWordOffset)
         << "kDataBytes cannot exceed " << kSignalWordOffset;
 
@@ -238,8 +241,8 @@ int main(int argc, char** argv) {
 
     std::vector<int> active_ranks_mask(world_size, 1);
 
-    p2p->importPeerHandles(gdr_buffer, rank, world_size,
-                           remote_handles, active_ranks_mask);
+    p2p->importPeerHandles(gdr_buffer, rank, world_size, remote_handles,
+                           active_ranks_mask);
 
     CHECK(p2p->allPeersAccessible())
         << "P2P not accessible between rank " << rank << " and peer";

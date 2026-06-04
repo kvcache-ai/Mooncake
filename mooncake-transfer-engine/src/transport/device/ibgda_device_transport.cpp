@@ -99,9 +99,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         num_ranks_ = num_ranks;
         num_qps_ = num_qps;
 
-        std::string nic = device_name.empty()
-                              ? autoDetectNic(device_filter_)
-                              : device_name;
+        std::string nic =
+            device_name.empty() ? autoDetectNic(device_filter_) : device_name;
         if (nic.empty()) {
             LOG(WARNING) << "[EP IBGDA] No RDMA NIC found";
             return -1;
@@ -171,7 +170,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         // Allocate device-visible tables
-        if (cudaMalloc(&raddrs_, num_ranks_ * sizeof(uint64_t)) != cudaSuccess ||
+        if (cudaMalloc(&raddrs_, num_ranks_ * sizeof(uint64_t)) !=
+                cudaSuccess ||
             cudaMalloc(&rkeys_, num_ranks_ * sizeof(uint32_t)) != cudaSuccess ||
             cudaMalloc(&qp_devctxs_, num_qps_ * sizeof(mlx5gda_qp_devctx)) !=
                 cudaSuccess) {
@@ -180,15 +180,16 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         LOG(INFO) << "[EP IBGDA] Initialized on " << nic
-                  << " (gid_index=" << gid_index_
-                  << ", roce=" << is_roce_ << ")";
+                  << " (gid_index=" << gid_index_ << ", roce=" << is_roce_
+                  << ")";
         return 0;
     }
 
     int registerMemory(void* ptr, size_t bytes) override {
-        mr_ = ibv_reg_mr(pd_, ptr, bytes,
-                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                             IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+        mr_ =
+            ibv_reg_mr(pd_, ptr, bytes,
+                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                           IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
         if (!mr_) {
             LOG(ERROR) << "[EP IBGDA] ibv_reg_mr failed";
             return -1;
@@ -206,7 +207,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
-                                               IBV_ACCESS_LOCAL_WRITE);
+                                              IBV_ACCESS_LOCAL_WRITE);
         if (!ctrl_buf_umem_) {
             LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
                        << errno << ")";
@@ -225,9 +226,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
         for (int i = 0; i < num_qps_; ++i) {
-            mlx5gda_qp* qp = mlx5gda_create_rc_qp(
-                mpd_, ctrl_buf_, ctrl_buf_umem_, ctrl_buf_heap_, pd_, 16384, 1,
-                stream);
+            mlx5gda_qp* qp =
+                mlx5gda_create_rc_qp(mpd_, ctrl_buf_, ctrl_buf_umem_,
+                                     ctrl_buf_heap_, pd_, 16384, 1, stream);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
                 return -1;
@@ -249,10 +250,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                     static_cast<char*>(ctrl_buf_) + qp->dbr_offset),
                 .bf = static_cast<char*>(qp->uar->reg_addr),
             };
-            cudaMemcpy(static_cast<char*>(qp_devctxs_) +
-                           i * sizeof(mlx5gda_qp_devctx),
-                       &devctx, sizeof(mlx5gda_qp_devctx),
-                       cudaMemcpyHostToDevice);
+            cudaMemcpy(
+                static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
+                &devctx, sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
             qps_.push_back(qp);
         }
         return 0;
@@ -298,11 +298,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 ah_attr.port_num = 0;
             }
 
-            if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr,
-                                               remote_qpns[i], IBV_MTU_4096)) {
+            if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr, remote_qpns[i],
+                                              IBV_MTU_4096)) {
                 LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i
-                           << " (roce=" << is_roce
-                           << " gid_idx=" << gid_index_
+                           << " (roce=" << is_roce << " gid_idx=" << gid_index_
                            << " remote_qpn=" << remote_qpns[i]
                            << " udp_sport=" << ah_attr.dlid
                            << " hop_limit=" << (int)ah_attr.grh.hop_limit
@@ -324,8 +323,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                                 : static_cast<uint32_t>(remote_keys[i]);
             cudaMemcpy(static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
                        &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t),
-                       &rkey, sizeof(uint32_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(static_cast<char*>(rkeys_) + i * sizeof(uint32_t), &rkey,
+                       sizeof(uint32_t), cudaMemcpyHostToDevice);
         }
         return 0;
     }
@@ -334,10 +333,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         RdmaLocalMetadata meta;
         meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
         meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
-        meta.subnet_prefix =
-            static_cast<int64_t>(gid_.global.subnet_prefix);
-        meta.interface_id =
-            static_cast<int64_t>(gid_.global.interface_id);
+        meta.subnet_prefix = static_cast<int64_t>(gid_.global.subnet_prefix);
+        meta.interface_id = static_cast<int64_t>(gid_.global.interface_id);
         for (auto* qp : qps_) {
             meta.qpns.push_back(static_cast<int32_t>(qp->qpn));
             meta.lids.push_back(static_cast<int32_t>(lid_));
@@ -373,11 +370,26 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ibv_dereg_mr(mr_);
             mr_ = nullptr;
         }
-        if (raddrs_) { cudaFree(raddrs_); raddrs_ = nullptr; }
-        if (rkeys_) { cudaFree(rkeys_); rkeys_ = nullptr; }
-        if (qp_devctxs_) { cudaFree(qp_devctxs_); qp_devctxs_ = nullptr; }
-        if (pd_) { ibv_dealloc_pd(pd_); pd_ = nullptr; }
-        if (ctx_) { ibv_close_device(ctx_); ctx_ = nullptr; }
+        if (raddrs_) {
+            cudaFree(raddrs_);
+            raddrs_ = nullptr;
+        }
+        if (rkeys_) {
+            cudaFree(rkeys_);
+            rkeys_ = nullptr;
+        }
+        if (qp_devctxs_) {
+            cudaFree(qp_devctxs_);
+            qp_devctxs_ = nullptr;
+        }
+        if (pd_) {
+            ibv_dealloc_pd(pd_);
+            pd_ = nullptr;
+        }
+        if (ctx_) {
+            ibv_close_device(ctx_);
+            ctx_ = nullptr;
+        }
     }
 
     // IB resources
@@ -394,7 +406,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     std::vector<std::string> device_filter_;
 
     // Control buffer
-    void* ctrl_buf_ = nullptr;          // GPU VA
+    void* ctrl_buf_ = nullptr;  // GPU VA
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 

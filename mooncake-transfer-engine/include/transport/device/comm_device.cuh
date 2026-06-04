@@ -24,12 +24,11 @@ struct CommCtx {
 
 // Construct CommCtx from the raw kernel arguments.
 // raddrs/rkeys/qp_devctxs may be nullptr on MUSA (ignored).
-__device__ __forceinline__ CommCtx
-make_comm_ctx(void* gdr_buffer, const int32_t* nvlink_available,
-              void* const* ipc_peer_ptrs, void* raddrs, void* rkeys,
-              void* qp_devctxs, const void* rdma_send_signal_buffer,
-              const void* rdma_recv_signal_buffer, int rank, int num_ranks,
-              int num_qps) {
+__device__ __forceinline__ CommCtx make_comm_ctx(
+    void* gdr_buffer, const int32_t* nvlink_available,
+    void* const* ipc_peer_ptrs, void* raddrs, void* rkeys, void* qp_devctxs,
+    const void* rdma_send_signal_buffer, const void* rdma_recv_signal_buffer,
+    int rank, int num_ranks, int num_qps) {
     CommCtx ctx;
     ctx.rank = rank;
 
@@ -70,8 +69,8 @@ __device__ __forceinline__ void* mc_comm_peer_ptr(const CommCtx& ctx,
 //   - P2P rank:    peer-mapped recv_ptr (caller does UNROLLED_WARP_COPY)
 //   - IBGDA rank:  nullptr (caller must stage data then call mc_rdma_put)
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void* mc_route_put(const CommCtx& ctx,
-                                              int dst_rank, void* recv_ptr) {
+__device__ __forceinline__ void* mc_route_put(const CommCtx& ctx, int dst_rank,
+                                              void* recv_ptr) {
     if (dst_rank == ctx.rank) return recv_ptr;
     if (mc_comm_p2p_available(ctx, dst_rank))
         return mc_comm_peer_ptr(ctx, dst_rank, recv_ptr);
