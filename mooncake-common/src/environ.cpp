@@ -36,8 +36,7 @@ size_t Environ::GetSizeT(const char* name, size_t default_value) {
         char* endptr = nullptr;
         errno = 0;
         long long result = std::strtoll(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
-            result < 0 ||
+        if (endptr == val || *endptr != '\0' || errno == ERANGE || result < 0 ||
             static_cast<unsigned long long>(result) > SIZE_MAX) {
             std::cerr << "[Mooncake] Warning: invalid value '" << val
                       << "' for env " << name << ", using default "
