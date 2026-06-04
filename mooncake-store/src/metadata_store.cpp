@@ -7,7 +7,8 @@ void StandbySegmentRegistry::OnSegmentMount(const StandbySegmentInfo& info) {
     segments_by_endpoint_[info.transport_endpoint] = info;
 }
 
-void StandbySegmentRegistry::OnSegmentUnmount(const std::string& transport_endpoint) {
+void StandbySegmentRegistry::OnSegmentUnmount(
+    const std::string& transport_endpoint) {
     std::lock_guard<std::shared_mutex> lock(mutex_);
     segments_by_endpoint_.erase(transport_endpoint);
 }
@@ -17,9 +18,11 @@ void StandbySegmentRegistry::OnSegmentUpdate(const StandbySegmentInfo& info) {
     segments_by_endpoint_[info.transport_endpoint] = info;
 }
 
-bool StandbySegmentRegistry::HasSegment(const std::string& transport_endpoint) const {
+bool StandbySegmentRegistry::HasSegment(
+    const std::string& transport_endpoint) const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    return segments_by_endpoint_.find(transport_endpoint) != segments_by_endpoint_.end();
+    return segments_by_endpoint_.find(transport_endpoint) !=
+           segments_by_endpoint_.end();
 }
 
 std::optional<StandbySegmentInfo> StandbySegmentRegistry::GetSegment(

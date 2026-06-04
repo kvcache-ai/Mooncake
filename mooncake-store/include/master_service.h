@@ -2017,8 +2017,7 @@ class MasterService {
                               const std::string& key,
                               const std::string& payload);
     tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
-        OpType type, const std::string& key,
-        const std::string& payload = {});
+        OpType type, const std::string& key, const std::string& payload = {});
     tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
         OpType type, const std::string& tenant_id, const std::string& key,
         const std::string& payload);
@@ -2030,8 +2029,7 @@ class MasterService {
         const std::vector<Replica::Descriptor>& replicas,
         const std::string& group_id = "",
         ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
-    ErrorCode PersistOpLogEntryWithSyncRetries(
-        const OpLogEntry& entry) const;
+    ErrorCode PersistOpLogEntryWithSyncRetries(const OpLogEntry& entry) const;
 
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
@@ -2063,15 +2061,19 @@ class MasterService {
     bool ProcessPendingMutationOnce(PendingMutation& m);
     void EnqueueRetryOnPersistFailure(const char* why, PendingMutationKind kind,
                                       OpLogEntry entry);
-    void AppendOrPersistOrEnqueue(const char* why, OpType type, const std::string& key,
-                                 const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueue(const char* why, OpType type,
+                                  const std::string& key,
+                                  const std::string& payload,
+                                  PendingMutationKind kind);
     void AppendOrPersistOrEnqueue(const char* why, OpType type,
                                   const std::string& tenant_id,
                                   const std::string& key,
                                   const std::string& payload,
                                   PendingMutationKind kind);
-    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type, const std::string& key,
-                                     const std::string& payload, PendingMutationKind kind);
+    void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
+                                      const std::string& key,
+                                      const std::string& payload,
+                                      PendingMutationKind kind);
     void AppendOrPersistOrEnqueueLazy(const char* why, OpType type,
                                       const std::string& tenant_id,
                                       const std::string& key,
@@ -2097,22 +2099,21 @@ class MasterService {
      * already happened (UnmountSegment) and rolling back is impossible.
      */
     void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                         const std::string& key,
-                                         const std::string& payload);
+                                        const std::string& key,
+                                        const std::string& payload);
     void PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
-                                         const std::string& tenant_id,
-                                         const std::string& key,
-                                         const std::string& payload);
+                                        const std::string& tenant_id,
+                                        const std::string& key,
+                                        const std::string& payload);
 
     /**
      * Helper to persist REMOVE OpLog for a key with strong-consistency.
      * @return OK on success, error on persist failure (caller must skip erase)
      */
+    tl::expected<void, ErrorCode> PersistRemoveForHA(const char* why,
+                                                     const std::string& key);
     tl::expected<void, ErrorCode> PersistRemoveForHA(
-        const char* why, const std::string& key);
-    tl::expected<void, ErrorCode> PersistRemoveForHA(
-        const char* why, const std::string& tenant_id,
-        const std::string& key);
+        const char* why, const std::string& tenant_id, const std::string& key);
 
     /**
      * Build replica descriptors after removing replicas matching pred_fn.

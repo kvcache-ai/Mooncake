@@ -59,8 +59,7 @@ bool HotStandbyService::StandbyMetadataStore::PutMetadata(
     std::lock_guard<std::mutex> lock(mutex_);
     store_[normalized][key] = metadata;
     VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
-            << ", key=" << key
-            << ", replicas=" << metadata.replicas.size()
+            << ", key=" << key << ", replicas=" << metadata.replicas.size()
             << ", size=" << metadata.size;
     return true;
 }
@@ -138,8 +137,8 @@ void HotStandbyService::StandbyMetadataStore::Snapshot(
     out.clear();
     for (const auto& [tenant_id, tenant_store] : store_) {
         for (const auto& [key, metadata] : tenant_store) {
-            out.push_back(StandbyObjectEntry{
-                NormalizeTenantId(tenant_id), key, metadata});
+            out.push_back(StandbyObjectEntry{NormalizeTenantId(tenant_id), key,
+                                             metadata});
         }
     }
 }
@@ -317,7 +316,8 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
     for (const auto& entry : snapshot.metadata) {
-        metadata_store_->PutMetadata(entry.tenant_id, entry.key, entry.metadata);
+        metadata_store_->PutMetadata(entry.tenant_id, entry.key,
+                                     entry.metadata);
     }
     // Load segment registry from snapshot
     if (oplog_applier_) {

@@ -675,13 +675,15 @@ TEST_F(OpLogApplierTest, TestApplySegmentUnmount) {
     EXPECT_TRUE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
 
     // Then unmount
-    std::string unmount_payload = MakeSegmentUnmountPayload("192.168.1.1:12345");
+    std::string unmount_payload =
+        MakeSegmentUnmountPayload("192.168.1.1:12345");
     OpLogEntry unmount_entry =
         MakeEntry(2, OpType::SEGMENT_UNMOUNT, "seg1", unmount_payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount_entry));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
 
-    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
+    EXPECT_FALSE(
+        applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
 }
 
 TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
@@ -692,7 +694,8 @@ TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
         MakeEntry(1, OpType::SEGMENT_MOUNT, "seg1", mount_payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(mount_entry));
 
-    auto info_before = applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
+    auto info_before =
+        applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
     ASSERT_TRUE(info_before.has_value());
     EXPECT_EQ(1024u, info_before->capacity);
 
@@ -704,7 +707,8 @@ TEST_F(OpLogApplierTest, TestApplySegmentUpdate) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(update_entry));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
 
-    auto info_after = applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
+    auto info_after =
+        applier_->GetSegmentRegistry().GetSegment("192.168.1.1:12345");
     ASSERT_TRUE(info_after.has_value());
     EXPECT_EQ(2048u, info_after->capacity);
 }
@@ -720,12 +724,14 @@ TEST_F(OpLogApplierTest, TestApplySegmentMount_InvalidPayload) {
 
 TEST_F(OpLogApplierTest, TestApplySegmentUnmount_NonExistent) {
     // Unmount a segment that was never mounted - should not crash
-    std::string unmount_payload = MakeSegmentUnmountPayload("192.168.1.1:12345");
+    std::string unmount_payload =
+        MakeSegmentUnmountPayload("192.168.1.1:12345");
     OpLogEntry unmount_entry =
         MakeEntry(1, OpType::SEGMENT_UNMOUNT, "seg1", unmount_payload);
     EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount_entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_FALSE(applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
+    EXPECT_FALSE(
+        applier_->GetSegmentRegistry().HasSegment("192.168.1.1:12345"));
 }
 
 TEST_F(OpLogApplierTest, TestApplySegmentOperations_Mixed) {

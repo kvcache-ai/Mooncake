@@ -319,8 +319,9 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                     key = item.via.array.ptr[1].as<std::string>();
                     metadata_index = 2;
                 } else {
-                    LOG(ERROR) << "Snapshot metadata item has invalid array size: "
-                               << item.via.array.size;
+                    LOG(ERROR)
+                        << "Snapshot metadata item has invalid array size: "
+                        << item.via.array.size;
                     return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
                 }
 
@@ -335,9 +336,9 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                 if (!metadata_result->has_value()) {
                     continue;
                 }
-                snapshot.push_back(StandbyObjectEntry{
-                    normalized_tenant, key,
-                    std::move(metadata_result->value())});
+                snapshot.push_back(
+                    StandbyObjectEntry{normalized_tenant, key,
+                                       std::move(metadata_result->value())});
             } catch (const std::exception& ex) {
                 LOG(ERROR) << "Failed to parse snapshot metadata item: "
                            << ex.what();
@@ -511,8 +512,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // If a future change makes the serializer carry richer per-segment
         // data, the predicate below should be replaced with explicit branches
         // for each segment type.
-        ScopedSegmentAccess segment_access =
-            segment_manager.getSegmentAccess();
+        ScopedSegmentAccess segment_access = segment_manager.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> all_segments;
         segment_access.GetAllSegments(all_segments);
         SegmentView view = segment_manager.getView();

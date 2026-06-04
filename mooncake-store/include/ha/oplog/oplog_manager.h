@@ -80,8 +80,8 @@ struct OpLogEntry {
     OpType op_type{OpType::PUT_END};
     std::string tenant_id{"default"};  // Tenant identifier
     std::string object_key;            // Target object key
-    std::string payload;     // Serialized extra data (optional)
-    uint32_t checksum{0};    // Checksum of payload (implementation-defined)
+    std::string payload;               // Serialized extra data (optional)
+    uint32_t checksum{0};  // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{
         0};  // Hash of the entire key (for verification and optimization)
 };

@@ -28,8 +28,7 @@ class MinimalMockMetadataStore : public MetadataStore {
     using MetadataStore::PutMetadata;
     using MetadataStore::Remove;
 
-    bool PutMetadata(const std::string& tenant_id,
-                     const std::string& key,
+    bool PutMetadata(const std::string& tenant_id, const std::string& key,
                      const StandbyObjectMetadata& metadata) override {
         if (tenant_id != "default") return true;
         return PutMetadata(key, metadata);
@@ -44,7 +43,8 @@ class MinimalMockMetadataStore : public MetadataStore {
         if (tenant_id != "default") return true;
         return Remove(key);
     }
-    bool Exists(const std::string& tenant_id, const std::string& key) const override {
+    bool Exists(const std::string& tenant_id,
+                const std::string& key) const override {
         if (tenant_id != "default") return false;
         return Exists(key);
     }

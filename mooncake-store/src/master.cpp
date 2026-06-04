@@ -384,7 +384,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
-    default_config.GetString("oplog_store_type", &master_config.oplog_store_type,
+    default_config.GetString("oplog_store_type",
+                             &master_config.oplog_store_type,
                              FLAGS_oplog_store_type);
     default_config.GetString("oplog_store_root_dir",
                              &master_config.oplog_store_root_dir,

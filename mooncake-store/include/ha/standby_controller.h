@@ -44,7 +44,8 @@ class StandbyController {
      *
      * @return PromotionContext on success, error code on failure
      */
-    virtual tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() = 0;
+    virtual tl::expected<PromotionContext, ErrorCode>
+    PromoteStandbyAndExport() = 0;
 
     virtual void UpdateObservedLeader(
         const std::optional<MasterView>& observed_leader) = 0;

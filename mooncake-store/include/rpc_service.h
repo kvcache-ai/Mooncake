@@ -223,11 +223,11 @@ class WrappedMasterService {
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
 
-    // Internal method called by supervisor during promotion; NOT an RPC endpoint.
-    void RestoreFromStandby(
-        const std::vector<StandbyObjectEntry>& objects,
-        uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+    // Internal method called by supervisor during promotion; NOT an RPC
+    // endpoint.
+    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
+                            uint64_t initial_oplog_sequence_id,
+                            const std::vector<StandbySegmentInfo>& segments);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

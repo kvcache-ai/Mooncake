@@ -1380,8 +1380,7 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 
-bool SegmentManager::HasSegmentByEndpoint(
-    const std::string& endpoint) const {
+bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
     for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
         if (mounted_segment.segment.te_endpoint == endpoint) {
@@ -1392,8 +1391,8 @@ bool SegmentManager::HasSegmentByEndpoint(
 }
 
 bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
-                                        std::string& segment_name,
-                                        std::string& te_endpoint) const {
+                                         std::string& segment_name,
+                                         std::string& te_endpoint) const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
     auto it = mounted_segments_.find(segment_id);
     if (it == mounted_segments_.end()) {

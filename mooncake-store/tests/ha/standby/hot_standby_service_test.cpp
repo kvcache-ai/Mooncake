@@ -467,7 +467,8 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
     ASSERT_EQ(1u, snapshot.objects.size());
     EXPECT_EQ("key-1", snapshot.objects[0].key);
     EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
-    // Segment registry is empty because snapshot-only standby has no oplog_applier
+    // Segment registry is empty because snapshot-only standby has no
+    // oplog_applier
     EXPECT_TRUE(snapshot.segments.empty());
 }
 

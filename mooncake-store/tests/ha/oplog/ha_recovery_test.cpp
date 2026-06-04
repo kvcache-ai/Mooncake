@@ -81,9 +81,8 @@ class HaRecoveryTest : public ::testing::Test {
             meta.client_id = {1, 2};
             meta.size = 1024;
             meta.last_sequence_id = i;
-            data.emplace_back(StandbyObjectEntry{"default",
-                                                 "key_" + std::to_string(i),
-                                                 meta});
+            data.emplace_back(StandbyObjectEntry{
+                "default", "key_" + std::to_string(i), meta});
         }
         return data;
     }

@@ -594,7 +594,8 @@ void OpLogApplier::LoadSegmentRegistry(
 
 void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
     SegmentMountOp op;
-    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_MOUNT payload for key "
                    << entry.object_key;
         return;
@@ -611,7 +612,8 @@ void OpLogApplier::ApplySegmentMount(const OpLogEntry& entry) {
 
 void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
     SegmentUnmountOp op;
-    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UNMOUNT payload for key "
                    << entry.object_key;
         return;
@@ -622,7 +624,8 @@ void OpLogApplier::ApplySegmentUnmount(const OpLogEntry& entry) {
 
 void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     SegmentUpdateOp op;
-    if (struct_pack::deserialize_to(op, entry.payload) != struct_pack::errc::ok) {
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+        struct_pack::errc::ok) {
         LOG(ERROR) << "Failed to deserialize SEGMENT_UPDATE payload for key "
                    << entry.object_key;
         return;

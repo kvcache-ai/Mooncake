@@ -435,8 +435,7 @@ class SegmentManager {
 
     // Endpoint-based segment queries (for standby restore)
     bool HasSegmentByEndpoint(const std::string& endpoint) const;
-    bool GetSegmentBasicInfo(const UUID& segment_id,
-                             std::string& segment_name,
+    bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
                              std::string& te_endpoint) const;
 
    private:

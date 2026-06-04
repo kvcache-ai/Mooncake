@@ -164,7 +164,8 @@ TEST(StandbyControllerTest, PromoteStandbyReturnsStartFailure) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, controller->PromoteStandby());
 }
 
-TEST(StandbyControllerTest, PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
+TEST(StandbyControllerTest,
+     PromoteStandbyAndExport_ReturnsErrorWhenNotStarted) {
     ha::HABackendSpec spec{
         .type = ha::HABackendType::UNKNOWN,
         .connstring = "",
@@ -203,8 +204,8 @@ TEST_P(HotStandbySnapshotBootstrapTest,
         .cluster_namespace = cluster_id_,
     };
 
-    auto config =
-        MakeSnapshotProviderConfig(GetParam(), cluster_id_, FLAGS_redis_endpoint);
+    auto config = MakeSnapshotProviderConfig(GetParam(), cluster_id_,
+                                             FLAGS_redis_endpoint);
     config.enable_snapshot_restore = true;
     config.local_hostname = "127.0.0.1:50051";
 
