@@ -310,13 +310,6 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
     }
 }
 
-#ifdef MOONCAKE_EP_USE_MUSA
-void preloadReduceKernels() {
-    // MUSA: mcc has no cudaFuncGetAttributes, kernels are JIT-compiled on
-    // first use. CUDA preloading is done in mooncake_worker.cu (nvcc).
-}
-#endif
-
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
     : cuda_device_index_(cuda_device_index) {
     int deviceCount = 0;

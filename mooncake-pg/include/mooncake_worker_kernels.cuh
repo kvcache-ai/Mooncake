@@ -8,9 +8,11 @@
 
 namespace mooncake {
 
-// Kernel function declarations (torch-free, safe for mcc/nvcc)
-// Guarded so g++ doesn't see __global__ which it can't parse.
+// Kernel function declarations — guarded so g++ doesn't see __global__
+// which it can't parse. MUSA uses torch-free signatures (mcc can't parse
+// torch headers); CUDA uses the original torch-typed signatures.
 #if defined(__CUDACC__) || defined(__MUSA__)
+#ifdef __MUSA__
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
                                   uint64_t submitSequence, void* meta,
@@ -22,6 +24,19 @@ template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks,
                              int op, bool* activeRanks);
+#else
+__global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
+                                  int64_t broadcastRoot, int bufferOffset,
+                                  uint64_t submitSequence, void* meta,
+                                  Task* tasks, int numRanks,
+                                  const bool* activeRanks,
+                                  int* activeRanksTensor, size_t taskId);
+
+template <typename scalar_t>
+__global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
+                             size_t numElements, size_t numRanks,
+                             c10d::ReduceOp::RedOpType op, bool* activeRanks);
+#endif
 #endif
 
 // Host-callable kernel launch wrappers (compiled by mcc/nvcc, callable from g++)
@@ -65,6 +80,8 @@ void launchReduceKernel_bool(bool* dst, const bool* src,
 void launchReduceKernel_bf16(void* dst, const void* src,
                              size_t numElements, size_t numRanks,
                              int op, bool* activeRanks, cudaStream_t stream);
+
+void preloadReduceKernels();
 
 }  // namespace mooncake
 
