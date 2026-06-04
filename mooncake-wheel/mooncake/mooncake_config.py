@@ -65,9 +65,10 @@ _SIZE_SUFFIXES = [
     ("b", 1),
 ]
 
+
 def _parse_segment_size(value) -> int:
-    if isinstance(value, (int, float)):
-        return int(value)
+    if isinstance(value, int):
+        return value
     if isinstance(value, str):
         s = value.strip().lower()
         if not s:
@@ -82,6 +83,7 @@ def _parse_segment_size(value) -> int:
                 return int(float(num) * multiplier)
         return int(float(s))
     return int(value)
+
 
 @dataclass
 class MooncakeConfig:

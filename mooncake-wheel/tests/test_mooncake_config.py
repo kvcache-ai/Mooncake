@@ -3,7 +3,13 @@ import os
 import tempfile
 import unittest
 
-from mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE, _parse_segment_size
+from mooncake.mooncake_config import (
+    MooncakeConfig,
+    DEFAULT_GLOBAL_SEGMENT_SIZE,
+    DEFAULT_LOCAL_BUFFER_SIZE,
+    _parse_segment_size,
+)
+
 
 class TestMooncakeConfig(unittest.TestCase):
     def setUp(self):
@@ -129,6 +135,7 @@ class TestMooncakeConfig(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
         self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
+
 
 class TestParseSegmentSize(unittest.TestCase):
     def test_integer_passthrough(self):
