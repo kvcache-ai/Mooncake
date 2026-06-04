@@ -413,6 +413,7 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {
     if (!p2p_transport_) {
@@ -428,6 +429,7 @@ device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
     }
     return rdma_transport_.get();
 }
+#endif
 
 int TransferEngineImpl::getRpcPort() {
     return metadata_->localRpcMeta().rpc_port;
