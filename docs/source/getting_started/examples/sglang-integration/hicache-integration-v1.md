@@ -351,8 +351,6 @@ python -m sglang.launch_server \
 
 Mooncake HiCache works with SGLang's **PD disaggregation** mode. The `master service`, `metadata service`, and optional `store service` configurations are the same as described above.
 
-Among SGLang's three PD roles (`prefill worker`, `decode worker`, `router`), only the `prefill worker` supports enabling HiCache. To combine both features:
-
 1. Follow the [PD Disaggregation Guide](../sglang-integration-v1) to set up the prefill, decode, and router workers.
 2. Add the HiCache-related parameters (`--enable-hierarchical-cache`, `--hicache-storage-backend mooncake`, `--hicache-storage-prefetch-policy`, etc.) to the **prefill worker** only, as described in the HiCache sections above.
 

@@ -68,7 +68,7 @@ Key arguments:
 
 ## Run PD Disaggregation
 
-### Cross-Node
+### Multi-Node
 
 ```bash
 # Prefill node (192.168.0.137)
@@ -100,7 +100,7 @@ curl -X POST http://127.0.0.1:8000/generate \
   -d '{"text": "Tell me a long story", "sampling_params": {"temperature": 0}}'
 ```
 
-### Same-Node
+### Single-Node
 
 ```bash
 # Prefill
@@ -122,15 +122,9 @@ python3 -m sglang_router.launch_router \
   --decode  "http://192.168.0.137:30001" \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
-```
 
-TP is supported but not required — omit `--tp-size 2` for single-GPU setups.
-
-### XpYd Topology
-
-Multiple decode instances per prefill are supported. Multiple prefills on the same node are not supported due to bootstrap server port conflicts.
-
-```bash
+# Router for multi node.
+# Here is an example for 2 decode node running on 192.168.0.137 and 192.168.0.140
 python3 -m sglang_router.launch_router \
   --pd-disaggregation \
   --prefill "http://192.168.0.137:30000" 8998 \
@@ -138,6 +132,10 @@ python3 -m sglang_router.launch_router \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
 ```
+
+TP is supported but not required — omit `--tp-size 2` for single-GPU setups.
+
+Multiple decode instances per prefill are supported. Multiple prefills on the same node are not supported due to bootstrap server port conflicts.
 
 ```{tip}
 If you encounter HuggingFace timeouts, set `export SGLANG_USE_MODELSCOPE=true`.
