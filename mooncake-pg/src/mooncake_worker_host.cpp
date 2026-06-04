@@ -9,11 +9,21 @@
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 #include <mooncake_pg_gpu_utils.h>
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAGraphsUtils.muh>
+#else
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 #endif
 
 #include "pg_utils.h"
+
+#ifdef MOONCAKE_EP_USE_MUSA
+namespace gpu_capture = at::musa;
+namespace gpu_c10 = c10::musa;
+#else
+namespace gpu_capture = at::cuda;
+namespace gpu_c10 = c10::cuda;
+#endif
 
 namespace mooncake {
 
@@ -54,16 +64,11 @@ class MooncakeWorkCuda : public ::c10d::Work {
 
     bool wait(std::chrono::milliseconds timeout) override {
         bool submitted = true;
-#ifndef MOONCAKE_EP_USE_MUSA
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
+        if (gpu_capture::currentStreamCaptureStatus() ==
+            gpu_c10::CaptureStatus::None) {
             submitted =
                 worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
         }
-#else
-        submitted =
-            worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
-#endif
         if (!submitted) return false;
 
         auto current_stream = getCurrentGPUStream();
@@ -83,14 +88,12 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     using MooncakeWorkCuda::MooncakeWorkCuda;
 
     bool wait(std::chrono::milliseconds timeout) override {
-#ifndef MOONCAKE_EP_USE_MUSA
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
+        if (gpu_capture::currentStreamCaptureStatus() !=
+            gpu_c10::CaptureStatus::None) {
             auto current_stream = getCurrentGPUStream();
             event_->block(current_stream);
             return true;
         }
-#endif
 
         if (timeout == kNoTimeout) {
             event_->synchronize();
@@ -111,51 +114,46 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
-#ifdef MOONCAKE_EP_USE_MUSA
-    auto gpu_stream = (musaStream_t)stream;
-#else
-    auto gpu_stream = stream;
-#endif
 
     switch (dst.scalar_type()) {
         case c10::kByte:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     gpu_stream);
+                                     stream);
             break;
         case c10::kChar:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
-                                    (int)op, activeRanks, gpu_stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kShort:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     gpu_stream);
+                                     stream);
             break;
         case c10::kInt:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
-                                     (int)op, activeRanks, gpu_stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kLong:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
                                      numRanks, (int)op, activeRanks,
-                                     gpu_stream);
+                                     stream);
             break;
         case c10::kFloat:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
-                                     (int)op, activeRanks, gpu_stream);
+                                     (int)op, activeRanks, stream);
             break;
         case c10::kDouble:
             launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
-                                      (int)op, activeRanks, gpu_stream);
+                                      (int)op, activeRanks, stream);
             break;
         case c10::kBool:
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
-                                    (int)op, activeRanks, gpu_stream);
+                                    (int)op, activeRanks, stream);
             break;
         case c10::kBFloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
-                                    activeRanks, gpu_stream);
+                                    activeRanks, stream);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
