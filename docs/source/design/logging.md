@@ -31,7 +31,7 @@ Supported `MC_LOG_LEVEL` values: `TRACE`, `INFO`, `WARNING`, `ERROR` (case-insen
 
 ## Initialization
 
-All binaries and Python extensions call `InitMooncakeLogging()` once (see `mooncake-common/include/mooncake_log.h`):
+All binaries and Python extensions call `InitMooncakeLogging()` (see `mooncake-common/include/mooncake_log.h`). It is safe from multiple extension modules (`engine.so`, `store.so`) because glog is initialized at most once per process:
 
 - `mooncake_master`, `mooncake_client`
 - pybind modules `store` and `engine`
