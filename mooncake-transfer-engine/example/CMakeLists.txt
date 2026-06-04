@@ -61,3 +61,21 @@ endif()
 if(USE_UBSHMEM)
   target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 endif()
+
+# Device Transport Example — two-rank P2P write + signal via Device API.
+# Requires 2 GPUs with P2P access.  Built but not registered with CTest
+# (manual execution only, like rdma_transport_test).
+if(USE_CUDA)
+  enable_language(CUDA)
+  add_executable(device_transport_example
+                 ${WORKSPACE}/device_transport_example.cu)
+  set_source_files_properties(
+    ${WORKSPACE}/device_transport_example.cu
+    PROPERTIES LANGUAGE CUDA)
+  target_include_directories(device_transport_example PRIVATE
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
+  target_link_libraries(device_transport_example PUBLIC
+    transfer_engine gflags::gflags glog::glog)
+  set_target_properties(device_transport_example PROPERTIES
+    CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
+endif()
