@@ -242,16 +242,12 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // 4. Build CommCtx and launch kernel.
     // -----------------------------------------------------------------------
-    auto ctx = mooncake::device::make_comm_ctx(
-        gdr_buffer,
-        p2p->availableTablePtr(),
-        p2p->peerPtrsTablePtr(),
-        nullptr,   // raddrs (not used for P2P)
-        nullptr,   // rkeys  (not used for P2P)
-        nullptr,   // qp_devctxs (not used for P2P)
-        nullptr,   // rdma_send_signal_buffer
-        nullptr,   // rdma_recv_signal_buffer
-        rank, world_size, 0 /*num_qps*/);
+    mooncake::device::CommCtx ctx{};
+    ctx.rank = rank;
+    ctx.p2p.available = p2p->availableTablePtr();
+    ctx.p2p.peer_ptrs = p2p->peerPtrsTablePtr();
+    ctx.p2p.local_base = gdr_buffer;
+    // IBGDA fields left as nullptr (not used for P2P-only example).
 
     // Copy CommCtx to device memory so the kernel can access it.
     mooncake::device::CommCtx* d_ctx = nullptr;
