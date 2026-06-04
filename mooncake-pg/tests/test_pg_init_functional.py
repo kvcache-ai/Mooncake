@@ -30,6 +30,21 @@ def _null_init_worker(ctx: MooncakePGWorkerContext) -> None:
     ctx.record_result({"sum": int(tensor.cpu().item())})
 
 
+def _lazy_init_worker(ctx: MooncakePGWorkerContext) -> None:
+    """Test lazy init triggers on first collective."""
+    device = ctx.init_group(lazy_init=True)
+    tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    ctx.record_result({"sum": int(tensor.cpu().item())})
+
+
+def _lazy_init_destroy_without_use_worker(ctx: MooncakePGWorkerContext) -> None:
+    """Test lazy init process group can be destroyed before first use."""
+    ctx.init_group(lazy_init=True)
+    dist.destroy_process_group(dist.group.WORLD)
+    ctx.record_result({"destroyed": True})
+
+
 def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
     """Test subgroup creation and destruction."""
     device = ctx.init_group()
@@ -116,6 +131,21 @@ class _InitFunctionalMixin:
         expected_sum = sum(range(1, self.world_size + 1))
         for row in rows:
             self.assertEqual(row["sum"], expected_sum)
+
+    def test_lazy_init(self) -> None:
+        """Test lazy init triggers on first collective."""
+        rows = self.spawn_backend_and_collect(_lazy_init_worker)
+        self.assert_all_ok(rows)
+        expected_sum = sum(range(1, self.world_size + 1))
+        for row in rows:
+            self.assertEqual(row["sum"], expected_sum)
+
+    def test_lazy_init_destroy_without_use(self) -> None:
+        """Test lazy init group can be destroyed without first use."""
+        rows = self.spawn_backend_and_collect(_lazy_init_destroy_without_use_worker)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertTrue(row["destroyed"])
 
     def test_subgroup_create_destroy(self) -> None:
         """Test subgroup creation and destruction."""

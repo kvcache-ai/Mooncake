@@ -101,18 +101,26 @@ def mooncake_backend_options(
     world_size: int,
     device_type: str,
     *,
-    active_value: int = 0,
+    active_value: int = 1,
     is_extension: bool = False,
     max_world_size: int | None = None,
+    lazy_init: bool = False,
 ) -> pg.MooncakeBackendOptions:
     device = torch.device(device_type)
     tensor_size = world_size if max_world_size is None else int(max_world_size)
-    active_ranks = torch.full(
+    active_ranks = torch.zeros(
         (tensor_size,),
-        int(active_value),
         dtype=torch.int32,
         device=device,
     )
+    active_ranks[:world_size].fill_(int(active_value))
+    if lazy_init:
+        return pg.MooncakeBackendOptions(
+            active_ranks,
+            bool(is_extension),
+            tensor_size,
+            True,
+        )
     if max_world_size is None:
         if is_extension:
             return pg.MooncakeBackendOptions(active_ranks, True)
@@ -121,7 +129,7 @@ def mooncake_backend_options(
 
 
 def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
-    return mooncake_backend_options(world_size, "cpu", active_value=0)
+    return mooncake_backend_options(world_size, "cpu", active_value=1)
 
 
 def mooncake_extension_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
@@ -144,6 +152,7 @@ def init_mooncake_group(
     is_extension: bool = False,
     active_value: int | None = None,
     max_world_size: int | None = None,
+    lazy_init: bool = False,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -153,15 +162,14 @@ def init_mooncake_group(
         "world_size": world_size,
     }
     if use_pg_options:
-        resolved_active_value = (
-            1 if is_extension else 0 if active_value is None else active_value
-        )
+        resolved_active_value = 1 if active_value is None else active_value
         kwargs["pg_options"] = mooncake_backend_options(
             world_size,
             device_type,
             active_value=resolved_active_value,
             is_extension=is_extension,
             max_world_size=max_world_size,
+            lazy_init=lazy_init,
         )
     dist.init_process_group(**kwargs)
     return device
@@ -220,6 +228,7 @@ class MooncakePGWorkerContext:
         is_extension: bool = False,
         active_value: int | None = None,
         max_world_size: int | None = None,
+        lazy_init: bool = False,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -233,6 +242,7 @@ class MooncakePGWorkerContext:
             is_extension=is_extension,
             active_value=active_value,
             max_world_size=max_world_size,
+            lazy_init=lazy_init,
         )
         return self._device
 

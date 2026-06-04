@@ -110,6 +110,7 @@ class MooncakeWorker {
      * @return True if all tasks completed within the timeout; false if timed
      * out.
      */
+    bool hasActiveTasks(const TransferGroupMeta* meta) const;
     bool drainTasks(const TransferGroupMeta* meta) const;
 
     bool waitUntilTasksSubmitted(

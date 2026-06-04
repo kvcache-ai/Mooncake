@@ -1,5 +1,5 @@
 import os
-import time
+import signal
 import unittest
 
 import torch
@@ -21,10 +21,15 @@ from pg_test_utils import (
 BROKEN_RANK = 1
 
 
+def _rank_sum(world_size: int, excluded: set[int] | None = None) -> int:
+    excluded = set() if excluded is None else excluded
+    return sum(rank for rank in range(world_size) if rank not in excluded)
+
+
 def _dynamic_world_size_worker(
     ctx: MooncakePGWorkerContext,
 ) -> None:
-    """Worker for testing that dist.get_world_size() reflects dynamic size after extend."""
+    """Worker for testing that extend_group_size_to reserves inactive capacity."""
     initial_world_size = ctx.world_size
     ctx.init_group()
     backend = ctx.get_backend()
@@ -40,8 +45,17 @@ def _dynamic_world_size_worker(
     assert new_ws == initial_world_size + 1, (
         f"rank {ctx.rank}: after extend world_size={new_ws}, expected {initial_world_size + 1}"
     )
+    active_ranks = pg.get_active_ranks(backend).cpu().tolist()
+    expected_active = [1] * initial_world_size + [0]
+    assert active_ranks == expected_active, (
+        f"rank {ctx.rank}: after extend active_ranks={active_ranks}, expected {expected_active}"
+    )
 
-    ctx.record_result({"initial_ws": initial_ws, "new_ws": new_ws})
+    ctx.record_result({
+        "initial_ws": initial_ws,
+        "new_ws": new_ws,
+        "active_ranks": active_ranks,
+    })
 
 
 def _extension_worker(
@@ -92,11 +106,17 @@ def _extension_worker(
         )
         pg.recover_ranks(backend, join_ranks)
 
-        # After recover_ranks, world_size should now reflect the expanded group
         actual_ws_after = dist.get_world_size()
         assert actual_ws_after == ctx.world_size, (
             f"rank {ctx.proc_rank}: world_size after recover={actual_ws_after}, "
             f"expected max_world_size={ctx.world_size}"
+        )
+
+        active_after = pg.get_active_ranks(backend).cpu().tolist()
+        expected_active_after = [1] * ctx.world_size
+        assert active_after == expected_active_after, (
+            f"rank {ctx.proc_rank}: active_ranks after recover={active_after}, "
+            f"expected {expected_active_after}"
         )
 
         # Final collective
@@ -107,6 +127,7 @@ def _extension_worker(
             "role": "original",
             "rank": ctx.proc_rank,
             "baseline": baseline,
+            "active_ranks": active_after,
         })
     else:
         # Extension rank
@@ -145,11 +166,11 @@ def _extension_worker(
         # publishes the extension state.
         pg.join_group(backend)
 
-        # After joinGroup, world_size should reflect the full group
-        actual_ws_after = dist.get_world_size()
-        assert actual_ws_after == ctx.world_size, (
-            f"extension rank: world_size after joinGroup={actual_ws_after}, "
-            f"expected {ctx.world_size}"
+        active_after = pg.get_active_ranks(backend).cpu().tolist()
+        expected_active_after = [1] * ctx.world_size
+        assert active_after == expected_active_after, (
+            f"extension rank: active_ranks after joinGroup={active_after}, "
+            f"expected {expected_active_after}"
         )
 
         # Final collective
@@ -159,6 +180,7 @@ def _extension_worker(
         ctx.record_result({
             "role": "extension",
             "rank": extension_rank,
+            "active_ranks": active_after,
         })
 
 
@@ -575,29 +597,44 @@ def _allgather_reduce_scatter_recovery_worker(
 def _fault_detection_worker(
     ctx: MooncakePGWorkerContext,
     broken_exited: mp.Event,
+    hard_kill: bool = False,
 ) -> None:
     """Worker for testing fault detection - survivors can continue without broken rank."""
     device = ctx.init_group()
 
-    # Step 1: All ranks participate in first collective
+    # Step 1: All ranks participate in first collective.
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    baseline = int(tensor.cpu().item())
+    expected_baseline = _rank_sum(ctx.world_size)
+    if baseline != expected_baseline:
+        raise AssertionError(f"baseline expected {expected_baseline}, got {baseline}")
 
+    # Step 2: One rank exits; survivors only observe membership change when the
+    # next collective detects the failed participant.
     if ctx.rank == BROKEN_RANK:
-        # Step 2: Broken rank exits after first collective
-        ctx.record_result({"role": "broken"})
+        ctx.record_result({"role": "broken", "baseline": baseline})
         broken_exited.set()
+        if hard_kill:
+            os.kill(os.getpid(), signal.SIGKILL)
         os._exit(0)
 
-    # Step 3: Survivors wait for broken rank to exit
     broken_exited.wait()
 
-    # Step 4: Survivors run collective without broken rank
-    # This should not hang - verifies fault detection works
+    # Step 3: The collective itself deactivates the failed rank and completes
+    # among surviving active ranks.
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    degraded = int(tensor.item())
+    expected_degraded = _rank_sum(ctx.world_size, {BROKEN_RANK})
+    if degraded != expected_degraded:
+        raise AssertionError(f"degraded expected {expected_degraded}, got {degraded}")
 
-    ctx.record_result({"role": "survivor"})
+    ctx.record_result({
+        "role": "survivor",
+        "baseline": baseline,
+        "degraded": degraded,
+    })
 
 
 def _replacement_recovery_worker(
@@ -616,10 +653,16 @@ def _replacement_recovery_worker(
         # First collective with all ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        baseline = int(tensor.cpu().item())
+        expected_baseline = _rank_sum(ctx.world_size)
+        if baseline != expected_baseline:
+            raise AssertionError(
+                f"baseline expected {expected_baseline}, got {baseline}"
+            )
 
         if logical_rank == BROKEN_RANK:
             # Broken rank exits
-            ctx.record_result({"role": "broken"})
+            ctx.record_result({"role": "broken", "baseline": baseline})
             broken_exited.set()
             os._exit(0)
 
@@ -627,9 +670,16 @@ def _replacement_recovery_worker(
         broken_exited.wait()
         backend = ctx.get_backend()
 
-        # Run collective without broken rank
+        # The collective itself deactivates the failed rank and completes among
+        # the surviving active ranks.
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        degraded = int(tensor.cpu().item())
+        expected_degraded = _rank_sum(ctx.world_size, {BROKEN_RANK})
+        if degraded != expected_degraded:
+            raise AssertionError(
+                f"degraded expected {expected_degraded}, got {degraded}"
+            )
 
         # Signal that we're ready for replacement
         if logical_rank == 0:
@@ -653,8 +703,18 @@ def _replacement_recovery_worker(
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        recovered = int(tensor.cpu().item())
+        if recovered != expected_baseline:
+            raise AssertionError(
+                f"recovered expected {expected_baseline}, got {recovered}"
+            )
 
-        ctx.record_result({"role": "survivor"})
+        ctx.record_result({
+            "role": "survivor",
+            "baseline": baseline,
+            "degraded": degraded,
+            "recovered": recovered,
+        })
     else:
         # Replacement process (proc_rank = world_size)
         # Wait for signal to start
@@ -673,8 +733,14 @@ def _replacement_recovery_worker(
         # Final collective with all 4 ranks
         tensor = torch.tensor([logical_rank], dtype=torch.int32, device=device)
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        recovered = int(tensor.cpu().item())
+        expected_recovered = _rank_sum(ctx.world_size)
+        if recovered != expected_recovered:
+            raise AssertionError(
+                f"replacement expected {expected_recovered}, got {recovered}"
+            )
 
-        ctx.record_result({"role": "replacement"})
+        ctx.record_result({"role": "replacement", "recovered": recovered})
 
 
 class _ElasticMixin:
@@ -682,7 +748,7 @@ class _ElasticMixin:
     spawn_timeout_s = 30.0
 
     def test_dynamic_world_size(self) -> None:
-        """Test that dist.get_world_size() returns updated value after extend_group_size_to."""
+        """Test that extend_group_size_to reserves inactive capacity."""
         rows = self.spawn_backend_and_collect(
             _dynamic_world_size_worker,
             timeout_s=30.0,
@@ -691,6 +757,7 @@ class _ElasticMixin:
         self.assert_all_ok(rows)
         for row in rows:
             self.assertEqual(row["new_ws"], self.world_size + 1)
+            self.assertEqual(row["active_ranks"], [1] * self.world_size + [0])
 
     def test_failed_rank(self) -> None:
         """Test that survivors can continue collective after a rank fails."""
@@ -707,9 +774,35 @@ class _ElasticMixin:
         survivor_rows = [r for r in rows if r.get("role") == "survivor"]
         self.assertEqual(len(survivor_rows), self.world_size - 1)
 
+        expected_baseline = _rank_sum(self.world_size)
+        expected_degraded = _rank_sum(self.world_size, {BROKEN_RANK})
+        for row in survivor_rows:
+            self.assertEqual(row["baseline"], expected_baseline)
+            self.assertEqual(row["degraded"], expected_degraded)
+
         # Broken rank should have exited (may not have result)
         broken_rows = [r for r in rows if r.get("role") == "broken"]
         self.assertGreaterEqual(len(broken_rows), 1)
+
+    def test_kill9_fault_detection(self) -> None:
+        """Gated hard-kill repro for degraded survivor continuation."""
+        if os.environ.get("MOONCAKE_PG_ENABLE_KILL9_TESTS") != "1":
+            self.skipTest("set MOONCAKE_PG_ENABLE_KILL9_TESTS=1 to run")
+
+        spawn_ctx = mp.get_context("spawn")
+        broken_exited = spawn_ctx.Event()
+        rows = self.spawn_backend_and_collect(
+            _fault_detection_worker,
+            broken_exited,
+            True,
+            timeout_s=60.0,
+        )
+
+        survivor_rows = [r for r in rows if r.get("role") == "survivor"]
+        self.assertEqual(len(survivor_rows), self.world_size - 1)
+        expected_degraded = _rank_sum(self.world_size, {BROKEN_RANK})
+        for row in survivor_rows:
+            self.assertEqual(row["degraded"], expected_degraded)
 
     def test_recovery(self) -> None:
         """Test that replacement can join and restore full collective."""
@@ -735,6 +828,15 @@ class _ElasticMixin:
         self.assertEqual(len(survivor_rows), self.world_size - 1)
         self.assertEqual(len(replacement_rows), 1)
         self.assertGreaterEqual(len(broken_rows), 1)
+
+        expected_baseline = _rank_sum(self.world_size)
+        expected_degraded = _rank_sum(self.world_size, {BROKEN_RANK})
+        for row in survivor_rows:
+            self.assertEqual(row["baseline"], expected_baseline)
+            self.assertEqual(row["degraded"], expected_degraded)
+            self.assertEqual(row["recovered"], expected_baseline)
+        for row in replacement_rows:
+            self.assertEqual(row["recovered"], expected_baseline)
 
     def test_extension(self) -> None:
         """Test extension mode allows new ranks to join existing group."""
@@ -763,6 +865,8 @@ class _ElasticMixin:
         expected_baseline = (self.world_size - 1) * self.world_size // 2
         for row in original_rows:
             self.assertEqual(row.get("baseline"), expected_baseline)
+        for row in rows:
+            self.assertEqual(row.get("active_ranks"), [1] * self.world_size)
 
     def test_extension_with_subgroups(self) -> None:
         """Test extension with multiple disjoint subgroups using split-ranks pattern."""

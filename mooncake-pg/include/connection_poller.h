@@ -2,10 +2,13 @@
 #define MOONCAKE_PG_CONNECTION_POLLER_H
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -42,6 +45,16 @@ struct PeerConnection {
     std::chrono::steady_clock::time_point last_check_store;
     size_t check_store_backoff_ms{kCheckStoreInitialBackoffMs};
 
+    // Out-of-band liveness probe state. The connection poller probes connected
+    // active peers periodically and only marks them disconnected after multiple
+    // consecutive failures to avoid transient false positives.
+    // NOTE: health-check failures are intentionally isolated from
+    // peerConnected/activeRanks so that idle PG does not observe membership
+    // changes.  Only collective/P2P transfer failures may mutate activeRanks.
+    std::chrono::steady_clock::time_point last_liveness_probe;
+    int consecutive_liveness_failures{0};
+    bool peerAliveByHealthCheck{true};
+
     void increaseCheckStoreBackoff() {
         check_store_backoff_ms =
             (std::min)(check_store_backoff_ms * 2,
@@ -55,6 +68,8 @@ struct PeerConnection {
 
 class ConnectionContext {
     static constexpr size_t kDrainPollerTimeoutMs = 5000;  // 5s
+    static constexpr size_t kHealthCheckIntervalMs = 1000;
+    static constexpr int kHealthCheckFailureThreshold = 3;
     friend class ConnectionPoller;
 
     int backendIndex_;
@@ -99,6 +114,8 @@ class ConnectionContext {
     std::mutex backend_wakeup_mutex_;
     std::condition_variable backend_wakeup_cv_;
 
+    std::function<bool()> livenessProbeAllowed_;
+
     bool resource_abandoned_{false};
 
    public:
@@ -133,6 +150,7 @@ class ConnectionContext {
 
     // Allow polling ranks beyond groupSize_ without changing groupSize_.
     void setPollingLimitTo(int pollingLimit);
+    void setLivenessProbeGuard(std::function<bool()> livenessProbeAllowed);
 
     /**
      * @brief Checks whether all peers within the group have
@@ -211,6 +229,7 @@ class ConnectionContext {
 
     // Internal helpers
     bool pollPeer(int pollingRank);
+    void markPeerDisconnected(int pollingRank, const char* reason);
 };
 
 class ConnectionPoller {
