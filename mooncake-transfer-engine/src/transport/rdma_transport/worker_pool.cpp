@@ -143,7 +143,7 @@ int WorkerPool::submitPostSend(
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
         auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->name,
+            MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
@@ -380,7 +380,7 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             slice->rdma.dest_rkey =
                 peer_segment_desc->buffers[buffer_id].rkey[device_id];
             auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->name,
+                MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);

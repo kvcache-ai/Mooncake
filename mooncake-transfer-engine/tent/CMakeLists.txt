@@ -8,4 +8,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(src)
 add_subdirectory(plugins)
-add_subdirectory(tests)
+if (BUILD_UNIT_TESTS)
+    add_subdirectory(tests)
+endif()

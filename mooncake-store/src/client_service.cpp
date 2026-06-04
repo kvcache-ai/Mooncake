@@ -8,13 +8,20 @@
 #include <csignal>
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
+#ifdef USE_NOF
+#include <numa.h>
+#endif
 #include <optional>
 #include <ranges>
+#include <span>
+#include <sched.h>
 #include <thread>
 #include <set>
 #include <ylt/struct_json/json_reader.h>
@@ -38,6 +45,214 @@ using gpu_staging::CopyDeviceToHost;
 using gpu_staging::IsDevicePointer;
 using gpu_staging::SetDevice;
 
+namespace {
+
+#ifdef USE_NOF
+std::optional<int> GetConfiguredNumaSocketId() {
+    const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
+    if (!raw_value || raw_value[0] == '\0') {
+        return std::nullopt;
+    }
+
+    char* end_ptr = nullptr;
+    errno = 0;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value ||
+        (end_ptr != nullptr && *end_ptr != '\0') || parsed < 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid MC_STORE_NUMA_SOCKET_ID=" << raw_value
+                     << ", falling back to auto-detect";
+        return std::nullopt;
+    }
+
+    return static_cast<int>(parsed);
+}
+
+int GetCurrentNumaSocketId() {
+    if (numa_available() < 0) {
+        return 0;
+    }
+    int cpu = sched_getcpu();
+    if (cpu < 0) {
+        return 0;
+    }
+    int node = numa_node_of_cpu(cpu);
+    return node < 0 ? 0 : node;
+}
+#endif
+
+struct ContiguousSliceRange {
+    void* ptr = nullptr;
+    size_t size = 0;
+};
+
+std::optional<ContiguousSliceRange> GetContiguousSliceRange(
+    std::span<const Slice> slices) {
+    if (slices.empty()) {
+        return std::nullopt;
+    }
+
+    uintptr_t expected_ptr = 0;
+    uintptr_t start_ptr = 0;
+    size_t total_size = 0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& slice = slices[i];
+        if (slice.ptr == nullptr) {
+            return std::nullopt;
+        }
+
+        const auto current_ptr = reinterpret_cast<uintptr_t>(slice.ptr);
+        if (i == 0) {
+            start_ptr = current_ptr;
+            expected_ptr = current_ptr;
+        } else if (current_ptr != expected_ptr) {
+            return std::nullopt;
+        }
+
+        if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+            return std::nullopt;
+        }
+        if (slice.size > std::numeric_limits<uintptr_t>::max() - current_ptr) {
+            return std::nullopt;
+        }
+
+        total_size += slice.size;
+        expected_ptr = current_ptr + slice.size;
+    }
+
+    if (total_size == 0) {
+        return std::nullopt;
+    }
+
+    return ContiguousSliceRange{.ptr = reinterpret_cast<void*>(start_ptr),
+                                .size = total_size};
+}
+
+struct ReplicaTransferSummary {
+    size_t allocated_memory_replicas = 0;
+    size_t allocated_nof_replicas = 0;
+    size_t successful_memory_transfers = 0;
+    size_t successful_nof_transfers = 0;
+    size_t failed_memory_transfers = 0;
+    size_t failed_nof_transfers = 0;
+    ErrorCode first_error = ErrorCode::OK;
+
+    void RecordAllocatedReplica(const Replica::Descriptor& replica) {
+        if (replica.is_memory_replica()) {
+            ++allocated_memory_replicas;
+        } else if (replica.is_nof_replica()) {
+            ++allocated_nof_replicas;
+        }
+    }
+
+    void RecordSuccess(ReplicaType replica_type) {
+        if (replica_type == ReplicaType::MEMORY) {
+            ++successful_memory_transfers;
+        } else if (replica_type == ReplicaType::NOF_SSD) {
+            ++successful_nof_transfers;
+        }
+    }
+
+    void RecordFailure(ReplicaType replica_type, ErrorCode error) {
+        if (replica_type == ReplicaType::MEMORY) {
+            ++failed_memory_transfers;
+        } else if (replica_type == ReplicaType::NOF_SSD) {
+            ++failed_nof_transfers;
+        }
+        if (first_error == ErrorCode::OK) {
+            first_error = error;
+        }
+    }
+};
+
+bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
+                                  const ReplicaTransferSummary& summary) {
+    if (config.nof_replica_num == 0) {
+        return summary.allocated_memory_replicas > 0;
+    }
+    if (DetermineReplicaWriteMode(config) ==
+        ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        return summary.allocated_memory_replicas +
+                   summary.allocated_nof_replicas >
+               0;
+    }
+    return summary.allocated_memory_replicas == config.replica_num &&
+           summary.allocated_nof_replicas == config.nof_replica_num;
+}
+
+// success describes whether the overall put should succeed. Reliable modes
+// require all allocated replicas to complete. Flexible dual-replica mode only
+// requires one replica type to succeed, so success may be true while
+// revoke_type is also set for the failed side.
+struct FinalizeDecision {
+    std::optional<ReplicaType> end_type;
+    std::optional<ReplicaType> revoke_type;
+    bool success = false;
+    ErrorCode error = ErrorCode::OK;
+};
+
+FinalizeDecision DetermineFinalizeDecision(
+    const ReplicateConfig& config, const ReplicaTransferSummary& summary) {
+    const auto write_mode = DetermineReplicaWriteMode(config);
+    const bool allocation_satisfied =
+        HasExpectedReplicaAllocation(config, summary);
+
+    if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
+        const bool all_transfers_succeeded =
+            summary.successful_memory_transfers ==
+                summary.allocated_memory_replicas &&
+            summary.successful_nof_transfers ==
+                summary.allocated_nof_replicas &&
+            summary.failed_memory_transfers == 0 &&
+            summary.failed_nof_transfers == 0;
+        if (allocation_satisfied && all_transfers_succeeded) {
+            return {.end_type = ReplicaType::ALL,
+                    .revoke_type = std::nullopt,
+                    .success = true,
+                    .error = ErrorCode::OK};
+        }
+        return {.end_type = std::nullopt,
+                .revoke_type = ReplicaType::ALL,
+                .success = false,
+                .error = allocation_satisfied
+                             ? (summary.first_error == ErrorCode::OK
+                                    ? ErrorCode::TRANSFER_FAIL
+                                    : summary.first_error)
+                             : ErrorCode::NO_AVAILABLE_HANDLE};
+    }
+
+    const bool memory_succeeded = summary.successful_memory_transfers > 0;
+    const bool nof_succeeded = summary.successful_nof_transfers > 0;
+
+    if (memory_succeeded && nof_succeeded) {
+        return {.end_type = ReplicaType::ALL,
+                .revoke_type = std::nullopt,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+    if (memory_succeeded) {
+        return {.end_type = ReplicaType::MEMORY,
+                .revoke_type = ReplicaType::NOF_SSD,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+    if (nof_succeeded) {
+        return {.end_type = ReplicaType::NOF_SSD,
+                .revoke_type = ReplicaType::MEMORY,
+                .success = true,
+                .error = ErrorCode::OK};
+    }
+
+    return {.end_type = std::nullopt,
+            .revoke_type = ReplicaType::ALL,
+            .success = false,
+            .error = summary.first_error == ErrorCode::OK
+                         ? ErrorCode::NO_AVAILABLE_HANDLE
+                         : summary.first_error};
+}
+
+}  // namespace
+
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
     for (const auto& slice : slices) {
@@ -57,11 +272,13 @@ using gpu_staging::SetDevice;
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
-               const std::map<std::string, std::string>& labels)
+               const std::map<std::string, std::string>& labels,
+               const std::string& tenant_id)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr),
+                     metrics_ ? &metrics_->master_client_metric : nullptr,
+                     tenant_id),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
@@ -569,6 +786,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "ub") {
+            auto deviceName = device_names.value_or("bonding_dev_0");
+            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
+            auto devices = splitString(deviceName, ',', true);
+            auto topology = transfer_engine_->getLocalTopology();
+            if (topology) {
+                topology->discover(devices);
+                LOG(INFO) << "Topology discovery complete with specified "
+                             "devices. Found "
+                          << topology->getHcaList().size() << " HCAs";
+            }
+            transport = transfer_engine_->installTransport("ub", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install ub transport with specified "
+                              "devices";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -582,9 +816,17 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
+#ifdef USE_NOF
+    int numa_socket_id =
+        GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
+    transfer_submitter_ = std::make_unique<TransferSubmitter>(
+        *transfer_engine_, storage_backend_, local_hostname_,
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
+#else
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
+#endif
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -592,9 +834,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels) {
-    auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, protocol, labels));
+    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    auto client = std::shared_ptr<Client>(new Client(
+        local_hostname, metadata_connstring, protocol, labels, tenant_id));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -772,9 +1014,14 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
+    return BatchQuery(object_keys, master_client_.tenant_id());
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto response = master_client_.BatchGetReplicaList(object_keys);
+    auto response = master_client_.BatchGetReplicaList(object_keys, tenant_id);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -1112,8 +1359,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         // Submit transfer operation asynchronously
-        auto future = transfer_submitter_->submit(replica, slices_it->second,
-                                                  TransferRequest::READ);
+        std::optional<TransferFuture> future;
+        if (replica.is_nof_replica()) {
+            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
+            if (!contiguous_range.has_value()) {
+                LOG(ERROR) << "NoF transfer requires contiguous slices";
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            future = transfer_submitter_->submit(
+                replica, slices_it->second, TransferRequest::READ,
+                contiguous_range->ptr, contiguous_range->size);
+        } else {
+            future = transfer_submitter_->submit(replica, slices_it->second,
+                                                 TransferRequest::READ);
+        }
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
@@ -1247,6 +1507,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    ReplicaTransferSummary transfer_summary;
+    for (const auto& replica : start_result.value()) {
+        transfer_summary.RecordAllocatedReplica(replica);
+    }
+
     // Record Put transfer latency (all replicas)
     auto t0_put = std::chrono::steady_clock::now();
 
@@ -1266,19 +1531,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     for (const auto& replica : start_result.value()) {
-        if (replica.is_memory_replica()) {
+        if (replica.is_memory_replica() || replica.is_nof_replica()) {
             // Transfer data using allocated handles from all replicas
+            const auto replica_type = replica.is_memory_replica()
+                                          ? ReplicaType::MEMORY
+                                          : ReplicaType::NOF_SSD;
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
-                // Revoke put operation
-                auto revoke_result =
-                    master_client_.PutRevoke(key, ReplicaType::MEMORY);
-                if (!revoke_result) {
-                    LOG(ERROR) << "Failed to revoke put operation";
-                    return tl::unexpected(revoke_result.error());
-                }
-                return tl::unexpected(transfer_err);
+                transfer_summary.RecordFailure(replica_type, transfer_err);
+                continue;
             }
+            transfer_summary.RecordSuccess(replica_type);
         }
     }
 
@@ -1289,12 +1552,30 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
 
-    // End put operation
-    auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
-    if (!end_result) {
-        ErrorCode err = end_result.error();
-        LOG(ERROR) << "Failed to end put operation: " << err;
-        return tl::unexpected(err);
+    const auto finalize_decision =
+        DetermineFinalizeDecision(config, transfer_summary);
+
+    if (finalize_decision.end_type.has_value()) {
+        auto end_result =
+            master_client_.PutEnd(key, *finalize_decision.end_type);
+        if (!end_result) {
+            ErrorCode err = end_result.error();
+            LOG(ERROR) << "Failed to end put operation: " << err;
+            return tl::unexpected(err);
+        }
+    }
+
+    if (finalize_decision.revoke_type.has_value()) {
+        auto revoke_result =
+            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        if (!revoke_result) {
+            LOG(ERROR) << "Failed to revoke put operation";
+            return tl::unexpected(revoke_result.error());
+        }
+    }
+
+    if (!finalize_decision.success) {
+        return tl::unexpected(finalize_decision.error);
     }
 
     return {};
@@ -1421,23 +1702,34 @@ enum class PutOperationState {
 
 class PutOperation {
    public:
+    struct PendingTransferRecord {
+        ReplicaType replica_type;
+        TransferFuture future;
+
+        PendingTransferRecord(ReplicaType type,
+                              TransferFuture&& transfer_future)
+            : replica_type(type), future(std::move(transfer_future)) {}
+    };
+
     PutOperation(std::string_view k, const std::vector<Slice>& s)
         : key(k), slices(s) {
-        value_length = CalculateSliceSize(slices);
         // Initialize with a pending error state to ensure result is always set
         result = tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     std::string key;
     std::vector<Slice> slices;
-    size_t value_length;
     std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
-    std::vector<TransferFuture> pending_transfers;
+    std::vector<PendingTransferRecord> pending_transfers;
+
+    size_t requested_memory_replicas = 0;
+    size_t requested_nof_replicas = 0;
+    ReplicaTransferSummary transfer_summary;
 
     // Error context for debugging
     std::optional<std::string> failure_context;
@@ -1447,6 +1739,15 @@ class PutOperation {
         state = PutOperationState::SUCCESS;
         result = {};
         failure_context.reset();
+    }
+
+    void SetTerminalError(ErrorCode error, PutOperationState terminal_state,
+                          const std::string& context = "") {
+        state = terminal_state;
+        result = tl::unexpected(error);
+        if (!context.empty()) {
+            failure_context = context;
+        }
     }
 
     void SetError(ErrorCode error, const std::string& context = "") {
@@ -1463,6 +1764,36 @@ class PutOperation {
             state = PutOperationState::TRANSFER_FAILED;
         } else {
             state = PutOperationState::FINALIZE_FAILED;
+        }
+    }
+
+    void AppendFailureContext(const std::string& context) {
+        if (context.empty()) {
+            return;
+        }
+        if (!failure_context.has_value()) {
+            failure_context = context;
+            return;
+        }
+        failure_context = *failure_context + "; " + context;
+    }
+
+    void InitializeRequestedReplicas(const ReplicateConfig& config) {
+        requested_memory_replicas = config.replica_num;
+        requested_nof_replicas = config.nof_replica_num;
+    }
+
+    ReplicateConfig ToReplicateConfig() const {
+        ReplicateConfig config;
+        config.replica_num = requested_memory_replicas;
+        config.nof_replica_num = requested_nof_replicas;
+        return config;
+    }
+
+    void RecordAllocatedReplicas() {
+        transfer_summary = ReplicaTransferSummary{};
+        for (const auto& replica : replicas) {
+            transfer_summary.RecordAllocatedReplica(replica);
         }
     }
 
@@ -1519,11 +1850,22 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
 
     // Process individual responses with robust error handling
     for (size_t i = 0; i < ops.size(); ++i) {
+        ops[i].InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
-            ops[i].SetError(start_responses[i].error(),
-                            "Master failed to start put operation");
+            ops[i].SetTerminalError(start_responses[i].error(),
+                                    PutOperationState::MASTER_FAILED,
+                                    "Master failed to start put operation");
         } else {
             ops[i].replicas = start_responses[i].value();
+            ops[i].RecordAllocatedReplicas();
+            if (!HasExpectedReplicaAllocation(config,
+                                              ops[i].transfer_summary)) {
+                ops[i].SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                        PutOperationState::MASTER_FAILED,
+                                        "Allocated replicas do not satisfy "
+                                        "requested replica policy");
+                continue;
+            }
             // Operation continues to next stage - result remains INTERNAL_ERROR
             // until fully successful
             VLOG(1) << "Successfully started put for key " << ops[i].key
@@ -1582,8 +1924,9 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
-            op.SetError(ErrorCode::INVALID_PARAMS,
-                        "TransferSubmitter not initialized");
+            op.SetTerminalError(ErrorCode::INVALID_PARAMS,
+                                PutOperationState::TRANSFER_FAILED,
+                                "TransferSubmitter not initialized");
         }
         return;
     }
@@ -1596,13 +1939,11 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 
         // Skip operations that don't have replicas (failed in StartBatchPut)
         if (op.replicas.empty()) {
-            op.SetError(ErrorCode::INTERNAL_ERROR,
-                        "No replicas available for transfer");
+            op.SetTerminalError(ErrorCode::INTERNAL_ERROR,
+                                PutOperationState::MASTER_FAILED,
+                                "No replicas available for transfer");
             continue;
         }
-
-        bool all_transfers_submitted = true;
-        std::string failure_context;
 
         // We must deal with disk replica first, then the disk putrevoke/putend
         // can be called surely
@@ -1621,31 +1962,48 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         for (size_t replica_idx = 0; replica_idx < op.replicas.size();
              ++replica_idx) {
             const auto& replica = op.replicas[replica_idx];
-            if (replica.is_memory_replica()) {
-                auto submit_result = transfer_submitter_->submit(
-                    replica, op.slices, TransferRequest::WRITE);
+            if (replica.is_memory_replica() || replica.is_nof_replica()) {
+                const auto replica_type = replica.is_memory_replica()
+                                              ? ReplicaType::MEMORY
+                                              : ReplicaType::NOF_SSD;
+                std::optional<TransferFuture> submit_result;
+                if (replica.is_nof_replica()) {
+                    auto contiguous_range = GetContiguousSliceRange(op.slices);
+                    if (!contiguous_range.has_value()) {
+                        std::string failure_context =
+                            "NoF transfer requires contiguous slices for "
+                            "replica " +
+                            std::to_string(replica_idx);
+                        op.transfer_summary.RecordFailure(
+                            replica_type, ErrorCode::INVALID_PARAMS);
+                        op.AppendFailureContext(failure_context);
+                        continue;
+                    }
+                    submit_result = transfer_submitter_->submit(
+                        replica, op.slices, TransferRequest::WRITE,
+                        contiguous_range->ptr, contiguous_range->size);
+                } else {
+                    submit_result = transfer_submitter_->submit(
+                        replica, op.slices, TransferRequest::WRITE);
+                }
 
                 if (!submit_result) {
-                    failure_context = "Failed to submit transfer for replica " +
-                                      std::to_string(replica_idx);
-                    all_transfers_submitted = false;
-                    break;
+                    std::string failure_context =
+                        "Failed to submit transfer for replica " +
+                        std::to_string(replica_idx);
+                    op.transfer_summary.RecordFailure(replica_type,
+                                                      ErrorCode::TRANSFER_FAIL);
+                    op.AppendFailureContext(failure_context);
+                    continue;
                 }
 
                 op.pending_transfers.emplace_back(
-                    std::move(submit_result.value()));
+                    replica_type, std::move(submit_result.value()));
             }
         }
 
-        if (!all_transfers_submitted) {
-            LOG(ERROR) << "Transfer submission failed for key " << op.key
-                       << ": " << failure_context;
-            op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
-            op.pending_transfers.clear();
-        } else {
-            VLOG(1) << "Successfully submitted " << op.pending_transfers.size()
-                    << " transfers for key " << op.key;
-        }
+        VLOG(1) << "Submitted " << op.pending_transfers.size()
+                << " transfers for key " << op.key;
     }
 }
 
@@ -1656,154 +2014,223 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             continue;
         }
 
-        // Skip operations with no pending transfers (failed in SubmitTransfers)
-        if (op.pending_transfers.empty()) {
-            op.SetError(ErrorCode::INTERNAL_ERROR,
-                        "No pending transfers to wait for");
-            continue;
-        }
-
-        bool all_transfers_succeeded = true;
-        ErrorCode first_error = ErrorCode::OK;
-        size_t failed_transfer_idx = 0;
-
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
-            ErrorCode transfer_result = op.pending_transfers[i].get();
+            auto& pending_transfer = op.pending_transfers[i];
+            ErrorCode transfer_result = pending_transfer.future.get();
             if (transfer_result != ErrorCode::OK) {
-                if (all_transfers_succeeded) {
-                    // Record the first error for reporting
-                    first_error = transfer_result;
-                    failed_transfer_idx = i;
-                    all_transfers_succeeded = false;
-                }
-                // Continue waiting for all transfers to avoid resource leaks
+                op.transfer_summary.RecordFailure(pending_transfer.replica_type,
+                                                  transfer_result);
+                std::string error_context =
+                    "Transfer " + std::to_string(i) + " failed";
+                op.AppendFailureContext(error_context);
+            } else {
+                op.transfer_summary.RecordSuccess(
+                    pending_transfer.replica_type);
             }
         }
 
-        if (all_transfers_succeeded) {
-            VLOG(1) << "All transfers completed successfully for key "
-                    << op.key;
-            // Transfer phase successful - continue to finalization
-            // Note: Don't mark as SUCCESS yet, need to complete finalization
-        } else {
-            std::string error_context =
-                "Transfer " + std::to_string(failed_transfer_idx) + " failed";
-            LOG(ERROR) << "Transfer failed for key " << op.key << ": "
-                       << toString(first_error) << " (" << error_context << ")";
-            op.SetError(first_error, error_context);
-        }
+        VLOG(1) << "Transfers finished for key " << op.key << ", success(mem="
+                << op.transfer_summary.successful_memory_transfers
+                << ", nof=" << op.transfer_summary.successful_nof_transfers
+                << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
+                << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
     }
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
-    // For each operation,
-    // If transfers completed successfully, we need to call BatchPutEnd
-    // If the operation failed but has allocated replicas, we need to call
-    // BatchPutRevoke
+    struct BatchFinalizeGroup {
+        std::vector<std::string> keys;
+        std::vector<size_t> indices;
+    };
 
-    std::vector<std::string> successful_keys;
-    std::vector<size_t> successful_indices;
-    std::vector<std::string> failed_keys;
-    std::vector<size_t> failed_indices;
+    BatchFinalizeGroup end_all_group;
+    BatchFinalizeGroup end_memory_group;
+    BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup revoke_all_group;
+    BatchFinalizeGroup revoke_memory_group;
+    BatchFinalizeGroup revoke_nof_group;
 
-    // Reserve space to avoid reallocations
-    successful_keys.reserve(ops.size());
-    successful_indices.reserve(ops.size());
-    failed_keys.reserve(ops.size());
-    failed_indices.reserve(ops.size());
+    std::vector<size_t> pending_finalize_actions(ops.size(), 0);
+    std::vector<bool> should_succeed(ops.size(), false);
+    std::vector<ErrorCode> terminal_errors(ops.size(), ErrorCode::OK);
+    std::vector<std::optional<ErrorCode>> finalize_rpc_errors(ops.size());
+
+    auto add_group_entry = [](BatchFinalizeGroup& group, const std::string& key,
+                              size_t index) {
+        group.keys.emplace_back(key);
+        group.indices.emplace_back(index);
+    };
+
+    auto add_finalize_action =
+        [&](const std::optional<ReplicaType>& replica_type, bool is_end,
+            const std::string& key, size_t index) {
+            if (!replica_type.has_value()) {
+                return;
+            }
+            switch (*replica_type) {
+                case ReplicaType::ALL:
+                    add_group_entry(is_end ? end_all_group : revoke_all_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::MEMORY:
+                    add_group_entry(
+                        is_end ? end_memory_group : revoke_memory_group, key,
+                        index);
+                    ++pending_finalize_actions[index];
+                    break;
+                case ReplicaType::NOF_SSD:
+                    add_group_entry(is_end ? end_nof_group : revoke_nof_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
+                default:
+                    LOG(ERROR) << "Unexpected replica type in batch finalize: "
+                               << *replica_type;
+                    finalize_rpc_errors[index] = ErrorCode::INVALID_PARAMS;
+                    break;
+            }
+        };
+
+    auto complete_finalize_action = [&](size_t index) {
+        if (pending_finalize_actions[index] > 0) {
+            --pending_finalize_actions[index];
+        }
+    };
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
-
-        // Check if operation completed transfers successfully and needs
-        // finalization
-        if (!op.IsResolved() && !op.replicas.empty() &&
-            !op.pending_transfers.empty()) {
-            // Transfers completed, needs BatchPutEnd
-            successful_keys.emplace_back(op.key);
-            successful_indices.emplace_back(i);
-        } else if (op.state != PutOperationState::PENDING &&
-                   !op.replicas.empty()) {
-            // Operation failed but has allocated replicas, needs BatchPutRevoke
-            failed_keys.emplace_back(op.key);
-            failed_indices.emplace_back(i);
+        if (op.IsResolved()) {
+            if (!op.IsSuccessful() && !op.replicas.empty()) {
+                terminal_errors[i] = op.result.has_value()
+                                         ? ErrorCode::INTERNAL_ERROR
+                                         : op.result.error();
+                add_finalize_action(ReplicaType::ALL, false, op.key, i);
+            }
+            continue;
         }
-        // Operations without replicas (early failures) don't need finalization
+        if (op.replicas.empty()) {
+            op.SetTerminalError(ErrorCode::INTERNAL_ERROR,
+                                PutOperationState::MASTER_FAILED,
+                                "Operation has no replicas to finalize");
+            continue;
+        }
+
+        const auto finalize_decision = DetermineFinalizeDecision(
+            op.ToReplicateConfig(), op.transfer_summary);
+        should_succeed[i] = finalize_decision.success;
+        terminal_errors[i] = finalize_decision.error;
+        add_finalize_action(finalize_decision.end_type, true, op.key, i);
+        add_finalize_action(finalize_decision.revoke_type, false, op.key, i);
     }
 
-    // Process successful operations
-    if (!successful_keys.empty()) {
-        auto end_responses = master_client_.BatchPutEnd(successful_keys);
-        if (end_responses.size() != successful_keys.size()) {
-            LOG(ERROR) << "BatchPutEnd response size mismatch: expected "
-                       << successful_keys.size() << ", got "
-                       << end_responses.size();
-            for (size_t idx : successful_indices) {
-                ops[idx].SetError(ErrorCode::RPC_FAIL,
-                                  "BatchPutEnd response size mismatch");
-            }
-        } else {
-            // Process individual responses
-            for (size_t i = 0; i < end_responses.size(); ++i) {
-                const size_t op_idx = successful_indices[i];
-                if (!end_responses[i]) {
-                    LOG(ERROR) << "Failed to finalize put for key "
-                               << successful_keys[i] << ": "
-                               << toString(end_responses[i].error());
-                    ops[op_idx].SetError(end_responses[i].error(),
-                                         "BatchPutEnd failed");
-                } else {
-                    // Operation fully successful
-                    ops[op_idx].SetSuccess();
-                    VLOG(1) << "Successfully completed put for key "
-                            << successful_keys[i];
-                }
-            }
+    auto process_end_group = [&](BatchFinalizeGroup& group,
+                                 ReplicaType replica_type) {
+        if (group.keys.empty()) {
+            return;
         }
-    }
+        auto responses = master_client_.BatchPutEnd(group.keys, replica_type);
+        if (responses.size() != group.keys.size()) {
+            for (size_t idx : group.indices) {
+                finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
+                complete_finalize_action(idx);
+            }
+            return;
+        }
+        for (size_t i = 0; i < responses.size(); ++i) {
+            const size_t op_idx = group.indices[i];
+            if (!responses[i]) {
+                finalize_rpc_errors[op_idx] = responses[i].error();
+                LOG(ERROR) << "Failed to BatchPutEnd key " << group.keys[i]
+                           << ": " << toString(responses[i].error());
+                complete_finalize_action(op_idx);
+                continue;
+            }
+            complete_finalize_action(op_idx);
+        }
+    };
 
-    // Process failed operations that need cleanup
-    if (!failed_keys.empty()) {
-        auto revoke_responses = master_client_.BatchPutRevoke(failed_keys);
-        if (revoke_responses.size() != failed_keys.size()) {
-            LOG(ERROR) << "BatchPutRevoke response size mismatch: expected "
-                       << failed_keys.size() << ", got "
-                       << revoke_responses.size();
-            // Mark all failed operations with revoke RPC failure
-            for (size_t idx : failed_indices) {
-                ops[idx].SetError(ErrorCode::RPC_FAIL,
-                                  "BatchPutRevoke response size mismatch");
-            }
-        } else {
-            // Process individual revoke responses
-            for (size_t i = 0; i < revoke_responses.size(); ++i) {
-                const size_t op_idx = failed_indices[i];
-                if (!revoke_responses[i]) {
-                    LOG(ERROR)
-                        << "Failed to revoke put for key " << failed_keys[i]
-                        << ": " << toString(revoke_responses[i].error());
-                    // Preserve original error but note revoke failure in
-                    // context
-                    std::string original_context =
-                        ops[op_idx].failure_context.value_or("unknown error");
-                    ops[op_idx].failure_context =
-                        original_context + "; revoke also failed";
-                } else {
-                    LOG(INFO) << "Successfully revoked failed put for key "
-                              << failed_keys[i];
-                }
-            }
+    auto process_revoke_group = [&](BatchFinalizeGroup& group,
+                                    ReplicaType replica_type) {
+        if (group.keys.empty()) {
+            return;
         }
-    }
+        auto responses =
+            master_client_.BatchPutRevoke(group.keys, replica_type);
+        if (responses.size() != group.keys.size()) {
+            for (size_t idx : group.indices) {
+                finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
+                complete_finalize_action(idx);
+            }
+            return;
+        }
+        for (size_t i = 0; i < responses.size(); ++i) {
+            const size_t op_idx = group.indices[i];
+            if (!responses[i]) {
+                finalize_rpc_errors[op_idx] = responses[i].error();
+                LOG(ERROR) << "Failed to BatchPutRevoke key " << group.keys[i]
+                           << ": " << toString(responses[i].error());
+                complete_finalize_action(op_idx);
+                continue;
+            }
+            complete_finalize_action(op_idx);
+        }
+    };
 
-    // Ensure all operations have definitive results
-    for (auto& op : ops) {
-        if (!op.IsResolved()) {
-            op.SetError(ErrorCode::INTERNAL_ERROR,
-                        "Operation not resolved after finalization");
-            LOG(ERROR) << "Operation for key " << op.key
-                       << " was not properly resolved";
+    process_end_group(end_all_group, ReplicaType::ALL);
+    process_end_group(end_memory_group, ReplicaType::MEMORY);
+    process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_all_group, ReplicaType::ALL);
+    process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
+    process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+
+    auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
+        if (finalize_rpc_errors[index].has_value()) {
+            op.AppendFailureContext("Batch finalization RPC failed: " +
+                                    toString(*finalize_rpc_errors[index]));
         }
+        if (pending_finalize_actions[index] != 0) {
+            op.AppendFailureContext(
+                "Operation has unfinished finalize actions");
+        }
+    };
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        auto& op = ops[i];
+        if (op.IsResolved()) {
+            if (!op.IsSuccessful()) {
+                append_finalize_error_context(op, i);
+            }
+            continue;
+        }
+        if (finalize_rpc_errors[i].has_value() ||
+            pending_finalize_actions[i] != 0) {
+            if (!should_succeed[i] && terminal_errors[i] != ErrorCode::OK) {
+                append_finalize_error_context(op, i);
+                op.SetTerminalError(
+                    terminal_errors[i], PutOperationState::TRANSFER_FAILED,
+                    op.failure_context.value_or(
+                        "Replica transfer failed before finalize"));
+            } else if (finalize_rpc_errors[i].has_value()) {
+                op.SetTerminalError(*finalize_rpc_errors[i],
+                                    PutOperationState::FINALIZE_FAILED,
+                                    "Batch finalization RPC failed");
+            } else {
+                op.SetTerminalError(
+                    ErrorCode::INTERNAL_ERROR,
+                    PutOperationState::FINALIZE_FAILED,
+                    "Operation has unfinished finalize actions");
+            }
+            continue;
+        }
+        if (should_succeed[i]) {
+            op.SetSuccess();
+            continue;
+        }
+        op.SetTerminalError(terminal_errors[i],
+                            PutOperationState::TRANSFER_FAILED,
+                            op.failure_context.value_or(
+                                "Replica transfer failed before finalize"));
     }
 }
 
@@ -1984,6 +2411,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         merged_ops.emplace_back(op.key, op.slices);
         auto& merged_op = merged_ops.back();
         merged_op.replicas = op.replicas;
+        merged_op.transfer_summary.allocated_memory_replicas = 1;
         auto submit_result = transfer_submitter_->submit_batch(
             op.replicas, op.batched_slices, TransferRequest::WRITE);
         if (!submit_result) {
@@ -1991,12 +2419,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             all_transfers_submitted = false;
         } else {
             merged_op.pending_transfers.emplace_back(
-                std::move(submit_result.value()));
+                ReplicaType::MEMORY, std::move(submit_result.value()));
         }
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
                        << ": " << failure_context;
-            merged_op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
+            merged_op.transfer_summary.RecordFailure(ReplicaType::MEMORY,
+                                                     ErrorCode::TRANSFER_FAIL);
+            merged_op.failure_context = failure_context;
             merged_op.pending_transfers.clear();
         } else {
             VLOG(1) << "Successfully submitted "
@@ -2009,7 +2439,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
-        seg_to_ops.at(seg).state = op.state;
+        seg_to_ops.at(seg).transfer_summary = op.transfer_summary;
+        seg_to_ops.at(seg).failure_context = op.failure_context;
     }
     for (auto& op : ops) {
         if (op.IsResolved()) {
@@ -2018,10 +2449,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
-        op.state = seg_to_ops.at(seg).state;
-        auto state = std::make_shared<EmptyOperationState>();
-        auto future = TransferFuture(state);
-        op.pending_transfers.emplace_back(std::move(future));
+        op.transfer_summary.successful_memory_transfers =
+            seg_to_ops.at(seg).transfer_summary.successful_memory_transfers > 0
+                ? 1
+                : 0;
+        op.transfer_summary.failed_memory_transfers =
+            seg_to_ops.at(seg).transfer_summary.failed_memory_transfers > 0 ? 1
+                                                                            : 0;
+        op.transfer_summary.first_error =
+            seg_to_ops.at(seg).transfer_summary.first_error;
+        op.failure_context = seg_to_ops.at(seg).failure_context;
     }
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
@@ -2043,6 +2480,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
+        if (client_cfg.nof_replica_num > 0) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                          "NoF replicas";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
         if (client_cfg.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "replica_num != 1";
@@ -2092,10 +2535,11 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
-    // if (storage_backend_) {
-    //     storage_backend_->RemoveAll();
-    // }
-    return master_client_.RemoveAll(force);
+    auto result = master_client_.RemoveAll(force);
+    if (result && storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
@@ -2108,9 +2552,21 @@ tl::expected<void, ErrorCode> Client::EvictDiskReplica(
     return master_client_.EvictDiskReplica(key, replica_type);
 }
 
+tl::expected<void, ErrorCode> Client::EvictDiskReplica(
+    const std::string& key, const std::string& tenant_id,
+    ReplicaType replica_type) {
+    return master_client_.EvictDiskReplica(key, tenant_id, replica_type);
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
     return master_client_.BatchEvictDiskReplica(keys, replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchEvictDiskReplica(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    ReplicaType replica_type) {
+    return master_client_.BatchEvictDiskReplica(keys, tenant_id, replica_type);
 }
 
 std::vector<int> Client::GetNicNumaNodes() const {
@@ -2436,8 +2892,7 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
 }
 
 tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
-    bool enable_offloading,
-    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    bool enable_offloading, std::vector<OffloadTaskItem>& offloading_objects) {
     auto response =
         master_client_.OffloadObjectHeartbeat(client_id_, enable_offloading);
     if (!response) {
@@ -2489,8 +2944,14 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
-    std::unordered_map<std::string, int64_t>& promotion_objects) {
+    std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);
     if (!response) {
         return tl::make_unexpected(response.error());
@@ -2507,14 +2968,32 @@ Client::PromotionAllocStart(
                                               preferred_segments);
 }
 
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStart(
+    const std::string& key, const std::string& tenant_id, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStart(client_id_, key, tenant_id, size,
+                                              preferred_segments);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
     const std::string& key) {
     return master_client_.NotifyPromotionSuccess(client_id_, key);
 }
 
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccess(
+    const std::string& key, const std::string& tenant_id) {
+    return master_client_.NotifyPromotionSuccess(client_id_, key, tenant_id);
+}
+
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key) {
     return master_client_.NotifyPromotionFailure(client_id_, key);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
+    const std::string& key, const std::string& tenant_id) {
+    return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
@@ -2527,10 +3006,22 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     return master_client_.CreateCopyTask(key, targets);
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
+    const std::string& key, const std::string& tenant_id,
+    const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, tenant_id, targets);
+}
+
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::string& target) {
+    return master_client_.CreateMoveTask(key, tenant_id, source, target);
 }
 
 tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
@@ -2593,11 +3084,18 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
+    return Copy(key, master_client_.tenant_id(), source, targets);
+}
+
+tl::expected<void, ErrorCode> Client::Copy(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::vector<std::string>& targets) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
-    auto start_result = master_client_.CopyStart(key, source, targets);
+    auto start_result =
+        master_client_.CopyStart(key, tenant_id, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -2611,7 +3109,7 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
                   << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key);
+        auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -2622,9 +3120,9 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key); },
-        [&]() { return master_client_.CopyRevoke(key); }, response.source,
-        response.targets);
+        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
+        [&]() { return master_client_.CopyRevoke(key, tenant_id); },
+        response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -2637,12 +3135,20 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
+    return Move(key, master_client_.tenant_id(), source, target);
+}
+
+tl::expected<void, ErrorCode> Client::Move(const std::string& key,
+                                           const std::string& tenant_id,
+                                           const std::string& source,
+                                           const std::string& target) {
     LOG(INFO) << "action=replica_move_start" << ", key=" << key
               << ", source_segment=" << source << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
-    auto move_start_result = master_client_.MoveStart(key, source, target);
+    auto move_start_result =
+        master_client_.MoveStart(key, tenant_id, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
         LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
@@ -2656,7 +3162,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
                   << ", info=target_replica_already_exists";
         // Target already exists, consider it success
-        auto move_end_result = master_client_.MoveEnd(key);
+        auto move_end_result = master_client_.MoveEnd(key, tenant_id);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
             LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
@@ -2669,9 +3175,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     std::vector<Replica::Descriptor> targets = {response.target.value()};
 
     auto result = ExecuteReplicaTransfer(
-        key, "move", [&]() { return master_client_.MoveEnd(key); },
-        [&]() { return master_client_.MoveRevoke(key); }, response.source,
-        targets);
+        key, "move", [&]() { return master_client_.MoveEnd(key, tenant_id); },
+        [&]() { return master_client_.MoveRevoke(key, tenant_id); },
+        response.source, targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_move_success" << ", key=" << key
@@ -2804,8 +3310,20 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future =
-        transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    std::optional<TransferFuture> future;
+    if (replica_descriptor.is_nof_replica()) {
+        auto contiguous_range = GetContiguousSliceRange(slices);
+        if (!contiguous_range.has_value()) {
+            LOG(ERROR) << "NoF transfer requires contiguous slices";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        future = transfer_submitter_->submit(replica_descriptor, slices,
+                                             op_code, contiguous_range->ptr,
+                                             contiguous_range->size);
+    } else {
+        future =
+            transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -2847,8 +3365,14 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
         total_size = mem_desc.buffer_descriptor.size_;
-    } else {
+    } else if (replica_descriptor.is_nof_replica()) {
+        auto& nof_desc = replica_descriptor.get_nof_descriptor();
+        total_size = nof_desc.buffer_descriptor.size_;
+    } else if (replica_descriptor.is_disk_replica()) {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
+        total_size = disk_desc.object_size;
+    } else if (replica_descriptor.is_local_disk_replica()) {
+        auto& disk_desc = replica_descriptor.get_local_disk_descriptor();
         total_size = disk_desc.object_size;
     }
 
@@ -2926,8 +3450,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result =
-                    Copy(payload.key, payload.source, payload.targets);
+                auto copy_result = Copy(payload.key, payload.tenant_id,
+                                        payload.source, payload.targets);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -2938,8 +3462,8 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_MOVE: {
                 ReplicaMovePayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto move_result =
-                    Move(payload.key, payload.source, payload.target);
+                auto move_result = Move(payload.key, payload.tenant_id,
+                                        payload.source, payload.target);
                 if (move_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
@@ -3259,11 +3783,24 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
         }
     }
 
+    // Prefer local MEMORY replicas first
     for (const auto& rep : replica_list) {
         if (rep.is_memory_replica()) {
             const auto& mem_desc = rep.get_memory_descriptor();
             const std::string& endpoint =
                 mem_desc.buffer_descriptor.transport_endpoint_;
+            if (local_endpoints.count(endpoint)) {
+                return rep;
+            }
+        }
+    }
+
+    // Then prefer local NOF_SSD replicas
+    for (const auto& rep : replica_list) {
+        if (rep.is_nof_replica()) {
+            const auto& nof_desc = rep.get_nof_descriptor();
+            const std::string& endpoint =
+                nof_desc.buffer_descriptor.transport_endpoint_;
             if (local_endpoints.count(endpoint)) {
                 return rep;
             }

@@ -125,6 +125,19 @@ class EfaContext {
     // Submit slices for transfer
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    // Same-process self-loopback fast path.  When a slice's resolved peer
+    // NIC path equals our own (same server_name — which embeds the
+    // per-process RPC port — AND same device), source and destination are
+    // both valid pointers in THIS process's address space.  We satisfy the
+    // copy with a local memcpy / cudaMemcpy instead of issuing it over EFA.
+    //
+    // This avoids libfabric's EFA SHM intra-node path, which performs a
+    // host memcpy into FI_HMEM_CUDA device buffers and segfaults
+    // (ofiwg/libfabric#12328).  Returns true if the slice was handled here
+    // (and marked success/failed); false if it should fall through to the
+    // normal EFA submit path.
+    bool tryLoopbackCopy(Transport::Slice* slice);
+
     // Hot-path submit: post a batch of slices to `peer_fi_addr` via the
     // shared endpoint.  Handles WR / CQ reservation, MR descriptor prep,
     // and the fi_write / fi_read burst under post_lock_.  Called by

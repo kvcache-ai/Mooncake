@@ -58,7 +58,16 @@ class MasterMetricManager {
         MEMORY_HIT_RATE,
         SSD_HIT_RATE,
         OVERALL_HIT_RATE,
-        VALID_GET_RATE
+        VALID_GET_RATE,
+        // Clearer aliases for Store-observed counters. The legacy names above
+        // are kept to preserve RPC/API enum values.
+        MEMORY_CURRENT_CACHED_OBJECTS = MEMORY_TOTAL,
+        SSD_CURRENT_CACHED_OBJECTS = SSD_TOTAL,
+        // These values may exceed 1.0 because the numerator is cumulative
+        // while the denominator is the current cached object count.
+        MEMORY_HITS_PER_CURRENT_CACHED_OBJECT = MEMORY_HIT_RATE,
+        SSD_HITS_PER_CURRENT_CACHED_OBJECT = SSD_HIT_RATE,
+        OVERALL_HITS_PER_CURRENT_CACHED_OBJECT = OVERALL_HIT_RATE
     };
     using CacheHitStatDict = std::unordered_map<CacheHitStat, double>;
     void add_stat_to_dict(CacheHitStatDict&, CacheHitStat, double);
@@ -285,6 +294,31 @@ class MasterMetricManager {
     int64_t get_put_start_discard_cnt();
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
+
+    // Promotion-on-hit Metrics
+    void inc_promotion_in_flight(int64_t val = 1);
+    void dec_promotion_in_flight(int64_t val = 1);
+    void inc_promotion_admitted(int64_t val = 1);
+    void inc_promotion_completed(int64_t val = 1);
+    void inc_promotion_completed_bytes(int64_t bytes);
+    void inc_promotion_expired(int64_t val = 1);
+    void inc_promotion_failed(int64_t val = 1);
+    void inc_promotion_cancelled(int64_t val = 1);
+    void inc_promotion_rejected_frequency(int64_t val = 1);
+    void inc_promotion_rejected_watermark(int64_t val = 1);
+    void inc_promotion_rejected_cap(int64_t val = 1);
+
+    // Promotion-on-hit Metrics Getters
+    int64_t get_promotion_in_flight();
+    int64_t get_promotion_admitted();
+    int64_t get_promotion_completed();
+    int64_t get_promotion_completed_bytes();
+    int64_t get_promotion_expired();
+    int64_t get_promotion_failed();
+    int64_t get_promotion_cancelled();
+    int64_t get_promotion_rejected_frequency();
+    int64_t get_promotion_rejected_watermark();
+    int64_t get_promotion_rejected_cap();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
@@ -581,7 +615,8 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
 
-    // cache hit Statistics
+    // Store-observed cache reuse statistics. These counters do not represent
+    // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
     ylt::metric::gauge_t mem_cache_nums_;
@@ -621,6 +656,18 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
+
+    // Promotion-on-hit Metrics
+    ylt::metric::gauge_t promotion_in_flight_metric_;
+    ylt::metric::counter_t promotion_admitted_;
+    ylt::metric::counter_t promotion_completed_;
+    ylt::metric::counter_t promotion_completed_bytes_;
+    ylt::metric::counter_t promotion_expired_;
+    ylt::metric::counter_t promotion_failed_;
+    ylt::metric::counter_t promotion_cancelled_;
+    ylt::metric::counter_t promotion_rejected_frequency_;
+    ylt::metric::counter_t promotion_rejected_watermark_;
+    ylt::metric::counter_t promotion_rejected_cap_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

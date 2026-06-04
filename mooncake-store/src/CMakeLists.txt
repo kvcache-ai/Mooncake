@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/distributed_storage_backend.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -116,6 +117,7 @@ endif()
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SOURCES ${HF3FS_SOURCES})
+  list(APPEND MOONCAKE_STORE_SOURCES storage/distributed/hf3fs_adapter.cpp)
   find_library(
     HF3FS_API_LIB hf3fs_api_shared
     PATHS /usr/lib

@@ -218,6 +218,9 @@ mooncake-operator/mooncake-operator
 # Stripped binaries (build artifacts)
 *.stripped
 
+# MacOS
+.DS_Store
+
 # Next.js build artifacts
 mooncake-operator/ui/.next/
 mooncake-operator/ui/node_modules/
