@@ -56,8 +56,6 @@ See the [SGLang official compilation guide](https://docs.sglang.ai/start/install
 
 ## Configuration
 
-Since [PR 5460](https://github.com/sgl-project/sglang/pull/5460), no `mooncake.json` configuration file is needed — Mooncake auto-detects RDMA devices.
-
 Key arguments:
 
 | Argument | Description |

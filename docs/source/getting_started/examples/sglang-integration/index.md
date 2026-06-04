@@ -1,4 +1,4 @@
-# SGLang x Mooncake Integration
+# Mooncake x SGLang Integration
 
 Mooncake integrates with SGLang through two paths — **PD Disaggregation** for cross-instance KV cache transfer via the Transfer Engine, and **HiCache L3 Backend** for hierarchical KV cache storage with Mooncake Store.
 
@@ -9,13 +9,11 @@ Mooncake integrates with SGLang through two paths — **PD Disaggregation** for 
 SGLang uses Mooncake's Transfer Engine for direct zero-copy KV cache transfer between prefill and decode instances over RDMA.
 
 ```
-  +-----------+   Transfer Engine (RDMA)    +-----------+
-  | SGLang    | ◄━━━━━━━━━━━━━━━━━━━━━━► | SGLang     |
+  +-----------+   Transfer Engine (RDMA)   +------------+
+  | SGLang    | ◄━━━━━━━━━━━━━━━━━━━━━━►   | SGLang     |
   | Prefill   |     KV cache blocks        | Decode     |
-  +-----------+                            +-----------+
+  +-----------+                            +------------+
 ```
-
-Since [PR 5460](https://github.com/sgl-project/sglang/pull/5460), no `mooncake.json` is needed — devices are auto-detected.
 
 ```bash
 # Prefill node
@@ -52,15 +50,15 @@ HiCache extends SGLang's RadixAttention with three memory tiers, using Mooncake 
 ```
   +----------------------------------------------+
   | SGLang + HiCache                             |
-  |  ┌─────────┐  ┌─────────┐  ┌──────────────┐ |
-  |  │ L1(GPU) │  │ L2(CPU) │  │ L3(Mooncake) │ |
-  |  └─────────┘  └─────────┘  └──────┬───────┘ |
-  +------------------------------------+----------+
+  |  ┌─────────┐  ┌─────────┐  ┌──────────────┐  |
+  |  │ L1(GPU) │  │ L2(CPU) │  │ L3(Mooncake) │  |
+  |  └─────────┘  └─────────┘  └──────┬───────┘  |
+  +-----------------------------------+----------+
                                       |
-                             +--------+--------+
-                             | Mooncake Store  |
+                             +--------+---------+
+                             | Mooncake Store   |
                              | Distributed Pool |
-                             +-----------------+
+                             +------------------+
 ```
 
 When local cache misses, HiCache automatically prefetches KV blocks from remote storage via RDMA.
@@ -71,7 +69,6 @@ mooncake_master --enable_http_metadata_server=true
 
 # 2. Launch SGLang with HiCache + Mooncake L3
 export MOONCAKE_MASTER=127.0.0.1:50051
-export MC_STORE_USE_HUGEPAGE="1"
 
 python -m sglang.launch_server \
   --model-path [model_path] \
