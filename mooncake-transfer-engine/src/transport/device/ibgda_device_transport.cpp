@@ -91,6 +91,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int initialize(const std::string& device_name, int num_ranks,
                    int num_qps) override {
+        if (num_qps < num_ranks) {
+            LOG(ERROR) << "[EP IBGDA] num_qps (" << num_qps
+                       << ") must be >= num_ranks (" << num_ranks << ")";
+            return -1;
+        }
         num_ranks_ = num_ranks;
         num_qps_ = num_qps;
 
@@ -166,9 +171,13 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         // Allocate device-visible tables
-        cudaMalloc(&raddrs_, num_ranks_ * sizeof(uint64_t));
-        cudaMalloc(&rkeys_, num_ranks_ * sizeof(uint32_t));
-        cudaMalloc(&qp_devctxs_, num_qps_ * sizeof(mlx5gda_qp_devctx));
+        if (cudaMalloc(&raddrs_, num_ranks_ * sizeof(uint64_t)) != cudaSuccess ||
+            cudaMalloc(&rkeys_, num_ranks_ * sizeof(uint32_t)) != cudaSuccess ||
+            cudaMalloc(&qp_devctxs_, num_qps_ * sizeof(mlx5gda_qp_devctx)) !=
+                cudaSuccess) {
+            LOG(ERROR) << "[EP IBGDA] Failed to allocate device-visible tables";
+            return -1;
+        }
 
         LOG(INFO) << "[EP IBGDA] Initialized on " << nic
                   << " (gid_index=" << gid_index_
@@ -225,6 +234,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             }
             if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
                 LOG(ERROR) << "[EP IBGDA] rst2init failed at " << i;
+                mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
                 return -1;
             }
             cudaStreamSynchronize(stream);

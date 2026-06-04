@@ -186,6 +186,10 @@ int main(int argc, char** argv) {
     int world_size = FLAGS_world_size;
     CHECK(rank == 0 || rank == 1) << "--rank must be 0 or 1";
     CHECK_EQ(world_size, 2) << "This example requires exactly 2 ranks";
+    CHECK_EQ(FLAGS_kDataBytes % 16, 0)
+        << "kDataBytes must be a multiple of 16";
+    CHECK_LE(FLAGS_kDataBytes, kSignalWordOffset)
+        << "kDataBytes cannot exceed " << kSignalWordOffset;
 
     int gpu_id = FLAGS_gpu_id >= 0 ? FLAGS_gpu_id : rank;
     checkCuda(cudaSetDevice(gpu_id), "cudaSetDevice");

@@ -91,6 +91,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cudaGetDevice(&device_id);
         int device_count = 0;
         cudaGetDeviceCount(&device_count);
+        CHECK_GT(device_count, 0) << "No CUDA/MUSA devices found";
 
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;
