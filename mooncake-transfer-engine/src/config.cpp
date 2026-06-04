@@ -270,7 +270,8 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (!std::filesystem::is_directory(log_dir_path)) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";
