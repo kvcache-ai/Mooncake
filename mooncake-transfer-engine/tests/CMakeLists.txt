@@ -91,6 +91,32 @@ if (USE_EFA)
 
     add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
     target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags glog::glog)
+
+    # GPU (CUDA device memory) loopback test — reproduces the EFA SHM
+    # intra-node segfault on FI_HMEM_CUDA buffers (ofiwg/libfabric#12328)
+    # and validates EfaContext::tryLoopbackCopy.  Needs CUDA headers/libs.
+    if (USE_CUDA)
+        add_executable(efa_gpu_loopback_test ${WORKSPACE}/efa_gpu_loopback_test.cpp)
+        # Resolve CUDA include dirs / runtime via CUDAToolkit instead of a
+        # hardcoded /usr/local/cuda/include, so the test builds wherever CUDA
+        # lives (e.g. the DLAMI pip venv layout).  find_package is idempotent
+        # and may not have run yet in this scope (top-level only calls it under
+        # WITH_EP), so request it here; fall back to the legacy path if the
+        # module variant is unavailable.
+        find_package(CUDAToolkit QUIET)
+        if (CUDAToolkit_FOUND)
+            target_include_directories(efa_gpu_loopback_test
+                PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+            target_link_libraries(efa_gpu_loopback_test
+                PUBLIC transfer_engine gtest gtest_main CUDA::cudart)
+        else()
+            target_include_directories(efa_gpu_loopback_test
+                PRIVATE /usr/local/cuda/include)
+            target_link_libraries(efa_gpu_loopback_test
+                PUBLIC transfer_engine gtest gtest_main cudart)
+        endif()
+        add_test(NAME efa_gpu_loopback_test COMMAND efa_gpu_loopback_test)
+    endif()
 endif()
 
 # UB transport test with URMA endpoint and mock support
