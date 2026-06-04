@@ -2,10 +2,15 @@ const https = require('https')
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const os = require('os')
 
 let k8sCaData = ''
 let k8sServer = ''
+let k8sClientCert = ''   // PEM cert from kubeconfig
+let k8sClientKey = ''    // PEM key from kubeconfig
+let k8sToken = ''         // static token from kubeconfig (when not using SA token file)
 
+// Try in-cluster SA credentials first, then fall back to kubeconfig
 try {
   const caPath = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
   if (fs.existsSync(caPath)) {
@@ -14,13 +19,64 @@ try {
     const host = process.env.KUBERNETES_SERVICE_HOST || 'kubernetes.default.svc'
     const port = process.env.KUBERNETES_SERVICE_PORT || '443'
     k8sServer = `https://${host}:${port}`
-    console.log('[api-handler] Loaded K8s credentials (token will be read on each request)')
+    console.log('[api-handler] Loaded in-cluster K8s credentials')
   }
 } catch (e) {
-  console.warn('[api-handler] Failed to load K8s credentials:', e.message)
+  console.warn('[api-handler] Failed to load in-cluster credentials:', e.message)
+}
+
+// Kubeconfig fallback
+if (!k8sServer) {
+  try {
+    const yaml = require('js-yaml')
+    const kubeconfigPath = process.env.KUBECONFIG || path.join(os.homedir(), '.kube', 'config')
+    if (fs.existsSync(kubeconfigPath)) {
+      const kc = yaml.load(fs.readFileSync(kubeconfigPath, 'utf8'))
+      const currentCtx = kc['current-context']
+      const ctx = (kc.contexts || []).find(c => c.name === currentCtx)
+      if (ctx) {
+        const cluster = (kc.clusters || []).find(c => c.name === ctx.context.cluster)
+        const user = (kc.users || []).find(u => u.name === ctx.context.user)
+        if (cluster && user) {
+          k8sServer = cluster.cluster.server
+          if (cluster.cluster['certificate-authority-data']) {
+            k8sCaData = cluster.cluster['certificate-authority-data']
+          } else if (cluster.cluster['certificate-authority']) {
+            k8sCaData = fs.readFileSync(
+              cluster.cluster['certificate-authority'].replace(/^~/, os.homedir()),
+              'base64'
+            )
+          }
+          if (user.user['client-certificate-data']) {
+            k8sClientCert = Buffer.from(user.user['client-certificate-data'], 'base64').toString('utf8')
+          } else if (user.user['client-certificate']) {
+            k8sClientCert = fs.readFileSync(
+              user.user['client-certificate'].replace(/^~/, os.homedir()),
+              'utf8'
+            )
+          }
+          if (user.user['client-key-data']) {
+            k8sClientKey = Buffer.from(user.user['client-key-data'], 'base64').toString('utf8')
+          } else if (user.user['client-key']) {
+            k8sClientKey = fs.readFileSync(
+              user.user['client-key'].replace(/^~/, os.homedir()),
+              'utf8'
+            )
+          }
+          if (user.user.token) {
+            k8sToken = user.user.token
+          }
+          console.log('[api-handler] Loaded K8s credentials from kubeconfig:', kubeconfigPath, '->', k8sServer)
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[api-handler] Failed to load kubeconfig:', e.message)
+  }
 }
 
 function getK8sToken() {
+  if (k8sToken) return k8sToken
   try {
     const tokenPath = '/var/run/secrets/kubernetes.io/serviceaccount/token'
     return fs.readFileSync(tokenPath, 'utf8').trim()
@@ -31,11 +87,20 @@ function getK8sToken() {
 
 function k8sRequest(apiPath, method = 'GET', body) {
   return new Promise((resolve, reject) => {
+    if (!k8sServer) {
+      reject(new Error('K8s API server not available — not running in-cluster and no kubeconfig found'))
+      return
+    }
     const url = new URL(apiPath, k8sServer)
     const ca = k8sCaData ? Buffer.from(k8sCaData, 'base64') : undefined
     const headers = {
-      'Authorization': `Bearer ${getK8sToken()}`,
       'Accept': 'application/json',
+    }
+    // Use client cert auth when available; otherwise fall back to Bearer token
+    if (k8sClientCert && k8sClientKey) {
+      // client cert auth — don't add Authorization header
+    } else {
+      headers['Authorization'] = `Bearer ${getK8sToken()}`
     }
     if (method === 'POST' || method === 'PUT') headers['Content-Type'] = 'application/json'
     const options = {
@@ -46,6 +111,8 @@ function k8sRequest(apiPath, method = 'GET', body) {
       headers,
       ca,
       rejectUnauthorized: !!ca,
+      cert: k8sClientCert || undefined,
+      key: k8sClientKey || undefined,
     }
     const req = https.request(options, (res) => {
       let data = ''
@@ -101,7 +168,8 @@ const drainJobs = new Map()
 const drainStatusEnum = ['CREATED', 'PLANNING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED']
 
 async function handleApiRequest(req, res) {
-  const url = new URL(req.url, 'http://localhost')
+  try {
+    const url = new URL(req.url, 'http://localhost')
 
   // GET /api/debug
   if (url.pathname === '/api/debug') {
@@ -618,6 +686,23 @@ async function callMasterAPI(namespace, name, method, apiPath, body) {
   })
 }
 
+// POST /api/clusters/:namespace/:name/delete-pod — delete a pod via K8s API
+const deletePodMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/delete-pod$/)
+if (deletePodMatch && req.method === 'POST') {
+  let body = ''
+  for await (const chunk of req) body += chunk
+  try {
+    const [, namespace] = deletePodMatch
+    const { podName } = JSON.parse(body)
+    if (!podName) return jsonReply(res, 400, { error: 'podName is required' })
+
+    await k8sRequest(`/api/v1/namespaces/${namespace}/pods/${podName}`, 'DELETE')
+    return jsonReply(res, 200, { success: true })
+  } catch (e) {
+    return jsonReply(res, 500, { error: e.message })
+  }
+}
+
 // GET /api/clusters/:namespace/:name/drain-status
 const drainStatusMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/drain-status$/)
 if (drainStatusMatch && req.method === 'GET') {
@@ -649,6 +734,7 @@ if (drainStatusMatch && req.method === 'GET') {
             status: statusStr,
             jobId: tracked.jobId,
             migratedBytes: result.migrated_bytes || 0,
+            speedMbps: parseFloat(result.speed_mbps) || 0,
             succeededUnits: result.succeeded_units || 0,
             failedUnits: result.failed_units || 0,
             message: result.message || '',
@@ -682,7 +768,7 @@ if (drainWorkerMatch && req.method === 'POST') {
   for await (const chunk of req) body += chunk
   try {
     const [, namespace, name] = drainWorkerMatch
-    const { podIP, maxConcurrency, bandwidthMBPS, targetIPs } = JSON.parse(body)
+    const { podIP, podName, maxConcurrency, bandwidthMBPS, targetIPs } = JSON.parse(body)
     if (!podIP) return jsonReply(res, 400, { error: 'podIP is required' })
 
     const clusterKey = `${namespace}/${name}`
@@ -697,21 +783,34 @@ if (drainWorkerMatch && req.method === 'POST') {
     const mc = Math.min(Math.max(parseInt(maxConcurrency) || 4, 1), 64)
     const bw = Math.max(parseInt(bandwidthMBPS) || 0, 0)
 
-    // Construct segment name as IP:TransferPort
-    let transferPort = 13006
-    try {
-      const clusterCR = await k8sRequest(
-        `/apis/mooncake.io/v1alpha1/namespaces/${namespace}/mooncakeclusters/${name}`
-      )
-      if (clusterCR.spec?.workers?.transferPort) transferPort = clusterCR.spec.workers.transferPort
-    } catch (e) {
-      console.warn(`[api-handler] Failed to fetch cluster CR, using transferPort=${transferPort}: ${e.message}`)
+    // Resolve pod IP from K8s API by podName (handles dynamic IP changes after restart)
+    let resolvedPodIP = podIP
+    if (podName) {
+      try {
+        const podDetail = await k8sRequest(`/api/v1/namespaces/${namespace}/pods/${podName}`)
+        if (podDetail?.status?.podIP) {
+          resolvedPodIP = podDetail.status.podIP
+          console.log(`[drain-worker] Resolved ${podName} -> ${resolvedPodIP} (provided IP was ${podIP})`)
+        }
+      } catch (e) {
+        console.warn(`[drain-worker] Failed to look up pod ${podName}, using provided IP ${podIP}: ${e.message}`)
+      }
     }
-    const segmentName = `${podIP}:${transferPort}`
 
-    // Build target_segments if targetIPs provided
+    // Get segment names from master's authoritative segment list (not Prometheus /metrics)
+    const segmentsText = await callMasterAPI(namespace, name, 'GET', '/get_all_segments')
+    const allSegments = (typeof segmentsText === 'string' ? segmentsText : String(segmentsText))
+      .split('\n')
+      .map(s => s.trim())
+      .filter(s => s.length > 0)
+
+    const segmentName = allSegments.find(s => s.startsWith(`${resolvedPodIP}:`))
+    if (!segmentName) {
+      return jsonReply(res, 404, { error: `No segment found for pod ${podName || podIP} (IP: ${resolvedPodIP}) on master` })
+    }
+
     const targetSegments = Array.isArray(targetIPs) && targetIPs.length > 0
-      ? targetIPs.map(ip => `${ip}:${transferPort}`)
+      ? targetIPs.map(ip => allSegments.find(s => s.startsWith(`${ip}:`))).filter(Boolean)
       : undefined
 
     const drainBody = {
@@ -763,7 +862,11 @@ if (cancelDrainMatch && req.method === 'POST') {
   }
 }
 
-  return false // not handled
+      return false // not handled
+  } catch (e) {
+    console.error('[api-handler] Unhandled error:', e.message)
+    return jsonReply(res, 500, { error: e.message })
+  }
 }
 
 module.exports = { handleApiRequest }

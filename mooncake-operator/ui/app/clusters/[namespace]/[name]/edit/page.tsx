@@ -105,7 +105,10 @@ export default function EditClusterPage({
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-gray-900">Edit Cluster {name}</h1>
+      <a href={`/clusters/${namespace}/${name}`} className="text-sm text-indigo-600 hover:text-indigo-800">
+        &larr; Back to Cluster
+      </a>
+      <h1 className="text-2xl font-semibold text-gray-900 mt-2">Edit Cluster {name}</h1>
       <p className="text-sm text-gray-500 mt-1">Namespace: {namespace}</p>
 
       {error && (

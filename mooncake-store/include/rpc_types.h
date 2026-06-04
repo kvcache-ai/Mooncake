@@ -168,11 +168,12 @@ struct QueryJobResponse {
     uint64_t blocked_units;
     uint64_t active_units;
     uint64_t migrated_bytes;
+    double speed_mbps{0.0};
     std::string message;
 };
 YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
          last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
-         blocked_units, active_units, migrated_bytes, message);
+         blocked_units, active_units, migrated_bytes, speed_mbps, message);
 
 /**
  * @brief Response structure for QueryTask operation

@@ -1,0 +1,6 @@
+ui/node_modules
+ui/.next
+ui/.git
+.git
+.gitignore
+*.md

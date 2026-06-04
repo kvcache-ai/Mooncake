@@ -3195,6 +3195,10 @@ void Client::StorageHeartbeatThreadMain() {
 
             LOG(INFO) << "Reconnected to master " << next_view.leader_address;
             ping_fail_count = 0;
+            if (!remount_segment_future.valid()) {
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
+            }
         } else {
             const std::string current_master_address = direct_master_address_;
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
@@ -3211,6 +3215,10 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(INFO) << "Reconnected to master " << current_master_address;
             last_ping_success_.store(true);
             ping_fail_count = 0;
+            if (!remount_segment_future.valid()) {
+                remount_segment_future =
+                    std::async(std::launch::async, remount_segment);
+            }
         }
     }
     // Explicitly wait for the remount segment thread to finish

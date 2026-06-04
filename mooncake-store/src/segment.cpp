@@ -74,10 +74,75 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         segment_manager_->mounted_segments_.find(segment.id);
     if (exist_segment_it != segment_manager_->mounted_segments_.end()) {
         auto& exist_segment = exist_segment_it->second;
-        if (exist_segment.status == SegmentStatus::OK) {
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=segment_already_exists";
-            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        if (exist_segment.status == SegmentStatus::OK ||
+            exist_segment.status == SegmentStatus::DRAINED) {
+            // Check if the existing segment belongs to a different client.
+            // This can happen when:
+            // 1. A worker pod restarts and reconnects with the same segment
+            //    UUID, but the old client's entry is still present.
+            // 2. A segment was drained (status DRAINED) and the affected
+            //    worker is remounting — the old entry is stale.
+            bool same_client = false;
+            auto client_it =
+                segment_manager_->client_by_name_.find(segment.name);
+            if (client_it != segment_manager_->client_by_name_.end() &&
+                client_it->second == client_id) {
+                same_client = true;
+            }
+
+            if (!same_client ||
+                exist_segment.status == SegmentStatus::DRAINED) {
+                const char* reason =
+                    exist_segment.status == SegmentStatus::DRAINED
+                        ? "segment_drained"
+                        : "stale_client";
+                LOG(WARNING)
+                    << "segment_name=" << segment.name
+                    << ", reason=" << reason
+                    << ", old_client="
+                    << (client_it != segment_manager_->client_by_name_.end()
+                            ? client_it->second
+                            : UUID{0, 0})
+                    << ", new_client=" << client_id
+                    << ", old_status="
+                    << static_cast<int>(exist_segment.status)
+                    << ", action=reassign_stale_segment_to_new_client";
+                // Remove old allocator from allocator manager
+                if (HasAllocator(segment_manager_->allocator_manager_,
+                                 segment.name,
+                                 exist_segment.buf_allocator)) {
+                    segment_manager_->allocator_manager_.removeAllocator(
+                        segment.name, exist_segment.buf_allocator);
+                }
+                exist_segment.buf_allocator.reset();
+                // Remove old client association
+                if (client_it !=
+                    segment_manager_->client_by_name_.end()) {
+                    auto old_client_seg_it =
+                        segment_manager_->client_segments_.find(
+                            client_it->second);
+                    if (old_client_seg_it !=
+                        segment_manager_->client_segments_.end()) {
+                        auto& vec = old_client_seg_it->second;
+                        vec.erase(std::remove(vec.begin(), vec.end(),
+                                              segment.id),
+                                  vec.end());
+                        if (vec.empty()) {
+                            segment_manager_->client_segments_.erase(
+                                old_client_seg_it);
+                        }
+                    }
+                }
+                // Erase old entry, fall through to mount the new one
+                size_t old_capacity = exist_segment.segment.size;
+                segment_manager_->mounted_segments_.erase(exist_segment_it);
+                MasterMetricManager::instance().dec_total_mem_capacity(
+                    segment.name, old_capacity);
+            } else {
+                LOG(WARNING) << "segment_name=" << segment.name
+                             << ", warn=segment_already_exists";
+                return ErrorCode::SEGMENT_ALREADY_EXISTS;
+            }
         } else {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=segment_already_exists_but_not_ok"

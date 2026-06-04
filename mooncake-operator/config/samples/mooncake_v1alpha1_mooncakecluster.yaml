@@ -11,23 +11,23 @@ spec:
     metricsPort: 9003
     resources:
       requests:
-        cpu: "2"
-        memory: "4Gi"
+        cpu: "1"
+        memory: "1Gi"
       limits:
-        cpu: "4"
-        memory: "8Gi"
+        cpu: "1"
+        memory: "1Gi"
   workers:
     replicas: 2
     segmentSize: "4Gi"
-    rdmaEnabled: true
+    rdmaEnabled: false
     gpuEnabled: false
     resources:
       requests:
-        cpu: "4"
-        memory: "8Gi"
+        cpu: "1"
+        memory: "1Gi"
       limits:
-        cpu: "8"
-        memory: "16Gi"
+        cpu: "1"
+        memory: "1Gi"
   ha:
     type: k8s
   eviction:

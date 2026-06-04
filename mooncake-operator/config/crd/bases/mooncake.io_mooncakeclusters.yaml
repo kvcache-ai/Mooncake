@@ -292,7 +292,7 @@ spec:
                     default: 1
                     description: Replicas is the number of worker replicas.
                     format: int32
-                    minimum: 1
+                    minimum: 0
                     type: integer
                   resources:
                     description: Resources defines the resource requirements for worker

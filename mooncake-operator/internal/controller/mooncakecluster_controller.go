@@ -449,6 +449,9 @@ func statefulSetSpecsEqual(a, b *appsv1.StatefulSetSpec) bool {
 	if !reflect.DeepEqual(a.Template.Spec.Affinity, b.Template.Spec.Affinity) {
 		return false
 	}
+	if !reflect.DeepEqual(ac.Resources, bc.Resources) {
+		return false
+	}
 	return true
 }
 
@@ -506,6 +509,9 @@ func deploymentSpecsEqual(a, b *appsv1.DeploymentSpec) bool {
 		return false
 	}
 	if !envVarsEqual(ac.Env, bc.Env) {
+		return false
+	}
+	if !reflect.DeepEqual(ac.Resources, bc.Resources) {
 		return false
 	}
 	return true

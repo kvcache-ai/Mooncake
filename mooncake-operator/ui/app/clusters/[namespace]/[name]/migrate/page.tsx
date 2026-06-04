@@ -12,6 +12,7 @@ interface DrainStatusEntry {
   status: string
   jobId?: string
   migratedBytes?: number
+  speedMbps?: number
   succeededUnits?: number
   failedUnits?: number
   message?: string
@@ -24,6 +25,7 @@ interface MigrationJob {
   jobId: string
   status: string
   migratedBytes: number
+  speedMbps: number
   succeededUnits: number
   failedUnits: number
   message: string
@@ -52,6 +54,13 @@ function formatBytes(bytes: number): string {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
   return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`
+}
+
+function formatSpeed(mbps: number): string {
+  if (mbps <= 0) return '-'
+  if (mbps < 1) return `${(mbps * 1000).toFixed(0)} Kbps`
+  if (mbps < 1000) return `${mbps.toFixed(1)} Mbps`
+  return `${(mbps / 1000).toFixed(2)} Gbps`
 }
 
 export default function MigratePage({
@@ -132,6 +141,7 @@ export default function MigratePage({
         ...job,
         status: ds.status,
         migratedBytes: ds.migratedBytes || 0,
+        speedMbps: ds.speedMbps || 0,
         succeededUnits: ds.succeededUnits || 0,
         failedUnits: ds.failedUnits || 0,
         message: ds.message || '',
@@ -209,6 +219,7 @@ export default function MigratePage({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             podIP: srcIP,
+            podName: pod?.metadata.name,
             maxConcurrency,
             bandwidthMBPS,
             targetIPs,
@@ -222,6 +233,7 @@ export default function MigratePage({
           jobId: data.jobId,
           status: 'CREATED',
           migratedBytes: 0,
+          speedMbps: 0,
           succeededUnits: 0,
           failedUnits: 0,
           message: '',
@@ -233,6 +245,7 @@ export default function MigratePage({
           jobId: '',
           status: 'FAILED',
           migratedBytes: 0,
+          speedMbps: 0,
           succeededUnits: 0,
           failedUnits: 0,
           message: '',
@@ -535,6 +548,7 @@ export default function MigratePage({
                     <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">IP</th>
                     <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                     <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Data Migrated</th>
+                    <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Speed</th>
                     <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Objects</th>
                     <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Details</th>
                   </tr>
@@ -549,6 +563,9 @@ export default function MigratePage({
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         {formatBytes(job.migratedBytes)}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        {job.status === 'RUNNING' || job.status === 'PLANNING' ? formatSpeed(job.speedMbps) : '-'}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         <span className="text-green-600">{job.succeededUnits}</span>

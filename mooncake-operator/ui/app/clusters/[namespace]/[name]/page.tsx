@@ -73,19 +73,6 @@ interface SegmentStat {
   [ip: string]: { used: number; capacity: number }
 }
 
-interface DrainStatusEntry {
-  status: string
-  jobId?: string
-  migratedBytes?: number
-  succeededUnits?: number
-  failedUnits?: number
-  message?: string
-  error?: string
-}
-
-interface DrainStatusData {
-  statuses: Record<string, DrainStatusEntry>
-}
 
 function Toast({ message, onClose }: { message: string; onClose: () => void }) {
   useEffect(() => {
@@ -97,25 +84,6 @@ function Toast({ message, onClose }: { message: string; onClose: () => void }) {
       {message}
       <button onClick={onClose} className="ml-3 text-gray-300 hover:text-white">&times;</button>
     </div>
-  )
-}
-
-function DrainStatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    'N/A': 'bg-gray-100 text-gray-600',
-    CREATED: 'bg-blue-100 text-blue-800',
-    PLANNING: 'bg-yellow-100 text-yellow-800',
-    RUNNING: 'bg-yellow-100 text-yellow-800',
-    SUCCEEDED: 'bg-green-100 text-green-800',
-    FAILED: 'bg-red-100 text-red-800',
-    CANCELED: 'bg-gray-100 text-gray-600',
-    UNKNOWN: 'bg-gray-100 text-gray-600',
-  }
-  const color = colors[status] || colors.UNKNOWN
-  return (
-    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${color}`}>
-      {status}
-    </span>
   )
 }
 
@@ -260,111 +228,45 @@ export default function ClusterDetailPage({
   const [masterStats, setMasterStats] = useState<MasterStat[]>([])
   const [podMetrics, setPodMetrics] = useState<PodMetric[]>([])
   const [segmentStats, setSegmentStats] = useState<SegmentStat>({})
-  const [drainStatuses, setDrainStatuses] = useState<Record<string, DrainStatusEntry>>({})
   const [toast, setToast] = useState<string | null>(null)
-  const [drainingPods, setDrainingPods] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  const fetchData = () => {
-    setLoading(true)
-    setError(null)
+  const fetchData = (silent?: boolean) => {
+    if (!silent) {
+      setLoading(true)
+      setError(null)
+    }
     Promise.all([
       fetch(`/api/clusters/${namespace}/${name}`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/pods`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/master-stats`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/pod-metrics`).then(r => r.json()),
       fetch(`/api/clusters/${namespace}/${name}/worker-segments`).then(r => r.json()),
-      fetch(`/api/clusters/${namespace}/${name}/drain-status`).then(r => r.json()),
     ])
-      .then(([clusterData, podsData, statsData, metricsData, segmentsData, drainData]) => {
+      .then(([clusterData, podsData, statsData, metricsData, segmentsData]) => {
         if (clusterData.error) throw new Error(clusterData.error)
         setCluster(clusterData.cluster)
         setPods(podsData.pods || [])
         setMasterStats(statsData.stats || [])
         setPodMetrics(metricsData.metrics || [])
         setSegmentStats(segmentsData.segments || {})
-        if (drainData.statuses) {
-          setDrainStatuses(drainData.statuses)
-          // Update drainingPods set based on active drain jobs
-          const draining = new Set<string>()
-          for (const [ip, entry] of Object.entries(drainData.statuses as Record<string, DrainStatusEntry>)) {
-            if (entry.status === 'CREATED' || entry.status === 'PLANNING' || entry.status === 'RUNNING') {
-              draining.add(ip)
-            }
-          }
-          setDrainingPods(draining)
-        }
       })
-      .catch(e => setError(e.message))
-      .finally(() => setLoading(false))
+      .catch(e => {
+        if (!silent) setError(e.message)
+      })
+      .finally(() => {
+        if (!silent) setLoading(false)
+      })
   }
-
-  // Auto-refresh drain status every 3s when any pod is draining
-  useEffect(() => {
-    if (drainingPods.size === 0) return
-    const interval = setInterval(() => {
-      fetch(`/api/clusters/${namespace}/${name}/drain-status`)
-        .then(r => r.json())
-        .then(data => {
-          if (data.statuses) {
-            setDrainStatuses(data.statuses)
-            const draining = new Set<string>()
-            for (const [ip, entry] of Object.entries(data.statuses as Record<string, DrainStatusEntry>)) {
-              if (entry.status === 'CREATED' || entry.status === 'PLANNING' || entry.status === 'RUNNING') {
-                draining.add(ip)
-              }
-            }
-            setDrainingPods(draining)
-          }
-        })
-        .catch(() => {})
-    }, 3000)
-    return () => clearInterval(interval)
-  }, [drainingPods.size, namespace, name])
 
   useEffect(() => { fetchData() }, [namespace, name])
 
-  const handleDrainWorker = async (podIP: string) => {
-    if (!confirm(`Migrate data from worker (IP: ${podIP})?`)) return
-    try {
-      const res = await fetch(`/api/clusters/${namespace}/${name}/drain-worker`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ podIP }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to start drain')
-      setToast(`Migration started for ${podIP} (job: ${data.jobId})`)
-      // Refresh status immediately
-      const drainRes = await fetch(`/api/clusters/${namespace}/${name}/drain-status`)
-      const drainData = await drainRes.json()
-      if (drainData.statuses) setDrainStatuses(drainData.statuses)
-    } catch (e: any) {
-      setToast('Drain failed: ' + e.message)
-    }
-  }
-
-  const handleCancelDrain = async (podIP: string) => {
-    const entry = drainStatuses[podIP]
-    if (!entry?.jobId) return
-    try {
-      const res = await fetch(`/api/clusters/${namespace}/${name}/cancel-drain`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jobId: entry.jobId }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Failed to cancel drain')
-      setToast('Migration cancelled')
-      // Refresh status
-      const drainRes = await fetch(`/api/clusters/${namespace}/${name}/drain-status`)
-      const drainData = await drainRes.json()
-      if (drainData.statuses) setDrainStatuses(drainData.statuses)
-    } catch (e: any) {
-      setToast('Cancel failed: ' + e.message)
-    }
-  }
+  // Auto-refresh cluster data every 5s
+  useEffect(() => {
+    const interval = setInterval(() => fetchData(true), 5000)
+    return () => clearInterval(interval)
+  }, [namespace, name])
 
   const handleDelete = async () => {
     if (!confirm(`Delete cluster "${name}" in namespace "${namespace}"?`)) return
@@ -388,7 +290,7 @@ export default function ClusterDetailPage({
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
         Error loading cluster: {error}
-        <button onClick={fetchData} className="ml-3 underline text-red-600 hover:text-red-800">Retry</button>
+        <button onClick={() => fetchData()} className="ml-3 underline text-red-600 hover:text-red-800">Retry</button>
       </div>
     )
   }
@@ -471,6 +373,152 @@ export default function ClusterDetailPage({
         </div>
       </div>
 
+      {/* Master Capacity */}
+      {masterStats.length > 0 && (
+        <div className="mt-6 bg-white shadow sm:rounded-lg">
+          <div className="px-4 py-5 sm:px-6">
+            <h3 className="text-lg leading-6 font-medium text-gray-900">Master Capacity</h3>
+          </div>
+          <div className="border-t border-gray-200">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pod</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Mem Storage</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SSD Storage</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Keys</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Clients</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {masterStats.map(s => {
+                  const parsed = parseSummary(s.summary)
+                  return (
+                    <tr key={s.name}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{s.name}</td>
+                      <td className="px-6 py-4 whitespace-nowrap"><MasterRoleBadge role={s.health?.role || s.role} /></td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        {parsed ? `${parsed.memUsed} / ${parsed.memCapacity}` : '-'}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        {parsed && parsed.ssdUsed !== '-' ? `${parsed.ssdUsed} / ${parsed.ssdCapacity}` : '-'}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{parsed?.keys || '-'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{parsed?.clients || '-'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <PodStatusBadge phase={s.phase} />
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Pods table */}
+      <div className="mt-6 bg-white shadow sm:rounded-lg">
+        <div className="px-4 py-5 sm:px-6">
+          <h3 className="text-lg leading-6 font-medium text-gray-900">Pods</h3>
+        </div>
+        <div className="border-t border-gray-200 overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Node</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">CPU</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Segment</th>
+                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {workerPods.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="px-6 py-12 text-center text-sm text-gray-500">No pods found.</td>
+                </tr>
+              ) : (
+                workerPods.map(p => {
+                  const ms = masterStats.find(s => s.name === p.metadata.name)
+                  const metric = podMetrics.find(m => m.metadata.name === p.metadata.name)
+                  const res = containerResources(p.spec.containers)
+                  const { cpuUsage, memUsage } = containerUsage(metric?.containers || [])
+                  const handleDeletePod = async () => {
+                    if (!confirm(`Delete pod "${p.metadata.name}"?`)) return
+                    try {
+                      const res = await fetch(`/api/clusters/${namespace}/${name}/delete-pod`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ podName: p.metadata.name }),
+                      })
+                      const data = await res.json()
+                      if (!res.ok) throw new Error(data.error || 'Failed to delete pod')
+                      setToast(`Pod "${p.metadata.name}" deleted`)
+                      fetchData(true)
+                    } catch (e: any) {
+                      setToast('Delete failed: ' + e.message)
+                    }
+                  }
+                  return (
+                    <tr key={p.metadata.uid} className="hover:bg-gray-50">
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{p.metadata.name}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">worker</span>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap"><PodStatusBadge phase={p.status.phase} /></td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.spec.nodeName}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[120px]">
+                        {metric ? (
+                          <div className="flex flex-col gap-0.5">
+                            <ResourceBar usage={cpuUsage} limit={res.cpuLimit} label={formatCpu(metric?.containers?.[0]?.usage?.cpu)} />
+                            <span className="text-[10px] text-gray-400">{formatCpu(p.spec.containers?.[0]?.resources?.limits?.cpu || p.spec.containers?.[0]?.resources?.requests?.cpu)} limit</span>
+                          </div>
+                        ) : <span className="text-xs text-gray-400">-</span>}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[140px]">
+                        {metric ? (
+                          <div className="flex flex-col gap-0.5">
+                            <ResourceBar usage={memUsage} limit={res.memLimit} label={formatBytes(memUsage)} />
+                            <span className="text-[10px] text-gray-400">{formatBytes(res.memLimit || res.memRequest)} limit</span>
+                          </div>
+                        ) : <span className="text-xs text-gray-400">-</span>}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[140px]">
+                        {(() => {
+                          const seg = segmentStats[p.status.podIP]
+                          return seg ? (
+                            <div className="flex flex-col gap-0.5">
+                              <ResourceBar usage={seg.used} limit={seg.capacity} label={formatBytes(seg.used)} />
+                              <span className="text-[10px] text-gray-400">{formatBytes(seg.capacity)} limit</span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-gray-400">-</span>
+                          )
+                        })()}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm">
+                        <button
+                          onClick={handleDeletePod}
+                          className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-red-700 bg-red-100 hover:bg-red-200"
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       {/* Configuration */}
       <div className="mt-6 bg-white shadow sm:rounded-lg">
         <div className="px-4 py-5 sm:px-6">
@@ -529,169 +577,6 @@ export default function ClusterDetailPage({
               </div>
             )}
           </dl>
-        </div>
-      </div>
-
-      {/* Master Capacity */}
-      {masterStats.length > 0 && (
-        <div className="mt-6 bg-white shadow sm:rounded-lg">
-          <div className="px-4 py-5 sm:px-6">
-            <h3 className="text-lg leading-6 font-medium text-gray-900">Master Capacity</h3>
-          </div>
-          <div className="border-t border-gray-200">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Pod</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Mem Storage</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">SSD Storage</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Keys</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Clients</th>
-                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {masterStats.map(s => {
-                  const parsed = parseSummary(s.summary)
-                  return (
-                    <tr key={s.name}>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{s.name}</td>
-                      <td className="px-6 py-4 whitespace-nowrap"><MasterRoleBadge role={s.health?.role || s.role} /></td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {parsed ? `${parsed.memUsed} / ${parsed.memCapacity}` : '-'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {parsed && parsed.ssdUsed !== '-' ? `${parsed.ssdUsed} / ${parsed.ssdCapacity}` : '-'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{parsed?.keys || '-'}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{parsed?.clients || '-'}</td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <PodStatusBadge phase={s.phase} />
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Pods table */}
-      <div className="mt-6 bg-white shadow sm:rounded-lg">
-        <div className="px-4 py-5 sm:px-6">
-          <h3 className="text-lg leading-6 font-medium text-gray-900">Pods</h3>
-        </div>
-        <div className="border-t border-gray-200">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Node</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">CPU</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Segment</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Drain Status</th>
-                <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {workerPods.length === 0 ? (
-                <tr>
-                  <td colSpan={9} className="px-6 py-12 text-center text-sm text-gray-500">No pods found.</td>
-                </tr>
-              ) : (
-                workerPods.map(p => {
-                  const ms = masterStats.find(s => s.name === p.metadata.name)
-                  const metric = podMetrics.find(m => m.metadata.name === p.metadata.name)
-                  const res = containerResources(p.spec.containers)
-                  const { cpuUsage, memUsage } = containerUsage(metric?.containers || [])
-                  const drain = drainStatuses[p.status.podIP] || { status: 'N/A' }
-                  const isActive = drain.status === 'CREATED' || drain.status === 'PLANNING' || drain.status === 'RUNNING'
-                  return (
-                    <tr key={p.metadata.uid} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{p.metadata.name}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">worker</span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap"><PodStatusBadge phase={p.status.phase} /></td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{p.spec.nodeName}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[120px]">
-                        {metric ? (
-                          <div className="flex flex-col gap-0.5">
-                            <ResourceBar usage={cpuUsage} limit={res.cpuLimit} label={formatCpu(metric?.containers?.[0]?.usage?.cpu)} />
-                            <span className="text-[10px] text-gray-400">{formatCpu(p.spec.containers?.[0]?.resources?.limits?.cpu || p.spec.containers?.[0]?.resources?.requests?.cpu)} limit</span>
-                          </div>
-                        ) : <span className="text-xs text-gray-400">-</span>}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[140px]">
-                        {metric ? (
-                          <div className="flex flex-col gap-0.5">
-                            <ResourceBar usage={memUsage} limit={res.memLimit} label={formatBytes(memUsage)} />
-                            <span className="text-[10px] text-gray-400">{formatBytes(res.memLimit || res.memRequest)} limit</span>
-                          </div>
-                        ) : <span className="text-xs text-gray-400">-</span>}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[140px]">
-                        {(() => {
-                          const seg = segmentStats[p.status.podIP]
-                          return seg ? (
-                            <ResourceBar usage={seg.used} limit={seg.capacity} label={formatBytes(seg.used)} />
-                          ) : (
-                            <span className="text-xs text-gray-400">-</span>
-                          )
-                        })()}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm min-w-[160px]">
-                        <div className="flex flex-col gap-1">
-                          <DrainStatusBadge status={drain.status} />
-                          {isActive && drain.migratedBytes !== undefined && (
-                            <span className="text-[10px] text-gray-500">
-                              {formatBytes(drain.migratedBytes)} migrated
-                              {drain.succeededUnits !== undefined && ` (${drain.succeededUnits} ok`}
-                              {drain.failedUnits ? `, ${drain.failedUnits} fail` : ''}
-                              {drain.succeededUnits !== undefined ? ')' : ''}
-                            </span>
-                          )}
-                          {drain.status === 'FAILED' && drain.message && (
-                            <span className="text-[10px] text-red-500" title={drain.message}>failed</span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm">
-                        <div className="flex gap-2">
-                          {drain.status === 'N/A' && (
-                            <button
-                              onClick={() => handleDrainWorker(p.status.podIP)}
-                              className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-indigo-700 bg-indigo-100 hover:bg-indigo-200"
-                            >
-                              Migrate
-                            </button>
-                          )}
-                          {isActive && (
-                            <button
-                              onClick={() => handleCancelDrain(p.status.podIP)}
-                              className="inline-flex items-center px-2.5 py-1 border border-transparent text-xs font-medium rounded text-red-700 bg-red-100 hover:bg-red-200"
-                            >
-                              Cancel
-                            </button>
-                          )}
-                          {drain.status === 'SUCCEEDED' && (
-                            <span className="inline-flex items-center px-2.5 py-1 text-xs font-medium text-green-700 bg-green-100 rounded">
-                              Drained
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })
-              )}
-            </tbody>
-          </table>
         </div>
       </div>
     </div>

@@ -8,7 +8,7 @@ export default function TestClusterPage({
   params: { namespace: string; name: string }
 }) {
   const { namespace, name } = params
-  const [dataSize, setDataSize] = useState('1MB')
+  const [dataSize, setDataSize] = useState('4MB')
   const [replicaNum, setReplicaNum] = useState(3)
   const [repeatCount, setRepeatCount] = useState(16)
   const [submitting, setSubmitting] = useState(false)
@@ -82,35 +82,14 @@ export default function TestClusterPage({
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold text-gray-900">Test Cluster {name}</h1>
+      <a href={`/clusters/${namespace}/${name}`} className="text-sm text-indigo-600 hover:text-indigo-800">
+        &larr; Back to Cluster
+      </a>
+      <h1 className="text-2xl font-semibold text-gray-900 mt-2">Test Cluster {name}</h1>
       <p className="text-sm text-gray-500 mt-1">Namespace: {namespace}</p>
 
       {error && (
         <div className="mt-4 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">{error}</div>
-      )}
-
-      {/* Status banner */}
-      {jobStatus !== 'idle' && (
-        <div className={`mt-4 border px-4 py-3 rounded ${statusColor[jobStatus]}`}>
-          <div className="flex items-center">
-            {jobStatus === 'Running' && (
-              <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-            )}
-            <span className="font-medium">{statusLabel[jobStatus]}</span>
-          </div>
-        </div>
-      )}
-
-      {/* Logs */}
-      {logs && (
-        <div className="mt-4">
-          <pre className="bg-gray-900 text-green-400 p-4 rounded text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap">
-            {logs}
-          </pre>
-        </div>
       )}
 
       <form className="mt-6 space-y-6 bg-white shadow sm:rounded-lg p-6" onSubmit={handleSubmit}>
@@ -148,6 +127,30 @@ export default function TestClusterPage({
           </button>
         </div>
       </form>
+
+      {/* Status banner */}
+      {jobStatus !== 'idle' && (
+        <div className={`mt-4 border px-4 py-3 rounded ${statusColor[jobStatus]}`}>
+          <div className="flex items-center">
+            {jobStatus === 'Running' && (
+              <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            )}
+            <span className="font-medium">{statusLabel[jobStatus]}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Logs */}
+      {logs && (
+        <div className="mt-4">
+          <pre className="bg-gray-900 text-green-400 p-4 rounded text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap">
+            {logs}
+          </pre>
+        </div>
+      )}
 
       {/* Job info */}
       {jobName && (

@@ -1168,6 +1168,12 @@ int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
     rpcMetaJSON["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
     if (!storage_plugin_->set(full_key, rpcMetaJSON)) {
+        // SET may fail because key already exists (duplicate rpc_meta check
+        // in some metadata server implementations). Verify via GET.
+        Json::Value verify;
+        if (storage_plugin_->get(full_key, verify) && verify == rpcMetaJSON) {
+            return 0;
+        }
         LOG(ERROR) << "Failed to re-publish RPC meta entry for " << server_name;
         return ERR_METADATA;
     }

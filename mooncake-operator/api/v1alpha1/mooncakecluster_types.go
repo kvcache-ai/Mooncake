@@ -85,7 +85,7 @@ type MasterSpec struct {
 // WorkerSpec defines the worker node configuration.
 type WorkerSpec struct {
 	// Replicas is the number of worker replicas.
-	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=1
 	Replicas int32 `json:"replicas,omitempty"`
 

@@ -29,6 +29,11 @@ app.prepare().then(() => {
         if (handled !== false) return
       } catch (e) {
         console.error('[api-handler] Error:', e.message)
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: e.message }))
+        }
+        return
       }
     }
 
