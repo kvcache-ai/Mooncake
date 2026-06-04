@@ -17,6 +17,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
+#include "tent/runtime/transport_selector.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -304,6 +305,8 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
+    const TransportType hint = TransportSelector::parseTransportType(
+        XferBenchConfig::tent_transport_hint);
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
         entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
@@ -311,6 +314,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
+        entry.transport_hint = hint;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

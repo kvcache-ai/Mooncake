@@ -25,16 +25,20 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"rdma", RDMA},           {"tcp", TCP},     {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},     {"io_uring", IOURING},
-        {"ascend", AscendDirect}, {"mnnvl", MNNVL},
+        {"unspec", UNSPEC},       {"rdma", RDMA},
+        {"mnnvl", MNNVL},         {"shm", SHM},
+        {"nvlink", NVLINK},       {"gds", GDS},
+        {"io_uring", IOURING},    {"tcp", TCP},
+        {"ascend", AscendDirect}, {"sunrise_link", SUNRISE_LINK},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {RDMA, "rdma"},           {TCP, "tcp"},     {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},     {IOURING, "io_uring"},
-        {AscendDirect, "ascend"}, {MNNVL, "mnnvl"}, {UNSPEC, "unspec"},
+        {UNSPEC, "unspec"},       {RDMA, "rdma"},
+        {MNNVL, "mnnvl"},         {SHM, "shm"},
+        {NVLINK, "nvlink"},       {GDS, "gds"},
+        {IOURING, "io_uring"},    {TCP, "tcp"},
+        {AscendDirect, "ascend"}, {SUNRISE_LINK, "sunrise_link"},
 };
 
 // Memory type name mapping for pattern matching
@@ -354,7 +358,7 @@ SelectionResult TransportSelector::select(
     const SelectionContext& context,
     const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
         available_transports,
-    int transport_index) {
+    int transport_index, TransportType hint) {
     SelectionResult result;
 
     // Find the first matching policy (JSON order wins)
@@ -392,41 +396,58 @@ SelectionResult TransportSelector::select(
         }
     }
 
-    // If policy has transports list, use it
-    if (!matching_policy->transports.empty()) {
-        int priority_index = transport_index;
-        for (size_t i = 0; i < matching_policy->transports.size(); ++i) {
-            TransportType type = matching_policy->transports[i];
-            if (isTransportAvailable(type, context, available_transports)) {
-                if (priority_index-- <= 0) {
-                    result.transport = type;
-                    VLOG(1) << "Selected transport " << transportTypeName(type)
-                            << " for policy " << matching_policy->name
-                            << ", device_mask=0x" << std::hex
-                            << result.device_mask << std::dec;
-                    return result;
-                }
+    // The "raw" candidate set is whatever the matching policy authorizes:
+    // the policy's explicit transports list, or the buffer's registered
+    // transports as a fallback.
+    static const std::vector<TransportType> kEmpty;
+    const auto& raw = !matching_policy->transports.empty()
+                          ? matching_policy->transports
+                      : context.buffer_transports ? *context.buffer_transports
+                                                  : kEmpty;
+
+    if (transport_index < 0) return result;
+    const int original_index = transport_index;
+
+    // hint, if present, occupies slot 0.
+    const bool has_hint = (hint != UNSPEC);
+    if (has_hint) {
+        bool in_raw = false;
+        for (TransportType t : raw) {
+            if (t == hint) {
+                in_raw = true;
+                break;
             }
         }
-        return result;  // UNSPEC
-    }
-
-    // Otherwise, use buffer_transports order (original behavior)
-    if (context.buffer_transports) {
-        for (auto type : *context.buffer_transports) {
-            if (isTransportAvailable(type, context, available_transports)) {
-                if (transport_index-- <= 0) {
-                    result.transport = type;
-                    VLOG(1) << "Selected transport " << transportTypeName(type)
-                            << " from buffer_transports"
-                            << ", device_mask=0x" << std::hex
-                            << result.device_mask << std::dec;
-                    return result;
-                }
-            }
+        if (!in_raw ||
+            !isTransportAvailable(hint, context, available_transports)) {
+            return result;  // UNSPEC -> task FAILED downstream
+        }
+        if (transport_index == 0) {
+            result.transport = hint;
+        } else {
+            --transport_index;
         }
     }
 
+    // Walk raw skipping hint and decrement transport_index until it hits zero.
+    if (result.transport == UNSPEC) {
+        for (TransportType type : raw) {
+            if (has_hint && type == hint) continue;
+            if (!isTransportAvailable(type, context, available_transports))
+                continue;
+            if (transport_index == 0) {
+                result.transport = type;
+                break;
+            }
+            --transport_index;
+        }
+    }
+    if (result.transport == UNSPEC) return result;
+    VLOG(1) << "Selected transport " << transportTypeName(result.transport)
+            << " for policy " << matching_policy->name << " at index "
+            << original_index << " (hint=" << transportTypeName(hint)
+            << "), device_mask=0x" << std::hex << result.device_mask
+            << std::dec;
     return result;
 }
 

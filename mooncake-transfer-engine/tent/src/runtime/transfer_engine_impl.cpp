@@ -607,14 +607,14 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
         }
         return result;
     }
-    if (transport_list_[MNNVL]) result.push_back(MNNVL);
-    if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
-    if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
-    if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
+    if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[SHM]) result.push_back(SHM);
-    if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[GDS]) result.push_back(GDS);
+    if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
+    if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
     return result;
 }
 
@@ -804,6 +804,25 @@ static MemoryType getTypeEnum(const std::string& type) {
     return MTYPE_UNKNOWN;
 }
 
+Status TransferEngineImpl::validateTransportHint(const Request& req,
+                                                 size_t request_index) {
+    if (req.transport_hint == UNSPEC) return Status::OK();
+    if ((int)req.transport_hint < 0 ||
+        (int)req.transport_hint >= kSupportedTransportTypes) {
+        return Status::InvalidArgument(
+            "transport_hint out of range for request[" +
+            std::to_string(request_index) + "]" LOC_MARK);
+    }
+    if (!transport_list_[req.transport_hint]) {
+        return Status::InvalidArgument(
+            "transport_hint=" +
+            TransportSelector::transportTypeName(req.transport_hint) +
+            " is not enabled in config (request[" +
+            std::to_string(request_index) + "])" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                                                      int transport_index) {
     SegmentDesc* desc;
@@ -816,16 +835,17 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     }
     auto local_mtype = Platform::getLoader().getMemoryType(request.source);
 
+    const TransportType hint = request.transport_hint;
+
     // Legacy mode: use original logic (before TransportSelector)
     if (transport_selector_ && transport_selector_->isLegacyMode()) {
         SelectionResult result;
+        std::vector<TransportType> raw;
         if (desc->type == SegmentType::File) {
-            if (checkAvailability(transport_list_[GDS], local_mtype)) {
-                if (transport_index-- == 0) result.transport = GDS;
-            }
-            if (checkAvailability(transport_list_[IOURING], local_mtype)) {
-                if (transport_index-- == 0) result.transport = IOURING;
-            }
+            if (checkAvailability(transport_list_[GDS], local_mtype))
+                raw.push_back(GDS);
+            if (checkAvailability(transport_list_[IOURING], local_mtype))
+                raw.push_back(IOURING);
         } else {
             auto entry =
                 desc->findBuffer(request.target_offset, request.length);
@@ -844,19 +864,34 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
                         continue;
                     if (checkAvailability(transport_list_[type], local_mtype,
                                           remote_mtype)) {
-                        if (transport_index-- == 0) {
-                            result.transport = type;
-                            break;
-                        }
+                        raw.push_back(type);
                     }
                 }
             }
         }
+
+        bool prepend_hint = false;
+        if (hint != UNSPEC) {
+            if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
+                return result;  // UNSPEC: hint not authorized for this req
+            }
+            prepend_hint = true;
+        }
+        std::vector<TransportType> candidates;
+        if (prepend_hint) candidates.push_back(hint);
+        for (auto type : raw) {
+            if (prepend_hint && type == hint) continue;
+            candidates.push_back(type);
+        }
+        if (transport_index >= 0 &&
+            (size_t)transport_index < candidates.size()) {
+            result.transport = candidates[transport_index];
+        }
         return result;
     }
 
-    // New TransportSelector-based logic
-    // Build selection context
+    // Selector mode: build ctx, then defer everything to
+    // TransportSelector::select().
     SelectionContext ctx;
     ctx.transfer_size = request.length;
     ctx.priority_level =
@@ -870,9 +905,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = MTYPE_CPU;
         ctx.buffer_transports = nullptr;  // Empty - use policy priority
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     } else {
         // Memory segment
         auto entry = desc->findBuffer(request.target_offset, request.length);
@@ -887,14 +919,16 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
         ctx.local_memory_type = local_mtype;
         ctx.remote_memory_type = remote_mtype;
         ctx.buffer_transports = &entry->transports;
-
-        return transport_selector_->select(ctx, transport_list_,
-                                           transport_index);
     }
+
+    return transport_selector_->select(ctx, transport_list_, transport_index,
+                                       hint);
 }
 
 static const char* transportTypeName(TransportType type) {
     switch (type) {
+        case UNSPEC:
+            return "UNSPEC";
         case RDMA:
             return "RDMA";
         case MNNVL:
@@ -911,9 +945,10 @@ static const char* transportTypeName(TransportType type) {
             return "TCP";
         case AscendDirect:
             return "AscendDirect";
-        default:
-            return "UNSPEC";
+        case SUNRISE_LINK:
+            return "SUNRISE_LINK";
     }
+    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {
@@ -989,6 +1024,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
         if (a.req.target_id != b.req.target_id)
             return a.req.target_id < b.req.target_id;
+        if (a.req.transport_hint != b.req.transport_hint)
+            return a.req.transport_hint < b.req.transport_hint;
         if (a.req.target_offset != b.req.target_offset)
             return a.req.target_offset < b.req.target_offset;
         return requestSourceAddr(a.req) < requestSourceAddr(b.req);
@@ -997,6 +1034,10 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
     auto can_merge = [](const Item& last, const Item& curr) {
         if (last.req.opcode != curr.req.opcode ||
             last.req.target_id != curr.req.target_id) {
+            return false;
+        }
+        // Mixed transport_hint inside one batch must not be merged.
+        if (last.req.transport_hint != curr.req.transport_hint) {
             return false;
         }
         if (!last.boundary.source_key || !curr.boundary.source_key ||
@@ -1169,6 +1210,11 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     Batch* batch = (Batch*)(batch_id);
+
+    for (size_t i = 0; i < request_list.size(); ++i) {
+        auto st = validateTransportHint(request_list[i], i);
+        if (!st.ok()) return st;
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];

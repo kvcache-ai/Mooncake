@@ -2,6 +2,7 @@
 .vscode
 build
 build_ofed4
+build-new
 old
 local_test
 go.sum

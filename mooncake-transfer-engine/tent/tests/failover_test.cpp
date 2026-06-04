@@ -128,11 +128,13 @@ TEST(FailoverConfigTest, AutoFailoverOnPollCanBeDisabled) {
 // verify the enum values are well-defined and usable in switch)
 // ---------------------------------------------------------------------------
 
-TEST(TransportTypeTest, UnspecIsSentinel) {
-    // UNSPEC must be the last enum value so that types [0, UNSPEC) are the
-    // valid transport types and kSupportedTransportTypes == (int)UNSPEC.
-    EXPECT_GT(kSupportedTransportTypes, 0);
-    EXPECT_EQ(kSupportedTransportTypes, static_cast<int>(UNSPEC));
+TEST(TransportTypeTest, UnspecIsZeroSlot) {
+    // UNSPEC must be value 0 so that zero-initialized tent_request /
+    // tent_memory_options structs (the C ABI) default to UNSPEC
+    // rather than silently pinning to whichever transport happened 
+    // to occupy slot 0.
+    EXPECT_EQ(static_cast<int>(UNSPEC), 0);
+    EXPECT_EQ(kSupportedTransportTypes, static_cast<int>(SUNRISE_LINK) + 1);
 }
 
 // ---------------------------------------------------------------------------
