@@ -76,6 +76,11 @@ if(USE_CUDA)
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(device_transport_example PUBLIC
     transfer_engine gflags::gflags glog::glog)
-  set_target_properties(device_transport_example PROPERTIES
-    CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
+  if(TORCH_CUDA_ARCH_LIST)
+    set_target_properties(device_transport_example PROPERTIES
+      CUDA_ARCHITECTURES "${TORCH_CUDA_ARCH_LIST}")
+  else()
+    set_target_properties(device_transport_example PROPERTIES
+      CUDA_ARCHITECTURES "80;90")
+  endif()
 endif()
