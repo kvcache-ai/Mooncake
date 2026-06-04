@@ -11,7 +11,7 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
-#include "ha_metric_manager.h"
+
 #include "http_metadata_server.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -1093,8 +1093,6 @@ int main(int argc, char* argv[]) {
         // Give the server some time to start
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-
-    mooncake::HAMetricManager::Init();
 
     if (master_config.enable_ha) {
         mooncake::ha::MasterServiceSupervisor supervisor(
