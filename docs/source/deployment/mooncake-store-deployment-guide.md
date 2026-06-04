@@ -4,38 +4,8 @@ This guide covers the architecture, minimal deployment, and operational tuning o
 
 ## Architecture Overview
 
-Mooncake Store is a distributed KV cache engine for LLM inference. A deployment involves three node roles:
 
-```
-                            +--------------------+
-                            |   Master Service   |
-                            | (mooncake_master)  |
-                            | - Object alloc     |
-                            | - Eviction policy  |
-                            | - Node membership  |
-                            +--------+-----------+
-                                     |
-                           Control plane (RPC)
-                                     |
-         +---------------------------+---------------------------+
-         |                           |                           |
-+--------v--------+         +--------v--------+         +--------v--------+
-|   Client Node   |         |   Client Node   |         |   Client Node   |
-| (App + Embed)   |         | (App + Embed)   |         | (Standalone)    |
-|                 |         |                 |         |                 |
-|  DRAM/VRAM/SSD  |         |  DRAM/VRAM/SSD  |         |  DRAM/VRAM/SSD  |
-+--------+--------+         +--------+--------+         +--------+--------+
-         |                           |                           |
-         +---------------------------+---------------------------+
-                           Data plane (RDMA/TCP)
-                    Transfer Engine — zero-copy, multi-NIC
-                                    |
-                          +---------+---------+
-                          | Metadata Service  |
-                          | (etcd / Redis /   |
-                          |  HTTP)            |
-                          +-------------------+
-```
+![architecture](../image/mooncake-store-preview.png)
 
 **Master Service** (`mooncake_master`): The central coordinator. It manages cluster membership, allocates object storage across client nodes, and enforces eviction/placement policies. Runs as a standalone process.
 
@@ -150,20 +120,6 @@ mooncake_master \
 ```
 
 Limitation: the master is a single point of failure. If it crashes, cluster operations pause until it is restored.
-
----
-
-### Single-Node (RDMA) — Production with RDMA Transport
-
-For production workloads, enable RDMA for both the control and data planes:
-
-```bash
-MC_RPC_PROTOCOL=rdma mooncake_master \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_port=8080
-```
-
-Clients must also set `MC_RPC_PROTOCOL=rdma` and pass valid `rdma_devices` to the Python `setup()` call. The same single-master limitation applies.
 
 ---
 
@@ -544,4 +500,3 @@ export MC_YLT_LOG_LEVEL=info
 ```
 
 Available: `trace`, `debug`, `info`, `warn` (or `warning`), `error`, `critical`.
-
