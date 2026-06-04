@@ -52,15 +52,20 @@ class Environ {
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
 
+    // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
+    // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
+    // Helper method to get bool from env (checks for "1", "true", "TRUE")
     static bool GetBool(const char* name, bool default_value);
+    // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
 
    private:
     Environ();
 
+    // Member variables
     int num_cq_per_ctx_;
     int num_comp_channels_per_ctx_;
     int ib_port_;
