@@ -27,9 +27,10 @@ struct StandbyObjectMetadata {
     // 2. After promotion, new Primary should grant fresh leases, not restore
     // old ones
     uint64_t last_sequence_id{
-        0};  // Last OpLog sequence ID that modified this key
-    std::string group_id;                    // Tenant group identifier
-    ObjectDataType data_type{ObjectDataType::UNKNOWN};  // Data type classification
+        0};                // Last OpLog sequence ID that modified this key
+    std::string group_id;  // Tenant group identifier
+    ObjectDataType data_type{
+        ObjectDataType::UNKNOWN};  // Data type classification
 
     StandbyObjectMetadata() = default;
 
@@ -89,8 +90,8 @@ struct MetadataPayload {
     UUID client_id{0, 0};
     uint64_t size{0};
     std::vector<Replica::Descriptor> replicas;
-    struct_pack::compatible<std::string, 1> group_id;       // Tenant group
-    struct_pack::compatible<ObjectDataType, 1> data_type;   // Data type
+    struct_pack::compatible<std::string, 1> group_id;      // Tenant group
+    struct_pack::compatible<ObjectDataType, 1> data_type;  // Data type
 
     YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type);
 
@@ -113,7 +114,7 @@ struct MetadataPayload {
  * Used to reconstruct segment view after promotion.
  */
 class StandbySegmentRegistry {
-  public:
+   public:
     StandbySegmentRegistry() = default;
 
     // Segment lifecycle events
@@ -128,7 +129,7 @@ class StandbySegmentRegistry {
     std::vector<StandbySegmentInfo> GetAllSegments() const;
     void Clear();
 
-  private:
+   private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
 };

@@ -24,8 +24,7 @@ class MockMetadataStore : public MetadataStore {
     using MetadataStore::Remove;
 
     // Tenant-aware methods (primary API)
-    bool PutMetadata(const std::string& tenant_id,
-                     const std::string& key,
+    bool PutMetadata(const std::string& tenant_id, const std::string& key,
                      const StandbyObjectMetadata& metadata) override {
         const auto normalized = NormalizeTenantId(tenant_id);
         metadata_map_[normalized][key] = metadata;
@@ -46,8 +45,7 @@ class MockMetadataStore : public MetadataStore {
         return std::nullopt;
     }
 
-    bool Remove(const std::string& tenant_id,
-                const std::string& key) override {
+    bool Remove(const std::string& tenant_id, const std::string& key) override {
         const auto normalized = NormalizeTenantId(tenant_id);
         auto tenant_it = metadata_map_.find(normalized);
         if (tenant_it == metadata_map_.end()) {

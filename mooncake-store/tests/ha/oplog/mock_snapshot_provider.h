@@ -15,9 +15,8 @@ namespace mooncake::test {
 // Allows pre-filling snapshot data and simulating load failures.
 class MockSnapshotProvider : public SnapshotProvider {
    public:
-    void SetSnapshot(
-        const std::string& snap_id, uint64_t seq_id,
-        std::vector<StandbyObjectEntry> data) {
+    void SetSnapshot(const std::string& snap_id, uint64_t seq_id,
+                     std::vector<StandbyObjectEntry> data) {
         snapshot_id_ = snap_id;
         snapshot_seq_id_ = seq_id;
         snapshot_data_ = std::move(data);

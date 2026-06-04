@@ -78,7 +78,8 @@ class NoopStandbyController final : public StandbyController {
 
     ErrorCode PromoteStandby() override { return ErrorCode::OK; }
 
-    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() override {
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
         return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
@@ -213,7 +214,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         return err;
     }
 
-    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport() override {
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
         // Verify standby is running first (same check as PromoteStandby)
         ErrorCode promote_error = ErrorCode::OK;
         {
