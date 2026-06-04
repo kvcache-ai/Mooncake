@@ -44,7 +44,7 @@
 DEFINE_int32(rank, -1, "Rank of this process (0 or 1)");
 DEFINE_int32(world_size, 2, "Total number of ranks");
 DEFINE_int32(gpu_id, -1, "GPU ID (defaults to rank)");
-DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server address");
+DEFINE_string(metadata_server, "P2PHANDSHAKE", "Metadata server (P2PHANDSHAKE for no external deps)");
 DEFINE_string(local_server_name, "", "Local server name (default: 127.0.0.1:<port>)");
 DEFINE_string(ipc_dir, "/tmp", "Directory for IPC handle exchange files");
 DEFINE_int32(kDataBytes, 4096, "Bytes to transfer in the P2P write");
@@ -251,31 +251,47 @@ int main(int argc, char** argv) {
     ctx.p2p.local_base = gdr_buffer;
     // IBGDA fields left as nullptr (not used for P2P-only example).
 
-    // Copy CommCtx to device memory so the kernel can access it.
-    mooncake::device::CommCtx* d_ctx = nullptr;
-    checkCuda(cudaMalloc(&d_ctx, sizeof(mooncake::device::CommCtx)),
-              "cudaMalloc CommCtx");
-    checkCuda(cudaMemcpy(d_ctx, &ctx, sizeof(mooncake::device::CommCtx),
-                         cudaMemcpyHostToDevice),
-              "cudaMemcpy CommCtx");
-
+    // Pass CommCtx by value — CUDA copies it to kernel parameter space.
     if (rank == 0) {
         LOG(INFO) << "Rank 0 launching sender kernel...";
-        senderKernel<<<1, 1>>>(*d_ctx, peer_rank, FLAGS_kDataBytes);
+        senderKernel<<<1, 1>>>(ctx, peer_rank, FLAGS_kDataBytes);
     } else {
         LOG(INFO) << "Rank 1 launching receiver kernel...";
-        receiverKernel<<<1, 1>>>(*d_ctx, peer_rank, FLAGS_kDataBytes);
+        receiverKernel<<<1, 1>>>(ctx, peer_rank, FLAGS_kDataBytes);
     }
     checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
     // -----------------------------------------------------------------------
-    // 5. Cleanup.
+    // 5. Barrier: rank 1 signals completion, rank 0 waits before cleanup.
+    //    The IPC handle is only valid while the original allocation exists,
+    //    so rank 0 must not free its buffer until rank 1 has opened it.
     // -----------------------------------------------------------------------
-    checkCuda(cudaFree(d_ctx), "cudaFree CommCtx");
+    if (rank == 1) {
+        // Signal rank 0 that we're done.
+        std::string done_path = FLAGS_ipc_dir + "/device_api_ex_done.bin";
+        std::ofstream ofs(done_path);
+        ofs << "1";
+        ofs.close();
+    } else {
+        // Wait for rank 1 to finish.
+        std::string done_path = FLAGS_ipc_dir + "/device_api_ex_done.bin";
+        for (int attempt = 0; attempt < 300; ++attempt) {
+            std::ifstream ifs(done_path);
+            if (ifs) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Cleanup.
+    // -----------------------------------------------------------------------
     p2p->freeBuffer(gdr_buffer);
 
     // Remove IPC handle files.
     std::remove(ipcFilePath(rank).c_str());
+    if (rank == 0) {
+        std::remove((FLAGS_ipc_dir + "/device_api_ex_done.bin").c_str());
+    }
 
     LOG(INFO) << "Rank " << rank << " done.";
     return 0;
