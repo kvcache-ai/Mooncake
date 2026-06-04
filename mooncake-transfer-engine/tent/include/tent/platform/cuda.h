@@ -20,6 +20,7 @@
 #include "tent/common/concurrent/rw_spinlock.h"
 
 #include <cuda_runtime.h>
+#include "tent/platform/cuda_utils.h"
 
 namespace mooncake {
 namespace tent {

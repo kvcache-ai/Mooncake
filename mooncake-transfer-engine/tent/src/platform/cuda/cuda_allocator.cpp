@@ -16,12 +16,13 @@
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
-#include <cuda_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
+#include <cstring>
 
 namespace mooncake {
 namespace tent {
+
 Status CudaPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
@@ -42,26 +43,34 @@ Status CudaPlatform::allocate(void** pptr, size_t size,
 }
 
 Status CudaPlatform::free(void* ptr, size_t size) {
-    cudaPointerAttributes attributes;
-    CHECK_CUDA(cudaPointerGetAttributes(&attributes, ptr));
-    if (attributes.type == cudaMemoryTypeDevice) {
+    int dev = getCudaDeviceForPtr(ptr);
+    if (dev >= 0) {
         CHECK_CUDA(cudaFree(ptr));
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(ptr, size);
     } else {
-        LOG(ERROR) << "Unknown memory type, " << ptr << " " << attributes.type;
+        numa_free(ptr, size);
     }
     return Status::OK();
 }
 
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
+    // Determine which GPU (if any) owns src or dst before touching any CUDA
+    // runtime API, to avoid implicitly creating a primary context on GPU 0.
+    int dev = getCudaDeviceForPtr(src);
+    if (dev < 0) dev = getCudaDeviceForPtr(dst);
+    if (dev < 0) {
+        // Both pointers are host memory; plain memcpy is sufficient.
+        ::memcpy(dst, src, length);
+        return Status::OK();
+    }
+    // Set the device before any CUDA runtime call so the calling thread
+    // doesn't implicitly initialize GPU 0 as its current device.
+    CHECK_CUDA(cudaSetDevice(dev));
     // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
     CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, dev));
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
