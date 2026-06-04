@@ -215,6 +215,9 @@ mooncake-operator/.kube/
 mooncake-operator/bin/
 mooncake-operator/mooncake-operator
 
+# Stripped binaries (build artifacts)
+*.stripped
+
 # Next.js build artifacts
 mooncake-operator/ui/.next/
 mooncake-operator/ui/node_modules/
