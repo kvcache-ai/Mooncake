@@ -1,16 +1,47 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 
 interface Cluster {
   metadata: { name: string; namespace: string }
   status?: { phase?: string; masterReady?: number; workerReady?: number }
 }
 
+interface OperatorPod {
+  name: string
+  phase: string
+  node: string
+  ready: boolean
+}
+
+interface OperatorLeaderInfo {
+  holder: string
+  leaseDuration: number
+  acquireTime: string
+  renewTime: string
+  leaderTransitions: number
+}
+
+interface OperatorStatus {
+  pods: OperatorPod[]
+  readyCount: number
+  totalCount: number
+  leader: OperatorLeaderInfo | null
+  error?: string
+}
+
+function getLeaderPodName(holder: string): string {
+  return holder ? holder.split('_')[0] : ''
+}
+
 export default function Home() {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [opStatus, setOpStatus] = useState<OperatorStatus | null>(null)
+  const [opLoading, setOpLoading] = useState(true)
+  const [scaling, setScaling] = useState(false)
+  const [scaleInput, setScaleInput] = useState('2')
 
   useEffect(() => {
     let cancelled = false
@@ -34,9 +65,63 @@ export default function Home() {
     return () => { cancelled = true }
   }, [])
 
+  useEffect(() => {
+    let cancelled = false
+    function fetchOp() {
+      fetch('/api/operator')
+        .then(r => r.json())
+        .then(d => {
+          if (cancelled) return
+          setOpStatus(d)
+          if (!cancelled && d?.totalCount) {
+            setScaleInput(String(d.totalCount))
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setOpLoading(false)
+        })
+    }
+    fetchOp()
+    const interval = setInterval(fetchOp, 15000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [])
+
+  const handleScale = useCallback(async (replicas: number) => {
+    if (replicas < 1) return
+    setScaling(true)
+    try {
+      const resp = await fetch('/api/operator/scale', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ replicas }),
+      })
+      const data = await resp.json()
+      if (data.success) {
+        setScaleInput(String(replicas))
+        // Refresh status after a short delay
+        setTimeout(async () => {
+          const r = await fetch('/api/operator')
+          const d = await r.json()
+          setOpStatus(d)
+          setScaling(false)
+        }, 2000)
+        return
+      }
+    } catch (e) {
+      console.error('Scale failed', e)
+    }
+    setScaling(false)
+  }, [])
+
   const total = clusters.length
   const running = clusters.filter(c => c.status?.phase === 'Running').length
   const failed = clusters.filter(c => c.status?.phase === 'Failed').length
+
+  const leaderPodName = opStatus?.leader ? getLeaderPodName(opStatus.leader.holder) : ''
 
   return (
     <div>
@@ -48,6 +133,7 @@ export default function Home() {
         </div>
       )}
 
+      {/* Cluster Summary Cards */}
       <div className="mt-6 grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
         <div className="bg-white overflow-hidden shadow rounded-lg">
           <div className="p-5">
@@ -106,6 +192,133 @@ export default function Home() {
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Operator HA Status Section */}
+      <div className="mt-8">
+        <h2 className="text-xl font-semibold text-gray-900">Operator HA Status</h2>
+        <div className="mt-4 bg-white overflow-hidden shadow rounded-lg">
+          {opLoading ? (
+            <div className="p-5 text-gray-500">Loading operator status...</div>
+          ) : opStatus?.error ? (
+            <div className="p-5 text-red-600">Error: {opStatus.error}</div>
+          ) : (
+            <div className="p-5">
+              {/* Summary row */}
+              <div className="flex flex-wrap items-center gap-6 mb-4">
+                <div>
+                  <span className="text-sm text-gray-500">Pods</span>
+                  <span className="ml-2 text-lg font-semibold text-gray-900">
+                    {opStatus?.readyCount || 0}/{opStatus?.totalCount || 0}
+                  </span>
+                  <span className="ml-1 text-sm text-gray-500">ready</span>
+                </div>
+                {opStatus?.leader && (
+                  <>
+                    <div>
+                      <span className="text-sm text-gray-500">Transitions</span>
+                      <span className="ml-2 text-sm font-semibold text-gray-900">
+                        {opStatus.leader.leaderTransitions}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-sm text-gray-500">Lease Duration</span>
+                      <span className="ml-2 text-sm text-gray-900">
+                        {opStatus.leader.leaseDuration}s
+                      </span>
+                    </div>
+                  </>
+                )}
+
+                {/* Scale controls */}
+                <div className="ml-auto flex items-center gap-2">
+                  <span className="text-sm text-gray-500">Replicas</span>
+                  <div className="flex items-center border border-gray-300 rounded">
+                    <button
+                      onClick={() => handleScale(Math.max(1, parseInt(scaleInput || '1') - 1))}
+                      disabled={scaling || parseInt(scaleInput || '1') <= 1}
+                      className="px-2 py-1 text-gray-600 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed border-r border-gray-300"
+                    >
+                      -
+                    </button>
+                    <input
+                      type="number"
+                      min={1}
+                      value={scaleInput}
+                      onChange={e => setScaleInput(e.target.value)}
+                      onBlur={e => {
+                        const v = parseInt(e.target.value)
+                        if (!isNaN(v) && v >= 1) handleScale(v)
+                        else setScaleInput(String(opStatus?.totalCount || 1))
+                      }}
+                      className="w-14 text-center text-sm py-1 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                    />
+                    <button
+                      onClick={() => handleScale(Math.max(1, parseInt(scaleInput || '1') + 1))}
+                      disabled={scaling}
+                      className="px-2 py-1 text-gray-600 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed border-l border-gray-300"
+                    >
+                      +
+                    </button>
+                  </div>
+                  {scaling && <span className="text-xs text-indigo-600">updating...</span>}
+                </div>
+              </div>
+
+              {/* Pod table */}
+              {opStatus && opStatus.pods.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-200">
+                        <th className="text-left py-2 pr-4 text-gray-500 font-medium">Pod</th>
+                        <th className="text-left py-2 pr-4 text-gray-500 font-medium">Status</th>
+                        <th className="text-left py-2 pr-4 text-gray-500 font-medium">Ready</th>
+                        <th className="text-left py-2 pr-4 text-gray-500 font-medium">Leader</th>
+                        <th className="text-left py-2 text-gray-500 font-medium">Node</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {opStatus.pods.map(pod => (
+                        <tr key={pod.name} className="border-b border-gray-100 hover:bg-gray-50">
+                          <td className="py-2 pr-4 font-mono text-xs text-gray-900 truncate max-w-xs">
+                            {pod.name}
+                          </td>
+                          <td className="py-2 pr-4">
+                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                              pod.phase === 'Running' ? 'bg-green-100 text-green-800' :
+                              pod.phase === 'Pending' ? 'bg-yellow-100 text-yellow-800' :
+                              'bg-gray-100 text-gray-800'
+                            }`}>
+                              {pod.phase}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4">
+                            {pod.ready ? (
+                              <span className="text-green-600 font-medium">Yes</span>
+                            ) : (
+                              <span className="text-red-600 font-medium">No</span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4">
+                            {leaderPodName && pod.name.startsWith(leaderPodName) ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-800">
+                                Leader
+                              </span>
+                            ) : (
+                              <span className="text-gray-300">-</span>
+                            )}
+                          </td>
+                          <td className="py-2 text-xs text-gray-500 font-mono">{pod.node}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

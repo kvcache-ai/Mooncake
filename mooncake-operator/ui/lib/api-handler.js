@@ -103,6 +103,7 @@ function k8sRequest(apiPath, method = 'GET', body) {
       headers['Authorization'] = `Bearer ${getK8sToken()}`
     }
     if (method === 'POST' || method === 'PUT') headers['Content-Type'] = 'application/json'
+    if (method === 'PATCH') headers['Content-Type'] = 'application/json-patch+json'
     const options = {
       hostname: url.hostname,
       port: url.port || 443,
@@ -170,6 +171,81 @@ const drainStatusEnum = ['CREATED', 'PLANNING', 'RUNNING', 'SUCCEEDED', 'FAILED'
 async function handleApiRequest(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost')
+
+  // GET /api/operator - get operator HA status (pods + leader)
+  if (url.pathname === '/api/operator' && req.method === 'GET') {
+    try {
+      const namespace = 'mooncake-operator-system'
+
+      // Get operator pods
+      const podResult = await k8sRequest(
+        `/api/v1/namespaces/${namespace}/pods?labelSelector=control-plane%3Dmooncake-operator`
+      )
+      const pods = (podResult?.items || []).map(pod => {
+        const readyCondition = (pod.status?.conditions || []).find(c => c.type === 'Ready')
+        return {
+          name: pod.metadata?.name || '',
+          phase: pod.status?.phase || 'Unknown',
+          node: pod.spec?.nodeName || '',
+          ready: readyCondition?.status === 'True',
+        }
+      })
+
+      // Get leader lease
+      let leader = null
+      try {
+        const leaseResult = await k8sRequest(
+          `/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases/mooncake-operator-leader`
+        )
+        if (leaseResult?.spec) {
+          leader = {
+            holder: leaseResult.spec.holderIdentity || '',
+            leaseDuration: leaseResult.spec.leaseDurationSeconds || 0,
+            acquireTime: leaseResult.spec.acquireTime || '',
+            renewTime: leaseResult.spec.renewTime || '',
+            leaderTransitions: leaseResult.spec.leaderTransitions || 0,
+          }
+        }
+      } catch (e) {
+        // Lease may not exist yet
+        console.warn('[api-handler] Failed to get operator lease:', e.message)
+      }
+
+      return jsonReply(res, 200, {
+        pods,
+        readyCount: pods.filter(p => p.ready).length,
+        totalCount: pods.length,
+        leader,
+      })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
+  // PUT /api/operator/scale - scale the operator deployment replicas
+  if (url.pathname === '/api/operator/scale' && req.method === 'PUT') {
+    let body = ''
+    for await (const chunk of req) body += chunk
+    try {
+      const { replicas } = JSON.parse(body)
+      if (typeof replicas !== 'number' || replicas < 1 || !Number.isInteger(replicas)) {
+        return jsonReply(res, 400, { error: 'replicas must be an integer >= 1' })
+      }
+      const namespace = 'mooncake-operator-system'
+      const depName = 'mooncake-operator-controller-manager'
+
+      // Patch the deployment's replicas
+      const patch = [{ op: 'replace', path: '/spec/replicas', value: replicas }]
+      const result = await k8sRequest(
+        `/apis/apps/v1/namespaces/${namespace}/deployments/${depName}`,
+        'PATCH',
+        patch
+      )
+      return jsonReply(res, 200, { replicas, success: true })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
 
   // GET /api/debug
   if (url.pathname === '/api/debug') {

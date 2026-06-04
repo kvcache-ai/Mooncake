@@ -16,7 +16,7 @@ spec:
   selector:
     matchLabels:
       control-plane: mooncake-operator
-  replicas: 1
+  replicas: 2
   template:
     metadata:
       labels:
@@ -24,6 +24,15 @@ spec:
     spec:
       serviceAccountName: mooncake-operator-controller-manager
       terminationGracePeriodSeconds: 10
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  control-plane: mooncake-operator
+              topologyKey: kubernetes.io/hostname
       containers:
       - name: manager
         image: mooncake-operator:latest

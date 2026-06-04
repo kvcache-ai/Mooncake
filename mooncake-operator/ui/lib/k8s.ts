@@ -153,3 +153,111 @@ export async function deleteMooncakeCluster(namespace: string, name: string): Pr
     return false
   }
 }
+
+export interface OperatorPod {
+  name: string
+  phase: string
+  node: string
+  ready: boolean
+}
+
+export interface OperatorLeaderInfo {
+  holder: string
+  leaseDuration: number
+  acquireTime: string
+  renewTime: string
+  leaderTransitions: number
+}
+
+export interface OperatorStatus {
+  pods: OperatorPod[]
+  readyCount: number
+  totalCount: number
+  leader: OperatorLeaderInfo | null
+  error?: string
+}
+
+const coreApi = kc.makeApiClient(k8s.CoreV1Api)
+
+export async function getOperatorPods(): Promise<OperatorPod[]> {
+  try {
+    const resp = await coreApi.listNamespacedPod(
+      'mooncake-operator-system',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'control-plane=mooncake-operator'
+    )
+    return (resp.body.items || []).map(pod => {
+      const readyCondition = pod.status?.conditions?.find(
+        c => c.type === 'Ready'
+      )
+      return {
+        name: pod.metadata?.name || '',
+        phase: pod.status?.phase || 'Unknown',
+        node: pod.spec?.nodeName || '',
+        ready: readyCondition?.status === 'True',
+      }
+    })
+  } catch (err) {
+    console.error('Failed to list operator pods:', err)
+    return []
+  }
+}
+
+export async function getOperatorLeader(): Promise<OperatorLeaderInfo | null> {
+  try {
+    const coordinationApi = kc.makeApiClient(k8s.CoordinationV1Api)
+    const resp = await coordinationApi.readNamespacedLease(
+      'mooncake-operator-leader',
+      'mooncake-operator-system'
+    )
+    const lease = resp.body
+    if (!lease.spec) return null
+    return {
+      holder: lease.spec.holderIdentity || '',
+      leaseDuration: lease.spec.leaseDurationSeconds || 0,
+      acquireTime: lease.spec.acquireTime?.toString() || '',
+      renewTime: lease.spec.renewTime?.toString() || '',
+      leaderTransitions: lease.spec.leaseTransitions || 0,
+    }
+  } catch (err) {
+    console.error('Failed to get operator leader lease:', err)
+    return null
+  }
+}
+
+export async function getOperatorStatus(): Promise<OperatorStatus> {
+  const [pods, leader] = await Promise.all([
+    getOperatorPods(),
+    getOperatorLeader(),
+  ])
+  return {
+    pods,
+    readyCount: pods.filter(p => p.ready).length,
+    totalCount: pods.length,
+    leader,
+  }
+}
+
+export async function scaleOperatorDeployment(replicas: number): Promise<{ success: boolean; replicas: number }> {
+  try {
+    const appsApi = kc.makeApiClient(k8s.AppsV1Api)
+    await appsApi.patchNamespacedDeployment(
+      'mooncake-operator-controller-manager',
+      'mooncake-operator-system',
+      [{ op: 'replace', path: '/spec/replicas', value: replicas }],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { headers: { 'Content-Type': 'application/json-patch+json' } }
+    )
+    return { success: true, replicas }
+  } catch (err) {
+    console.error('Failed to scale operator deployment:', err)
+    throw err
+  }
+}
