@@ -44,8 +44,8 @@ class TcpAddressValidationTest : public ::testing::Test {
 
     void SetUp() override {
         buffers_ = {
-            {0x1000, 0x2000},      // [0x1000, 0x3000)
-            {0x10000, 0x100000},   // [0x10000, 0x110000)
+            {0x1000, 0x2000},     // [0x1000, 0x3000)
+            {0x10000, 0x100000},  // [0x10000, 0x110000)
         };
     }
 };

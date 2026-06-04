@@ -103,11 +103,10 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 uint64_t size = le64toh(header_.size);
                 if (validate_addr_ &&
                     !validate_addr_((uint64_t)local_buffer_, size)) {
-                    LOG(ERROR)
-                        << "ServerSession: remote-supplied address 0x"
-                        << std::hex << (uint64_t)local_buffer_ << std::dec
-                        << " with size " << size
-                        << " is not within any registered buffer";
+                    LOG(ERROR) << "ServerSession: remote-supplied address 0x"
+                               << std::hex << (uint64_t)local_buffer_
+                               << std::dec << " with size " << size
+                               << " is not within any registered buffer";
                     session_mutex_.unlock();
                     return;
                 }
@@ -496,8 +495,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
 struct TcpContext {
     TcpContext(short port, ValidateAddrFn validate_addr)
-        : acceptor(io_context),
-          validate_addr_(std::move(validate_addr)) {
+        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -531,8 +529,8 @@ struct TcpContext {
                 socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                 auto socket_ptr =
                     std::make_shared<tcpsocket>(std::move(socket));
-                auto session = std::make_shared<ServerSession>(
-                    socket_ptr, validate_addr_);
+                auto session =
+                    std::make_shared<ServerSession>(socket_ptr, validate_addr_);
                 session->start();
             }
             doAccept();
@@ -618,10 +616,9 @@ int TcpTransport::install(std::string& local_server_name,
 
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
-    context_ = new TcpContext(tcp_port,
-                              [this](uint64_t addr, uint64_t size) {
-                                  return validateAddress(addr, size);
-                              });
+    context_ = new TcpContext(tcp_port, [this](uint64_t addr, uint64_t size) {
+        return validateAddress(addr, size);
+    });
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
