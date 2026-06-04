@@ -132,21 +132,27 @@ class BufferAllocatorBase {
  * this allocator are invalid for actual I/O but preserve endpoint info.
  */
 class DummyBufferAllocator final : public BufferAllocatorBase {
-  public:
+   public:
     explicit DummyBufferAllocator(std::string segment_name,
                                   std::string transport_endpoint)
         : segment_name_(std::move(segment_name)),
           transport_endpoint_(std::move(transport_endpoint)) {}
 
-    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override { return nullptr; }
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        return nullptr;
+    }
     void deallocate(AllocatedBuffer* handle) override {}
     size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
-    size_t getLargestFreeRegion() const override { return kAllocatorUnknownFreeSpace; }
+    size_t getLargestFreeRegion() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
     size_t size() const override { return 0; }
     std::string getSegmentName() const override { return segment_name_; }
-    std::string getTransportEndpoint() const override { return transport_endpoint_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
 
-  private:
+   private:
     std::string segment_name_;
     std::string transport_endpoint_;
 };
