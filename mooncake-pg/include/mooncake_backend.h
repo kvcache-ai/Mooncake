@@ -34,7 +34,7 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    bool supportsCoalescing() const { return false; }
+    bool supportsCoalescing() const override { return false; }
 
     c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
                                         int dstRank, int tag) override;
@@ -96,7 +96,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     const std::string getBackendName() const override;
 
-    int getSize() const { return meta_ ? meta_->activeSize : size_; }
+    int getSize() const override { return meta_ ? meta_->activeSize : size_; }
 
     // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
     // Only single-tensor ops are supported.
@@ -149,7 +149,7 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         std::vector<std::vector<at::Tensor>>& inputTensors,
         const c10d::ScatterOptions& opts) override;
 
-    void shutdown();
+    void shutdown() override;
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 

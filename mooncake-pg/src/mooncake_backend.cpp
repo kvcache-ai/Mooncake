@@ -1,3 +1,8 @@
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAContext.h>
+#else
+#include <ATen/cuda/CUDAContext.h>
+#endif
 #include <cuda_alike.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
@@ -10,10 +15,25 @@
 #include "connection_poller.h"
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
-#include <mooncake_pg_gpu_utils.h>
 #include "pg_utils.h"
 
 namespace mooncake {
+
+#ifdef MOONCAKE_EP_USE_MUSA
+static inline GPUStream getCurrentGPUStream(int device_index = -1) {
+    return at::musa::getCurrentMUSAStream(device_index);
+}
+static inline int currentGPUDevice() { return at::musa::current_device(); }
+static inline constexpr auto kGPUDevice = c10::DeviceType::PrivateUse1;
+static inline constexpr auto kGPUDeviceType = at::musa::kMUSA;
+#else
+static inline GPUStream getCurrentGPUStream(int device_index = -1) {
+    return at::cuda::getCurrentCUDAStream(device_index);
+}
+static inline int currentGPUDevice() { return at::cuda::current_device(); }
+static inline constexpr auto kGPUDevice = torch::kCUDA;
+static inline constexpr auto kGPUDeviceType = c10::DeviceType::CUDA;
+#endif
 
 constexpr const char* REGISTER_BUFFER_ERROR_MSG =
     "Failed to register local memory.";
@@ -384,13 +404,8 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-#ifdef MOONCAKE_EP_USE_MUSA
-            TORCH_CHECK(options_->activeRanks_.device().is_privateuseone(),
-                        "activeRanks must be on MUSA.");
-#else
-            TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
-                        "activeRanks must be on CUDA.");
-#endif
+            TORCH_CHECK(options_->activeRanks_.device().type() == kGPUDeviceType,
+                        "activeRanks must be on GPU.");
         }
         if (max_size != size) {
             TORCH_CHECK(options_->activeRanks_.numel() == max_size,

@@ -89,7 +89,7 @@ void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              Task* tasks, int numRanks,
                              const bool* activeRanks,
                              int* activeRanksTensor, size_t taskId,
-                             musaStream_t stream) {
+                             cudaStream_t stream) {
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, bufferOffset, submitSequence,
         meta, tasks, numRanks, activeRanks, activeRanksTensor, taskId);
@@ -99,7 +99,7 @@ void launchEnqueueTaskKernel(int opType, size_t tensorSize,
     void launchReduceKernel_##suffix(scalar_t* dst, const scalar_t* src,       \
                                     size_t numElements, size_t numRanks,       \
                                     int op, bool* activeRanks,                 \
-                                    musaStream_t stream) {                     \
+                                    cudaStream_t stream) {                     \
         reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks,  \
                                              op, activeRanks);                 \
     }
@@ -116,7 +116,7 @@ DEF_LAUNCH_REDUCE(bool, bool)
 // BFloat16 needs special handling since it's a struct, not a primitive
 void launchReduceKernel_bf16(void* dst, const void* src,
                              size_t numElements, size_t numRanks,
-                             int op, bool* activeRanks, musaStream_t stream) {
+                             int op, bool* activeRanks, cudaStream_t stream) {
     reduceKernel<<<64, 256, 0, stream>>>(
         (mt_bfloat16*)dst, (const mt_bfloat16*)src,
         numElements, numRanks, op, activeRanks);
