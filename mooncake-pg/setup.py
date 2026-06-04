@@ -56,14 +56,21 @@ if use_musa:
                         "-O3",
                     ],
                 },
-                libraries=["glog", "jsoncpp", "numa"],
+                libraries=["glog", "jsoncpp"],
                 extra_link_args=[
                     "-Wl,--no-as-needed",
                     "-libverbs",
                     "-lmlx5",
+                    "-lnuma",
                     "-Wl,-rpath,$ORIGIN",
                     "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
                     "-l:engine.so",
+                    "-L" + os.path.join(current_dir, "../build/mooncake-common"),
+                    "-lasio",
+                    "-L" + os.path.join(current_dir, "../build/mooncake-transfer-engine/tent/src"),
+                    "-ltent_shared",
+                    os.path.join(current_dir, "../build/mooncake-transfer-engine/src/common/base/libbase.a"),
+                    os.path.join(current_dir, "../build/mooncake-transfer-engine/src/transport/device/libibgda.a"),
                 ],
             )
         ],
@@ -121,7 +128,9 @@ else:
                 extra_link_args=[
                     "-Wl,-rpath,$ORIGIN",
                     "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                    "-Wl,--push-state,--no-as-needed",
                     "-l:engine.so",
+                    "-Wl,--pop-state",
                 ],
             )
         ],

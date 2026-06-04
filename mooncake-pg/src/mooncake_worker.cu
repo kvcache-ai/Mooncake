@@ -13,6 +13,7 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   Task* tasks, int numRanks,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
+    // Copy task into slot
     tasks[taskId].opType = (int)opType;
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
@@ -20,9 +21,11 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
+    // Publish task metadata before notifying the host worker thread.
     __threadfence_system();
     tasks[taskId].active = true;
 
+    // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
         __threadfence_system();
     }
@@ -63,6 +66,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                             acc *= src[rank * numElements + elem_idx];
                             break;
                         default:
+                            // never
                             break;
                     }
                 }

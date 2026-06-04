@@ -65,8 +65,8 @@ struct SegmentInfo {
 
 struct TransferGroupMeta {
     int rank;
-    int size;
-    int activeSize;
+    int size;        // capacity: number of slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
@@ -90,7 +90,7 @@ __global__
 struct Task {
     volatile bool active = false;
     int opType = 0;  // c10d::OpType as int, for ABI compatibility with kernel code
-    size_t tensorSize;
+    size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
     uint64_t submitSequence = 0;
@@ -140,6 +140,18 @@ class MooncakeWorker {
 
     void Start();
 
+    /**
+     * @brief Waits for all active collective tasks for the given backend to
+     * complete.
+     *
+     * Used during graceful shutdown to ensure no pending collective operations
+     * are active before releasing resources. Blocks until all tasks complete
+     * or the timeout expires.
+     *
+     * @param meta The transfer group metadata identifying the backend.
+     * @return True if all tasks completed within the timeout; false if timed
+     * out.
+     */
     bool drainTasks(const TransferGroupMeta* meta) const;
 
     bool waitUntilTasksSubmitted(
@@ -152,7 +164,7 @@ class MooncakeWorker {
     static constexpr size_t kNumTasks_ = 4;
 
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
-    static constexpr size_t kDrainTasksTimeoutMs = 5000;
+    static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     bool running_ = false;
     std::atomic<bool> started_{false};
@@ -173,6 +185,7 @@ class MooncakeWorker {
 class MooncakeWorkerManager {
    public:
     static MooncakeWorkerManager& GetInstance() {
+        // leaky singleton to avoid destructor fiasco problem
         static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
         return *manager;
     }
@@ -184,6 +197,8 @@ class MooncakeWorkerManager {
     std::shared_ptr<MooncakeWorker> GetWorker(int worker_id);
     static constexpr int CPUWorkerID = -1;
     std::mutex manager_mutex_;
+    // Keep workers alive for the entire process lifetime because their
+    // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
 #endif  // !defined(__MUSA__)
