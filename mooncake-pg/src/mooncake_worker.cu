@@ -11,9 +11,9 @@
 namespace mooncake {
 
 // ── Kernel functions ──────────────────────────────────────────────
-
-#ifdef __MUSA__
-// MUSA: torch-free signatures (mcc cannot parse torch headers)
+// Both CUDA and MUSA share the same kernel bodies. Parameters use plain
+// C++ types (int instead of c10d::OpType / c10d::ReduceOp::RedOpType)
+// so that mcc can compile them without torch headers.
 
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
@@ -21,73 +21,8 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   Task* tasks, int numRanks,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
-    tasks[taskId].opType = opType;
-    tasks[taskId].tensorSize = tensorSize;
-    tasks[taskId].broadcastRoot = broadcastRoot;
-    tasks[taskId].bufferOffset = bufferOffset;
-    tasks[taskId].submitSequence = submitSequence;
-    tasks[taskId].transferGroupMeta = meta;
-
-    __threadfence_system();
-    tasks[taskId].active = true;
-
-    while (tasks[taskId].active) {
-        __threadfence_system();
-    }
-    for (int i = 0; i < numRanks; ++i) {
-        activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
-    }
-}
-
-template <typename scalar_t>
-__global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
-                             size_t numElements, size_t numRanks,
-                             int op, bool* activeRanks) {
-    size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = blockDim.x * gridDim.x;
-    for (size_t elem_idx = thread_idx; elem_idx < numElements;
-         elem_idx += stride) {
-        bool valid = false;
-        float acc = 0.0f;
-        for (size_t rank = 0; rank < numRanks; ++rank) {
-            if (activeRanks[rank]) {
-                if (!valid) {
-                    acc = (float)src[rank * numElements + elem_idx];
-                    valid = true;
-                } else {
-                    switch (op) {
-                        case 0:  // SUM
-                            acc += (float)src[rank * numElements + elem_idx];
-                            break;
-                        case 2:  // PRODUCT
-                            acc *= (float)src[rank * numElements + elem_idx];
-                            break;
-                        case 3:  // MIN
-                            acc = fminf(acc, (float)src[rank * numElements + elem_idx]);
-                            break;
-                        case 4:  // MAX
-                            acc = fmaxf(acc, (float)src[rank * numElements + elem_idx]);
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
-        }
-        dst[elem_idx] = (scalar_t)acc;
-    }
-}
-
-#else  // CUDA: original signatures with torch types
-
-__global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
-                                  int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, void* meta,
-                                  Task* tasks, int numRanks,
-                                  const bool* activeRanks,
-                                  int* activeRanksTensor, size_t taskId) {
     // Copy task into slot
-    tasks[taskId].opType = (int)opType;
+    tasks[taskId].opType = opType;
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
@@ -110,7 +45,7 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              size_t numElements, size_t numRanks,
-                             c10d::ReduceOp::RedOpType op, bool* activeRanks) {
+                             int op, bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
@@ -124,19 +59,19 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                     valid = true;
                 } else {
                     switch (op) {
-                        case c10d::ReduceOp::SUM:
+                        case 0:  // SUM
                             acc += src[rank * numElements + elem_idx];
                             break;
-                        case c10d::ReduceOp::MIN:
+                        case 2:  // PRODUCT
+                            acc *= src[rank * numElements + elem_idx];
+                            break;
+                        case 3:  // MIN
                             acc = std::min(src[rank * numElements + elem_idx],
                                            acc);
                             break;
-                        case c10d::ReduceOp::MAX:
+                        case 4:  // MAX
                             acc = std::max(src[rank * numElements + elem_idx],
                                            acc);
-                            break;
-                        case c10d::ReduceOp::PRODUCT:
-                            acc *= src[rank * numElements + elem_idx];
                             break;
                         default:
                             // never
@@ -148,8 +83,6 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         dst[elem_idx] = acc;
     }
 }
-
-#endif  // __MUSA__
 
 }  // namespace mooncake
 
@@ -171,19 +104,11 @@ void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              const bool* activeRanks,
                              int* activeRanksTensor, size_t taskId,
                              cudaStream_t stream) {
-#ifdef __MUSA__
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
         opType, tensorSize, broadcastRoot, bufferOffset, submitSequence,
         meta, tasks, numRanks, activeRanks, activeRanksTensor, taskId);
-#else
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        (c10d::OpType)opType, tensorSize, broadcastRoot, bufferOffset,
-        submitSequence, meta, tasks, numRanks, activeRanks,
-        activeRanksTensor, taskId);
-#endif
 }
 
-#ifdef __MUSA__
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                    \
     void launchReduceKernel_##suffix(scalar_t* dst, const scalar_t* src,       \
                                     size_t numElements, size_t numRanks,       \
@@ -192,17 +117,6 @@ void launchEnqueueTaskKernel(int opType, size_t tensorSize,
         reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks,  \
                                              op, activeRanks);                 \
     }
-#else
-#define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                    \
-    void launchReduceKernel_##suffix(scalar_t* dst, const scalar_t* src,       \
-                                    size_t numElements, size_t numRanks,       \
-                                    int op, bool* activeRanks,                 \
-                                    cudaStream_t stream) {                     \
-        reduceKernel<<<64, 256, 0, stream>>>(                                  \
-            dst, src, numElements, numRanks,                                   \
-            (c10d::ReduceOp::RedOpType)op, activeRanks);                       \
-    }
-#endif
 
 DEF_LAUNCH_REDUCE(uint8_t, uint8)
 DEF_LAUNCH_REDUCE(int8_t, int8)
@@ -225,7 +139,7 @@ void launchReduceKernel_bf16(void* dst, const void* src,
 #else
     reduceKernel<<<64, 256, 0, stream>>>(
         (at::BFloat16*)dst, (const at::BFloat16*)src,
-        numElements, numRanks, (c10d::ReduceOp::RedOpType)op, activeRanks);
+        numElements, numRanks, op, activeRanks);
 #endif
 }
 
