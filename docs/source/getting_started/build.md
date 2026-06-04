@@ -77,7 +77,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libhiredis-dev \
                        pkg-config \
                        patchelf
-
+    
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -152,7 +152,20 @@ pip install mooncake-transfer-engine-non-cuda
     - `-DMACA_LIB_DIR=/path/to/maca/lib64`
     - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated CMake list)
 
-6. Install yalantinglibs
+6. If you want to compile Huawei Ascend NPU support, first install the Ascend CANN Toolkit following the instructions at https://www.hiascend.com/document. After that:
+    1) Source `set_env.sh` in the CANN installation directory to configure the build environment (no need to manually set `ASCEND_HOME_PATH` or other related environment variables).
+    2) Mooncake provides two Ascend NPU transport paths, choose one as needed:
+       - `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine. (refer to [Version Compatibility Guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md) for details).
+       - `-DUSE_UBSHMEM=ON`: Shared memory transport based on CANN VMM APIs (requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5).
+
+    Example for building with Ascend NPU:
+    ```bash
+    source /usr/local/Ascend/cann/set_env.sh
+    cmake .. -DUSE_ASCEND_DIRECT=ON
+    make -j
+    ```
+
+7. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -162,7 +175,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-7. In the root directory of this project, run the following commands:
+8. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -170,7 +183,7 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-8. Install Mooncake python package and mooncake_master executable
+9. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -259,3 +272,5 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: Enable Ascend Direct transport and HCCS support via the ADXL engine (**recommended**). 
+- `-DUSE_UBSHMEM=[ON|OFF]`: Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs.
