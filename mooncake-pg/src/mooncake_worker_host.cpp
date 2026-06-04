@@ -8,6 +8,7 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
+#include <mooncake_pg_gpu_utils.h>
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <ATen/musa/MUSAGraphsUtils.muh>
 #else
@@ -19,29 +20,9 @@
 #ifdef MOONCAKE_EP_USE_MUSA
 namespace gpu_capture = at::musa;
 namespace gpu_c10 = c10::musa;
-static inline auto getCurrentGPUStream(int device_index = -1) {
-    return at::musa::getCurrentMUSAStream(device_index);
-}
-static inline auto getGPUStreamFromPool(bool non_blocking = false,
-                                        int device_index = -1) {
-    return at::musa::getStreamFromPool(non_blocking, device_index);
-}
-static inline int currentGPUDevice() { return at::musa::current_device(); }
-static inline constexpr auto kGPUDevice = c10::DeviceType::PrivateUse1;
-static inline constexpr auto kGPUDeviceType = at::musa::kMUSA;
 #else
 namespace gpu_capture = at::cuda;
 namespace gpu_c10 = c10::cuda;
-static inline auto getCurrentGPUStream(int device_index = -1) {
-    return at::cuda::getCurrentCUDAStream(device_index);
-}
-static inline auto getGPUStreamFromPool(bool non_blocking = false,
-                                        int device_index = -1) {
-    return at::cuda::getStreamFromPool(non_blocking, device_index);
-}
-static inline int currentGPUDevice() { return at::cuda::current_device(); }
-static inline constexpr auto kGPUDevice = torch::kCUDA;
-static inline constexpr auto kGPUDeviceType = c10::DeviceType::CUDA;
 #endif
 
 namespace mooncake {

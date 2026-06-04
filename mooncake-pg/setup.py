@@ -56,14 +56,13 @@ if use_musa:
                         "-O3",
                     ],
                 },
-                libraries=["glog", "jsoncpp", "numa"],
+                libraries=["ibverbs", "mlx5"],
                 extra_link_args=[
-                    "-Wl,--no-as-needed",
-                    "-libverbs",
-                    "-lmlx5",
                     "-Wl,-rpath,$ORIGIN",
                     "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                    "-Wl,--push-state,--no-as-needed",
                     "-l:engine.so",
+                    "-Wl,--pop-state",
                 ],
             )
         ],

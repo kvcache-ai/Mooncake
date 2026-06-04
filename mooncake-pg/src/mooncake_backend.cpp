@@ -7,6 +7,7 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <mooncake_backend.h>
+#include <mooncake_pg_gpu_utils.h>
 #include <p2p_proxy.h>
 #include <thread>
 #include <chrono>
@@ -18,22 +19,6 @@
 #include "pg_utils.h"
 
 namespace mooncake {
-
-#ifdef MOONCAKE_EP_USE_MUSA
-static inline GPUStream getCurrentGPUStream(int device_index = -1) {
-    return at::musa::getCurrentMUSAStream(device_index);
-}
-static inline int currentGPUDevice() { return at::musa::current_device(); }
-static inline constexpr auto kGPUDevice = c10::DeviceType::PrivateUse1;
-static inline constexpr auto kGPUDeviceType = at::musa::kMUSA;
-#else
-static inline GPUStream getCurrentGPUStream(int device_index = -1) {
-    return at::cuda::getCurrentCUDAStream(device_index);
-}
-static inline int currentGPUDevice() { return at::cuda::current_device(); }
-static inline constexpr auto kGPUDevice = torch::kCUDA;
-static inline constexpr auto kGPUDeviceType = c10::DeviceType::CUDA;
-#endif
 
 constexpr const char* REGISTER_BUFFER_ERROR_MSG =
     "Failed to register local memory.";
