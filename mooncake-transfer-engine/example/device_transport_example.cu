@@ -114,6 +114,7 @@ static constexpr int kSignalWordOffset = 4096;  // must match kDataBytes default
 // Rank 0: P2P-write data to rank 1, then signal.
 __global__ void senderKernel(mooncake::device::CommCtx ctx,
                              int dst_rank, int data_bytes) {
+    using namespace mooncake::device;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
     // Write a known pattern to the peer's data region via P2P.
@@ -146,6 +147,7 @@ __global__ void senderKernel(mooncake::device::CommCtx ctx,
 // Rank 1: wait for signal from rank 0, then verify data.
 __global__ void receiverKernel(mooncake::device::CommCtx ctx,
                                int src_rank, int data_bytes) {
+    using namespace mooncake::device;
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
     char* local_data = reinterpret_cast<char*>(ctx.p2p.local_base);
