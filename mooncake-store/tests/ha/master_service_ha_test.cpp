@@ -65,7 +65,8 @@ class MasterServiceHATest : public ::testing::Test {
         return key;
     }
 
-    std::string PutObjectOnSegment(MasterService& service, const UUID& client_id,
+    std::string PutObjectOnSegment(MasterService& service,
+                                   const UUID& client_id,
                                    const std::string& key,
                                    const std::string& segment_name,
                                    size_t slice_length = 1024) const {
@@ -337,8 +338,7 @@ TEST_F(MasterServiceHATest, CopyEndPublishesPutEndOpLog) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto copy_start =
-        service->CopyStart(client_id, key, "seg1", {"seg2"});
+    auto copy_start = service->CopyStart(client_id, key, "seg1", {"seg2"});
     ASSERT_TRUE(copy_start.has_value());
 
     auto res = service->CopyEnd(client_id, key);
@@ -371,8 +371,7 @@ TEST_F(MasterServiceHATest, MoveEndPublishesPutEndOpLog) {
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto move_start =
-        service->MoveStart(client_id, key, "seg1", "seg2");
+    auto move_start = service->MoveStart(client_id, key, "seg1", "seg2");
     ASSERT_TRUE(move_start.has_value());
 
     auto res = service->MoveEnd(client_id, key);
@@ -406,8 +405,7 @@ TEST_F(MasterServiceHATest,
     PrepareSimpleSegment(*service, "seg2",
                          kDefaultSegmentBase + kDefaultSegmentSize);
 
-    auto copy_start =
-        service->CopyStart(client_id, key, "seg1", {"seg2"});
+    auto copy_start = service->CopyStart(client_id, key, "seg1", {"seg2"});
     ASSERT_TRUE(copy_start.has_value());
 
     auto copy_end = service->CopyEnd(client_id, key);
@@ -765,8 +763,7 @@ TEST_F(MasterServiceHATest,
         << "Memory replica must still be present (and now COMPLETE) after "
            "PutEnd, proving the reaper preserved the PROCESSING replica on "
            "persist failure";
-    EXPECT_TRUE(has_local_disk)
-        << "LOCAL_DISK replica must still be present";
+    EXPECT_TRUE(has_local_disk) << "LOCAL_DISK replica must still be present";
 }
 
 // ===== Step 4: SEGMENT_UNMOUNT retry-on-failure =====

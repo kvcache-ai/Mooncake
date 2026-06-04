@@ -451,10 +451,11 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestHighThroughputSync) {
     LOG(INFO) << "Max lag observed: " << max_lag << " entries";
 }
 
-// Helper to build a struct_pack-serialized MetadataPayload for integration tests.
-std::string MakeTenantPayload(uint64_t size,
-                              const std::string& group_id = "",
-                              ObjectDataType data_type = ObjectDataType::UNKNOWN) {
+// Helper to build a struct_pack-serialized MetadataPayload for integration
+// tests.
+std::string MakeTenantPayload(
+    uint64_t size, const std::string& group_id = "",
+    ObjectDataType data_type = ObjectDataType::UNKNOWN) {
     MetadataPayload payload;
     payload.client_id = {1, 2};
     payload.size = size;
@@ -533,10 +534,8 @@ TEST_F(LocalFsHotStandbyIntegrationTest, TestMultiTenantIsolation) {
             entry_b = &e;
         }
     }
-    ASSERT_NE(entry_a, nullptr)
-        << "tenantA/foo missing after promotion";
-    ASSERT_NE(entry_b, nullptr)
-        << "tenantB/foo missing after promotion";
+    ASSERT_NE(entry_a, nullptr) << "tenantA/foo missing after promotion";
+    ASSERT_NE(entry_b, nullptr) << "tenantB/foo missing after promotion";
 
     EXPECT_EQ(1024u, entry_a->metadata.size);
     EXPECT_EQ("groupA", entry_a->metadata.group_id);

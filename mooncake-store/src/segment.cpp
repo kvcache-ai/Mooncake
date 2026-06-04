@@ -1502,23 +1502,30 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_total_capacity_bytes;
 }
 
 int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
 }
 
-bool SegmentManager::HasSegmentByEndpoint(
-    const std::string& endpoint) const {
+bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
     for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
         if (mounted_segment.segment.te_endpoint == endpoint) {
@@ -1529,8 +1536,8 @@ bool SegmentManager::HasSegmentByEndpoint(
 }
 
 bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
-                                        std::string& segment_name,
-                                        std::string& te_endpoint) const {
+                                         std::string& segment_name,
+                                         std::string& te_endpoint) const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
     auto it = mounted_segments_.find(segment_id);
     if (it == mounted_segments_.end()) {

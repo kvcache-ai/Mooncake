@@ -2240,8 +2240,7 @@ class MasterService {
                               const std::string& key,
                               const std::string& payload);
     tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
-        OpType type, const std::string& key,
-        const std::string& payload = {});
+        OpType type, const std::string& key, const std::string& payload = {});
     tl::expected<uint64_t, ErrorCode> AppendOpLogAndNotifyDurable(
         OpType type, const TenantId& tenant_id, const std::string& key,
         const std::string& payload);

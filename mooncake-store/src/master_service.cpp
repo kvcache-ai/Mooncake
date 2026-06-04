@@ -2572,8 +2572,8 @@ auto MasterService::BatchReplicaClear(
             }
 
             if (enable_ha_ && oplog_store_) {
-                auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
-                    OpType::REMOVE, key, {});
+                auto persist_result =
+                    AppendOpLogAndNotifyDurableOrAbort(OpType::REMOVE, key, {});
                 if (!persist_result) {
                     continue;
                 }
@@ -3659,8 +3659,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, object_id.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post,
-                metadata.group_id, metadata.data_type));
+                metadata.client_id, metadata.size, post, metadata.group_id,
+                metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -4529,8 +4529,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, metadata.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post,
-                metadata.group_id, metadata.data_type));
+                metadata.client_id, metadata.size, post, metadata.group_id,
+                metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -4845,8 +4845,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
             OpType::PUT_END, metadata.tenant_id, key,
             SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post,
-                metadata.group_id, metadata.data_type));
+                metadata.client_id, metadata.size, post, metadata.group_id,
+                metadata.data_type));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -5044,8 +5044,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                         << " matched by regex. Removing.";
                 if (enable_ha_ && oplog_store_) {
                     auto err = PersistRemoveForHA("RemoveByRegex",
-                                                  normalized_tenant,
-                                                  it->first);
+                                                  normalized_tenant, it->first);
                     if (!err) {
                         ++it;
                         continue;
@@ -5088,9 +5087,8 @@ long MasterService::RemoveAll(bool force) {
                         &Replica::fn_is_memory_replica);
 
                     if (enable_ha_ && oplog_store_) {
-                        auto err = PersistRemoveForHA("RemoveAll",
-                                                      tenant_it->first,
-                                                      it->first);
+                        auto err = PersistRemoveForHA(
+                            "RemoveAll", tenant_it->first, it->first);
                         if (!err) {
                             ++it;
                             continue;  // skip erase on persist failure
@@ -6418,8 +6416,8 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
             auto persist_result = AppendOpLogAndNotifyDurableOrAbort(
                 OpType::PUT_END, metadata.tenant_id, key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post,
-                    metadata.group_id, metadata.data_type));
+                    metadata.client_id, metadata.size, post, metadata.group_id,
+                    metadata.data_type));
             if (!persist_result) {
                 // Keep staged replica PROCESSING and task untouched. Caller
                 // can retry; promotion_in_flight remains accurate.
@@ -6677,8 +6675,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                             OpType::PUT_END, tenant_it->first, *key_it,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
                                 metadata.client_id, metadata.size,
-                                post_descriptors,
-                                metadata.group_id, metadata.data_type));
+                                post_descriptors, metadata.group_id,
+                                metadata.data_type));
                     }
                     if (!persist_result) {
                         LOG(WARNING) << "DiscardExpiredProcessingReplicas: "
