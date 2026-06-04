@@ -1,6 +1,6 @@
 # Mooncake Store Deployment
 
-This guide covers the architecture, minimal deployment, and operational tuning of Mooncake Store.
+This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 ## Architecture Overview
 
@@ -476,22 +476,6 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Set `1` to disable arena, fall back to per-call `mmap()` |
-
-For HiCache-style deployments, pre-flight the host before reserving hugepages:
-
-```bash
-python3 scripts/check_hicache_hugepage_requirements.py \
-  --tp-size 4 \
-  --hicache-size 64gb \
-  --global-segment-size 8gb \
-  --arena-pool-size 56gb \
-  --available-hugetlb 512gb
-
-sudo sysctl -w vm.nr_hugepages=262144
-grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
-```
-
-The arena is disabled by default. Start with `8gb` or `16gb` and size upward using the helper script.
 
 ### yalantinglibs Log Level
 
