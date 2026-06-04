@@ -349,54 +349,14 @@ python -m sglang.launch_server \
 
 ### Prefill/Decode Disaggregation
 
-In **PD disaggregation**, the configurations for the `metadata service`, `mooncake master`, and the optional `store service` remain the same as described above. The difference is that SGLang introduces three distinct roles: `prefill worker`, `decode worker`, and `router`.
+Mooncake HiCache works with SGLang's **PD disaggregation** mode. The `master service`, `metadata service`, and optional `store service` configurations are the same as described above.
 
-Among these, the `prefill worker` supports enabling **HiCache**. To run with PD disaggregation, start from the [PD configuration](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration-v1.html), and add the HiCache-related parameters (as previously described for the `SGLang server`) to the `prefill worker`.
+Among SGLang's three PD roles (`prefill worker`, `decode worker`, `router`), only the `prefill worker` supports enabling HiCache. To combine both features:
 
-In the example below, one `prefill worker`, one `decode worker`, and one `router` are launched. HiCache is enabled on the `prefill worker` to optimize prefill performance.
+1. Follow the [PD Disaggregation Guide](../sglang-integration-v1) to set up the prefill, decode, and router workers.
+2. Add the HiCache-related parameters (`--enable-hierarchical-cache`, `--hicache-storage-backend mooncake`, `--hicache-storage-prefetch-policy`, etc.) to the **prefill worker** only, as described in the HiCache sections above.
 
-**Prefill worker**:
-
-```bash
-MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_1" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
-python -m sglang.launch_server \
-    --model-path [model_path] \
-    --page-size 64 \
-    --enable-hierarchical-cache \
-    --hicache-storage-prefetch-policy timeout \
-    --hicache-storage-backend mooncake \
-    --disaggregation-mode prefill \
-    --disaggregation-ib-device "mlx5_1" \
-    --base-gpu-id 0 \
-    --port 30000
-```
-
-**Decode worker**:
-
-```bash
-python -m sglang.launch_server \
-    --model-path [model_path] \
-    --page-size 64 \
-    --disaggregation-mode decode \
-    --disaggregation-ib-device "mlx5_1" \
-    --base-gpu-id 1 \
-    --port 30001
-```
-
-**Router**:
-
-```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://127.0.0.1:30000" \
-    --decode "http://127.0.0.1:30001" \
-    --host 0.0.0.0 \
-    --port 8000
-```
+The Mooncake and HiCache configuration (environment variables or JSON config) is applied identically to the prefill worker — no changes are needed on the decode worker or router.
 
 ## Troubleshooting
 
