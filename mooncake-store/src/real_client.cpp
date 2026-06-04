@@ -5512,11 +5512,11 @@ RealClient::batch_get_into_offload_object_internal(
                                                               start_time)
             .count());
     VLOG(1) << "Time taken for batch_get_into_offload_object_internal: "
-              << elapsed_time
-              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size()
-              << ", batch_id: " << batchGetResp->batch_id
-              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+            << elapsed_time
+            << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
+            << ", key size: " << objects.size()
+            << ", batch_id: " << batchGetResp->batch_id
+            << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
 
     // Release buffer immediately after transfer completion (fire-and-forget)
     // This allows early buffer reclamation instead of waiting for GC lease

@@ -3157,8 +3157,9 @@ auto MasterService::Ping(const UUID& client_id)
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
-        VLOG(1) << "Storage root directory or cluster ID is not set. persisting "
-                << "data is disabled.";
+        VLOG(1)
+            << "Storage root directory or cluster ID is not set. persisting "
+            << "data is disabled.";
         return std::string();
     }
     return root_fs_dir_ + "/" + cluster_id_;
@@ -3167,8 +3168,9 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
-        VLOG(1) << "Storage root directory or cluster ID is not set. persisting "
-                << "data is disabled.";
+        VLOG(1)
+            << "Storage root directory or cluster ID is not set. persisting "
+            << "data is disabled.";
         return GetStorageConfigResponse("", enable_disk_eviction_,
                                         quota_bytes_);
     }
@@ -3845,9 +3847,9 @@ void MasterService::EvictionThreadFunc() {
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             VLOG(1) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
-                      << " high_watermark=" << eviction_high_watermark_ratio_
-                      << " need_mem_eviction=" << need_mem_eviction_
-                      << " eviction_ratio=" << eviction_ratio_;
+                    << " high_watermark=" << eviction_high_watermark_ratio_
+                    << " need_mem_eviction=" << need_mem_eviction_
+                    << " eviction_ratio=" << eviction_ratio_;
             double evict_ratio_target = std::max(
                 eviction_ratio_,
                 used_ratio - eviction_high_watermark_ratio_ + eviction_ratio_);

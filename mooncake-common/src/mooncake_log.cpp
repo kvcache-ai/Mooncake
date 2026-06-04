@@ -29,8 +29,9 @@ namespace mooncake {
 namespace {
 
 std::string ToUpper(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return value;
 }
 
@@ -136,8 +137,9 @@ void InitYltLogLevelFromEnv() {
     }
 
     std::string level_str(env_level);
-    std::transform(level_str.begin(), level_str.end(), level_str.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(
+        level_str.begin(), level_str.end(), level_str.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
     easylog::Severity severity = easylog::Severity::WARN;
     if (level_str == "trace") {

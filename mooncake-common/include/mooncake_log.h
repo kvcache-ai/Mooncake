@@ -22,10 +22,12 @@ namespace mooncake {
  * Mooncake standard logging: Google glog for all C++ application code.
  *
  *   LOG(INFO|WARNING|ERROR|FATAL)  — severity channel (MC_LOG_LEVEL)
- *   VLOG(n)                        — verbose channel (MC_LOG_LEVEL=TRACE or MC_VLOG_LEVEL)
+ *   VLOG(n)                        — verbose channel (MC_LOG_LEVEL=TRACE or
+ * MC_VLOG_LEVEL)
  *
- * yalantinglibs coro_rpc emits through easylog internally; InitMooncakeLogging()
- * maps MC_LOG_LEVEL to easylog so RPC and application logs share one env knob.
+ * yalantinglibs coro_rpc emits through easylog internally;
+ * InitMooncakeLogging() maps MC_LOG_LEVEL to easylog so RPC and application
+ * logs share one env knob.
  *
  * Environment (use MC_LOG_LEVEL as the single control):
  *   MC_LOG_LEVEL    — TRACE | INFO | WARNING | ERROR

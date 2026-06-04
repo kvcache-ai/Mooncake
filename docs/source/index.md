@@ -102,6 +102,7 @@ performance/storage-benchmark
 :maxdepth: 2
 
 design/architecture
+design/logging
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index

@@ -1811,7 +1811,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     ScopedVLogTimer timer(1, "MountLocalDiskSegment");
     timer.LogRequest("action=mount_local_disk_segment");
     VLOG(1) << "Mount local disk segment with client id is : " << client_id
-              << ", enable offloading is: " << enable_offloading;
+            << ", enable offloading is: " << enable_offloading;
     auto result =
         master_service_.MountLocalDiskSegment(client_id, enable_offloading);
 
