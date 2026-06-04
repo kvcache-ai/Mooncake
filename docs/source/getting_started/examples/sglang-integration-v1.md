@@ -28,28 +28,23 @@ pip3 uninstall mooncake-transfer-engine
 
 ### Install SGLang
 
+It is recommended to use uv for faster installation:
+
 ```bash
-git clone git@github.com:sgl-project/sglang.git
-cd sglang
 pip install --upgrade pip
-pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.5/flashinfer-python
+pip install uv
+uv pip install sglang
 ```
 
-For AMD GPUs, use the ROCm docker image:
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
 
 ```bash
-docker run -it --rm --network=host \
-    --device=/dev/kfd --device=/dev/dri \
-    --ipc=host --shm-size 16G \
-    --group-add video \
-    --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    -v /home/workspace:/workspace \
-   rocm/sgl-dev:20250707
-
-pip3 install mooncake-transfer-engine
-sudo apt update && sudo apt install libibverbs1 libibverbs-dev -y
-sudo apt-get install lsof net-tools iputils-ping -y
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
 ```
 
 See the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html) if you encounter issues.

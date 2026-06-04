@@ -26,21 +26,26 @@ This integration is particularly valuable for production deployments involving l
 
 ### Install SGLang
 
-1. Clone SGLang from official repo
+It is recommended to use uv for faster installation:
 
 ```bash
-git clone git@github.com:sgl-project/sglang.git
-```
-
-2. Build
-
-```bash
-cd sglang
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install uv
+uv pip install sglang
 ```
 
-For more details, please refer to [SGLang official installation guide](https://docs.sglang.ai/get_started/install.html).
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+
+```bash
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
+See the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html) if you encounter issues.
 
 ### Install Mooncake
 
@@ -50,37 +55,7 @@ For more details, please refer to [SGLang official installation guide](https://d
 pip install mooncake-transfer-engine
 ```
 
-**Method 2: from source**
-
-Clone Mooncake project:
-
-```bash
-git clone https://github.com/kvcache-ai/Mooncake --recursive
-```
-
-Install dependencies:
-
-```bash
-cd Mooncake
-bash dependencies.sh
-```
-
-Build the project:
-
-```bash
-mkdir build
-cd build
-cmake ..
-make -j
-```
-
-Install Mooncake:
-
-```bash
-sudo make install
-```
-
-For more details, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
+If you want to build from source or using some other advanced features which not contained in prebuilt pip package, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ## Deployment
 
