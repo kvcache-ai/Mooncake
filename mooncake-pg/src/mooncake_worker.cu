@@ -48,70 +48,81 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                              int op, bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
+
+#ifdef __MUSA__
+    // mt_bfloat16 lacks arithmetic and comparison operators; use float
+    // accumulator and fminf/fmaxf for that type only.  Other types
+    // (float, double, int64_t, etc.) use their native accumulator to
+    // preserve full precision.
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         bool valid = false;
-#ifdef __MUSA__
-        // mt_bfloat16 lacks arithmetic operators; use float accumulator
-        // and cast back. For other scalar types this is equivalent to
-        // the CUDA path below.
-        float acc = 0.0f;
-#else
-        scalar_t acc = 0;
-#endif
+        acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {
-#ifdef __MUSA__
-                    acc = (float)src[rank * numElements + elem_idx];
-#else
-                    acc = src[rank * numElements + elem_idx];
-#endif
+                    if constexpr (kIsBf16) {
+                        acc = (float)src[rank * numElements + elem_idx];
+                    } else {
+                        acc = src[rank * numElements + elem_idx];
+                    }
                     valid = true;
                 } else {
-                    switch (op) {
-                        case 0:  // SUM
-#ifdef __MUSA__
-                            acc += (float)src[rank * numElements + elem_idx];
-#else
-                            acc += src[rank * numElements + elem_idx];
-#endif
-                            break;
-                        case 2:  // PRODUCT
-#ifdef __MUSA__
-                            acc *= (float)src[rank * numElements + elem_idx];
-#else
-                            acc *= src[rank * numElements + elem_idx];
-#endif
-                            break;
-                        case 3:  // MIN
-#ifdef __MUSA__
-                            acc = fminf(acc, (float)src[rank * numElements + elem_idx]);
-#else
-                            acc = std::min(src[rank * numElements + elem_idx],
-                                           acc);
-#endif
-                            break;
-                        case 4:  // MAX
-#ifdef __MUSA__
-                            acc = fmaxf(acc, (float)src[rank * numElements + elem_idx]);
-#else
-                            acc = std::max(src[rank * numElements + elem_idx],
-                                           acc);
-#endif
-                            break;
-                        default:
-                            // never
-                            break;
+                    if constexpr (kIsBf16) {
+                        float val =
+                            (float)src[rank * numElements + elem_idx];
+                        switch (op) {
+                            case 0:  // SUM
+                                acc += val;
+                                break;
+                            case 2:  // PRODUCT
+                                acc *= val;
+                                break;
+                            case 3:  // MIN
+                                acc = fminf(acc, val);
+                                break;
+                            case 4:  // MAX
+                                acc = fmaxf(acc, val);
+                                break;
+                            default:
+                                break;
+                        }
+                    } else {
+                        switch (op) {
+                            case 0:  // SUM
+                                acc += src[rank * numElements + elem_idx];
+                                break;
+                            case 2:  // PRODUCT
+                                acc *= src[rank * numElements + elem_idx];
+                                break;
+                            case 3:  // MIN
+                                acc = std::min(
+                                    src[rank * numElements + elem_idx],
+                                    acc);
+                                break;
+                            case 4:  // MAX
+                                acc = std::max(
+                                    src[rank * numElements + elem_idx],
+                                    acc);
+                                break;
+                            default:
+                                break;
+                        }
                     }
                 }
             }
         }
-#ifdef __MUSA__
-        dst[elem_idx] = (scalar_t)acc;
-#else
-        dst[elem_idx] = acc;
-#endif
+        if constexpr (kIsBf16) {
+            dst[elem_idx] = (scalar_t)acc;
+        } else {
+            dst[elem_idx] = acc;
+        }
     }
 }
 
