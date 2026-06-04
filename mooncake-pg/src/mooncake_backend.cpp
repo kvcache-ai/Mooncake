@@ -388,8 +388,9 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options_->activeRanks_.device().type() == kGPUDeviceType,
-                        "activeRanks must be on GPU.");
+            TORCH_CHECK(
+                options_->activeRanks_.device().type() == kGPUDeviceType,
+                "activeRanks must be on GPU.");
         }
         if (max_size != size) {
             TORCH_CHECK(options_->activeRanks_.numel() == max_size,
@@ -398,9 +399,9 @@ MooncakeBackend::MooncakeBackend(
         }
         meta_->activeRanksTensor = options_->activeRanks_;
     } else {
-        meta_->activeRanksTensor = at::ones(
-            {max_size}, torch::dtype(torch::kInt32)
-                            .device(isCpu ? torch::kCPU : kGPUDevice));
+        meta_->activeRanksTensor =
+            at::ones({max_size}, torch::dtype(torch::kInt32)
+                                     .device(isCpu ? torch::kCPU : kGPUDevice));
         if (max_size != size) {
             meta_->activeRanksTensor.slice(0, size, max_size).fill_(0);
         }
@@ -485,8 +486,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
         P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
     if (!isCpu_) {
-        auto current_stream =
-            getCurrentGPUStream(contiguous.device().index());
+        auto current_stream = getCurrentGPUStream(contiguous.device().index());
         stream = current_stream.stream();
     }
 
@@ -518,8 +518,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
         P2PProxy::OpStatus::kPending);
     cudaStream_t stream = nullptr;
     if (!isCpu_) {
-        auto current_stream =
-            getCurrentGPUStream(target.device().index());
+        auto current_stream = getCurrentGPUStream(target.device().index());
         stream = current_stream.stream();
     }
 
@@ -554,8 +553,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
                 memcpy((char*)tensor.data_ptr() + pos, src, realSize);
             });
     } else {
-        GPUStream stream =
-            getCurrentGPUStream(tensor.device().index());
+        GPUStream stream = getCurrentGPUStream(tensor.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::BROADCAST, tensorSize, root, meta_, connection_ctx_,
             stream,
@@ -635,8 +633,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
                 }
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(inputTensor.device().index());
+        auto stream = getCurrentGPUStream(inputTensor.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::ALLGATHER, tensorSize, 0, meta_, connection_ctx_,
             stream,
@@ -676,8 +673,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                 }
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(inputBuffer.device().index());
+        auto stream = getCurrentGPUStream(inputBuffer.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, meta_,
             connection_ctx_, stream,
@@ -722,8 +718,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
                                 opts.reduceOp, meta_->activeRanks);
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(inputBuffer.device().index());
+        auto stream = getCurrentGPUStream(inputBuffer.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, meta_,
             connection_ctx_, stream,
@@ -769,8 +764,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
                 }
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(inputTensors[0].device().index());
+        auto stream = getCurrentGPUStream(inputTensors[0].device().index());
         return worker_->putTaskCuda(
             c10d::OpType::ALLTOALL, tensorSize, 0, meta_, connection_ctx_,
             stream,
@@ -884,8 +878,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
                 }
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(inputTensor.device().index());
+        auto stream = getCurrentGPUStream(inputTensor.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::GATHER, tensorSize, root, meta_, connection_ctx_,
             stream,
@@ -938,8 +931,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
                 memcpy((char*)outputTensor.data_ptr() + pos, src, realSize);
             });
     } else {
-        auto stream =
-            getCurrentGPUStream(outputTensor.device().index());
+        auto stream = getCurrentGPUStream(outputTensor.device().index());
         return worker_->putTaskCuda(
             c10d::OpType::SCATTER, tensorSize, root, meta_, connection_ctx_,
             stream,
@@ -1117,8 +1109,7 @@ int MooncakeBackend::getNumSyncedRanks() {
     auto work = allreduce(tensors, opts);
     work->wait();
     if (!isCpu_) {
-        auto stream =
-            getCurrentGPUStream(tensors[0].device().index());
+        auto stream = getCurrentGPUStream(tensors[0].device().index());
         cudaStreamSynchronize(stream);
     }
     return tensors[0].cpu().item<int>();
@@ -1188,8 +1179,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
         auto work = allreduce(tensors, opts);
         work->wait();
         if (!isCpu_) {
-            auto stream =
-                getCurrentGPUStream(tensors[0].device().index());
+            auto stream = getCurrentGPUStream(tensors[0].device().index());
             cudaStreamSynchronize(stream);
         }
         bool activeRanksChanged = false;

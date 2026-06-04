@@ -186,8 +186,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
     switch (dst.scalar_type()) {
         case c10::kByte:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kChar:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
@@ -195,8 +194,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
             break;
         case c10::kShort:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kInt:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
@@ -204,8 +202,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
             break;
         case c10::kLong:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
-                                     numRanks, (int)op, activeRanks,
-                                     stream);
+                                     numRanks, (int)op, activeRanks, stream);
             break;
         case c10::kFloat:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,

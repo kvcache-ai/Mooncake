@@ -87,9 +87,10 @@ struct TransferGroupMeta {
 #if defined(__CUDACC__) || defined(__MUSA__)
 __global__
 #endif
-struct Task {
+    struct Task {
     volatile bool active = false;
-    int opType = 0;  // c10d::OpType as int, for ABI compatibility with kernel code
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;

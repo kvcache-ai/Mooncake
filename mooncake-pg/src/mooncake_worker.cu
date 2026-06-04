@@ -44,8 +44,8 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
-                             size_t numElements, size_t numRanks,
-                             int op, bool* activeRanks) {
+                             size_t numElements, size_t numRanks, int op,
+                             bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
 
@@ -75,8 +75,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                     valid = true;
                 } else {
                     if constexpr (kIsBf16) {
-                        float val =
-                            (float)src[rank * numElements + elem_idx];
+                        float val = (float)src[rank * numElements + elem_idx];
                         switch (op) {
                             case 0:  // SUM
                                 acc += val;
@@ -103,13 +102,11 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                                 break;
                             case 3:  // MIN
                                 acc = std::min(
-                                    src[rank * numElements + elem_idx],
-                                    acc);
+                                    src[rank * numElements + elem_idx], acc);
                                 break;
                             case 4:  // MAX
                                 acc = std::max(
-                                    src[rank * numElements + elem_idx],
-                                    acc);
+                                    src[rank * numElements + elem_idx], acc);
                                 break;
                             default:
                                 break;
@@ -141,23 +138,21 @@ namespace mooncake {
 
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, void* meta,
-                             Task* tasks, int numRanks,
-                             const bool* activeRanks,
+                             uint64_t submitSequence, void* meta, Task* tasks,
+                             int numRanks, const bool* activeRanks,
                              int* activeRanksTensor, size_t taskId,
                              cudaStream_t stream) {
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence,
-        meta, tasks, numRanks, activeRanks, activeRanksTensor, taskId);
+        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence, meta,
+        tasks, numRanks, activeRanks, activeRanksTensor, taskId);
 }
 
-#define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                    \
-    void launchReduceKernel_##suffix(scalar_t* dst, const scalar_t* src,       \
-                                    size_t numElements, size_t numRanks,       \
-                                    int op, bool* activeRanks,                 \
-                                    cudaStream_t stream) {                     \
-        reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks,  \
-                                             op, activeRanks);                 \
+#define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
+    void launchReduceKernel_##suffix(                                         \
+        scalar_t* dst, const scalar_t* src, size_t numElements,               \
+        size_t numRanks, int op, bool* activeRanks, cudaStream_t stream) {    \
+        reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks, \
+                                             op, activeRanks);                \
     }
 
 DEF_LAUNCH_REDUCE(uint8_t, uint8)
@@ -171,17 +166,17 @@ DEF_LAUNCH_REDUCE(bool, bool)
 
 #undef DEF_LAUNCH_REDUCE
 
-void launchReduceKernel_bf16(void* dst, const void* src,
-                             size_t numElements, size_t numRanks,
-                             int op, bool* activeRanks, cudaStream_t stream) {
+void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
+                             size_t numRanks, int op, bool* activeRanks,
+                             cudaStream_t stream) {
 #ifdef __MUSA__
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (mt_bfloat16*)dst, (const mt_bfloat16*)src,
-        numElements, numRanks, op, activeRanks);
+    reduceKernel<<<64, 256, 0, stream>>>((mt_bfloat16*)dst,
+                                         (const mt_bfloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #else
-    reduceKernel<<<64, 256, 0, stream>>>(
-        (at::BFloat16*)dst, (const at::BFloat16*)src,
-        numElements, numRanks, op, activeRanks);
+    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
+                                         (const at::BFloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
 #endif
 }
 
@@ -194,8 +189,8 @@ void preloadReduceKernels() {
     auto preload = [](const char* name, auto kernel_ptr) {
         cudaFuncAttributes attr{};
         auto err = cudaFuncGetAttributes(&attr, kernel_ptr);
-        TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name,
-                    ": ", cudaGetErrorString(err));
+        TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                    cudaGetErrorString(err));
     };
     preload("reduceKernel<uint8_t>",
             reinterpret_cast<const void*>(reduceKernel<uint8_t>));

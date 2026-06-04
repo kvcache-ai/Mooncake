@@ -85,11 +85,12 @@ void MooncakeWorker::startWorker() {
                 }
 
                 auto group = (TransferGroupMeta*)task.transferGroupMeta;
-                bool skipTransfer = ((c10d::OpType)task.opType == c10d::OpType::BROADCAST &&
-                                     group->rank != task.broadcastRoot) ||
-                                    ((c10d::OpType)task.opType == c10d::OpType::SCATTER &&
-                                     group->rank != task.broadcastRoot) ||
-                                    (c10d::OpType)task.opType == c10d::OpType::BARRIER;
+                bool skipTransfer =
+                    ((c10d::OpType)task.opType == c10d::OpType::BROADCAST &&
+                     group->rank != task.broadcastRoot) ||
+                    ((c10d::OpType)task.opType == c10d::OpType::SCATTER &&
+                     group->rank != task.broadcastRoot) ||
+                    (c10d::OpType)task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
@@ -107,8 +108,10 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        if (((c10d::OpType)task.opType == c10d::OpType::GATHER ||
-                             (c10d::OpType)task.opType == c10d::OpType::REDUCE) &&
+                        if (((c10d::OpType)task.opType ==
+                                 c10d::OpType::GATHER ||
+                             (c10d::OpType)task.opType ==
+                                 c10d::OpType::REDUCE) &&
                             j != task.broadcastRoot) {
                             continue;
                         }
