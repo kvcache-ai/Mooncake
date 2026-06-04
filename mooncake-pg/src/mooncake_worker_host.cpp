@@ -8,7 +8,6 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
-#include <mooncake_pg_gpu_utils.h>
 #ifdef MOONCAKE_EP_USE_MUSA
 #include <ATen/musa/MUSAGraphsUtils.muh>
 #else

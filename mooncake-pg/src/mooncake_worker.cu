@@ -51,27 +51,54 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         bool valid = false;
+#ifdef __MUSA__
+        // mt_bfloat16 lacks arithmetic operators; use float accumulator
+        // and cast back. For other scalar types this is equivalent to
+        // the CUDA path below.
+        float acc = 0.0f;
+#else
         scalar_t acc = 0;
+#endif
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {
+#ifdef __MUSA__
+                    acc = (float)src[rank * numElements + elem_idx];
+#else
                     acc = src[rank * numElements + elem_idx];
+#endif
                     valid = true;
                 } else {
                     switch (op) {
                         case 0:  // SUM
+#ifdef __MUSA__
+                            acc += (float)src[rank * numElements + elem_idx];
+#else
                             acc += src[rank * numElements + elem_idx];
+#endif
                             break;
                         case 2:  // PRODUCT
+#ifdef __MUSA__
+                            acc *= (float)src[rank * numElements + elem_idx];
+#else
                             acc *= src[rank * numElements + elem_idx];
+#endif
                             break;
                         case 3:  // MIN
+#ifdef __MUSA__
+                            acc = fminf(acc, (float)src[rank * numElements + elem_idx]);
+#else
                             acc = std::min(src[rank * numElements + elem_idx],
                                            acc);
+#endif
                             break;
                         case 4:  // MAX
+#ifdef __MUSA__
+                            acc = fmaxf(acc, (float)src[rank * numElements + elem_idx]);
+#else
                             acc = std::max(src[rank * numElements + elem_idx],
                                            acc);
+#endif
                             break;
                         default:
                             // never
@@ -80,7 +107,11 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                 }
             }
         }
+#ifdef __MUSA__
+        dst[elem_idx] = (scalar_t)acc;
+#else
         dst[elem_idx] = acc;
+#endif
     }
 }
 

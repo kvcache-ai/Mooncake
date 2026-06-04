@@ -7,7 +7,6 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <mooncake_backend.h>
-#include <mooncake_pg_gpu_utils.h>
 #include <p2p_proxy.h>
 #include <thread>
 #include <chrono>
