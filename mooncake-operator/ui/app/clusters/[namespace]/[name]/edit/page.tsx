@@ -89,7 +89,13 @@ export default function EditClusterPage({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ spec }),
       })
-      const data = await res.json()
+      let data: any = {}
+      try {
+        data = await res.json()
+      } catch {
+        // Response body may be empty in some error cases — fall back to status text
+        if (!res.ok) throw new Error(`Request failed: ${res.status} ${res.statusText}`)
+      }
       if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`)
       setSuccess(true)
     } catch (err: any) {

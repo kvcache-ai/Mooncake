@@ -29,10 +29,14 @@ app.prepare().then(() => {
         if (handled !== false) return
       } catch (e) {
         console.error('[api-handler] Error:', e.message)
+        // Always try to send a JSON error response, even if headers were already sent.
+        // res.end() is safe to call multiple times in Node.js and will not throw after
+        // the response has been closed — it prevents "Unexpected end of JSON input" on
+        // the client when the response headers were partially sent before the error.
         if (!res.headersSent) {
           res.writeHead(500, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: e.message }))
         }
+        try { res.end(JSON.stringify({ error: e.message })) } catch (_) { /* ignore */ }
         return
       }
     }
