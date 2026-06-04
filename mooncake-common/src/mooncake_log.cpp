@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
-#include <mutex>
 #include <string>
 #include <unistd.h>
 
@@ -162,13 +161,14 @@ void InitYltLogLevelFromEnv() {
 }
 
 void InitMooncakeLogging(const char* argv0) {
-    static std::once_flag once;
-    std::call_once(once, [argv0]() {
-        const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
+    const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
+    // mooncake_log may be linked into multiple extension modules (engine.so,
+    // store.so). std::once_flag is per-DSO, so use glog's process-wide check.
+    if (!google::IsGoogleLoggingInitialized()) {
         google::InitGoogleLogging(program);
-        ApplyGlogEnvironment(nullptr);
-        InitYltLogLevelFromEnv();
-    });
+    }
+    ApplyGlogEnvironment(nullptr);
+    InitYltLogLevelFromEnv();
 }
 
 }  // namespace mooncake
