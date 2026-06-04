@@ -217,17 +217,6 @@ mooncake_master \
 
 ---
 
-### Client Modes
-
-Regardless of the master deployment mode, a client can operate in three modes:
-
-| Mode | Description |
-|------|-------------|
-| **Embedded** | Client runs inside the LLM inference process (e.g., vLLM) via shared library. Contributes memory when `global_segment_size > 0`. |
-| **Dummy-Real** | Per-rank dummy clients forward requests to one real client per inference instance. Zero-copy shared memory between ranks. |
-| **Standalone Service** | A dedicated `mooncake_store_service` process owns memory/SSD. Inference processes run as pure clients (`global_segment_size = 0`). |
-
-
 ## Metrics Endpoints
 
 The master exposes Prometheus-style metrics on `--metrics_port`:
