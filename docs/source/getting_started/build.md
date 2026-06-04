@@ -155,8 +155,8 @@ pip install mooncake-transfer-engine-non-cuda
 6. If you want to compile Huawei Ascend NPU support, first install the Ascend CANN Toolkit following the instructions at https://www.hiascend.com/document. After that:
     1) Source `set_env.sh` in the CANN installation directory to configure the build environment (no need to manually set `ASCEND_HOME_PATH` or other related environment variables).
     2) Mooncake provides two Ascend NPU transport paths, choose one as needed:
-       - `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine.
-       - `-DUSE_UBSHMEM=ON`: Shared memory transport based on CANN VMM Apis (requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5).
+       - `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine. (refer to [Version Compatibility Guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md) for details).
+       - `-DUSE_UBSHMEM=ON`: Shared memory transport based on CANN VMM APIs (requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5).
 
     Example for building with Ascend NPU:
     ```bash
@@ -273,4 +273,4 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
 - `-DUSE_ASCEND_DIRECT=[ON|OFF]`: Enable Ascend Direct transport and HCCS support via the ADXL engine (**recommended**). 
-- `-DUSE_UBSHMEM=[ON|OFF]`: Enable Huawei Ascend NPU shared memory transport via CANN VMM Apis.
+- `-DUSE_UBSHMEM=[ON|OFF]`: Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs.
