@@ -86,10 +86,37 @@ void recoverRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend,
     mooncakeBackend->recoverRanks(ranks);
 }
 
+void deactivateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
+                    const std::vector<int>& ranks, bool disconnect) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    mooncakeBackend->deactivateRank(ranks, disconnect);
+}
+
+void activateRank(c10::intrusive_ptr<c10d::ProcessGroup> backend,
+                  const std::vector<int>& ranks) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    mooncakeBackend->activateRank(ranks);
+}
+
 void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
     mooncakeBackend->joinGroup();
+}
+
+at::Tensor getFailedRanks(c10::intrusive_ptr<c10d::Work> work) {
+    if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
+        return w->getFailedRanks();
+    }
+    if (auto* w = dynamic_cast<MooncakeWorkCpu*>(work.get())) {
+        return w->getFailedRanks();
+    }
+    if (auto* w = dynamic_cast<MooncakeP2PWork*>(work.get())) {
+        return w->getFailedRanks();
+    }
+    return at::Tensor();
 }
 
 /// Python-facing wrapper that extracts the raw TransferEngine* from a
@@ -111,6 +138,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
+    m.def("set_collective_timeout_us", &MooncakeBackend::setCollectiveTimeoutUs,
+          py::arg("us"),
+          "Set the default peer-liveness probe timeout (microseconds) for "
+          "collective operations.");
+    m.def("set_p2p_timeout_us", &MooncakeBackend::setP2PTimeoutUs,
+          py::arg("us"),
+          "Set the default P2P transfer timeout (microseconds).");
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
           "Set an external TransferEngine to be used by MooncakeBackend. "
@@ -124,7 +158,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("extend_group_size_to", &extendGroupSizeTo);
     m.def("get_peer_state", &getPeerState);
     m.def("recover_ranks", &recoverRanks);
+    m.def("activate_rank", &activateRank);
+    m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
+          py::arg("ranks"), py::arg("disconnect") = false);
     m.def("join_group", &joinGroup);
+    m.def("get_failed_ranks", &getFailedRanks, py::arg("work"));
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
@@ -133,7 +171,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
              py::arg("is_extension"))
         .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
-             py::arg("is_extension"), py::arg("max_world_size"));
+             py::arg("is_extension"), py::arg("max_world_size"))
+        .def(py::init<at::Tensor, bool, int, bool>(), py::arg("active_ranks"),
+             py::arg("is_extension"), py::arg("max_world_size"),
+             py::arg("auto_deactivate_on_failure"));
 }
 
 }  // namespace mooncake

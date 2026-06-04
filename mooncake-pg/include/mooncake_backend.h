@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <mooncake_worker.cuh>
+#include <work_handles.h>
 #include <connection_poller.h>
 #include <p2p_proxy.h>
 #include <sys/types.h>
@@ -86,6 +87,9 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
 class MooncakeBackend final : public ::c10d::ProcessGroup {
    public:
+    static constexpr size_t kDefaultCollectiveTimeoutUs = 100000;  // 100 ms
+    static constexpr int64_t kDefaultP2PTimeoutUs = 3000000;       // 3 s
+
     struct MooncakeBackendOptions final : torch::CustomClassHolder {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : activeRanks_{activeRanks} {}
@@ -96,6 +100,12 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
             : activeRanks_{activeRanks},
               isExtension_{isExtension},
               maxWorldSize_{maxWorldSize} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension,
+                               int maxWorldSize, bool autoDeactivateOnFailure)
+            : activeRanks_{activeRanks},
+              isExtension_{isExtension},
+              maxWorldSize_{maxWorldSize},
+              autoDeactivateOnFailure_{autoDeactivateOnFailure} {}
 
         ~MooncakeBackendOptions() override = default;
 
@@ -105,6 +115,20 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
         // When > 0, the backend may pre-size internal rank metadata to this
         // value (while PyTorch's group_size() remains unchanged).
         int maxWorldSize_ = -1;
+
+        // Controls whether PG automatically deactivates failed ranks on
+        // timeout or operation failure.
+        //
+        // When set to true (default), failed ranks are removed from the local
+        // active rank automatically.
+        // When set to false, PG only reports failures through per-operation
+        // failedRanks, while leaving the active rank unchanged so that the
+        // caller can decide whether and how to handle the failure.
+        //
+        // Note that the upper layer is responsible for maintaining active rank
+        // consistency. Any automatic deactivation in PG is local to the current
+        // rank only; no cross-rank synchronization is performed implicitly.
+        bool autoDeactivateOnFailure_ = true;
     };
 
     /**
@@ -183,6 +207,9 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
+    static void setCollectiveTimeoutUs(size_t us) { collectiveTimeoutUs_ = us; }
+    static void setP2PTimeoutUs(int64_t us) { p2pTimeoutUs_ = us; }
+
     static void setDeviceFilter(std::vector<std::string> filters) {
         engine_->setWhitelistFilters(std::move(filters));
     }
@@ -236,6 +263,11 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void recoverRanks(const std::vector<int>& ranks);
 
+    // alias to recoverRanks
+    void activateRank(const std::vector<int>& ranks);
+
+    void deactivateRank(const std::vector<int>& ranks, bool disconnect = false);
+
     void joinGroup();
 
    private:
@@ -256,6 +288,8 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     const c10::intrusive_ptr<MooncakeBackendOptions> options_;
     bool isCpu_{false};
     static std::string hostIp_;
+    static size_t collectiveTimeoutUs_;
+    static int64_t p2pTimeoutUs_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
     int32_t* cpu_sync_send_region_[2];
