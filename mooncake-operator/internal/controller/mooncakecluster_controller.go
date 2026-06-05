@@ -1446,6 +1446,18 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 		updated, err := r.queryDrainJob(ctx, masterAddr, job.JobID)
 		if err != nil {
 			logger.V(1).Info("failed to query drain job", "jobID", job.JobID, "error", err)
+			// When query fails (e.g. master restarted and job ID no longer exists),
+			// treat it as terminal — clean up if the pod is also gone.
+			podStillExists := false
+			for _, tp := range terminatingPods {
+				if string(tp.UID) == uid {
+					podStillExists = true
+					break
+				}
+			}
+			if !podStillExists {
+				delete(r.drainJobs, uid)
+			}
 			continue
 		}
 		if updated != nil {
@@ -1563,12 +1575,17 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 	return nil
 }
 
-// cleanupStaleDrainJobs removes tracking entries for completed jobs whose pods no longer exist.
+// cleanupStaleDrainJobs removes tracking entries for completed or stuck jobs.
 func (r *MooncakeClusterReconciler) cleanupStaleDrainJobs() {
 	r.drainJobsMu.Lock()
 	defer r.drainJobsMu.Unlock()
+	now := time.Now()
 	for uid, job := range r.drainJobs {
 		if job.Status >= 3 { // completed
+			delete(r.drainJobs, uid)
+		} else if job.Status == 0 && job.JobID != "" && now.Sub(job.CreatedAt) > 10*time.Minute {
+			// Stuck at CREATED for over 10 minutes: the master likely restarted
+			// and the job ID is no longer valid. Clean it up.
 			delete(r.drainJobs, uid)
 		}
 	}
