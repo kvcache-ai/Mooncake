@@ -33,6 +33,9 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#if defined(USE_CUDA) || defined(USE_MUSA)
+#include "transport/device/device_transport.h"
+#endif
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -335,6 +338,13 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+#if defined(USE_CUDA) || defined(USE_MUSA)
+    // Device transport accessors — lazily created, owned by this impl.
+    device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
+    device::RdmaTransport* getOrCreateRdmaTransport(
+        const std::vector<std::string>& device_filter = {});
+#endif
+
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
 
     int syncSegmentCache(const std::string& segment_name = "") {
@@ -410,6 +420,13 @@ class TransferEngineImpl {
     bool auto_discover_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+    // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
+    // Referenced by EP and future CPU-proxy paths.
+    std::unique_ptr<device::P2pTransport> p2p_transport_;
+    std::unique_ptr<device::RdmaTransport> rdma_transport_;
+#endif
 
 #ifdef WITH_METRICS
     // Latency bucket in microseconds

@@ -1,5 +1,6 @@
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
 
 option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
 
