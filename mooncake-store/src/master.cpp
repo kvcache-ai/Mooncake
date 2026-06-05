@@ -410,7 +410,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("kv_events_block_size",
                              &master_config.kv_events_block_size,
                              FLAGS_kv_events_block_size);
-    default_config.GetUInt32("kv_events_dp_rank", &master_config.kv_events_dp_rank,
+    default_config.GetUInt32("kv_events_dp_rank",
+                             &master_config.kv_events_dp_rank,
                              FLAGS_kv_events_dp_rank);
     default_config.GetBool("kv_events_emit_legacy_compat",
                            &master_config.kv_events_emit_legacy_compat,
@@ -750,7 +751,8 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.kv_events_dp_rank = FLAGS_kv_events_dp_rank;
     }
-    if ((google::GetCommandLineFlagInfo("kv_events_emit_legacy_compat", &info) &&
+    if ((google::GetCommandLineFlagInfo("kv_events_emit_legacy_compat",
+                                        &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.kv_events_emit_legacy_compat =

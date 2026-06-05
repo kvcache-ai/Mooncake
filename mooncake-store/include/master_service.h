@@ -1982,7 +1982,8 @@ class MasterService {
     void PublishKvRemoved(const std::string& key,
                           const ObjectMetadata& metadata);
     void PublishKvRemoved(const std::string& key, const std::string& medium);
-    void PublishKvRemovedAfterEvict(const std::string& key, uint64_t freed_bytes,
+    void PublishKvRemovedAfterEvict(const std::string& key,
+                                    uint64_t freed_bytes,
                                     const ObjectMetadata& metadata);
 };
 

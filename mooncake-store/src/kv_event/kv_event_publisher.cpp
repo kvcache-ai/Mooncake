@@ -32,8 +32,8 @@ void PackOptionalString(msgpack::packer<msgpack::sbuffer>& packer,
     }
 }
 
-void PackOptionalU32(msgpack::packer<msgpack::sbuffer>& packer,
-                     uint32_t value, bool has_value) {
+void PackOptionalU32(msgpack::packer<msgpack::sbuffer>& packer, uint32_t value,
+                     bool has_value) {
     if (!has_value) {
         packer.pack_nil();
     } else {
@@ -196,9 +196,8 @@ void KvEventPublisher::WorkerLoop() {
     while (!stop_.load()) {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return stop_.load() || !queue_.empty();
-            });
+            queue_cv_.wait(lock,
+                           [this] { return stop_.load() || !queue_.empty(); });
             while (!queue_.empty() && batch.size() < kMaxBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();
@@ -226,9 +225,9 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
             skipped_unparsed_keys_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        encoded.push_back(
-            EncodedEvent{pending, seq_hash.value(),
-                         next_event_id_.fetch_add(1, std::memory_order_relaxed)});
+        encoded.push_back(EncodedEvent{
+            pending, seq_hash.value(),
+            next_event_id_.fetch_add(1, std::memory_order_relaxed)});
     }
     if (encoded.empty()) {
         return;
@@ -248,8 +247,7 @@ void KvEventPublisher::PublishBatch(const std::vector<PendingEvent>& batch) {
     for (const auto& item : encoded) {
         const bool is_stored = item.pending.kind == EventKind::kStored;
         const char* rfc_type = is_stored ? "stored" : "removed";
-        const char* legacy_type =
-            is_stored ? "BlockStored" : "BlockRemoved";
+        const char* legacy_type = is_stored ? "BlockStored" : "BlockRemoved";
 
         const size_t map_size =
             ComputeEventMapSize(is_stored, config_.emit_legacy_compat_fields);

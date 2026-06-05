@@ -5367,9 +5367,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             tenant_state, /*allow_soft_pinned=*/false);
                         total_freed_size += evict_result.freed_bytes;
                         if (!it->second.IsGrouped()) {
-                            PublishKvRemovedAfterEvict(
-                                it->first, evict_result.freed_bytes,
-                                it->second);
+                            PublishKvRemovedAfterEvict(it->first,
+                                                       evict_result.freed_bytes,
+                                                       it->second);
                         }
                         if (it->second.IsValid() == false) {
                             it = EraseMetadata(tenant_state, it,

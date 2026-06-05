@@ -30,8 +30,10 @@ class KvEventPublisher {
     bool enabled() const { return config_.enabled; }
 
     // Non-blocking enqueue; never drops events (unbounded queue).
-    void PublishStored(const std::string& object_key, const std::string& medium);
-    void PublishRemoved(const std::string& object_key, const std::string& medium);
+    void PublishStored(const std::string& object_key,
+                       const std::string& medium);
+    void PublishRemoved(const std::string& object_key,
+                        const std::string& medium);
 
     struct Stats {
         uint64_t published_batches{0};
@@ -84,7 +86,8 @@ class KvEventPublisher {
 // Stub when mooncake_store is built without libzmq (ENABLE_KV_EVENTS=OFF).
 class KvEventPublisher {
    public:
-    explicit KvEventPublisher(KvEventConfig config) : config_(std::move(config)) {}
+    explicit KvEventPublisher(KvEventConfig config)
+        : config_(std::move(config)) {}
 
     bool enabled() const { return false; }
 
