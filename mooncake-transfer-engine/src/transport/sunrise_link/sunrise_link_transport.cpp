@@ -33,7 +33,25 @@ static std::string TangRtSharedObjectPath(const char* soname) {
     const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
     std::string arch_dir =
         (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
-    return r + "/lib/" + arch_dir + "/" + soname;
+    std::string arch_path = r + "/lib/" + arch_dir + "/" + soname;
+    if (access(arch_path.c_str(), F_OK) == 0) return arch_path;
+    return r + "/lib/" + soname;
+}
+
+static const char* kRawAddrPrefix = "RAW_ADDR:";
+
+struct RuntimeState {
+    bool loaded{false};
+};
+
+static std::mutex& processRuntimeMutex() {
+    static std::mutex m;
+    return m;
+}
+
+static RuntimeState& processRuntime() {
+    static RuntimeState state;
+    return state;
 }
 
 constexpr int kMaxTangDevLocks = 64;
@@ -221,13 +239,10 @@ SunriseLinkTransport::SunriseLinkTransport() = default;
 
 SunriseLinkTransport::~SunriseLinkTransport() {
     for (auto& entry : remap_entries_) {
-        if (entry.second.shm_addr) tangIpcCloseMemHandle(entry.second.shm_addr);
+        if (entry.second.shm_addr && !entry.second.is_raw_addr)
+            tangIpcCloseMemHandle(entry.second.shm_addr);
     }
     remap_entries_.clear();
-    {
-        std::lock_guard<std::mutex> guard(runtime_mutex_);
-        unloadRuntime();
-    }
 }
 
 int SunriseLinkTransport::install(std::string& local_server_name,
@@ -252,33 +267,31 @@ int SunriseLinkTransport::install(std::string& local_server_name,
 }
 
 bool SunriseLinkTransport::loadRuntime() {
-    std::lock_guard<std::mutex> guard(runtime_mutex_);
-    if (runtime_loaded_) return true;
+    std::lock_guard<std::mutex> guard(processRuntimeMutex());
+    auto& rt = processRuntime();
+    if (rt.loaded) return true;
 
-    runtime_.ptml_handle =
+    void* ptml_handle =
         dlopen(TangRtSharedObjectPath("libptml_shared.so").c_str(),
                RTLD_NOW | RTLD_GLOBAL);
-    if (!runtime_.ptml_handle) {
+    if (!ptml_handle) {
         LOG(ERROR) << "SunriseLinkTransport: failed to load PTML: "
                    << dlerror();
-        unloadRuntime();
         return false;
     }
 
-    runtime_.tang_handle =
+    void* tang_handle =
         dlopen(TangRtSharedObjectPath("libtangrt_shared.so").c_str(),
                RTLD_NOW | RTLD_GLOBAL);
-    if (!runtime_.tang_handle) {
+    if (!tang_handle) {
         LOG(ERROR) << "SunriseLinkTransport: failed to load Tang runtime: "
                    << dlerror();
-        unloadRuntime();
         return false;
     }
 
     ptmlReturn_t ret = ptmlInit();
     if (ret != PTML_SUCCESS) {
         LOG(ERROR) << "SunriseLinkTransport: ptmlInit failed: " << ret;
-        unloadRuntime();
         return false;
     }
     ret = ptmlPtlinkEnableAll();
@@ -287,20 +300,8 @@ bool SunriseLinkTransport::loadRuntime() {
                      << ret;
     }
 
-    runtime_loaded_ = true;
+    rt.loaded = true;
     return true;
-}
-
-void SunriseLinkTransport::unloadRuntime() {
-    if (runtime_.tang_handle) {
-        dlclose(runtime_.tang_handle);
-        runtime_.tang_handle = nullptr;
-    }
-    if (runtime_.ptml_handle) {
-        dlclose(runtime_.ptml_handle);
-        runtime_.ptml_handle = nullptr;
-    }
-    runtime_loaded_ = false;
 }
 
 int SunriseLinkTransport::inferRegisteredDevice(void* ptr) const {
@@ -359,18 +360,22 @@ int SunriseLinkTransport::registerLocalMemory(void* addr, size_t length,
     }
     err = tangIpcGetMemHandle(&handle, addr);
     if (saved_dev >= 0) tangSetDevice(saved_dev);
-    if (err != tangSuccess) {
-        LOG(ERROR) << "SunriseLinkTransport: tangIpcGetMemHandle failed: "
-                   << err << " " << tangGetErrorString(err);
-        return -1;
+
+    std::string shm_name;
+    if (err == tangSuccess) {
+        shm_name = serializeBinaryData(&handle, sizeof(handle));
+    } else {
+        LOG(WARNING) << "SunriseLinkTransport: tangIpcGetMemHandle failed: "
+                     << err << " " << tangGetErrorString(err)
+                     << ", falling back to RAW_ADDR";
+        shm_name = kRawAddrPrefix + std::to_string(attr.device);
     }
 
     {
         std::lock_guard<std::mutex> guard(register_mutex_);
-        if (registered_base_addrs_.count(reinterpret_cast<uint64_t>(addr))) {
+        if (registered_regions_.count(addr)) {
             return 0;
         }
-        registered_base_addrs_.insert(reinterpret_cast<uint64_t>(addr));
         registered_regions_[addr] = RegisteredRegion{length, attr.device};
     }
 
@@ -378,7 +383,7 @@ int SunriseLinkTransport::registerLocalMemory(void* addr, size_t length,
     desc.addr = reinterpret_cast<uint64_t>(addr);
     desc.length = length;
     desc.name = location;
-    desc.shm_name = serializeBinaryData(&handle, sizeof(handle));
+    desc.shm_name = shm_name;
     return metadata_->addLocalMemoryBuffer(desc, update_metadata);
 }
 
@@ -386,7 +391,6 @@ int SunriseLinkTransport::unregisterLocalMemory(void* addr,
                                                 bool update_metadata) {
     {
         std::lock_guard<std::mutex> guard(register_mutex_);
-        registered_base_addrs_.erase(reinterpret_cast<uint64_t>(addr));
         registered_regions_.erase(addr);
     }
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
@@ -429,45 +433,58 @@ int SunriseLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 
             RWSpinlock::WriteGuard guard(remap_lock_);
             if (!remap_entries_.count(key)) {
-                std::vector<unsigned char> output_buffer;
-                deserializeBinaryData(entry.shm_name, output_buffer);
-                if (output_buffer.size() != sizeof(tangIpcMemHandle_t)) {
-                    LOG(ERROR)
-                        << "SunriseLinkTransport: invalid IPC handle size";
-                    return -1;
-                }
-                tangIpcMemHandle_t handle;
-                memcpy(&handle, output_buffer.data(), sizeof(handle));
-                void* shm_addr = nullptr;
-                int remote_gpu_id = ParseSunriseDeviceId(entry.name);
-                int saved_dev = -1;
-                tangGetDevice(&saved_dev);
-                if (remote_gpu_id >= 0) {
-                    tangError_t sd = tangSetDevice(remote_gpu_id);
-                    if (sd != tangSuccess) {
+                if (entry.shm_name.compare(0, strlen(kRawAddrPrefix),
+                                           kRawAddrPrefix) == 0) {
+                    int remote_gpu_id = std::stoi(
+                        entry.shm_name.substr(strlen(kRawAddrPrefix)));
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_addr = reinterpret_cast<void*>(entry.addr);
+                    shm_entry.length = entry.length;
+                    shm_entry.gpu_id = remote_gpu_id;
+                    shm_entry.is_raw_addr = true;
+                    remap_entries_[key] = shm_entry;
+                } else {
+                    std::vector<unsigned char> output_buffer;
+                    deserializeBinaryData(entry.shm_name, output_buffer);
+                    if (output_buffer.size() != sizeof(tangIpcMemHandle_t)) {
                         LOG(ERROR)
-                            << "SunriseLinkTransport: tangSetDevice "
-                            << "before tangIpcOpenMemHandle failed: " << sd
-                            << " " << tangGetErrorString(sd)
-                            << " device=" << remote_gpu_id;
-                        if (saved_dev >= 0) tangSetDevice(saved_dev);
+                            << "SunriseLinkTransport: invalid IPC handle size";
                         return -1;
                     }
+                    tangIpcMemHandle_t handle;
+                    memcpy(&handle, output_buffer.data(), sizeof(handle));
+                    void* shm_addr = nullptr;
+                    int remote_gpu_id = ParseSunriseDeviceId(entry.name);
+                    int saved_dev = -1;
+                    tangGetDevice(&saved_dev);
+                    if (remote_gpu_id >= 0) {
+                        tangError_t sd = tangSetDevice(remote_gpu_id);
+                        if (sd != tangSuccess) {
+                            LOG(ERROR)
+                                << "SunriseLinkTransport: tangSetDevice "
+                                << "before tangIpcOpenMemHandle failed: " << sd
+                                << " " << tangGetErrorString(sd)
+                                << " device=" << remote_gpu_id;
+                            if (saved_dev >= 0) tangSetDevice(saved_dev);
+                            return -1;
+                        }
+                    }
+                    tangError_t err = tangIpcOpenMemHandle(
+                        &shm_addr, handle, tangIpcMemLazyEnablePeerAccess);
+                    if (saved_dev >= 0) tangSetDevice(saved_dev);
+                    if (err != tangSuccess) {
+                        LOG(ERROR)
+                            << "SunriseLinkTransport: tangIpcOpenMemHandle "
+                            << "failed: " << err << " "
+                            << tangGetErrorString(err);
+                        return -1;
+                    }
+                    OpenedShmEntry shm_entry;
+                    shm_entry.shm_addr = shm_addr;
+                    shm_entry.length = entry.length;
+                    shm_entry.gpu_id = remote_gpu_id;
+                    remap_entries_[key] = shm_entry;
                 }
-                tangError_t err = tangIpcOpenMemHandle(
-                    &shm_addr, handle, tangIpcMemLazyEnablePeerAccess);
-                if (saved_dev >= 0) tangSetDevice(saved_dev);
-                if (err != tangSuccess) {
-                    LOG(ERROR)
-                        << "SunriseLinkTransport: tangIpcOpenMemHandle "
-                        << "failed: " << err << " " << tangGetErrorString(err);
-                    return -1;
-                }
-                OpenedShmEntry shm_entry;
-                shm_entry.shm_addr = shm_addr;
-                shm_entry.length = entry.length;
-                shm_entry.gpu_id = remote_gpu_id;
-                remap_entries_[key] = shm_entry;
             }
 
             auto opened = remap_entries_[key];

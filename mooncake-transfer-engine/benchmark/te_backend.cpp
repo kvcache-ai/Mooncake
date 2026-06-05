@@ -22,6 +22,7 @@
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_alike.h"
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif

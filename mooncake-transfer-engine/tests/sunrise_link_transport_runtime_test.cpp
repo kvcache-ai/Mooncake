@@ -102,3 +102,30 @@ TEST(SunriseLinkTransportRuntimeTest,
     EXPECT_EQ(get_ret, tangSuccess) << tangGetErrorString(get_ret);
     EXPECT_EQ(current_dev, 0);
 }
+
+TEST(SunriseLinkTransportRuntimeTest,
+     DestroyingOneTransportDoesNotBreakAnother) {
+    int gpu_count = 0;
+    if (tangGetDeviceCount(&gpu_count) != tangSuccess || gpu_count <= 0) {
+        GTEST_SKIP() << "Sunrise device is unavailable";
+    }
+
+    auto engine1 = std::make_unique<TransferEngine>(false);
+    engine1->init("P2PHANDSHAKE", "sunrise_runtime_test:12350");
+    Transport* transport1 = engine1->installTransport("sunrise_link", nullptr);
+    ASSERT_NE(transport1, nullptr);
+
+    {
+        auto engine2 = std::make_unique<TransferEngine>(false);
+        engine2->init("P2PHANDSHAKE", "sunrise_runtime_test:12351");
+        Transport* transport2 =
+            engine2->installTransport("sunrise_link", nullptr);
+        ASSERT_NE(transport2, nullptr);
+    }
+
+    ASSERT_EQ(tangSetDevice(0), tangSuccess);
+    void* buffer = nullptr;
+    tangError_t ret = tangMalloc(&buffer, 4096);
+    EXPECT_EQ(ret, tangSuccess) << tangGetErrorString(ret);
+    if (buffer) tangFree(buffer);
+}

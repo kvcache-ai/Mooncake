@@ -5,7 +5,6 @@
 
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -63,6 +62,7 @@ class SunriseLinkTransport : public Transport {
         void* shm_addr;
         uint64_t length;
         int gpu_id;
+        bool is_raw_addr = false;
     };
 
     int relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
@@ -74,15 +74,8 @@ class SunriseLinkTransport : public Transport {
     int inferRegisteredDevice(void* ptr) const;
     int inferPointerDeviceBestEffort(void* ptr, int preferred_dev) const;
     bool loadRuntime();
-    void unloadRuntime();
-
-    struct RuntimeLibHandle {
-        void* tang_handle{nullptr};
-        void* ptml_handle{nullptr};
-    } runtime_;
 
     mutable std::mutex register_mutex_;
-    std::unordered_set<uint64_t> registered_base_addrs_;
     struct RegisteredRegion {
         size_t length;
         int gpu_id;
@@ -92,9 +85,6 @@ class SunriseLinkTransport : public Transport {
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
     RWSpinlock remap_lock_;
-
-    std::mutex runtime_mutex_;
-    bool runtime_loaded_{false};
 };
 
 }  // namespace mooncake
