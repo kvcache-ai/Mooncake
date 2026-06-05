@@ -160,7 +160,8 @@ DeserializeStandbyObjectMetadata(
         ObjectDataType data_type = ObjectDataType::UNKNOWN;
         if (index < total_elements &&
             array[index].type == msgpack::type::POSITIVE_INTEGER) {
-            data_type = static_cast<ObjectDataType>(array[index++].as<uint8_t>());
+            data_type =
+                static_cast<ObjectDataType>(array[index++].as<uint8_t>());
         }
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
@@ -218,8 +219,7 @@ DeserializeStandbyObjectMetadata(
         }
 
         std::string group_id;
-        if (index < total_elements &&
-            array[index].type == msgpack::type::STR) {
+        if (index < total_elements && array[index].type == msgpack::type::STR) {
             group_id = array[index++].as<std::string>();
         }
 
