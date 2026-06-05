@@ -673,6 +673,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
+        {
+            std::lock_guard<std::mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_ = RegisteredBufferRegion{
+                .base = client_buffer_allocator_->getBase(),
+                .size = local_buffer_size,
+                .offset = 0,
+                .mode = RegisteredBufferMode::Whole,
+                .chunk_size = local_buffer_size,
+                .chunks = {},
+            };
+        }
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -1003,6 +1014,16 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
+        {
+            std::unique_lock<std::mutex> lock(registered_buffer_mutex_);
+            if (local_buffer_region_.has_value()) {
+                local_buffer_region_->unregistering = true;
+                registered_buffer_cv_.wait(lock, [&] {
+                    return !local_buffer_region_.has_value() ||
+                           local_buffer_region_->active_operations == 0;
+                });
+            }
+        }
         auto unregister_result = client_->unregisterLocalMemory(
             client_buffer_allocator_->getBase(), true);
         if (!unregister_result) {
@@ -1010,6 +1031,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 << "Failed to unregister client local buffer on tear down: "
                 << toString(unregister_result.error());
         }
+        std::lock_guard<std::mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
+        registered_buffer_cv_.notify_all();
     }
     // Reset all resources
     client_.reset();
@@ -2741,9 +2765,11 @@ RealClient::RegisteredBufferGuard::RegisteredBufferGuard(
     RegisteredBufferGuard &&other) noexcept
     : client_(other.client_),
       base_(other.base_),
+      is_local_buffer_region_(other.is_local_buffer_region_),
       region_(std::move(other.region_)) {
     other.client_ = nullptr;
     other.base_ = nullptr;
+    other.is_local_buffer_region_ = false;
 }
 
 RealClient::RegisteredBufferGuard &RealClient::RegisteredBufferGuard::operator=(
@@ -2752,9 +2778,11 @@ RealClient::RegisteredBufferGuard &RealClient::RegisteredBufferGuard::operator=(
         release();
         client_ = other.client_;
         base_ = other.base_;
+        is_local_buffer_region_ = other.is_local_buffer_region_;
         region_ = std::move(other.region_);
         other.client_ = nullptr;
         other.base_ = nullptr;
+        other.is_local_buffer_region_ = false;
     }
     return *this;
 }
@@ -2766,16 +2794,28 @@ void RealClient::RegisteredBufferGuard::release() {
         return;
     }
     std::unique_lock<std::mutex> lock(client_->registered_buffer_mutex_);
-    auto it = client_->registered_buffers_.find(base_);
-    if (it != client_->registered_buffers_.end() &&
-        it->second.active_operations > 0) {
-        --it->second.active_operations;
-        if (it->second.active_operations == 0) {
-            client_->registered_buffer_cv_.notify_all();
+    if (is_local_buffer_region_) {
+        if (client_->local_buffer_region_.has_value() &&
+            client_->local_buffer_region_->base == base_ &&
+            client_->local_buffer_region_->active_operations > 0) {
+            --client_->local_buffer_region_->active_operations;
+            if (client_->local_buffer_region_->active_operations == 0) {
+                client_->registered_buffer_cv_.notify_all();
+            }
+        }
+    } else {
+        auto it = client_->registered_buffers_.find(base_);
+        if (it != client_->registered_buffers_.end() &&
+            it->second.active_operations > 0) {
+            --it->second.active_operations;
+            if (it->second.active_operations == 0) {
+                client_->registered_buffer_cv_.notify_all();
+            }
         }
     }
     client_ = nullptr;
     base_ = nullptr;
+    is_local_buffer_region_ = false;
 }
 
 std::optional<RealClient::RegisteredBufferGuard>
@@ -2798,6 +2838,23 @@ RealClient::resolve_registered_buffer_guard(void *buffer) {
             guard.region_ = record;
             guard.region_.offset = static_cast<size_t>(offset);
             return guard;
+        }
+    }
+    if (local_buffer_region_.has_value() &&
+        !local_buffer_region_->registering &&
+        !local_buffer_region_->unregistering) {
+        const auto base =
+            reinterpret_cast<uintptr_t>(local_buffer_region_->base);
+        if (target >= base) {
+            const auto offset = target - base;
+            if (offset < local_buffer_region_->size) {
+                ++local_buffer_region_->active_operations;
+                RegisteredBufferGuard guard(this, local_buffer_region_->base);
+                guard.is_local_buffer_region_ = true;
+                guard.region_ = *local_buffer_region_;
+                guard.region_.offset = static_cast<size_t>(offset);
+                return guard;
+            }
         }
     }
     return std::nullopt;

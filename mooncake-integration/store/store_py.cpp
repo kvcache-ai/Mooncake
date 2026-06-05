@@ -1620,10 +1620,7 @@ class RegisteredBufferPoolPyWrapper {
                                   std::optional<double> default_timeout,
                                   std::optional<size_t> max_regions)
         : store_(store.store_),
-          max_bytes_(max_bytes),
           min_size_class_(min_size_class),
-          max_size_class_(
-              std::min(max_size_class.value_or(max_bytes), max_bytes)),
           alignment_(alignment),
           block_on_exhaustion_(block_on_exhaustion),
           default_timeout_(default_timeout),
@@ -1631,13 +1628,27 @@ class RegisteredBufferPoolPyWrapper {
         if (!store_) {
             throw py::value_error("store is not initialized");
         }
-        if (max_bytes == 0) {
-            throw py::value_error("max_bytes must be positive");
-        }
         if (min_size_class == 0 || alignment == 0) {
             throw py::value_error(
                 "min_size_class and alignment must be positive");
         }
+        if (store_->client_buffer_allocator_ &&
+            store_->client_buffer_allocator_->size() > 0) {
+            uses_shared_local_buffer_ = true;
+            shared_local_buffer_capacity_ =
+                store_->client_buffer_allocator_->size();
+            max_bytes_ = shared_local_buffer_capacity_;
+            max_size_class_ =
+                std::min(max_size_class.value_or(shared_local_buffer_capacity_),
+                         shared_local_buffer_capacity_);
+            return;
+        }
+        if (max_bytes == 0) {
+            throw py::value_error("max_bytes must be positive");
+        }
+        max_bytes_ = max_bytes;
+        max_size_class_ =
+            std::min(max_size_class.value_or(max_bytes), max_bytes);
     }
 
     RegisteredBufferLeasePyWrapper acquire(size_t size,
@@ -1806,7 +1817,8 @@ class RegisteredBufferPoolPyWrapper {
                 "registered buffer lease does not belong to this pool or is "
                 "not active");
         }
-        const bool should_drop = closed_ || capacity > max_size_class_;
+        const bool should_drop =
+            uses_shared_local_buffer_ || closed_ || capacity > max_size_class_;
         if (should_drop) {
             regions_.erase(ptr);
             region_sizes_.erase(ptr);
@@ -1819,6 +1831,11 @@ class RegisteredBufferPoolPyWrapper {
     }
 
     void prewarm(size_t size, size_t count) {
+        if (uses_shared_local_buffer_) {
+            (void)size;
+            (void)count;
+            return;
+        }
         const size_t size_class = size_class_for(size);
         for (size_t i = 0; i < count; ++i) {
             auto handle = allocate_registered_region(size_class);
@@ -1833,6 +1850,11 @@ class RegisteredBufferPoolPyWrapper {
     }
 
     void ensure_prewarmed(size_t size, size_t count) {
+        if (uses_shared_local_buffer_) {
+            (void)size;
+            (void)count;
+            return;
+        }
         const size_t size_class = size_class_for(size);
         while (true) {
             size_t missing = 0;
@@ -1904,6 +1926,9 @@ class RegisteredBufferPoolPyWrapper {
    private:
     std::optional<RegisteredBufferLeasePyWrapper> try_acquire_locked(
         size_t requested_size, std::unique_lock<std::mutex> &lock) {
+        if (uses_shared_local_buffer_) {
+            return try_acquire_shared_local_locked(requested_size, lock);
+        }
         const auto oversize_class = oversize_size_class(requested_size);
         if (oversize_class.has_value()) {
             return allocate_acquire_locked(*oversize_class, requested_size,
@@ -1926,6 +1951,47 @@ class RegisteredBufferPoolPyWrapper {
                                            lock);
         }
         return std::nullopt;
+    }
+
+    std::optional<RegisteredBufferLeasePyWrapper>
+    try_acquire_shared_local_locked(size_t requested_size,
+                                    std::unique_lock<std::mutex> &lock) {
+        const size_t allocation_size = std::max<size_t>(requested_size, 1);
+        if (!has_capacity_for(allocation_size)) {
+            return std::nullopt;
+        }
+        reserve_region_locked(allocation_size);
+        lock.unlock();
+        std::shared_ptr<BufferHandle> handle;
+        if (auto alloc_result =
+                store_->client_buffer_allocator_->allocate(allocation_size);
+            alloc_result.has_value()) {
+            handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+        }
+        lock.lock();
+        reserved_bytes_ -= allocation_size;
+        condition_.notify_all();
+        if (!handle) {
+            return std::nullopt;
+        }
+        if (closed_) {
+            lock.unlock();
+            handle.reset();
+            lock.lock();
+            throw std::runtime_error("registered buffer pool is closed");
+        }
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+        in_use_.insert(ptr);
+        regions_[ptr] = handle;
+        region_sizes_[ptr] = allocation_size;
+        total_bytes_ += allocation_size;
+        acquire_count_ += 1;
+        allocate_count_ += 1;
+        if (requested_size > max_size_class_) {
+            oversize_allocate_count_ += 1;
+        }
+        return RegisteredBufferLeasePyWrapper(this, ptr, allocation_size,
+                                              requested_size, handle);
     }
 
     RegisteredBufferLeasePyWrapper allocate_acquire_locked(
@@ -1998,6 +2064,16 @@ class RegisteredBufferPoolPyWrapper {
     }
 
     bool has_capacity_for(size_t size_class) const {
+        if (uses_shared_local_buffer_) {
+            if (size_class > shared_local_buffer_capacity_) {
+                return false;
+            }
+            if (!max_regions_.has_value()) {
+                return true;
+            }
+            const size_t reserved_regions = reserved_bytes_ == 0 ? 0 : 1;
+            return in_use_.size() + reserved_regions < *max_regions_;
+        }
         if (size_class > max_bytes_) {
             return false;
         }
@@ -2015,8 +2091,10 @@ class RegisteredBufferPoolPyWrapper {
 
     void raise_if_impossible(size_t size) const {
         const size_t size_class =
-            oversize_size_class_for_empty_pool(size).value_or(
-                size_class_for(size));
+            uses_shared_local_buffer_
+                ? std::max<size_t>(size, 1)
+                : oversize_size_class_for_empty_pool(size).value_or(
+                      size_class_for(size));
         if (size_class > max_bytes_) {
             throw py::value_error(
                 "requested buffer size exceeds pool capacity: " +
@@ -2029,14 +2107,14 @@ class RegisteredBufferPoolPyWrapper {
 
     std::optional<size_t> oversize_size_class_for_empty_pool(
         size_t size) const {
-        if (size <= max_size_class_) {
+        if (uses_shared_local_buffer_ || size <= max_size_class_) {
             return std::nullopt;
         }
         return round_up(size, alignment_);
     }
 
     std::optional<size_t> oversize_size_class(size_t size) const {
-        if (size <= max_size_class_) {
+        if (uses_shared_local_buffer_ || size <= max_size_class_) {
             return std::nullopt;
         }
         const size_t rounded = round_up(size, alignment_);
@@ -2095,10 +2173,12 @@ class RegisteredBufferPoolPyWrapper {
     }
 
     std::shared_ptr<PyClient> store_;
-    size_t max_bytes_;
+    size_t max_bytes_ = 0;
     size_t min_size_class_;
-    size_t max_size_class_;
+    size_t max_size_class_ = 0;
     size_t alignment_;
+    bool uses_shared_local_buffer_ = false;
+    size_t shared_local_buffer_capacity_ = 0;
     bool block_on_exhaustion_;
     std::optional<double> default_timeout_;
     std::optional<size_t> max_regions_;

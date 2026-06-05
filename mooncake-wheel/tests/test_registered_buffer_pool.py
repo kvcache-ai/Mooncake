@@ -73,6 +73,12 @@ class FakeStore:
         return results
 
 
+def test_registered_buffer_pool_requires_max_bytes_without_native_extension():
+    store = FakeStore()
+    with pytest.raises(ValueError, match="max_bytes is required"):
+        RegisteredBufferPool(store)
+
+
 def test_registered_buffer_pool_registers_external_buffer_best_effort():
     store = FakeStore()
     pool = RegisteredBufferPool(store, max_bytes=4096, min_size_class=1024, alignment=4096)

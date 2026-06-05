@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - extension may be unavailable in pure P
 class RegisteredBufferPoolConfig:
     """Configuration for a reusable Mooncake registered scratch buffer pool."""
 
-    max_bytes: int
+    max_bytes: Optional[int] = None
     min_size_class: int = 64 * 1024
     max_size_class: Optional[int] = None
     alignment: int = 8 * 1024 * 1024
@@ -110,14 +110,16 @@ class ExternalRegisteredBufferLease:
 class RegisteredBufferPool:
     """Reusable pool of Mooncake-registered scratch buffers.
 
-    Uses the C++ store pool when available; otherwise falls back to the pure Python implementation for tests and
-    unrecompiled local extensions.
+    When backed by the native Mooncake store extension, the pool borrows from
+    the store's setup-time local registered buffer, so ``max_bytes`` becomes an
+    optional compatibility argument. The pure Python fallback still uses
+    ``max_bytes`` as the owned pool capacity.
     """
 
     def __init__(
         self,
         store: Any,
-        max_bytes: int,
+        max_bytes: Optional[int] = None,
         *,
         min_size_class: int = 64 * 1024,
         max_size_class: Optional[int] = None,
@@ -132,7 +134,7 @@ class RegisteredBufferPool:
         if CppRegisteredBufferPool is not None and store.__class__.__module__ == "mooncake.store":
             self._cpp_pool = CppRegisteredBufferPool(
                 store,
-                max_bytes,
+                1 if max_bytes is None else max_bytes,
                 min_size_class,
                 max_size_class,
                 alignment,
@@ -145,6 +147,8 @@ class RegisteredBufferPool:
                     raise ValueError("prewarm_size is required when prewarm_count is positive")
                 self._cpp_pool.prewarm(prewarm_size, prewarm_count)
             return
+        if max_bytes is None:
+            raise ValueError("max_bytes is required without the native Mooncake store extension")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         if min_size_class <= 0 or alignment <= 0:

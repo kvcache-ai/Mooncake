@@ -147,6 +147,7 @@ class RealClient : public PyClient {
 
         RealClient *client_{nullptr};
         void *base_{nullptr};
+        bool is_local_buffer_region_{false};
         RegisteredBufferRegion region_{};
     };
 
@@ -816,6 +817,7 @@ class RealClient : public PyClient {
     mutable std::mutex registered_buffer_mutex_;
     std::condition_variable registered_buffer_cv_;
     std::unordered_map<void *, RegisteredBufferRegion> registered_buffers_;
+    std::optional<RegisteredBufferRegion> local_buffer_region_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
