@@ -80,7 +80,9 @@ class CatalogBackedSnapshotProviderTest
         ASSERT_TRUE(snapshot->has_value());
         ASSERT_EQ(snapshot->value().metadata.size(), 1u);
 
-        const auto& [key, metadata] = snapshot->value().metadata.front();
+        const auto& [tenant_id, key, metadata] =
+            snapshot->value().metadata.front();
+        EXPECT_EQ(tenant_id, "default");
         EXPECT_EQ(key, kDefaultTestObjectKey);
         EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
         EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
