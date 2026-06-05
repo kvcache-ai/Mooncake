@@ -1761,6 +1761,7 @@ fn replication_policy(
     has_policy.then_some(policy)
 }
 
+#[inline]
 pub(crate) fn pointer_from_usize(pointer: usize) -> PyResult<*mut c_void> {
     if pointer == 0 {
         return Err(PyValueError::new_err("buffer pointer must not be null"));
@@ -1931,6 +1932,7 @@ fn execute_real_batch_put_from(
     result
 }
 
+#[inline]
 pub(crate) fn run_without_gil<T, F>(f: F) -> Result<T, StoreError>
 where
     T: pyo3::marker::Ungil + Send,
@@ -1939,6 +1941,7 @@ where
     allow_threads_ungil(f)
 }
 
+#[inline]
 fn allow_threads_ungil<T, F>(f: F) -> T
 where
     T: pyo3::marker::Ungil,
@@ -1947,6 +1950,7 @@ where
     Python::with_gil(|py| py.allow_threads(f))
 }
 
+#[inline]
 pub(crate) fn store_error_to_py(error: StoreError) -> PyErr {
     match error {
         StoreError::NotFound(message) => PyKeyError::new_err(message),
