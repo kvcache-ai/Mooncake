@@ -475,11 +475,12 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     replicate_config.group_ids = std::vector<std::string>{
         FindGroupIdOnDifferentShard(service_.get(), key)};
 
-    auto put_start = service_->PutStart(client_id, key, 1024, replicate_config);
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, replicate_config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    ASSERT_TRUE(service_->ExistKey(key).value_or(false));
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, "default").value_or(false));
 
     auto persist_result = CallPersistState("20240701_130000_000");
     ASSERT_TRUE(persist_result.has_value())
@@ -488,11 +489,11 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     service_.reset();
     service_ = std::make_unique<MasterService>(make_config());
 
-    auto restored_replicas = service_->GetReplicaList(key);
+    auto restored_replicas = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(restored_replicas.has_value())
         << "Grouped key should remain reachable by key after restore";
-    ASSERT_TRUE(service_->Remove(key, /*force=*/true).has_value());
-    EXPECT_FALSE(service_->ExistKey(key).value_or(true));
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+    EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
 }
 
 TEST_F(SnapshotChildProcessTest,
@@ -704,12 +705,14 @@ TEST_F(SnapshotChildProcessTest,
         << "MountSegment failed";
 
     const std::string key1 = "restore_fallback_key_1";
-    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    auto put1 = service_->PutStart(client_id, key1, "default", {1024},
+                                   {.replica_num = 1});
     ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
     ASSERT_TRUE(
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value())
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd for key1 failed";
-    EXPECT_TRUE(service_->ExistKey(key1).value_or(false))
+    EXPECT_TRUE(service_->ExistKey(key1, "default").value_or(false))
         << "ExistKey should refresh lease for key1 before snapshot1";
 
     const std::string snapshot_id1 = "20240702_120000_000";
@@ -719,12 +722,14 @@ TEST_F(SnapshotChildProcessTest,
         << persist_result.error().message;
 
     const std::string key2 = "restore_fallback_key_2";
-    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    auto put2 = service_->PutStart(client_id, key2, "default", {1024},
+                                   {.replica_num = 1});
     ASSERT_TRUE(put2.has_value()) << "PutStart for key2 failed";
     ASSERT_TRUE(
-        service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value())
+        service_->PutEnd(client_id, key2, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd for key2 failed";
-    EXPECT_TRUE(service_->ExistKey(key2).value_or(false))
+    EXPECT_TRUE(service_->ExistKey(key2, "default").value_or(false))
         << "ExistKey should refresh lease for key2 before snapshot2";
 
     const std::string snapshot_id2 = "20240702_120500_000";
@@ -755,9 +760,9 @@ TEST_F(SnapshotChildProcessTest,
                               .build();
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
-    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
+    EXPECT_TRUE(restored_service->ExistKey(key1, "default").value_or(false))
         << "Restore should fall back to the previous healthy snapshot";
-    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false))
+    EXPECT_FALSE(restored_service->ExistKey(key2, "default").value_or(false))
         << "Corrupted latest snapshot must not be partially restored";
 
     restored_service.reset();
@@ -828,22 +833,22 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
 
     // Add a complete object (clean data)
     std::string clean_key = "clean_object";
-    auto put_result =
-        service_->PutStart(client_id, clean_key, {1024}, {.replica_num = 1});
+    auto put_result = service_->PutStart(client_id, clean_key, "default",
+                                         {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_result.has_value()) << "PutStart clean failed";
     auto put_end_result =
-        service_->PutEnd(client_id, clean_key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, clean_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value()) << "PutEnd clean failed";
 
     // Add an incomplete object (PutStart without PutEnd -> non-COMPLETE)
     std::string dirty_key = "dirty_incomplete";
-    auto put_dirty_result =
-        service_->PutStart(client_id, dirty_key, {1024}, {.replica_num = 1});
+    auto put_dirty_result = service_->PutStart(client_id, dirty_key, "default",
+                                               {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_dirty_result.has_value()) << "PutStart dirty failed";
     // Intentionally NO PutEnd -> replica stays in PENDING status
 
     // Verify both keys exist in metadata before snapshot
-    EXPECT_TRUE(service_->ExistKey(clean_key).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(clean_key, "default").value_or(false));
     EXPECT_TRUE(KeyExistsInMetadata(service_.get(), dirty_key))
         << "Dirty key should exist in raw metadata after PutStart";
 
@@ -866,7 +871,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify non-COMPLETE replica was cleaned, complete one remains
-    EXPECT_TRUE(restored_service->ExistKey(clean_key).value_or(false))
+    EXPECT_TRUE(
+        restored_service->ExistKey(clean_key, "default").value_or(false))
         << "Complete object should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), dirty_key))
         << "Non-COMPLETE object should be cleaned from metadata during restore";
@@ -902,23 +908,25 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     // Add two complete objects via PutStart + PutEnd
     // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
     std::string expired_key = "expired_lease_object";
-    auto put_exp =
-        service_->PutStart(client_id, expired_key, {1024}, {.replica_num = 1});
+    auto put_exp = service_->PutStart(client_id, expired_key, "default", {1024},
+                                      {.replica_num = 1});
     ASSERT_TRUE(put_exp.has_value()) << "PutStart expired failed";
-    ASSERT_TRUE(service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
-                    .has_value())
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, expired_key, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd expired failed";
 
     std::string normal_key = "normal_lease_object";
-    auto put_norm =
-        service_->PutStart(client_id, normal_key, {1024}, {.replica_num = 1});
+    auto put_norm = service_->PutStart(client_id, normal_key, "default", {1024},
+                                       {.replica_num = 1});
     ASSERT_TRUE(put_norm.has_value()) << "PutStart normal failed";
-    ASSERT_TRUE(service_->PutEnd(client_id, normal_key, ReplicaType::MEMORY)
-                    .has_value())
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, normal_key, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd normal failed";
 
     // ExistKey grants a fresh lease (now + 600s) to normal_key
-    EXPECT_TRUE(service_->ExistKey(normal_key).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(normal_key, "default").value_or(false));
     // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
 
     // Step 2: Persist state
@@ -940,7 +948,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify normal data retained, expired-lease data cleaned
-    EXPECT_TRUE(restored_service->ExistKey(normal_key).value_or(false))
+    EXPECT_TRUE(
+        restored_service->ExistKey(normal_key, "default").value_or(false))
         << "Normal object with valid lease should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";

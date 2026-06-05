@@ -1793,7 +1793,9 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
 
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
-    return master_service_.GetAllKeys();
+    // Compatibility endpoint: /get_all_keys historically listed only the
+    // default tenant's keys.
+    return master_service_.GetAllKeys("default");
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
