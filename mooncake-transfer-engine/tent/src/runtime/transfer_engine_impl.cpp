@@ -607,14 +607,14 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
         }
         return result;
     }
-    if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[MNNVL]) result.push_back(MNNVL);
-    if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
-    if (transport_list_[GDS]) result.push_back(GDS);
-    if (transport_list_[TCP]) result.push_back(TCP);
-    if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
+    if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[SUNRISE_LINK]) result.push_back(SUNRISE_LINK);
+    if (transport_list_[AscendDirect]) result.push_back(AscendDirect);
+    if (transport_list_[SHM]) result.push_back(SHM);
+    if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[GDS]) result.push_back(GDS);
     return result;
 }
 

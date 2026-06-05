@@ -43,7 +43,7 @@ struct Notification {
 #define LOCAL_SEGMENT_ID (0ull)
 #endif
 
-enum TransportType {
+enum TransportType : int {
     UNSPEC = 0,
     RDMA,
     MNNVL,

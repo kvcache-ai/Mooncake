@@ -71,7 +71,7 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
     Status freeSubBatch(SubBatchRef& batch) override {
-        delete batch;
+        delete static_cast<FakeSubBatch*>(batch);
         batch = nullptr;
         return Status::OK();
     }
