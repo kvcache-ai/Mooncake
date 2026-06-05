@@ -54,9 +54,11 @@ enum TransportType {
     TCP,
     AscendDirect,
     SUNRISE_LINK,
+    // Sentinel: must remain the last enumerator.
+    kNumTransportTypes,
 };
 
-const static int kSupportedTransportTypes = (int)SUNRISE_LINK + 1;
+const static int kSupportedTransportTypes = (int)kNumTransportTypes;
 
 inline TransportType c_to_transport_hint(int v) {
     if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
