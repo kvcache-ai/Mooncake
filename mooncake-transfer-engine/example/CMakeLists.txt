@@ -76,6 +76,11 @@ if(USE_CUDA)
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(device_transport_example PUBLIC
     transfer_engine gflags::gflags glog::glog)
+  # common.h (pulled in via transfer_engine.h) uses C++20 std::string APIs
+  # such as starts_with; nvcc does not inherit CMAKE_CXX_STANDARD, so set the
+  # CUDA standard explicitly on this target.
+  set_target_properties(device_transport_example PROPERTIES
+    CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
   # Convert torch-style arch list (e.g. "8.0;9.0") to CMake CUDA format
   # (e.g. "80;90") by stripping the dot.
   if(TORCH_CUDA_ARCH_LIST)
