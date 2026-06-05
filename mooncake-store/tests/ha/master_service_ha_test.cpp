@@ -79,7 +79,71 @@ class MasterServiceHATest : public ::testing::Test {
             service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
         return key;
     }
+
+    Replica::Descriptor MakeStandbyMemoryReplica(const std::string& endpoint,
+                                                 size_t size = 1024) const {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+
+        MemoryDescriptor mem_desc;
+        mem_desc.buffer_descriptor.transport_endpoint_ = endpoint;
+        mem_desc.buffer_descriptor.buffer_address_ = 0;
+        mem_desc.buffer_descriptor.size_ = size;
+        replica.descriptor_variant = std::move(mem_desc);
+        return replica;
+    }
+
+    StandbyObjectEntry MakeStandbyObject(const std::string& key,
+                                         const std::string& endpoint,
+                                         size_t size = 1024) const {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = size;
+        metadata.last_sequence_id = 1;
+        metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint, size));
+        return StandbyObjectEntry{"default", key, std::move(metadata)};
+    }
+
+    StandbySegmentInfo MakeStandbyMemorySegment(
+        const std::string& endpoint,
+        size_t capacity = kDefaultSegmentSize) const {
+        StandbySegmentInfo segment;
+        segment.segment_name = endpoint;
+        segment.transport_endpoint = endpoint;
+        segment.capacity = capacity;
+        segment.is_memory_segment = true;
+        return segment;
+    }
 };
+
+TEST_F(MasterServiceHATest, RestoreFromStandbySnapshotClearsInvalidEndpoints) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_cluster_id("test_cluster")
+                              .build();
+    MasterService service(service_config);
+    service.SetOpLogStoreForTesting(std::make_shared<MockOpLogStore>());
+
+    const std::string endpoint = "restored_segment";
+    [[maybe_unused]] const auto context =
+        PrepareSimpleSegment(service, endpoint);
+
+    service.RestoreFromStandbySnapshot(
+        {MakeStandbyObject("stale_restore_key", endpoint)}, 1, {});
+
+    service.RestoreFromStandbySnapshot(
+        {MakeStandbyObject("valid_restore_key", endpoint)}, 2,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    auto valid_result = service.GetReplicaList("valid_restore_key");
+    ASSERT_TRUE(valid_result.has_value()) << toString(valid_result.error());
+    ASSERT_EQ(1u, valid_result->replicas.size());
+    EXPECT_EQ(endpoint, valid_result->replicas.front()
+                            .get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
+}
 
 // Test that RemoveByRegex publishes REMOVE OpLog entries for matched keys.
 TEST_F(MasterServiceHATest, RemoveByRegexPublishesRemoveOpLog) {
