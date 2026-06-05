@@ -315,6 +315,11 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 
 ### High Availability
 
+```{caution}
+High Availability is experimental feature.
+```
+
+**Master Node High Availability**
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--enable_ha` | `false` | Enable HA mode |
@@ -322,6 +327,26 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+
+**Metadata Snapshot And Restore**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_snapshot` | `false` | Enable periodic metadata snapshot |
+| `--snapshot_interval_seconds` | `300` (5 min) | Interval between snapshots |
+| `--snapshot_child_timeout_seconds` | `3600` (1 hour) | Timeout per snapshot child process |
+| `--snapshot_retention_count` | `10` | Number of recent snapshots retained |
+| `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
+| `--snapshot_catalog_store_type` | empty | Catalog store: `embedded` or `redis` |
+| `--snapshot_catalog_store_connstring` | empty | Catalog store connection string (required for `redis`) |
+| `--snapshot_backup_dir` | empty | Optional local backup directory |
+| `--enable_snapshot_restore` | `false` | Restore from latest snapshot at startup |
+
+**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for local snapshots.
+
+```{warning}
+The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Old snapshots exceeding `--snapshot_retention_count` are automatically deleted. Use a dedicated directory to avoid data loss.
+```
 
 ### Task Manager
 
@@ -360,26 +385,6 @@ Start with `--enable_offload=true` to move cold data to SSD automatically. Add `
 | `--cxl_size` | `8GB` (`8589934592`) | CXL memory size in bytes |
 
 When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the master preferentially allocates new objects on CXL memory.
-
-### Snapshot & Restore
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--enable_snapshot` | `false` | Enable periodic metadata snapshot |
-| `--snapshot_interval_seconds` | `300` (5 min) | Interval between snapshots |
-| `--snapshot_child_timeout_seconds` | `3600` (1 hour) | Timeout per snapshot child process |
-| `--snapshot_retention_count` | `10` | Number of recent snapshots retained |
-| `--snapshot_object_store_type` | required | Object store: `local` or `s3` |
-| `--snapshot_catalog_store_type` | empty | Catalog store: `embedded` or `redis` |
-| `--snapshot_catalog_store_connstring` | empty | Catalog store connection string (required for `redis`) |
-| `--snapshot_backup_dir` | empty | Optional local backup directory |
-| `--enable_snapshot_restore` | `false` | Restore from latest snapshot at startup |
-
-**Environment variable:** `MOONCAKE_SNAPSHOT_LOCAL_PATH` (required when `--snapshot_object_store_type=local`) — persistent directory for local snapshots.
-
-```{warning}
-The snapshot storage path is a **managed directory** exclusively controlled by Mooncake. Old snapshots exceeding `--snapshot_retention_count` are automatically deleted. Use a dedicated directory to avoid data loss.
-```
 
 ### DFS Storage
 
