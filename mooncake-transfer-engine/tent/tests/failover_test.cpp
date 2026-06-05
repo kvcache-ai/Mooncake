@@ -131,7 +131,7 @@ TEST(FailoverConfigTest, AutoFailoverOnPollCanBeDisabled) {
 TEST(TransportTypeTest, UnspecIsZeroSlot) {
     // UNSPEC must be value 0 so that zero-initialized tent_request /
     // tent_memory_options structs (the C ABI) default to UNSPEC
-    // rather than silently pinning to whichever transport happened 
+    // rather than silently pinning to whichever transport happened
     // to occupy slot 0.
     EXPECT_EQ(static_cast<int>(UNSPEC), 0);
     EXPECT_EQ(kSupportedTransportTypes, static_cast<int>(SUNRISE_LINK) + 1);

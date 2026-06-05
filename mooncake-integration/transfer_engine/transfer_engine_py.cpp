@@ -21,6 +21,10 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
+#ifdef USE_TENT
+#include "tent/runtime/transport_selector.h"
+#endif
+
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
 #endif
@@ -321,19 +325,12 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
 }
 
 static int parseTransportHint(const std::string& name) {
-    if (name.empty() || name == "unspec") return 0;
-    if (name == "rdma") return 1;
-    if (name == "mnnvl") return 2;
-    if (name == "shm") return 3;
-    if (name == "nvlink") return 4;
-    if (name == "gds") return 5;
-    if (name == "io_uring") return 6;
-    if (name == "tcp") return 7;
-    if (name == "ascend") return 8;
-    if (name == "sunrise_link") return 9;
-    LOG(WARNING) << "Unknown transport_hint '" << name
-                 << "', falling back to policy-driven selection";
+#ifdef USE_TENT
+    if (name.empty()) return mooncake::tent::UNSPEC;
+    return mooncake::tent::TransportSelector::parseTransportType(name);
+#else
     return 0;
+#endif
 }
 
 int TransferEnginePy::transferSyncWrite(const char* target_hostname,
