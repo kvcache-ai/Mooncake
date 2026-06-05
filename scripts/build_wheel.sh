@@ -56,6 +56,12 @@ if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     cp ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
+# Copy libmooncake_common.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so ]; then
+    echo "Copying libmooncake_common.so..."
+    cp ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so mooncake-wheel/mooncake/libmooncake_common.so
+fi
+
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
 if [ -f ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so ]; then
     echo "Copying libetcd_wrapper.so..."
@@ -201,7 +207,20 @@ if [ "$NPU_BUILD" = "1" ]; then
         echo "Error: $PYTHON_CMD not found for NPU wheel build"
         exit 1
     fi
-    "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel
+    max_attempts=3
+    attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel; then
+            break
+        fi
+        echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    if [ $attempt -gt $max_attempts ]; then
+        echo "Error: pip install failed after $max_attempts attempts"
+        exit 1
+    fi
 elif command -v pip &>/dev/null; then
     python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
@@ -278,6 +297,12 @@ else
     python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
     AUDITWHEEL_CMD="auditwheel"
 fi
+
+AUDITWHEEL_EXCLUDES=""
+if [ "$NPU_BUILD" = "1" ]; then
+    AUDITWHEEL_EXCLUDES="--exclude libmooncake_store.so* --exclude libmooncake_common.so* --exclude libtransfer_engine.so* --exclude libetcd_wrapper.so* --exclude libasio.so*"
+fi
+
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -366,6 +391,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
+    ${AUDITWHEEL_EXCLUDES} \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
@@ -395,6 +421,41 @@ fi
 # Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
 if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
+fi
+
+# NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
+# on all ELF files so everything resolves from a single directory.
+if [ "$NPU_BUILD" = "1" ]; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        VENDORED_LIBS_DIR=$(find "$UNPACKED_PKG_DIR" -mindepth 1 -maxdepth 1 -type d -name "*.libs" | head -1)
+        if [ -n "$VENDORED_LIBS_DIR" ]; then
+            echo "Moving vendored libraries into mooncake/..."
+            cp "$VENDORED_LIBS_DIR"/*.so* "${UNPACKED_PKG_DIR}/mooncake/" 2>/dev/null || true
+            rm -rf "$VENDORED_LIBS_DIR"
+            rm -f "${UNPACKED_PKG_DIR}/$(basename "$VENDORED_LIBS_DIR").pth"
+        fi
+        echo "Setting RPATH=\$ORIGIN for all ELF files..."
+        find "${UNPACKED_PKG_DIR}/mooncake/" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+        echo "Verifying RPATH..."
+        verify_failed=0
+        while IFS= read -r -d '' f; do
+            rpath=$(patchelf --print-rpath "$f")
+            if [ "$rpath" != '$ORIGIN' ]; then
+                echo "Error: RPATH verification failed for $(basename "$f"): got '${rpath}'"
+                verify_failed=1
+            fi
+        done < <(find "${UNPACKED_PKG_DIR}/mooncake/" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
+        if [ "$verify_failed" -ne 0 ]; then
+            exit 1
+        fi
+        rm "$REPAIRED_WHEEL"
+        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
 fi
 
 # Replace original wheel with repaired wheel

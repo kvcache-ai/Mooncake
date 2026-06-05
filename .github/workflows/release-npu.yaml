@@ -1,9 +1,12 @@
 name: Release Ascend NPU
 
 on:
-  push:
-    tags:
-      - 'v*'
+  pull_request:
+    branches:
+      - main
+  # push:
+  #   tags:
+  #     - 'v*'
 
 jobs:
   build:
@@ -17,7 +20,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.11']
 
     env:
       BUILD_WITH_EP: "0"
@@ -149,15 +152,14 @@ jobs:
           cd build
           cmake_args=(
             -DUSE_ASCEND_DIRECT=ON
-            -DUSE_CUDA=OFF
-            -DWITH_EP=OFF
-            -DUSE_HTTP=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON
             -DBUILD_UNIT_TESTS=OFF
-            -DBUILD_EXAMPLES=ON
             -DCMAKE_BUILD_TYPE=Release
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
           )
           cmake .. "${cmake_args[@]}"
 
@@ -220,10 +222,10 @@ jobs:
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/
 
-      - name: Upload wheels to GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: mooncake-wheel/dist-release/*.whl
+      # - name: Upload wheels to GitHub Release
+      #   uses: softprops/action-gh-release@v1
+      #   with:
+      #     files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
