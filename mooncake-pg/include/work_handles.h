@@ -18,7 +18,8 @@ class MooncakeWorker;
 
 // Per-operation failedRanks buffer (non-copyable, movable)
 // CPU: owning tensor.
-// CUDA: pinned mapped memory (tensor is non-owning view).
+// CUDA: pinned mapped memory (tensor owns the allocation via custom deleter;
+//       dev_ptr is the device-visible alias of the same buffer).
 struct FailedRanks {
     at::Tensor tensor;
     int* dev_ptr = nullptr;  // CUDA only: device pointer for GPU kernel.
@@ -30,27 +31,13 @@ struct FailedRanks {
     FailedRanks(const FailedRanks&) = delete;
     FailedRanks& operator=(const FailedRanks&) = delete;
 
-    FailedRanks(FailedRanks&& o) noexcept
-        : tensor(std::move(o.tensor)), dev_ptr(o.dev_ptr) {
-        o.dev_ptr = nullptr;
-    }
-    FailedRanks& operator=(FailedRanks&& o) noexcept {
-        if (this != &o) {
-            freePinned();
-            tensor = std::move(o.tensor);
-            dev_ptr = o.dev_ptr;
-            o.dev_ptr = nullptr;
-        }
-        return *this;
-    }
-    ~FailedRanks() { freePinned(); }
+    FailedRanks(FailedRanks&& o) noexcept = default;
+    FailedRanks& operator=(FailedRanks&& o) noexcept = default;
+    ~FailedRanks() = default;
 
     int* data() { return tensor.data_ptr<int>(); }
 
     static FailedRanks allocate(int n, bool isCpu);
-
-   private:
-    void freePinned();
 };
 
 // Collective Work handles

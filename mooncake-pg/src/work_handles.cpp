@@ -11,21 +11,21 @@ FailedRanks FailedRanks::allocate(int n, bool isCpu) {
     if (isCpu) {
         return {torch::zeros({n}, torch::kInt32), nullptr};
     }
-    int* host_ptr;
-    int* dev_ptr;
-    cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    int* host_ptr = nullptr;
+    int* dev_ptr = nullptr;
+    cudaError_t err =
+        cudaHostAlloc(&host_ptr, n * sizeof(int), cudaHostAllocMapped);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaHostAlloc failed: ", cudaGetErrorString(err));
+    err = cudaHostGetDevicePointer(reinterpret_cast<void**>(&dev_ptr), host_ptr,
+                                   0);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
     std::memset(host_ptr, 0, n * sizeof(int));
-    auto t = torch::from_blob(host_ptr, {n}, torch::kInt32);
+    auto deleter = [](void* ptr) { cudaFreeHost(ptr); };
+    auto t = torch::from_blob(host_ptr, {n}, deleter,
+                              torch::TensorOptions().dtype(torch::kInt32));
     return {t, dev_ptr};
-}
-
-void FailedRanks::freePinned() {
-    if (dev_ptr && tensor.defined()) {
-        cudaFreeHost(tensor.data_ptr());
-        tensor.reset();
-        dev_ptr = nullptr;
-    }
 }
 
 bool MooncakeWorkCuda::wait(std::chrono::milliseconds timeout) {
