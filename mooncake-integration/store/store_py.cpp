@@ -707,15 +707,19 @@ class MooncakeStorePyWrapper {
             // Note: In batch mode, we need contiguous memory for Metadata +
             // Data.
             std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
-
+            std::shared_ptr<ClientBufferAllocator> allocator =
+                store_->client_service_->GetBufferAllocator();
+            if (!allocator) {
+                LOG(ERROR) << "Failed to get buffer allocator";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
             for (size_t i = 0; i < infos.size(); ++i) {
                 if (!infos[i].valid()) continue;
 
                 size_t total_size =
                     sizeof(TensorMetadata) + infos[i].tensor_size;
-                auto alloc_result =
-                    store_->client_service_->GetBufferAllocator()->allocate(
-                        total_size);
+                auto alloc_result = allocator->allocate(total_size);
 
                 if (!alloc_result) {
                     LOG(ERROR)

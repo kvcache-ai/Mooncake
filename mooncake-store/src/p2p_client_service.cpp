@@ -2195,6 +2195,10 @@ void P2PClientService::RegisterHttpMethods() {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "buffer allocator not initialized");
                 return;
+            } else if (body.size() == 0) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing body");
+                return;
             }
 
             auto alloc_result = local_buffer_allocator_->allocate(body.size());
