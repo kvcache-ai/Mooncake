@@ -155,7 +155,6 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 	}
 
 	masterAddr := mc.Name + "-master-headless." + mc.Namespace + ":50051"
-	metadataServer := "http://" + mc.Name + "-master-headless." + mc.Namespace + ":8080/metadata"
 
 	transferPort := mc.Spec.Workers.TransferPort
 	if transferPort == 0 {
@@ -170,16 +169,111 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 		Command: []string{
 			"sh",
 			"-c",
-			"exec mooncake_client " +
-				"--master_server_address=" + masterAddr + " " +
-				"--global_segment_size=" + convertSegmentSize(mc.Spec.Workers.SegmentSize) + " " +
-				"--metadata_server=" + metadataServer + " " +
-				"--host=$POD_IP:${MC_STORE_CLIENT_MIN_PORT}",
+			`
+# Dynamically discover the leader master for metadata registration.
+# In HA mode (3 master replicas), each master stores metadata independently
+# in memory. Registering with a standby causes 404 errors for clients
+# that query the leader. Discover the leader at startup by querying each
+# master's /role endpoint.
+LEADER=""
+for i in 0 1 2; do
+  TRY_ADDR="${CLUSTER_NAME}-master-${i}.${CLUSTER_NAME}-master-headless.${POD_NAMESPACE}.svc"
+  ROLE=$(TRY_ADDR=$TRY_ADDR python3 <<- 'PYEOF' 2>/dev/null
+import os, urllib.request
+addr = os.environ['TRY_ADDR']
+print(urllib.request.urlopen('http://' + addr + ':9003/role', timeout=3).read().decode().strip())
+PYEOF
+)
+  if [ "${ROLE}" = "leader" ]; then
+    LEADER="${TRY_ADDR}"
+    break
+  fi
+done
+[ -z "${LEADER}" ] && LEADER="${CLUSTER_NAME}-master-headless.${POD_NAMESPACE}.svc"
+METADATA_SERVER="http://${LEADER}:8080/metadata"
+exec mooncake_client \
+  --master_server_address="` + masterAddr + `" \
+  --global_segment_size="` + convertSegmentSize(mc.Spec.Workers.SegmentSize) + `" \
+  --local_buffer_size=512MB \
+  --metadata_server="${METADATA_SERVER}" \
+  --host="${POD_IP}:${MC_STORE_CLIENT_MIN_PORT}"
+`,
+		},
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{
+						"python3", "-c",
+						`
+import os, json, time, urllib.request, sys
+
+pod_ip = os.environ.get('POD_IP', '')
+port = os.environ.get('MC_STORE_CLIENT_MIN_PORT', '13006')
+segment = pod_ip + ':' + port
+cluster = os.environ.get('CLUSTER_NAME', '')
+namespace = os.environ.get('POD_NAMESPACE', '')
+
+# Discover leader master — only the leader has segment metadata in HA mode
+leader = ''
+for i in range(3):
+    try:
+        addr = '%s-master-%d.%s-master-headless.%s.svc' % (cluster, i, cluster, namespace)
+        r = urllib.request.urlopen('http://' + addr + ':9003/role', timeout=3)
+        role = r.read().decode().strip()
+        if role == 'leader':
+            leader = addr
+            break
+    except Exception:
+        continue
+if not leader:
+    leader = '%s-master.%s.svc' % (cluster, namespace)
+
+def get_lifecycle():
+    try:
+        req = urllib.request.Request(
+            'http://' + leader + ':9003/api/v1/segments/status?segment=' + segment)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read().decode()
+            result = json.loads(data)
+            return result.get('status_name', '')
+    except Exception:
+        return ''
+
+lifecycle = get_lifecycle()
+if lifecycle == 'DRAINED':
+    sys.exit(0)
+
+timeout = 600
+interval = 5
+elapsed = 0
+while elapsed < timeout:
+    lifecycle = get_lifecycle()
+    if lifecycle == 'DRAINED':
+        sys.exit(0)
+    time.sleep(interval)
+    elapsed += interval
+sys.exit(0)
+`,
+					},
+				},
+			},
 		},
 		Env: []corev1.EnvVar{
 			{
 				Name:  "LD_LIBRARY_PATH",
 				Value: "/usr/local/lib/mooncake",
+			},
+			{
+				Name:  "CLUSTER_NAME",
+				Value: mc.Name,
+			},
+			{
+				Name: "POD_NAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.namespace",
+					},
+				},
 			},
 			{
 				Name:  "MC_STORE_CLIENT_MIN_PORT",
@@ -188,6 +282,10 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 			{
 				Name:  "MC_STORE_CLIENT_MAX_PORT",
 				Value: portStr,
+			},
+			{
+				Name:  "MC_LOCAL_BUFFER_SIZE",
+				Value: "536870912",
 			},
 			{
 				Name: "POD_IP",
@@ -256,8 +354,9 @@ func (r *MooncakeClusterReconciler) buildWorkerDeployment(mc *mooncakev1alpha1.M
 					Labels: mergeLabels(labels, selector),
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{container},
-					Volumes:    volumes,
+					TerminationGracePeriodSeconds: int64Ptr(3600),
+					Containers:                    []corev1.Container{container},
+					Volumes:                       volumes,
 				},
 			},
 		},
@@ -688,3 +787,5 @@ func mergeResourceList(a, b corev1.ResourceList) corev1.ResourceList {
 func resourcePtr(q resource.Quantity) *resource.Quantity {
 	return &q
 }
+
+func int64Ptr(i int64) *int64 { return &i }

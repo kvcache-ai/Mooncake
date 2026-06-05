@@ -168,6 +168,37 @@ function deepMerge(target, src) {
 const drainJobs = new Map()
 const drainStatusEnum = ['CREATED', 'PLANNING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED']
 
+// Helper: find the leader master pod by querying each master's /role endpoint via K8s API proxy
+async function findLeaderPod(namespace, name) {
+  try {
+    const podResult = await k8sRequest(
+      `/api/v1/namespaces/${namespace}/pods?labelSelector=app=mooncake-master,cluster=${name}`
+    )
+    const pods = podResult?.items || []
+    const containerPort = 9003 // metrics port, used for admin HTTP API
+
+    for (const pod of pods) {
+      const podName = pod.metadata.name
+      try {
+        const proxyPrefix = `/api/v1/namespaces/${namespace}/pods/${podName}:${containerPort}/proxy`
+        const roleText = await k8sRequest(`${proxyPrefix}/role`)
+        const role = typeof roleText === 'string' ? roleText.trim() : ''
+        if (role === 'leader') {
+          console.log(`[findLeaderPod] Leader found: ${podName}`)
+          return podName
+        }
+      } catch (e) {
+        console.warn(`[findLeaderPod] Failed to query role for ${podName}: ${e.message}`)
+      }
+    }
+  } catch (e) {
+    console.warn(`[findLeaderPod] Failed to list master pods: ${e.message}`)
+  }
+  // Fallback: master-0 is typically the default leader
+  console.log(`[findLeaderPod] No leader detected via role query, using ${name}-master-0`)
+  return name + '-master-0'
+}
+
 async function handleApiRequest(req, res) {
   try {
     const url = new URL(req.url, 'http://localhost')
@@ -518,7 +549,6 @@ async function handleApiRequest(req, res) {
     return Math.floor(val * (multipliers[unit] || 1))
   }
 
-  // POST /api/clusters/:namespace/:name/test — create a test Job
   const testCreateMatch = url.pathname.match(/^\/api\/clusters\/([^/]+)\/([^/]+)\/test$/)
   if (testCreateMatch && req.method === 'POST') {
     let body = ''
@@ -563,7 +593,9 @@ async function handleApiRequest(req, res) {
       }
 
       const masterAddr = name + '-master-headless.' + namespace + ':' + rpcPort
-      const metadataServer = 'http://' + name + '-master-headless.' + namespace + ':' + metadataPort + '/metadata'
+      // Use leader master's pod DNS for metadata server to avoid per-master metadata partition
+      const leaderPod = await findLeaderPod(namespace, name)
+      const metadataServer = 'http://' + leaderPod + '.' + name + '-master-headless.' + namespace + '.svc:' + metadataPort + '/metadata'
 
       const timestamp = Date.now()
       const jobName = name + '-test-' + timestamp
@@ -650,7 +682,7 @@ PYEOF`
                 env: [
                   { name: 'MC_MASTER_ADDR', value: masterAddr },
                   { name: 'MC_METADATA_SERVER', value: metadataServer },
-                  { name: 'MC_SEGMENT_SIZE', value: '1073741824' },
+                  { name: 'MC_SEGMENT_SIZE', value: String(segmentBytes) },
                   { name: 'MC_LOCAL_BUFFER_SIZE', value: String(512 * 1024 * 1024) },
                   { name: 'MC_PROTOCOL', value: 'tcp' },
                   { name: 'POD_IP', valueFrom: { fieldRef: { fieldPath: 'status.podIP' } } },

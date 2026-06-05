@@ -364,6 +364,62 @@ spec:
           status:
             description: MooncakeClusterStatus defines the observed state of MooncakeCluster.
             properties:
+              autoDrainJobs:
+                description: AutoDrainJobs tracks drain jobs for worker pods that are being terminated.
+                items:
+                  description: AutoDrainJobStatus tracks the status of an automatic drain job.
+                  properties:
+                    podName:
+                      description: PodName is the name of the terminating worker pod.
+                      type: string
+                    podIP:
+                      description: PodIP is the IP address of the terminating worker.
+                      type: string
+                    segmentName:
+                      description: SegmentName is the segment name being drained.
+                      type: string
+                    jobId:
+                      description: JobID is the drain job ID on the master.
+                      type: string
+                    status:
+                      description: Status is the human-readable drain status.
+                      type: string
+                    migratedBytes:
+                      description: MigratedBytes is the number of bytes migrated.
+                      format: int64
+                      type: integer
+                    speedMbps:
+                      description: SpeedMbps is the current migration speed in Mbps.
+                      format: double
+                      type: number
+                    succeededUnits:
+                      description: SucceededUnits is the number of successfully migrated objects.
+                      format: int64
+                      type: integer
+                    failedUnits:
+                      description: FailedUnits is the number of failed object migrations.
+                      format: int64
+                      type: integer
+                    error:
+                      description: Error contains an error message if the drain job failed.
+                      type: string
+                    createdAt:
+                      description: CreatedAt is the timestamp when the drain job was created.
+                      format: date-time
+                      type: string
+                  required:
+                  - podName
+                  - podIP
+                  - segmentName
+                  - jobId
+                  - status
+                  - migratedBytes
+                  - speedMbps
+                  - succeededUnits
+                  - failedUnits
+                  - createdAt
+                  type: object
+                type: array
               conditions:
                 description: Conditions represent the latest available observations
                   of the cluster's state.

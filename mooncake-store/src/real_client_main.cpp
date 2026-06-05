@@ -17,6 +17,8 @@ DEFINE_string(master_server_address, "127.0.0.1:50051",
 DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
+DEFINE_string(local_buffer_size, "0", "Local buffer size for remote transfer (e.g. 512MB, 1GB). "
+              "0 means use built-in default (16MB).");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(start_offload_rpc_server, true,
@@ -102,6 +104,11 @@ int main(int argc, char *argv[]) {
     }
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
+    size_t local_buffer_size = string_to_byte_size(FLAGS_local_buffer_size);
+    if (local_buffer_size == 0) {
+        // Default to 16MB when not explicitly set
+        local_buffer_size = 16 * 1024 * 1024;
+    }
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
     globalConfig().ascend_agent_mode = true;
@@ -109,7 +116,7 @@ int main(int argc, char *argv[]) {
 
     auto client_inst = RealClient::create();
     auto res = client_inst->setup_internal(
-        FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
+        FLAGS_host, FLAGS_metadata_server, global_segment_size, local_buffer_size,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
         FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server);

@@ -360,6 +360,32 @@ type MigrationConfig struct {
 	MaxRemigrationHops int32 `json:"maxRemigrationHops,omitempty"`
 }
 
+// AutoDrainJobStatus tracks the status of an automatic drain job for a terminating worker.
+type AutoDrainJobStatus struct {
+	// PodName is the name of the terminating worker pod.
+	PodName string `json:"podName"`
+	// PodIP is the IP address of the terminating worker.
+	PodIP string `json:"podIP"`
+	// SegmentName is the segment name being drained.
+	SegmentName string `json:"segmentName"`
+	// JobID is the drain job ID on the master.
+	JobID string `json:"jobId"`
+	// Status is the human-readable drain status (CREATED, RUNNING, SUCCEEDED, FAILED, etc.).
+	Status string `json:"status"`
+	// MigratedBytes is the number of bytes migrated so far.
+	MigratedBytes uint64 `json:"migratedBytes"`
+	// SpeedMbps is the current migration speed in Mbps.
+	SpeedMbps float64 `json:"speedMbps"`
+	// SucceededUnits is the number of successfully migrated objects.
+	SucceededUnits uint64 `json:"succeededUnits"`
+	// FailedUnits is the number of failed object migrations.
+	FailedUnits uint64 `json:"failedUnits"`
+	// Error contains an error message if the drain job failed.
+	Error string `json:"error,omitempty"`
+	// CreatedAt is the timestamp when the drain job was created.
+	CreatedAt metav1.Time `json:"createdAt"`
+}
+
 // MooncakeClusterStatus defines the observed state of MooncakeCluster.
 type MooncakeClusterStatus struct {
 	// Phase is the current lifecycle phase of the cluster.
@@ -393,6 +419,10 @@ type MooncakeClusterStatus struct {
 
 	// ObservedGeneration is the most recent generation observed.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// AutoDrainJobs tracks drain jobs for worker pods that are being terminated.
+	// +optional
+	AutoDrainJobs []AutoDrainJobStatus `json:"autoDrainJobs,omitempty"`
 }
 
 // ClusterCondition describes the state of a MooncakeCluster at a certain point.

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,19 +27,39 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	mooncakev1alpha1 "github.com/kvcache-ai/Mooncake/mooncake-operator/api/v1alpha1"
 )
 
 const finalizerName = "mooncake.io/finalizer"
 
+// drainJobInfo tracks an auto-migration drain job for a terminating worker pod.
+type drainJobInfo struct {
+	PodName        string
+	PodIP          string
+	SegmentName    string
+	JobID          string
+	Status         int
+	MigratedBytes  uint64
+	SpeedMbps      float64
+	SucceededUnits uint64
+	FailedUnits    uint64
+	Error          string
+	CreatedAt      time.Time
+}
+
 // MooncakeClusterReconciler reconciles a MooncakeCluster object.
 type MooncakeClusterReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Scheme      *runtime.Scheme
+	Recorder    record.EventRecorder
+	drainJobsMu sync.Mutex
+	drainJobs   map[string]*drainJobInfo // key: pod.UID
 }
 
 // +kubebuilder:rbac:groups=mooncake.io,resources=mooncakeclusters,verbs=get;list;watch;create;update;patch;delete
@@ -58,6 +79,13 @@ type MooncakeClusterReconciler struct {
 
 func (r *MooncakeClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Initialize drain job tracker if needed
+	r.drainJobsMu.Lock()
+	if r.drainJobs == nil {
+		r.drainJobs = make(map[string]*drainJobInfo)
+	}
+	r.drainJobsMu.Unlock()
 
 	// 1. Fetch MooncakeCluster CR
 	var mc mooncakev1alpha1.MooncakeCluster
@@ -111,6 +139,11 @@ func (r *MooncakeClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	if err := r.reconcileWorkerDeployment(ctx, &mc); err != nil {
 		return r.setFailed(ctx, &mc, "WorkerDeploymentError", err)
+	}
+
+	// Handle terminating worker pods (direct pod deletion or scale-down drain)
+	if err := r.reconcileTerminatingWorkers(ctx, &mc); err != nil {
+		logger.Error(err, "reconcileTerminatingWorkers failed")
 	}
 
 	// 6. Reconcile vLLM components (proxy, prefill, decode)
@@ -485,6 +518,8 @@ func (r *MooncakeClusterReconciler) reconcileWorkerDeployment(ctx context.Contex
 
 	patchBase := client.MergeFrom(existing.DeepCopy())
 	existing.Spec.Replicas = desired.Spec.Replicas
+	existing.Spec.Template.Spec.TerminationGracePeriodSeconds = desired.Spec.Template.Spec.TerminationGracePeriodSeconds
+	existing.Spec.Template.Spec.Containers[0].Lifecycle = desired.Spec.Template.Spec.Containers[0].Lifecycle
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
 	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.Spec.Template.Spec.Containers[0].ImagePullPolicy
 	existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
@@ -495,6 +530,13 @@ func (r *MooncakeClusterReconciler) reconcileWorkerDeployment(ctx context.Contex
 
 func deploymentSpecsEqual(a, b *appsv1.DeploymentSpec) bool {
 	if *a.Replicas != *b.Replicas {
+		return false
+	}
+	if a.Template.Spec.TerminationGracePeriodSeconds == nil || b.Template.Spec.TerminationGracePeriodSeconds == nil {
+		if a.Template.Spec.TerminationGracePeriodSeconds != b.Template.Spec.TerminationGracePeriodSeconds {
+			return false
+		}
+	} else if *a.Template.Spec.TerminationGracePeriodSeconds != *b.Template.Spec.TerminationGracePeriodSeconds {
 		return false
 	}
 	ac := a.Template.Spec.Containers[0]
@@ -512,6 +554,9 @@ func deploymentSpecsEqual(a, b *appsv1.DeploymentSpec) bool {
 		return false
 	}
 	if !reflect.DeepEqual(ac.Resources, bc.Resources) {
+		return false
+	}
+	if !reflect.DeepEqual(ac.Lifecycle, bc.Lifecycle) {
 		return false
 	}
 	return true
@@ -569,10 +614,8 @@ func (r *MooncakeClusterReconciler) orchestrateWorkerScaleDown(
 
 	terminatingPods := pods.Items[:terminateCount]
 	logger.Info("terminating worker pods", "count", len(terminatingPods))
-
-	// Build master HTTP address using ClusterIP service (stable DNS)
-	masterAddr := fmt.Sprintf("http://%s-master.%s.svc:%d",
-		mc.Name, mc.Namespace, mc.Spec.Master.MetricsPort)
+	// Build master HTTP address pointing to the leader master pod
+	masterAddr := getMasterAddr(mc)
 
 	// Read migration config from CRD
 	maxConcurrency := int32(4)
@@ -681,7 +724,7 @@ func (r *MooncakeClusterReconciler) drainWorker(
 	}
 
 	var createResp struct {
-		ID     string `json:"id"`
+		JobID  string `json:"job_id"`
 		Status string `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
@@ -690,11 +733,12 @@ func (r *MooncakeClusterReconciler) drainWorker(
 		return "", fmt.Errorf("decoding drain response (body: %s): %w", string(respBody), err)
 	}
 
-	if createResp.ID == "" {
-		return "", fmt.Errorf("drain job response missing id")
+	if createResp.JobID == "" {
+		return "", fmt.Errorf("drain job response missing job_id")
 	}
 
-	return createResp.ID, nil
+	return createResp.JobID, nil
+
 }
 
 // waitDrainJobs polls drain job statuses until all complete or timeout.
@@ -831,10 +875,22 @@ func (r *MooncakeClusterReconciler) reconcileStatus(ctx context.Context, mc *moo
 	}
 
 	readyMasters := int32(0)
+	var leaderNode string
 	for _, pod := range masterPods.Items {
 		if isPodReady(&pod) {
 			readyMasters++
+			if leaderNode == "" {
+				// Query each master's /role endpoint to find the leader
+				role, err := r.queryMasterRole(ctx, &pod, mc.Spec.Master.MetricsPort)
+				if err == nil && role == "leader" {
+					leaderNode = pod.Name
+				}
+			}
 		}
+	}
+	// If no leader detected, default to master-0
+	if leaderNode == "" && len(masterPods.Items) > 0 {
+		leaderNode = masterPods.Items[0].Name
 	}
 
 	// Count ready worker pods
@@ -900,20 +956,44 @@ func (r *MooncakeClusterReconciler) reconcileStatus(ctx context.Context, mc *moo
 		desiredPhase = mc.Status.Phase
 	}
 
+	// Collect current auto-drain job statuses from tracking map
+	r.drainJobsMu.Lock()
+	drainJobStatuses := make([]mooncakev1alpha1.AutoDrainJobStatus, 0, len(r.drainJobs))
+	for _, job := range r.drainJobs {
+		drainJobStatuses = append(drainJobStatuses, mooncakev1alpha1.AutoDrainJobStatus{
+			PodName:        job.PodName,
+			PodIP:          job.PodIP,
+			SegmentName:    job.SegmentName,
+			JobID:          job.JobID,
+			Status:         drainStatusString(job.Status),
+			MigratedBytes:  job.MigratedBytes,
+			SpeedMbps:      job.SpeedMbps,
+			SucceededUnits: job.SucceededUnits,
+			FailedUnits:    job.FailedUnits,
+			Error:          job.Error,
+			CreatedAt:      metav1.NewTime(job.CreatedAt),
+		})
+	}
+	r.drainJobsMu.Unlock()
+
 	// Skip patch if nothing changed — avoids unnecessary API writes
 	if mc.Status.Phase == desiredPhase &&
 		mc.Status.MasterReady == readyMasters &&
+		mc.Status.LeaderNode == leaderNode &&
 		mc.Status.WorkerReady == readyWorkers &&
 		(!vllmConfigured ||
 			(mc.Status.ProxyReady == readyProxies &&
 				mc.Status.PrefillReady == readyPrefills &&
 				mc.Status.DecodeReady == readyDecodes)) &&
-		mc.Status.ObservedGeneration == mc.Generation {
+		mc.Status.ObservedGeneration == mc.Generation &&
+		reflect.DeepEqual(mc.Status.AutoDrainJobs, drainJobStatuses) {
 		return nil
 	}
 
 	mc.Status.MasterReady = readyMasters
+	mc.Status.LeaderNode = leaderNode
 	mc.Status.WorkerReady = readyWorkers
+	mc.Status.AutoDrainJobs = drainJobStatuses
 	if vllmConfigured {
 		mc.Status.ProxyReady = readyProxies
 		mc.Status.PrefillReady = readyPrefills
@@ -1314,9 +1394,379 @@ func (r *MooncakeClusterReconciler) migrateDecodePod(
 	return nil
 }
 
+// reconcileTerminatingWorkers handles worker pods that are being deleted.
+// Drain jobs are created for all terminating pods simultaneously. The master
+// handles concurrent drain scheduling; the otherWorkersExist check prevents
+// circular draining (A→B and B→A) deadlocks.
+func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
+	ctx context.Context,
+	mc *mooncakev1alpha1.MooncakeCluster,
+) error {
+	logger := log.FromContext(ctx)
+
+	// List all worker pods with DeletionTimestamp set
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(mc.Namespace),
+		client.MatchingLabels{"app": "mooncake-worker", "cluster": mc.Name},
+	); err != nil {
+		return fmt.Errorf("listing worker pods: %w", err)
+	}
+
+	var terminatingPods []corev1.Pod
+	for _, pod := range pods.Items {
+		if pod.DeletionTimestamp != nil {
+			terminatingPods = append(terminatingPods, pod)
+		}
+	}
+
+	if len(terminatingPods) == 0 {
+		// Clean up stale drain jobs (from already-deleted pods)
+		r.cleanupStaleDrainJobs()
+		return nil
+	}
+
+	// Sort by creation timestamp (newest first, like scale-down logic)
+	sort.Slice(terminatingPods, func(i, j int) bool {
+		return terminatingPods[i].CreationTimestamp.After(terminatingPods[j].CreationTimestamp.Time)
+	})
+
+	masterAddr := getMasterAddr(mc)
+	transferPort := mc.Spec.Workers.TransferPort
+	if transferPort == 0 {
+		transferPort = 13006
+	}
+
+	// 1. Update status of all tracked drain jobs
+	r.drainJobsMu.Lock()
+	for uid, job := range r.drainJobs {
+		if job.JobID == "" {
+			continue
+		}
+		updated, err := r.queryDrainJob(ctx, masterAddr, job.JobID)
+		if err != nil {
+			logger.V(1).Info("failed to query drain job", "jobID", job.JobID, "error", err)
+			continue
+		}
+		if updated != nil {
+			job.Status = updated.Status
+			job.MigratedBytes = updated.MigratedBytes
+			job.SpeedMbps = updated.SpeedMbps
+			job.SucceededUnits = updated.SucceededUnits
+			job.FailedUnits = updated.FailedUnits
+			if job.Status >= 3 { // SUCCEEDED, FAILED, or CANCELED
+				if updated.Error != "" {
+					job.Error = updated.Error
+				}
+			}
+		}
+		// Clean up completed jobs (pod no longer exists)
+		podStillExists := false
+		for _, tp := range terminatingPods {
+			if string(tp.UID) == uid {
+				podStillExists = true
+				break
+			}
+		}
+		if !podStillExists && job.Status >= 3 {
+			delete(r.drainJobs, uid)
+		}
+	}
+
+	r.drainJobsMu.Unlock()
+
+	// 3. Process the next terminating pod that doesn't have a tracked job
+	for _, pod := range terminatingPods {
+		r.drainJobsMu.Lock()
+		_, tracked := r.drainJobs[string(pod.UID)]
+		r.drainJobsMu.Unlock()
+		if tracked {
+			continue
+		}
+
+		podIP := pod.Status.PodIP
+		if podIP == "" {
+			logger.Info("terminating pod has no IP, skipping drain", "pod", pod.Name)
+			continue
+		}
+
+		segmentName := fmt.Sprintf("%s:%d", podIP, transferPort)
+
+		// Check segment lifecycle status on master
+		lifecycle, err := r.querySegmentLifecycle(ctx, masterAddr, segmentName)
+		if err != nil {
+			logger.Info("failed to query segment lifecycle, will still attempt drain",
+				"pod", pod.Name, "segment", segmentName, "error", err)
+			// Don't skip — try to create drain job anyway
+		} else if lifecycle == "DRAINED" {
+			logger.Info("segment already drained, skipping drain",
+				"pod", pod.Name, "segment", segmentName)
+			continue
+		}
+
+		// Check if there are other ready workers to receive the data
+		otherWorkersExist := false
+		for _, tp := range pods.Items {
+			if tp.DeletionTimestamp != nil {
+				continue // Skip other terminating pods too
+			}
+			if isPodReady(&tp) && tp.Status.PodIP != "" && tp.Status.PodIP != podIP {
+				otherWorkersExist = true
+				break
+			}
+		}
+
+		if !otherWorkersExist {
+			logger.Info("no other ready workers available, discarding data for terminating pod",
+				"pod", pod.Name, "segment", segmentName)
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainSkipped",
+				fmt.Sprintf("No target workers for segment %s on terminating pod %s, data will be discarded", segmentName, pod.Name))
+			continue
+		}
+
+		// Create drain job
+		maxConcurrency := int32(4)
+		bandwidthMBPS := int32(0)
+		if mc.Spec.Workers.Migration != nil {
+			if mc.Spec.Workers.Migration.MaxConcurrency > 0 {
+				maxConcurrency = mc.Spec.Workers.Migration.MaxConcurrency
+			}
+			bandwidthMBPS = mc.Spec.Workers.Migration.BandwidthMBPS
+		}
+
+		jobID, err := r.drainWorker(ctx, masterAddr, podIP, transferPort, maxConcurrency, bandwidthMBPS)
+		if err != nil {
+			logger.Error(err, "failed to create drain job for terminating pod", "pod", pod.Name)
+			r.Recorder.Event(mc, corev1.EventTypeWarning, "AutoDrainFailed",
+				fmt.Sprintf("Failed to create drain job for terminating pod %s (segment %s): %v", pod.Name, segmentName, err))
+			continue
+		}
+
+		r.drainJobsMu.Lock()
+		r.drainJobs[string(pod.UID)] = &drainJobInfo{
+			PodName:     pod.Name,
+			PodIP:       podIP,
+			SegmentName: segmentName,
+			JobID:       jobID,
+			Status:      0, // CREATED
+			CreatedAt:   time.Now(),
+		}
+		r.drainJobsMu.Unlock()
+
+		logger.Info("auto-drain job created for terminating worker",
+			"pod", pod.Name, "segment", segmentName, "jobID", jobID)
+		r.Recorder.Event(mc, corev1.EventTypeNormal, "AutoDrainStarted",
+			fmt.Sprintf("Auto-drain job %s created for terminating pod %s (segment %s)", jobID, pod.Name, segmentName))
+
+	}
+
+	return nil
+}
+
+// cleanupStaleDrainJobs removes tracking entries for completed jobs whose pods no longer exist.
+func (r *MooncakeClusterReconciler) cleanupStaleDrainJobs() {
+	r.drainJobsMu.Lock()
+	defer r.drainJobsMu.Unlock()
+	for uid, job := range r.drainJobs {
+		if job.Status >= 3 { // completed
+			delete(r.drainJobs, uid)
+		}
+	}
+}
+
+// updateAutoDrainStatus writes the current auto-drain job statuses into the CR.
+func (r *MooncakeClusterReconciler) updateAutoDrainStatus(ctx context.Context, mc *mooncakev1alpha1.MooncakeCluster) {
+	r.drainJobsMu.Lock()
+	jobs := make([]mooncakev1alpha1.AutoDrainJobStatus, 0, len(r.drainJobs))
+	for _, job := range r.drainJobs {
+		statusStr := drainStatusString(job.Status)
+		adjs := mooncakev1alpha1.AutoDrainJobStatus{
+			PodName:        job.PodName,
+			PodIP:          job.PodIP,
+			SegmentName:    job.SegmentName,
+			JobID:          job.JobID,
+			Status:         statusStr,
+			MigratedBytes:  job.MigratedBytes,
+			SpeedMbps:      job.SpeedMbps,
+			SucceededUnits: job.SucceededUnits,
+			FailedUnits:    job.FailedUnits,
+			Error:          job.Error,
+			CreatedAt:      metav1.NewTime(job.CreatedAt),
+		}
+		jobs = append(jobs, adjs)
+	}
+	r.drainJobsMu.Unlock()
+
+	if len(jobs) == 0 {
+		return
+	}
+
+	patchBase := client.MergeFrom(mc.DeepCopy())
+	mc.Status.AutoDrainJobs = jobs
+	if err := r.Status().Patch(ctx, mc, patchBase); err != nil {
+		log.FromContext(ctx).V(1).Info("failed to patch auto-drain status", "error", err)
+	}
+}
+
+// querySegmentLifecycle queries the master for a segment's lifecycle status.
+// Returns the status_name string (e.g., "OK", "DRAINING", "DRAINED") or empty on error.
+func (r *MooncakeClusterReconciler) querySegmentLifecycle(ctx context.Context, masterAddr, segmentName string) (string, error) {
+	url := fmt.Sprintf("%s/api/v1/segments/status?segment=%s", masterAddr, segmentName)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", nil // Segment not found or unavailable
+	}
+
+	var result struct {
+		Success    bool   `json:"success"`
+		StatusName string `json:"status_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	return result.StatusName, nil
+}
+
+// queryDrainJob queries the master for a drain job's status.
+func (r *MooncakeClusterReconciler) queryDrainJob(ctx context.Context, masterAddr, jobID string) (*drainJobInfo, error) {
+	url := fmt.Sprintf("%s/api/v1/drain_jobs/query?job_id=%s", masterAddr, jobID)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("drain query returned HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Success        bool    `json:"success"`
+		Status         int     `json:"status"`
+		MigratedBytes  uint64  `json:"migrated_bytes"`
+		SpeedMbps      float64 `json:"speed_mbps"`
+		SucceededUnits uint64  `json:"succeeded_units"`
+		FailedUnits    uint64  `json:"failed_units"`
+		Message        string  `json:"message,omitempty"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &drainJobInfo{
+		JobID:          jobID,
+		Status:         result.Status,
+		MigratedBytes:  result.MigratedBytes,
+		SpeedMbps:      result.SpeedMbps,
+		SucceededUnits: result.SucceededUnits,
+		FailedUnits:    result.FailedUnits,
+		Error:          result.Message,
+	}, nil
+}
+
+// drainStatusString converts a numeric drain status to a human-readable string.
+func drainStatusString(status int) string {
+	switch status {
+	case 0:
+		return "CREATED"
+	case 1:
+		return "PLANNING"
+	case 2:
+		return "RUNNING"
+	case 3:
+		return "SUCCEEDED"
+	case 4:
+		return "FAILED"
+	case 5:
+		return "CANCELED"
+	default:
+		return fmt.Sprintf("UNKNOWN(%d)", status)
+	}
+}
+
+// getMasterAddr constructs the master HTTP API address from the cluster CR.
+func getMasterAddr(mc *mooncakev1alpha1.MooncakeCluster) string {
+	metricsPort := mc.Spec.Master.MetricsPort
+	if metricsPort == 0 {
+		metricsPort = 9003
+	}
+	// Use leader pod's headless DNS to avoid 503 from standby masters
+	leaderPod := mc.Status.LeaderNode
+	if leaderPod == "" {
+		leaderPod = mc.Name + "-master-0"
+	}
+	return fmt.Sprintf("http://%s.%s-master-headless.%s.svc:%d",
+		leaderPod, mc.Name, mc.Namespace, metricsPort)
+}
+
 func (r *MooncakeClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Map worker pod events to the parent MooncakeCluster
+	podMapper := func(ctx context.Context, obj client.Object) []reconcile.Request {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok {
+			return nil
+		}
+		clusterName, ok1 := pod.Labels["cluster"]
+		if !ok1 {
+			return nil
+		}
+		// Only handle worker pods
+		if pod.Labels["app"] != "mooncake-worker" {
+			return nil
+		}
+		return []reconcile.Request{
+			{
+				NamespacedName: types.NamespacedName{
+					Namespace: pod.Namespace,
+					Name:      clusterName,
+				},
+			},
+		}
+	}
+
+	// Only trigger on pod deletion (DeletionTimestamp set)
+	podPredicate := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return false },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, ok1 := e.ObjectOld.(*corev1.Pod)
+			newPod, ok2 := e.ObjectNew.(*corev1.Pod)
+			if !ok1 || !ok2 {
+				return false
+			}
+			// Only trigger when DeletionTimestamp is newly set
+			return newPod.DeletionTimestamp != nil && oldPod.DeletionTimestamp == nil
+		},
+		DeleteFunc:  func(e event.DeleteEvent) bool { return false },
+		GenericFunc: func(e event.GenericEvent) bool { return false },
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&mooncakev1alpha1.MooncakeCluster{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(podMapper),
+			builder.WithPredicates(podPredicate),
+		).
 		Complete(r)
 }
 
@@ -1327,6 +1777,36 @@ func isPodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// queryMasterRole queries a master pod's /role endpoint.
+func (r *MooncakeClusterReconciler) queryMasterRole(ctx context.Context, pod *corev1.Pod, metricsPort int32) (string, error) {
+	if metricsPort == 0 {
+		metricsPort = 9003
+	}
+	podIP := pod.Status.PodIP
+	if podIP == "" {
+		return "", fmt.Errorf("pod %s has no IP", pod.Name)
+	}
+
+	url := fmt.Sprintf("http://%s:%d/role", podIP, metricsPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
 }
 
 func setCondition(status *mooncakev1alpha1.MooncakeClusterStatus, condType, condStatus, reason, message string) {

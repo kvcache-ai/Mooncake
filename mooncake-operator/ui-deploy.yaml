@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mooncake-operator-ui
+  namespace: mooncake-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mooncake-operator-ui
+rules:
+- apiGroups: ["mooncake.io"]
+  resources: ["mooncakeclusters"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "pods/proxy", "services", "endpoints", "configmaps", "namespaces", "events"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets"]
+  verbs: ["get", "list", "watch", "patch"]
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mooncake-operator-ui
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mooncake-operator-ui
+subjects:
+- kind: ServiceAccount
+  name: mooncake-operator-ui
+  namespace: mooncake-operator-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mooncake-operator-ui
+  namespace: mooncake-operator-system
+  labels:
+    app: mooncake-operator-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mooncake-operator-ui
+  template:
+    metadata:
+      labels:
+        app: mooncake-operator-ui
+    spec:
+      serviceAccountName: mooncake-operator-ui
+      containers:
+      - name: ui
+        image: mooncake-operator-ui:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+        env:
+        - name: PORT
+          value: "3000"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mooncake-operator-ui
+  namespace: mooncake-operator-system
+spec:
+  type: NodePort
+  selector:
+    app: mooncake-operator-ui
+  ports:
+  - port: 3000
+    targetPort: 3000
+    nodePort: 30001

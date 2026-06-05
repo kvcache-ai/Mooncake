@@ -35,6 +35,7 @@ interface Cluster {
     masterReady?: number
     workerReady?: number
     leaderNode?: string
+    autoDrainJobs?: AutoDrainJob[]
     conditions?: Array<{ type: string; status: string; reason: string; message: string; lastTransitionTime: string }>
     observedGeneration?: number
   }
@@ -71,6 +72,44 @@ interface MasterStat {
 
 interface SegmentStat {
   [ip: string]: { used: number; capacity: number }
+}
+
+interface AutoDrainJob {
+  podName: string
+  podIP: string
+  segmentName: string
+  jobId: string
+  status: string
+  migratedBytes: number
+  speedMbps: number
+  succeededUnits: number
+  failedUnits: number
+  error?: string
+  createdAt: string
+}
+
+function DrainStatusBadge({ status }: { status: string }) {
+  const colors: Record<string, string> = {
+    CREATED: 'bg-blue-100 text-blue-800',
+    PLANNING: 'bg-yellow-100 text-yellow-800',
+    RUNNING: 'bg-yellow-100 text-yellow-800',
+    SUCCEEDED: 'bg-green-100 text-green-800',
+    FAILED: 'bg-red-100 text-red-800',
+    CANCELED: 'bg-gray-100 text-gray-600',
+  }
+  const color = colors[status] || 'bg-gray-100 text-gray-600'
+  return (
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${color}`}>
+      {status}
+    </span>
+  )
+}
+
+function formatSpeed(mbps: number): string {
+  if (mbps <= 0) return '-'
+  if (mbps < 1) return `${(mbps * 1000).toFixed(0)} Kbps`
+  if (mbps < 1000) return `${mbps.toFixed(1)} Mbps`
+  return `${(mbps / 1000).toFixed(2)} Gbps`
 }
 
 
@@ -313,6 +352,9 @@ export default function ClusterDetailPage({
   // Filter to only worker pods for the pods table
   const workerPods = pods.filter(p => p.metadata.name.includes('-worker-'))
 
+  // Auto-drain jobs from cluster status
+  const autoDrainJobs: AutoDrainJob[] = status.autoDrainJobs || []
+
   return (
     <div>
       {/* Header */}
@@ -518,6 +560,57 @@ export default function ClusterDetailPage({
           </table>
         </div>
       </div>
+
+      {autoDrainJobs.length > 0 && (
+        <div className="mt-6 bg-white shadow sm:rounded-lg">
+          <div className="px-4 py-5 sm:px-6">
+            <h3 className="text-lg leading-6 font-medium text-gray-900">Data Migration in Progress</h3>
+            <p className="mt-1 text-sm text-gray-500">Auto-migration of worker data during pod termination</p>
+          </div>
+          <div className="border-t border-gray-200">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Worker</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Segment</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Migrated</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Speed</th>
+                  <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Objects</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {autoDrainJobs.map(job => (
+                  <tr key={job.jobId} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{job.podName}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{job.segmentName}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <DrainStatusBadge status={job.status} />
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {formatBytes(job.migratedBytes)}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {job.status === 'RUNNING' || job.status === 'PLANNING' ? formatSpeed(job.speedMbps) : '-'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <span className="text-green-600">{job.succeededUnits}</span>
+                      {job.failedUnits > 0 && (
+                        <span className="text-red-600 ml-1">/ {job.failedUnits} failed</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {autoDrainJobs.some(j => ['CREATED', 'PLANNING', 'RUNNING'].includes(j.status)) && (
+              <div className="px-6 py-3 bg-gray-50 text-sm text-gray-500 border-t">
+                Migration in progress — worker pods will terminate when data migration completes
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Configuration */}
       <div className="mt-6 bg-white shadow sm:rounded-lg">

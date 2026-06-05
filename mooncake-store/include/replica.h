@@ -143,6 +143,11 @@ struct ReplicateConfig {
     }
 };
 
+YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, with_soft_pin,
+         with_hard_pin, preferred_segments, preferred_segment,
+         preferred_nof_segments, prefer_alloc_in_same_node, data_type,
+         group_ids);
+
 enum class ReplicaWriteMode {
     SINGLE_REPLICA,
     FLEXIBLE_DUAL_REPLICA,

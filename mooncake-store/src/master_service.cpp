@@ -7323,39 +7323,6 @@ void MasterService::ProcessDrainJobs() {
         RefreshDrainJobTasks(*job);
         if (MaybeCompleteDrainJob(*job)) {
             VLOG(6) << "ProcessDrainJobs: job=" << job->id << " completed, skipping schedule";
-            if (job->status == JobStatus::SUCCEEDED) {
-                // Evict affected clients from ok_client_ so they detect
-                // NEED_REMOUNT on their next heartbeat.  Drain sets the
-                // source segments to DRAINED, which prevents new
-                // allocations.  Bouncing the client forces a remount with
-                // a fresh segment UUID, restoring healthy state.
-                std::vector<UUID> clients_to_evict;
-                {
-                    ScopedSegmentAccess segment_access =
-                        segment_manager_.getSegmentAccess();
-                    for (const auto& seg_name : job->request.segments) {
-                        UUID client_id;
-                        if (segment_access.GetClientIdBySegmentName(
-                                seg_name, client_id) == ErrorCode::OK) {
-                            clients_to_evict.push_back(client_id);
-                        }
-                    }
-                }
-                {
-                    std::unique_lock<std::shared_mutex> lock(client_mutex_);
-                    for (const auto& cid : clients_to_evict) {
-                        auto it = ok_client_.find(cid);
-                        if (it != ok_client_.end()) {
-                            ok_client_.erase(it);
-                            MasterMetricManager::instance()
-                                .dec_active_clients();
-                            LOG(INFO)
-                                << "Drain cleanup: evicted client=" << cid
-                                << " from ok_client_, will trigger remount";
-                        }
-                    }
-                }
-            }
             continue;
         }
         VLOG(6) << "ProcessDrainJobs: job=" << job->id << " not complete, calling ScheduleDrainJobTasks";
