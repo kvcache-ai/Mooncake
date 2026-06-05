@@ -304,9 +304,11 @@ pool.close()
 
 Behavior and lifecycle rules:
 
-- Leases share the store local buffer with internal Store staging paths.
+- Leases prefer the store local buffer shared with internal Store staging paths.
+- If local-buffer allocation is temporarily exhausted, `BufferPool` can allocate and register a short-lived overflow buffer; the overflow buffer is unregistered when the lease is released.
 - `max_regions` can limit the number of concurrently active external leases.
-- `acquire(size, block=False)` raises when the pool is exhausted instead of waiting.
+- `max_bytes` bounds total active local-buffer and overflow leases; the default allows one local-buffer-sized overflow burst.
+- `acquire(size, block=False)` raises when both local and overflow capacity are exhausted instead of waiting.
 - `acquire(size, timeout=...)` can wait for another lease to be released.
 - Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
 - `release()` fails while exported views are alive. Delete those views first, then release.

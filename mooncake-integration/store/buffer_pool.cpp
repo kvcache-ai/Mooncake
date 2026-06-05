@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -149,6 +150,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
     struct Region {
         std::shared_ptr<BufferHandle> handle;
         size_t size = 0;
+        bool overflow_registered = false;
     };
 
     friend class BufferLeaseNative;
@@ -157,6 +159,8 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
                                                          size_t requested_size);
     std::optional<Region> try_acquire_locked(std::unique_lock<std::mutex> &lock,
                                              size_t requested_size);
+    std::shared_ptr<BufferHandle> allocate_overflow_unlocked(size_t size);
+    void unregister_overflow_unlocked(const Region &region);
     void release_internal(const std::shared_ptr<BufferHandle> &handle);
     void reserve_locked(size_t size_class);
     void unreserve_locked(size_t size_class);
@@ -290,11 +294,18 @@ BufferPoolNative::BufferPoolNative(const py::object &store, size_t max_bytes,
             "BufferPool requires a store configured with a local buffer");
     }
     local_buffer_capacity_ = py_client_->client_buffer_allocator_->size();
-    max_bytes_ = local_buffer_capacity_;
+    if (max_bytes == 0) {
+        if (local_buffer_capacity_ >
+            std::numeric_limits<size_t>::max() - local_buffer_capacity_) {
+            max_bytes_ = local_buffer_capacity_;
+        } else {
+            max_bytes_ = local_buffer_capacity_ * 2;
+        }
+    } else {
+        max_bytes_ = std::max(max_bytes, local_buffer_capacity_);
+    }
     max_size_class_ =
-        std::min(max_size_class.is_none() ? local_buffer_capacity_
-                                          : max_size_class.cast<size_t>(),
-                 local_buffer_capacity_);
+        max_size_class.is_none() ? max_bytes_ : max_size_class.cast<size_t>();
     if (!default_timeout.is_none()) {
         default_timeout_ = default_timeout.cast<double>();
     }
@@ -387,10 +398,20 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     reserve_locked(allocation_size);
     lock.unlock();
     std::shared_ptr<BufferHandle> handle;
-    if (auto alloc_result =
-            py_client_->client_buffer_allocator_->allocate(allocation_size);
-        alloc_result.has_value()) {
-        handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    bool overflow_registered = false;
+    try {
+        if (auto alloc_result =
+                py_client_->client_buffer_allocator_->allocate(allocation_size);
+            alloc_result.has_value()) {
+            handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+        } else {
+            handle = allocate_overflow_unlocked(allocation_size);
+            overflow_registered = handle != nullptr;
+        }
+    } catch (...) {
+        lock.lock();
+        unreserve_locked(allocation_size);
+        throw;
     }
     lock.lock();
     unreserve_locked(allocation_size);
@@ -398,13 +419,17 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
         return std::nullopt;
     }
     if (closing_ || closed_) {
+        Region region{handle, allocation_size, overflow_registered};
         lock.unlock();
+        if (overflow_registered) {
+            unregister_overflow_unlocked(region);
+        }
         handle.reset();
         lock.lock();
         throw std::runtime_error("buffer pool is closing");
     }
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
-    Region region{handle, allocation_size};
+    Region region{handle, allocation_size, overflow_registered};
     regions_.emplace(ptr, region);
     total_bytes_ += allocation_size;
     ++allocate_count_;
@@ -414,19 +439,55 @@ std::optional<BufferPoolNative::Region> BufferPoolNative::try_acquire_locked(
     return region;
 }
 
+std::shared_ptr<BufferHandle> BufferPoolNative::allocate_overflow_unlocked(
+    size_t size) {
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, alignment_, size) != 0) {
+        return nullptr;
+    }
+    auto data = std::shared_ptr<void>(ptr, std::free);
+    int ret = -1;
+    {
+        py::gil_scoped_acquire acquire_gil;
+        ret = py::cast<int>(store_obj_.attr("register_buffer")(
+            reinterpret_cast<uintptr_t>(ptr), size));
+    }
+    if (ret != 0) {
+        data.reset();
+        throw std::runtime_error("overflow buffer registration failed");
+    }
+    return std::make_shared<BufferHandle>(
+        ptr, size, [data = std::move(data)]() mutable { data.reset(); });
+}
+
+void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
+    py::gil_scoped_acquire acquire_gil;
+    int ret = py::cast<int>(store_obj_.attr("unregister_buffer")(
+        reinterpret_cast<uintptr_t>(region.handle->ptr())));
+    if (ret != 0) {
+        throw std::runtime_error("overflow buffer unregistration failed");
+    }
+}
+
 void BufferPoolNative::release_internal(
     const std::shared_ptr<BufferHandle> &handle) {
     if (!handle) throw std::runtime_error("buffer lease is closed");
     uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!in_use_.count(ptr)) {
-        throw std::runtime_error("buffer lease is not active");
+    Region region;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!in_use_.count(ptr)) {
+            throw std::runtime_error("buffer lease is not active");
+        }
+        region = regions_.at(ptr);
+        regions_.erase(ptr);
+        if (total_bytes_ >= region.size) total_bytes_ -= region.size;
+        in_use_.erase(ptr);
+        ++release_count_;
     }
-    const Region region = regions_.at(ptr);
-    regions_.erase(ptr);
-    if (total_bytes_ >= region.size) total_bytes_ -= region.size;
-    in_use_.erase(ptr);
-    ++release_count_;
+    if (region.overflow_registered) {
+        unregister_overflow_unlocked(region);
+    }
     condition_.notify_all();
 }
 
@@ -451,7 +512,13 @@ std::pair<size_t, bool> BufferPoolNative::allocation_size(size_t size) const {
 }
 
 bool BufferPoolNative::has_capacity_for_locked(size_t size_class) const {
-    if (size_class > local_buffer_capacity_) {
+    if (size_class > max_bytes_) {
+        return false;
+    }
+    if (total_bytes_ > max_bytes_ - reserved_bytes_) {
+        return false;
+    }
+    if (size_class > max_bytes_ - total_bytes_ - reserved_bytes_) {
         return false;
     }
     return !max_regions_.has_value() ||

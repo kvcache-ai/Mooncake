@@ -49,6 +49,19 @@ def test_registered_buffer_pool_uses_store_local_buffer_by_default() -> None:
     pool.close()
 
 
+def test_registered_buffer_pool_overflows_when_local_buffer_is_full() -> None:
+    store = create_store()
+    pool = BufferPool(store)
+
+    local_lease = pool.acquire(4 * 1024 * 1024)
+    overflow_lease = pool.acquire(1024, block=False)
+    assert overflow_lease.size == 1024
+
+    overflow_lease.release()
+    local_lease.release()
+    pool.close()
+
+
 def test_registered_buffer_pool_prewarm_and_close() -> None:
     store = create_store()
     pool = BufferPool(
