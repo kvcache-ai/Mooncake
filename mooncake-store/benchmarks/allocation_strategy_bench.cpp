@@ -23,14 +23,14 @@ DEFINE_int64(segment_capacity, 1024,
              "Per-segment capacity in MB (base capacity for skewed mode)");
 DEFINE_int32(num_allocations, 10000, "Number of allocations to benchmark");
 DEFINE_int32(convergence_sample_interval, 100,
-             "Sample utilization stddev every N allocations (scaleout only)");
-DEFINE_bool(
-    run_all, false,
-    "Also run the Scale-Out matrix in addition to the default Fillup matrix");
+             "Sample utilization stddev or fragmentation every N allocations");
+DEFINE_bool(run_all, false,
+            "Run all workload matrices instead of only the selected workload");
 
 // Scale-Out workload flags
 DEFINE_string(workload, "fillup",
-              "Workload type: fillup (default), scaleout, dsa");
+              "Workload type: fillup (default), scaleout, dsa, "
+              "size_class_churn");
 DEFINE_int32(
     scale_out_trigger_pct, 50,
     "Pre-fill cluster to this utilization % before injecting new nodes "
@@ -73,6 +73,11 @@ DEFINE_double(dsa_evict_ratio, 0.05,
               "(default 0.05 = 5%). Lower values keep "
               "the steady-state cluster fill closer to the fragmentation "
               "ceiling but trigger evictions more frequently.");
+DEFINE_string(size_class_pattern, "kv_mixed",
+              "Size-class churn pattern: kv_mixed, dsa_pair, or all");
+DEFINE_double(size_class_evict_ratio, 0.02,
+              "Fraction of live objects to evict on each Allocate failure "
+              "in size_class_churn mode.");
 
 using namespace mooncake;
 
@@ -99,11 +104,13 @@ constexpr int kDsaMaxBatch = 128;           // per-round batch upper bound
 constexpr int kDsaMaxRetries = 5;
 // Lower bound on the auto-derived allocation count per DSA case.
 constexpr int kDsaMinAllocs = 100;
+constexpr int kSizeClassMaxRetries = 5;
 
 enum class WorkloadType {
     FILL_UP,    // Only allocate, measure throughput/latency
     SCALE_OUT,  // Inject new nodes mid-run, measure adoption speed
     DSA,        // DSA paired KV+indexer with random fail-triggered eviction
+    SIZE_CLASS_CHURN  // Mixed size classes with steady-state churn
 };
 
 struct BenchConfig {
@@ -127,6 +134,10 @@ struct BenchConfig {
 
     // DSA workload knobs (only used when workload_type == DSA).
     bool dsa_paired = false;  // false = KV-only, true = KV+indexer pair
+
+    // Size-class churn knobs (only used when workload_type ==
+    // SIZE_CLASS_CHURN).
+    std::string size_class_pattern = "kv_mixed";
 };
 
 struct UtilRatioStats {
@@ -137,6 +148,41 @@ struct UtilRatioStats {
     double max = 0.0;
     double avg = 0.0;
     bool valid = false;
+};
+
+struct DistributionStats {
+    double min = 0.0;
+    double p50 = 0.0;
+    double p90 = 0.0;
+    double p99 = 0.0;
+    double max = 0.0;
+    double avg = 0.0;
+    bool valid = false;
+};
+
+struct FragmentationSnapshot {
+    uint64_t allocated_size = 0;
+    uint64_t allocated_num = 0;
+    uint64_t total_free_space = 0;
+    uint64_t largest_free_region = 0;
+    uint64_t capacity = 0;
+    double fragmentation_ratio = 0.0;
+    bool valid = false;
+};
+
+struct SizeClassSpec {
+    std::string name;
+    size_t size;
+    int weight;
+};
+
+struct SizeClassStat {
+    std::string name;
+    size_t size = 0;
+    int weight = 0;
+    int success_count = 0;
+    int total_count = 0;
+    DistributionStats latency_stats;
 };
 
 /**
@@ -197,6 +243,14 @@ struct ScaleOutResult : BenchResultBase {
     int trigger_alloc_idx = -1;
     int re_converge_allocs = -1;
     std::vector<double> new_node_util_over_time;
+};
+
+struct SizeClassChurnResult : BenchResultBase {
+    std::string pattern_name;
+    DistributionStats fragmentation_stats;
+    DistributionStats largest_free_mb_stats;
+    FragmentationSnapshot final_fragmentation;
+    std::vector<SizeClassStat> size_class_stats;
 };
 
 static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
@@ -389,6 +443,114 @@ static UtilRatioStats computeUtilRatioStats(std::vector<double>& util_ratios) {
                 util_ratios.size();
     stats.valid = true;
     return stats;
+}
+
+static DistributionStats computeDistributionStats(std::vector<double>& values) {
+    DistributionStats stats;
+    if (values.empty()) return stats;
+
+    std::sort(values.begin(), values.end());
+
+    auto percentile = [&](double p) -> double {
+        size_t idx = static_cast<size_t>(std::round(p * (values.size() - 1)));
+        return values[idx];
+    };
+
+    stats.min = values.front();
+    stats.p50 = percentile(0.50);
+    stats.p90 = percentile(0.90);
+    stats.p99 = percentile(0.99);
+    stats.max = values.back();
+    stats.avg =
+        std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    stats.valid = true;
+    return stats;
+}
+
+static FragmentationSnapshot computeFragmentationSnapshot(
+    const AllocatorManager& manager) {
+    FragmentationSnapshot snapshot;
+    double weighted_fragmentation = 0.0;
+
+    for (const auto& name : manager.getNames()) {
+        const auto* allocs = manager.getAllocators(name);
+        if (!allocs) continue;
+
+        for (const auto& alloc : *allocs) {
+            auto offset_alloc =
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(alloc);
+            if (!offset_alloc) continue;
+
+            auto allocator = offset_alloc->getOffsetAllocator();
+            if (!allocator) continue;
+
+            auto metrics = allocator->get_metrics();
+            snapshot.allocated_size += metrics.allocated_size_;
+            snapshot.allocated_num += metrics.allocated_num_;
+            snapshot.total_free_space += metrics.total_free_space_;
+            snapshot.capacity += metrics.capacity;
+            snapshot.largest_free_region = std::max(
+                snapshot.largest_free_region, metrics.largest_free_region_);
+            if (metrics.total_free_space_ > 0) {
+                double local_fragmentation =
+                    1.0 - (static_cast<double>(metrics.largest_free_region_) /
+                           static_cast<double>(metrics.total_free_space_));
+                local_fragmentation = std::clamp(local_fragmentation, 0.0, 1.0);
+                weighted_fragmentation +=
+                    local_fragmentation * metrics.total_free_space_;
+            }
+            snapshot.valid = true;
+        }
+    }
+
+    if (snapshot.valid && snapshot.total_free_space > 0) {
+        snapshot.fragmentation_ratio =
+            weighted_fragmentation /
+            static_cast<double>(snapshot.total_free_space);
+    }
+
+    return snapshot;
+}
+
+static std::vector<SizeClassSpec> getSizeClassSpecs(
+    const std::string& pattern_name) {
+    if (pattern_name == "kv_mixed") {
+        return {
+            {"small", 4 * KiB, 70},
+            {"medium", 256 * KiB, 20},
+            {"large", kDsaKvSize, 10},
+        };
+    }
+
+    if (pattern_name == "dsa_pair") {
+        return {
+            {"kv", kDsaKvSize, 50},
+            {"indexer", kDsaIndexerSize, 50},
+        };
+    }
+
+    return {};
+}
+
+static size_t chooseSizeClassIndex(const std::vector<SizeClassSpec>& specs,
+                                   std::mt19937& rng) {
+    if (specs.empty()) return 0;
+
+    int total_weight = 0;
+    for (const auto& spec : specs) {
+        total_weight += spec.weight;
+    }
+
+    if (total_weight <= 0) return 0;
+
+    std::uniform_int_distribution<int> dist(1, total_weight);
+    int pick = dist(rng);
+    for (size_t i = 0; i < specs.size(); ++i) {
+        pick -= specs[i].weight;
+        if (pick <= 0) return i;
+    }
+
+    return specs.size() - 1;
 }
 
 static std::string strategyName(AllocationStrategyType type) {
@@ -798,6 +960,61 @@ static bool dsaAllocateWithEvict(
     return false;
 }
 
+static bool sizeClassAllocateWithEvict(
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    AllocatorManager& manager, size_t size, int replica_num,
+    std::vector<std::vector<Replica>>& live, std::mt19937& rng,
+    int& evict_count, double evict_ratio) {
+    for (int attempt = 0; attempt <= kSizeClassMaxRetries; ++attempt) {
+        auto result = strategy->Allocate(manager, size, replica_num);
+        if (result.has_value()) {
+            live.push_back(std::move(result.value()));
+            return true;
+        }
+
+        if (live.empty()) return false;
+        if (attempt == kSizeClassMaxRetries) return false;
+
+        evictRandomFraction(live, evict_ratio, rng);
+        ++evict_count;
+    }
+
+    return false;
+}
+
+static void prefillSizeClassChurn(
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    AllocatorManager& manager, const BenchConfig& cfg,
+    const std::vector<SizeClassSpec>& specs,
+    std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
+    if (cfg.prefill_pct <= 0 || specs.empty()) return;
+
+    int prefill_count = 0;
+    int consec_failures = 0;
+    int evict_throwaway = 0;
+    const int kMaxConsecFailures = 10;
+
+    while (true) {
+        if (prefill_count % kPreFillSampleInterval == 0) {
+            if (computeAverageUtilAll(manager) * 100.0 >= cfg.prefill_pct) {
+                break;
+            }
+        }
+
+        size_t class_idx = chooseSizeClassIndex(specs, rng);
+        bool ok = sizeClassAllocateWithEvict(
+            strategy, manager, specs[class_idx].size, cfg.replica_num,
+            live_allocations, rng, evict_throwaway,
+            FLAGS_size_class_evict_ratio);
+        if (ok) {
+            consec_failures = 0;
+        } else if (++consec_failures >= kMaxConsecFailures) {
+            break;
+        }
+        ++prefill_count;
+    }
+}
+
 // Run DSA workload; the allocation count is derived from cluster capacity.
 static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
@@ -918,6 +1135,115 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     res.evict_count = evict_count;
     res.dsa_paired = cfg.dsa_paired;
     res.util_ratio_stats = computeUtilRatioStats(util_ratios);
+    computeLatencyStats(latencies, total_us, total_count, res);
+    return res;
+}
+
+static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    auto specs = getSizeClassSpecs(cfg.size_class_pattern);
+
+    std::vector<SizeClassStat> per_class_stats;
+    per_class_stats.reserve(specs.size());
+    std::vector<std::vector<double>> per_class_latencies(specs.size());
+    for (const auto& spec : specs) {
+        SizeClassStat stat;
+        stat.name = spec.name;
+        stat.size = spec.size;
+        stat.weight = spec.weight;
+        per_class_stats.push_back(std::move(stat));
+    }
+
+    std::vector<double> latencies;
+    latencies.reserve(cfg.num_allocations);
+    int sample_interval = std::max(1, FLAGS_convergence_sample_interval);
+    std::vector<double> fragmentation_samples;
+    fragmentation_samples.reserve(cfg.num_allocations / sample_interval + 2);
+    std::vector<double> largest_free_mb_samples;
+    largest_free_mb_samples.reserve(fragmentation_samples.capacity());
+
+    std::vector<std::vector<Replica>> live_allocations;
+    live_allocations.reserve(std::min(cfg.num_allocations, 1 << 20));
+
+    std::mt19937 rng(42);
+    prefillSizeClassChurn(strategy, manager, cfg, specs, live_allocations, rng);
+
+    int success_count = 0;
+    int total_count = 0;
+    int evict_count = 0;
+    double instrumentation_time_us = 0.0;
+
+    auto total_start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < cfg.num_allocations; ++i) {
+        size_t class_idx = chooseSizeClassIndex(specs, rng);
+        const auto& spec = specs[class_idx];
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        bool ok = sizeClassAllocateWithEvict(
+            strategy, manager, spec.size, cfg.replica_num, live_allocations,
+            rng, evict_count, FLAGS_size_class_evict_ratio);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        double latency_ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count();
+        latencies.push_back(latency_ns);
+        per_class_latencies[class_idx].push_back(latency_ns);
+
+        ++total_count;
+        ++per_class_stats[class_idx].total_count;
+        if (ok) {
+            ++success_count;
+            ++per_class_stats[class_idx].success_count;
+        }
+
+        if ((i + 1) % sample_interval == 0 || i == cfg.num_allocations - 1) {
+            auto s0 = std::chrono::high_resolution_clock::now();
+            auto snapshot = computeFragmentationSnapshot(manager);
+            if (snapshot.valid) {
+                fragmentation_samples.push_back(snapshot.fragmentation_ratio);
+                largest_free_mb_samples.push_back(
+                    static_cast<double>(snapshot.largest_free_region) / MiB);
+            }
+            auto s1 = std::chrono::high_resolution_clock::now();
+            instrumentation_time_us +=
+                std::chrono::duration<double, std::micro>(s1 - s0).count();
+        }
+    }
+
+    auto total_end = std::chrono::high_resolution_clock::now();
+    double total_us =
+        std::chrono::duration<double, std::micro>(total_end - total_start)
+            .count();
+    total_us -= instrumentation_time_us;
+    total_us = std::max(total_us, 1.0);
+
+    for (size_t i = 0; i < per_class_stats.size(); ++i) {
+        per_class_stats[i].latency_stats =
+            computeDistributionStats(per_class_latencies[i]);
+    }
+
+    SizeClassChurnResult res;
+    res.strategy_name = cfg.strategy_name;
+    res.num_segments = cfg.num_segments;
+    res.alloc_size = 0;
+    res.replica_num = cfg.replica_num;
+    res.skewed = cfg.skewed;
+    res.cluster_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
+    res.success_count = success_count;
+    res.total_count = total_count;
+    res.evict_count = evict_count;
+    res.pattern_name = cfg.size_class_pattern;
+    res.fragmentation_stats = computeDistributionStats(fragmentation_samples);
+    res.largest_free_mb_stats =
+        computeDistributionStats(largest_free_mb_samples);
+    res.final_fragmentation = computeFragmentationSnapshot(manager);
+    res.size_class_stats = std::move(per_class_stats);
     computeLatencyStats(latencies, total_us, total_count, res);
     return res;
 }
@@ -1048,6 +1374,74 @@ static void printScaleOutResult(const ScaleOutResult& r) {
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
               << std::setw(14) << converge_str << std::setw(15) << alloc_ratio
               << std::endl;
+}
+
+static void printSizeClassChurnHeader() {
+    std::cout << std::string(260, '-') << std::endl;
+    std::cout << std::left << std::setw(18) << "Strategy" << std::setw(9)
+              << "Replica" << std::setw(10) << "Segments" << std::setw(14)
+              << "Pattern" << std::setw(12) << "Cluster(GB)" << std::setw(8)
+              << "Skewed" << std::right << std::setw(14) << "Throughput"
+              << std::setw(12) << "Avg(ns)" << std::setw(12) << "P50(ns)"
+              << std::setw(12) << "P90(ns)" << std::setw(12) << "P99(ns)"
+              << std::setw(12) << "Frag_avg" << std::setw(12) << "Frag_p50"
+              << std::setw(12) << "Frag_p90" << std::setw(12) << "Frag_p99"
+              << std::setw(15) << "LargestFreeMB" << std::setw(10) << "AvgUtil%"
+              << std::setw(15) << "Succ/Total" << std::setw(14) << "Evictions"
+              << std::endl;
+    std::cout << std::string(260, '-') << std::endl;
+}
+
+static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
+    std::string alloc_ratio =
+        std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
+    std::ostringstream cap_ss;
+    cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
+
+    double final_largest_free_mb =
+        static_cast<double>(r.final_fragmentation.largest_free_region) / MiB;
+
+    std::cout << std::left << std::setw(18) << r.strategy_name << std::setw(9)
+              << r.replica_num << std::setw(10) << r.num_segments
+              << std::setw(14) << r.pattern_name << std::setw(12)
+              << cap_ss.str() << std::setw(8) << (r.skewed ? "yes" : "no")
+              << std::right << std::fixed << std::setprecision(0)
+              << std::setw(14) << r.throughput << std::setw(12) << r.avg_ns
+              << std::setw(12) << r.p50_ns << std::setw(12) << r.p90_ns
+              << std::setw(12) << r.p99_ns << std::setprecision(4)
+              << std::setw(12) << r.fragmentation_stats.avg << std::setw(12)
+              << r.fragmentation_stats.p50 << std::setw(12)
+              << r.fragmentation_stats.p90 << std::setw(12)
+              << r.fragmentation_stats.p99 << std::setprecision(1)
+              << std::setw(15) << final_largest_free_mb << std::setprecision(2)
+              << std::setw(9) << (r.final_avg_util * 100.0) << "%"
+              << std::setw(15) << alloc_ratio << std::setw(14) << r.evict_count
+              << std::endl;
+
+    std::cout << "Fragmentation summary [" << r.strategy_name
+              << ", pattern=" << r.pattern_name
+              << ", segments=" << r.num_segments
+              << ", replica=" << r.replica_num
+              << ", skewed=" << (r.skewed ? "yes" : "no")
+              << "]: avg=" << std::fixed << std::setprecision(4)
+              << r.fragmentation_stats.avg
+              << ", p50=" << r.fragmentation_stats.p50
+              << ", p90=" << r.fragmentation_stats.p90
+              << ", p99=" << r.fragmentation_stats.p99
+              << ", max=" << r.fragmentation_stats.max
+              << ", final_largest_free=" << std::setprecision(1)
+              << final_largest_free_mb << " MB" << std::endl;
+
+    std::cout << "Size-class breakdown:";
+    for (const auto& stat : r.size_class_stats) {
+        std::string ratio = std::to_string(stat.success_count) + "/" +
+                            std::to_string(stat.total_count);
+        std::cout << " " << stat.name << "(" << (stat.size / KiB)
+                  << "KB,w=" << stat.weight << ",succ=" << ratio
+                  << ",p99_ns=" << std::fixed << std::setprecision(0)
+                  << stat.latency_stats.p99 << ")";
+    }
+    std::cout << std::endl;
 }
 
 static void runFillupBenchmarks() {
@@ -1278,6 +1672,107 @@ static void runDsaMatrix() {
     }
 }
 
+static void runSizeClassChurnMatrix() {
+    std::vector<bool> skewed_options = {false, true};
+    std::vector<int> segment_counts = {1, 10, 100};
+    std::vector<int> replica_nums = {1, 2, 3};
+    std::vector<AllocationStrategyType> strategies = {
+        AllocationStrategyType::RANDOM,
+        AllocationStrategyType::FREE_RATIO_FIRST,
+    };
+
+    std::vector<std::string> patterns;
+    if (FLAGS_size_class_pattern == "all") {
+        patterns = {"kv_mixed", "dsa_pair"};
+    } else {
+        patterns = {FLAGS_size_class_pattern};
+    }
+
+    if (FLAGS_size_class_evict_ratio <= 0.0 ||
+        FLAGS_size_class_evict_ratio > 1.0) {
+        std::cout << "Invalid size_class_evict_ratio: "
+                  << FLAGS_size_class_evict_ratio
+                  << ". Use a value in the range (0.0, 1.0]." << std::endl;
+        return;
+    }
+
+    for (const auto& pattern : patterns) {
+        if (getSizeClassSpecs(pattern).empty()) {
+            std::cout << "Invalid size_class_pattern: " << pattern
+                      << ". Use --size_class_pattern=kv_mixed, dsa_pair, or "
+                         "all."
+                      << std::endl;
+            return;
+        }
+    }
+
+    std::cout << "\n=== Size-Class Churn Fragmentation Benchmark Matrix ===\n"
+              << "Workload: prefill to --prefill_pct if set, then run "
+              << FLAGS_num_allocations
+              << " mixed-size allocation attempts with fail-triggered random "
+                 "eviction and retry.\n"
+              << "Fragmentation: 1 - largest_free_region / total_free_space, "
+                 "sampled every --convergence_sample_interval allocations.\n"
+              << "Config: segment_capacity=" << FLAGS_segment_capacity
+              << " MB, prefill_pct=" << FLAGS_prefill_pct
+              << ", evict_ratio=" << FLAGS_size_class_evict_ratio
+              << ", size_class_pattern=" << FLAGS_size_class_pattern << "\n"
+              << "Patterns: kv_mixed = 4KB:70%, 256KB:20%, 3198KB:10%; "
+                 "dsa_pair = 3198KB:50%, 643KB:50%.\n"
+              << "Skewed setup: half nodes are (base + 50%) capacity, half are "
+                 "(base - 50%)\n"
+              << std::endl;
+
+    std::vector<BenchConfig> configs;
+    for (const auto& pattern : patterns) {
+        for (auto skew : skewed_options) {
+            for (auto strategy : strategies) {
+                for (auto segs : segment_counts) {
+                    for (auto rep : replica_nums) {
+                        if (rep > segs) continue;
+                        BenchConfig cfg;
+                        cfg.num_segments = segs;
+                        cfg.segment_capacity =
+                            static_cast<size_t>(FLAGS_segment_capacity) * MiB;
+                        cfg.alloc_size = 0;
+                        cfg.replica_num = rep;
+                        cfg.num_allocations = FLAGS_num_allocations;
+                        cfg.skewed = skew;
+                        cfg.strategy_type = strategy;
+                        cfg.strategy_name = strategyName(strategy);
+                        cfg.prefill_pct = FLAGS_prefill_pct;
+                        cfg.workload_type = WorkloadType::SIZE_CLASS_CHURN;
+                        cfg.size_class_pattern = pattern;
+                        configs.push_back(cfg);
+                    }
+                }
+            }
+        }
+    }
+
+    bool first = true;
+    std::string prev_pattern;
+    AllocationStrategyType prev_strategy = AllocationStrategyType::RANDOM;
+
+    for (const auto& cfg : configs) {
+        if (first || cfg.size_class_pattern != prev_pattern) {
+            std::cout << "\n--- Pattern: " << cfg.size_class_pattern << " ---"
+                      << std::endl;
+            prev_pattern = cfg.size_class_pattern;
+            first = true;
+        }
+
+        if (first || cfg.strategy_type != prev_strategy) {
+            printSizeClassChurnHeader();
+            prev_strategy = cfg.strategy_type;
+            first = false;
+        }
+
+        auto result = runSizeClassChurnBenchmark(cfg);
+        printSizeClassChurnResult(result);
+    }
+}
+
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
         "AllocationStrategy performance benchmark.\n"
@@ -1289,16 +1784,19 @@ int main(int argc, char* argv[]) {
         runFillupBenchmarks();
         runScaleOutMatrix();
         runDsaMatrix();
+        runSizeClassChurnMatrix();
     } else if (FLAGS_workload == "fillup") {
         runFillupBenchmarks();
     } else if (FLAGS_workload == "scaleout") {
         runScaleOutMatrix();
     } else if (FLAGS_workload == "dsa") {
         runDsaMatrix();
+    } else if (FLAGS_workload == "size_class_churn") {
+        runSizeClassChurnMatrix();
     } else {
         std::cout << "Invalid workload type: " << FLAGS_workload
-                  << ". Use --workload=fillup, --workload=scaleout, or "
-                     "--workload=dsa."
+                  << ". Use --workload=fillup, --workload=scaleout, "
+                     "--workload=dsa, or --workload=size_class_churn."
                   << std::endl;
     }
 
