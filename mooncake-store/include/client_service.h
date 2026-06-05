@@ -399,7 +399,7 @@ class ClientService {
      *        May be nullptr if local_buffer_size was 0.
      */
     std::shared_ptr<ClientBufferAllocator> GetBufferAllocator() const {
-        return buffer_allocator_;
+        return local_buffer_allocator_;
     }
 
     /**
@@ -557,14 +557,14 @@ class ClientService {
     void StopHttpServer();
 
     /**
-     * @brief Creates and TE-registers a shared buffer pool. Called during
-     *        Init after TransferEngine is ready.
-     * @param pool_size Size in bytes (0 = skip, buffer_allocator_ stays null).
+     * @brief Creates and TE-registers a shared buffer pool.
+     * @param pool_size Size in bytes (0 = skip, local_buffer_allocator_ stays
+     * null).
      * @param protocol Transport protocol for memory allocation.
      * @param use_hugepage Whether to allocate with huge pages.
      */
-    void InitBufferAllocator(size_t pool_size, const std::string& protocol,
-                             bool use_hugepage = false);
+    void InitLocalBufferAllocator(size_t pool_size, const std::string& protocol,
+                                  bool use_hugepage = false);
 
     /**
      * @brief Registers the client into the master server.
@@ -665,14 +665,10 @@ class ClientService {
     SharedMutex running_rw_mtx_;
     bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
 
-    // HTTP server (serves both metrics endpoints and any extra endpoints
-    // registered by subclasses via RegisterHttpMethods).
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     uint16_t http_port_ = 0;  // 0 means disabled
 
-    // Shared TE-registered buffer pool for Get/Put operations (HTTP handlers,
-    // RealClient put/get_buffer, etc.). Created by InitBufferAllocator().
-    std::shared_ptr<ClientBufferAllocator> buffer_allocator_;
+    std::shared_ptr<ClientBufferAllocator> local_buffer_allocator_;
 };
 
 }  // namespace mooncake

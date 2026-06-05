@@ -193,10 +193,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     }
     client_service_ = *client_opt;
 
-    // Buffer allocator is now managed by ClientService (InitBufferAllocator
-    // called during ClientService::Init). RealClient uses
-    // client_service_->GetBufferAllocator() to access the shared pool.
-
     // Start IPC server to accept FD from dummy clients
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
@@ -252,7 +248,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
     // Gracefully stop accepting new requests and drain in-flight operations
-    // ClientService::Stop() handles buffer_allocator_ unregister + reset.
     client_service_->Stop();
     client_service_->Destroy();
 

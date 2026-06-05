@@ -109,9 +109,9 @@ ClientService::~ClientService() {
 
 void ClientService::Stop() {
     StopHttpServer();
-    if (buffer_allocator_) {
-        unregisterLocalMemory(buffer_allocator_->getBase(), false);
-        buffer_allocator_.reset();
+    if (local_buffer_allocator_) {
+        unregisterLocalMemory(local_buffer_allocator_->getBase(), false);
+        local_buffer_allocator_.reset();
     }
     StopHeartbeat();
 }
@@ -792,23 +792,23 @@ void ClientService::StopHttpServer() {
     }
 }
 
-void ClientService::InitBufferAllocator(size_t pool_size,
-                                        const std::string& protocol,
-                                        bool use_hugepage) {
+void ClientService::InitLocalBufferAllocator(size_t pool_size,
+                                             const std::string& protocol,
+                                             bool use_hugepage) {
     if (pool_size == 0) {
         LOG(INFO) << "Buffer allocator pool size is 0, skip initialization";
         return;
     }
-    buffer_allocator_ =
+    local_buffer_allocator_ =
         ClientBufferAllocator::create(pool_size, protocol, use_hugepage);
-    if (buffer_allocator_) {
-        auto result =
-            RegisterLocalMemory(buffer_allocator_->getBase(),
-                                buffer_allocator_->size(), "*", false, true);
+    if (local_buffer_allocator_) {
+        auto result = RegisterLocalMemory(local_buffer_allocator_->getBase(),
+                                          local_buffer_allocator_->size(), "*",
+                                          false, true);
         if (!result) {
             LOG(ERROR) << "Failed to register buffer allocator memory: "
                        << toString(result.error());
-            buffer_allocator_.reset();
+            local_buffer_allocator_.reset();
         } else {
             LOG(INFO) << "Buffer allocator initialized: " << pool_size
                       << " bytes";

@@ -165,7 +165,7 @@ ErrorCode CentralizedClientService::Init(
 
     InitTransferSubmitter();
 
-    InitBufferAllocator(config.local_buffer_size, config.protocol);
+    InitLocalBufferAllocator(config.local_buffer_size, config.protocol);
 
     is_running_ = true;
 

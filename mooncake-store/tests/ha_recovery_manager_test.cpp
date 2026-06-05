@@ -156,8 +156,7 @@ TEST_F(HARecoveryManagerTest, BasicStateMachineSmoke) {
     // instantly, so SYNCING may be unobservable by the time we check).
     mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     auto state = mgr->GetState();
-    EXPECT_TRUE(state == HAClientState::SYNCING ||
-                state == HAClientState::FULL)
+    EXPECT_TRUE(state == HAClientState::SYNCING || state == HAClientState::FULL)
         << "Expected SYNCING or FULL, got " << static_cast<int>(state);
 
     // Wait for recovery to settle at FULL.
@@ -167,8 +166,7 @@ TEST_F(HARecoveryManagerTest, BasicStateMachineSmoke) {
     // FULL + MASTER_RECONNECTED -> SYNCING -> FULL again (same race).
     mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     state = mgr->GetState();
-    EXPECT_TRUE(state == HAClientState::SYNCING ||
-                state == HAClientState::FULL)
+    EXPECT_TRUE(state == HAClientState::SYNCING || state == HAClientState::FULL)
         << "Expected SYNCING or FULL, got " << static_cast<int>(state);
 }
 

@@ -176,19 +176,13 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         return err;
     }
 
-    // 6.5. Initialize shared buffer allocator (TE-registered pool for
-    //      HTTP handlers and any caller that needs temp registered memory).
-    //      If local_buffer_size is 0 but HTTP is enabled, use a default
-    //      64 MiB pool so HTTP /get and /put can still function.
-    {
-        constexpr size_t kDefaultHttpPoolSize = 64ULL * 1024 * 1024;
-        size_t pool_size = config.local_buffer_size > 0
-                               ? config.local_buffer_size
-                               : kDefaultHttpPoolSize;
-        InitBufferAllocator(pool_size, config.protocol);
-    }
+    // 7. Initialize shared buffer allocator
+    constexpr size_t kDefaultHttpPoolSize = 64ULL * 1024 * 1024;
+    size_t pool_size = config.local_buffer_size > 0 ? config.local_buffer_size
+                                                    : kDefaultHttpPoolSize;
+    InitLocalBufferAllocator(pool_size, config.protocol);
 
-    // 7. Initialize async route notifier if enabled
+    // 8. Initialize async route notifier if enabled
     if (config.async_sender_thread_count > 0) {
         // When async ADD is rejected by Master, delete the local replica
         // since Master won't track it.
@@ -216,7 +210,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
-    // 8. Start P2P client RPC service
+    // 9. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_, metrics_.get());
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
@@ -243,7 +237,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
 
-    // 9. If started in FULL state, notify master that sync is complete.
+    // 10. If started in FULL state, notify master that sync is complete.
     //    If in DEGRADED state, heartbeat will recover later.
     if (!ha_manager_->IsDegraded()) {
         ha_manager_->SetSyncCompleted();
@@ -252,7 +246,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << "establish master connection when available";
     }
 
-    // 10. Mark service as ready for recovery. HA recovery thread can now
+    // 11. Mark service as ready for recovery. HA recovery thread can now
     // proceed.
     ha_manager_->SetReadyForRecovery();
 
@@ -1829,10 +1823,7 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
 
-    // 1) Local first via DataManager — DataManager owns only data-plane
-    //    info (segment_id + object_size); the service layer attaches its
-    //    own identity (client_id / ip / rpc_port) to assemble the final
-    //    descriptor. Nothing is mocked.
+    // 1) Local first
     if (data_manager_.has_value()) {
         auto local = data_manager_->Query(object_key);
         if (local.has_value()) {
@@ -2167,13 +2158,13 @@ void P2PClientService::RegisterHttpMethods() {
             }
             std::string key(key_view);
 
-            if (!buffer_allocator_) {
+            if (!local_buffer_allocator_) {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "buffer allocator not initialized");
                 return;
             }
 
-            auto result = Get(key, buffer_allocator_, {});
+            auto result = Get(key, local_buffer_allocator_, {});
             if (!result) {
                 resp.set_status_and_content(
                     ErrorToHttpStatus(result.error()),
@@ -2200,13 +2191,13 @@ void P2PClientService::RegisterHttpMethods() {
             std::string key(key_view);
             auto body = req.get_body();
 
-            if (!buffer_allocator_) {
+            if (!local_buffer_allocator_) {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "buffer allocator not initialized");
                 return;
             }
 
-            auto alloc_result = buffer_allocator_->allocate(body.size());
+            auto alloc_result = local_buffer_allocator_->allocate(body.size());
             if (!alloc_result) {
                 resp.set_status_and_content(status_type::service_unavailable,
                                             "buffer pool exhausted");
