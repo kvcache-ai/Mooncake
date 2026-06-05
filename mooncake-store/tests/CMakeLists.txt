@@ -36,6 +36,12 @@ endfunction()
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
+if(ENABLE_KV_EVENTS
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kv_event_publisher_test.cpp")
+  add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
+  target_compile_definitions(kv_event_publisher_test PRIVATE
+                             MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
