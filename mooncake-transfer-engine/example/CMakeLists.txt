@@ -65,7 +65,16 @@ endif()
 # Device Transport Example — two-rank P2P write + signal via Device API.
 # Requires 2 GPUs with P2P access.  Built but not registered with CTest
 # (manual execution only, like rdma_transport_test).
-if(USE_CUDA)
+#
+# Off by default: this .cu target pulls in transfer_engine.h, whose common.h
+# uses C++20 std::string APIs (e.g. starts_with), so it needs the CUDA20
+# dialect.  Older CMake (such as the CI Docker image) cannot enable CUDA20 and
+# fails at generate time.  Opt in explicitly with -DBUILD_DEVICE_TRANSPORT_EXAMPLE=ON
+# when building manually on a host with a recent CMake and 2 GPUs.
+option(BUILD_DEVICE_TRANSPORT_EXAMPLE
+       "Build the two-rank Device API P2P example (requires CUDA20-capable CMake and 2 GPUs)"
+       OFF)
+if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
   enable_language(CUDA)
   add_executable(device_transport_example
                  ${WORKSPACE}/device_transport_example.cu)
