@@ -23,6 +23,22 @@ namespace mooncake {
 namespace tent {
 namespace {
 
+QueueOwnerInput makeOwner(
+    size_t public_task_id, size_t length,
+    QueueOwnerKind kind = QueueOwnerKind::User,
+    std::vector<size_t> derived_task_ids = std::vector<size_t>()) {
+    QueueOwnerInput owner;
+    owner.owner_task_id = public_task_id;
+    owner.derived_task_ids = std::move(derived_task_ids);
+    owner.request.opcode = Request::WRITE;
+    owner.request.source = nullptr;
+    owner.request.target_id = 1;
+    owner.request.target_offset = public_task_id * 4096;
+    owner.request.length = length;
+    owner.kind = kind;
+    return owner;
+}
+
 QueueSubmit makeSubmit(uint64_t batch_token, size_t batch_slots_left,
                        std::vector<QueueOwnerInput> owners) {
     QueueSubmit submit;
@@ -42,6 +58,149 @@ TEST(AdmissionQueueTest, AllowsEmptySubmitAsNoOp) {
     EXPECT_TRUE(admitted_ids.empty());
     EXPECT_EQ(queue.outstandingOwners(), 0u);
     EXPECT_EQ(queue.outstandingBytes(), 0u);
+}
+
+TEST(AdmissionQueueTest, RejectsInvalidInputsWithoutPartialAdmission) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids{99};
+
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1, 2,
+            {makeOwner(0, 16, QueueOwnerKind::User, {1}), makeOwner(1, 16)}),
+        admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+
+    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(2, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+}
+
+TEST(AdmissionQueueTest, RejectsUnsupportedOwnerKindWithoutPartialAdmission) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids{99};
+
+    auto invalid_owner = makeOwner(0, 16, static_cast<QueueOwnerKind>(99), {1});
+    auto status = queue.tryAdmit(makeSubmit(1, 2, {std::move(invalid_owner)}),
+                                 admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+
+    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(2, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+}
+
+TEST(AdmissionQueueTest, RejectsCapacityExceededWithoutPartialAdmission) {
+    LocalTransferAdmissionQueue queue({1, 64, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+
+    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+}
+
+TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+
+    status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(1, 16), makeOwner(0, 16)}), admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 16u);
+
+    QueueOwnerId owner_id = 0;
+    status = queue.resolveOwner(1, 1, owner_id);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+}
+
+TEST(AdmissionQueueTest, AccountsPublicSlotsSeparatelyFromQueueOwners) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(7, 32, QueueOwnerKind::User, {8, 9})}),
+        admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+
+    status = queue.tryAdmit(
+        makeSubmit(1, 3, {makeOwner(7, 32, QueueOwnerKind::User, {8, 9})}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 32u);
+
+    QueueOwnerId resolved_owner = 0;
+    status = queue.resolveOwner(1, 7, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, admitted_ids[0]);
+    status = queue.resolveOwner(1, 8, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, admitted_ids[0]);
+    status = queue.resolveOwner(1, 9, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, admitted_ids[0]);
+    status = queue.resolveOwner(1, 0, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+}
+
+TEST(AdmissionQueueTest, PreservesStagingReserveForStagingInternalOwners) {
+    LocalTransferAdmissionQueue queue({2, 100, 1, 40});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 60)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.tryAdmit(makeSubmit(2, 1, {makeOwner(0, 1)}), admitted_ids);
+    EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 60u);
+
+    status = queue.tryAdmit(
+        makeSubmit(3, 1, {makeOwner(0, 40, QueueOwnerKind::StagingInternal)}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 2u);
+    EXPECT_EQ(queue.outstandingOwners(), 2u);
+    EXPECT_EQ(queue.outstandingBytes(), 100u);
 }
 
 }  // namespace

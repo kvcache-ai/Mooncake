@@ -14,8 +14,46 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <limits>
+#include <set>
+
 namespace mooncake {
 namespace tent {
+namespace {
+
+using PublicTaskKey = std::pair<uint64_t, size_t>;
+
+bool isSupportedOwnerKind(QueueOwnerKind kind) {
+    switch (kind) {
+        case QueueOwnerKind::User:
+        case QueueOwnerKind::StagingInternal:
+            return true;
+    }
+    return false;
+}
+
+Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
+    if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+        return Status::InvalidArgument(
+            "admission queue charge overflow" LOC_MARK);
+    }
+    out = lhs + rhs;
+    return Status::OK();
+}
+
+Status validateLimits(const QueueLimits& limits) {
+    if (limits.staging_owner_reserve > limits.max_outstanding_owners) {
+        return Status::InvalidArgument(
+            "staging owner reserve exceeds owner limit" LOC_MARK);
+    }
+    if (limits.staging_byte_reserve > limits.max_outstanding_bytes) {
+        return Status::InvalidArgument(
+            "staging byte reserve exceeds byte limit" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
     : limits_(limits) {}
@@ -23,12 +61,119 @@ LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {
     admitted_owner_ids.clear();
+    CHECK_STATUS(validateLimits(limits_));
     if (submit.batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
-    if (!submit.owners.empty()) {
-        return Status::NotImplemented("queue admission is not wired" LOC_MARK);
+    if (submit.owners.empty()) return Status::OK();
+
+    std::set<PublicTaskKey> public_keys;
+    size_t byte_charge = 0;
+    size_t user_owner_charge = 0;
+    size_t user_byte_charge = 0;
+
+    for (const auto& owner : submit.owners) {
+        if (!isSupportedOwnerKind(owner.kind)) {
+            return Status::InvalidArgument(
+                "unsupported queue owner kind" LOC_MARK);
+        }
+        if (owner.request.length == 0) {
+            return Status::InvalidArgument("empty transfer request" LOC_MARK);
+        }
+
+        const PublicTaskKey owner_key{submit.batch_token, owner.owner_task_id};
+        if (!public_keys.insert(owner_key).second) {
+            return Status::InvalidArgument("duplicate public task id" LOC_MARK);
+        }
+        for (const auto derived_task_id : owner.derived_task_ids) {
+            if (derived_task_id == owner.owner_task_id) {
+                return Status::InvalidArgument(
+                    "owner task id appears in derived task ids" LOC_MARK);
+            }
+            const PublicTaskKey derived_key{submit.batch_token,
+                                            derived_task_id};
+            if (!public_keys.insert(derived_key).second) {
+                return Status::InvalidArgument(
+                    "duplicate public task id" LOC_MARK);
+            }
+        }
+
+        CHECK_STATUS(
+            checkedAdd(byte_charge, owner.request.length, byte_charge));
+        if (owner.kind == QueueOwnerKind::User) {
+            CHECK_STATUS(checkedAdd(user_owner_charge, 1, user_owner_charge));
+            CHECK_STATUS(checkedAdd(user_byte_charge, owner.request.length,
+                                    user_byte_charge));
+        }
     }
+
+    if (public_keys.size() > submit.batch_slots_left) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
+
+    for (const auto& key : public_keys) {
+        if (public_to_owner_.count(key)) {
+            return Status::InvalidEntry(
+                "public task id already admitted" LOC_MARK);
+        }
+    }
+
+    const size_t owner_charge = submit.owners.size();
+    size_t next_outstanding_owners = 0;
+    size_t next_outstanding_bytes = 0;
+    size_t next_user_owners = 0;
+    size_t next_user_bytes = 0;
+    CHECK_STATUS(
+        checkedAdd(outstanding_owners_, owner_charge, next_outstanding_owners));
+    CHECK_STATUS(
+        checkedAdd(outstanding_bytes_, byte_charge, next_outstanding_bytes));
+    CHECK_STATUS(checkedAdd(outstanding_user_owners_, user_owner_charge,
+                            next_user_owners));
+    CHECK_STATUS(
+        checkedAdd(outstanding_user_bytes_, user_byte_charge, next_user_bytes));
+
+    const size_t user_owner_limit =
+        limits_.max_outstanding_owners - limits_.staging_owner_reserve;
+    const size_t user_byte_limit =
+        limits_.max_outstanding_bytes - limits_.staging_byte_reserve;
+
+    if (next_outstanding_owners > limits_.max_outstanding_owners) {
+        return Status::TooManyRequests(
+            "queue owner capacity exceeded" LOC_MARK);
+    }
+    if (next_outstanding_bytes > limits_.max_outstanding_bytes) {
+        return Status::TooManyRequests("queue byte capacity exceeded" LOC_MARK);
+    }
+    if (next_user_owners > user_owner_limit) {
+        return Status::TooManyRequests("user owner capacity exceeded" LOC_MARK);
+    }
+    if (next_user_bytes > user_byte_limit) {
+        return Status::TooManyRequests("user byte capacity exceeded" LOC_MARK);
+    }
+
+    admitted_owner_ids.reserve(submit.owners.size());
+    for (const auto& owner_input : submit.owners) {
+        const QueueOwnerId owner_id = next_owner_id_++;
+        QueueOwner owner;
+        owner.batch_token = submit.batch_token;
+        owner.request = owner_input.request;
+        owner.kind = owner_input.kind;
+        owners_.emplace(owner_id, owner);
+
+        public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
+            owner_id;
+        for (const auto derived_task_id : owner_input.derived_task_ids) {
+            public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
+        }
+        fifo_.push_back(owner_id);
+        admitted_owner_ids.push_back(owner_id);
+    }
+
+    outstanding_owners_ = next_outstanding_owners;
+    outstanding_bytes_ = next_outstanding_bytes;
+    outstanding_user_owners_ = next_user_owners;
+    outstanding_user_bytes_ = next_user_bytes;
     return Status::OK();
 }
 
@@ -58,12 +203,15 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
 Status LocalTransferAdmissionQueue::resolveOwner(uint64_t batch_token,
                                                  size_t public_task_id,
                                                  QueueOwnerId& owner_id) const {
-    (void)public_task_id;
-    owner_id = 0;
     if (batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
-    return Status::InvalidEntry("public task id not found" LOC_MARK);
+    auto it = public_to_owner_.find({batch_token, public_task_id});
+    if (it == public_to_owner_.end()) {
+        return Status::InvalidEntry("public task id not found" LOC_MARK);
+    }
+    owner_id = it->second;
+    return Status::OK();
 }
 
 Status LocalTransferAdmissionQueue::getPublicStatus(
