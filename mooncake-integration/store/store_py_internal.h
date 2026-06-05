@@ -90,12 +90,21 @@ struct PlannedQueryResult {
     std::optional<CachedQueryResultResponse> cached_query_result;
 };
 
+struct TensorIntoRegularFullFormulaPlan {
+    std::vector<std::string> read_keys;
+    std::vector<int64_t> global_shape;
+    int split_dim{0};
+    size_t element_size{0};
+    size_t data_offset{sizeof(TensorMetadata)};
+};
+
 struct TensorIntoPlan {
     uintptr_t user_buffer_ptr{0};
     uintptr_t registered_buffer_ptr{0};
     size_t registered_buffer_size{0};
     size_t total_length{0};
     std::vector<TensorIntoFragment> fragments;
+    std::optional<TensorIntoRegularFullFormulaPlan> regular_full_formula;
     std::vector<PlannedQueryResult> query_results;
     std::optional<TensorMetadata> materialized_metadata;
 };

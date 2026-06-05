@@ -342,21 +342,23 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
     }
     const size_t target_tensor_bytes = target_tensor_numel * *element_size;
     const size_t total_length = sizeof(TensorMetadata) + target_tensor_bytes;
+
+    auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
+    if (!region.has_value()) {
+        return std::nullopt;
+    }
     if (total_length > size || region->offset + total_length > region->size) {
         LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
         return std::nullopt;
     }
-
-    TensorMetadata materialized_metadata = target_metadata;
-    materialized_metadata.header.data_bytes = target_tensor_bytes;
 
     TensorIntoPlan plan;
     plan.user_buffer_ptr = buffer_ptr;
     plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
     plan.registered_buffer_size = region->size;
     plan.total_length = total_length;
-    plan.query_results.reserve(sources.size());
-    plan.materialized_metadata = materialized_metadata;
+    plan.materialized_metadata = target_metadata;
+    plan.materialized_metadata->header.data_bytes = target_tensor_bytes;
 
     int64_t elements_before = 1;
     for (int i = 0; i < split_dim; ++i) {
@@ -393,10 +395,6 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
             covered[static_cast<size_t>(idx)] = true;
         }
 
-        if (source.cached_query_result.has_value()) {
-            plan.query_results.push_back(PlannedQueryResult{
-                source.read_key, std::move(source.cached_query_result)});
-        }
         for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
             const size_t dst_offset =
                 region->offset + sizeof(TensorMetadata) +
@@ -429,6 +427,14 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         !(allow_empty_fragments && target_tensor_bytes == 0)) {
         LOG(ERROR) << context << ": no fragments planned for reconstruction";
         return std::nullopt;
+    }
+
+    plan.query_results.reserve(sources.size());
+    for (auto &source : sources) {
+        if (source.cached_query_result.has_value()) {
+            plan.query_results.push_back(PlannedQueryResult{
+                source.read_key, std::move(source.cached_query_result)});
+        }
     }
     return plan;
 }
@@ -811,6 +817,24 @@ std::optional<TensorIntoPlan> build_writer_shard_full_tensor_into_plan(
         reconstruction->allow_empty_fragments);
 }
 
+std::vector<std::string> build_parallelism_shard_read_keys(
+    const std::string &key, const TensorParallelismSpec &canonical_parallelism,
+    size_t tp_axis_index, int shard_count,
+    std::optional<int> split_dim = std::nullopt) {
+    std::vector<std::string> shard_keys;
+    shard_keys.reserve(shard_count);
+    for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
+        auto shard_parallelism = canonical_parallelism;
+        shard_parallelism.axes[tp_axis_index].rank = shard_rank;
+        shard_parallelism.axes[tp_axis_index].size = shard_count;
+        if (split_dim.has_value()) {
+            shard_parallelism.axes[tp_axis_index].split_dim = *split_dim;
+        }
+        shard_keys.push_back(get_parallelism_key_name(key, shard_parallelism));
+    }
+    return shard_keys;
+}
+
 std::optional<FullTensorReconstructionSources>
 load_parallelism_manifest_reconstruction(
     const std::string &key, const TensorParallelismSpec &parallelism,
@@ -822,13 +846,7 @@ load_parallelism_manifest_reconstruction(
         return std::nullopt;
     }
 
-    std::shared_ptr<BufferHandle> manifest_handle;
-    {
-        py::gil_scoped_release release_gil;
-        manifest_handle =
-            store_->get_buffer(get_parallelism_manifest_key_name(key));
-    }
-    auto parsed_manifest = parse_writer_shard_manifest(manifest_handle.get());
+    auto parsed_manifest = load_parallelism_manifest(key, context);
     if (!parsed_manifest.has_value()) {
         return std::nullopt;
     }
@@ -863,14 +881,8 @@ load_parallelism_manifest_reconstruction(
         return std::nullopt;
     }
 
-    std::vector<std::string> shard_keys;
-    shard_keys.reserve(shard_count);
-    for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
-        auto shard_parallelism = *canonical_parallelism;
-        shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
-        shard_parallelism.axes[*tp_axis_index].size = shard_count;
-        shard_keys.push_back(get_parallelism_key_name(key, shard_parallelism));
-    }
+    auto shard_keys = build_parallelism_shard_read_keys(
+        key, *canonical_parallelism, *tp_axis_index, shard_count);
 
     auto ordered_sources =
         load_reconstructed_shard_sources_batch(shard_keys, context);
@@ -1001,13 +1013,8 @@ load_parallelism_full_reconstruction_sources(
         return reconstruction;
     }
 
-    std::vector<std::string> shard_keys;
-    shard_keys.reserve(request_tp_axis->size);
-    for (int shard_rank = 0; shard_rank < request_tp_axis->size; ++shard_rank) {
-        auto shard_parallelism = *canonical_parallelism;
-        shard_parallelism.axes[*tp_axis_index].rank = shard_rank;
-        shard_keys.push_back(get_parallelism_key_name(key, shard_parallelism));
-    }
+    auto shard_keys = build_parallelism_shard_read_keys(
+        key, *canonical_parallelism, *tp_axis_index, request_tp_axis->size);
     auto ordered_sources =
         load_reconstructed_shard_sources_batch(shard_keys, context);
     if (!ordered_sources.has_value()) {
@@ -1061,9 +1068,120 @@ load_parallelism_full_reconstruction_sources(
     return reconstruction;
 }
 
-std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_plan(
+std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const TensorParallelismSpec &parallelism, const std::string &context) {
+    if (std::getenv("MOONCAKE_DISABLE_REGULAR_FULL_FORMULA")) {
+        return std::nullopt;
+    }
+
+    const ParallelAxisSpec *request_tp_axis =
+        find_axis_spec_by_kind(parallelism, LayoutAxisKind::TP);
+    if (!request_tp_axis) {
+        return std::nullopt;
+    }
+
+    auto manifest = load_parallelism_manifest(key, context);
+    if (!manifest.has_value()) {
+        return std::nullopt;
+    }
+    const auto &global_shape = manifest->global_shape;
+    const int split_dim = manifest->manifest.header.split_dim;
+    const int shard_count = manifest->manifest.header.shard_count;
+    if (split_dim < 0 || split_dim >= static_cast<int>(global_shape.size()) ||
+        shard_count <= 0) {
+        return std::nullopt;
+    }
+    if (request_tp_axis->split_dim.has_value() &&
+        request_tp_axis->split_dim.value() != split_dim) {
+        return std::nullopt;
+    }
+    if (!is_uniform_shardable_dim(global_shape[split_dim],
+                                  request_tp_axis->size) ||
+        !is_uniform_shardable_dim(global_shape[split_dim], shard_count)) {
+        return std::nullopt;
+    }
+    auto element_size = TensorDtypeElementSize(manifest->manifest.header.dtype);
+    if (!element_size.has_value()) {
+        return std::nullopt;
+    }
+
+    auto canonical_parallelism = canonicalize_parallelism_spec(parallelism);
+    if (!canonical_parallelism.has_value()) {
+        return std::nullopt;
+    }
+    auto tp_axis_index = find_tp_axis_index(canonical_parallelism->axes);
+    if (!tp_axis_index.has_value()) {
+        return std::nullopt;
+    }
+
+    size_t tensor_numel = 1;
+    for (auto dim : global_shape) {
+        if (dim <= 0) {
+            return std::nullopt;
+        }
+        tensor_numel *= static_cast<size_t>(dim);
+    }
+    const size_t tensor_bytes = tensor_numel * *element_size;
+    const size_t total_length = sizeof(TensorMetadata) + tensor_bytes;
+
+    auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
+    if (!region.has_value()) {
+        return std::nullopt;
+    }
+    if (total_length > size || region->offset + total_length > region->size) {
+        LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
+        return std::nullopt;
+    }
+
+    TensorIntoPlan plan;
+    plan.user_buffer_ptr = buffer_ptr;
+    plan.registered_buffer_ptr = reinterpret_cast<uintptr_t>(region->base);
+    plan.registered_buffer_size = region->size;
+    plan.total_length = total_length;
+    plan.materialized_metadata =
+        BuildTensorMetadata(manifest->manifest.header.dtype, global_shape,
+                            global_shape, TensorLayoutKind::FULL);
+    plan.materialized_metadata->header.data_bytes = tensor_bytes;
+
+    TensorIntoRegularFullFormulaPlan formula;
+    formula.global_shape = global_shape;
+    formula.split_dim = split_dim;
+    formula.element_size = *element_size;
+    formula.data_offset = sizeof(TensorMetadata);
+    formula.read_keys = build_parallelism_shard_read_keys(
+        key, *canonical_parallelism, *tp_axis_index, shard_count, split_dim);
+
+    std::vector<CachedQueryResultResponse> cached_query_results;
+    {
+        py::gil_scoped_release release_gil;
+        cached_query_results = batch_query_for_reuse(formula.read_keys);
+    }
+    if (cached_query_results.size() != formula.read_keys.size()) {
+        return std::nullopt;
+    }
+    plan.query_results.reserve(formula.read_keys.size());
+    for (size_t i = 0; i < formula.read_keys.size(); ++i) {
+        plan.query_results.push_back(
+            PlannedQueryResult{formula.read_keys[i], cached_query_results[i]});
+    }
+
+    plan.regular_full_formula = std::move(formula);
+    return plan;
+}
+
+std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_plan(
+    const std::string &key, uintptr_t buffer_ptr, size_t size,
+    const TensorParallelismSpec &parallelism, const std::string &context,
+    bool allow_formula_plan = true) {
+    if (allow_formula_plan) {
+        if (auto formula_plan = build_parallelism_full_tensor_into_formula_plan(
+                key, buffer_ptr, size, parallelism, context);
+            formula_plan.has_value()) {
+            return formula_plan;
+        }
+    }
+
     auto reconstruction =
         load_parallelism_full_reconstruction_sources(key, parallelism, context);
     if (!reconstruction.has_value()) {
@@ -1205,28 +1323,83 @@ std::vector<bool> execute_tensor_into_plan_transfers(
         std::vector<std::vector<size_t>> dst_offsets;
         std::vector<std::vector<size_t>> src_offsets;
         std::vector<std::vector<size_t>> sizes;
-        key_to_index.reserve(plan.fragments.size());
-        keys.reserve(plan.fragments.size());
-        dst_offsets.reserve(plan.fragments.size());
-        src_offsets.reserve(plan.fragments.size());
-        sizes.reserve(plan.fragments.size());
 
-        for (const auto &fragment : plan.fragments) {
-            if (fragment.read_key.empty() || fragment.size == 0) {
-                continue;
+        if (plan.regular_full_formula.has_value()) {
+            const auto &formula = *plan.regular_full_formula;
+            keys = formula.read_keys;
+            dst_offsets.resize(keys.size());
+            src_offsets.resize(keys.size());
+            sizes.resize(keys.size());
+
+            int64_t elements_before = 1;
+            for (int i = 0; i < formula.split_dim; ++i) {
+                elements_before *= formula.global_shape[i];
             }
-            auto [it, inserted] =
-                key_to_index.emplace(fragment.read_key, keys.size());
-            if (inserted) {
-                keys.push_back(fragment.read_key);
-                dst_offsets.emplace_back();
-                src_offsets.emplace_back();
-                sizes.emplace_back();
+            int64_t elements_after = 1;
+            for (size_t i = formula.split_dim + 1;
+                 i < formula.global_shape.size(); ++i) {
+                elements_after *= formula.global_shape[i];
             }
-            const size_t key_index = it->second;
-            dst_offsets[key_index].push_back(fragment.dst_offset);
-            src_offsets[key_index].push_back(fragment.src_offset);
-            sizes[key_index].push_back(fragment.size);
+            const size_t base_dst_offset =
+                plan.user_buffer_ptr - plan.registered_buffer_ptr;
+            const int64_t split_extent =
+                formula.global_shape[formula.split_dim];
+            for (size_t shard_rank = 0; shard_rank < formula.read_keys.size();
+                 ++shard_rank) {
+                const auto [shard_start, shard_extent] = calculate_shard_range(
+                    split_extent, static_cast<int>(shard_rank),
+                    static_cast<int>(formula.read_keys.size()));
+                if (shard_extent <= 0) {
+                    continue;
+                }
+                const size_t row_bytes = static_cast<size_t>(shard_extent) *
+                                         static_cast<size_t>(elements_after) *
+                                         formula.element_size;
+                dst_offsets[shard_rank].reserve(
+                    static_cast<size_t>(elements_before));
+                src_offsets[shard_rank].reserve(
+                    static_cast<size_t>(elements_before));
+                sizes[shard_rank].reserve(static_cast<size_t>(elements_before));
+                for (int64_t slice_idx = 0; slice_idx < elements_before;
+                     ++slice_idx) {
+                    dst_offsets[shard_rank].push_back(
+                        base_dst_offset + sizeof(TensorMetadata) +
+                        static_cast<size_t>(slice_idx * split_extent +
+                                            shard_start) *
+                            static_cast<size_t>(elements_after) *
+                            formula.element_size);
+                    src_offsets[shard_rank].push_back(
+                        formula.data_offset +
+                        static_cast<size_t>(slice_idx * shard_extent) *
+                            static_cast<size_t>(elements_after) *
+                            formula.element_size);
+                    sizes[shard_rank].push_back(row_bytes);
+                }
+            }
+        } else {
+            key_to_index.reserve(plan.fragments.size());
+            keys.reserve(plan.fragments.size());
+            dst_offsets.reserve(plan.fragments.size());
+            src_offsets.reserve(plan.fragments.size());
+            sizes.reserve(plan.fragments.size());
+
+            for (const auto &fragment : plan.fragments) {
+                if (fragment.read_key.empty() || fragment.size == 0) {
+                    continue;
+                }
+                auto [it, inserted] =
+                    key_to_index.emplace(fragment.read_key, keys.size());
+                if (inserted) {
+                    keys.push_back(fragment.read_key);
+                    dst_offsets.emplace_back();
+                    src_offsets.emplace_back();
+                    sizes.emplace_back();
+                }
+                const size_t key_index = it->second;
+                dst_offsets[key_index].push_back(fragment.dst_offset);
+                src_offsets[key_index].push_back(fragment.src_offset);
+                sizes[key_index].push_back(fragment.size);
+            }
         }
 
         all_keys.push_back(std::move(keys));
@@ -1314,7 +1487,8 @@ py::list execute_tensor_into_plans(std::vector<TensorIntoPlan> plans) {
 
 std::optional<TensorIntoPlan> build_tensor_into_plan_for_target(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
-    const py::object &target, const std::string &context) {
+    const py::object &target, const std::string &context,
+    bool allow_formula_plan = true) {
     auto parsed_target = parse_read_target_spec(target);
     if (!parsed_target.has_value()) {
         return std::nullopt;
@@ -1357,8 +1531,8 @@ std::optional<TensorIntoPlan> build_tensor_into_plan_for_target(
     }
 
     if (parsed_target->mode == ReadTargetMode::FULL) {
-        return build_parallelism_full_tensor_into_plan(key, buffer_ptr, size,
-                                                       *parallelism, context);
+        return build_parallelism_full_tensor_into_plan(
+            key, buffer_ptr, size, *parallelism, context, allow_formula_plan);
     }
 
     LOG(ERROR) << context << ": unsupported ReadTarget mode";
@@ -1469,11 +1643,25 @@ pybind11::object get_tensor_with_parallelism_into(
     if (!plan.has_value()) {
         return py::none();
     }
+    const bool used_formula_plan = plan->regular_full_formula.has_value();
     auto results = execute_tensor_into_plans({*plan});
-    if (results.empty()) {
-        return py::none();
+    if (!results.empty() && !results[0].is_none()) {
+        return py::reinterpret_borrow<py::object>(results[0]);
     }
-    return py::reinterpret_borrow<py::object>(results[0]);
+
+    if (used_formula_plan) {
+        auto fallback_plan = build_tensor_into_plan_for_target(
+            key, buffer_ptr, size, target, "get_tensor_with_parallelism_into",
+            false /* allow_formula_plan */);
+        if (!fallback_plan.has_value()) {
+            return py::none();
+        }
+        auto fallback_results = execute_tensor_into_plans({*fallback_plan});
+        if (!fallback_results.empty()) {
+            return py::reinterpret_borrow<py::object>(fallback_results[0]);
+        }
+    }
+    return py::none();
 }
 
 pybind11::list batch_get_tensor_with_parallelism_into(
@@ -1505,6 +1693,8 @@ pybind11::list batch_get_tensor_with_parallelism_into(
     plans.reserve(keys.size());
     std::vector<size_t> plan_indices;
     plan_indices.reserve(keys.size());
+    std::vector<bool> plan_used_formula;
+    plan_used_formula.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         py::object target =
             target_list.has_value()
@@ -1517,12 +1707,43 @@ pybind11::list batch_get_tensor_with_parallelism_into(
             continue;
         }
         plan_indices.push_back(i);
+        plan_used_formula.push_back(plan->regular_full_formula.has_value());
         plans.push_back(std::move(*plan));
     }
 
     auto results = execute_tensor_into_plans(std::move(plans));
+    std::vector<TensorIntoPlan> fallback_plans;
+    std::vector<size_t> fallback_indices;
+    fallback_plans.reserve(plan_indices.size());
+    fallback_indices.reserve(plan_indices.size());
     for (size_t i = 0; i < plan_indices.size() && i < results.size(); ++i) {
-        empty[plan_indices[i]] = results[i];
+        if (!results[i].is_none() || !plan_used_formula[i]) {
+            empty[plan_indices[i]] = results[i];
+            continue;
+        }
+
+        const size_t original_index = plan_indices[i];
+        py::object target = target_list.has_value()
+                                ? py::reinterpret_borrow<py::object>(
+                                      (*target_list)[original_index])
+                                : py::none();
+        auto fallback_plan = build_tensor_into_plan_for_target(
+            keys[original_index], buffer_ptrs[original_index],
+            sizes[original_index], target,
+            "batch_get_tensor_with_parallelism_into",
+            false /* allow_formula_plan */);
+        if (!fallback_plan.has_value()) {
+            continue;
+        }
+        fallback_indices.push_back(original_index);
+        fallback_plans.push_back(std::move(*fallback_plan));
+    }
+
+    auto fallback_results =
+        execute_tensor_into_plans(std::move(fallback_plans));
+    for (size_t i = 0;
+         i < fallback_indices.size() && i < fallback_results.size(); ++i) {
+        empty[fallback_indices[i]] = fallback_results[i];
     }
     return empty;
 }

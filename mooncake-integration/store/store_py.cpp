@@ -1165,6 +1165,27 @@ class MooncakeStorePyWrapper {
         return region;
     }
 
+    std::optional<ParsedParallelismManifest> load_parallelism_manifest(
+        const std::string &key, const std::string &context) const {
+        std::shared_ptr<BufferHandle> manifest_handle;
+        {
+            py::gil_scoped_release release_gil;
+            manifest_handle =
+                store_->get_buffer(get_parallelism_manifest_key_name(key));
+        }
+        auto parsed_manifest =
+            parse_writer_shard_manifest(manifest_handle.get());
+        if (!parsed_manifest.has_value()) {
+            return std::nullopt;
+        }
+        if (parsed_manifest->manifest.header.ndim !=
+            static_cast<int32_t>(parsed_manifest->global_shape.size())) {
+            LOG(ERROR) << context << ": invalid parallelism manifest shape";
+            return std::nullopt;
+        }
+        return parsed_manifest;
+    }
+
 #include "store_py_parallel_read.h"
 
     // --- Upsert tensor methods ---

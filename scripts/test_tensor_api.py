@@ -1381,6 +1381,59 @@ class TestMooncakeFunctional(MooncakeTestBase):
                     )
                     self.assertNotEqual(rc, 0)
 
+    def test_27b_unified_parallelism_full_into_formula_all_split_dims_and_hetero_tp(self):
+        require_unified_parallelism_api(self)
+        previous_disable = os.environ.pop("MOONCAKE_DISABLE_REGULAR_FULL_FORMULA", None)
+        cases = [
+            ((8, 12, 16), 0, 4, [2, 4, 8]),
+            ((8, 12, 16), 1, 4, [2, 3, 4, 6]),
+            ((8, 12, 16), 2, 4, [2, 4, 8, 16]),
+        ]
+        try:
+            for case_index, (shape, split_dim, write_tp_size, read_tp_sizes) in enumerate(cases):
+                tensor = make_deterministic_tensor(shape)
+                for read_tp_size in read_tp_sizes:
+                    with self.subTest(
+                        case=f"split_dim={split_dim},write_tp={write_tp_size},read_tp={read_tp_size}"
+                    ):
+                        key = f"func_unified_formula_split_{case_index}_{read_tp_size}"
+                        self.assertEqual(shape[split_dim] % read_tp_size, 0)
+                        rc = put_uniform_full_tensor_with_unified_tp(
+                            self.store, key, tensor, write_tp_size, split_dim
+                        )
+                        self.assertEqual(rc, 0)
+                        target = make_read_target(
+                            "full",
+                            build_tp_parallelism(
+                                read_tp_size, split_dim, rank=read_tp_size - 1
+                            ),
+                        )
+                        full_result = self.store.get_tensor_with_parallelism(
+                            key, target
+                        )
+                        self.assertIsNotNone(full_result)
+                        self.assertTrue(torch.equal(full_result, tensor))
+
+                        buffer_spacing = max(
+                            serialized_tensor_size(tensor) + 4096, 1 * 1024 * 1024
+                        )
+                        buffer = (ctypes.c_ubyte * buffer_spacing)()
+                        buffer_ptr = ctypes.addressof(buffer)
+                        self.assertEqual(
+                            self.store.register_buffer(buffer_ptr, buffer_spacing), 0
+                        )
+                        try:
+                            into_result = self.store.get_tensor_with_parallelism_into(
+                                key, buffer_ptr, buffer_spacing, target=target
+                            )
+                            self.assertIsNotNone(into_result)
+                            self.assertTrue(torch.equal(into_result, tensor))
+                        finally:
+                            self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+        finally:
+            if previous_disable is not None:
+                os.environ["MOONCAKE_DISABLE_REGULAR_FULL_FORMULA"] = previous_disable
+
     def test_28_writer_shard_full_reconstruction(self):
         require_unified_parallelism_api(self)
         key = "func_writer_shard_full"
@@ -2362,6 +2415,51 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
         self.total_bits = tensor.numel() * tensor.element_size() * 8
         self._print_perf("Unified Full Into", into_times)
+
+    def test_benchmark_09_unified_full_into_formula_vs_generic_cold(self):
+        require_unified_parallelism_api(self)
+        key = "bench_unified_full_into_formula"
+        tensor = self.tensors[0]
+        tp_size = 4
+        split_dim = 0
+        full_target = make_read_target("full", build_tp_parallelism(tp_size, split_dim, rank=2))
+        buffer_spacing = serialized_tensor_size(tensor) + 1 * 1024 * 1024
+        buffer = (ctypes.c_ubyte * buffer_spacing)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_spacing), 0)
+        generic_times = []
+        formula_times = []
+        try:
+            print(f"--- Running Unified Full Into Formula vs Generic Cold Benchmark (TP={tp_size}) ---")
+            for _ in range(self.BENCH_ITERATIONS):
+                self.store.remove_all()
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store, key, tensor, tp_size, split_dim
+                )
+                self.assertEqual(rc, 0)
+
+                os.environ["MOONCAKE_DISABLE_REGULAR_FULL_FORMULA"] = "1"
+                t0 = time.perf_counter()
+                self._run_unified_full_into(key, full_target, buffer_ptr, buffer_spacing, tensor)
+                generic_times.append(time.perf_counter() - t0)
+
+                self.store.remove_all()
+                rc = put_uniform_full_tensor_with_unified_tp(
+                    self.store, key, tensor, tp_size, split_dim
+                )
+                self.assertEqual(rc, 0)
+
+                os.environ.pop("MOONCAKE_DISABLE_REGULAR_FULL_FORMULA", None)
+                t0 = time.perf_counter()
+                self._run_unified_full_into(key, full_target, buffer_ptr, buffer_spacing, tensor)
+                formula_times.append(time.perf_counter() - t0)
+        finally:
+            os.environ.pop("MOONCAKE_DISABLE_REGULAR_FULL_FORMULA", None)
+            self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+
+        self.total_bits = tensor.numel() * tensor.element_size() * 8
+        self._print_perf("Unified Full Into Generic Cold", generic_times)
+        self._print_perf("Unified Full Into Formula Cold", formula_times)
 
 # ==========================================
 #  Stress/Concurrency Tests
