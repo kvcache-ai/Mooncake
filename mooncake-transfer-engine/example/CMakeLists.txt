@@ -78,9 +78,10 @@ if(USE_CUDA)
     transfer_engine gflags::gflags glog::glog)
   # common.h (pulled in via transfer_engine.h) uses C++20 std::string APIs
   # such as starts_with; nvcc does not inherit CMAKE_CXX_STANDARD, so set the
-  # CUDA standard explicitly on this target.
+  # CUDA standard explicitly on this target.  CUDA_EXTENSIONS OFF requests
+  # plain -std=c++20 (nvcc has no gnu++20 dialect mapping).
   set_target_properties(device_transport_example PROPERTIES
-    CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
   # Convert torch-style arch list (e.g. "8.0;9.0") to CMake CUDA format
   # (e.g. "80;90") by stripping the dot.
   if(TORCH_CUDA_ARCH_LIST)
