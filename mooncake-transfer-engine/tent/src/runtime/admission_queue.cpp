@@ -23,6 +23,11 @@ namespace {
 
 using PublicTaskKey = std::pair<uint64_t, size_t>;
 
+bool isSupportedTerminalStatus(TransferStatusEnum status) {
+    return status == TransferStatusEnum::COMPLETED ||
+           status == TransferStatusEnum::FAILED;
+}
+
 bool isSupportedOwnerKind(QueueOwnerKind kind) {
     switch (kind) {
         case QueueOwnerKind::User:
@@ -179,23 +184,94 @@ Status LocalTransferAdmissionQueue::tryAdmit(
 
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     size_t max_owners, size_t max_bytes) {
-    (void)max_owners;
-    (void)max_bytes;
-    return {};
+    std::vector<QueueOwnerId> picked;
+    if (max_owners == 0 || max_bytes == 0) return picked;
+
+    size_t used_owners = 0;
+    size_t used_bytes = 0;
+    while (!fifo_.empty() && used_owners < max_owners) {
+        auto owner_id = fifo_.front();
+        auto owner_it = owners_.find(owner_id);
+        // Non-queued entries should not normally remain in fifo_, but stale
+        // entries are skipped defensively so retireBatch() does not need to
+        // scan the dispatch queue.
+        if (owner_it == owners_.end() ||
+            owner_it->second.state != QueueState::Queued) {
+            fifo_.pop_front();
+            continue;
+        }
+
+        const auto& owner = owner_it->second;
+        const size_t remaining_bytes = max_bytes - used_bytes;
+        if (owner.request.length > remaining_bytes) break;
+
+        fifo_.pop_front();
+        owner_it->second.state = QueueState::Dispatching;
+        picked.push_back(owner_id);
+        ++used_owners;
+        used_bytes += owner.request.length;
+    }
+    return picked;
 }
 
 Status LocalTransferAdmissionQueue::complete(
     QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
-    (void)terminal_status;
     if (owner_id == 0) {
         return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
     }
-    return Status::NotImplemented("queue completion is not wired" LOC_MARK);
+    if (!isSupportedTerminalStatus(terminal_status)) {
+        return Status::InvalidArgument("unsupported terminal status" LOC_MARK);
+    }
+
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    auto& owner = owner_it->second;
+    if (owner.state != QueueState::Dispatching) {
+        return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
+    }
+
+    owner.state = terminal_status == TransferStatusEnum::COMPLETED
+                      ? QueueState::Completed
+                      : QueueState::Failed;
+    --outstanding_owners_;
+    outstanding_bytes_ -= owner.request.length;
+    if (owner.kind == QueueOwnerKind::User) {
+        --outstanding_user_owners_;
+        outstanding_user_bytes_ -= owner.request.length;
+    }
+    return Status::OK();
 }
 
 Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
     if (batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
+    }
+
+    for (const auto& entry : owners_) {
+        const auto& owner = entry.second;
+        const bool terminal = owner.state == QueueState::Completed ||
+                              owner.state == QueueState::Failed;
+        if (owner.batch_token == batch_token && !terminal) {
+            return Status::InvalidEntry(
+                "batch has non-terminal queue owners" LOC_MARK);
+        }
+    }
+
+    for (auto it = owners_.begin(); it != owners_.end();) {
+        if (it->second.batch_token == batch_token) {
+            it = owners_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = public_to_owner_.begin(); it != public_to_owner_.end();) {
+        if (it->first.first == batch_token) {
+            it = public_to_owner_.erase(it);
+        } else {
+            ++it;
+        }
     }
     return Status::OK();
 }
@@ -217,12 +293,25 @@ Status LocalTransferAdmissionQueue::resolveOwner(uint64_t batch_token,
 Status LocalTransferAdmissionQueue::getPublicStatus(
     uint64_t batch_token, size_t public_task_id,
     TransferStatusEnum& status) const {
-    (void)public_task_id;
-    status = TransferStatusEnum::INVALID;
-    if (batch_token == 0) {
-        return Status::InvalidArgument("invalid batch token" LOC_MARK);
+    QueueOwnerId owner_id = 0;
+    CHECK_STATUS(resolveOwner(batch_token, public_task_id, owner_id));
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InternalError("queue owner mapping is stale" LOC_MARK);
     }
-    return Status::InvalidEntry("public task id not found" LOC_MARK);
+    switch (owner_it->second.state) {
+        case QueueState::Queued:
+        case QueueState::Dispatching:
+            status = TransferStatusEnum::PENDING;
+            break;
+        case QueueState::Completed:
+            status = TransferStatusEnum::COMPLETED;
+            break;
+        case QueueState::Failed:
+            status = TransferStatusEnum::FAILED;
+            break;
+    }
+    return Status::OK();
 }
 
 size_t LocalTransferAdmissionQueue::outstandingOwners() const {

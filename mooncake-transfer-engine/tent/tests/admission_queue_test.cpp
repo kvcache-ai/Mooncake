@@ -142,6 +142,19 @@ TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
     QueueOwnerId owner_id = 0;
     status = queue.resolveOwner(1, 1, owner_id);
     EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    status = queue.retireBatch(1);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.tryAdmit(makeSubmit(2, 1, {makeOwner(0, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 2u);
 }
 
 TEST(AdmissionQueueTest, AccountsPublicSlotsSeparatelyFromQueueOwners) {
@@ -201,6 +214,146 @@ TEST(AdmissionQueueTest, PreservesStagingReserveForStagingInternalOwners) {
     EXPECT_EQ(admitted_ids[0], 2u);
     EXPECT_EQ(queue.outstandingOwners(), 2u);
     EXPECT_EQ(queue.outstandingBytes(), 100u);
+}
+
+TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2,
+                   {makeOwner(0, 60),
+                    makeOwner(1, 10, QueueOwnerKind::StagingInternal)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+    const std::vector<QueueOwnerId> expected_ids{1, 2};
+    EXPECT_EQ(admitted_ids, expected_ids);
+
+    EXPECT_TRUE(queue.pickForDispatch(2, 50).empty());
+
+    auto picked = queue.pickForDispatch(2, 70);
+
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+
+    status = queue.complete(admitted_ids[0], TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+    status = queue.complete(admitted_ids[0], TransferStatusEnum::PENDING);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.outstandingBytes(), 16u);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+}
+
+TEST(AdmissionQueueTest, RetainsTerminalStatusUntilBatchRetire) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(0, 16, QueueOwnerKind::User, {1})}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    TransferStatusEnum public_status = TransferStatusEnum::INVALID;
+    status = queue.getPublicStatus(1, 1, public_status);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(public_status, TransferStatusEnum::PENDING);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::FAILED);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.getPublicStatus(1, 0, public_status);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(public_status, TransferStatusEnum::FAILED);
+    status = queue.getPublicStatus(1, 1, public_status);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(public_status, TransferStatusEnum::FAILED);
+
+    status = queue.retireBatch(1);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    QueueOwnerId resolved_owner = 0;
+    status = queue.resolveOwner(1, 0, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+    status = queue.getPublicStatus(1, 1, public_status);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+}
+
+TEST(AdmissionQueueTest, RejectsRetireWithNonTerminalOwners) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1, 2, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.retireBatch(1);
+    EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
+
+    picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.retireBatch(1);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+}
+
+TEST(AdmissionQueueTest, AllowsBatchTokenReuseAfterRetire) {
+    LocalTransferAdmissionQueue queue({1, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+
+    auto picked = queue.pickForDispatch(1, 16);
+    ASSERT_EQ(picked.size(), 1u);
+    status = queue.complete(picked[0], TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    status = queue.retireBatch(1);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+
+    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 2u);
+
+    QueueOwnerId resolved_owner = 0;
+    status = queue.resolveOwner(1, 0, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, 2u);
 }
 
 }  // namespace
