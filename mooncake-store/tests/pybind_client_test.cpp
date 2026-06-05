@@ -300,7 +300,7 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
         py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
     ASSERT_TRUE(local_alloc.has_value());
     BufferHandle handle = std::move(*local_alloc);
-    auto *dst = static_cast<char *>(handle.ptr()) + 16;
+    auto* dst = static_cast<char*>(handle.ptr()) + 16;
     std::memset(handle.ptr(), 0, handle.size());
 
     auto bytes_read = py_client_->get_into(key, dst, test_data.size());
