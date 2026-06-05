@@ -243,7 +243,7 @@ For maximum performance, especially with RDMA networks, use the zero-copy API. T
 
 ⚠️ **Important**: `register_buffer` is required for zero-copy RDMA operations. Without proper buffer registration, undefined behavior and memory corruption may occur.
 
-Zero-copy operations require registering memory buffers with the store. For repeated reads and writes, prefer the Python `BufferPool` helper described below so you can reuse registered buffers instead of registering and unregistering on every operation.
+Zero-copy operations require registered memory buffers. For repeated reads and writes, prefer the Python `BufferPool` helper described below so leases come from the store's setup-time local buffer instead of registering and unregistering memory for every operation.
 
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
@@ -277,20 +277,14 @@ store.unregister_buffer(buffer_ptr)
 
 </details>
 
-#### Registered Buffer Pool Helper
+#### BufferPool Helper
 
-`BufferPool` keeps a bounded set of registered scratch buffers for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary registered memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
+`BufferPool` leases scratch buffers from the store's setup-time local buffer for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
 
 ```python
 from mooncake.buffer_pool import BufferPool
 
-pool = BufferPool(
-    store,
-    max_bytes=256 * 1024 * 1024,
-    min_size_class=64 * 1024,
-    max_size_class=16 * 1024 * 1024,
-    alignment=8 * 1024 * 1024,
-)
+pool = BufferPool(store)
 
 with pool.buffer(1024 * 1024) as lease:
     n = store.get_into("my_key", lease.ptr, lease.size)
@@ -303,15 +297,15 @@ pool.close()
 
 `acquire(size)` and `buffer(size)` return a lease object. A lease exposes:
 
-- `ptr`: the registered memory address to pass to zero-copy APIs.
+- `ptr`: the local-buffer address to pass to zero-copy APIs.
 - `size`: the requested logical size.
 - `buffer`: a Python `memoryview` over the logical requested size.
-- `release()`: returns the region to the pool, or unregisters it if it is oversized or the pool is closing.
+- `release()`: returns the local-buffer allocation to the store allocator.
 
 Behavior and lifecycle rules:
 
-- Requested sizes are rounded into reusable size classes up to `max_size_class`; larger requests are supported but are not reused.
-- `max_bytes` bounds the total registered memory owned by the pool.
+- Leases share the store local buffer with internal Store staging paths.
+- `max_regions` can limit the number of concurrently active external leases.
 - `acquire(size, block=False)` raises when the pool is exhausted instead of waiting.
 - `acquire(size, timeout=...)` can wait for another lease to be released.
 - Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
