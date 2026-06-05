@@ -130,6 +130,111 @@ store.close()
 
 </details>
 
+## Structured Object Store Helper
+
+`mooncake.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
+It is designed for cases such as rollout / batch transfer where callers want to keep their own object semantics locally while using Mooncake for fast payload movement.
+
+The helper separates two concepts:
+
+- **structured object path**: named members with metadata-aware materialization;
+- **generic bundle path**: manifest + named payloads when the caller only needs raw grouped objects.
+
+### Main types
+
+```python
+from mooncake.structured_object_store import (
+    MooncakeBundleTransfer,
+    StructuredMemberSlice,
+    StructuredObjectPayload,
+)
+```
+
+- `MooncakeBundleTransfer`: public helper facade built on a `MooncakeDistributedStore`.
+- `StructuredObjectPayload`: structured object to write. Members are passed in `buffers`, and optional object metadata is passed in `metadata`.
+- `StructuredMemberSlice`: slice selection for one structured member during reads.
+
+### Structured object write and full read
+
+Use `put_structured_object()` to write one structured object. The default read path is `read_spec(ref)`, and full-object materialization is just the default case of the partial-read API.
+
+```python
+import numpy as np
+from mooncake.store import MooncakeDistributedStore
+from mooncake.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
+
+store = MooncakeDistributedStore()
+transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
+
+payload = StructuredObjectPayload(
+    metadata={"step": 7, "layout": "rollout"},
+    buffers={
+        "tokens": np.array(range(24), dtype=np.int32).reshape(6, 4),
+        "mask": np.ones((6, 4), dtype=np.int8),
+        "prompt_ids": b"sample-ids",
+    },
+)
+
+ref = transfer.put_structured_object(payload)
+result = transfer.materialize(transfer.read_spec(ref))
+
+tokens = result.objects["tokens"]
+prompt_ids = result.objects["prompt_ids"]
+metadata = result.metadata
+```
+
+### Partial reads
+
+Read narrowing happens on top of `read_spec(ref)`:
+
+- `select_members([...])` keeps only selected members;
+- `slice_member(name, axis=0, start=..., end=...)` slices one ndarray member;
+- `materialize(spec)` returns newly materialized objects.
+
+```python
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize(spec)
+
+selected_tokens = result.objects["tokens"]
+```
+
+Current scope:
+
+- byte members support full-member reads;
+- ndarray members support full reads and sliced reads;
+- full read is the default `read_spec(ref)` case.
+
+### Reusing caller-owned destinations
+
+Use `materialize_into()` when the caller already owns the destination ndarray buffers and wants Mooncake to fill them directly.
+
+```python
+destination = np.empty((3, 4), dtype=np.int32)
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize_into(spec, {"tokens": destination})
+
+assert result.objects["tokens"] is destination
+```
+
+`materialize_into()` is only for members whose destination layout is already known to the caller. For byte members or default object reconstruction, use `materialize()`.
+
+### Generic bundle fallback
+
+If the caller does not need structured member semantics, the same helper also supports raw named bundles:
+
+- `put_bundle(...)`
+- `remove_bundle(...)`
+
+Use the bundle path when the object is just a manifest plus named payloads, and use the structured object path when callers want member selection, slicing, and ndarray-aware materialization.
+
 ## Zero-Copy API (Advanced Performance)
 
 For maximum performance, especially with RDMA networks, use the zero-copy API. This allows direct memory access without intermediate copies.
@@ -481,8 +586,36 @@ config.preferred_segment = self.get_hostname()
 
 ```python
 config = ReplicateConfig()
-config.prefer_alloc_in_same_node = "True
+config.prefer_alloc_in_same_node = "True"
 ```
+
+#### group_ids
+**Type:** `List[str] | None`
+**Default:** `None`
+**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped.
+
+For batch write APIs, the number of group IDs must match the number of keys:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a", "", "session-b"]
+
+store.put_batch(
+    ["key-a", "key-b", "key-c"],
+    [b"value-a", b"value-b", b"value-c"],
+    config,
+)
+```
+
+For a single-object write, provide one group ID:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a"]
+
+store.put("key-a", b"value-a", config)
+```
+
 ---
 
 ## Unified Parallel Tensor IO API
@@ -2715,8 +2848,6 @@ bind_to_numa_node(0)
 
 ---
 
----
-
 ## Error Handling
 
 Most methods return integer status codes:
@@ -2739,5 +2870,3 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 4. **Configure replication** appropriately - more replicas provide better availability but use more storage
 5. **Use soft pinning** for frequently accessed objects to keep them in memory
 6. **Choose RDMA protocol** when available for maximum performance
-
----

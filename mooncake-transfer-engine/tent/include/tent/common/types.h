@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,11 @@ namespace tent {
 
 using BatchID = uint64_t;
 using SegmentID = uint64_t;
+
+// QoS priority levels
+static constexpr uint8_t PRIO_HIGH = 0;
+static constexpr uint8_t PRIO_MEDIUM = 1;
+static constexpr uint8_t PRIO_LOW = 2;
 
 struct Notification {
     std::string name;
@@ -44,6 +50,10 @@ struct Request {
     SegmentID target_id;
     uint64_t target_offset;
     size_t length;
+    int priority =
+        PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
+    std::optional<std::string>
+        policy_name;  // Optional: bind to specific policy by name
 };
 
 enum TransferStatusEnum {

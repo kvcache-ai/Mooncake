@@ -163,7 +163,8 @@ jobs:
         cmake .. \
           -DUSE_ASCEND_DIRECT=ON \
           -DBUILD_EXAMPLES=OFF \
-          -DBUILD_UNIT_TESTS=OFF
+          -DBUILD_UNIT_TESTS=OFF \
+          -DENABLE_DEBUG_SYMBOLS=OFF
 
     - name: Build
       shell: bash

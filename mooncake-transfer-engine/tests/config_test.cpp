@@ -23,7 +23,10 @@ namespace {
 
 class PkeyIndexEnvTest : public ::testing::Test {
    protected:
-    void TearDown() override { ::unsetenv("MC_PKEY_INDEX"); }
+    void TearDown() override {
+        ::unsetenv("MC_PKEY_INDEX");
+        ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
+    }
 };
 
 TEST_F(PkeyIndexEnvTest, DefaultIsZeroWhenUnset) {
@@ -77,6 +80,29 @@ TEST_F(PkeyIndexEnvTest, EmptyStringKeepsDefault) {
     config.pkey_index = 4;
     loadGlobalConfig(config);
     EXPECT_EQ(config.pkey_index, 4);
+}
+
+TEST_F(PkeyIndexEnvTest, AutoGidRetriesDefaultsToTwoWhenUnset) {
+    ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
+    GlobalConfig config;
+    config.auto_gid_max_retries = 2;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.auto_gid_max_retries, 2);
+}
+
+TEST_F(PkeyIndexEnvTest, AutoGidRetriesAcceptsValidOverride) {
+    ASSERT_EQ(::setenv("MC_AUTO_GID_MAX_RETRIES", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.auto_gid_max_retries, 0);
+}
+
+TEST_F(PkeyIndexEnvTest, AutoGidRetriesRejectsOutOfRangeOverride) {
+    ASSERT_EQ(::setenv("MC_AUTO_GID_MAX_RETRIES", "99", 1), 0);
+    GlobalConfig config;
+    config.auto_gid_max_retries = 5;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.auto_gid_max_retries, 5);
 }
 
 }  // namespace

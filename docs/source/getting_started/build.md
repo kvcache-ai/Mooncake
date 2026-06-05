@@ -20,7 +20,7 @@ pip install mooncake-transfer-engine-non-cuda
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
 > **Note**: MLU support is currently source-build only. If you need Cambricon MLU memory support, install Neuware and build with `-DUSE_MLU=ON`.
 
-## Automatic
+## Automatic Build
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
@@ -45,7 +45,7 @@ pip install mooncake-transfer-engine-non-cuda
    sudo make install
    ```
 
-## Manual
+## Manual Build
 
 ### Recommended Version
 - cmake: 3.22.x
@@ -77,7 +77,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libhiredis-dev \
                        pkg-config \
                        patchelf
-
+    
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -100,11 +100,14 @@ pip install mooncake-transfer-engine-non-cuda
     ```
 
 2. If you want to compile the GPUDirect support module, first follow the instructions in https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ to install CUDA (ensure to enable `nvidia-fs` for proper `cuFile` module compilation). After that:
-    1) Follow Section 3.7 in https://docs.nvidia.com/cuda/gpudirect-rdma/ to install `nvidia-peermem` for enabling GPU-Direct RDMA
-    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cuFile`, `cudart`, and other libraries during compilation:
+    1) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `cuFile`, `cudart`, and other libraries during compilation:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
+    ```
+    ```{admonition} GPU-Direct RDMA
+    :class: note
+    Mooncake could use the DMA-BUF path for GPU-Direct RDMA, which does **not** require the `nvidia-peermem` kernel module. If you prefer the DMA-BUF path, please set the runtime environment variable `WITH_NVIDIA_PEERMEM=0` before starting Mooncake. If you prefer the legacy `ibv_reg_mr` path (which requires `nvidia-peermem`), set the runtime environment variable `WITH_NVIDIA_PEERMEM=1`. See Section 3.7 of https://docs.nvidia.com/cuda/gpudirect-rdma/ for instructions on installing `nvidia-peermem`.
     ```
 
 3. If you want to compile the Moore Mthreads GPUDirect support module, first follow the instructions in https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide to install MUSA. After that:
@@ -149,7 +152,20 @@ pip install mooncake-transfer-engine-non-cuda
     - `-DMACA_LIB_DIR=/path/to/maca/lib64`
     - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"` (semicolon-separated CMake list)
 
-6. Install yalantinglibs
+6. If you want to compile Huawei Ascend NPU support, first install the Ascend CANN Toolkit following the instructions at https://www.hiascend.com/document. After that:
+    1) Source `set_env.sh` in the CANN installation directory to configure the build environment (no need to manually set `ASCEND_HOME_PATH` or other related environment variables).
+    2) Mooncake provides two Ascend NPU transport paths, choose one as needed:
+       - `-DUSE_ASCEND_DIRECT=ON` (**recommended**): Ascend Direct transport based on the ADXL engine. (refer to [Version Compatibility Guide](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md) for details).
+       - `-DUSE_UBSHMEM=ON`: Shared memory transport based on CANN VMM APIs (requires CANN >= 9.0.0, driver >= 26.0.0, Lingqu >= 1.5).
+
+    Example for building with Ascend NPU:
+    ```bash
+    source /usr/local/Ascend/cann/set_env.sh
+    cmake .. -DUSE_ASCEND_DIRECT=ON
+    make -j
+    ```
+
+7. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -159,7 +175,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-7. In the root directory of this project, run the following commands:
+8. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -167,7 +183,7 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-8. Install Mooncake python package and mooncake_master executable
+9. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -256,3 +272,5 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: Enable Ascend Direct transport and HCCS support via the ADXL engine (**recommended**). 
+- `-DUSE_UBSHMEM=[ON|OFF]`: Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs.

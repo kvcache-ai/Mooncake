@@ -81,6 +81,8 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
         return {.ret = -1, .status = status, .retryable = true};
     }
 
+    recordConnectedSegment(local_engine_idx, target_adxl_engine_name);
+
     if (params_.use_short_connection) {
         disconnect(local_engine_idx, target_adxl_engine_name,
                    params_.connect_timeout);

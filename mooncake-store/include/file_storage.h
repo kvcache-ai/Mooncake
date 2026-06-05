@@ -51,6 +51,7 @@ class FileStorage {
 
    private:
     friend class FileStorageTest;
+    friend class FileStoragePromotionTest;
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -74,7 +75,7 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> OffloadObjects(
-        const std::unordered_map<std::string, int64_t>& offloading_objects);
+        const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
@@ -82,9 +83,23 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
+     * 4. Pulls and processes any pending L2->L1 promotion tasks queued by the
+     *    master (mirror of step 1+2 in the reverse direction).
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
+
+    /**
+     * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
+     * Pulls promotion work from the master, stages a MEMORY replica for each
+     * key, copies the bytes from local SSD into that replica, and notifies the
+     * master on success. A failure on any single key is logged and skipped;
+     * the master-side reaper decrements the source replica's refcnt and
+     * erases the task entry on TTL expiry, and any orphaned PROCESSING
+     * MEMORY replica is reaped via the standard discarded-replicas path.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -92,7 +107,7 @@ class FileStorage {
         std::unordered_map<std::string, Slice>& batch_object);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
-        const std::vector<std::string>& keys,
+        const std::vector<std::string>& keys, const std::string& tenant_id,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
@@ -102,6 +117,13 @@ class FileStorage {
         const std::vector<int64_t>& sizes);
 
     void ClientBufferGCThreadFunc();
+
+    /**
+     * @brief Re-registers all offloaded objects with the master.
+     * Called after master restart recovery to sync SSD object metadata.
+     * This is the same logic as the ScanMeta step in Init().
+     */
+    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
@@ -121,6 +143,8 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::future<void> rescan_future_;
+    std::atomic<bool> metadata_resync_pending_{false};
 };
 
 }  // namespace mooncake

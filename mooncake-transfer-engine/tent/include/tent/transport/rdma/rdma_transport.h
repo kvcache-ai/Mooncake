@@ -120,6 +120,11 @@ class RdmaTransport : public Transport {
     bool installed_;
     std::shared_ptr<Config> conf_;
     std::string local_segment_name_;
+    // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
+    // rdma_server_name_ holds the RDMA-reachable address for NIC path
+    // construction, while local_segment_name_ keeps the TCP-reachable
+    // address for P2P routing.
+    std::string rdma_server_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     LocalBufferManager local_buffer_manager_;

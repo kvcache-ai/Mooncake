@@ -2,8 +2,15 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
+option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+
+if(ENABLE_DEBUG_SYMBOLS)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
@@ -124,6 +131,7 @@ if (ENABLE_MULTI_PROTOCOL)
 endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
+option(USE_MLX5DV "enable mlx5 direct verbs (libmlx5) for QP UDP source port override" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
 if (USE_LRU_MASTER)

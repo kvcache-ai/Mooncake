@@ -7,6 +7,7 @@ install(FILES multi_transport.h DESTINATION include)
 install(FILES topology.h DESTINATION include)
 install(FILES transfer_engine.h DESTINATION include)
 install(FILES transfer_metadata.h DESTINATION include)
+install(FILES ub_allocator.h DESTINATION include)
 install(FILES common/base/status.h DESTINATION include/common/base)
 install(FILES transport/transport.h DESTINATION include/transport)
 

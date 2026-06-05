@@ -128,7 +128,10 @@ class MooncakeStoreService:
                     self.config.local_buffer_size,
                     self.config.protocol,
                     self.config.device_name,
-                    self.config.master_server_address
+                    self.config.master_server_address,
+                    None,
+                    self.config.enable_ssd_offload,
+                    self.config.ssd_offload_path
                 )
 
                 if ret != 0:

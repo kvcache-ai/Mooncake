@@ -23,6 +23,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace mooncake {
 
@@ -49,6 +50,7 @@ struct GlobalConfig {
     int workers_per_ctx = 2;
     size_t slice_size = 65536;
     int retry_cnt = 9;
+    int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
     bool metacache = true;
     int log_level = google::INFO;
@@ -63,6 +65,16 @@ struct GlobalConfig {
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
+    // mlx5 QP UDP source ports for ECMP path diversification.
+    // Empty = no modification. QP at index i uses
+    // mlx5_qp_udp_sports[i % size]. Requires mlx5 device + RoCEv2,
+    // and the binary must be built with USE_MLX5DV.
+    std::vector<uint16_t> mlx5_qp_udp_sports;
+    // mlx5 QP LAG port balancing. When enabled, QPs are distributed across
+    // physical LAG ports: QP at index i is pinned to port (i % num_lag_ports)
+    // + 1. num_lag_ports is queried from hardware; if the device is not in LAG
+    // mode the setting is a no-op. Requires USE_MLX5DV.
+    bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;

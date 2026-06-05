@@ -1,11 +1,14 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <string_view>
 
 #include <glog/logging.h>
+
+#include "types.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -23,6 +26,8 @@ using common::redis::ConnectRedis;
 using common::redis::IsStringReply;
 using common::redis::RedisReplyPtr;
 using common::redis::SanitizeHashTagComponent;
+
+#ifdef STORE_USE_REDIS
 
 tl::expected<long long, ErrorCode> ParseSnapshotScore(
     std::string_view snapshot_id) {
@@ -67,8 +72,6 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
     }
     return descriptor.value();
 }
-
-#ifdef STORE_USE_REDIS
 
 constexpr char kPublishSnapshotScript[] = R"LUA(
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
@@ -315,10 +318,15 @@ ErrorCode RedisSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
 
 ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
     const ClusterNamespace& cluster_namespace) {
-    if (cluster_namespace.empty()) {
-        return "mooncake";
+    if (!cluster_namespace.empty()) {
+        return cluster_namespace;
     }
-    return cluster_namespace;
+
+    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (env_cluster_id != nullptr && *env_cluster_id != '\0') {
+        return env_cluster_id;
+    }
+    return DEFAULT_CLUSTER_ID;
 }
 
 std::string RedisSnapshotCatalogStore::BuildLatestKey(
