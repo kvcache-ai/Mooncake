@@ -1,13 +1,24 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#if !defined(__MUSA__)
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAContext.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <torch/torch.h>
+#endif
+#include <ATen/ATen.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+#else
+// MUSA device compilation: minimal includes to avoid mcc compiler crash
+#include <cstddef>
+#include <cstdint>
+#endif
+
+#include <cuda_alike.h>
 #include <transfer_engine.h>
 
 #include <memory>
@@ -17,7 +28,30 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef MOONCAKE_EP_USE_MUSA
+#define cudaDeviceSynchronize musaDeviceSynchronize
+#define cudaError cudaError_t
+#define cudaErrorNotReady musaErrorNotReady
+#define cudaEventCreateWithFlags musaEventCreateWithFlags
+#define cudaEventDestroy musaEventDestroy
+#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventQuery musaEventQuery
+#define cudaEventRecord musaEventRecord
+#define cudaFuncAttributes musaFuncAttributes
+#define cudaFuncGetAttributes musaFuncGetAttributes
+#define cudaHostAlloc musaHostAlloc
+#define cudaHostAllocMapped musaHostAllocMapped
+#endif
+
 namespace mooncake {
+
+#if !defined(__MUSA__)
+#ifdef MOONCAKE_EP_USE_MUSA
+using GPUStream = at::musa::MUSAStream;
+#else
+using GPUStream = at::cuda::CUDAStream;
+#endif
+#endif
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
@@ -36,19 +70,27 @@ struct TransferGroupMeta {
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
+#if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
+#endif
     bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
+#if !defined(__MUSA__)
     c10::intrusive_ptr<::c10d::Store> store;
+#endif
     int bufferBaseIndex;
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };
 
-__global__ struct Task {
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+    struct Task {
     volatile bool active = false;
-    c10d::OpType opType = c10d::OpType::UNKNOWN;
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
@@ -57,6 +99,7 @@ __global__ struct Task {
     void* transferGroupMeta;
 };
 
+#if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
@@ -90,11 +133,11 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& issue_stream,
+        const GPUStream& issue_stream,
         const std::function<void(void* dst, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
+                                 const GPUStream&)>& tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& bufferToTensor);
+                                 const GPUStream&)>& bufferToTensor);
 
     void Start();
 
@@ -159,6 +202,7 @@ class MooncakeWorkerManager {
     // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
+#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 

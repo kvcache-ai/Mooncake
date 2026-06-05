@@ -83,6 +83,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyDefault musaMemcpyDefault
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
@@ -96,6 +97,8 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStream_t musaStream_t
+#define cudaEvent_t musaEvent_t
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
 #define cudaSuccess musaSuccess
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaEvent_t musaEvent_t
