@@ -1407,9 +1407,13 @@ auto MasterService::AllocateAndInsertMetadata(
             preferred_segments = config.preferred_segments;
         }
 
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
-            preferred_segments);
+            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
+            &ssd_access);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -2206,12 +2210,33 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
             [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
-        metadata.EraseReplicas([&client_id](const Replica& replica) {
-            return replica.is_local_disk_replica() &&
-                   replica.get_descriptor()
-                           .get_local_disk_descriptor()
-                           .client_id == client_id;
-        });
+        // Pop matching replicas and track their total size
+        auto erased =
+            metadata.PopReplicas([&client_id](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id;
+            });
+
+        int64_t evicted_size = 0;
+        for (const auto& replica : erased) {
+            evicted_size += replica.get_descriptor()
+                                .get_local_disk_descriptor()
+                                .object_size;
+        }
+
+        // Decrement SSD usage tracking
+        if (evicted_size > 0) {
+            ScopedLocalDiskSegmentAccess ssd_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& client_segments = ssd_access.getClientLocalDiskSegment();
+            auto disk_it = client_segments.find(client_id);
+            if (disk_it != client_segments.end()) {
+                disk_it->second->ssd_used_bytes.fetch_sub(
+                    evicted_size, std::memory_order_relaxed);
+            }
+        }
     } else {
         LOG(ERROR) << "key=" << key
                    << ", error=invalid_replica_type_for_eviction";
@@ -3238,6 +3263,25 @@ auto MasterService::NotifyOffloadSuccess(
             return tl::make_unexpected(res.error());
         }
     }
+
+    // Track SSD usage for the client
+    {
+        int64_t total_ssd_increment = 0;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            total_ssd_increment += metadatas[i].data_size;
+        }
+        if (total_ssd_increment > 0) {
+            ScopedLocalDiskSegmentAccess ssd_access =
+                segment_manager_.getLocalDiskSegmentAccess();
+            auto& client_segments = ssd_access.getClientLocalDiskSegment();
+            auto disk_it = client_segments.find(client_id);
+            if (disk_it != client_segments.end()) {
+                disk_it->second->ssd_used_bytes.fetch_add(
+                    total_ssd_increment, std::memory_order_relaxed);
+            }
+        }
+    }
+
     return {};
 }
 
