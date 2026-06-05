@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -2377,6 +2378,7 @@ void MasterService::RestoreFromStandbySnapshot(
 
     // 2. Build allocator keepalive map for standby segments.
     standby_allocator_keepalive_.clear();
+    invalid_replica_endpoints_.clear();
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
             standby_allocator_keepalive_[seg.transport_endpoint] =
@@ -2389,78 +2391,96 @@ void MasterService::RestoreFromStandbySnapshot(
     }
 
     // 3. Restore object metadata.
-    for (const auto& entry : objects) {
-        const auto& key = entry.key;
-        const auto& standby_meta = entry.metadata;
-        std::vector<Replica> replicas;
-        replicas.reserve(standby_meta.replicas.size());
-
-        for (const auto& desc : standby_meta.replicas) {
-            if (desc.is_memory_replica()) {
-                const auto& mem_desc = desc.get_memory_descriptor();
-                const std::string& endpoint =
-                    mem_desc.buffer_descriptor.transport_endpoint_;
-                auto it = standby_allocator_keepalive_.find(endpoint);
-                if (it != standby_allocator_keepalive_.end()) {
-                    auto alloc = it->second;
-                    replicas.emplace_back(
-                        std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
-                        desc.status);
-                } else {
-                    invalid_replica_endpoints_.insert(endpoint);
-                }
-            } else if (desc.is_nof_replica()) {
-                const auto& nof_desc = desc.get_nof_descriptor();
-                const std::string& endpoint =
-                    nof_desc.buffer_descriptor.transport_endpoint_;
-                auto it = standby_allocator_keepalive_.find(endpoint);
-                if (it != standby_allocator_keepalive_.end()) {
-                    auto alloc = it->second;
-                    replicas.emplace_back(
-                        std::make_unique<AllocatedBuffer>(alloc, nullptr, 0),
-                        desc.status, ReplicaType::NOF_SSD);
-                } else {
-                    invalid_replica_endpoints_.insert(endpoint);
-                }
-            } else if (desc.is_disk_replica()) {
-                const auto& disk_desc = desc.get_disk_descriptor();
-                replicas.emplace_back(disk_desc.file_path,
-                                      disk_desc.object_size, desc.status);
-            } else if (desc.is_local_disk_replica()) {
-                const auto& local_disk_desc = desc.get_local_disk_descriptor();
-                replicas.emplace_back(
-                    local_disk_desc.client_id, local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status);
-            }
-        }
-
-        auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(key);
+    const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
+        auto [scoped_tenant_id, user_key] =
+            TenantId::ParseScopedKey(entry.key);
         TenantId tenant_id(entry.tenant_id);
         if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
             tenant_id = std::move(scoped_tenant_id);
         }
+        return std::make_pair(std::move(tenant_id), std::move(user_key));
+    };
+
+    std::unordered_map<size_t, std::vector<const StandbyObjectEntry*>>
+        objects_by_shard;
+    for (const auto& entry : objects) {
+        auto [tenant_id, user_key] = resolve_standby_object(entry);
         if (!tenant_id.IsValid()) {
             LOG(WARNING) << "RestoreFromStandbySnapshot: invalid tenant_id="
-                         << entry.tenant_id << ", key=" << key
+                         << entry.tenant_id << ", key=" << entry.key
                          << ", skipping";
             continue;
         }
-        auto shard_idx = getMetadataShardIndex(tenant_id, user_key);
+        const auto shard_idx = entry.metadata.group_id.empty()
+                                   ? getShardIndex(tenant_id, user_key)
+                                   : getShardIndex(entry.metadata.group_id);
+        objects_by_shard[shard_idx].push_back(&entry);
+    }
+
+    for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
         auto now = std::chrono::system_clock::now();
-        auto& tenant_state = shard->tenants[tenant_id];
-        tenant_state.metadata.emplace(
-            std::piecewise_construct, std::forward_as_tuple(user_key),
-            std::forward_as_tuple(standby_meta.client_id, now,
-                                  standby_meta.size, std::move(replicas), false,
-                                  false, standby_meta.data_type,
-                                  standby_meta.group_id,
-                                  tenant_id, user_key));
-        if (!standby_meta.group_id.empty()) {
-            RegisterGroupMember(tenant_state, tenant_id, user_key,
-                                standby_meta.group_id);
+        for (const auto* entry_ptr : shard_objects) {
+            const auto& entry = *entry_ptr;
+            auto [tenant_id, user_key] = resolve_standby_object(entry);
+            const auto& standby_meta = entry.metadata;
+            std::vector<Replica> replicas;
+            replicas.reserve(standby_meta.replicas.size());
+
+            for (const auto& desc : standby_meta.replicas) {
+                if (desc.is_memory_replica()) {
+                    const auto& mem_desc = desc.get_memory_descriptor();
+                    const std::string& endpoint =
+                        mem_desc.buffer_descriptor.transport_endpoint_;
+                    auto it = standby_allocator_keepalive_.find(endpoint);
+                    if (it != standby_allocator_keepalive_.end()) {
+                        auto alloc = it->second;
+                        replicas.emplace_back(std::make_unique<AllocatedBuffer>(
+                                                  alloc, nullptr, 0),
+                                              desc.status);
+                    } else {
+                        invalid_replica_endpoints_.insert(endpoint);
+                    }
+                } else if (desc.is_nof_replica()) {
+                    const auto& nof_desc = desc.get_nof_descriptor();
+                    const std::string& endpoint =
+                        nof_desc.buffer_descriptor.transport_endpoint_;
+                    auto it = standby_allocator_keepalive_.find(endpoint);
+                    if (it != standby_allocator_keepalive_.end()) {
+                        auto alloc = it->second;
+                        replicas.emplace_back(std::make_unique<AllocatedBuffer>(
+                                                  alloc, nullptr, 0),
+                                              desc.status,
+                                              ReplicaType::NOF_SSD);
+                    } else {
+                        invalid_replica_endpoints_.insert(endpoint);
+                    }
+                } else if (desc.is_disk_replica()) {
+                    const auto& disk_desc = desc.get_disk_descriptor();
+                    replicas.emplace_back(disk_desc.file_path,
+                                          disk_desc.object_size, desc.status);
+                } else if (desc.is_local_disk_replica()) {
+                    const auto& local_disk_desc =
+                        desc.get_local_disk_descriptor();
+                    replicas.emplace_back(
+                        local_disk_desc.client_id, local_disk_desc.object_size,
+                        local_disk_desc.transport_endpoint, desc.status);
+                }
+            }
+
+            auto& tenant_state = shard->tenants[tenant_id];
+            tenant_state.metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(user_key),
+                std::forward_as_tuple(
+                    standby_meta.client_id, now, standby_meta.size,
+                    std::move(replicas), false, false, standby_meta.data_type,
+                    standby_meta.group_id, tenant_id, user_key));
+            if (!standby_meta.group_id.empty()) {
+                RegisterGroupMember(tenant_state, tenant_id, user_key,
+                                    standby_meta.group_id);
+            }
+            tenant_state.processing_keys.erase(user_key);
         }
-        tenant_state.processing_keys.erase(user_key);
     }
 
     // 4. Log the result.
@@ -10161,7 +10181,21 @@ void MasterService::PendingMutationWorker() {
                                        return m.next_retry_at <= now;
                                    });
             if (it == pending_mutations_.end()) {
-                pending_mutations_cv_.wait_for(lock, std::chrono::seconds(1));
+                if (pending_mutations_.empty()) {
+                    pending_mutations_cv_.wait(lock, [this] {
+                        return !pending_mutations_running_.load() ||
+                               !pending_mutations_.empty();
+                    });
+                } else {
+                    auto earliest = std::min_element(
+                        pending_mutations_.begin(), pending_mutations_.end(),
+                        [](const PendingMutation& lhs,
+                           const PendingMutation& rhs) {
+                            return lhs.next_retry_at < rhs.next_retry_at;
+                        });
+                    pending_mutations_cv_.wait_until(lock,
+                                                     earliest->next_retry_at);
+                }
                 continue;
             }
             mutation = std::move(*it);
