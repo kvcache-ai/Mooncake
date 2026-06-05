@@ -2147,7 +2147,7 @@ void P2PClientService::RegisterHttpMethods() {
 
     using namespace coro_http;
 
-    // /get?key=<key>
+    // curl "localhost:9003/get?key=test_key"
     http_server_->set_http_handler<GET>(
         "/get", [this](coro_http_request& req, coro_http_response& resp) {
             auto key_view = req.get_query_value("key");
@@ -2179,7 +2179,7 @@ void P2PClientService::RegisterHttpMethods() {
                             buffer->size()));
         });
 
-    // /put?key=<key>
+    // curl -X POST -d "hello world" "localhost:9003/put?key=test_key"
     http_server_->set_http_handler<POST>(
         "/put", [this](coro_http_request& req, coro_http_response& resp) {
             auto key_view = req.get_query_value("key");
@@ -2223,7 +2223,7 @@ void P2PClientService::RegisterHttpMethods() {
             resp.set_status_and_content(status_type::ok, "OK");
         });
 
-    // /remove_local?key=<key>
+    // curl -X POST "localhost:9003/remove_local?key=test_key"
     http_server_->set_http_handler<POST>(
         "/remove_local",
         [this](coro_http_request& req, coro_http_response& resp) {
@@ -2244,7 +2244,7 @@ void P2PClientService::RegisterHttpMethods() {
             resp.set_status_and_content(status_type::ok, "OK");
         });
 
-    // /remove_all_local
+    // curl -X POST "localhost:9003/remove_all_local"
     http_server_->set_http_handler<POST>(
         "/remove_all_local",
         [this](coro_http_request& req, coro_http_response& resp) {
