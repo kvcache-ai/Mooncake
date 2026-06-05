@@ -3,7 +3,13 @@ import os
 import tempfile
 import unittest
 
-from mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE
+from mooncake.mooncake_config import (
+    MooncakeConfig,
+    DEFAULT_GLOBAL_SEGMENT_SIZE,
+    DEFAULT_LOCAL_BUFFER_SIZE,
+    _parse_segment_size,
+)
+
 
 class TestMooncakeConfig(unittest.TestCase):
     def setUp(self):
@@ -129,6 +135,69 @@ class TestMooncakeConfig(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
         self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
+
+
+class TestParseSegmentSize(unittest.TestCase):
+    def test_integer_passthrough(self):
+        self.assertEqual(_parse_segment_size(1024), 1024)
+        self.assertEqual(_parse_segment_size(0), 0)
+
+    def test_float_passthrough(self):
+        self.assertEqual(_parse_segment_size(1.5), 1)
+
+    def test_bytes_string(self):
+        self.assertEqual(_parse_segment_size("1024"), 1024)
+        self.assertEqual(_parse_segment_size("  2048  "), 2048)
+
+    def test_kb_suffix(self):
+        self.assertEqual(_parse_segment_size("1kb"), 1024)
+        self.assertEqual(_parse_segment_size("1KB"), 1024)
+        self.assertEqual(_parse_segment_size("512k"), 512 * 1024)
+        self.assertEqual(_parse_segment_size("1.5kb"), int(1.5 * 1024))
+
+    def test_mb_suffix(self):
+        self.assertEqual(_parse_segment_size("1mb"), 1024 ** 2)
+        self.assertEqual(_parse_segment_size("512MB"), 512 * 1024 ** 2)
+        self.assertEqual(_parse_segment_size("1m"), 1024 ** 2)
+
+    def test_gb_suffix(self):
+        self.assertEqual(_parse_segment_size("1gb"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("3GB"), 3 * 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1g"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1.5gb"), int(1.5 * 1024 ** 3))
+
+    def test_tb_suffix(self):
+        self.assertEqual(_parse_segment_size("1tb"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1TB"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1t"), 1024 ** 4)
+
+    def test_b_suffix(self):
+        self.assertEqual(_parse_segment_size("4096b"), 4096)
+        self.assertEqual(_parse_segment_size("4096B"), 4096)
+
+    def test_empty_string_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("")
+        with self.assertRaises(ValueError):
+            _parse_segment_size("   ")
+
+    def test_missing_number_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("gb")
+        with self.assertRaises(ValueError):
+            _parse_segment_size("mb")
+
+    def test_bare_float_string(self):
+        self.assertEqual(_parse_segment_size("1.5"), 1)
+        self.assertEqual(_parse_segment_size("1e9"), 1000000000)
+
+    def test_invalid_string_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("abc")
+
+    def test_whitespace_handling(self):
+        self.assertEqual(_parse_segment_size("  3 gb  "), 3 * 1024 ** 3)
+
 
 if __name__ == '__main__':
     unittest.main()
