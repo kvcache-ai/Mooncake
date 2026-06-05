@@ -152,17 +152,22 @@ TEST_F(HARecoveryManagerTest, BasicStateMachineSmoke) {
     EXPECT_EQ(mgr->GetState(), HAClientState::DEGRADED);
     EXPECT_TRUE(mgr->IsDegraded());
 
-    // DEGRADED -> SYNCING (no data_manager: pipeline exits fast)
+    // DEGRADED -> SYNCING -> FULL (no data_manager: pipeline completes
+    // instantly, so SYNCING may be unobservable by the time we check).
     mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     auto state = mgr->GetState();
-    EXPECT_TRUE(state == HAClientState::SYNCING);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    state = mgr->GetState();
-    EXPECT_TRUE(state == HAClientState::FULL);
+    EXPECT_TRUE(state == HAClientState::SYNCING || state == HAClientState::FULL)
+        << "Expected SYNCING or FULL, got " << static_cast<int>(state);
 
+    // Wait for recovery to settle at FULL.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(mgr->GetState(), HAClientState::FULL);
+
+    // FULL + MASTER_RECONNECTED -> SYNCING -> FULL again (same race).
     mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
     state = mgr->GetState();
-    EXPECT_TRUE(state == HAClientState::SYNCING);
+    EXPECT_TRUE(state == HAClientState::SYNCING || state == HAClientState::FULL)
+        << "Expected SYNCING or FULL, got " << static_cast<int>(state);
 }
 
 TEST_F(HARecoveryManagerTest, DuplicateUnreachableIsNoop) {

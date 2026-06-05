@@ -43,8 +43,8 @@ class ClientMetaTest : public ::testing::Test {
         segment.id = {1, 1};
         segment.name = "test_segment";
         segment.size = 1024 * 1024;
-        segment.extra =
-            CentralizedSegmentExtraData{.base = 0x100000000, .te_endpoint = ""};
+        segment.extra = CentralizedSegmentExtraData{
+            .base = 0x100000000, .te_endpoint = "", .protocol = ""};
         return segment;
     }
 };
@@ -219,8 +219,8 @@ TEST_F(ClientMetaTest, ConcurrentHealthChangeAndMount) {
             segment.id = {100, (uint64_t)i};
             segment.name = "seg_" + std::to_string(i);
             segment.size = 1024 * 1024;
-            segment.extra = CentralizedSegmentExtraData{.base = 0x200000000,
-                                                        .te_endpoint = ""};
+            segment.extra = CentralizedSegmentExtraData{
+                .base = 0x200000000, .te_endpoint = "", .protocol = ""};
 
             auto res = meta->MountSegment(segment);
             if (res.has_value()) {

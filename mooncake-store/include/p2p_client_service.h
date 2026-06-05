@@ -34,13 +34,12 @@ class P2PClientService final : public ClientService {
      * @param local_ip IP address of the local node.
      * @param te_port TE port of the local node.
      * @param metadata_connstring Connection string for metadata server.
-     * @param metrics_port Port for metrics HTTP server.
-     * @param enable_metrics_http Whether to enable metrics HTTP server.
+     * @param http_port Port for HTTP server.
+     * @param enable_http_server Whether to enable HTTP server.
      * @param labels Optional labels for client metrics.
      */
     P2PClientService(const std::string& metadata_connstring,
-                     uint16_t metrics_port = 9003,
-                     bool enable_metrics_http = true,
+                     uint16_t http_port = 9003, bool enable_http_server = true,
                      const std::map<std::string, std::string>& labels = {});
 
     virtual ~P2PClientService();
@@ -183,6 +182,13 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<long, ErrorCode> RemoveAllLocal() override;
 
+    /**
+     * @brief Removes a single object from THIS client's local tiered storage.
+     * @param key Key to remove
+     * @return ErrorCode indicating success/failure.
+     */
+    tl::expected<void, ErrorCode> RemoveLocal(const ObjectKey& key) override;
+
     MasterClient& GetMasterClient() override { return master_client_; }
 
     ClientMetric* GetMetrics() override { return metrics_.get(); }
@@ -197,6 +203,7 @@ class P2PClientService final : public ClientService {
      *        3. init tiered backend and data manager
      */
     ErrorCode InitStorage(const P2PClientConfig& config);
+
     /**
      * @brief build add replica callback.
      *        when tier add replica, call master to update metadata
@@ -491,6 +498,7 @@ class P2PClientService final : public ClientService {
 
    private:
     void OnHAEvent(HAEvent event) override;
+    void RegisterHttpMethods() override;
 
    private:
     std::unique_ptr<P2PClientMetric> metrics_;

@@ -728,7 +728,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
             if (tier_it != entry->replicas.end()) {
                 if (notify_master && remove_replica_callback_) {
                     auto result = remove_replica_callback_(
-                        key, tier_it->second->loc.tier->GetTierId(), DELETE);
+                        key, tier_it->second->loc.tier->GetTierId());
                     if (!result.has_value()) {
                         LOG(ERROR)
                             << "Failed to Delete key " << key << " in Tier "
@@ -789,22 +789,25 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
             LOG(ERROR) << "Key not found: " << key;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        UUID invalid_id{0, 0};
-        if (notify_master && remove_replica_callback_) {
-            auto result = remove_replica_callback_(key, invalid_id, DELETE_ALL);
-            if (!result.has_value()) {
-                LOG(ERROR) << "Failed to Delete key " << key
-                           << " for Master, error_code=" << result.error();
-                return tl::make_unexpected(result.error());
-            }
-        }
-
         auto entry = it->second;
 
         {
             std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
             handles_to_free.reserve(entry->replicas.size());
             for (auto& replica : entry->replicas) {
+                if (notify_master && remove_replica_callback_) {
+                    UUID segment_id = replica.first;
+                    if (replica.second && replica.second->loc.tier) {
+                        segment_id = replica.second->loc.tier->GetTierId();
+                    }
+                    auto result = remove_replica_callback_(key, segment_id);
+                    if (!result.has_value()) {
+                        LOG(WARNING)
+                            << "Delete(all-tiers): notify master failed"
+                            << ", key=" << key << ", segment_id=" << segment_id
+                            << ", error_code=" << result.error();
+                    }
+                }
                 handles_to_free.push_back(replica.second);
             }
             entry->replicas.clear();
@@ -860,8 +863,7 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
                     if (handle && handle->loc.tier) {
                         segment_id = handle->loc.tier->GetTierId();
                     }
-                    auto result =
-                        remove_replica_callback_(key, segment_id, DELETE);
+                    auto result = remove_replica_callback_(key, segment_id);
                     if (!result.has_value()) {
                         LOG(WARNING)
                             << "RemoveAll: notify master failed"

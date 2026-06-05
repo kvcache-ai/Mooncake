@@ -33,8 +33,8 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})");
 
-    EXPECT_EQ(p2p_config.metrics_port, 9003);
-    EXPECT_TRUE(p2p_config.enable_metrics_http);
+    EXPECT_EQ(p2p_config.http_port, 9003);
+    EXPECT_TRUE(p2p_config.enable_http_server);
 
     // Test P2P config with custom metrics settings
     auto p2p_config_custom = ClientConfigBuilder::build_p2p_real_client(
@@ -42,21 +42,21 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
         nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9005,   // metrics_port
-        false,  // enable_metrics_http
+        9005,   // http_port
+        false,  // enable_http_server
         {}      // labels
     );
 
-    EXPECT_EQ(p2p_config_custom.metrics_port, 9005);
-    EXPECT_FALSE(p2p_config_custom.enable_metrics_http);
+    EXPECT_EQ(p2p_config_custom.http_port, 9005);
+    EXPECT_FALSE(p2p_config_custom.enable_http_server);
 
     // Test Centralized config with default metrics settings
     auto centralized_config =
         ClientConfigBuilder::build_centralized_real_client(
             "127.0.0.1", "http://127.0.0.1:8080/metadata");
 
-    EXPECT_EQ(centralized_config.metrics_port, 9003);
-    EXPECT_TRUE(centralized_config.enable_metrics_http);
+    EXPECT_EQ(centralized_config.http_port, 9003);
+    EXPECT_TRUE(centralized_config.enable_http_server);
 
     // Test Centralized config with custom metrics settings
     auto centralized_config_custom =
@@ -64,13 +64,13 @@ TEST_F(ClientHttpMetricsTest, ConfigBuilderMetricsSettings) {
             "127.0.0.1", "http://127.0.0.1:8080/metadata", "tcp", std::nullopt,
             "127.0.0.1:50051", 0, 0, nullptr, "",
             false,  // enable_offload
-            9006,   // metrics_port
-            false,  // enable_metrics_http
+            9006,   // http_port
+            false,  // enable_http_server
             {}      // labels
         );
 
-    EXPECT_EQ(centralized_config_custom.metrics_port, 9006);
-    EXPECT_FALSE(centralized_config_custom.enable_metrics_http);
+    EXPECT_EQ(centralized_config_custom.http_port, 9006);
+    EXPECT_FALSE(centralized_config_custom.enable_http_server);
 }
 
 // Test metrics disabled scenario
@@ -80,12 +80,12 @@ TEST_F(ClientHttpMetricsTest, MetricsDisabled) {
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
         nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9003,  // metrics_port
-        false  // enable_metrics_http = false
+        9003,  // http_port
+        false  // enable_http_server = false
     );
 
-    EXPECT_EQ(config.metrics_port, 9003);
-    EXPECT_FALSE(config.enable_metrics_http);
+    EXPECT_EQ(config.http_port, 9003);
+    EXPECT_FALSE(config.enable_http_server);
 }
 
 // Test with labels
@@ -98,16 +98,16 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
         "127.0.0.1:50051",
         R"({"tiers": [{"type": "memory", "capacity": 1073741824}]})", 0,
         nullptr, "", 12345, 2, 1024, 300 * 1024 * 1024, 5 * 60 * 1000, "te", 32,
-        9003,   // metrics_port
-        true,   // enable_metrics_http
+        9003,   // http_port
+        true,   // enable_http_server
         labels  // labels
     );
 
     EXPECT_EQ(config.labels.size(), 2);
     EXPECT_EQ(config.labels["instance_id"], "test_instance");
     EXPECT_EQ(config.labels["cluster_id"], "test_cluster");
-    EXPECT_EQ(config.metrics_port, 9003);
-    EXPECT_TRUE(config.enable_metrics_http);
+    EXPECT_EQ(config.http_port, 9003);
+    EXPECT_TRUE(config.enable_http_server);
 }
 
 // Test HTTP server endpoints directly

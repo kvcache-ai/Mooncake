@@ -48,12 +48,6 @@ struct TierView {
 };
 
 /**
- * @enum REMOVE_CALLBACK_TYPE
- * @brief The type of metadata synchronization callback.
- */
-enum REMOVE_CALLBACK_TYPE { DELETE = 0, DELETE_ALL = 1 };
-
-/**
  * @struct AllocationEntry
  * @brief The internal state of an allocation.
  * acts as the "Control Block" for the resource.
@@ -89,10 +83,10 @@ using AddReplicaCallback = std::function<tl::expected<void, ErrorCode>(
 
 /**
  * @brief Callback for metadata synchronization when a replica is removed.
- * Returns true if sync succeeds, false otherwise.
+ * Returns OK on success.
  */
 using RemoveReplicaCallback = std::function<tl::expected<void, ErrorCode>(
-    std::string_view key, const UUID& tier_id, enum REMOVE_CALLBACK_TYPE type)>;
+    std::string_view key, const UUID& tier_id)>;
 
 /**
  * @brief Result of TieredBackend::conditionalExecute.

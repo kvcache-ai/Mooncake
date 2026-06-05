@@ -24,10 +24,9 @@ namespace mooncake {
 
 CentralizedClientService::CentralizedClientService(
     const std::string& metadata_connstring, const std::string& protocol,
-    uint16_t metrics_port, bool enable_metrics_http,
+    uint16_t http_port, bool enable_http_server,
     const std::map<std::string, std::string>& labels)
-    : ClientService(metadata_connstring, metrics_port, enable_metrics_http,
-                    labels),
+    : ClientService(metadata_connstring, http_port, enable_http_server, labels),
       metrics_(ClientMetric::Create(labels)),
       protocol_(protocol),
       master_client_(client_id_,
@@ -166,6 +165,8 @@ ErrorCode CentralizedClientService::Init(
 
     InitTransferSubmitter();
 
+    InitLocalBufferAllocator(config.local_buffer_size, config.protocol);
+
     is_running_ = true;
 
     auto reg = RegisterClient();
@@ -268,6 +269,8 @@ ErrorCode CentralizedClientService::Init(
 
     // Start heartbeat AFTER all initialization is complete
     StartHeartbeat(master_server_entry);
+
+    StartHttpServer();
 
     return ErrorCode::OK;
 }

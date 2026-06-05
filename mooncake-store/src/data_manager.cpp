@@ -1818,15 +1818,31 @@ std::vector<RemoteBufferDesc> DataManager::SlicesToRemoteBufferDescs(
 // Delete / Exist
 // ================================================================
 
-tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
+tl::expected<std::pair<UUID, uint64_t>, ErrorCode> DataManager::Query(
     std::string_view key) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
+        if (handle.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to query key: " << key
+                       << ", error: " << toString(handle.error());
+        }
         return tl::unexpected(handle.error());
     }
     auto& loc = handle.value()->loc;
-    size_t size = loc.data.buffer ? loc.data.buffer->size() : 0;
-    return size;
+    UUID segment_id = loc.tier ? loc.tier->GetTierId() : UUID{0, 0};
+    uint64_t object_size = loc.data.buffer ? loc.data.buffer->size() : 0;
+    return std::make_pair(segment_id, object_size);
+}
+
+tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
+    std::string_view key) {
+    auto info = Query(key);
+    if (!info) {
+        LOG(ERROR) << "Failed to query object size for key: " << key
+                   << ", error: " << toString(info.error());
+        return tl::unexpected(info.error());
+    }
+    return info.value().second;
 }
 
 tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,

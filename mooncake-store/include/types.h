@@ -206,7 +206,6 @@ enum class ErrorCode : int32_t {
     SHUTTING_DOWN = -1600,  ///< Store is shutting down, rejecting new requests.
     ASYNC_ENQUEUE_FAILED = -1601,  ///< Async metadata notifier enqueue failed
                                    ///< (queue full/stopped).
-    INACCESSIBLE_MASTER = -1602
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

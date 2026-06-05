@@ -38,10 +38,9 @@ inline bool IsAlreadyExistsError(ErrorCode err) {
 // ============================================================================
 
 P2PClientService::P2PClientService(
-    const std::string& metadata_connstring, uint16_t metrics_port,
-    bool enable_metrics_http, const std::map<std::string, std::string>& labels)
-    : ClientService(metadata_connstring, metrics_port, enable_metrics_http,
-                    labels),
+    const std::string& metadata_connstring, uint16_t http_port,
+    bool enable_http_server, const std::map<std::string, std::string>& labels)
+    : ClientService(metadata_connstring, http_port, enable_http_server, labels),
       metrics_(P2PClientMetric::Create(labels)),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr) {}
@@ -177,7 +176,13 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
         return err;
     }
 
-    // 7. Initialize async route notifier if enabled
+    // 7. Initialize shared buffer allocator
+    constexpr size_t kDefaultHttpPoolSize = 64ULL * 1024 * 1024;
+    size_t pool_size = config.local_buffer_size > 0 ? config.local_buffer_size
+                                                    : kDefaultHttpPoolSize;
+    InitLocalBufferAllocator(pool_size, config.protocol);
+
+    // 8. Initialize async route notifier if enabled
     if (config.async_sender_thread_count > 0) {
         // When async ADD is rejected by Master, delete the local replica
         // since Master won't track it.
@@ -205,7 +210,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
-    // 8. Start P2P client RPC service
+    // 9. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_, metrics_.get());
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
@@ -232,7 +237,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
     LOG(INFO) << "P2P RPC server started on port " << client_rpc_port_;
 
-    // 9. If started in FULL state, notify master that sync is complete.
+    // 10. If started in FULL state, notify master that sync is complete.
     //    If in DEGRADED state, heartbeat will recover later.
     if (!ha_manager_->IsDegraded()) {
         ha_manager_->SetSyncCompleted();
@@ -241,7 +246,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << "establish master connection when available";
     }
 
-    // 10. Mark service as ready for recovery. HA recovery thread can now
+    // 11. Mark service as ready for recovery. HA recovery thread can now
     // proceed.
     ha_manager_->SetReadyForRecovery();
 
@@ -321,6 +326,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
                              config.route_cache_ttl_ms);
     }
 
+    StartHttpServer();
+
     return ErrorCode::OK;
 }
 
@@ -341,35 +348,20 @@ AddReplicaCallback P2PClientService::BuildAddReplicaCallback() {
 }
 
 RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
-    return
-        [this](
-            std::string_view key, const UUID& tier_id,
-            enum REMOVE_CALLBACK_TYPE type) -> tl::expected<void, ErrorCode> {
-            // In degraded mode, skip metadata notification to Master.
-            // The recovery pipeline will re-sync all local metadata,
-            // and Master will discard routes for keys that no longer
-            // exist locally.
-            if (ha_manager_ && ha_manager_->IsDegraded()) {
-                return {};
-            }
-            if (type == REMOVE_CALLBACK_TYPE::DELETE) {
-                if (async_route_notifier_) {
-                    return async_route_notifier_->EnqueueRemove(key, tier_id);
-                }
-                return SyncRemoveReplica(key, tier_id);
-            } else if (type == REMOVE_CALLBACK_TYPE::DELETE_ALL) {
-                // TODO:
-                // Currently Master does not support deleting all replicas of a
-                // key within a client. The future will be implemented in
-                // future.
-                LOG(ERROR) << "DELETE_ALL callback is not supported"
-                           << ", key: " << key;
-                return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
-            }
-
-            LOG(ERROR) << "Unknown callback type: " << static_cast<int>(type);
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        };
+    return [this](std::string_view key,
+                  const UUID& tier_id) -> tl::expected<void, ErrorCode> {
+        // In degraded mode, skip metadata notification to Master.
+        // The recovery pipeline will re-sync all local metadata,
+        // and Master will discard routes for keys that no longer
+        // exist locally.
+        if (ha_manager_ && ha_manager_->IsDegraded()) {
+            return {};
+        }
+        if (async_route_notifier_) {
+            return async_route_notifier_->EnqueueRemove(key, tier_id);
+        }
+        return SyncRemoveReplica(key, tier_id);
+    };
 }
 
 tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
@@ -1831,14 +1823,40 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
 
-    // DEGRADED: return empty result (local-only, no Master query)
+    // 1) Local first
+    if (data_manager_.has_value()) {
+        auto local = data_manager_->Query(object_key);
+        if (local.has_value()) {
+            P2PProxyDescriptor proxy;
+            proxy.client_id = client_id_;
+            proxy.segment_id = local.value().first;
+            proxy.ip_address = local_ip_;
+            proxy.rpc_port = client_rpc_port_;
+            proxy.object_size = local.value().second;
+
+            Replica::Descriptor desc;
+            desc.descriptor_variant = std::move(proxy);
+            desc.status = ReplicaStatus::COMPLETE;
+
+            std::vector<Replica::Descriptor> replicas;
+            replicas.push_back(std::move(desc));
+            return std::make_unique<QueryResult>(std::move(replicas));
+        }
+        if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "fail to query local object"
+                       << ", key=" << object_key << ", error=" << local.error();
+            return tl::make_unexpected(local.error());
+        }
+    }
+
+    // 2) Local miss + DEGRADED: master unreachable, treat as not found.
     if (ha_manager_ && ha_manager_->IsDegraded()) {
         LOG(WARNING) << "fail to access master"
                      << ", key=" << object_key;
-        return tl::make_unexpected(ErrorCode::INACCESSIBLE_MASTER);
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    // Query master for replica list
+    // 3) Local miss + healthy: fall back to master.
     auto result = master_client_.GetReplicaList(object_key, config);
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
@@ -1939,6 +1957,28 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAllLocal() {
     }
     LOG(INFO) << "RemoveAllLocal: removed " << result.value() << " local keys";
     return result.value();
+}
+
+tl::expected<void, ErrorCode> P2PClientService::RemoveLocal(
+    const ObjectKey& key) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    auto result = data_manager_->Delete(key);
+    if (!result.has_value()) {
+        LOG(ERROR) << "fail to call Delete"
+                   << ", key=" << key << ", error_code=" << result.error();
+        return tl::make_unexpected(result.error());
+    }
+    LOG(INFO) << "RemoveLocal: removed key=" << key;
+    return {};
 }
 
 // ============================================================================
@@ -2076,6 +2116,148 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         co_return;
     }
     promise->setValue(tl::expected<void, ErrorCode>{});
+}
+
+// ============================================================================
+// HTTP data-ops endpoints
+// ============================================================================
+
+namespace {
+
+// Map ErrorCode to a sensible HTTP status. Defaults to 500 for unknown codes.
+coro_http::status_type ErrorToHttpStatus(ErrorCode err) {
+    using ST = coro_http::status_type;
+    switch (err) {
+        case ErrorCode::OBJECT_NOT_FOUND:
+            return ST::not_found;
+        case ErrorCode::SHUTTING_DOWN:
+            return ST::service_unavailable;
+        case ErrorCode::INVALID_PARAMS:
+            return ST::bad_request;
+        default:
+            return ST::internal_server_error;
+    }
+}
+
+}  // namespace
+
+void P2PClientService::RegisterHttpMethods() {
+    if (!http_server_) return;
+    ClientService::RegisterHttpMethods();
+
+    using namespace coro_http;
+
+    // curl "localhost:9003/get?key=test_key"
+    http_server_->set_http_handler<GET>(
+        "/get", [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+
+            if (!local_buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            }
+
+            auto result = Get(key, local_buffer_allocator_, {});
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            const auto& buffer = result.value();
+            resp.add_header("Content-Type", "application/octet-stream");
+            resp.set_status_and_content(
+                status_type::ok,
+                std::string(static_cast<const char*>(buffer->ptr()),
+                            buffer->size()));
+        });
+
+    // curl -X POST -d "hello world" "localhost:9003/put?key=test_key"
+    http_server_->set_http_handler<POST>(
+        "/put", [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+            auto body = req.get_body();
+
+            if (!local_buffer_allocator_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer allocator not initialized");
+                return;
+            } else if (body.size() == 0) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing body");
+                return;
+            }
+
+            auto alloc_result = local_buffer_allocator_->allocate(body.size());
+            if (!alloc_result) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "buffer pool exhausted");
+                return;
+            }
+            auto& buf_handle = *alloc_result;
+            memcpy(buf_handle.ptr(), body.data(), body.size());
+
+            Slice slice{static_cast<char*>(buf_handle.ptr()), body.size()};
+            std::vector<Slice> slices{slice};
+            auto result = Put(key, slices, WriteRouteRequestConfig{});
+
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // curl -X POST "localhost:9003/remove_local?key=test_key"
+    http_server_->set_http_handler<POST>(
+        "/remove_local",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto key_view = req.get_query_value("key");
+            if (key_view.empty()) {
+                resp.set_status_and_content(status_type::bad_request,
+                                            "Missing key parameter");
+                return;
+            }
+            std::string key(key_view);
+            auto result = RemoveLocal(key);
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // curl -X POST "localhost:9003/remove_all_local"
+    http_server_->set_http_handler<POST>(
+        "/remove_all_local",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = RemoveAllLocal();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.set_status_and_content(status_type::ok,
+                                        std::to_string(result.value()));
+        });
 }
 
 }  // namespace mooncake

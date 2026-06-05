@@ -238,6 +238,16 @@ class ClientService {
     }
 
     /**
+     * @brief Removes a single object from this Client's LOCAL tiered storage.
+     * @param key Key to remove
+     * @return ErrorCode indicating success/failure.
+     */
+    virtual tl::expected<void, ErrorCode> RemoveLocal(const ObjectKey& key) {
+        (void)key;
+        return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+    }
+
+    /**
      * @brief Registers a memory segment to master for allocation
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
@@ -373,16 +383,24 @@ class ClientService {
     }
 
     /**
-     * @brief Gets the metrics HTTP server port.
-     * @return The port number, or 0 if metrics server is disabled.
+     * @brief Gets the HTTP server port.
+     * @return The port number, or 0 if HTTP server is disabled.
      */
-    uint16_t GetMetricsPort() const { return metrics_port_; }
+    uint16_t GetHttpPort() const { return http_port_; }
 
     /**
-     * @brief Checks if metrics HTTP server is enabled.
+     * @brief Checks if HTTP server is enabled.
      * @return True if enabled, false otherwise.
      */
-    bool IsMetricsHttpEnabled() const { return enable_metrics_http_; }
+    bool IsHttpServerEnabled() const { return http_server_ != nullptr; }
+
+    /**
+     * @brief Returns the shared buffer allocator (TE-registered pool).
+     *        May be nullptr if local_buffer_size was 0.
+     */
+    std::shared_ptr<ClientBufferAllocator> GetBufferAllocator() const {
+        return local_buffer_allocator_;
+    }
 
     /**
      * @brief Gets the health status for the /health endpoint.
@@ -435,7 +453,7 @@ class ClientService {
      * @brief Private constructor to enforce creation through Create() method
      */
     ClientService(const std::string& metadata_connstring,
-                  uint16_t metrics_port = 9003, bool enable_metrics_http = true,
+                  uint16_t http_port = 9003, bool enable_http_server = true,
                   const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -523,18 +541,30 @@ class ClientService {
     virtual HeartbeatRequest build_heartbeat_request() = 0;
 
     /**
-     * @brief Starts the metrics HTTP server.
-     * @param enable_metrics_http Whether to enable the HTTP server.
-     * @param metrics_port Port to use.
-     * @return The actual port number, or 0 if disabled.
+     * @brief Registers HTTP handlers on the http_server_ instance.
+     * No-op when the HTTP server is disabled.
      */
-    uint16_t StartMetricsHttpServer(bool enable_metrics_http,
-                                    uint16_t metrics_port);
+    virtual void RegisterHttpMethods();
 
     /**
-     * @brief Stops the metrics HTTP server.
+     * @brief Starts the HTTP server.
      */
-    void StopMetricsHttpServer();
+    void StartHttpServer();
+
+    /**
+     * @brief Stops the HTTP server.
+     */
+    void StopHttpServer();
+
+    /**
+     * @brief Creates and TE-registers a shared buffer pool.
+     * @param pool_size Size in bytes (0 = skip, local_buffer_allocator_ stays
+     * null).
+     * @param protocol Transport protocol for memory allocation.
+     * @param use_hugepage Whether to allocate with huge pages.
+     */
+    void InitLocalBufferAllocator(size_t pool_size, const std::string& protocol,
+                                  bool use_hugepage = false);
 
     /**
      * @brief Registers the client into the master server.
@@ -635,10 +665,10 @@ class ClientService {
     SharedMutex running_rw_mtx_;
     bool is_running_ GUARDED_BY(running_rw_mtx_) = false;
 
-    // Metrics HTTP server
-    std::unique_ptr<coro_http::coro_http_server> metrics_http_server_;
-    uint16_t metrics_port_ = 0;  // 0 means disabled
-    bool enable_metrics_http_ = true;
+    std::unique_ptr<coro_http::coro_http_server> http_server_;
+    uint16_t http_port_ = 0;  // 0 means disabled
+
+    std::shared_ptr<ClientBufferAllocator> local_buffer_allocator_;
 };
 
 }  // namespace mooncake

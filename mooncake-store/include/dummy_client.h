@@ -139,6 +139,8 @@ class DummyClient : public PyClient {
 
     long removeAllLocal() override;
 
+    int removeLocal(const std::string& key) override;
+
     int isExist(const std::string& key) override;
 
     std::vector<int> batchIsExist(

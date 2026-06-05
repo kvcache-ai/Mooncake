@@ -193,28 +193,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     }
     client_service_ = *client_opt;
 
-    // Local_buffer_size is allowed to be 0 when we use separately deployment.
-    // If it is 0, skip registering local memory in real client.
-    // Dummy Client can create shm and share it with Real Client.
-    // Moreover, invoke ibv_reg_mr() with size=0 is UB, and may
-    // fail in some rdma implementations.
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        config.local_buffer_size, this->protocol, should_use_hugepage);
-    if (config.local_buffer_size > 0) {
-        LOG(INFO) << "Registering local memory: " << config.local_buffer_size
-                  << " bytes";
-        auto result = client_service_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), config.local_buffer_size,
-            kWildcardLocation, false, true);
-        if (!result.has_value()) {
-            LOG(ERROR) << "Failed to register local memory: "
-                       << toString(result.error());
-            return tl::unexpected(result.error());
-        }
-    } else {
-        LOG(INFO) << "Local buffer size is 0, skip registering local memory";
-    }
-
     // Start IPC server to accept FD from dummy clients
     if (!ipc_socket_path_.empty()) {
         if (start_ipc_server() != 0) {
@@ -271,23 +249,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     // Gracefully stop accepting new requests and drain in-flight operations
     client_service_->Stop();
-
-    // Unregister local memory after stopping the service
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
-        auto unregister_result = client_service_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
-        }
-    }
-
     client_service_->Destroy();
 
     // Reset all resources
     client_service_.reset();
-    client_buffer_allocator_.reset();
     device_name = "";
     protocol = "";
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
@@ -369,8 +334,8 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
 
 int RealClient::put(const std::string& key, std::span<const char> value,
                     const WriteConfig& config) {
-    return to_py_ret(
-        put_internal(key, value, config, client_buffer_allocator_));
+    return to_py_ret(put_internal(key, value, config,
+                                  client_service_->GetBufferAllocator()));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_batch_internal(
@@ -461,8 +426,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
 int RealClient::put_batch(const std::vector<std::string>& keys,
                           const std::vector<std::span<const char>>& values,
                           const WriteConfig& config) {
-    return to_py_ret(
-        put_batch_internal(keys, values, config, client_buffer_allocator_));
+    return to_py_ret(put_batch_internal(keys, values, config,
+                                        client_service_->GetBufferAllocator()));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_parts_internal(
@@ -545,8 +510,8 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
 int RealClient::put_parts(const std::string& key,
                           std::vector<std::span<const char>> values,
                           const WriteConfig& config) {
-    return to_py_ret(
-        put_parts_internal(key, values, config, client_buffer_allocator_));
+    return to_py_ret(put_parts_internal(key, values, config,
+                                        client_service_->GetBufferAllocator()));
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
@@ -601,6 +566,19 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAllLocal_internal() {
 
 long RealClient::removeAllLocal() {
     return to_py_ret(removeAllLocal_internal());
+}
+
+tl::expected<void, ErrorCode> RealClient::removeLocal_internal(
+    const std::string& key) {
+    if (!client_service_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_service_->RemoveLocal(key);
+}
+
+int RealClient::removeLocal(const std::string& key) {
+    return to_py_ret(removeLocal_internal(key));
 }
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
@@ -872,13 +850,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(
     const std::string& key, const ReadRouteConfig& config) {
-    return get_buffer_internal(key, client_buffer_allocator_, config);
+    return get_buffer_internal(key, client_service_->GetBufferAllocator(),
+                               config);
 }
 
 std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
     const std::string& key, const ReadRouteConfig& config) {
     auto buffer_handle =
-        get_buffer_internal(key, client_buffer_allocator_, config);
+        get_buffer_internal(key, client_service_->GetBufferAllocator(), config);
     if (!buffer_handle) {
         LOG(ERROR) << "Failed to get buffer for key: " << key;
         return std::make_tuple(0, 0);
@@ -941,8 +920,8 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string>& keys,
         return final_results;
     }
 
-    auto results =
-        client_service_->BatchGet(keys, client_buffer_allocator_, config);
+    auto results = client_service_->BatchGet(
+        keys, client_service_->GetBufferAllocator(), config);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         if (results[i]) {

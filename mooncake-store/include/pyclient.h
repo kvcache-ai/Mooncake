@@ -100,6 +100,8 @@ class PyClient {
 
     virtual long removeAllLocal() = 0;
 
+    virtual int removeLocal(const std::string& key) = 0;
+
     virtual int isExist(const std::string& key) = 0;
 
     virtual std::vector<int> batchIsExist(
@@ -125,7 +127,6 @@ class PyClient {
         const UUID& task_id) = 0;
 
     std::shared_ptr<mooncake::ClientService> client_service_ = nullptr;
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
 
 }  // namespace mooncake

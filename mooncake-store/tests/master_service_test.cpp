@@ -37,8 +37,10 @@ class MasterServiceTest : public ::testing::Test {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
-        segment.extra = CentralizedSegmentExtraData{
-            .base = static_cast<uintptr_t>(base), .te_endpoint = segment.name};
+        segment.extra =
+            CentralizedSegmentExtraData{.base = static_cast<uintptr_t>(base),
+                                        .te_endpoint = segment.name,
+                                        .protocol = ""};
         segment.size = size;
         return segment;
     }
