@@ -249,30 +249,40 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
 
-    for (const auto& entry : owners_) {
-        const auto& owner = entry.second;
+    const PublicTaskKey batch_begin{batch_token, 0};
+    auto public_begin = public_to_owner_.lower_bound(batch_begin);
+    auto public_end = public_to_owner_.upper_bound(
+        {batch_token, std::numeric_limits<size_t>::max()});
+
+    std::set<QueueOwnerId> owner_ids;
+    for (auto it = public_begin; it != public_end; ++it) {
+        owner_ids.insert(it->second);
+    }
+
+    for (const auto owner_id : owner_ids) {
+        auto owner_it = owners_.find(owner_id);
+        if (owner_it == owners_.end()) {
+            return Status::InternalError(
+                "queue owner mapping is stale" LOC_MARK);
+        }
+
+        const auto& owner = owner_it->second;
+        if (owner.batch_token != batch_token) {
+            return Status::InternalError(
+                "queue owner batch token mismatch" LOC_MARK);
+        }
         const bool terminal = owner.state == QueueState::Completed ||
                               owner.state == QueueState::Failed;
-        if (owner.batch_token == batch_token && !terminal) {
+        if (!terminal) {
             return Status::InvalidEntry(
                 "batch has non-terminal queue owners" LOC_MARK);
         }
     }
 
-    for (auto it = owners_.begin(); it != owners_.end();) {
-        if (it->second.batch_token == batch_token) {
-            it = owners_.erase(it);
-        } else {
-            ++it;
-        }
+    for (const auto owner_id : owner_ids) {
+        owners_.erase(owner_id);
     }
-    for (auto it = public_to_owner_.begin(); it != public_to_owner_.end();) {
-        if (it->first.first == batch_token) {
-            it = public_to_owner_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    public_to_owner_.erase(public_begin, public_end);
     return Status::OK();
 }
 
