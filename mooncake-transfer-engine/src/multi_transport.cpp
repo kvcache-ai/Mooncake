@@ -422,6 +422,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {
+        delete transport;
         return nullptr;
     }
 
