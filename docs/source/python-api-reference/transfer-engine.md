@@ -817,3 +817,32 @@ The Transfer Engine Python API is thread-safe for most operations. However, it's
 2. **Transfer Failures**: Verify target hostname is correct and network connectivity is established
 3. **Memory Issues**: Ensure sufficient system memory and proper buffer alignment
 4. **Performance Issues**: Check RDMA device configuration and network topology
+
+## Compile-time Feature Support Attributes
+
+The `mooncake.engine` module provides boolean attributes that indicate whether specific features were enabled during compilation:
+
+### Module Attributes
+
+- `engine.SUPPORT_CUDA`: Whether CUDA support is enabled
+- `engine.SUPPORT_EFA`: Whether EFA (Elastic Fabric Adapter) support is enabled
+- `engine.SUPPORT_HIP`: Whether HIP (Heterogeneous-compute Interface for Portability) support is enabled
+- `engine.SUPPORT_MNNVL`: Whether MNNVL transport protocol support is enabled
+- `engine.SUPPORT_INTRA_NVLINK`: Whether intra-node NVLink support is enabled
+
+### Usage Example
+
+```python
+from mooncake import engine
+
+# Check if CUDA is supported
+if engine.SUPPORT_CUDA:
+    print("CUDA support is available")
+
+# Check all features
+print(f"CUDA: {engine.SUPPORT_CUDA}")
+print(f"EFA: {engine.SUPPORT_EFA}")
+print(f"HIP: {engine.SUPPORT_HIP}")
+print(f"MNNVL: {engine.SUPPORT_MNNVL}")
+print(f"Intra-NVLink: {engine.SUPPORT_INTRA_NVLINK}")
+```
