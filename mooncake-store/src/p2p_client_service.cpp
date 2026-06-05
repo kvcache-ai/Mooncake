@@ -2147,7 +2147,7 @@ void P2PClientService::RegisterHttpMethods() {
 
     using namespace coro_http;
 
-    // GET /get?key=<key>
+    // /get?key=<key>
     http_server_->set_http_handler<GET>(
         "/get", [this](coro_http_request& req, coro_http_response& resp) {
             auto key_view = req.get_query_value("key");
@@ -2179,8 +2179,8 @@ void P2PClientService::RegisterHttpMethods() {
                             buffer->size()));
         });
 
-    // PUT /put?key=<key>
-    http_server_->set_http_handler<PUT>(
+    // /put?key=<key>
+    http_server_->set_http_handler<POST>(
         "/put", [this](coro_http_request& req, coro_http_response& resp) {
             auto key_view = req.get_query_value("key");
             if (key_view.empty()) {
@@ -2223,8 +2223,8 @@ void P2PClientService::RegisterHttpMethods() {
             resp.set_status_and_content(status_type::ok, "OK");
         });
 
-    // DELETE /remove_local?key=<key>
-    http_server_->set_http_handler<http_method::DEL>(
+    // /remove_local?key=<key>
+    http_server_->set_http_handler<POST>(
         "/remove_local",
         [this](coro_http_request& req, coro_http_response& resp) {
             auto key_view = req.get_query_value("key");
@@ -2244,8 +2244,8 @@ void P2PClientService::RegisterHttpMethods() {
             resp.set_status_and_content(status_type::ok, "OK");
         });
 
-    // DELETE /remove_all_local
-    http_server_->set_http_handler<http_method::DEL>(
+    // /remove_all_local
+    http_server_->set_http_handler<POST>(
         "/remove_all_local",
         [this](coro_http_request& req, coro_http_response& resp) {
             auto result = RemoveAllLocal();

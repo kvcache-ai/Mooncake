@@ -11,7 +11,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <async_simple/coro/SyncAwait.h>
 
 #include <csignal>
 #include <cstdint>
@@ -91,17 +90,11 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
         return client.get(url);
     }
 
-    static coro_http::resp_data HttpPut(const std::string& url,
-                                        std::string body) {
+    static coro_http::resp_data HttpPost(const std::string& url,
+                                         std::string body = "") {
         coro_http::coro_http_client client;
-        return async_simple::coro::syncAwait(client.async_put(
-            url, std::move(body), coro_http::req_content_type::octet_stream));
-    }
-
-    static coro_http::resp_data HttpDelete(const std::string& url) {
-        coro_http::coro_http_client client;
-        return async_simple::coro::syncAwait(
-            client.async_delete(url, "", coro_http::req_content_type::none));
+        return client.post(url, std::move(body),
+                           coro_http::req_content_type::octet_stream);
     }
 
     static InProcP2PMaster master_;
@@ -123,7 +116,7 @@ TEST_F(P2PClientHttpEndpointsTest, HttpPutThenGet) {
     const std::string key = "http_put_then_get";
     const std::string body = "hello-from-http";
 
-    auto put_resp = HttpPut(Url("/put", "key=" + key), body);
+    auto put_resp = HttpPost(Url("/put", "key=" + key), body);
     ASSERT_EQ(put_resp.status, 200) << "PUT failed: status=" << put_resp.status
                                     << " body=" << put_resp.resp_body;
 
@@ -153,9 +146,9 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveLocalCycle) {
     const std::string key = "http_remove_local_cycle";
     const std::string body = "to_be_removed_via_http";
 
-    ASSERT_EQ(HttpPut(Url("/put", "key=" + key), body).status, 200);
+    ASSERT_EQ(HttpPost(Url("/put", "key=" + key), body).status, 200);
 
-    auto del_resp = HttpDelete(Url("/remove_local", "key=" + key));
+    auto del_resp = HttpPost(Url("/remove_local", "key=" + key));
     ASSERT_EQ(del_resp.status, 200)
         << "DELETE failed: status=" << del_resp.status
         << " body=" << del_resp.resp_body;
@@ -166,7 +159,7 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveLocalCycle) {
 }
 
 TEST_F(P2PClientHttpEndpointsTest, HttpRemoveLocalMissingKeyParam) {
-    auto resp = HttpDelete(Url("/remove_local"));
+    auto resp = HttpPost(Url("/remove_local"));
     EXPECT_NE(resp.status, 200)
         << "Server unexpectedly accepted /remove_local without ?key=";
 }
@@ -177,7 +170,7 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveLocalMissingKeyParam) {
 
 TEST_F(P2PClientHttpEndpointsTest, HttpRemoveAllLocal) {
     // Baseline so the count assertion below is exact.
-    auto baseline = HttpDelete(Url("/remove_all_local"));
+    auto baseline = HttpPost(Url("/remove_all_local"));
     ASSERT_EQ(baseline.status, 200)
         << "Baseline /remove_all_local failed: " << baseline.resp_body;
 
@@ -186,12 +179,12 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveAllLocal) {
     for (int i = 0; i < kNumKeys; ++i) {
         std::string key = "http_remove_all_local_" + std::to_string(i);
         std::string body = "payload_" + std::to_string(i);
-        ASSERT_EQ(HttpPut(Url("/put", "key=" + key), body).status, 200)
+        ASSERT_EQ(HttpPost(Url("/put", "key=" + key), body).status, 200)
             << "PUT failed for " << key;
         keys.push_back(std::move(key));
     }
 
-    auto del_resp = HttpDelete(Url("/remove_all_local"));
+    auto del_resp = HttpPost(Url("/remove_all_local"));
     ASSERT_EQ(del_resp.status, 200)
         << "DELETE /remove_all_local failed: status=" << del_resp.status
         << " body=" << del_resp.resp_body;
