@@ -112,6 +112,7 @@ design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
 design/conductor/indexer-api-design
+design/ssd-free-ratio-first-allocation
 :::
 
 % API Documentation
