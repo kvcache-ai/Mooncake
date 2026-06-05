@@ -25,19 +25,27 @@ def create_store() -> MooncakeDistributedStore:
     return store
 
 
-def test_registered_buffer_pool_reuses_released_buffer() -> None:
+def test_registered_buffer_pool_acquires_released_buffer() -> None:
     store = create_store()
-    pool = BufferPool(store, 1024 * 1024, min_size_class=4096, alignment=4096)
+    pool = BufferPool(store, min_size_class=4096, alignment=4096)
 
     lease = pool.acquire(1234)
-    ptr = lease.ptr
     lease.buffer[:4] = b"abcd"
     assert bytes(lease.buffer[:4]) == b"abcd"
     lease.release()
 
-    reused = pool.acquire(2048)
-    assert reused.ptr == ptr
-    reused.release()
+    next_lease = pool.acquire(2048)
+    next_lease.release()
+    pool.close()
+
+
+def test_registered_buffer_pool_uses_store_local_buffer_by_default() -> None:
+    store = create_store()
+    pool = BufferPool(store)
+
+    lease = pool.acquire(1024)
+    assert lease.size == 1024
+    lease.release()
     pool.close()
 
 
@@ -58,14 +66,12 @@ def test_registered_buffer_pool_prewarm_and_close() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_returns_aligned_buffers() -> None:
+def test_registered_buffer_pool_uses_local_buffer_alignment() -> None:
     store = create_store()
-    pool = BufferPool(
-        store, 1024 * 1024, min_size_class=4096, alignment=65536
-    )
+    pool = BufferPool(store, min_size_class=4096, alignment=65536)
 
     lease = pool.acquire(1024)
-    assert lease.ptr % 65536 == 0
+    assert lease.ptr % 64 == 0
     lease.release()
     pool.close()
 
@@ -94,10 +100,10 @@ def test_registered_buffer_pool_nonblocking_exhaustion() -> None:
     store = create_store()
     pool = BufferPool(
         store,
-        4096,
         min_size_class=4096,
         max_size_class=4096,
         alignment=4096,
+        max_regions=1,
         block_on_exhaustion=False,
     )
 
@@ -112,10 +118,10 @@ def test_registered_buffer_pool_timeout_allows_late_release() -> None:
     store = create_store()
     pool = BufferPool(
         store,
-        4096,
         min_size_class=4096,
         max_size_class=4096,
         alignment=4096,
+        max_regions=1,
     )
     lease = pool.acquire(1)
     acquired = []
@@ -138,10 +144,10 @@ def test_registered_buffer_pool_blocking_acquire_releases_gil() -> None:
     store = create_store()
     pool = BufferPool(
         store,
-        4096,
         min_size_class=4096,
         max_size_class=4096,
         alignment=4096,
+        max_regions=1,
     )
     lease = pool.acquire(1)
     acquired = []

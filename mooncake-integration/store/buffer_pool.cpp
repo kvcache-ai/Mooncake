@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -26,6 +27,52 @@
 namespace py = pybind11;
 
 namespace mooncake {
+namespace {
+
+constexpr char kPyClientCapsuleName[] = "mooncake.PyClient.shared_ptr";
+constexpr char kPyClientCapsuleMethod[] = "_get_pyclient_capsule";
+
+std::shared_ptr<PyClient> unwrap_pyclient_capsule(py::object capsule) {
+    if (capsule.is_none()) {
+        return nullptr;
+    }
+    if (!PyCapsule_CheckExact(capsule.ptr())) {
+        throw std::runtime_error(
+            "store wrapper returned a non-capsule PyClient handle");
+    }
+    py::capsule py_client_capsule(capsule);
+    const char *capsule_name = py_client_capsule.name();
+    if (capsule_name == nullptr ||
+        std::strcmp(capsule_name, kPyClientCapsuleName) != 0) {
+        throw std::runtime_error(
+            "store wrapper returned an unexpected PyClient capsule type");
+    }
+    auto *ptr = static_cast<std::shared_ptr<PyClient> *>(
+        py_client_capsule.get_pointer());
+    if (ptr == nullptr) {
+        throw std::runtime_error(
+            "store wrapper returned an empty PyClient capsule");
+    }
+    return *ptr;
+}
+
+std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
+    if (store_obj.is_none()) {
+        return nullptr;
+    }
+    try {
+        return store_obj.cast<std::shared_ptr<PyClient>>();
+    } catch (const py::cast_error &) {
+    }
+    if (!py::hasattr(store_obj, kPyClientCapsuleMethod)) {
+        throw std::runtime_error(
+            "RegisteredBufferPool store parameter must be a PyClient or store "
+            "wrapper that implements _get_pyclient_capsule()");
+    }
+    return unwrap_pyclient_capsule(store_obj.attr(kPyClientCapsuleMethod)());
+}
+
+}  // namespace
 
 class RegisteredBufferPoolNative;
 class RegisteredBufferLeaseNative;
@@ -120,6 +167,8 @@ class RegisteredBufferPoolNative
         Region region, size_t requested_size);
     std::optional<Region> try_acquire_locked(std::unique_lock<std::mutex> &lock,
                                              size_t requested_size);
+    std::optional<Region> try_acquire_shared_local_locked(
+        std::unique_lock<std::mutex> &lock, size_t requested_size);
     Region allocate_region_locked(std::unique_lock<std::mutex> &lock,
                                   size_t size_class);
     void release_internal(const std::shared_ptr<BufferHandle> &handle);
@@ -132,6 +181,9 @@ class RegisteredBufferPoolNative
     void raise_if_open_locked() const;
 
     py::object store_obj_;
+    std::shared_ptr<PyClient> py_client_;
+    bool uses_shared_local_buffer_ = false;
+    size_t shared_local_buffer_capacity_ = 0;
     size_t max_bytes_ = 0;
     size_t min_size_class_ = 0;
     size_t max_size_class_ = 0;
@@ -237,17 +289,13 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
     py::object max_size_class, size_t alignment, bool block_on_exhaustion,
     py::object default_timeout, py::object max_regions)
     : store_obj_(store),
+      py_client_(unwrap_store(store)),
       max_bytes_(max_bytes),
       min_size_class_(min_size_class),
-      max_size_class_(max_size_class.is_none() ? max_bytes
-                                               : max_size_class.cast<size_t>()),
       alignment_(alignment),
       block_on_exhaustion_(block_on_exhaustion) {
-    if (store_obj_.is_none()) {
+    if (store_obj_.is_none() || !py_client_) {
         throw std::runtime_error("MooncakeDistributedStore is not initialized");
-    }
-    if (max_bytes_ == 0) {
-        throw std::runtime_error("max_bytes must be positive");
     }
     if (min_size_class_ == 0 || alignment_ == 0) {
         throw std::runtime_error(
@@ -257,7 +305,25 @@ RegisteredBufferPoolNative::RegisteredBufferPoolNative(
         throw std::runtime_error(
             "alignment must be a power of two and at least sizeof(void*)");
     }
-    max_size_class_ = std::min(max_size_class_, max_bytes_);
+    if (py_client_->client_buffer_allocator_ &&
+        py_client_->client_buffer_allocator_->size() > 0) {
+        uses_shared_local_buffer_ = true;
+        shared_local_buffer_capacity_ =
+            py_client_->client_buffer_allocator_->size();
+        max_bytes_ = shared_local_buffer_capacity_;
+        max_size_class_ =
+            std::min(max_size_class.is_none() ? shared_local_buffer_capacity_
+                                              : max_size_class.cast<size_t>(),
+                     shared_local_buffer_capacity_);
+    } else {
+        if (max_bytes_ == 0) {
+            throw std::runtime_error("max_bytes must be positive");
+        }
+        max_size_class_ =
+            std::min(max_size_class.is_none() ? max_bytes_
+                                              : max_size_class.cast<size_t>(),
+                     max_bytes_);
+    }
     if (!default_timeout.is_none()) {
         default_timeout_ = default_timeout.cast<double>();
     }
@@ -308,6 +374,11 @@ RegisteredBufferPoolNative::acquire(size_t size, py::object block,
 }
 
 void RegisteredBufferPoolNative::prewarm(size_t size, size_t count) {
+    if (uses_shared_local_buffer_) {
+        (void)size;
+        (void)count;
+        return;
+    }
     auto [size_class, oversize] = allocation_size(size);
     if (oversize) {
         throw std::runtime_error("cannot prewarm oversize buffers");
@@ -407,6 +478,9 @@ RegisteredBufferPoolNative::make_lease_locked(Region region,
 std::optional<RegisteredBufferPoolNative::Region>
 RegisteredBufferPoolNative::try_acquire_locked(
     std::unique_lock<std::mutex> &lock, size_t requested_size) {
+    if (uses_shared_local_buffer_) {
+        return try_acquire_shared_local_locked(lock, requested_size);
+    }
     auto [size_class, oversize] = allocation_size(requested_size);
     if (!oversize) {
         auto free_iter = free_.find(size_class);
@@ -431,6 +505,43 @@ RegisteredBufferPoolNative::try_acquire_locked(
         ++oversize_allocate_count_;
     } else {
         ++allocate_count_;
+    }
+    return region;
+}
+
+std::optional<RegisteredBufferPoolNative::Region>
+RegisteredBufferPoolNative::try_acquire_shared_local_locked(
+    std::unique_lock<std::mutex> &lock, size_t requested_size) {
+    const size_t allocation_size = std::max<size_t>(requested_size, 1);
+    if (!has_capacity_for_locked(allocation_size)) {
+        return std::nullopt;
+    }
+    reserve_locked(allocation_size);
+    lock.unlock();
+    std::shared_ptr<BufferHandle> handle;
+    if (auto alloc_result =
+            py_client_->client_buffer_allocator_->allocate(allocation_size);
+        alloc_result.has_value()) {
+        handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    }
+    lock.lock();
+    unreserve_locked(allocation_size);
+    if (!handle) {
+        return std::nullopt;
+    }
+    if (closing_ || closed_) {
+        lock.unlock();
+        handle.reset();
+        lock.lock();
+        throw std::runtime_error("registered buffer pool is closing");
+    }
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
+    Region region{handle, allocation_size};
+    regions_.emplace(ptr, region);
+    total_bytes_ += allocation_size;
+    ++allocate_count_;
+    if (requested_size > max_size_class_) {
+        ++oversize_allocate_count_;
     }
     return region;
 }
@@ -506,6 +617,14 @@ void RegisteredBufferPoolNative::release_internal(
             throw std::runtime_error("registered buffer lease is not active");
         }
         region = regions_.at(ptr);
+        if (uses_shared_local_buffer_) {
+            regions_.erase(ptr);
+            if (total_bytes_ >= region.size) total_bytes_ -= region.size;
+            in_use_.erase(ptr);
+            ++release_count_;
+            condition_.notify_all();
+            return;
+        }
         should_unregister =
             closed_ || closing_ || region.size > max_size_class_;
         if (!should_unregister) {
@@ -548,6 +667,9 @@ void RegisteredBufferPoolNative::unreserve_locked(size_t size_class) {
 std::pair<size_t, bool> RegisteredBufferPoolNative::allocation_size(
     size_t size) const {
     size = std::max<size_t>(size, 1);
+    if (uses_shared_local_buffer_) {
+        return {size, size > max_size_class_};
+    }
     if (size > max_size_class_) {
         return {align_size(size), true};
     }
@@ -569,6 +691,13 @@ size_t RegisteredBufferPoolNative::align_size(size_t size) const {
 
 bool RegisteredBufferPoolNative::has_capacity_for_locked(
     size_t size_class) const {
+    if (uses_shared_local_buffer_) {
+        if (size_class > shared_local_buffer_capacity_) {
+            return false;
+        }
+        return !max_regions_.has_value() ||
+               in_use_.size() + reserved_regions_ < *max_regions_;
+    }
     if (size_class > max_bytes_) {
         return false;
     }
@@ -648,7 +777,7 @@ void bind_buffer_pool(py::module &m) {
                  }
                  return pool;
              }),
-             py::arg("store"), py::arg("max_bytes"),
+             py::arg("store"), py::arg("max_bytes") = 0,
              py::arg("min_size_class") = 64 * 1024,
              py::arg("max_size_class") = py::none(),
              py::arg("alignment") = 8 * 1024 * 1024,

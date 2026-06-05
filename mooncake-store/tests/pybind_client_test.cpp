@@ -5,6 +5,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -272,6 +273,39 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     // Test isExist
     int exist_result = py_client_->isExist(key);
     EXPECT_EQ(exist_result, 1) << "Key should exist";
+}
+
+TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "local_buffer_subrange_key";
+    const std::string test_data = "shared-local-buffer-read";
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    auto local_alloc =
+        py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
+    ASSERT_TRUE(local_alloc.has_value());
+    BufferHandle handle = std::move(*local_alloc);
+    auto *dst = static_cast<char *>(handle.ptr()) + 16;
+    std::memset(handle.ptr(), 0, handle.size());
+
+    auto bytes_read = py_client_->get_into(key, dst, test_data.size());
+    ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
+    EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
 // Test Get Operation will fail if the lease has expired.

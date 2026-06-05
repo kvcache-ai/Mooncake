@@ -761,6 +761,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
+        {
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_ = RegisteredBufferRegion{
+                .base = client_buffer_allocator_->getBase(),
+                .size = local_buffer_size,
+                .offset = 0,
+            };
+        }
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -1098,6 +1106,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 << "Failed to unregister client local buffer on tear down: "
                 << toString(unregister_result.error());
         }
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
     }
 
     // Reset all resources
@@ -3081,6 +3091,18 @@ RealClient::resolve_registered_buffer(void *buffer) const {
             };
         }
     }
+    if (local_buffer_region_.has_value()) {
+        const auto base =
+            reinterpret_cast<uintptr_t>(local_buffer_region_->base);
+        if (target >= base) {
+            const auto offset = target - base;
+            if (offset < local_buffer_region_->size) {
+                RegisteredBufferRegion region = *local_buffer_region_;
+                region.offset = static_cast<size_t>(offset);
+                return region;
+            }
+        }
+    }
     return std::nullopt;
 }
 
@@ -3358,16 +3380,15 @@ RealClient::get_into_ranges_internal(
         resolved_buffer_capacities = *buffer_capacities;
     } else {
         resolved_buffer_capacities.resize(buffer_count, 0);
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         for (size_t i = 0; i < buffer_count; ++i) {
-            auto it = registered_buffer_sizes_.find(buffers[i]);
-            if (it == registered_buffer_sizes_.end()) {
+            auto region = resolve_registered_buffer(buffers[i]);
+            if (!region.has_value()) {
                 LOG(ERROR)
                     << "get_into_ranges: buffer is not registered at index "
                     << i;
                 continue;
             }
-            resolved_buffer_capacities[i] = it->second;
+            resolved_buffer_capacities[i] = region->size - region->offset;
         }
     }
 
