@@ -1,9 +1,6 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
 #include <cuda_alike.h>
-#include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <atomic>
 #include <chrono>
@@ -23,6 +20,7 @@ namespace mooncake {
 // On MNNVL clusters all GPUs support fabric mem handles, meaning
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
+#ifndef MOONCAKE_EP_USE_MUSA
 static bool supportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
 
@@ -41,6 +39,10 @@ static bool supportFabricMem() {
     }
     return true;
 }
+#else
+// MUSA does not support NVLink fabric memory handles.
+static bool supportFabricMem() { return false; }
+#endif
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      bool isDummy,
                                      uint64_t* local2global_rank_map,
