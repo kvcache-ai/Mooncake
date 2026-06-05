@@ -351,23 +351,40 @@ Client::~Client() {
         graceful_unmount_cleanup_callbacks_.clear();
     }
 
-    // Unmount mounted segments: notify master + local cleanup
+    // Best-effort notify master to clean up routing metadata.
+    // Done outside the lock to avoid holding mounted_segments_mutex_ during
+    // RPC.
     for (auto& segment : mounted_segments_copy) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
+        auto result = master_client_.UnmountSegment(segment.id);
         if (!result) {
-            LOG(ERROR) << "Failed to unmount segment in destructor: "
-                       << toString(result.error());
+            LOG(WARNING) << "Failed to notify master of unmount in destructor: "
+                         << toString(result.error());
         }
     }
 
-    // Unregister gracefully unmounting segments: master already has timer
-    for (auto& segment : gracefully_unmounting_segments_copy) {
-        int rc = transfer_engine_->unregisterLocalMemory(
-            reinterpret_cast<void*>(segment.base));
-        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
-            LOG(ERROR) << "Failed to unregister transfer buffer in destructor: "
-                       << rc;
+    // Local cleanup: unregister MRs and sync TE metadata.
+    // update_metadata=true pushes empty descriptor to TE metadata server so
+    // peers won't route to stale RDMA addresses.
+    if (transfer_engine_) {
+        for (auto& segment : mounted_segments_copy) {
+            int rc = transfer_engine_->unregisterLocalMemory(
+                reinterpret_cast<void*>(segment.base), true);
+            if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+                LOG(ERROR)
+                    << "Failed to unregister mounted segment in destructor: "
+                    << rc;
+            }
+        }
+
+        // Unregister gracefully unmounting segments: master already has timer
+        for (auto& segment : gracefully_unmounting_segments_copy) {
+            int rc = transfer_engine_->unregisterLocalMemory(
+                reinterpret_cast<void*>(segment.base), false);
+            if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+                LOG(ERROR)
+                    << "Failed to unregister transfer buffer in destructor: "
+                    << rc;
+            }
         }
     }
 
@@ -2595,15 +2612,22 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
     auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    ErrorCode master_err = ErrorCode::OK;
     if (!unmount_result) {
-        ErrorCode err = unmount_result.error();
+        master_err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
-                   << toString(err);
-        return tl::unexpected(err);
+                   << toString(master_err)
+                   << ", proceeding with local TE cleanup anyway";
+        // Continue with local cleanup even if master notification fails.
+        // Master will clean up its metadata via ClientMonitorFunc TTL expiry.
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+    int rc = 0;
+    if (transfer_engine_) {
+        rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(it->second.base),
+            unmount_result.has_value());
+    }
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -2611,11 +2635,12 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         if (rc != ERR_ADDRESS_NOT_REGISTERED) {
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
     }
 
     mounted_segments_.erase(it);
+    if (master_err != ErrorCode::OK) {
+        return tl::unexpected(master_err);
+    }
     return {};
 }
 
@@ -2648,6 +2673,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         return tl::unexpected(check_result.error());
     }
 
+    if (!transfer_engine_) {
+        LOG(ERROR) << "Transfer engine is not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     UUID segment_id;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
@@ -2667,8 +2697,8 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
+        int rc = transfer_engine_->registerLocalMemory(
+            const_cast<void*>(buffer), size, location, true, true);
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
                        << " size=" << size << ", error=" << rc;
@@ -2692,6 +2722,14 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            // Rollback: unregister the TE memory that was just registered
+            int unreg_rc = transfer_engine_->unregisterLocalMemory(
+                const_cast<void*>(buffer), false);
+            if (unreg_rc != 0 && unreg_rc != ERR_ADDRESS_NOT_REGISTERED) {
+                LOG(ERROR) << "Failed to rollback TE registration after mount "
+                              "failure: "
+                           << unreg_rc;
+            }
             return tl::unexpected(err);
         }
 

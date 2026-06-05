@@ -113,10 +113,12 @@ class TransferEngineImpl {
                                std::vector<size_t> size_list,
                                Permission permission = kGlobalReadWrite);
 
-    Status unregisterLocalMemory(void* addr, size_t size = 0);
+    Status unregisterLocalMemory(void* addr, size_t size = 0,
+                                 bool update_metadata = true);
 
     Status unregisterLocalMemory(std::vector<void*> addr_list,
-                                 std::vector<size_t> size_list = {});
+                                 std::vector<size_t> size_list = {},
+                                 bool update_metadata = true);
 
     // advanced buffer allocate function
     Status allocateLocalMemory(void** addr, size_t size,
