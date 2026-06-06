@@ -431,8 +431,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
         }
 
         TransferStatus status;
-        bool completed = false;
-        while (!completed) {
+        while (true) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -440,11 +439,11 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
-                completed = true;
+                return -1;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
-                completed = true;
+                return -1;
             }
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
@@ -530,9 +529,7 @@ int TransferEnginePy::batchTransferSync(
         }
 
         TransferStatus status;
-        bool completed = false;
-        bool already_freed = false;
-        while (!completed) {
+        while (true) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
             if (status.s == TransferStatusEnum::COMPLETED) {
@@ -540,13 +537,11 @@ int TransferEnginePy::batchTransferSync(
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
                 engine_->freeBatchID(batch_id);
-                already_freed = true;
-                completed = true;
+                return -1;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
                 engine_->freeBatchID(batch_id);
-                already_freed = true;
-                completed = true;
+                return -1;
             }
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
@@ -557,9 +552,7 @@ int TransferEnginePy::batchTransferSync(
                 // TODO: as @doujiang24 mentioned, early free(while there are
                 // still waiting tasks) the batch_id may fail and cause memory
                 // leak(a known issue).
-                if (!already_freed) {
-                    engine_->freeBatchID(batch_id);
-                }
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
