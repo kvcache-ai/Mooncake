@@ -1014,6 +1014,7 @@ void MooncakeBackend::shutdown() {
             cudaFreeHost(meta_->activeRanks);
         }
         meta_->activeRanks = nullptr;
+        meta_->activeRanksDevice = nullptr;
     }
 }
 
