@@ -941,6 +941,19 @@ class BucketStorageBackend : public StorageBackendInterface {
         const;
 
    private:
+    using OwnedAlignedBuffer = std::unique_ptr<void, void (*)(void*)>;
+
+    static void FreeAlignedBuffer(void* ptr);
+
+    struct ScratchBufferLease {
+        void* data = nullptr;
+        OwnedAlignedBuffer owned{nullptr,
+                                 &BucketStorageBackend::FreeAlignedBuffer};
+    };
+
+    static tl::expected<ScratchBufferLease, ErrorCode> AcquireScratchBuffer(
+        size_t size);
+
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -957,11 +970,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
-    // Aligned buffer for O_DIRECT I/O operations
-    // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
+    // Reuse a per-thread aligned scratch buffer for common O_DIRECT-sized I/O
+    // without sharing mutable scratch space across concurrent readers/writers.
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 32MB
     // Disable direct io_uring reads after the first hard failure (for example
     // filesystem / kernel combinations that reject O_DIRECT reads outright).
     mutable std::atomic<bool> direct_batch_read_enabled_{true};

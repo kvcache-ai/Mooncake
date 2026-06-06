@@ -1255,22 +1255,47 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_) {
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
+      bucket_backend_config_(bucket_backend_config_) {}
+
+void BucketStorageBackend::FreeAlignedBuffer(void* ptr) { free(ptr); }
+
+tl::expected<BucketStorageBackend::ScratchBufferLease, ErrorCode>
+BucketStorageBackend::AcquireScratchBuffer(size_t size) {
+    ScratchBufferLease lease;
+    if (size == 0) {
+        return lease;
     }
+
+    if (size <= kAlignedBufferSize) {
+        thread_local OwnedAlignedBuffer thread_local_buffer{
+            nullptr, &BucketStorageBackend::FreeAlignedBuffer};
+        if (thread_local_buffer == nullptr) {
+            void* buf = nullptr;
+            int ret =
+                posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
+            if (ret != 0) {
+                LOG(ERROR) << "AcquireScratchBuffer: posix_memalign("
+                           << kAlignedBufferSize
+                           << ") failed: " << strerror(ret);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            thread_local_buffer.reset(buf);
+        }
+        lease.data = thread_local_buffer.get();
+        return lease;
+    }
+
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, size);
+    if (ret != 0) {
+        LOG(ERROR) << "AcquireScratchBuffer: posix_memalign(" << size
+                   << ") failed: " << strerror(ret);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    lease.data = buf;
+    lease.owned.reset(buf);
+    return lease;
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -1543,15 +1568,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 // otherwise reading unrelated bytes can outweigh the syscall
                 // savings.
                 if (span_size <= total_requested_bytes * 2) {
-                    void* span_buffer = nullptr;
-                    std::unique_ptr<char[]> temp_buffer;
-                    if (span_size <= kAlignedBufferSize &&
-                        aligned_io_buffer_ != nullptr) {
-                        span_buffer = aligned_io_buffer_.get();
-                    } else {
-                        temp_buffer = std::make_unique<char[]>(span_size);
-                        span_buffer = temp_buffer.get();
+                    auto scratch_res = AcquireScratchBuffer(span_size);
+                    if (!scratch_res) {
+                        return tl::make_unexpected(scratch_res.error());
                     }
+                    auto scratch = std::move(scratch_res.value());
+                    void* span_buffer = scratch.data;
 
                     iovec span_iov{span_buffer, span_size};
                     auto span_read_res =
@@ -1951,6 +1973,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    {
+        MutexLocker locker(&iterator_mutex_);
+        next_bucket_ = -1;
+    }
+
     while (true) {
         auto has_next_res = HasNext();
         if (!has_next_res) {
@@ -2175,28 +2202,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
-        void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
+        auto scratch_res = AcquireScratchBuffer(aligned_size);
+        if (!scratch_res) {
+            return tl::make_unexpected(scratch_res.error());
+        }
+        auto scratch = std::move(scratch_res.value());
+        void* write_buffer = scratch.data;
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
+        if (aligned_size > kAlignedBufferSize) {
             LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
                          << " requires " << aligned_size
                          << " bytes, exceeds buffer size " << kAlignedBufferSize

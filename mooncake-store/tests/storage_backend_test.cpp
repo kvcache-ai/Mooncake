@@ -297,6 +297,48 @@ TEST_F(StorageBackendTest, BucketScan) {
     ASSERT_EQ(scan_metadatas.size(), 0);
 }
 
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_ScanMetaRestartsFromBeginningEachCall) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    // Keep the iterator limit above the single-bucket key count so this test
+    // isolates restart semantics instead of tripping the per-bucket scan
+    // validation path.
+    config.scanmeta_iterator_keys_limit = 16;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::vector<int64_t> buckets;
+    std::unordered_map<std::string, std::string> batch_data;
+    ASSERT_TRUE(
+        BatchOffloadUtil(storage_backend, keys, sizes, batch_data, buckets));
+
+    auto scan_all_keys = [&](std::vector<std::string>& out_keys) {
+        return storage_backend.ScanMeta(
+            [&](const std::vector<std::string>& batch_keys,
+                std::vector<StorageObjectMetadata>&) {
+                out_keys.insert(out_keys.end(), batch_keys.begin(),
+                                batch_keys.end());
+                return ErrorCode::OK;
+            });
+    };
+
+    std::vector<std::string> first_scan_keys;
+    std::vector<std::string> second_scan_keys;
+    ASSERT_TRUE(scan_all_keys(first_scan_keys));
+    ASSERT_TRUE(scan_all_keys(second_scan_keys));
+
+    ASSERT_EQ(first_scan_keys.size(), batch_data.size());
+    ASSERT_EQ(second_scan_keys.size(), batch_data.size());
+
+    std::sort(first_scan_keys.begin(), first_scan_keys.end());
+    std::sort(second_scan_keys.begin(), second_scan_keys.end());
+    EXPECT_EQ(second_scan_keys, first_scan_keys);
+}
+
 TEST_F(StorageBackendTest, InitializeWithValidStart) {
     BucketIdGenerator gen(100);
     EXPECT_EQ(gen.CurrentId(), 100);
@@ -2087,7 +2129,21 @@ TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadsNoBlocking) {
 
                 auto load_result = storage_backend.BatchLoad(load_slices);
                 if (load_result.has_value()) {
-                    successful_reads.fetch_add(1);
+                    bool data_matches = true;
+                    for (const auto& [key, slice] : load_slices) {
+                        std::string loaded(static_cast<char*>(slice.ptr),
+                                           slice.size);
+                        if (loaded != test_data.at(key)) {
+                            data_matches = false;
+                            break;
+                        }
+                    }
+
+                    if (data_matches) {
+                        successful_reads.fetch_add(1);
+                    } else {
+                        any_failure.store(true);
+                    }
                 } else {
                     any_failure.store(true);
                 }
