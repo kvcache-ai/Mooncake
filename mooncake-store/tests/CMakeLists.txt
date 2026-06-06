@@ -63,7 +63,6 @@ add_store_test(ha_recovery_manager_test ha_recovery_manager_test.cpp)
 add_store_test(ha_integration_test ha_integration_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_subdirectory(e2e)
-
 add_executable(high_availability_test high_availability_test.cpp)
 target_link_libraries(high_availability_test PUBLIC mooncake_store transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread)
 if (STORE_USE_ETCD)
