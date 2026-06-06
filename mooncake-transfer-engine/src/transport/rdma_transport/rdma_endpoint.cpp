@@ -95,7 +95,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list];
+    wr_depth_list_ = new volatile int[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
