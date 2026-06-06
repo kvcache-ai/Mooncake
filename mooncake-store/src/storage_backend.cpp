@@ -13,6 +13,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -21,7 +22,6 @@
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
-#include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
 
@@ -105,10 +105,23 @@ void StorageBackend::RecalculateAvailableSpace() {
     }
 }
 
-bool StorageBackend::IsEvictionEnabled() const { return enable_eviction_; }
+bool StorageBackend::IsEvictionEnabled() const {
+    // First check user configuration
+    if (!enable_eviction_) {
+        return false;
+    }
+
+#ifdef USE_3FS
+    // Eviction is only enabled for local storage, not for 3FS
+    return !is_3fs_dir_;
+#else
+    // If 3FS is not compiled in, eviction is enabled if user config allows
+    return true;
+#endif
+}
 
 tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
-    // Skip eviction initialization if disabled
+    // Skip eviction initialization for 3FS mode
     if (!IsEvictionEnabled()) {
         initialized_.store(true, std::memory_order_release);
         return {};
@@ -196,7 +209,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         if (total_space_ >= used_space_) {
             RecalculateAvailableSpace();
         } else {
-            // Only enable eviction for local storage
+            // Only enable eviction for local storage, not for 3FS
             if (IsEvictionEnabled()) {
                 eviction_needed = true;
                 available_space_ = -1;
@@ -205,11 +218,10 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                     << ") exceeds the new quota (" << total_space_
                     << "). Eviction will be triggered after initial setup.";
             } else {
-                // Eviction disabled, just log a warning but don't trigger
-                // eviction
+                // For 3FS mode, just log a warning but don't trigger eviction
                 LOG(WARNING) << "Existing used space (" << used_space_
                              << ") exceeds the new quota (" << total_space_
-                             << "). Eviction is disabled.";
+                             << "). Eviction is disabled for 3FS mode.";
                 RecalculateAvailableSpace();  // Still calculate available space
             }
         }
@@ -485,7 +497,7 @@ void StorageBackend::RemoveFile(const std::string& path) {
     std::this_thread::sleep_for(
         std::chrono::microseconds(50));  // sleep for 50 us
 
-    // Eviction disabled, use simple delete (no queue tracking)
+    // For 3FS mode, use original logic (no queue tracking)
     if (!IsEvictionEnabled()) {
         if (fs::exists(path)) {
             std::error_code ec;
@@ -541,7 +553,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         return;
     }
 
-    // Eviction disabled, use simple delete (no queue tracking)
+    // For 3FS mode, use original logic (no queue tracking)
     if (!IsEvictionEnabled()) {
         fs::path storage_root = fs::path(root_dir_) / fsdir_;
         if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
@@ -614,7 +626,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
 void StorageBackend::RemoveAll() {
     namespace fs = std::filesystem;
 
-    // Eviction disabled, use simple delete (no queue tracking)
+    // For 3FS mode, use original logic (no queue tracking)
     if (!IsEvictionEnabled()) {
         // Iterate through the root directory and remove all files
         for (const auto& entry : fs::directory_iterator(root_dir_)) {
@@ -777,6 +789,18 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
         return nullptr;
     }
 
+#ifdef USE_3FS
+    if (is_3fs_dir_) {
+        if (hf3fs_reg_fd(fd, 0) > 0) {
+            close(fd);
+            return nullptr;
+        }
+        return resource_manager_ ? std::make_unique<ThreeFSFile>(
+                                       path, fd, resource_manager_.get())
+                                 : nullptr;
+    }
+#endif
+
 #ifdef USE_URING
     if (use_uring_) {
         // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
@@ -813,7 +837,8 @@ bool StorageBackend::CheckDiskSpace(size_t required_size) {
 FileRecord StorageBackend::EvictFile() {
     // Eviction is only enabled for local storage
     if (!IsEvictionEnabled()) {
-        LOG(WARNING) << "Eviction is disabled. Cannot evict files.";
+        LOG(WARNING)
+            << "Eviction is disabled for 3FS mode. Cannot evict files.";
         return {};
     }
 
@@ -885,7 +910,8 @@ FileRecord StorageBackend::SelectFileToEvictByFIFO() {
 tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackend::EnsureDiskSpace(size_t required_size) {
     std::vector<std::string> evicted_keys;
-    // If eviction is disabled, skip space checking and eviction
+    // If eviction is disabled (3FS mode), skip space checking and eviction
+    // Let 3FS filesystem handle space management itself
     if (!IsEvictionEnabled()) {
         return evicted_keys;
     }
@@ -1462,16 +1488,140 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
+        auto run_logical_reads =
+            [&](StorageFile* active_file) -> tl::expected<void, ErrorCode> {
+#ifdef USE_URING
+            if (auto* buffered_uring = dynamic_cast<UringFile*>(active_file);
+                buffered_uring != nullptr) {
+                std::vector<UringFile::ReadDesc> read_descs;
+                read_descs.reserve(read_plans.size());
+                size_t expected_total_bytes = 0;
+
+                for (const auto& plan : read_plans) {
+                    int64_t actual_offset = plan.offset + plan.key_size;
+                    read_descs.push_back(UringFile::ReadDesc{
+                        plan.dest_slice.ptr, plan.dest_slice.size,
+                        actual_offset});
+                    expected_total_bytes += plan.dest_slice.size;
+                }
+
+                auto read_res = buffered_uring->batch_read(read_descs.data(),
+                                                           read_descs.size());
+                if (read_res) {
+                    if (read_res.value() == expected_total_bytes) {
+                        return {};
+                    }
+                    LOG(WARNING) << "Logical batch_read size mismatch for "
+                                 << "bucket_id=" << bucket_id
+                                 << ", expected=" << expected_total_bytes
+                                 << ", got=" << read_res.value()
+                                 << "; falling back to per-key reads";
+                } else {
+                    LOG(WARNING) << "Logical batch_read failed for bucket_id="
+                                 << bucket_id << ", error=" << read_res.error()
+                                 << "; falling back to per-key reads";
+                }
+            }
+#endif
+
+            if (read_plans.size() > 1) {
+                int64_t min_offset = std::numeric_limits<int64_t>::max();
+                int64_t max_end = 0;
+                size_t total_requested_bytes = 0;
+                for (const auto& plan : read_plans) {
+                    int64_t actual_offset = plan.offset + plan.key_size;
+                    int64_t data_end =
+                        actual_offset +
+                        static_cast<int64_t>(plan.dest_slice.size);
+                    min_offset = std::min(min_offset, actual_offset);
+                    max_end = std::max(max_end, data_end);
+                    total_requested_bytes += plan.dest_slice.size;
+                }
+
+                size_t span_size = static_cast<size_t>(max_end - min_offset);
+                // Coalesce only when the covered span is reasonably compact;
+                // otherwise reading unrelated bytes can outweigh the syscall
+                // savings.
+                if (span_size <= total_requested_bytes * 2) {
+                    void* span_buffer = nullptr;
+                    std::unique_ptr<char[]> temp_buffer;
+                    if (span_size <= kAlignedBufferSize &&
+                        aligned_io_buffer_ != nullptr) {
+                        span_buffer = aligned_io_buffer_.get();
+                    } else {
+                        temp_buffer = std::make_unique<char[]>(span_size);
+                        span_buffer = temp_buffer.get();
+                    }
+
+                    iovec span_iov{span_buffer, span_size};
+                    auto span_read_res =
+                        active_file->vector_read(&span_iov, 1, min_offset);
+                    if (span_read_res) {
+                        if (span_read_res.value() == span_size) {
+                            const char* span_bytes =
+                                static_cast<const char*>(span_buffer);
+                            for (const auto& plan : read_plans) {
+                                int64_t actual_offset =
+                                    plan.offset + plan.key_size;
+                                size_t src_offset = static_cast<size_t>(
+                                    actual_offset - min_offset);
+                                std::memcpy(plan.dest_slice.ptr,
+                                            span_bytes + src_offset,
+                                            plan.dest_slice.size);
+                            }
+                            return {};
+                        }
+                        LOG(WARNING) << "Span read size mismatch for bucket_id="
+                                     << bucket_id << ", expected=" << span_size
+                                     << ", got=" << span_read_res.value()
+                                     << "; falling back to per-key reads";
+                    } else {
+                        LOG(WARNING)
+                            << "Span read failed for bucket_id=" << bucket_id
+                            << ", error=" << span_read_res.error()
+                            << "; falling back to per-key reads";
+                    }
+                }
+            }
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                auto read_res =
+                    active_file->vector_read(&iov, 1, actual_offset);
+
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
+
+                if (read_res.value() != plan.dest_slice.size) {
+                    LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                               << ", expected: " << plan.dest_slice.size
+                               << ", got: " << read_res.value();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+            }
+            return {};
+        };
 
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        // Batch the independent O_DIRECT reads for this bucket into one
+        // io_uring submission. This increases effective NVMe queue depth
+        // without changing metadata or pointer semantics.
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr &&
+            direct_batch_read_enabled_.load(std::memory_order_relaxed)) {
+            std::vector<UringFile::ReadDesc> read_descs;
+            read_descs.reserve(read_plans.size());
+            std::vector<int64_t> offset_in_buffers;
+            offset_in_buffers.reserve(read_plans.size());
+            size_t expected_total_bytes = 0;
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -1482,40 +1632,76 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(aligned_end - aligned_offset);
                 int64_t offset_in_buffer = actual_offset - aligned_offset;
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
+                read_descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                offset_in_buffers.push_back(offset_in_buffer);
+                expected_total_bytes += aligned_size;
+            }
 
-                if (read_res) {
-                    // Adjust ptr to point to actual data start (no memcpy)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    read_res = plan.dest_slice.size;
+            auto read_res =
+                uring_file->batch_read(read_descs.data(), read_descs.size());
+            if (read_res && read_res.value() == expected_total_bytes) {
+                for (size_t i = 0; i < read_plans.size(); ++i) {
+                    batch_object.at(read_plans[i].key).ptr =
+                        static_cast<char*>(read_plans[i].dest_slice.ptr) +
+                        offset_in_buffers[i];
                 }
-            } else
+                continue;
+            }
+
+            LOG(WARNING)
+                << "O_DIRECT batch_read unavailable for bucket_id=" << bucket_id
+                << ", bytes="
+                << (read_res ? std::to_string(read_res.value()) : "error")
+                << ", status="
+                << (read_res
+                        ? "size_mismatch"
+                        : std::to_string(static_cast<int>(read_res.error())))
+                << "; disabling direct reads for this backend instance and "
+                   "retrying with buffered reads";
+            direct_batch_read_enabled_.store(false, std::memory_order_relaxed);
+
+            int buffered_fd =
+                open(filepath_res.value().c_str(), O_CLOEXEC | O_RDONLY, 0644);
+            if (buffered_fd < 0) {
+                LOG(ERROR) << "Failed to reopen bucket file without O_DIRECT: "
+                           << filepath_res.value() << ", errno=" << errno
+                           << " (" << strerror(errno) << ")";
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            auto buffered_file =
+                std::make_unique<PosixFile>(filepath_res.value(), buffered_fd);
+            auto fallback_result = run_logical_reads(buffered_file.get());
+            if (!fallback_result) {
+                return fallback_result;
+            }
+            continue;
+        }
 #endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
-            }
 
-            if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+#ifdef USE_URING
+        if (dynamic_cast<UringFile*>(file.get()) != nullptr) {
+            int buffered_fd =
+                open(filepath_res.value().c_str(), O_CLOEXEC | O_RDONLY, 0644);
+            if (buffered_fd < 0) {
+                LOG(ERROR) << "Failed to reopen bucket file without O_DIRECT: "
+                           << filepath_res.value() << ", errno=" << errno
+                           << " (" << strerror(errno) << ")";
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
             }
+            auto buffered_file =
+                std::make_unique<PosixFile>(filepath_res.value(), buffered_fd);
+            auto fallback_result = run_logical_reads(buffered_file.get());
+            if (!fallback_result) {
+                return fallback_result;
+            }
+            continue;
+        }
+#endif
 
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
-                           << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            }
+        auto fallback_result = run_logical_reads(file.get());
+        if (!fallback_result) {
+            return fallback_result;
         }
     }
 
@@ -1982,9 +2168,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     auto file = std::move(open_file_result.value());
 
 #ifdef USE_URING
-    // Try to use write_aligned for O_DIRECT I/O if file is UringFile
-    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-    if (uring_file != nullptr) {
+    // When io_uring-backed reads are enabled, pad bucket data files to a
+    // 4KB boundary so later O_DIRECT reads never need to extend past EOF.
+    if (file_storage_config_.use_uring) {
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
@@ -2028,11 +2215,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             memset(dst, 0, aligned_size - total_size);
         }
 
-        // Write using write_aligned
-        auto write_result =
-            uring_file->write_aligned(write_buffer, aligned_size, 0);
+        tl::expected<size_t, ErrorCode> write_result =
+            tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        if (uring_file != nullptr) {
+            write_result =
+                uring_file->write_aligned(write_buffer, aligned_size, 0);
+        } else {
+            iovec padded_iov{write_buffer, aligned_size};
+            write_result = file->vector_write(&padded_iov, 1, 0);
+        }
         if (!write_result) {
-            LOG(ERROR) << "write_aligned failed for: " << bucket_id
+            LOG(ERROR) << "Aligned bucket write failed for: " << bucket_id
                        << ", error: " << write_result.error();
             return tl::make_unexpected(write_result.error());
         }
@@ -2043,13 +2236,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        // Flush bucket data to stable storage before writing metadata when
+        // the write path is backed by UringFile. The Posix fallback preserves
+        // the previous semantics and still guarantees the padded file shape.
+        if (uring_file != nullptr) {
+            auto sync_result = uring_file->datasync();
+            if (!sync_result) {
+                LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
         }
 
         // Invalidate cache for this file since content changed
@@ -3196,30 +3391,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
         case StorageBackendType::kOffsetAllocator: {
             return std::make_shared<OffsetAllocatorStorageBackend>(config);
         }
-        case StorageBackendType::kDistributed: {
-            auto distributed_config =
-                DistributedStorageConfig::FromEnvironment();
-            if (!distributed_config.Validate()) {
-                throw std::invalid_argument(
-                    "Invalid DistributedStorage configuration");
-            }
-            std::unique_ptr<FileSystemAdapter> adapter;
-            if (distributed_config.fs_adapter_type == "hf3fs") {
-#ifdef USE_3FS
-                adapter = std::make_unique<Hf3fsAdapter>();
-#else
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-#endif
-            } else {
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(adapter));
-        }
         default: {
-            LOG(ERROR) << "Unsupported backend type: "
-                       << static_cast<int>(config.storage_backend_type);
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            LOG(FATAL) << "Unsupported backend type";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 }
