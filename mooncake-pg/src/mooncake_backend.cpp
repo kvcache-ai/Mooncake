@@ -1008,6 +1008,13 @@ void MooncakeBackend::shutdown() {
                 cudaFree(recv_buffer_[i]);
             }
         }
+        if (isCpu_) {
+            delete[] meta_->activeRanks;
+        } else {
+            cudaFreeHost(meta_->activeRanks);
+        }
+        meta_->activeRanks = nullptr;
+        meta_->activeRanksDevice = nullptr;
     }
 }
 
