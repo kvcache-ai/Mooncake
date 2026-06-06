@@ -102,6 +102,7 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
+set(KV_EVENTS_ZMQ_FOUND FALSE)
 if(ENABLE_KV_EVENTS)
   find_library(ZMQ_LIBRARY NAMES zmq libzmq PATHS /usr/lib /usr/local/lib
                                               /usr/lib64)
@@ -111,11 +112,13 @@ if(ENABLE_KV_EVENTS)
     list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
     list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
     list(APPEND MOONCAKE_STORE_SOURCES kv_event/kv_event_publisher.cpp)
+    set(KV_EVENTS_ZMQ_FOUND TRUE)
   else()
     message(
       WARNING
         "libzmq not found; KV events publisher disabled. Install libzmq3-dev "
         "or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
+    set(ENABLE_KV_EVENTS OFF)
     set(ENABLE_KV_EVENTS OFF PARENT_SCOPE)
   endif()
 endif()
@@ -246,7 +249,7 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-if(ENABLE_KV_EVENTS)
+if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
