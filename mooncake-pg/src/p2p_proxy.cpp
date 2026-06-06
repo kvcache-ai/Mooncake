@@ -8,7 +8,6 @@
 #include <cstring>
 #include <limits>
 #include <thread>
-#include "cuda_alike.h"
 #include "memory_location.h"
 #include "pg_utils.h"
 
