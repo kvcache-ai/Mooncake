@@ -2,12 +2,8 @@
 #define MOONCAKE_WORKER_CUH
 
 #if !defined(__MUSA__)
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <ATen/musa/MUSAContext.h>
-#else
-#include <ATen/cuda/CUDAContext.h>
-#endif
 #include <ATen/ATen.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
@@ -28,30 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef MOONCAKE_EP_USE_MUSA
-#define cudaDeviceSynchronize musaDeviceSynchronize
-#define cudaError cudaError_t
-#define cudaErrorNotReady musaErrorNotReady
-#define cudaEventCreateWithFlags musaEventCreateWithFlags
-#define cudaEventDestroy musaEventDestroy
-#define cudaEventDisableTiming musaEventDisableTiming
-#define cudaEventQuery musaEventQuery
-#define cudaEventRecord musaEventRecord
-#define cudaFuncAttributes musaFuncAttributes
-#define cudaFuncGetAttributes musaFuncGetAttributes
-#define cudaHostAlloc musaHostAlloc
-#define cudaHostAllocMapped musaHostAllocMapped
-#endif
-
 namespace mooncake {
-
-#if !defined(__MUSA__)
-#ifdef MOONCAKE_EP_USE_MUSA
-using GPUStream = at::musa::MUSAStream;
-#else
-using GPUStream = at::cuda::CUDAStream;
-#endif
-#endif
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
@@ -133,11 +106,11 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const GPUStream& issue_stream,
+        const at::cuda::CUDAStream& issue_stream,
         const std::function<void(void* dst, size_t pos, size_t realSize,
-                                 const GPUStream&)>& tensorToBuffer,
+                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,
-                                 const GPUStream&)>& bufferToTensor);
+                                 const at::cuda::CUDAStream&)>& bufferToTensor);
 
     void Start();
 
