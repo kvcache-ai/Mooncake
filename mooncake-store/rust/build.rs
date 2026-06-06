@@ -332,6 +332,7 @@ fn main() {
         ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
         ("uring", &["uring"]),
+        ("zmq", &["zmq"]),
     ] {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
