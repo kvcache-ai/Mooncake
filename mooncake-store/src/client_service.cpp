@@ -2675,7 +2675,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
+        int rc = transfer_engine_->registerLocalMemory(const_cast<void*>(buffer), size,
                                                        location, true, true);
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
@@ -2701,7 +2701,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
             int unreg_rc =
-                transfer_engine_->unregisterLocalMemory((void*)buffer);
+                transfer_engine_->unregisterLocalMemory(const_cast<void*>(buffer));
             if (unreg_rc != 0) {
                 LOG(WARNING) << "unregisterLocalMemory failed during cleanup"
                              << ", rc=" << unreg_rc;
