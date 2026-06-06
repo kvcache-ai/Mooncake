@@ -1,5 +1,8 @@
 #pragma once
 
+#include <condition_variable>
+#include <unordered_map>
+
 #include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
@@ -8,6 +11,7 @@
 namespace mooncake {
 
 struct SsdMetric;
+class FileStorageBenchmark;
 
 class FileStorage {
    public:
@@ -52,6 +56,12 @@ class FileStorage {
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
+    friend class FileStorageBenchmark;
+
+    tl::expected<BatchGetResult, ErrorCode> BatchGetOnce(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
@@ -59,15 +69,17 @@ class FileStorage {
         std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
+        // ref_count tracks how many readers share this staging buffer.
+        // Starts at 1 (the leader). Singleflight waiters increment it.
+        // ReleaseBuffer decrements; batch freed when ref_count reaches 0.
+        std::atomic<uint32_t> ref_count{1};
 
         AllocatedBatch() : batch_id(0), total_size(0) {}
-        AllocatedBatch(AllocatedBatch&&) = default;
-        AllocatedBatch& operator=(AllocatedBatch&&) = default;
 
         AllocatedBatch(const AllocatedBatch&) = delete;
         AllocatedBatch& operator=(const AllocatedBatch&) = delete;
-
-        ~AllocatedBatch() = default;
+        AllocatedBatch(AllocatedBatch&&) = delete;
+        AllocatedBatch& operator=(AllocatedBatch&&) = delete;
     };
 
     /**
@@ -136,6 +148,23 @@ class FileStorage {
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
     std::atomic<uint64_t> next_batch_id_{1};
+
+    // Singleflight with staging sharing. Leader does SSD IO; waiters
+    // spin-wait on an atomic flag (pure userspace on the hot path).
+    // A condition_variable gates the capacity limit only.
+    static constexpr size_t kMaxDistinctColdReadFlights = 256;
+    std::mutex singleflight_mutex_;
+    std::condition_variable singleflight_cv_;
+
+    struct ColdReadFlight {
+        alignas(64) std::atomic<bool> done{false};
+        tl::expected<BatchGetResult, ErrorCode> result;
+    };
+    std::unordered_map<std::string, std::shared_ptr<ColdReadFlight>>
+        inflight_cold_reads_;
+
+    void FinishFlight(const std::string& key, ColdReadFlight& flight,
+                      tl::expected<BatchGetResult, ErrorCode> result);
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
