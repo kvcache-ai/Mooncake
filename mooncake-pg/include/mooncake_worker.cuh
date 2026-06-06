@@ -167,7 +167,7 @@ class MooncakeWorker {
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
-    bool running_ = false;
+    std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
 
