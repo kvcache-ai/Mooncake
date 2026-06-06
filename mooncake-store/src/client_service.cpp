@@ -2700,7 +2700,12 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
-            transfer_engine_->unregisterLocalMemory((void*)buffer);
+            int unreg_rc =
+                transfer_engine_->unregisterLocalMemory((void*)buffer);
+            if (unreg_rc != 0) {
+                LOG(WARNING) << "unregisterLocalMemory failed during cleanup"
+                             << ", rc=" << unreg_rc;
+            }
             return tl::unexpected(err);
         }
 
