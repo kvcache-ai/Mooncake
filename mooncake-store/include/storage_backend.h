@@ -380,7 +380,7 @@ class StorageBackend {
      * @param quota_bytes Quota for the storage backend
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<void, ErrorCode> Init(uint64_t quota_bytes);
+    tl::expected<void, ErrorCode> Init(uint64_t quota_bytes = 0);
 
     /**
      * @brief Evict files for satisfying quota limitation

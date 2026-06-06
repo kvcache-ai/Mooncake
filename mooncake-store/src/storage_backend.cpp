@@ -120,7 +120,7 @@ bool StorageBackend::IsEvictionEnabled() const {
 #endif
 }
 
-tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
+tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes) {
     // Skip eviction initialization for 3FS mode
     if (!IsEvictionEnabled()) {
         initialized_.store(true, std::memory_order_release);
@@ -795,9 +795,11 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
             close(fd);
             return nullptr;
         }
-        return resource_manager_ ? std::make_unique<ThreeFSFile>(
-                                       path, fd, resource_manager_.get())
-                                 : nullptr;
+        if (!resource_manager_) {
+            close(fd);
+            return nullptr;
+        }
+        return std::make_unique<ThreeFSFile>(path, fd, resource_manager_.get());
     }
 #endif
 
@@ -1515,40 +1517,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
         auto run_logical_reads =
             [&](StorageFile* active_file) -> tl::expected<void, ErrorCode> {
-#ifdef USE_URING
-            if (auto* buffered_uring = dynamic_cast<UringFile*>(active_file);
-                buffered_uring != nullptr) {
-                std::vector<UringFile::ReadDesc> read_descs;
-                read_descs.reserve(read_plans.size());
-                size_t expected_total_bytes = 0;
-
-                for (const auto& plan : read_plans) {
-                    int64_t actual_offset = plan.offset + plan.key_size;
-                    read_descs.push_back(UringFile::ReadDesc{
-                        plan.dest_slice.ptr, plan.dest_slice.size,
-                        actual_offset});
-                    expected_total_bytes += plan.dest_slice.size;
-                }
-
-                auto read_res = buffered_uring->batch_read(read_descs.data(),
-                                                           read_descs.size());
-                if (read_res) {
-                    if (read_res.value() == expected_total_bytes) {
-                        return {};
-                    }
-                    LOG(WARNING) << "Logical batch_read size mismatch for "
-                                 << "bucket_id=" << bucket_id
-                                 << ", expected=" << expected_total_bytes
-                                 << ", got=" << read_res.value()
-                                 << "; falling back to per-key reads";
-                } else {
-                    LOG(WARNING) << "Logical batch_read failed for bucket_id="
-                                 << bucket_id << ", error=" << read_res.error()
-                                 << "; falling back to per-key reads";
-                }
-            }
-#endif
-
             if (read_plans.size() > 1) {
                 int64_t min_offset = std::numeric_limits<int64_t>::max();
                 int64_t max_end = 0;
