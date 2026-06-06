@@ -47,6 +47,8 @@ void TransferMetadata::dumpMetadataContent(const std::string &segment_name,
     auto segment_locked = segment_lock_.tryLockShared();
     auto rpc_meta_locked = rpc_meta_lock_.tryLockShared();
     if (!segment_locked || !rpc_meta_locked) {
+        if (rpc_meta_locked) rpc_meta_lock_.unlockShared();
+        if (segment_locked) segment_lock_.unlockShared();
         return;
     }
 
