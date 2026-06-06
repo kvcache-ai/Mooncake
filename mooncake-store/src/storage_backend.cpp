@@ -791,7 +791,7 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 
 #ifdef USE_3FS
     if (is_3fs_dir_) {
-        if (hf3fs_reg_fd(fd, 0) > 0) {
+        if (hf3fs_reg_fd(fd, 0) != 0) {
             close(fd);
             return nullptr;
         }
@@ -2684,7 +2684,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     // Use O_DIRECT only for reads: write latency is not sensitive in this
     // scenario, and O_DIRECT writes require 4096-byte alignment padding which
     // corrupts meta file parsing and wastes disk space on data files.
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    if (file_storage_config_.use_uring && mode == FileMode::Read &&
+        direct_batch_read_enabled_.load(std::memory_order_relaxed)) {
         flags |= O_DIRECT;
     }
 #endif
@@ -2696,7 +2697,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    if (file_storage_config_.use_uring && mode == FileMode::Read &&
+        direct_batch_read_enabled_.load(std::memory_order_relaxed)) {
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif
@@ -3373,8 +3375,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return std::make_shared<OffsetAllocatorStorageBackend>(config);
         }
         default: {
-            LOG(FATAL) << "Unsupported backend type";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            LOG(ERROR) << "Unsupported backend type: "
+                       << static_cast<int>(config.storage_backend_type);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 }
