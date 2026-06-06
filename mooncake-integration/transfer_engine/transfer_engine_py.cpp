@@ -416,6 +416,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
                 LOG(WARNING)
@@ -442,6 +443,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
                 completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
@@ -452,6 +454,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                           << current_ts - start_ts << "ns, local buffer "
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
@@ -541,6 +544,8 @@ int TransferEnginePy::batchTransferSync(
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
+                already_freed = true;
                 completed = true;
             }
             auto current_ts = getCurrentTimeInNano();
