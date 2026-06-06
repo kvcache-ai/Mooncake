@@ -1,7 +1,5 @@
 import os
 import re
-import subprocess
-import sys
 
 from setuptools import setup
 import torch
@@ -10,9 +8,11 @@ use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", 
 if use_musa:
     try:
         import torchada  # noqa: F401
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "torchada"])
-        import torchada  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "torchada is required to build the MUSA PG extension. "
+            "Please install it first using 'pip install torchada'."
+        ) from e
 
 
 from torch.utils.cpp_extension import (  # noqa: E402
