@@ -19,6 +19,9 @@ classifiers = [
 ]
 readme = ""
 
+[project.optional-dependencies]
+file-io = ["safetensors", "torch"]
+
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Documentation = "https://github.com/kvcache-ai/Mooncake/tree/main/doc"
