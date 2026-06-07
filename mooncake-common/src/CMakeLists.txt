@@ -22,9 +22,15 @@ else()
     message(STATUS "Found ASIO at: ${ASIO_INCLUDE_DIR}")
 endif()
 
+find_package(glog QUIET CONFIG)
+if(NOT TARGET glog::glog)
+    include(${CMAKE_CURRENT_LIST_DIR}/../FindGLOG.cmake)
+endif()
+
 set(MOONCAKE_COMMON_SOURCES
     default_config.cpp
     environ.cpp
+    mooncake_log.cpp
 )
 
 add_library(asio_shared SHARED asio_impl.cpp)
@@ -59,10 +65,24 @@ target_include_directories(mooncake_common PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES glog::glog)
+check_cxx_source_compiles("
+#include <glog/logging.h>
+int main() { return google::IsGoogleLoggingInitialized() ? 0 : 1; }
+" GLOG_HAS_IS_INITIALIZED)
+unset(CMAKE_REQUIRED_LIBRARIES)
+
 target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
     jsoncpp
+    glog::glog
+    ${CMAKE_DL_LIBS}
 )
+
+if(GLOG_HAS_IS_INITIALIZED)
+    target_compile_definitions(mooncake_common PRIVATE GLOG_HAS_IS_INITIALIZED)
+endif()
 
 if (BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)

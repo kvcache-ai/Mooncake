@@ -342,8 +342,8 @@ void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
                 reported_capacity);
         }
         segment_manager_->client_local_disk_segment_.erase(it);
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=unmount_local_disk_segment";
+        VLOG(1) << "client_id=" << client_id
+                << ", action=unmount_local_disk_segment";
     }
 }
 

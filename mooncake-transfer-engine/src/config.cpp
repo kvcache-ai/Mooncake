@@ -14,6 +14,8 @@
 
 #include "config.h"
 
+#include "mooncake_log.h"
+
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -253,21 +255,8 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* log_level = std::getenv("MC_LOG_LEVEL");
-    config.trace = false;
-    if (log_level) {
-        if (strcmp(log_level, "TRACE") == 0) {
-            config.log_level = google::INFO;
-            config.trace = true;
-        }
-        if (strcmp(log_level, "INFO") == 0)
-            config.log_level = google::INFO;
-        else if (strcmp(log_level, "WARNING") == 0)
-            config.log_level = google::WARNING;
-        else if (strcmp(log_level, "ERROR") == 0)
-            config.log_level = google::ERROR;
-    }
-    FLAGS_minloglevel = config.log_level;
+    config.trace = mooncake::ApplyGlogEnvironment(&config.trace);
+    config.log_level = static_cast<google::LogSeverity>(FLAGS_minloglevel);
 
     const char* slice_timeout_env = std::getenv("MC_SLICE_TIMEOUT");
     if (slice_timeout_env) {
@@ -277,26 +266,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
-    }
-
-    const char* log_dir_path = std::getenv("MC_LOG_DIR");
-    if (log_dir_path) {
-        google::InitGoogleLogging("mooncake-transfer-engine");
-        std::error_code ec;
-        if (!std::filesystem::is_directory(log_dir_path, ec)) {
-            LOG(WARNING)
-                << "Path [" << log_dir_path
-                << "] is not a valid directory path. Still logging to stderr.";
-        } else if (access(log_dir_path, W_OK) != 0) {
-            LOG(WARNING)
-                << "Path [" << log_dir_path
-                << "] is not a permitted directory path for the current user. \
-                Still logging to stderr.";
-        } else {
-            FLAGS_log_dir = log_dir_path;
-            FLAGS_logtostderr = 0;
-            FLAGS_stop_logging_if_full_disk = true;
-        }
     }
 
     const char* min_port_env = std::getenv("MC_MIN_RPC_PORT");

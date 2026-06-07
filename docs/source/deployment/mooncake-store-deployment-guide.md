@@ -186,7 +186,7 @@ The `64gb` / `56gb` inputs above are tuned examples for large HiCache deployment
 ## Set the Log Level for yalantinglibs coro_rpc and coro_http
 By default, the log level is set to warning. You can customize it using the following environment variable:
 
-`export MC_YLT_LOG_LEVEL=info`
+`export MC_LOG_LEVEL=INFO` (also configures RPC/easylog; `MC_YLT_LOG_LEVEL` is optional override)
 
 This sets the log level for yalantinglibs (including coro_rpc and coro_http) to info.
 

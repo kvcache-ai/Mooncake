@@ -2311,8 +2311,8 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                     ops[op_idx].failure_context =
                         original_context + "; revoke also failed";
                 } else {
-                    LOG(INFO) << "Successfully revoked failed upsert for key "
-                              << failed_keys[i];
+                    VLOG(1) << "Successfully revoked failed upsert for key "
+                            << failed_keys[i];
                 }
             }
         }
@@ -3090,8 +3090,8 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
-    LOG(INFO) << "action=replica_copy_start" << ", key=" << key
-              << ", targets_count=" << targets.size();
+    VLOG(1) << "action=replica_copy_start" << ", key=" << key
+            << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result =
@@ -3106,8 +3106,8 @@ tl::expected<void, ErrorCode> Client::Copy(
 
     const auto& response = start_result.value();
     if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
-                  << ", info=target_replicas_already_exist";
+        VLOG(1) << "action=replica_copy_skipped" << ", key=" << key
+                << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
         auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
         if (!copy_end_result.has_value()) {
@@ -3125,8 +3125,8 @@ tl::expected<void, ErrorCode> Client::Copy(
         response.source, response.targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_copy_success" << ", key=" << key
-                  << ", target_count=" << response.targets.size();
+        VLOG(1) << "action=replica_copy_success" << ", key=" << key
+                << ", target_count=" << response.targets.size();
     }
 
     return result;
@@ -3142,8 +3142,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& tenant_id,
                                            const std::string& source,
                                            const std::string& target) {
-    LOG(INFO) << "action=replica_move_start" << ", key=" << key
-              << ", source_segment=" << source << ", target_segment=" << target;
+    VLOG(1) << "action=replica_move_start" << ", key=" << key
+            << ", source_segment=" << source << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
@@ -3159,8 +3159,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
 
     const auto& response = move_start_result.value();
     if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
-                  << ", info=target_replica_already_exists";
+        VLOG(1) << "action=replica_move_skipped" << ", key=" << key
+                << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key, tenant_id);
         if (!move_end_result.has_value()) {
@@ -3180,9 +3180,9 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         response.source, targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_move_success" << ", key=" << key
-                  << ", source_segment=" << source
-                  << ", target_segment=" << target;
+        VLOG(1) << "action=replica_move_success" << ", key=" << key
+                << ", source_segment=" << source
+                << ", target_segment=" << target;
     }
 
     return result;
@@ -3398,8 +3398,8 @@ void Client::PollAndDispatchTasks() {
         if (fetch_result.has_value()) {
             const auto& tasks = fetch_result.value();
             if (!tasks.empty()) {
-                LOG(INFO) << "action=task_poll_success"
-                          << ", task_count=" << tasks.size();
+                VLOG(1) << "action=task_poll_success"
+                        << ", task_count=" << tasks.size();
                 for (const auto& task_assignment : tasks) {
                     SubmitTask(task_assignment);
                 }

@@ -9,6 +9,7 @@
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
+#include "mooncake_log.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
 #include "http_metadata_server.h"
@@ -946,13 +947,13 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 int main(int argc, char* argv[]) {
-    mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+    mooncake::InitMooncakeLogging(argv[0]);
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        mooncake::SetGlogLogDir(FLAGS_log_dir.c_str());
     }
 
     // Initialize the master configuration

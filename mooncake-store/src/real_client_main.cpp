@@ -4,6 +4,7 @@
 
 #include "client_service.h"
 #include "config.h"
+#include "mooncake_log.h"
 #include "real_client.h"
 
 using namespace mooncake;
@@ -97,8 +98,9 @@ int main(int argc, char *argv[]) {
     mooncake::ResourceTracker::getInstance();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    mooncake::InitMooncakeLogging(argv[0]);
     if (!FLAGS_log_dir.empty()) {
-        google::InitGoogleLogging(argv[0]);
+        mooncake::SetGlogLogDir(FLAGS_log_dir.c_str());
     }
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);

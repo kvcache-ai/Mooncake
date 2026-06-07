@@ -216,8 +216,6 @@ DummyClient::DummyClient()
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
                                     false)) {
-    // Initialize logging severity (leave as before)
-    mooncake::init_ylt_log_level();
     // Initialize client pools
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     client_pools_ =

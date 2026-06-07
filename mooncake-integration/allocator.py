@@ -11,6 +11,13 @@ from torch.cuda.memory import CUDAPluggableAllocator
 
 from .fabric_allocator_utils import get_mooncake_so_path, probe_allocator_backend
 
+try:
+    from mooncake.logging_config import configure_logging_from_env
+
+    configure_logging_from_env()
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
