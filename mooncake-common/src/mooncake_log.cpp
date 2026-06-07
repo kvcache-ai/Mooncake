@@ -162,37 +162,35 @@ void InitYltLogLevelFromEnv() {
 }
 
 namespace {
+
+constexpr const char* kIsInitSymbol =
+    "_ZN6google26IsGoogleLoggingInitializedEv";
+
 bool SafeInitGoogleLogging(const char* program) {
 #ifdef GLOG_HAS_IS_INITIALIZED
-    if (google::IsGoogleLoggingInitialized()) return false;
+    if (google::IsGoogleLoggingInitialized()) {
+        return false;
+    }
     google::InitGoogleLogging(program);
     return true;
 #else
-    // Runtime probe: glog >= 0.6 aborts on double InitGoogleLogging.
-    // The wheel may be compiled against old glog but run on systems
-    // with new glog, so we probe both dlsym and the process global.
-    //
-    // First try dlsym in the main executable and all loaded libraries.
     using IsInitFn = bool (*)();
-    void* sym = dlsym(RTLD_DEFAULT,
-                       "_ZN6google26IsGoogleLoggingInitializedEv");
-    if (sym) {
-        auto is_init = reinterpret_cast<IsInitFn>(sym);
-        if (is_init()) return false;
-    }
-    // Also try RTLD_NEXT in case glog is a transitive dependency.
+    void* sym = dlsym(RTLD_DEFAULT, kIsInitSymbol);
     if (!sym) {
-        sym = dlsym(RTLD_NEXT,
-                     "_ZN6google26IsGoogleLoggingInitializedEv");
-        if (sym) {
-            auto is_init = reinterpret_cast<IsInitFn>(sym);
-            if (is_init()) return false;
+        sym = dlsym(RTLD_NEXT, kIsInitSymbol);
+    }
+    if (sym) {
+        auto is_init =
+            reinterpret_cast<IsInitFn>(sym);
+        if (is_init()) {
+            return false;
         }
     }
     google::InitGoogleLogging(program);
     return true;
 #endif
 }
+
 }  // namespace
 
 void InitMooncakeLogging(const char* argv0) {
