@@ -180,8 +180,7 @@ bool SafeInitGoogleLogging(const char* program) {
         sym = dlsym(RTLD_NEXT, kIsInitSymbol);
     }
     if (sym) {
-        auto is_init =
-            reinterpret_cast<IsInitFn>(sym);
+        auto is_init = reinterpret_cast<IsInitFn>(sym);
         if (is_init()) {
             return false;
         }
