@@ -16,7 +16,7 @@ namespace mooncake {
  */
 struct WriteRouteRequestConfig {
     static constexpr size_t RETURN_ALL_CANDIDATES = 0;
-    size_t max_candidates = RETURN_ALL_CANDIDATES;
+    size_t max_candidates = 2;
     ObjectIterateStrategy strategy = ObjectIterateStrategy::CAPACITY_PRIORITY;
     bool allow_local = true;   // whether to filter local client
     bool prefer_local = true;  // enhance the priority of local client

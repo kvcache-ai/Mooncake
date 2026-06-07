@@ -57,6 +57,11 @@ DEFINE_uint32(
     p2p_key_lease_scan_interval_ms, 0,
     "Interval (ms) for background scanning of expired key leases (PreWrite / "
     "PinKey). 0 uses the built-in default (1000).");
+DEFINE_string(runtime_config, "",
+              "Runtime read/write config: a JSON string or a path to a JSON "
+              "file. Can also be set via env MC_RUNTIME_CONFIG. For example,"
+              "Centralization mode: conf/centralized_runtime_config.json, "
+              "P2P mode: conf/p2p_runtime_config.json. Ï");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server& server,
@@ -131,7 +136,7 @@ int main(int argc, char* argv[]) {
                 FLAGS_async_sender_thread_count, FLAGS_async_max_batch_size,
                 FLAGS_async_route_queue_size, FLAGS_p2p_key_lease_duration_ms,
                 FLAGS_p2p_key_lease_scan_interval_ms,
-                FLAGS_p2p_transfer_direction_mode);
+                FLAGS_p2p_transfer_direction_mode, FLAGS_runtime_config);
         } else {
             if (FLAGS_deployment_mode != "Centralization") {
                 LOG(WARNING)
@@ -147,8 +152,8 @@ int main(int argc, char* argv[]) {
                 local_buffer_size, nullptr,
                 "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
                 FLAGS_enable_offload, static_cast<uint16_t>(FLAGS_http_port),
-                FLAGS_enable_http_server, {},
-                static_cast<uint16_t>(FLAGS_port));
+                FLAGS_enable_http_server, {}, static_cast<uint16_t>(FLAGS_port),
+                FLAGS_runtime_config);
         }
     }();
 

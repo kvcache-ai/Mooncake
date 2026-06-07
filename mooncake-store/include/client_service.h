@@ -26,6 +26,7 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 #include "client_config_builder.h"
 #include "client_buffer.hpp"
+#include "runtime_config_store.h"
 
 namespace mooncake {
 
@@ -408,6 +409,20 @@ class ClientService {
      */
     virtual std::string GetHealthStatus() const { return "OK"; }
 
+    RuntimeConfigStore& getRuntimeConfigStore() {
+        return *runtime_config_store_;
+    }
+    const RuntimeConfigStore& getRuntimeConfigStore() const {
+        return *runtime_config_store_;
+    }
+
+    RuntimeConfigStore::WriteConfig getDefaultWriteConfig() const {
+        return runtime_config_store_->getDefaultWriteConfig();
+    }
+    ReadRouteConfig getDefaultReadConfig() const {
+        return runtime_config_store_->getDefaultReadConfig();
+    }
+
    public:
     std::string local_endpoint() const {
         return local_ip_ + ":" + std::to_string(te_port_);
@@ -546,6 +561,8 @@ class ClientService {
      */
     virtual void RegisterHttpMethods();
 
+    void RegisterRuntimeConfigHttpMethods();
+
     /**
      * @brief Starts the HTTP server.
      */
@@ -639,6 +656,7 @@ class ClientService {
     // Configuration
     std::string local_ip_;
     uint16_t te_port_ = 0;
+    std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
 
     // The segment endpoint that the transfer engine registered with the
     // metadata backend.
