@@ -9,23 +9,12 @@
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
 #include <work_handles.h>
-#ifdef MOONCAKE_EP_USE_MUSA
-#include <ATen/musa/MUSAGraphsUtils.muh>
-#else
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
-#endif
 
 #include "pg_utils.h"
 
-#ifdef MOONCAKE_EP_USE_MUSA
-namespace gpu_capture = at::musa;
-namespace gpu_c10 = c10::musa;
-#else
-namespace gpu_capture = at::cuda;
-namespace gpu_c10 = c10::cuda;
-#endif
-
 namespace mooncake {
+
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         int* failedRanks, cudaStream_t stream) {
@@ -171,7 +160,7 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 MooncakeWorker::MooncakeWorker(int cuda_device_index)
     : cuda_device_index_(cuda_device_index) {
     int deviceCount = 0;
-    cudaError err = cudaGetDeviceCount(&deviceCount);
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
     if (!err && deviceCount > 0) {
         cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
         cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
@@ -278,19 +267,19 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const GPUStream& issue_stream, FailedRanks failed_ranks,
+    const at::cuda::CUDAStream& issue_stream, FailedRanks failed_ranks,
     const std::function<void(void* dst, size_t pos, size_t realSize,
-                             const GPUStream&)>& tensorToBuffer,
+                             const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
-                             const GPUStream&)>& bufferToTensor) {
+                             const at::cuda::CUDAStream&)>& bufferToTensor) {
     connection_ctx->waitUntilNewRanksConnected();
 
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
-    GPUStream enq_stream =
-        getGPUStreamFromPool(false, issue_stream.device_index());
+    at::cuda::CUDAStream enq_stream =
+        at::cuda::getStreamFromPool(false, issue_stream.device_index());
 
-    auto event_start = std::make_shared<torch::Event>(kGPUDevice);
+    auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
     event_start->record(issue_stream);
     event_start->block(enq_stream);
 
@@ -322,7 +311,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
         ++meta->taskCount;
     }
 
-    auto event_end = std::make_shared<torch::Event>(kGPUDevice);
+    auto event_end = std::make_shared<torch::Event>(torch::kCUDA);
     event_end->record(enq_stream);
 
     if (opType == c10d::OpType::BARRIER) {

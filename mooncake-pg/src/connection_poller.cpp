@@ -461,8 +461,10 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             }
 
             // Reset warmup region
-            *reinterpret_cast<volatile int32_t*>(
-                &warmup_recv_region_[pollingRank]) = 0;
+            if (warmup_recv_region_) {
+                *reinterpret_cast<volatile int32_t*>(
+                    &warmup_recv_region_[pollingRank]) = 0;
+            }
 
             // Reset P2PProxy states
             p2p_proxy_->resetPeerState(pollingRank);

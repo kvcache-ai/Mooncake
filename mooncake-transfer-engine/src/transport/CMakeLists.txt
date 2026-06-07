@@ -72,3 +72,11 @@ if (USE_EFA)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
   target_link_libraries(transport PRIVATE fabric)
 endif()
+
+if(USE_CUDA OR USE_MUSA)
+  add_subdirectory(device)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
+  # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
+  # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
+  target_link_libraries(transport PUBLIC mlx5)
+endif()

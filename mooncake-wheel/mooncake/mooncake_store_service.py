@@ -461,15 +461,16 @@ class MooncakeStoreService:
         try:
             data = await request.json()
             key = data.get('key')
-            value = data.get('value').encode()
+            raw_value = data.get('value')
 
-            if not key or not value:
+            if not key or raw_value is None:
                 return web.Response(
                     status=400,
                     text=json.dumps({'error': 'Missing key or value'}),
                     content_type='application/json'
                 )
 
+            value = raw_value.encode()
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(
