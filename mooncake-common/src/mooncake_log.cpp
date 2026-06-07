@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <dirent.h>
 #include <string>
 #include <unistd.h>
@@ -162,17 +163,25 @@ void InitYltLogLevelFromEnv() {
 
 void InitMooncakeLogging(const char* argv0) {
     const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
-#ifdef GLOG_HAS_IS_INITIALIZED
-    if (!google::IsGoogleLoggingInitialized()) {
-        google::InitGoogleLogging(program);
-    }
-#else
     static bool glog_initialized = false;
     if (!glog_initialized) {
-        google::InitGoogleLogging(program);
+#ifdef GLOG_HAS_IS_INITIALIZED
+        if (!google::IsGoogleLoggingInitialized()) {
+            google::InitGoogleLogging(program);
+        }
+#else
+        // Runtime check: glog >= 0.6 aborts on double InitGoogleLogging.
+        // The wheel may be compiled against old glog but run with new glog,
+        // so probe for IsGoogleLoggingInitialized via dlsym at runtime.
+        using IsInitFn = bool (*)();
+        auto is_init = reinterpret_cast<IsInitFn>(
+            dlsym(RTLD_DEFAULT, "_ZN6google26IsGoogleLoggingInitializedEv"));
+        if (!is_init || !is_init()) {
+            google::InitGoogleLogging(program);
+        }
+#endif
         glog_initialized = true;
     }
-#endif
     ApplyGlogEnvironment(nullptr);
     InitYltLogLevelFromEnv();
 }

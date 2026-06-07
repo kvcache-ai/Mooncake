@@ -77,6 +77,7 @@ target_link_libraries(mooncake_common PUBLIC
     yaml-cpp
     jsoncpp
     glog::glog
+    ${CMAKE_DL_LIBS}
 )
 
 if(GLOG_HAS_IS_INITIALIZED)
