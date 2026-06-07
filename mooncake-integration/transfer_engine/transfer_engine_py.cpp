@@ -1036,7 +1036,8 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
-    mooncake::InitMooncakeLogging("mooncake-transfer-engine");
+    mooncake::ApplyGlogEnvironment(nullptr);
+    mooncake::InitYltLogLevelFromEnv();
 
 #ifdef USE_EFA
     m.attr("SUPPORT_EFA") = true;

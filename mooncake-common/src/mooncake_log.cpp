@@ -161,25 +161,45 @@ void InitYltLogLevelFromEnv() {
     easylog::set_min_severity(severity);
 }
 
+namespace {
+bool SafeInitGoogleLogging(const char* program) {
+#ifdef GLOG_HAS_IS_INITIALIZED
+    if (google::IsGoogleLoggingInitialized()) return false;
+    google::InitGoogleLogging(program);
+    return true;
+#else
+    // Runtime probe: glog >= 0.6 aborts on double InitGoogleLogging.
+    // The wheel may be compiled against old glog but run on systems
+    // with new glog, so we probe both dlsym and the process global.
+    //
+    // First try dlsym in the main executable and all loaded libraries.
+    using IsInitFn = bool (*)();
+    void* sym = dlsym(RTLD_DEFAULT,
+                       "_ZN6google26IsGoogleLoggingInitializedEv");
+    if (sym) {
+        auto is_init = reinterpret_cast<IsInitFn>(sym);
+        if (is_init()) return false;
+    }
+    // Also try RTLD_NEXT in case glog is a transitive dependency.
+    if (!sym) {
+        sym = dlsym(RTLD_NEXT,
+                     "_ZN6google26IsGoogleLoggingInitializedEv");
+        if (sym) {
+            auto is_init = reinterpret_cast<IsInitFn>(sym);
+            if (is_init()) return false;
+        }
+    }
+    google::InitGoogleLogging(program);
+    return true;
+#endif
+}
+}  // namespace
+
 void InitMooncakeLogging(const char* argv0) {
     const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
     static bool glog_initialized = false;
     if (!glog_initialized) {
-#ifdef GLOG_HAS_IS_INITIALIZED
-        if (!google::IsGoogleLoggingInitialized()) {
-            google::InitGoogleLogging(program);
-        }
-#else
-        // Runtime check: glog >= 0.6 aborts on double InitGoogleLogging.
-        // The wheel may be compiled against old glog but run with new glog,
-        // so probe for IsGoogleLoggingInitialized via dlsym at runtime.
-        using IsInitFn = bool (*)();
-        auto is_init = reinterpret_cast<IsInitFn>(
-            dlsym(RTLD_DEFAULT, "_ZN6google26IsGoogleLoggingInitializedEv"));
-        if (!is_init || !is_init()) {
-            google::InitGoogleLogging(program);
-        }
-#endif
+        SafeInitGoogleLogging(program);
         glog_initialized = true;
     }
     ApplyGlogEnvironment(nullptr);

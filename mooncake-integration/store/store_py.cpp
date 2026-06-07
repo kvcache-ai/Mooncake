@@ -1644,7 +1644,8 @@ class MooncakeHostMemAllocatorPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
-    mooncake::InitMooncakeLogging("mooncake-store");
+    mooncake::ApplyGlogEnvironment(nullptr);
+    mooncake::InitYltLogLevelFromEnv();
 
     // Object data type classification
     py::enum_<ObjectDataType>(m, "ObjectDataType")
