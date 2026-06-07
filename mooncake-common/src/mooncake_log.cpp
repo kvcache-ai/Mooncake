@@ -162,11 +162,17 @@ void InitYltLogLevelFromEnv() {
 
 void InitMooncakeLogging(const char* argv0) {
     const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
+#ifdef GLOG_HAS_IS_INITIALIZED
+    if (!google::IsGoogleLoggingInitialized()) {
+        google::InitGoogleLogging(program);
+    }
+#else
     static bool glog_initialized = false;
     if (!glog_initialized) {
         google::InitGoogleLogging(program);
         glog_initialized = true;
     }
+#endif
     ApplyGlogEnvironment(nullptr);
     InitYltLogLevelFromEnv();
 }
