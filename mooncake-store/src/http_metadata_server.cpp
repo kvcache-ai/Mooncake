@@ -171,7 +171,7 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
     }
 
     // Get all segments once from master service
-    auto segments_result = wrapped_master_service_->GetAllSegments();
+    auto segments_result = wrapped_master_service_->GetAllSegmentsForAdmin();
     if (!segments_result.has_value()) {
         LOG(WARNING) << "Failed to get all segments for metadata cleanup";
         return;
