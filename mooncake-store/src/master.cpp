@@ -943,11 +943,11 @@ int main(int argc, char* argv[]) {
         // file and all lower ones, so the INFO sink is a complete journal.
         // Disable the higher-severity files so everything lands in one file.
         const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
-        google::SetLogDestination(google::INFO, log_base.c_str());
-        google::SetLogDestination(google::WARNING, "");
-        google::SetLogDestination(google::ERROR, "");
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
         google::SetLogDestination(google::GLOG_FATAL, "");
-        google::SetLogSymlink(google::INFO, "mooncake_master");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
 
     // Initialize the master configuration
