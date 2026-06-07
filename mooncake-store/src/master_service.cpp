@@ -1840,6 +1840,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     if (metadata.IsValid() == false) {
+        PublishKvRemoved(key, metadata);
         accessor.Erase();
     }
     return {};

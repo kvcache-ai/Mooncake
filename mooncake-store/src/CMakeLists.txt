@@ -115,11 +115,9 @@ if(ENABLE_KV_EVENTS)
     set(KV_EVENTS_ZMQ_FOUND TRUE)
   else()
     message(
-      WARNING
-        "libzmq not found; KV events publisher disabled. Install libzmq3-dev "
-        "or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
-    set(ENABLE_KV_EVENTS OFF)
-    set(ENABLE_KV_EVENTS OFF PARENT_SCOPE)
+      FATAL_ERROR
+        "ENABLE_KV_EVENTS is ON but libzmq was not found. "
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ.")
   endif()
 endif()
 
