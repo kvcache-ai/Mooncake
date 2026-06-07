@@ -1,0 +1,352 @@
+name: Hotfix Release (Post Version)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: 'Base version to create hotfix from (e.g., 0.3.9)'
+        required: true
+        type: string
+      post_number:
+        description: 'Post release number (e.g., 1 for .post1)'
+        required: true
+        type: string
+      description:
+        description: 'Brief description of the hotfix'
+        required: true
+        type: string
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  prepare-hotfix:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      hotfix_version: ${{ steps.create_hotfix.outputs.hotfix_version }}
+      hotfix_tag: ${{ steps.create_hotfix.outputs.hotfix_tag }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Validate inputs
+        run: |
+          # Validate version format
+          if ! [[ "${{ github.event.inputs.base_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid version format. Expected format: X.Y.Z"
+            exit 1
+          fi
+
+          # Validate post number
+          if ! [[ "${{ github.event.inputs.post_number }}" =~ ^[0-9]+$ ]]; then
+            echo "Error: Post number must be a positive integer"
+            exit 1
+          fi
+
+      - name: Create hotfix version
+        id: create_hotfix
+        run: |
+          BASE_VERSION="${{ github.event.inputs.base_version }}"
+          POST_NUMBER="${{ github.event.inputs.post_number }}"
+          HOTFIX_VERSION="${BASE_VERSION}.post${POST_NUMBER}"
+          HOTFIX_TAG="v${HOTFIX_VERSION}"
+
+          echo "Hotfix version: $HOTFIX_VERSION"
+          echo "Hotfix tag: $HOTFIX_TAG"
+
+          # Check if tag already exists
+          if git rev-parse "$HOTFIX_TAG" >/dev/null 2>&1; then
+            echo "Error: Tag $HOTFIX_TAG already exists"
+            exit 1
+          fi
+
+          # Update pyproject.toml with hotfix version
+          sed -i "s/version = \".*\"/version = \"$HOTFIX_VERSION\"/" mooncake-wheel/pyproject.toml
+
+          echo "hotfix_version=$HOTFIX_VERSION" >> $GITHUB_OUTPUT
+          echo "hotfix_tag=$HOTFIX_TAG" >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create hotfix branch
+        run: |
+          BRANCH_NAME="hotfix/${{ steps.create_hotfix.outputs.hotfix_version }}"
+          git checkout -b "$BRANCH_NAME"
+          git add mooncake-wheel/pyproject.toml
+          git commit -m "Hotfix ${{ steps.create_hotfix.outputs.hotfix_version }}: ${{ github.event.inputs.description }}
+
+Generated with [Claude Code](https://claude.ai/code)
+via [Happy](https://happy.engineering)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>"
+          git push origin "$BRANCH_NAME"
+
+      - name: Create and push tag
+        run: |
+          git tag ${{ steps.create_hotfix.outputs.hotfix_tag }}
+          git push origin ${{ steps.create_hotfix.outputs.hotfix_tag }}
+
+  build-cuda:
+    needs: prepare-hotfix
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    env:
+      BUILD_WITH_EP: "1"
+      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
+      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-hotfix.outputs.hotfix_tag }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          df -h
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build project
+        run: |
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+          cd build
+          make -j
+          sudo make install
+        shell: bash
+
+      - name: Build nvlink_allocator.so
+        run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+        shell: bash
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  build-non-cuda:
+    needs: prepare-hotfix
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    env:
+      BUILD_WITH_EP: "0"
+      NON_CUDA_BUILD: "1"
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-hotfix.outputs.hotfix_tag }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Configure project
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build project
+        run: |
+          cd build
+          make -j
+          sudo make install
+        shell: bash
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-non-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  publish-hotfix:
+    needs: [prepare-hotfix, build-cuda, build-non-cuda]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-hotfix.outputs.hotfix_tag }}
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for hotfix release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Mooncake ${{ needs.prepare-hotfix.outputs.hotfix_version }} (Hotfix)
+
+          🔧 **This is a hotfix release addressing critical bugs.**
+
+          ## What's Fixed
+
+          ${{ github.event.inputs.description }}
+
+          ## Installation
+
+          ### CUDA version (default):
+          ```bash
+          pip install --upgrade mooncake-transfer-engine
+          ```
+
+          ### Non-CUDA version:
+          ```bash
+          pip install --upgrade mooncake-transfer-engine-non-cuda
+          ```
+
+          ## Python Support
+
+          - Python 3.10, 3.11, 3.12, 3.13
+
+          ## Documentation
+
+          - [GitHub Repository](https://github.com/kvcache-ai/Mooncake)
+          - [Documentation](https://kvcache-ai.github.io/Mooncake/)
+
+          ---
+          *This hotfix was released on $(date -u +"%Y-%m-%d")*
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.prepare-hotfix.outputs.hotfix_tag }}
+          name: Hotfix ${{ needs.prepare-hotfix.outputs.hotfix_version }}
+          body_path: release_notes.md
+          files: mooncake-wheel/dist-release/*.whl
+          draft: false
+          prerelease: false
+
+      - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/
+          password: ${{ secrets.PYPI_API_TOKEN }}
