@@ -1,266 +1,159 @@
 ---
 name: mooncake-ci-local
-description: Run Mooncake CI test suite locally — maps GitHub Actions CI steps to local commands. Use this skill whenever the user wants to run tests locally, reproduce a CI failure, check if their changes break tests, or run any subset of the CI test suite (C++ unit tests via ctest, Python integration tests, code format checks, or the full test pipeline). Trigger on phrases like "run tests", "run CI locally", "reproduce CI failure", "check my changes", "test before PR", "run ctest", "run python tests", "run all tests".
+description: Run Mooncake pre-PR local validation through scripts/run_ci_test.sh. Use this skill whenever the user wants to validate a branch before opening or submitting a PR, run local CI, run ci test, check changes before PR, reproduce GitHub Actions locally, or force a full pre-submit verification. Trigger on phrases like "提交 PR 前验证", "run ci test", "run local CI", "check my branch", "test before PR", "pre-submit validation", and "reproduce CI locally".
 ---
 
-# Mooncake CI Local Test Runner
+# Mooncake Pre-PR Local Validation
 
-You help users run the Mooncake CI test suite locally. The CI has three test layers. Map what the user wants to the right layer, check prerequisites, and run the tests.
+Use `bash scripts/run_ci_test.sh` as the default entry point. This is the single local lane for PR-before-submit validation, and it already coordinates the reproducible parts of GitHub Actions.
 
-## CI Test Layers
+## Default Entry Point
 
-### Layer 1 — C++ Unit Tests (ctest)
-**CI equivalent:** `build` job in `ci.yml` — "Test (in build env) with coverage"
+When the user asks for any of the following, run the repo script first instead of reconstructing the workflow by hand:
 
-**Prerequisite services:**
-```bash
-# 1. etcd (port 2379)
-etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-sleep 2
-etcdctl --endpoints=http://127.0.0.1:2379 endpoint health  # verify
+- 提交 PR 前本地验证
+- run ci test
+- run local CI
+- check my branch before PR
+- reproduce CI locally
 
-# 2. HTTP metadata server (port 8080)
-cd mooncake-transfer-engine/example/http-metadata-server-python
-pip install aiohttp
-python ./bootstrap_server.py &
-cd -
-```
-
-**Run:**
-```bash
-cd build
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
-```
-
-**Run specific test:**
-```bash
-cd build
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -R <test_name_pattern> --output-on-failure
-# List all available tests: ctest -N
-```
-
-### Layer 2 — Python Integration Tests
-**CI equivalent:** `test-wheel-ubuntu` job — `run_tests.sh`
-
-**Prerequisite:** Mooncake wheel must be installed (either via `pip install` or via `make install` after build).
-
-**Check install:**
-```bash
-python -c "import mooncake; print('OK')"
-which mooncake_master  # must NOT be /usr/local/bin (must be from Python package)
-```
-
-**Run full suite:**
-```bash
-# Start metadata server first
-mooncake_http_metadata_server --port 8080 &
-sleep 1
-
-cd mooncake-wheel/tests
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 MC_FORCE_TCP=true \
-  bash ../../scripts/run_tests.sh
-```
-
-**Individual Python tests** (all require metadata server + mooncake_master on port 50051):
-```bash
-# Setup shared services
-mooncake_http_metadata_server --port 8080 &
-mooncake_master --default_kv_lease_ttl=500 &
-sleep 2
-
-cd mooncake-wheel/tests
-export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
-export DEFAULT_KV_LEASE_TTL=500
-export MC_FORCE_TCP=true
-
-# Pick any test:
-python test_distributed_object_store.py
-python test_replicated_distributed_object_store.py
-python test_put_get_tensor.py          # requires torch + numpy
-python test_safetensor_functions.py    # requires safetensors
-python test_dummy_client.py
-python test_cli.py
-python test_distributed_object_store_cxl.py  # requires CXL build
-```
-
-**Transfer engine tests specifically:**
-```bash
-cd mooncake-wheel/tests
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &
-TARGET_PID=$!
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_initiator_test.py
-kill $TARGET_PID
-```
-
-**Scripts-based tests** (from `test-wheel-ubuntu` job):
-```bash
-# Tensor API perf test
-export MOONCAKE_MASTER="127.0.0.1:50051"
-export MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata"
-export MOONCAKE_PROTOCOL="tcp"
-export LOCAL_HOSTNAME="127.0.0.1"
-python scripts/test_tensor_api.py -n 1
-python scripts/test_async_store.py
-python scripts/test_copy_move_api.py
-```
-
-### Layer 3 — Static Checks (no services needed)
-**CI equivalent:** `clang-format` and `spell-check` jobs
-
-**Code format (changed files vs main):**
-```bash
-./scripts/code_format.sh --check --base origin/main
-# Auto-fix:
-./scripts/code_format.sh --base origin/main
-```
-
-**Spell check:**
-```bash
-# Requires typos tool: cargo install typos-cli
-typos
-```
-
-**Pre-commit (runs all hooks):**
-```bash
-pip install pre-commit
-pre-commit run --all-files
-# Or just on staged files:
-pre-commit run
-```
-
-## Build Configurations (from CI)
-
-If the user needs to build first, here are the CI-equivalent cmake flags:
-
-**Standard build with coverage (mirrors `build` job):**
-```bash
-mkdir build && cd build
-cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build .
-sudo cmake --install .
-```
-
-**All features ON (mirrors `build-flags` job):**
-```bash
-mkdir build && cd build
-cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
-cmake --build .
-sudo cmake --install .
-```
-
-**Transfer engine only:**
-```bash
-cd mooncake-transfer-engine
-mkdir build && cd build
-cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
-cmake --build .
-```
-
-## Workflow: Diagnosing and Running Tests
-
-### Step 1 — Understand what the user wants
-
-Ask (or infer from context):
-- All tests, or a specific subset?
-- Did a specific CI job fail? Which one?
-- Is the build already done, or do they need to build first?
-
-### Step 2 — Check and Fix Prerequisites
-
-**One-command setup** — this script checks all prerequisites and auto-fixes issues:
+Default command:
 
 ```bash
-bash .claude/skills/mooncake-ci-local/scripts/check-prerequisites.sh
+bash scripts/run_ci_test.sh
 ```
 
-**What it checks:**
-1. ✓ Build directory exists
-2. ✓ mooncake package installed (auto-installs via cmake --install if missing)
-3. ✓ ctest available
-4. ✓ Restarts all services (etcd, metadata server) in clean state
-5. ✓ Verifies all services are healthy
+What this script already covers:
 
-**If you need to build first:**
-```bash
-mkdir build && cd build
-cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CXL=ON -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build .
-sudo cmake --install .
-```
+- GitHub-like `paths-filter` against `origin/main`
+- `typos`
+- `scripts/code_format.sh --check`
+- default CMake configure/build/install in `build-ci-local`
+- `ctest`
+- wheel build in `build-wheel-local`
+- wheel installation validation
+- `scripts/run_tests.sh`
+- selected Python API and integration tests
+- per-stage summary and logs under `local_test/run-ci-logs/<timestamp>/`
 
-**If script fails:**
-- Build issues: See "Build Configurations" section below
-- mooncake install fails: Try `pip install mooncake-wheel/dist/*.whl` manually
-- etcd install fails: Download from https://github.com/etcd-io/etcd/releases
+## Standard Agent Workflow
 
-### Step 3 — Run and report
+1. Run `bash scripts/run_ci_test.sh` from the repo root unless the user explicitly asks for a narrower subset.
+2. Read the stage summary instead of dumping raw terminal output.
+3. Report these items back to the user:
+   - passed stages
+   - failed stages
+   - blocked stages
+   - unsupported stages
+   - whether `paths-filter` skipped downstream stages
+   - the log directory under `local_test/run-ci-logs/...`
+4. If there is a failure, inspect the corresponding stage log and summarize the root cause.
 
-Run the relevant test layer. On failure:
-1. Show the exact error message
-2. Check if it's a service/env issue (most common) vs a real test failure
-3. Suggest the fix (see common issues below)
+## Common Options
 
-## Common Local Test Issues
-
-**"mooncake_master found in /usr/local/bin" error in run_tests.sh:**
-The test expects mooncake_master to come from the Python package, not a system install.
-```bash
-# Remove the system-installed binary:
-sudo rm /usr/local/bin/mooncake_master
-# Or use the wheel-installed one:
-pip install mooncake-wheel/dist/*.whl
-```
-
-**etcd port conflict:**
-```bash
-pkill etcd && sleep 1
-etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-```
-
-**Metadata server port conflict:**
-```bash
-pkill -f bootstrap_server.py
-pkill -f mooncake_http_metadata_server
-```
-
-**Tests hang (master not responding):**
-```bash
-pkill mooncake_master
-sleep 2
-mooncake_master --default_kv_lease_ttl=500 &
-sleep 1
-```
-
-**torch/numpy not installed for tensor tests:**
-```bash
-pip install torch numpy safetensors packaging
-```
-
-**ctest shows no tests found:**
-```bash
-# Rebuild with unit tests enabled:
-cd build
-cmake .. -DBUILD_UNIT_TESTS=ON
-cmake --build .
-```
-
-## Quick One-Liners
+Force a full lane even if `paths-filter` would skip downstream stages:
 
 ```bash
-# Run ALL C++ tests (after building with etcd + metadata server running):
-# Note: full suite takes 5-15 minutes depending on hardware
-cd build && MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
-
-# Run only fast tests (skip slow integration tests):
-cd build && MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure --exclude-regex "etcd|ha_test|redis"
-
-# Run ALL Python tests:
-mooncake_http_metadata_server --port 8080 & sleep 1 && cd mooncake-wheel/tests && MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true bash ../../scripts/run_tests.sh
-
-# Check code format (changed files only):
-./scripts/code_format.sh --check --base origin/main
-
-# Full pre-commit check:
-pre-commit run --all-files
+bash scripts/run_ci_test.sh --skip-path-filter
 ```
+
+Use another base ref:
+
+```bash
+bash scripts/run_ci_test.sh --base origin/main
+```
+
+Auto-install missing dependencies:
+
+```bash
+bash scripts/run_ci_test.sh --install-deps
+```
+
+Keep services running for follow-up debugging:
+
+```bash
+bash scripts/run_ci_test.sh --keep-services
+```
+
+## Minimal Example
+
+User prompt:
+
+- 提交 PR 前，帮我跑一遍本地 CI 验证当前分支。
+
+Expected action:
+
+```bash
+bash scripts/run_ci_test.sh
+```
+
+If the user wants to ignore changed-path optimization and force the full lane:
+
+```bash
+bash scripts/run_ci_test.sh --skip-path-filter
+```
+
+See also `.claude/skills/mooncake-ci-local/examples/minimal.md`.
+
+## How To Interpret Results
+
+- `passed`: the stage succeeded locally.
+- `failed`: the stage reproduced a real local failure and needs investigation.
+- `blocked`: local environment or dependency issue prevented execution.
+- `unsupported`: intentionally not run in the local lane because it needs external platforms, special hardware, or a non-default build.
+
+If `paths-filter` skips downstream stages, explain that the current branch changed only non-source paths relative to the selected base.
+
+## Current Local Coverage
+
+Included by default:
+
+- spell check
+- code format check
+- default ASan CMake lane in `build-ci-local`
+- `ctest`
+- wheel build and installation test
+- `scripts/run_tests.sh`
+- selected Python API tests
+
+Unsupported by design in the default local lane:
+
+- Ascend jobs
+- T-one integration jobs
+- MUSA jobs
+- Docker image build jobs
+- CUDA 13 wheel jobs
+- PG-backend tests absent from the default wheel build
+- Python drain-http API stage in the local ASan lane
+
+## Targeted Reruns For Debugging
+
+Use targeted reruns only after the full script identifies a failing area, or when the user explicitly asks for a smaller scope.
+
+Rerun a specific C++ test pattern:
+
+```bash
+cd build-ci-local
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -R <pattern> --output-on-failure
+```
+
+Rerun the Python wheel integration lane:
+
+```bash
+source test_env/bin/activate
+MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
+```
+
+Rerun the safetensor unittest:
+
+```bash
+source test_env/bin/activate
+python -m unittest mooncake-wheel.tests.test_safetensor_functions
+```
+
+## Notes For The Agent
+
+- Prefer the repo script over rebuilding the CI workflow step by step.
+- Preserve the separation between `build-ci-local` and `build-wheel-local`.
+- Summarize failing stages from their logs instead of pasting raw output.
+- If the user only asks whether the branch is safe before opening a PR, the default answer path is `bash scripts/run_ci_test.sh`.
