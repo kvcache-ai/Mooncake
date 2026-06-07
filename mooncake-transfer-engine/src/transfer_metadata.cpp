@@ -220,6 +220,9 @@ static int encodeMultiProtocolSegmentDesc(
     const TransferMetadata::SegmentDesc &desc, Json::Value &segmentJSON) {
     // Multi-protocol encoding for CXL+TCP or CXL+RDMA combination
     segmentJSON["name"] = desc.name;
+    if (!desc.rdma_server_name.empty()) {
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
     Json::Value protocolJSON(Json::arrayValue);
     for (const auto &proto : protocols) {
         if (proto == "rdma") {
@@ -316,6 +319,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    if (!desc.rdma_server_name.empty()) {
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
 
     if (segmentJSON["protocol"] == "rdma" ||
         segmentJSON["protocol"] == "barex" ||
@@ -509,6 +515,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("rdma_server_name"))
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
     for (const auto &protocolStr : segmentJSON["protocol"]) {
         std::string proto = protocolStr.asString();
@@ -652,6 +660,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("rdma_server_name"))
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
     if (desc->protocol == "rdma" || desc->protocol == "barex" ||
         desc->protocol == "efa") {
@@ -898,7 +908,30 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
         }
     }
 
-    return decodeSegmentDesc(peer_json, segment_name);
+    auto result = decodeSegmentDesc(peer_json, segment_name);
+
+    // In P2P mode with dual-NIC setups (MC_RDMA_BIND_ADDRESS), the peer's
+    // segment descriptor may contain an rdma_server_name that differs from
+    // the TCP-routable segment_name. Cache the mapping so subsequent
+    // sendHandshake() calls can resolve the peer's TCP address from the
+    // RDMA server name extracted from NIC paths.
+    if (p2p_handshake_mode_ && result && !result->rdma_server_name.empty() &&
+        result->rdma_server_name != segment_name) {
+        auto [tcp_ip, tcp_port] = parseHostNameWithPort(segment_name);
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        if (!rpc_meta_map_.count(result->rdma_server_name)) {
+            RpcMetaDesc meta;
+            meta.ip_or_host_name = tcp_ip;
+            meta.rpc_port = tcp_port;
+            meta.sockfd = -1;
+            rpc_meta_map_[result->rdma_server_name] = meta;
+            LOG(INFO) << "P2P: cached RDMA->TCP mapping: "
+                      << result->rdma_server_name << " -> " << tcp_ip << ":"
+                      << tcp_port;
+        }
+    }
+
+    return result;
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {

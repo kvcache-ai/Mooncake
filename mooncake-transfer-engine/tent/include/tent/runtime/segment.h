@@ -169,11 +169,24 @@ struct SegmentDesc {
     std::string rpc_server_addr;
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
+    // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
+    // address may differ from the TCP-routable segment name.  When
+    // non-empty, NIC paths are constructed using this value instead
+    // of `name`.
+    std::string rdma_server_name;
+
    public:
     BufferDesc* findBuffer(uint64_t base, uint64_t length);
     DeviceDesc* findDevice(const std::string& name);
     const MemorySegmentDesc& getMemory() const {
         return std::get<MemorySegmentDesc>(detail);
+    }
+
+    // Returns the server name to use for NIC path construction.
+    // Uses rdma_server_name when available, otherwise falls back
+    // to name.
+    const std::string& nicPathServerName() const {
+        return rdma_server_name.empty() ? name : rdma_server_name;
     }
 };
 
@@ -182,6 +195,9 @@ inline void to_json(json& j, const SegmentDesc& s) {
              {"type", s.type},
              {"machine_id", s.machine_id},
              {"rpc_server_addr", s.rpc_server_addr}};
+    if (!s.rdma_server_name.empty()) {
+        j["rdma_server_name"] = s.rdma_server_name;
+    }
     if (s.type == SegmentType::Memory) {
         j["detail"] = std::get<MemorySegmentDesc>(s.detail);
     } else {
@@ -194,6 +210,9 @@ inline void from_json(const json& j, SegmentDesc& s) {
     j.at("type").get_to(s.type);
     j.at("machine_id").get_to(s.machine_id);
     j.at("rpc_server_addr").get_to(s.rpc_server_addr);
+    if (j.contains("rdma_server_name")) {
+        j.at("rdma_server_name").get_to(s.rdma_server_name);
+    }
     if (s.type == SegmentType::Memory) {
         s.detail = j.at("detail").get<MemorySegmentDesc>();
     } else {

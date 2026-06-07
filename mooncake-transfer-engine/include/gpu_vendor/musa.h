@@ -1,3 +1,5 @@
+#pragma once
+
 #include <string>
 #include <musa.h>
 #include <musa_runtime.h>
@@ -20,6 +22,11 @@ const static std::string GPU_PREFIX = "musa:";
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE MU_POINTER_ATTRIBUTE_RANGE_SIZE
 #define CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED \
     MU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED \
+    MU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
+#define CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL MU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+
+#define CUcontext MUcontext
 
 #define CUdevice MUdevice
 #define CUdeviceptr MUdeviceptr
@@ -76,6 +83,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaMemcpyAsync musaMemcpyAsync
 #define cudaMemcpyDefault musaMemcpyDefault
 #define cudaMemcpyDeviceToHost musaMemcpyDeviceToHost
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaMemcpyHostToDevice musaMemcpyHostToDevice
 #define cudaMemset musaMemset
 #define cudaMemsetAsync musaMemsetAsync
@@ -89,4 +97,25 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamSynchronize musaStreamSynchronize
 #define cudaStream_t musaStream_t
+#define cudaEvent_t musaEvent_t
+#define cudaHostGetDevicePointer musaHostGetDevicePointer
 #define cudaSuccess musaSuccess
+#define cudaDeviceGetAttribute musaDeviceGetAttribute
+#define cudaEvent_t musaEvent_t
+#define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
+#define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaLaunchConfig_t musaLaunchConfig_t
+#define cudaLaunchAttribute musaLaunchAttribute
+#define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
+#define cudaLaunchKernelEx musaLaunchKernelEx
+#define CUDA_R_16BF MUSA_R_16BF
+#define CUDA_R_32F MUSA_R_32F
+
+// IBGDA-specific mappings
+#define cuInit muInit
+#define cuDevicePrimaryCtxRetain muDevicePrimaryCtxRetain
+#define cuDevicePrimaryCtxRelease muDevicePrimaryCtxRelease
+#define cuCtxSetCurrent muCtxSetCurrent
+#define cudaHostRegisterMapped musaHostRegisterMapped
+#define cudaHostRegisterIoMemory musaHostRegisterIoMemory
+#define cudaHostGetDevicePointer musaHostGetDevicePointer

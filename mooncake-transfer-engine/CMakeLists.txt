@@ -83,7 +83,12 @@ endif()
 
 if(USE_TENT)
   add_subdirectory(tent)
-  if(BUILD_BENCHMARK)
-    add_subdirectory(benchmark)
-  endif()
+endif()
+
+# tebench only needs the classic Transfer Engine for its default "classic"
+# backend; the TENT backend is compiled in conditionally (see benchmark/
+# CMakeLists.txt and main.cpp). Keep it gated solely on BUILD_BENCHMARK so it
+# can be built without enabling USE_TENT.
+if (BUILD_BENCHMARK)
+  add_subdirectory(benchmark)
 endif()

@@ -68,7 +68,11 @@ class OffloadOnEvictTest : public ::testing::Test {
         if (!res) {
             return {};
         }
-        return std::move(res.value());
+        std::unordered_map<std::string, int64_t> queued;
+        for (const auto& task : res.value()) {
+            queued[task.key] = task.size;
+        }
+        return queued;
     }
 
     template <typename Predicate>

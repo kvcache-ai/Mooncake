@@ -1,9 +1,6 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
 #include <cuda_alike.h>
-#include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <atomic>
 #include <chrono>
@@ -24,6 +21,7 @@ namespace mooncake {
 // On MNNVL clusters all GPUs support fabric mem handles, meaning
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
+#ifndef MOONCAKE_EP_USE_MUSA
 static bool supportFabricMem() {
     if (!Environ::Get().GetNvlinkFabricMemEnabled()) return false;
 
@@ -39,6 +37,10 @@ static bool supportFabricMem() {
     }
     return true;
 }
+#else
+// MUSA does not support NVLink fabric memory handles.
+static bool supportFabricMem() { return false; }
+#endif
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      bool isDummy,
                                      uint64_t* local2global_rank_map,
@@ -446,8 +448,10 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             }
 
             // Reset warmup region
-            *reinterpret_cast<volatile int32_t*>(
-                &warmup_recv_region_[pollingRank]) = 0;
+            if (warmup_recv_region_) {
+                *reinterpret_cast<volatile int32_t*>(
+                    &warmup_recv_region_[pollingRank]) = 0;
+            }
 
             // Reset P2PProxy states
             p2p_proxy_->resetPeerState(pollingRank);

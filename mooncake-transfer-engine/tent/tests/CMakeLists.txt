@@ -20,6 +20,12 @@ target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+add_executable(tent_ip_utils_test ip_utils_test.cpp)
+target_link_libraries(tent_ip_utils_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(tent_ip_utils_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
+
 add_executable(request_merge_test request_merge_test.cpp)
 target_link_libraries(request_merge_test PRIVATE gtest gtest_main
                                                  tent_link_group)

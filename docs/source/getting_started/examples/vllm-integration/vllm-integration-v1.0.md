@@ -1,5 +1,10 @@
 # vLLM v1 backend Disaggregated Serving with MooncakeConnector
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [Disaggregated Prefill-Decode](disagg-prefill-decode) guide. Please use that guide for up-to-date information.
+```
+
 ## Overview
 
 This guide demonstrates how to use the MooncakeConnector with vLLM v1 backend for disaggregated serving in Prefill-Decode separation architecture. The integration enables efficient cross-node KV cache transfer using RDMA technology.
@@ -100,7 +105,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
     - `kv_producer`: For prefiller instances that generate KV caches
     - `kv_consumer`: For decoder instances that consume KV caches
     - `kv_both`: Enables symmetric functionality (experimental)
-    - `num_workers`: Thread pool size in each prefiller worker to send kvcache (default 10)
+  - `num_workers`: Thread pool size in each prefiller worker to send kvcache (default 10)
 
 ## Environment Variables
 

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <ylt/struct_json/json_reader.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -136,10 +137,13 @@ class MasterServiceTest : public ::testing::Test {
             ReplicaMovePayload payload;
             struct_json::from_json(payload, assignment.payload);
 
-            auto move_start = service.MoveStart(client_id, payload.key,
-                                                payload.source, payload.target);
+            auto move_start =
+                service.MoveStart(client_id, payload.key, payload.tenant_id,
+                                  payload.source, payload.target);
             EXPECT_TRUE(move_start.has_value());
-            EXPECT_TRUE(service.MoveEnd(client_id, payload.key).has_value());
+            EXPECT_TRUE(
+                service.MoveEnd(client_id, payload.key, payload.tenant_id)
+                    .has_value());
 
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
@@ -197,6 +201,27 @@ class MasterServiceTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
+
+TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
+    const auto scoped =
+        MakeTenantScopedStorageKey("tenant:with:colon", "path/key:with:colon");
+    EXPECT_NE(scoped.find('\0'), std::string::npos);
+
+    auto [tenant_id, key] = ParseTenantScopedStorageKey(scoped);
+    EXPECT_EQ(tenant_id, "tenant:with:colon");
+    EXPECT_EQ(key, "path/key:with:colon");
+
+    auto [default_tenant, default_key] = ParseTenantScopedStorageKey("raw_key");
+    EXPECT_EQ(default_tenant, "default");
+    EXPECT_EQ(default_key, "raw_key");
+
+    std::string legacy = "legacy_tenant";
+    legacy.push_back('\0');
+    legacy.append("legacy_key");
+    auto [legacy_tenant, legacy_key] = ParseTenantScopedStorageKey(legacy);
+    EXPECT_EQ(legacy_tenant, "legacy_tenant");
+    EXPECT_EQ(legacy_key, "legacy_key");
+}
 
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
@@ -619,6 +644,180 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     EXPECT_FALSE(exists_after_remove.value());
 }
 
+TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "tenant_grouped_shared_user_key";
+    const std::string tenant_a = "tenant_group_route_a";
+    const std::string tenant_b = "tenant_group_route_b";
+    const std::string group_a = FindGroupIdOnDifferentShard(key);
+    std::string group_b;
+    for (int i = 0; i < 10000; ++i) {
+        group_b = key + "_tenant_b_group_" + std::to_string(i);
+        if (std::hash<std::string>{}(group_b) % 1024 !=
+            std::hash<std::string>{}(group_a) % 1024) {
+            break;
+        }
+    }
+
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids = std::vector<std::string>{group_a};
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    config_b.group_ids = std::vector<std::string>{group_b};
+
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_a, 1024, config_a)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->PutStart(client_id, key, tenant_b, 2048, config_b)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value_or(false));
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentGroupedAndUngroupedFirstCreateDoesNotDuplicateMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "concurrent_grouped_ungrouped_first_create";
+    const std::string tenant_id = "tenant_concurrent_first_create";
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+
+    static constexpr size_t kThreadCount = 16;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<int> put_start_success(kThreadCount, 0);
+    std::vector<int> put_end_success(kThreadCount, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto& config =
+                (i % 2 == 0) ? grouped_config : ungrouped_config;
+            auto put_start =
+                service_->PutStart(client_id, key, tenant_id, 1024, config);
+            put_start_success[i] = put_start.has_value() ? 1 : 0;
+            if (put_start.has_value()) {
+                put_end_success[i] = service_->PutEnd(client_id, key, tenant_id,
+                                                      ReplicaType::MEMORY)
+                                             .has_value()
+                                         ? 1
+                                         : 0;
+            } else {
+                EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, put_start.error());
+            }
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(std::count(put_start_success.begin(), put_start_success.end(), 1),
+              1);
+    EXPECT_EQ(std::count(put_end_success.begin(), put_end_success.end(), 1), 1);
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentDifferentGroupedFirstCreateDoesNotDuplicateMetadata) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "concurrent_different_grouped_first_create";
+    const std::string tenant_id = "tenant_concurrent_grouped_first_create";
+    const std::string group_a = FindGroupIdOnDifferentShard(key);
+    std::string group_b;
+    for (int i = 0; i < 10000; ++i) {
+        group_b = key + "_other_group_" + std::to_string(i);
+        if (std::hash<std::string>{}(group_b) % 1024 !=
+            std::hash<std::string>{}(group_a) % 1024) {
+            break;
+        }
+    }
+    ReplicateConfig config_a;
+    config_a.replica_num = 1;
+    config_a.group_ids = std::vector<std::string>{group_a};
+    ReplicateConfig config_b;
+    config_b.replica_num = 1;
+    config_b.group_ids = std::vector<std::string>{group_b};
+
+    static constexpr size_t kThreadCount = 16;
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<int> put_start_success(kThreadCount, 0);
+    std::vector<int> put_end_success(kThreadCount, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            const auto& config = (i % 2 == 0) ? config_a : config_b;
+            auto put_start =
+                service_->PutStart(client_id, key, tenant_id, 1024, config);
+            put_start_success[i] = put_start.has_value() ? 1 : 0;
+            if (put_start.has_value()) {
+                put_end_success[i] = service_->PutEnd(client_id, key, tenant_id,
+                                                      ReplicaType::MEMORY)
+                                             .has_value()
+                                         ? 1
+                                         : 0;
+            } else {
+                EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, put_start.error());
+            }
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(std::count(put_start_success.begin(), put_start_success.end(), 1),
+              1);
+    EXPECT_EQ(std::count(put_end_success.begin(), put_end_success.end(), 1), 1);
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
+}
+
 TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
     auto service_config = MasterServiceConfig::builder()
                               .set_put_start_discard_timeout_sec(0)
@@ -645,6 +844,52 @@ TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
     ASSERT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+}
+
+TEST_F(MasterServiceTest, BatchRemoveUnregistersGroupedRoute) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "batch_remove_grouped_route";
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    PutCompletedObject(*service_, client_id, key, grouped_config);
+
+    auto remove_results =
+        service_->BatchRemove(std::vector<std::string>{key}, /*force=*/true);
+    ASSERT_EQ(remove_results.size(), 1u);
+    ASSERT_TRUE(remove_results[0].has_value());
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+}
+
+TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "regex_remove_grouped_route";
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    PutCompletedObject(*service_, client_id, key, grouped_config);
+
+    auto removed = service_->RemoveByRegex("^regex_remove_grouped_route$",
+                                           /*force=*/true);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed.value(), 1);
+
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
 }
 
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
@@ -811,6 +1056,28 @@ TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
     ASSERT_TRUE(
         service_->UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+}
+
+TEST_F(MasterServiceTest, UpsertRejectsExistingUngroupedToGrouped) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "upsert_ungrouped_to_grouped";
+    ReplicateConfig ungrouped_config;
+    ungrouped_config.replica_num = 1;
+    PutCompletedObject(*service_, client_id, key, ungrouped_config);
+
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    auto upsert_start =
+        service_->UpsertStart(client_id, key, 2048, grouped_config);
+    ASSERT_FALSE(upsert_start.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_start.error());
+
+    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
 }
 
 TEST_F(MasterServiceTest,
@@ -1082,6 +1349,208 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     replica_list = final_get_result.value().replicas;
     EXPECT_EQ(1, replica_list.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
+}
+
+TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "shared_user_key";
+    const std::string tenant_a = "tenant_a";
+    const std::string tenant_b = "tenant_b";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 2048, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
+    EXPECT_FALSE(service_->ExistKey(key).value());
+    EXPECT_TRUE(service_->ExistKey(key, tenant_a).value());
+    EXPECT_TRUE(service_->ExistKey(key, tenant_b).value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 2u);
+
+    ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(service_->GetKeyCount(), 1u);
+}
+
+TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "regex_shared_key";
+    const std::string tenant_a = "tenant_regex_a";
+    const std::string tenant_b = "tenant_regex_b";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, key, tenant_b, 1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
+                    .has_value());
+
+    auto default_matches = service_->GetReplicaListByRegex("^regex_shared");
+    ASSERT_TRUE(default_matches.has_value());
+    EXPECT_EQ(default_matches->size(), 1);
+
+    auto remove_default =
+        service_->RemoveByRegex("^regex_shared", /*force=*/true);
+    ASSERT_TRUE(remove_default.has_value());
+    EXPECT_EQ(remove_default.value(), 1);
+    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+
+    auto remove_tenant_a =
+        service_->RemoveByRegex("^regex_shared", tenant_a, /*force=*/true);
+    ASSERT_TRUE(remove_tenant_a.has_value());
+    EXPECT_EQ(remove_tenant_a.value(), 1);
+    EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::vector<std::string> keys = {"tenant_batch_upsert_key_a",
+                                           "tenant_batch_upsert_key_b"};
+    const std::vector<uint64_t> sizes = {1024, 2048};
+    const std::string tenant_a = "tenant_batch_upsert_a";
+    const std::string tenant_b = "tenant_batch_upsert_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto tenant_a_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_a, sizes, config);
+    ASSERT_EQ(tenant_a_results.size(), keys.size());
+    for (const auto& result : tenant_a_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_a_end = svc->BatchUpsertEnd(client_id, keys, tenant_a);
+    ASSERT_EQ(tenant_a_end.size(), keys.size());
+    for (const auto& result : tenant_a_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    auto tenant_b_results =
+        svc->BatchUpsertStart(client_id, keys, tenant_b, sizes, config);
+    ASSERT_EQ(tenant_b_results.size(), keys.size());
+    for (const auto& result : tenant_b_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto tenant_b_end = svc->BatchUpsertEnd(client_id, keys, tenant_b);
+    ASSERT_EQ(tenant_b_end.size(), keys.size());
+    for (const auto& result : tenant_b_end) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : keys) {
+        EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_a).has_value());
+        EXPECT_TRUE(svc->GetReplicaList(key, tenant_b).has_value());
+    }
+
+    const std::string revoke_key = "tenant_batch_upsert_revoke_key";
+    auto revoke_start =
+        svc->UpsertStart(client_id, revoke_key, tenant_a, 1024, config);
+    ASSERT_TRUE(revoke_start.has_value());
+    ASSERT_TRUE(
+        svc->UpsertRevoke(client_id, revoke_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_FALSE(svc->GetReplicaList(revoke_key, tenant_a).has_value());
+}
+
+TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string shared_key = "tenant_batch_remove_shared_key";
+    const std::string tenant_a = "tenant_batch_remove_a";
+    const std::string tenant_b = "tenant_batch_remove_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_a, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_b, 1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, shared_key, tenant_b, ReplicaType::MEMORY)
+            .has_value());
+
+    auto remove_a = svc->BatchRemove({shared_key}, tenant_a, /*force=*/true);
+    ASSERT_EQ(remove_a.size(), 1u);
+    ASSERT_TRUE(remove_a[0].has_value());
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_a).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(tenant_b, /*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_b).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 1);
+    EXPECT_FALSE(svc->GetReplicaList(shared_key).has_value());
+}
+
+TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
+    auto svc = std::make_unique<MasterService>();
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*svc);
+    const UUID client_id = generate_uuid();
+
+    const std::string key = "legacy_remove_all_shared_key";
+    const std::string tenant_a = "legacy_remove_all_a";
+    const std::string tenant_b = "legacy_remove_all_b";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_TRUE(svc->PutStart(client_id, key, 1024, config).has_value());
+    ASSERT_TRUE(svc->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_a, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, tenant_b, 1024, config).has_value());
+    ASSERT_TRUE(
+        svc->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY).has_value());
+
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 3);
+    EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_a).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, tenant_b).has_value());
+    EXPECT_EQ(svc->RemoveAll(/*force=*/true), 0);
 }
 
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
@@ -3829,6 +4298,117 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
         << "Client with all empty te_endpoints should have empty IP vector";
 }
 
+TEST_F(MasterServiceTest, BatchQueryIpBracketedIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a bracketed IPv6 endpoint
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "[::1]:17813";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpLinkLocalIpv6WithScopeTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a link-local IPv6 address with scope ID
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "fe80::a236:bcff:fecb:a1be%eno2:15773";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("fe80::a236:bcff:fecb:a1be%eno2", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpIpv6NoPortTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with an IPv6 address without port
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "::1";
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(1u, ip_addresses.size());
+    EXPECT_EQ("::1", ip_addresses[0]);
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpMixedIpv4AndIpv6Test) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount segments with IPv4 and IPv6 endpoints for the same client
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    Segment segment1 = MakeSegment("segment1", buffer1, size);
+    segment1.te_endpoint = "192.168.1.1:12345";
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+
+    Segment segment2 = MakeSegment("segment2", buffer2, size);
+    segment2.te_endpoint = "[::1]:17813";
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+    ASSERT_TRUE(query_result.has_value());
+
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    ASSERT_EQ(2u, ip_addresses.size());
+
+    std::unordered_set<std::string> ip_set(ip_addresses.begin(),
+                                           ip_addresses.end());
+    EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
+    EXPECT_NE(ip_set.find("::1"), ip_set.end());
+}
+
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
@@ -4042,8 +4622,11 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 
     keys.clear();
@@ -4059,8 +4642,11 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 }
 
@@ -4670,6 +5256,81 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
     auto fetch0_again = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
     ASSERT_TRUE(fetch0_again.has_value());
     EXPECT_TRUE(fetch0_again->empty());
+}
+
+TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
+    auto service = std::make_unique<MasterService>();
+    const auto ctx0 = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "tenant_task_key";
+    const std::string tenant_id = "tenant_for_async_task";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(service
+                    ->PutStart(put_client_id, key, tenant_id,
+                               /*slice_length=*/1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(put_client_id, key, tenant_id, ReplicaType::MEMORY)
+            .has_value());
+
+    auto copy_task_id = service->CreateCopyTask(key, tenant_id, {"segment_1"});
+    ASSERT_TRUE(copy_task_id.has_value());
+    auto move_task_id =
+        service->CreateMoveTask(key, tenant_id, "segment_0", "segment_1");
+    ASSERT_TRUE(move_task_id.has_value());
+
+    auto fetched = service->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 2u);
+
+    bool saw_copy = false;
+    bool saw_move = false;
+    for (const auto& assignment : *fetched) {
+        if (assignment.id == copy_task_id.value()) {
+            ReplicaCopyPayload payload;
+            struct_json::from_json(payload, assignment.payload);
+            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.key, key);
+            saw_copy = true;
+        } else if (assignment.id == move_task_id.value()) {
+            ReplicaMovePayload payload;
+            struct_json::from_json(payload, assignment.payload);
+            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.key, key);
+            saw_move = true;
+        }
+    }
+    EXPECT_TRUE(saw_copy);
+    EXPECT_TRUE(saw_move);
+}
+
+TEST_F(MasterServiceTest, LegacyTaskPayloadDefaultsTenant) {
+    ReplicaCopyPayload copy_payload;
+    struct_json::from_json(
+        copy_payload,
+        R"({"key":"legacy_copy_key","source":"segment_0","targets":["segment_1"]})");
+    EXPECT_EQ(copy_payload.tenant_id, "default");
+    EXPECT_EQ(copy_payload.key, "legacy_copy_key");
+    EXPECT_EQ(copy_payload.source, "segment_0");
+    ASSERT_EQ(copy_payload.targets.size(), 1u);
+    EXPECT_EQ(copy_payload.targets[0], "segment_1");
+
+    ReplicaMovePayload move_payload;
+    struct_json::from_json(
+        move_payload,
+        R"({"key":"legacy_move_key","source":"segment_0","target":"segment_1"})");
+    EXPECT_EQ(move_payload.tenant_id, "default");
+    EXPECT_EQ(move_payload.key, "legacy_move_key");
+    EXPECT_EQ(move_payload.source, "segment_0");
+    EXPECT_EQ(move_payload.target, "segment_1");
 }
 
 TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {

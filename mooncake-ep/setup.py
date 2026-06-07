@@ -40,7 +40,6 @@ setup(
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
-                "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
@@ -51,7 +50,9 @@ setup(
             extra_link_args=[
                 "-Wl,-rpath,$ORIGIN",
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
+                "-Wl,--push-state,--no-as-needed",
                 "-l:engine.so",
+                "-Wl,--pop-state",
             ],
         )
     ],

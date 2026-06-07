@@ -18,7 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <dirent.h>
+#include <filesystem>
 #include <sstream>
 #include <unistd.h>
 
@@ -126,6 +126,18 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.max_mr_size = max_mr_size;
     }
 
+    const char* auto_gid_max_retries_env =
+        std::getenv("MC_AUTO_GID_MAX_RETRIES");
+    if (auto_gid_max_retries_env) {
+        int val = atoi(auto_gid_max_retries_env);
+        if (val >= 0 && val <= 16) {
+            config.auto_gid_max_retries = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_AUTO_GID_MAX_RETRIES";
+        }
+    }
+
     if (env.GetDisableMetacache()) {
         config.metacache = false;
     }
@@ -157,7 +169,8 @@ void loadGlobalConfig(GlobalConfig &config) {
     std::string log_dir_path = env.GetLogDir();
     if (!log_dir_path.empty()) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (opendir(log_dir_path.c_str()) == NULL) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";

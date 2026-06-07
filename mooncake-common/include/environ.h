@@ -99,9 +99,7 @@ class Environ {
     bool GetUseTev1() const { return use_tev1_; }
     std::string GetYltLogLevel() const { return ylt_log_level_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
-
-   private:
-    Environ();
+    int GetEfaCqThreads() const { return efa_cq_threads_; }
 
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
@@ -112,6 +110,9 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
+
+   private:
+    Environ();
 
     // Member variables
     int num_cq_per_ctx_;
@@ -185,6 +186,7 @@ class Environ {
     bool use_tev1_;
     std::string ylt_log_level_;
     bool with_nvidia_peermem_;
+    int efa_cq_threads_;
 };
 
 }  // namespace mooncake

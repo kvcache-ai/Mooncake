@@ -16,7 +16,7 @@
      请切换安装如下 PyPI 源的 wheel 包:
      ```bash
       pip install mooncake-transfer-engine-non-cuda
-      ```
+     ```
      或者请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
 
 ## 自动安装
@@ -71,7 +71,7 @@
                    libnuma-dev \
                    libcurl4-openssl-dev \
                    libhiredis-dev
-
+    
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -144,7 +144,20 @@
     - `-DMACA_LIB_DIR=/path/to/maca/lib64`
     - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔的 CMake 列表）
 
-6. 安装 yalantinglibs
+6. 若需编译华为 Ascend NPU 支持，请先按照 https://www.hiascend.com/document 的指引安装 Ascend CANN Toolkit。之后：
+    1) 在 CANN 安装目录下执行 `source set_env.sh` 配置编译环境（无需手动设置 `ASCEND_HOME_PATH` 等环境变量）。
+    2) Mooncake 提供两种 Ascend NPU 传输路径，按需选择其中一个：
+       - `-DUSE_ASCEND_DIRECT=ON`（**推荐**）：基于 ADXL 引擎的 Ascend Direct 传输（[版本配套关系参考](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md)）。
+       - `-DUSE_UBSHMEM=ON`：基于 CANN VMM接口传输（CANN版本 >= 9.0.0 、驱动版本 >= 26.0.0、灵衢版本 >= 1.5）
+
+    启用 Ascend NPU 编译示例：
+    ```bash
+    source /usr/local/Ascend/cann/set_env.sh
+    cmake .. -DUSE_ASCEND_DIRECT=ON
+    make -j
+    ```
+
+7. 安装 yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -154,7 +167,7 @@
     make install
     ```
 
-7. 进入项目根目录，运行下列命令进行编译
+8. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
@@ -162,7 +175,7 @@
    make -j
    ```
 
-8. 安装 Mooncake python 包和 mooncake_master 可执行文件
+9. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
    make install
    ```
@@ -198,7 +211,8 @@
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
-- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 通过 ADXL 引擎启用 Ascend Direct 传输及 HCCS 支持（**NPU 推荐方式**）
+- `-DUSE_UBSHMEM=[ON|OFF]`: 通过 CANN VMM API 启用华为 Ascend NPU 共享内存传输
 - `-DUSE_MUSA=[ON|OFF]`: 启用Moore Threads GPUDirect RDMA
 
 ## 在 Docker 容器中使用 Mooncake

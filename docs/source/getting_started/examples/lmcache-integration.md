@@ -23,7 +23,12 @@ This strategic alliance delivers substantial mutual technological advancements:
 
 For a complete deployment guide with step-by-step instructions, see:
 
-👉 **[vLLM V1 Disaggregated Serving with Mooncake Store and LMCache](vllm-integration/vllmv1-lmcache-integration.md)**
+:::{toctree}
+:maxdepth: 1
+
+../examples/vllm-integration/vllmv1-lmcache-integration
+../examples/vllm-integration/vllmv1-lmcache-mp-integration
+:::
 
 ## Performance Benchmarking and Results
 
