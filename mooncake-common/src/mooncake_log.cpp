@@ -162,10 +162,10 @@ void InitYltLogLevelFromEnv() {
 
 void InitMooncakeLogging(const char* argv0) {
     const char* program = (argv0 && *argv0) ? argv0 : "mooncake";
-    // mooncake_log may be linked into multiple extension modules (engine.so,
-    // store.so). std::once_flag is per-DSO, so use glog's process-wide check.
-    if (!google::IsGoogleLoggingInitialized()) {
+    static bool glog_initialized = false;
+    if (!glog_initialized) {
         google::InitGoogleLogging(program);
+        glog_initialized = true;
     }
     ApplyGlogEnvironment(nullptr);
     InitYltLogLevelFromEnv();
