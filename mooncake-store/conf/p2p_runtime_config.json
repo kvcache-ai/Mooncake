@@ -1,0 +1,14 @@
+{
+    "write": {
+        "max_candidates": 2,
+        "strategy": 2,
+        "allow_local": true,
+        "prefer_local": true,
+        "early_return": true,
+        "tag_filters": [],
+        "priority_limit": 0
+    },
+    "read": {
+        "max_candidates": 0
+    }
+}

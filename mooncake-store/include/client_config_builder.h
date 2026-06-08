@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <cstdint>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
@@ -110,6 +111,10 @@ struct RealClientConfigBase {
 
     // Whether to enable HTTP server.
     bool enable_http_server = true;
+
+    // Parsed runtime read/write config JSON.
+    // Loaded from file path, inline JSON string, or env MC_RUNTIME_CONFIG
+    Json::Value runtime_config_json;
 };
 
 /**
@@ -225,12 +230,14 @@ class ClientConfigBuilder {
         const std::string& ipc_socket_path = "", bool enable_offload = false,
         uint16_t http_port = 9003, bool enable_http_server = true,
         const std::map<std::string, std::string>& labels = {},
-        uint16_t local_rpc_port = 50052) {
+        uint16_t local_rpc_port = 50052,
+        const std::string& runtime_config = "") {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, http_port, enable_http_server, labels);
+            ipc_socket_path, http_port, enable_http_server, labels,
+            runtime_config);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.local_rpc_port = local_rpc_port;
@@ -262,11 +269,13 @@ class ClientConfigBuilder {
                             DictCommon::kDefaultLocalBufferSize);
         std::string ipc_socket_path =
             get_config_str(config, DictCommon::kIpcSocketPath);
+        std::string runtime_config =
+            get_config_str(config, DictCommon::kRuntimeConfig);
 
         return build_centralized_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
             master_server_addr, global_segment_size, local_buffer_size, nullptr,
-            ipc_socket_path);
+            ipc_socket_path, false, 9003, true, {}, 50052, runtime_config);
     }
 
     static P2PClientConfig build_p2p_real_client(
@@ -292,12 +301,14 @@ class ClientConfigBuilder {
         size_t async_max_batch_size = 2000, size_t async_route_queue_size = 0,
         uint32_t p2p_key_lease_duration_ms = 0,
         uint32_t p2p_key_lease_scan_interval_ms = 0,
-        const std::string& p2p_transfer_direction_mode = "reverse") {
+        const std::string& p2p_transfer_direction_mode = "reverse",
+        const std::string& runtime_config = "") {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
             master_server_entry, local_buffer_size, transfer_engine,
-            ipc_socket_path, http_port, enable_http_server, labels);
+            ipc_socket_path, http_port, enable_http_server, labels,
+            runtime_config);
         config.client_rpc_port = client_rpc_port;
         config.rpc_thread_num = rpc_thread_num;
         config.lock_shard_count = lock_shard_count;
@@ -313,8 +324,7 @@ class ClientConfigBuilder {
         config.async_max_batch_size = async_max_batch_size;
         config.async_route_queue_size = async_route_queue_size;
 
-        Json::Value tiered_config =
-            LoadTieredConfig(tiered_backend_config_json);
+        Json::Value tiered_config = LoadJsonConfig(tiered_backend_config_json);
 
         if (tiered_config.isNull() || !tiered_config.isMember("tiers") ||
             tiered_config["tiers"].empty()) {
@@ -388,6 +398,8 @@ class ClientConfigBuilder {
         size_t async_route_queue_size =
             get_config_size(config, DictP2P::kAsyncRouteQueueSize,
                             DictP2P::kDefaultAsyncRouteQueueSize);
+        std::string runtime_config =
+            get_config_str(config, DictCommon::kRuntimeConfig);
 
         return build_p2p_real_client(
             local_hostname, metadata_server, protocol, rdma_devices,
@@ -395,7 +407,8 @@ class ClientConfigBuilder {
             nullptr, "", client_rpc_port, rpc_thread_num, lock_shard_count,
             route_cache_max_memory, route_cache_ttl_ms, local_transfer_mode,
             memcpy_async_worker_num, 9003, true, {}, async_sender_thread_count,
-            async_max_batch_size, async_route_queue_size);
+            async_max_batch_size, async_route_queue_size, 0, 0, "reverse",
+            runtime_config);
     }
 
    private:
@@ -409,6 +422,7 @@ class ClientConfigBuilder {
         static constexpr const char* kRdmaDevices = "rdma_devices";
         static constexpr const char* kMasterServerAddr = "master_server_addr";
         static constexpr const char* kIpcSocketPath = "ipc_socket_path";
+        static constexpr const char* kRuntimeConfig = "runtime_config";
         // Defaults
         static constexpr size_t kDefaultLocalBufferSize = 1024 * 1024 * 16;
         static constexpr const char* kDefaultProtocol = "tcp";
@@ -498,7 +512,7 @@ class ClientConfigBuilder {
     }
 
    private:
-    static Json::Value LoadTieredConfig(const std::string& json_or_path) {
+    static Json::Value LoadJsonConfig(const std::string& json_or_path) {
         Json::Value config;
         std::string json_content;
 
@@ -533,7 +547,7 @@ class ClientConfigBuilder {
         if (!reader->parse(json_content.data(),
                            json_content.data() + json_content.length(), &config,
                            &errors)) {
-            LOG(ERROR) << "Failed to parse tiered config: " << errors;
+            LOG(ERROR) << "Failed to parse JSON config: " << errors;
         }
         return config;
     }
@@ -546,7 +560,8 @@ class ClientConfigBuilder {
         const std::shared_ptr<TransferEngine>& transfer_engine,
         const std::string& ipc_socket_path, uint16_t http_port = 9003,
         bool enable_http_server = true,
-        const std::map<std::string, std::string>& labels = {}) {
+        const std::map<std::string, std::string>& labels = {},
+        const std::string& runtime_config = "") {
         // Parse local_hostname into IP and optional port.
         // Only set te_port when the user explicitly provides a port;
         // otherwise keep the default value (0 = randomly assigned).
@@ -583,6 +598,22 @@ class ClientConfigBuilder {
         config.http_port = http_port;
         config.enable_http_server = enable_http_server;
         config.labels = labels;
+        std::string rc_source = runtime_config;
+        if (runtime_config.empty()) {
+            const char* env = std::getenv("MC_RUNTIME_CONFIG");
+            if (env && *env) {
+                rc_source = env;
+            }
+        }
+        if (!rc_source.empty()) {
+            config.runtime_config_json = LoadJsonConfig(rc_source);
+            if (config.runtime_config_json.isNull() ||
+                !config.runtime_config_json.isObject()) {
+                throw std::runtime_error(
+                    "Invalid runtime configuration provided via runtime_config "
+                    "or MC_RUNTIME_CONFIG");
+            }
+        }
     }
 
     static LocalTransferMode parse_p2p_local_transfer_mode(std::string mode) {

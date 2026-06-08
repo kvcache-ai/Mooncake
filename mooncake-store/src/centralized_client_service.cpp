@@ -31,7 +31,10 @@ CentralizedClientService::CentralizedClientService(
       protocol_(protocol),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
-      write_thread_pool_(2) {}
+      write_thread_pool_(2) {
+    runtime_config_store_ =
+        std::make_unique<RuntimeConfigStore>(DeploymentMode::CENTRALIZATION);
+}
 
 CentralizedClientService::~CentralizedClientService() {
     Stop();
@@ -271,6 +274,8 @@ ErrorCode CentralizedClientService::Init(
     StartHeartbeat(master_server_entry);
 
     StartHttpServer();
+
+    runtime_config_store_->loadFromJson(config.runtime_config_json);
 
     return ErrorCode::OK;
 }

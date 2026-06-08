@@ -54,6 +54,7 @@ set(MOONCAKE_STORE_SOURCES
     ha_recovery_manager.cpp
     client_rpc_service.cpp
     peer_client.cpp
+    runtime_config_store.cpp
     tiered_cache/tiers/dram_tier.cpp
     tiered_cache/tiers/storage_tier.cpp
     tiered_cache/scheduler/simple_policy.cpp

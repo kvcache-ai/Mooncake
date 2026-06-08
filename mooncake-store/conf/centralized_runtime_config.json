@@ -1,0 +1,12 @@
+{
+    "write": {
+        "replica_num": 1,
+        "with_soft_pin": false,
+        "preferred_segments": [],
+        "preferred_segment": "",
+        "prefer_alloc_in_same_node": false
+    },
+    "read": {
+        "max_candidates": 0
+    }
+}

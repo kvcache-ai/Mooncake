@@ -491,8 +491,7 @@ TEST_F(P2PClientMetaTest, CollectCandidatesMultipleSegments) {
     req.client_id = {999, 999};
     req.size = 100;
     req.config.allow_local = true;
-
-    // 1. No filter conditions
+    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
     std::vector<WriteCandidate> candidates;
     auto result = meta->CollectWriteRouteCandidates(req, candidates);
     EXPECT_TRUE(result.has_value());
@@ -597,6 +596,7 @@ TEST_F(P2PClientMetaTest, CollectCandidatesTagFilter) {
     WriteRouteRequest req;
     req.size = 100;
     req.config.allow_local = true;
+    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
 
     // Filter "ssd": S1, S3 contain "ssd", should be excluded. S2, S4 remain.
     req.config.tag_filters = {"ssd"};

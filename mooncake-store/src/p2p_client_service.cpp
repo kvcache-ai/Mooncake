@@ -43,7 +43,10 @@ P2PClientService::P2PClientService(
     : ClientService(metadata_connstring, http_port, enable_http_server, labels),
       metrics_(P2PClientMetric::Create(labels)),
       master_client_(client_id_,
-                     metrics_ ? &metrics_->master_client_metric : nullptr) {}
+                     metrics_ ? &metrics_->master_client_metric : nullptr) {
+    runtime_config_store_ =
+        std::make_unique<RuntimeConfigStore>(DeploymentMode::P2P);
+}
 
 void P2PClientService::Stop() {
     if (!MarkShuttingDown()) {
@@ -249,6 +252,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     // 11. Mark service as ready for recovery. HA recovery thread can now
     // proceed.
     ha_manager_->SetReadyForRecovery();
+
+    runtime_config_store_->loadFromJson(config.runtime_config_json);
 
     return ErrorCode::OK;
 }
