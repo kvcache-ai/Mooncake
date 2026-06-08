@@ -83,8 +83,8 @@ static size_t getMaxPteEntries() {
         if (env) {
             try {
                 if (env[0] == '-') {
-                    LOG(ERROR) << "Invalid MC_EFA_MAX_PTE_ENTRIES value: "
-                               << env;
+                    LOG(ERROR)
+                        << "Invalid MC_EFA_MAX_PTE_ENTRIES value: " << env;
                 } else {
                     size_t val = std::stoull(env);
                     if (val > 0) {
