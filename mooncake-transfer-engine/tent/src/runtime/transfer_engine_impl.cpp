@@ -861,6 +861,7 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     ctx.transfer_size = request.length;
     ctx.priority_level =
         request.priority;  // Use request priority for selection
+    ctx.policy_name = request.policy_name;  // Optional: bind to specific policy
 
     if (desc->type == SegmentType::File) {
         // File segment: use selector with empty buffer_transports

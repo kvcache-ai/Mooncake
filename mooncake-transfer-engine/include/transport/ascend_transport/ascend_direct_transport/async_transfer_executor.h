@@ -18,10 +18,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
-#include <unordered_map>
 
 #include "transfer_executor_base.h"
 #include "transport/transport.h"
@@ -45,15 +46,34 @@ class AsyncTransferExecutor : public TransferExecutorBase {
         const std::vector<Transport::Slice*>& slice_list) override;
 
    private:
+    struct QueryBatch {
+        std::vector<Transport::Slice*> slices;
+        size_t engine_idx;
+        std::string target_adxl_engine_name;
+    };
+
+    struct BatchPollResult {
+        bool done = false;
+        // When true, disconnect once and fail every batch already in
+        // pending_batches for this route. Batches enqueued after disconnect
+        // are not affected.
+        bool fail_entire_route = false;
+        std::string fail_reason;
+    };
+
     void queryThreadLoop();
-    void fetchPendingBatches(
-        std::vector<std::vector<Transport::Slice*>>& out_batches);
-    bool processOneBatch(std::vector<Transport::Slice*>& slice_list);
-    void handleTaskFinished(adxl::TransferReq handle);
+    void fetchPendingBatches(std::vector<QueryBatch>& out_batches);
+    void processOneBatch(QueryBatch& batch, BatchPollResult& result);
+    void failAllPendingOnRoute(size_t engine_idx, const std::string& target,
+                               std::vector<QueryBatch>& pending,
+                               const std::string& reason);
+    void markBatchFailed(QueryBatch& batch, const std::string& reason,
+                         bool log_error = true);
+    void handleTaskFinished();
 
     std::atomic<bool> running_{false};
     std::thread query_thread_;
-    std::queue<std::vector<Transport::Slice*>> query_slice_queue_;
+    std::queue<QueryBatch> query_slice_queue_;
     std::mutex query_mutex_;
     std::condition_variable query_cv_;
 
@@ -61,9 +81,9 @@ class AsyncTransferExecutor : public TransferExecutorBase {
     size_t active_async_tasks_{0};
     std::mutex async_task_mutex_;
     std::condition_variable async_task_cv_;
-    std::mutex async_handle_map_mutex_;
-    std::unordered_map<uintptr_t, size_t> async_handle_to_engine_idx_;
     bool finalized_{false};
+
+    size_t last_context_engine_idx_{SIZE_MAX};
 };
 
 }  // namespace mooncake

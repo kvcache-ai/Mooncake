@@ -98,17 +98,13 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Configure project with coverage support
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -125,6 +121,10 @@ jobs:
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Start Metadata Server
       run: |
@@ -172,7 +172,7 @@ jobs:
         export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
         export CGO_ENABLED=1
         export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov"
+        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov -lxxhash"
         # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
         if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
         ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
@@ -297,7 +297,7 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -531,10 +531,6 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Run sccache stat for check
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
     - name: Install dependencies
       run: |
         sudo apt update -y
@@ -553,7 +549,7 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
         cmake --build .
         sudo cmake --install .
         df -h
@@ -563,7 +559,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -580,7 +576,7 @@ jobs:
     - name: Configure project with unit tests and examples
       run: |
         cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project with unit tests and examples
@@ -613,7 +609,7 @@ jobs:
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0"
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.9.1;2.10.0;2.11.0;2.12.0" -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -629,7 +625,7 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project with TENT
@@ -654,6 +650,10 @@ jobs:
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
+
+    - name: Run sccache stat for check
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
 
     - name: Generate Python version tag
       id: generate_tag_flags

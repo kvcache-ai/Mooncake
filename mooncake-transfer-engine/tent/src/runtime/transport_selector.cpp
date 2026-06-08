@@ -237,6 +237,13 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
 
 bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
                                       const SelectionContext& context) const {
+    // If context specifies a policy_name, only match that exact policy with
+    // matching segment type
+    if (context.policy_name.has_value()) {
+        return context.policy_name.value() == policy.name &&
+               policy.segment_type == context.segment_type;
+    }
+
     // Check segment type
     if (policy.segment_type != context.segment_type) {
         return false;

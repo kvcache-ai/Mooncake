@@ -67,10 +67,6 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Run sccache stat for check
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
-
       - name: Configure project
         run: |
           sudo apt update -y
@@ -97,6 +93,10 @@ jobs:
           cd mooncake-transfer-engine/nvlink-allocator
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release
@@ -156,10 +156,6 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Run sccache stat for check
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
-
       - name: Configure project
         run: |
           sudo apt update -y
@@ -175,6 +171,10 @@ jobs:
           make -j
           sudo make install
         shell: bash
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release
@@ -246,10 +246,6 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Run sccache stat for check
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
-
       - name: Configure project
         run: |
           sudo apt update -y
@@ -276,6 +272,10 @@ jobs:
           cd mooncake-transfer-engine/nvlink-allocator
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
+
+      - name: Run sccache stat for check
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: generate_tag_release

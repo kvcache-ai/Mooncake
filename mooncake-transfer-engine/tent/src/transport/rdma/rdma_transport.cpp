@@ -21,9 +21,11 @@
 #include <sys/time.h>
 
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -47,6 +49,39 @@
 
 namespace mooncake {
 namespace tent {
+
+namespace {
+
+uint16_t getRdmaBindDefaultPort(const Config& config) {
+    constexpr const char* kKey = "rpc_server_port";
+    if (!config.contains(kKey)) return 0;
+
+    json raw_value = config.get<json>(kKey, json());
+    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
+        long long value = raw_value.get<long long>();
+        if (value >= 0 && value <= static_cast<long long>(
+                                       std::numeric_limits<uint16_t>::max())) {
+            return static_cast<uint16_t>(value);
+        }
+        return 0;
+    }
+
+    if (raw_value.is_string()) {
+        const std::string string_value = raw_value.get<std::string>();
+        char* end = nullptr;
+        errno = 0;
+        unsigned long value = std::strtoul(string_value.c_str(), &end, 10);
+        if (errno == 0 && end != string_value.c_str() && *end == '\0' &&
+            value <= std::numeric_limits<uint16_t>::max()) {
+            return static_cast<uint16_t>(value);
+        }
+    }
+
+    return 0;
+}
+
+}  // namespace
+
 static Status configureLaneCount(std::shared_ptr<Config> conf,
                                  std::shared_ptr<RdmaParams> params) {
     constexpr int kUnset = -1;
@@ -217,13 +252,15 @@ Status RdmaTransport::install(std::string& local_segment_name,
     local_topology_ = local_topology;
 
     // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
-    // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
-    // while local_segment_name_ keeps the TCP-reachable address for P2P.
-    const char *rdma_bind_addr = std::getenv("MC_RDMA_BIND_ADDRESS");
-    if (rdma_bind_addr && rdma_bind_addr[0] != '\0') {
-        auto [host_name, port] = parseHostNameWithPort(local_segment_name);
-        rdma_server_name_ =
-            std::string(rdma_bind_addr) + ":" + std::to_string(port);
+    // transports/rdma/bind_address allows NIC paths to use an
+    // RDMA-reachable IP while local_segment_name_ keeps the
+    // TCP-reachable address for P2P.
+    const auto rdma_bind_addr = conf_->get("transports/rdma/bind_address", "");
+    if (!rdma_bind_addr.empty()) {
+        const uint16_t default_port = getRdmaBindDefaultPort(*conf_);
+        auto [host_name, port] =
+            parseHostNameWithPort(local_segment_name, default_port);
+        rdma_server_name_ = rdma_bind_addr + ":" + std::to_string(port);
         LOG(INFO) << "RdmaTransport(TENT): using RDMA bind address "
                   << rdma_server_name_
                   << " (TCP address: " << local_segment_name_ << ")";
@@ -599,7 +636,8 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
-    std::string peer_name = MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
+    std::string peer_name =
+        MakeNicPath(segment_desc->nicPathServerName(), target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
     if (!endpoint) {
         LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
