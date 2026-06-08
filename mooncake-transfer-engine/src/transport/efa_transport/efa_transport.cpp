@@ -82,10 +82,16 @@ static size_t getMaxPteEntries() {
         const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
         if (env) {
             try {
-                size_t val = std::stoull(env);
-                if (val > 0) {
-                    LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
-                    return val;
+                if (env[0] == '-') {
+                    LOG(ERROR) << "Invalid MC_EFA_MAX_PTE_ENTRIES value: "
+                               << env;
+                } else {
+                    size_t val = std::stoull(env);
+                    if (val > 0) {
+                        LOG(INFO)
+                            << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
+                        return val;
+                    }
                 }
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Invalid MC_EFA_MAX_PTE_ENTRIES value: " << env;
