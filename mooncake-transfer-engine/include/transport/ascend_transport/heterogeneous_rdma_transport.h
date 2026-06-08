@@ -144,7 +144,7 @@ class HeterogeneousRdmaTransport : public Transport {
         transfer_queue_cv_.notify_one();
     }
 
-    bool running_{};
+    std::atomic<bool> running_{};
     int logic_device_id_{};
 
     std::unique_ptr<RdmaTransport> transport_{};
