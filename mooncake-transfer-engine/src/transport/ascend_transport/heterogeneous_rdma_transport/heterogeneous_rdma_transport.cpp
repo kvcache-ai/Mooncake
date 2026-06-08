@@ -24,6 +24,7 @@ HeterogeneousRdmaTransport::~HeterogeneousRdmaTransport() {
     running_ = false;
     transfer_queue_cv_.notify_one();
     transfer_thread_.join();
+    aclrtSetDevice(logic_device_id_);
     if (stream_copy_created_) {
         aclrtDestroyStream(stream_copy_);
     }
@@ -56,6 +57,7 @@ void HeterogeneousRdmaTransport::transferLoop() {
         auto transfer_info = getTransfer();
         const auto &task_list = transfer_info.tasks;
         if (task_list.empty()) {
+            if (!running_) break;
             LOG(ERROR)
                 << "HeterogeneousRdmaTransport: empty transfer task batch";
             continue;
