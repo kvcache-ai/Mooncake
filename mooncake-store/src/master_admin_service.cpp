@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <map>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -15,6 +16,7 @@
 #include <ylt/struct_json/json_writer.h>
 #include <ylt/util/tl/expected.hpp>
 
+#include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
 #include "rpc_service.h"
@@ -26,34 +28,6 @@ const uint64_t kMetricReportIntervalSeconds = 10;
 
 namespace {
 
-std::string EscapeJson(std::string_view input) {
-    std::string escaped;
-    escaped.reserve(input.size());
-    for (char ch : input) {
-        switch (ch) {
-            case '\\':
-                escaped += "\\\\";
-                break;
-            case '"':
-                escaped += "\\\"";
-                break;
-            case '\n':
-                escaped += "\\n";
-                break;
-            case '\r':
-                escaped += "\\r";
-                break;
-            case '\t':
-                escaped += "\\t";
-                break;
-            default:
-                escaped.push_back(ch);
-                break;
-        }
-    }
-    return escaped;
-}
-
 std::string AppendMetricSections(std::string primary, std::string secondary) {
     if (!primary.empty() && primary.back() != '\n') {
         primary.push_back('\n');
@@ -62,23 +36,36 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     return primary;
 }
 
-void SetServiceUnavailable(coro_http::coro_http_response& resp,
-                           std::string_view message) {
-    const std::string payload =
-        std::string("{\"success\":false,\"error_code\":") +
-        std::to_string(toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE)) +
-        ",\"error_message\":\"" + EscapeJson(message) + "\"}";
-    resp.add_header("Content-Type", "application/json; charset=utf-8");
-    resp.set_status_and_content(coro_http::status_type::service_unavailable,
-                                payload);
-}
-
 struct HttpErrorResponse {
     bool success{false};
     int32_t error_code{0};
     std::string error_message;
 };
 YLT_REFL(HttpErrorResponse, success, error_code, error_message);
+
+struct HttpSimpleErrorResponse {
+    bool success{false};
+    std::string error;
+};
+YLT_REFL(HttpSimpleErrorResponse, success, error);
+
+struct HttpHealthResponse {
+    std::string status;
+    std::string role;
+    std::string ha_state;
+    bool service_ready{false};
+    std::optional<std::string> leader_address;
+    std::optional<uint64_t> view_version;
+};
+YLT_REFL(HttpHealthResponse, status, role, ha_state, service_ready,
+         leader_address, view_version);
+
+struct HttpLeaderResponse {
+    bool present{false};
+    std::optional<std::string> leader_address;
+    std::optional<uint64_t> view_version;
+};
+YLT_REFL(HttpLeaderResponse, present, leader_address, view_version);
 
 struct HttpCreateDrainJobResponse {
     bool success{false};
@@ -160,6 +147,19 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
 
+struct HttpBatchQueryKeyResult {
+    bool ok{false};
+    std::optional<std::string> error;
+    std::optional<std::vector<AllocatedBuffer::Descriptor>> values;
+};
+YLT_REFL(HttpBatchQueryKeyResult, ok, error, values);
+
+struct HttpBatchQueryKeysResponse {
+    bool success{false};
+    std::map<std::string, HttpBatchQueryKeyResult> data;
+};
+YLT_REFL(HttpBatchQueryKeysResponse, success, data);
+
 template <typename T>
 void WriteJsonResponse(coro_http::coro_http_response& resp,
                        coro_http::status_type status, const T& payload) {
@@ -167,6 +167,13 @@ void WriteJsonResponse(coro_http::coro_http_response& resp,
     struct_json::to_json(payload, json);
     resp.add_header("Content-Type", "application/json; charset=utf-8");
     resp.set_status_and_content(status, std::move(json));
+}
+
+template <typename T>
+std::string ToJsonString(const T& payload) {
+    std::string json;
+    struct_json::to_json(payload, json);
+    return json;
 }
 
 template <typename T>
@@ -196,6 +203,21 @@ void WriteErrorResponse(coro_http::coro_http_response& resp,
     payload.error_message =
         message.empty() ? toString(error) : std::move(message);
     WriteJsonResponse(resp, status, payload);
+}
+
+void WriteSimpleErrorResponse(coro_http::coro_http_response& resp,
+                              coro_http::status_type status,
+                              std::string error) {
+    HttpSimpleErrorResponse payload;
+    payload.error = std::move(error);
+    WriteJsonResponse(resp, status, payload);
+}
+
+void SetServiceUnavailable(coro_http::coro_http_response& resp,
+                           std::string message) {
+    WriteErrorResponse(resp, coro_http::status_type::service_unavailable,
+                       ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
+                       std::move(message));
 }
 
 tl::expected<UUID, ErrorCode> ParseJobId(std::string_view job_id_view) {
@@ -360,32 +382,27 @@ std::string MasterAdminServer::BuildMetricsSummaryText() const {
 
 std::string MasterAdminServer::BuildHealthJson() const {
     const auto snapshot = SnapshotState();
-    std::ostringstream oss;
-    oss << "{\"status\":\"ok\",\"role\":\""
-        << ha::MasterRuntimeRoleToString(snapshot.state) << "\",\"ha_state\":\""
-        << ha::MasterRuntimeStateToString(snapshot.state)
-        << "\",\"service_ready\":"
-        << (snapshot.service_available ? "true" : "false");
+    HttpHealthResponse payload;
+    payload.status = "ok";
+    payload.role = ha::MasterRuntimeRoleToString(snapshot.state);
+    payload.ha_state = ha::MasterRuntimeStateToString(snapshot.state);
+    payload.service_ready = snapshot.service_available;
     if (snapshot.leader_view.has_value()) {
-        oss << ",\"leader_address\":\""
-            << EscapeJson(snapshot.leader_view->leader_address)
-            << "\",\"view_version\":" << snapshot.leader_view->view_version;
+        payload.leader_address = snapshot.leader_view->leader_address;
+        payload.view_version = snapshot.leader_view->view_version;
     }
-    oss << "}";
-    return oss.str();
+    return ToJsonString(payload);
 }
 
 std::string MasterAdminServer::BuildLeaderJson() const {
     const auto snapshot = SnapshotState();
-    if (!snapshot.leader_view.has_value()) {
-        return "{\"present\":false}";
+    HttpLeaderResponse payload;
+    payload.present = snapshot.leader_view.has_value();
+    if (snapshot.leader_view.has_value()) {
+        payload.leader_address = snapshot.leader_view->leader_address;
+        payload.view_version = snapshot.leader_view->view_version;
     }
-
-    std::ostringstream oss;
-    oss << "{\"present\":true,\"leader_address\":\""
-        << EscapeJson(snapshot.leader_view->leader_address)
-        << "\",\"view_version\":" << snapshot.leader_view->view_version << "}";
-    return oss.str();
+    return ToJsonString(payload);
 }
 
 std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
@@ -736,12 +753,8 @@ void MasterAdminServer::InitHttpServer() {
         [this](coro_http_request& req, coro_http_response& resp) {
             auto service = GetActiveService();
             if (!service) {
-                resp.add_header("Content-Type",
-                                "application/json; charset=utf-8");
-                resp.set_status_and_content(
-                    status_type::service_unavailable,
-                    "{\"success\":false,\"error\":\"service plane is not "
-                    "active\"}");
+                WriteSimpleErrorResponse(resp, status_type::service_unavailable,
+                                         "service plane is not active");
                 return;
             }
 
@@ -756,64 +769,45 @@ void MasterAdminServer::InitHttpServer() {
                 }
             }
 
-            resp.add_header("Content-Type", "application/json; charset=utf-8");
             if (keys.empty()) {
-                resp.set_status_and_content(
-                    status_type::bad_request,
-                    "{\"success\":false,\"error\":\"No keys provided. Use "
-                    "?keys=key1,key2,...\"}");
+                WriteSimpleErrorResponse(
+                    resp, status_type::bad_request,
+                    "No keys provided. Use ?keys=key1,key2,...");
                 return;
             }
 
             auto results = service->BatchGetReplicaList(keys, "default");
             const size_t n = std::min(keys.size(), results.size());
-            std::string body;
-            body.reserve(n * 512);
-            body += "{\"success\":true,\"data\":{";
+            HttpBatchQueryKeysResponse payload;
+            payload.success = true;
 
             for (size_t i = 0; i < n; ++i) {
-                if (i > 0) {
-                    body += ",";
-                }
-
-                body += "\"";
-                body += EscapeJson(keys[i]);
-                body += "\":";
-
                 const auto& result = results[i];
+                HttpBatchQueryKeyResult item;
                 if (!result.has_value()) {
-                    body += "{\"ok\":false,\"error\":\"";
-                    body += EscapeJson(toString(result.error()));
-                    body += "\"}";
+                    item.error = toString(result.error());
+                    payload.data.emplace(keys[i], std::move(item));
                     continue;
                 }
 
-                body += "{\"ok\":true,\"values\":[";
-                bool first = true;
+                item.ok = true;
+                item.values = std::vector<AllocatedBuffer::Descriptor>{};
                 for (const auto& replica : result.value().replicas) {
                     if (!replica.is_memory_replica()) {
                         continue;
                     }
-
-                    std::string tmp;
-                    struct_json::to_json(
-                        replica.get_memory_descriptor().buffer_descriptor, tmp);
-                    if (!first) {
-                        body += ",";
-                    }
-                    body += tmp;
-                    first = false;
+                    item.values->emplace_back(
+                        replica.get_memory_descriptor().buffer_descriptor);
                 }
-                body += "]}";
+                payload.data.emplace(keys[i], std::move(item));
             }
 
-            body += "}}";
             if (results.size() != keys.size()) {
                 LOG(WARNING)
                     << "BatchGetReplicaList size mismatch: keys=" << keys.size()
                     << " results=" << results.size();
             }
-            resp.set_status_and_content(status_type::ok, std::move(body));
+            WriteJsonResponse(resp, status_type::ok, payload);
         });
 }
 
