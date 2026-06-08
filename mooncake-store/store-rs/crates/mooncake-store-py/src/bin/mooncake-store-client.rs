@@ -255,6 +255,7 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(normalize_trace_filter(args.trace_filter.as_deref()))?;
     build_info::log_build_info();
+    info!(config = ?args, "mooncake-store-client configuration");
     emit_compat_warnings(&args);
 
     let timeouts = resolve_timeout_config(&args)?;
