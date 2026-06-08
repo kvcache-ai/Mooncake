@@ -11,7 +11,7 @@ This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 **Client Node**: Each node contributes DRAM (and optionally VRAM/SSD) to form the distributed cache pool. Clients communicate with the master over RPC for control operations (`Put`/`Get`/`Remove`), but transfer actual data directly between each other via the Transfer Engine — the master is never in the data path.
 
-**Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service.
+**Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism (`P2PHANDSHAKE`) that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service — this is the simplest metadata handshake method and the recommended starting point (see [Quick Start](#quick-start)).
 
 For a detailed design discussion, see the [Mooncake Store Design](../design/mooncake-store.md).
 
@@ -26,13 +26,22 @@ Deploy a minimal single-node Mooncake Store in three steps.
 Choose one option:
 
 ```bash
-# Option A: Embed HTTP metadata server in the master (simplest)
+# Option A: P2P handshake — the simplest metadata handshake method (recommended)
+# Nothing to start here. There is no metadata service to deploy: each node
+# exchanges and stores metadata locally during connection setup. Just set the
+# client's metadata_server to the literal string "P2PHANDSHAKE" (see step 3).
+
+# Option B: Embed HTTP metadata server in the master
 # (configured in step 2 via --enable_http_metadata_server)
 
-# Option B: External etcd
+# Option C: External etcd
 etcd --listen-client-urls http://0.0.0.0:2379 \
      --advertise-client-urls http://localhost:2379
 ```
+
+> **Tip:** P2P handshake is the easiest way to get started — it is decentralized
+> and requires no etcd/Redis/HTTP metadata service. Prefer it for development and
+> simple deployments; use an external etcd/Redis for large, long-lived clusters.
 
 ### 2. Start the Master Service
 
@@ -77,6 +86,30 @@ store.setup(
 
 ```bash
 python3 stress_cluster_benchmark.py
+```
+
+To use **P2P handshake** instead of an HTTP/etcd metadata service, pass the
+literal string `P2PHANDSHAKE` as `metadata_server` — no other change is needed:
+
+```python
+store.setup(
+    local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
+    metadata_server="P2PHANDSHAKE",          # decentralized, no metadata service
+    global_segment_size=3200 * 1024 * 1024,
+    local_buffer_size=512 * 1024 * 1024,
+    protocol=os.getenv("PROTOCOL", "tcp"),
+    device_name=os.getenv("DEVICE_NAME", ""),
+    master_server_address=os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+)
+```
+
+The standalone store service accepts the same value:
+
+```bash
+python -m mooncake.mooncake_store_service \
+  --local_hostname=localhost \
+  --metadata_server=P2PHANDSHAKE \
+  --master_server=127.0.0.1:50051
 ```
 
 **What just happened:**
