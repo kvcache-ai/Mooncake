@@ -44,7 +44,7 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_prefix(
 
 std::vector<CachedQueryResultResponse> batch_query_for_reuse(
     const std::vector<std::string> &keys) {
-    if (auto real_client = std::dynamic_pointer_cast<RealClient>(store_)) {
+    if (auto real_client = get_real_client()) {
         return real_client->batch_get_query_results(keys);
     }
 
@@ -124,6 +124,9 @@ load_reconstructed_shard_sources_batch(const std::vector<std::string> &keys,
         std::vector<std::vector<std::vector<size_t>>> metadata_all_sizes(
             metadata_key_indices.size(), {{sizeof(TensorMetadata)}});
         for (size_t i = 0; i < metadata_key_indices.size(); ++i) {
+            // Each metadata read is modeled as a separate request, but they all
+            // write into non-overlapping offsets in the same registered scratch
+            // buffer.
             metadata_buffers.push_back(scratch_base);
             metadata_all_keys[i] = {keys[metadata_key_indices[i]]};
             metadata_all_dst_offsets[i] = {{i * sizeof(TensorMetadata)}};
@@ -1068,13 +1071,40 @@ load_parallelism_full_reconstruction_sources(
     return reconstruction;
 }
 
+bool validate_regular_full_formula_sources(
+    const std::vector<ReconstructedShardSource> &sources,
+    const std::vector<int64_t> &global_shape, int split_dim, int32_t dtype,
+    int shard_count, const std::string &context) {
+    if (sources.size() != static_cast<size_t>(shard_count)) {
+        return false;
+    }
+    for (int shard_rank = 0; shard_rank < shard_count; ++shard_rank) {
+        const auto &source = sources[shard_rank];
+        if (source.metadata.metadata.header.dtype != dtype) {
+            LOG(ERROR) << context << ": shard dtype mismatch for key "
+                       << source.read_key;
+            return false;
+        }
+        const LayoutAxis *tp_axis =
+            find_layout_axis(source.metadata.metadata, LayoutAxisKind::TP);
+        if (!tp_axis || tp_axis->shard_rank != shard_rank ||
+            tp_axis->shard_count != shard_count ||
+            tp_axis->split_dim != split_dim) {
+            LOG(ERROR) << context << ": shard TP metadata mismatch for key "
+                       << source.read_key;
+            return false;
+        }
+        if (!get_source_shard_range(source, global_shape, split_dim, context)
+                 .has_value()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
     const std::string &key, uintptr_t buffer_ptr, size_t size,
     const TensorParallelismSpec &parallelism, const std::string &context) {
-    if (std::getenv("MOONCAKE_DISABLE_REGULAR_FULL_FORMULA")) {
-        return std::nullopt;
-    }
-
     const ParallelAxisSpec *request_tp_axis =
         find_axis_spec_by_kind(parallelism, LayoutAxisKind::TP);
     if (!request_tp_axis) {
@@ -1152,18 +1182,21 @@ std::optional<TensorIntoPlan> build_parallelism_full_tensor_into_formula_plan(
     formula.read_keys = build_parallelism_shard_read_keys(
         key, *canonical_parallelism, *tp_axis_index, shard_count, split_dim);
 
-    std::vector<CachedQueryResultResponse> cached_query_results;
-    {
-        py::gil_scoped_release release_gil;
-        cached_query_results = batch_query_for_reuse(formula.read_keys);
-    }
-    if (cached_query_results.size() != formula.read_keys.size()) {
+    auto sources =
+        load_reconstructed_shard_sources_batch(formula.read_keys, context);
+    if (!sources.has_value() ||
+        !validate_regular_full_formula_sources(
+            *sources, global_shape, split_dim, manifest->manifest.header.dtype,
+            shard_count, context)) {
         return std::nullopt;
     }
-    plan.query_results.reserve(formula.read_keys.size());
-    for (size_t i = 0; i < formula.read_keys.size(); ++i) {
-        plan.query_results.push_back(
-            PlannedQueryResult{formula.read_keys[i], cached_query_results[i]});
+    plan.query_results.reserve(sources->size());
+    for (auto &source : *sources) {
+        if (!source.cached_query_result.has_value()) {
+            return std::nullopt;
+        }
+        plan.query_results.push_back(PlannedQueryResult{
+            source.read_key, std::move(*source.cached_query_result)});
     }
 
     plan.regular_full_formula = std::move(formula);
@@ -1650,6 +1683,9 @@ pybind11::object get_tensor_with_parallelism_into(
     }
 
     if (used_formula_plan) {
+        LOG(WARNING)
+            << "get_tensor_with_parallelism_into"
+            << ": formula plan execution failed, falling back to generic path";
         auto fallback_plan = build_tensor_into_plan_for_target(
             key, buffer_ptr, size, target, "get_tensor_with_parallelism_into",
             false /* allow_formula_plan */);
@@ -1723,6 +1759,10 @@ pybind11::list batch_get_tensor_with_parallelism_into(
         }
 
         const size_t original_index = plan_indices[i];
+        LOG(WARNING) << "batch_get_tensor_with_parallelism_into"
+                     << ": formula plan execution failed for key "
+                     << keys[original_index]
+                     << ", falling back to generic path";
         py::object target = target_list.has_value()
                                 ? py::reinterpret_borrow<py::object>(
                                       (*target_list)[original_index])

@@ -535,7 +535,7 @@ class RealClient : public PyClient {
     tl::expected<RangedReadMetadata, ErrorCode>
     build_ranged_read_metadata_from_query_result(
         const std::string &key,
-        const tl::expected<QueryResult, ErrorCode> &query_result);
+        tl::expected<QueryResult, ErrorCode> query_result);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key);
@@ -902,6 +902,7 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
 
+   private:
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

@@ -112,20 +112,21 @@ int EngramStore::lookup_rows_flat(const int64_t* row_ids, int B, int L,
         }
     }
 
+    const int register_ret =
+        store_->register_buffer(output_buffer, expected_size);
+    if (register_ret != 0) {
+        return fail_lookup();
+    }
+
     mooncake::PyClient::QueryResultCache query_result_cache;
     auto query_results = store_->batch_query(embed_keys_);
     if (query_results.size() != embed_keys_.size()) {
+        store_->unregister_buffer(output_buffer);
         return fail_lookup();
     }
     query_result_cache.reserve(embed_keys_.size());
     for (size_t i = 0; i < embed_keys_.size(); ++i) {
         query_result_cache.emplace(embed_keys_[i], query_results[i]);
-    }
-
-    const int register_ret =
-        store_->register_buffer(output_buffer, expected_size);
-    if (register_ret != 0) {
-        return fail_lookup();
     }
 
     auto results = store_->get_into_ranges(buffers, all_keys, all_dst_offsets,

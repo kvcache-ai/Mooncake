@@ -3382,7 +3382,12 @@ RealClient::get_into_ranges_internal(
     auto now = std::chrono::steady_clock::now();
     if (query_result_cache != nullptr) {
         for (const auto &[key, query_result] : *query_result_cache) {
-            if (!query_result || query_result->IsLeaseExpired(now)) {
+            if (!query_result) {
+                metadata_cache.emplace(key,
+                                       tl::unexpected(query_result.error()));
+                continue;
+            }
+            if (query_result->IsLeaseExpired(now)) {
                 continue;
             }
             metadata_cache.emplace(key,
@@ -3490,8 +3495,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::build_ranged_read_metadata_from_query_result(
-    const std::string &key,
-    const tl::expected<QueryResult, ErrorCode> &query_result) {
+    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
@@ -3515,7 +3519,7 @@ RealClient::build_ranged_read_metadata_from_query_result(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
-    auto query_value = query_result.value();
+    auto query_value = std::move(query_result.value());
     auto replica = *best_replica;
     return RangedReadMetadata{.query_result = std::move(query_value),
                               .replica = std::move(replica),

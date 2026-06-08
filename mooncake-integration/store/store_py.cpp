@@ -289,6 +289,7 @@ inline int to_py_ret(ErrorCode error_code) {
 class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
+    std::shared_ptr<RealClient> real_client_{nullptr};
     bool use_dummy_client_{false};
 
     MooncakeStorePyWrapper() = default;
@@ -299,6 +300,7 @@ class MooncakeStorePyWrapper {
         auto real_client = RealClient::create();
         use_dummy_client_ = false;
         store_ = real_client;
+        real_client_ = real_client;
         resource_tracker.registerInstance(
             std::static_pointer_cast<PyClient>(store_));
         return real_client;
@@ -1137,7 +1139,7 @@ class MooncakeStorePyWrapper {
         if (use_dummy_client_) {
             return nullptr;
         }
-        return std::dynamic_pointer_cast<RealClient>(store_);
+        return real_client_;
     }
 
     std::optional<RealClient::WritableBufferRegion>
@@ -2046,6 +2048,7 @@ PYBIND11_MODULE(store, m) {
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
+                self.real_client_.reset();
                 resource_tracker.registerInstance(
                     std::static_pointer_cast<PyClient>(self.store_));
                 auto [ip, port] = parseHostNameWithPort(server_address);
