@@ -155,7 +155,7 @@ mooncake_master \
 
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
-Extends the cache pool from DRAM to SSD. New objects land in DRAM; cold data is moved to SSD at eviction time; frequently re-accessed objects are promoted back to DRAM.
+Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
 
 ```bash
 mooncake_master \
@@ -374,7 +374,7 @@ Flags for controlling data movement between DRAM and SSD.
 | `--quota_bytes` | `0` (90% of capacity) | Storage quota in bytes |
 | `--enable_disk_eviction` | `true` | Enable disk eviction |
 
-Start with `--enable_offload=true` to move cold data to SSD automatically. Add `--promotion_on_hit=true` to re-promote hot SSD data back to DRAM on access.
+Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
 
 ### CXL Memory
 

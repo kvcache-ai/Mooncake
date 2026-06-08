@@ -1,5 +1,4 @@
-# Mooncake x LMCache Integration
-# Unite to Pioneer KVCache-Centric LLM Serving System
+# Mooncake x LMCache: Unite to Pioneer KVCache-Centric LLM Serving System
 
 Mooncake and LMCache have announced a strategic collaboration aimed at pioneering a KVCache-centric Large Language Model (LLM) serving system. This partnership seeks to significantly enhance the efficiency, scalability, and responsiveness of LLM applications.
 
@@ -69,10 +68,3 @@ Moving forward, LMCache and Mooncake plan to collaborate closely on several key 
 *   **Expanding caching strategies beyond simple prefix matching**, enhancing KVCache reusability by supporting more flexible matching patterns.
 
 This strategic partnership represents a significant advancement toward fully realizing the potential of next-generation LLM serving architectures.
-
-::: {toctree}
-:maxdepth: 1
-:hidden:
-
-vllm-integration/vllmv1-lmcache-integration
-:::

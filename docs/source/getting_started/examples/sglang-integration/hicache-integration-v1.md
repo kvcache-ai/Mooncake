@@ -6,6 +6,22 @@ This document describes how to use Mooncake as the storage backend for SGLang Hi
 
 ## Introduction
 
+### About Mooncake
+
+Mooncake aims to enhance the inference efficiency of large language models (LLMs), especially in slow object storage environments, by constructing a multi-level caching pool on high-speed interconnected DRAM/SSD resources. Compared to traditional caching systems, Mooncake utilizes (GPUDirect) RDMA technology to transfer data directly in a zero-copy manner, while maximizing the use of multi-NIC resources on a single machine.
+
+For more details about Mooncake, please refer to [Mooncake project](https://github.com/kvcache-ai/Mooncake) and [Mooncake documents](https://kvcache-ai.github.io/Mooncake/).
+
+### About SGLang HiCache
+
+SGLang HiCache is a hierarchical KV caching system that extends SGLang's RadixAttention with advanced multi-tier memory management capabilities. It implements a scalable hierarchical storage architecture that spans GPU memory, CPU memory, and external storage layers, delivering significant performance improvements for large language model inference.
+
+HiCache introduces a **HiRadixTree** that acts as a page table for referencing KV caches across different memory tiers: **GPU Memory (L1)**, **CPU Memory (L2)**, **Mooncake and other Storage Backends (L3)**.
+
+The system includes an intelligent cache controller that automatically manages data movement between tiers, implementing optimized prefetching strategies and multiple write policies (write-through, write-through-selective, and write-back).
+
+For more details about SGLang HiCache, please refer to [HiCache system design document](https://docs.sglang.ai/advanced_features/hicache_design.html) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+
 ### Mooncake & SGLang HiCache
 
 Mooncake serves as a high-performance L3 storage backend for SGLang HiCache, enabling distributed KV cache storage across multiple servers with RDMA-accelerated data transfer. This integration addresses the capacity limitations of traditional GPU-only or GPU+CPU caching by providing virtually unlimited cache storage through a distributed memory pool.
