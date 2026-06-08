@@ -1544,7 +1544,6 @@ WrappedMasterService::GetNoFSegmentsByName(const std::string& segment_name) {
         [&](auto& timer) { timer.LogRequest("segment_name=", segment_name); },
         [] {}, [] {});
 }
-}
 
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
