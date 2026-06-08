@@ -39,6 +39,9 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+- Logging (optional)
+  - The master uses glog. When `--log_dir` is set, all severities are merged into a single journal file in that directory (`mooncake_master.INFO.<date>-<time>.<pid>`), reachable through the stable `mooncake_master.INFO` symlink. glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) control the rest.
+
 - Task Manager (optional)
   - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
   - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
@@ -125,6 +128,21 @@ Examples:
 curl -s http://<master_host>:9003/metrics
 curl -s http://<master_host>:9003/metrics/summary
 ```
+
+Mooncake Store can report Store-observed cache reuse signals, such as
+completed `GetReplicaList` results served from memory/SSD and current cached
+object counts. These signals help operators understand reuse inside the Store,
+but they are not the final request-level or token-level cache hit ratio for an
+inference system. That end-to-end hit ratio should be calculated by Conductor or
+the inference engine, which can observe the full request path across GPU, CPU,
+and Mooncake tiers.
+
+For `CalcCacheStats()`, prefer the `MEMORY_CURRENT_CACHED_OBJECTS`,
+`SSD_CURRENT_CACHED_OBJECTS`, and `*_HITS_PER_CURRENT_CACHED_OBJECT` enum
+aliases when consuming Store-side values. The older `*_TOTAL` and `*_HIT_RATE`
+names are retained for compatibility. The `*_HIT_RATE` values divide cumulative
+Store-observed hits by current cached object counts, so they are not bounded
+request-level hit ratios and may exceed `1.0`.
 
 ## Client/Engine Tuning (Env Vars, with defaults)
 

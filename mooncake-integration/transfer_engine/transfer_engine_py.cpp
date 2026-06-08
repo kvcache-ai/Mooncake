@@ -1034,6 +1034,36 @@ void bind_coro_rpc_interface(py::module_& m) {
 }
 
 PYBIND11_MODULE(engine, m) {
+#ifdef USE_EFA
+    m.attr("SUPPORT_EFA") = true;
+#else
+    m.attr("SUPPORT_EFA") = false;
+#endif
+
+#ifdef USE_HIP
+    m.attr("SUPPORT_HIP") = true;
+#else
+    m.attr("SUPPORT_HIP") = false;
+#endif
+
+#ifdef USE_MNNVL
+    m.attr("SUPPORT_MNNVL") = true;
+#else
+    m.attr("SUPPORT_MNNVL") = false;
+#endif
+
+#ifdef USE_INTRA_NVLINK
+    m.attr("SUPPORT_INTRA_NVLINK") = true;
+#else
+    m.attr("SUPPORT_INTRA_NVLINK") = false;
+#endif
+
+#ifdef USE_CUDA
+    m.attr("SUPPORT_CUDA") = true;
+#else
+    m.attr("SUPPORT_CUDA") = false;
+#endif
+
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)

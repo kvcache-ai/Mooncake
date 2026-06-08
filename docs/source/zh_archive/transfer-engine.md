@@ -407,6 +407,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_WORKERS_PER_CTX` 每个设备实例对应的异步工作线程数量
 - `MC_SLICE_SIZE` Transfer Engine 中用户请求的切分粒度
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
+- `MC_AUTO_GID_MAX_RETRIES` classic RDMA 握手恢复过程中自动重探测本地 GID 的最大重试次数，默认值 2。设置为 0 可以关闭自动 GID 重试。
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 - `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
 - `MC_HANDSHAKE_MAX_LENGTH` P2P 模式下握手消息的最大长度（字节）。有效范围：1MB 到 128MB。默认值为 1MB (1048576 字节)。当单个 RDMA 实例注册大量内存缓冲区（>10,000）时，需要增大此值以避免握手失败。示例：设置为 10485760 表示 10MB

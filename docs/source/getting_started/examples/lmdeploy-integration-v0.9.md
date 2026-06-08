@@ -74,7 +74,7 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 -   The `--role` parameter sets the node role in the disaggregated system (`Prefill` for token embedding and KV cache generation).
 -   The `--proxy-url` parameter connects the worker instance back to the proxy for coordination.
 -   The `--backend` parameter specifies the model execution backend (e.g., `pytorch`, `turbomind`).
--   The `--migration-backend` parameter defines the KV cache transport mechanism (e.g., `Mooncake` and `DlSllime`).
+-   The `--migration-backend` parameter defines the KV cache transport mechanism (e.g., `Mooncake` and `DLSlime`).
 
 #### Decode:
 

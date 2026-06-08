@@ -69,12 +69,12 @@ getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
 getting_started/observability
-getting_started/plugin-usage/3FS-USRBIO-Plugin
-getting_started/examples/lmcache-integration
-getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
+Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
+getting_started/examples/lmdeploy-integration-v0.9
+getting_started/plugin-usage/3FS-USRBIO-Plugin
 :::
 
 % Making the most out of Mooncake
@@ -83,6 +83,7 @@ getting_started/examples/vllm-integration/index
 :caption: Performance
 :maxdepth: 1
 
+performance/vllm/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
@@ -92,18 +93,6 @@ performance/allocator-benchmark-result
 performance/allocation-strategy-benchmark-result
 performance/ssd-offload-benchmark-results
 performance/storage-benchmark
-:::
-
-% API Documentation
-
-:::{toctree}
-:caption: Python API Reference
-:maxdepth: 1
-
-python-api-reference/mooncake-store
-python-api-reference/transfer-engine
-http-api-reference/http-service
-python-api-reference/ep-backend
 :::
 
 % Explanation of Mooncake internals
@@ -125,6 +114,17 @@ design/conductor/conductor-architecture-design
 design/conductor/indexer-api-design
 :::
 
+% API Documentation
+
+:::{toctree}
+:caption: API Reference
+:maxdepth: 2
+
+api-reference/python/index
+api-reference/cpp/index
+api-reference/http/index
+:::
+
 % Q&A for Mooncake
 
 :::{toctree}
@@ -142,6 +142,7 @@ troubleshooting/troubleshooting
 :maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
+deployment/nvmf-ssd-deployment-guide
 :::
 
 % Community
@@ -151,4 +152,16 @@ deployment/mooncake-store-deployment-guide
 :maxdepth: 1
 
 community/governance
+:::
+
+% Archived content
+
+:::{toctree}
+:caption: Archived
+:maxdepth: 1
+
+getting_started/examples/vllm-integration/vllm-mooncakestoreconnector
+getting_started/examples/vllm-integration/vllm-integration-v0.2
+getting_started/examples/vllm-integration/vllm-integration-v0.3
+getting_started/examples/vllm-integration/vllm-integration-v1.0
 :::

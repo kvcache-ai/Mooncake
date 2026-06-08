@@ -80,6 +80,29 @@ int UbSIEVEEndpointStore::deleteEndpoint(const std::string& peer_nic_path) {
     return 0;
 }
 
+int UbSIEVEEndpointStore::deleteEndpointByPtr(UbEndPoint* point_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         iter++) {
+        if (iter->second.first.get() == point_ptr) {
+            std::string peer_nic_path = iter->first;
+            iter->second.first->deconstruct();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return 0;
+}
+
 void UbSIEVEEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) {
         return;
@@ -246,8 +269,14 @@ int UbWorkerPool::submitPostSend(
         auto targetSegment =
             peer_segment_desc->buffers[buffer_id].tseg[device_id];
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        if (!slice->ub.r_seg) {
+            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id" << device_id
+                       << " dest_addr=" << slice->ub.dest_addr;
+        }
         auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->name,
+            MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
@@ -333,7 +362,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(entry.first);
+                context_.deleteEndpointByPtr(endpoint.get());
             // enable for re-establishation
             for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
@@ -354,6 +383,10 @@ void UbWorkerPool::performPostSend(int thread_id) {
             }
             entry.second.clear();
             continue;
+        }
+        // Set endpoint pointer for each slice before submitting
+        for (auto& slice : entry.second) {
+            slice->ub.endpoint = endpoint.get();
         }
         endpoint->submitPostSend(entry.second, failed_slice_list);
 #endif
@@ -392,9 +425,12 @@ void UbWorkerPool::performPoll(int thread_id) {
                                  << context_.nicPath() << ", mark it inactive";
                     context_.set_active(false);
                 }
-                context_.deleteEndpoint(slice->peer_nic_path);
                 slice->ub.retry_cnt++;
                 if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                    if (slice->ub.endpoint) {
+                        auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
+                        context_.deleteEndpointByPtr(ptr);
+                    }
                     slice->markFailed();
                     processed_slice_count_++;
                 } else {
@@ -450,7 +486,7 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                 peer_segment_desc->buffers[buffer_id].tseg[device_id];
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
             auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->name,
+                MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
