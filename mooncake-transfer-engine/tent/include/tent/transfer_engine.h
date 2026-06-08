@@ -32,6 +32,9 @@ extern "C" {
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)
 
+/* IMPORTANT: callers MUST zero-initialize this struct
+ * (e.g. `tent_request_t r = {0};`). transport_hint relies on
+ * UNSPEC == 0 for the no-hint default. */
 struct tent_request {
     int opcode;
     void* source;
