@@ -391,7 +391,7 @@ impl StoreClient {
         Ok(())
     }
 
-    fn reclaim_release_is_skippable(error: &StoreError) -> bool {
+    fn reclaim_unavailable_runtime_is_skippable(error: &StoreError) -> bool {
         matches!(
             error,
             StoreError::NotFound(message) | StoreError::InvalidState(message)
@@ -399,9 +399,18 @@ impl StoreClient {
         )
     }
 
+    fn duplicate_reclaim_release_is_skippable(error: &StoreError) -> bool {
+        matches!(
+            error,
+            StoreError::Allocator(message)
+                if message.contains("segment release missing live allocation")
+        )
+    }
+
     fn release_reclaim_allocations_best_effort(
         &self,
         requests: &[AllocationReleaseRequest],
+        allow_duplicate_local_release: bool,
         context: &'static str,
     ) -> Result<()> {
         if requests.is_empty() {
@@ -429,17 +438,38 @@ impl StoreClient {
         let mut remote_groups = BTreeMap::<ClientRuntimeId, (ClientLease, Vec<usize>)>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
-                self.allocator.lock().release(
+                if let Err(error) = self.allocator.lock().release(
                     &request.storage_runtime,
                     &request.segment_name,
                     request.offset_bytes,
                     request.length_bytes,
-                )?;
+                ) {
+                    if allow_duplicate_local_release
+                        && Self::duplicate_reclaim_release_is_skippable(&error)
+                    {
+                        crate::observability::registry::record_reclaim_release(
+                            context,
+                            "skipped_duplicate_local_release",
+                        );
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            reclaim_runtime = %request.storage_runtime,
+                            segment = %request.segment_name.0,
+                            offset_bytes = request.offset_bytes,
+                            length_bytes = request.length_bytes,
+                            error = %error,
+                            context,
+                            "skipping duplicate local reclaim release"
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
                 continue;
             }
 
             if let Some(error) = remote_errors.get(&request.storage_runtime) {
-                if Self::reclaim_release_is_skippable(error) {
+                if Self::reclaim_unavailable_runtime_is_skippable(error) {
                     crate::observability::registry::record_reclaim_release(
                         context,
                         "skipped_unavailable_runtime",
@@ -498,7 +528,7 @@ impl StoreClient {
                 Ok(results) => {
                     for (index, result) in indices.iter().copied().zip(results) {
                         if let Err(error) = result {
-                            if Self::reclaim_release_is_skippable(&error) {
+                            if Self::reclaim_unavailable_runtime_is_skippable(&error) {
                                 crate::observability::registry::record_reclaim_release(
                                     context,
                                     "skipped_unavailable_runtime",
@@ -511,7 +541,24 @@ impl StoreClient {
                                     length_bytes = requests[index].length_bytes,
                                     error = %error,
                                     context,
-                                    "skipping reclaim after runtime became unavailable during allocator release"
+                                    "skipping reclaim release for unavailable runtime"
+                                );
+                                continue;
+                            }
+                            if Self::duplicate_reclaim_release_is_skippable(&error) {
+                                crate::observability::registry::record_reclaim_release(
+                                    context,
+                                    "skipped_duplicate_remote_release",
+                                );
+                                warn!(
+                                    runtime = %self.lease.runtime,
+                                    reclaim_runtime = %storage_runtime,
+                                    segment = %requests[index].segment_name.0,
+                                    offset_bytes = requests[index].offset_bytes,
+                                    length_bytes = requests[index].length_bytes,
+                                    error = %error,
+                                    context,
+                                    "skipping duplicate remote reclaim release"
                                 );
                                 continue;
                             }
@@ -539,7 +586,7 @@ impl StoreClient {
                     }
                 }
                 Err(error) => {
-                    if Self::reclaim_release_is_skippable(&error) {
+                    if Self::reclaim_unavailable_runtime_is_skippable(&error) {
                         crate::observability::registry::record_reclaim_release(
                             context,
                             "skipped_unavailable_runtime",
@@ -551,6 +598,21 @@ impl StoreClient {
                             error = %error,
                             context,
                             "skipping reclaim batch for unavailable runtime"
+                        );
+                        continue;
+                    }
+                    if Self::duplicate_reclaim_release_is_skippable(&error) {
+                        crate::observability::registry::record_reclaim_release(
+                            context,
+                            "skipped_duplicate_remote_release",
+                        );
+                        warn!(
+                            runtime = %self.lease.runtime,
+                            reclaim_runtime = %storage_runtime,
+                            items = indices.len(),
+                            error = %error,
+                            context,
+                            "skipping duplicate remote reclaim batch release"
                         );
                         continue;
                     }
@@ -612,7 +674,7 @@ impl StoreClient {
                 length_bytes: reclaim.length_bytes,
             })
             .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(&releases, "flush_due_reclaims")
+        self.release_reclaim_allocations_best_effort(&releases, true, "flush_due_reclaims")
     }
 
     fn flush_all_reclaims(&self) -> Result<()> {
@@ -629,7 +691,7 @@ impl StoreClient {
                 length_bytes: reclaim.length_bytes,
             })
             .collect::<Vec<_>>();
-        self.release_reclaim_allocations_best_effort(&releases, "flush_all_reclaims")
+        self.release_reclaim_allocations_best_effort(&releases, true, "flush_all_reclaims")
     }
 
     fn schedule_route_reclaim(&self, route: &ObjectRoute) -> Result<()> {

@@ -13618,11 +13618,21 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
             offset_bytes: reclaim_reservation.offset_bytes,
             length_bytes: reclaim_reservation.length_bytes,
         });
+        state.pending_reclaims.push_back(PendingReclaim {
+            due_at_ms: 0,
+            policy_rank: 1,
+            tenant: "tenant-a".to_string(),
+            qos_tier: "default".to_string(),
+            storage_runtime: client.runtime_id().clone(),
+            segment_name: reclaim_reservation.segment_name.clone(),
+            offset_bytes: reclaim_reservation.offset_bytes,
+            length_bytes: reclaim_reservation.length_bytes,
+        });
     }
     assert_eq!(client.allocator.lock().usage_bytes().0, 16);
     client
         .flush_due_reclaims()
-        .expect("flush_due_reclaims should skip unavailable runtimes");
+        .expect("flush_due_reclaims should skip unavailable and duplicate cleanup releases");
     assert_eq!(
         client.allocator.lock().usage_bytes().0,
         0,
@@ -13631,6 +13641,38 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
     assert!(
         client.state.lock().pending_reclaims.is_empty(),
         "due reclaim queue should be drained after flush"
+    );
+
+    let reclaim_all_reservation = client
+        .reserve_segment_allocation(client.runtime_id(), None, 24, true)
+        .expect("flush_all reclaim reservation should succeed");
+    {
+        let mut state = client.state.lock();
+        for _ in 0..2 {
+            state.pending_reclaims.push_back(PendingReclaim {
+                due_at_ms: now_ms().saturating_add(60_000),
+                policy_rank: 1,
+                tenant: "tenant-a".to_string(),
+                qos_tier: "default".to_string(),
+                storage_runtime: client.runtime_id().clone(),
+                segment_name: reclaim_all_reservation.segment_name.clone(),
+                offset_bytes: reclaim_all_reservation.offset_bytes,
+                length_bytes: reclaim_all_reservation.length_bytes,
+            });
+        }
+    }
+    assert_eq!(client.allocator.lock().usage_bytes().0, 24);
+    client
+        .flush_all_reclaims()
+        .expect("flush_all_reclaims should treat duplicate queue cleanup as idempotent");
+    assert_eq!(
+        client.allocator.lock().usage_bytes().0,
+        0,
+        "flush_all_reclaims should reclaim the queued local reservation"
+    );
+    assert!(
+        client.state.lock().pending_reclaims.is_empty(),
+        "flush_all_reclaims should drain the entire queue"
     );
 
     let primary = client.segment_name().expect("primary segment should exist");
@@ -13660,6 +13702,77 @@ fn runtime_alloc_helper_methods_cover_empty_batches_and_mismatch_paths() {
         ),
         Err(StoreError::InvalidState(_))
     ));
+}
+
+#[test]
+fn flush_due_reclaims_skips_duplicate_remote_release() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let storage_transport = Arc::new(TestTransport::new("remote-reclaim-storage-segment"));
+    let writer_transport = Arc::new(storage_transport.peer("remote-reclaim-writer-segment"));
+    let storage = StoreClientBuilder::new(metadata.clone(), "remote-reclaim-storage")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "true")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(storage_transport)
+        .local_memory(storage_config())
+        .build(test_future_expiry_ms())
+        .expect("storage build should succeed");
+    let writer = StoreClientBuilder::new(metadata, "remote-reclaim-writer")
+        .state(ClientLifecycleState::Active)
+        .label("pool", "pool-a")
+        .label("storage", "false")
+        .live_client_sync_interval(fast_live_client_sync_interval())
+        .transport(writer_transport)
+        .local_memory(storage_config_with_bytes(0))
+        .build(test_future_expiry_ms())
+        .expect("writer build should succeed");
+
+    storage
+        .register_local_memory()
+        .expect("storage registration should succeed");
+    writer
+        .register_local_memory()
+        .expect("writer registration should succeed");
+    wait_for_membership_convergence(&[&storage, &writer]);
+
+    let reservation = storage
+        .reserve_segment_allocation(storage.runtime_id(), None, 16, true)
+        .expect("storage reservation should succeed");
+    let usage_before_reclaim = storage.allocator.lock().usage_bytes().0;
+    assert!(
+        usage_before_reclaim > 0,
+        "remote storage reservation should consume allocator bytes"
+    );
+
+    {
+        let mut state = writer.state.lock();
+        for _ in 0..2 {
+            state.pending_reclaims.push_back(PendingReclaim {
+                due_at_ms: 0,
+                policy_rank: 1,
+                tenant: "tenant-a".to_string(),
+                qos_tier: "default".to_string(),
+                storage_runtime: storage.runtime_id().clone(),
+                segment_name: reservation.segment_name.clone(),
+                offset_bytes: reservation.offset_bytes,
+                length_bytes: reservation.length_bytes,
+            });
+        }
+    }
+
+    writer
+        .flush_due_reclaims()
+        .expect("flush_due_reclaims should treat duplicate remote cleanup as idempotent");
+    assert_eq!(
+        storage.allocator.lock().usage_bytes().0,
+        0,
+        "remote duplicate reclaim should still free the reserved bytes"
+    );
+    assert!(
+        writer.state.lock().pending_reclaims.is_empty(),
+        "writer reclaim queue should be drained after duplicate remote cleanup"
+    );
 }
 
 #[test]

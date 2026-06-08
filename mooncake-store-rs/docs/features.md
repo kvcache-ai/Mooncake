@@ -344,6 +344,9 @@ For tenant-scoped quota policy, delete now also finalizes a negative quota delta
 ### Graceful reclaim
 
 A reclaim grace window can delay release to smooth transitions or handoff behavior.
+Queued reclaim cleanup now treats duplicate local or remote release as idempotent
+cleanup noise, while direct non-cleanup release paths still return allocator
+errors.
 
 ## Multi-Tenancy
 

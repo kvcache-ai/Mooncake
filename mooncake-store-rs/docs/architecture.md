@@ -307,6 +307,7 @@ Reclaim is explicit and route-aware.
 - deletes schedule reclaim after route removal
 - `reclaim_grace_ms` controls delayed release behavior
 - remote release uses batched allocator RPC
+- queued reclaim cleanup is idempotent for duplicate local or remote release, but direct non-cleanup release still surfaces allocator errors
 
 ### Storage-owner CLOCK with route-owner CAS
 
