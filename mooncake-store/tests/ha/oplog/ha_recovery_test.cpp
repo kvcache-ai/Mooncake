@@ -74,15 +74,15 @@ class HaRecoveryTest : public ::testing::Test {
     }
 
     // Build snapshot data for keys key_1..key_count
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>
-    BuildSnapshotData(uint64_t count) {
-        std::vector<std::pair<std::string, StandbyObjectMetadata>> data;
+    std::vector<StandbyObjectEntry> BuildSnapshotData(uint64_t count) {
+        std::vector<StandbyObjectEntry> data;
         for (uint64_t i = 1; i <= count; ++i) {
             StandbyObjectMetadata meta;
             meta.client_id = {1, 2};
             meta.size = 1024;
             meta.last_sequence_id = i;
-            data.emplace_back("key_" + std::to_string(i), meta);
+            data.emplace_back(StandbyObjectEntry{
+                "default", "key_" + std::to_string(i), meta});
         }
         return data;
     }
@@ -95,8 +95,8 @@ class HaRecoveryTest : public ::testing::Test {
             return false;
         }
         const auto& snap = result->value();
-        for (const auto& [key, meta] : snap.metadata) {
-            metadata_store_->PutMetadata(key, meta);
+        for (const auto& entry : snap.metadata) {
+            metadata_store_->PutMetadata(entry.key, entry.metadata);
         }
         applier_->Recover(snap.snapshot_sequence_id);
         return true;

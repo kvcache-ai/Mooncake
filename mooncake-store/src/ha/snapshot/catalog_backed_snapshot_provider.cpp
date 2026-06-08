@@ -156,12 +156,12 @@ DeserializeStandbyObjectMetadata(
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
         }
 
-        // Skip the optional data_type; the standby restore path does not use
-        // it. A leading positive integer is data_type, whereas a replica is
-        // serialized as an array.
+        // Read data_type if present (8+ or 10+ format)
+        ObjectDataType data_type = ObjectDataType::UNKNOWN;
         if (index < total_elements &&
             array[index].type == msgpack::type::POSITIVE_INTEGER) {
-            ++index;  // data_type
+            data_type =
+                static_cast<ObjectDataType>(array[index++].as<uint8_t>());
         }
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
@@ -211,11 +211,25 @@ DeserializeStandbyObjectMetadata(
             return std::optional<StandbyObjectMetadata>();
         }
 
+        // Read hard_pinned and group_id if present. Standby does not need
+        // hard_pinned, but promotion needs group_id to rebuild group indexes.
+        if (index < total_elements &&
+            array[index].type == msgpack::type::BOOLEAN) {
+            ++index;  // hard_pinned
+        }
+
+        std::string group_id;
+        if (index < total_elements && array[index].type == msgpack::type::STR) {
+            group_id = array[index++].as<std::string>();
+        }
+
         StandbyObjectMetadata metadata;
         metadata.client_id = client_id;
         metadata.size = size;
         metadata.replicas = std::move(replicas);
         metadata.last_sequence_id = snapshot_sequence_id;
+        metadata.data_type = data_type;
+        metadata.group_id = std::move(group_id);
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();
@@ -223,8 +237,7 @@ DeserializeStandbyObjectMetadata(
     }
 }
 
-tl::expected<std::vector<std::pair<std::string, StandbyObjectMetadata>>,
-             ErrorCode>
+tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                                    const SegmentView& segment_view,
                                    uint64_t snapshot_sequence_id) {
@@ -245,7 +258,7 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
         return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
     }
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     const auto now = std::chrono::system_clock::now();
     for (uint32_t i = 0; i < shards->via.map.size; ++i) {
         const auto& shard_blob = shards->via.map.ptr[i].val;
@@ -286,23 +299,46 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
 
         for (uint32_t j = 0; j < metadata_entries->via.array.size; ++j) {
             const auto& item = metadata_entries->via.array.ptr[j];
-            if (item.type != msgpack::type::ARRAY || item.via.array.size != 2) {
+            if (item.type != msgpack::type::ARRAY) {
                 LOG(ERROR) << "Snapshot metadata item has invalid shape";
                 return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
             }
 
             try {
-                const std::string key = item.via.array.ptr[0].as<std::string>();
+                std::string tenant_id = "default";
+                std::string key;
+                size_t metadata_index;
+
+                if (item.via.array.size == 2) {
+                    // Old format: [key, metadata]
+                    key = item.via.array.ptr[0].as<std::string>();
+                    metadata_index = 1;
+                } else if (item.via.array.size == 3) {
+                    // New format: [tenant_id, key, metadata]
+                    tenant_id = item.via.array.ptr[0].as<std::string>();
+                    key = item.via.array.ptr[1].as<std::string>();
+                    metadata_index = 2;
+                } else {
+                    LOG(ERROR)
+                        << "Snapshot metadata item has invalid array size: "
+                        << item.via.array.size;
+                    return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+                }
+
+                const auto normalized_tenant = NormalizeTenantId(tenant_id);
+
                 auto metadata_result = DeserializeStandbyObjectMetadata(
-                    item.via.array.ptr[1], segment_view, snapshot_sequence_id,
-                    now);
+                    item.via.array.ptr[metadata_index], segment_view,
+                    snapshot_sequence_id, now);
                 if (!metadata_result) {
                     return tl::make_unexpected(metadata_result.error());
                 }
                 if (!metadata_result->has_value()) {
                     continue;
                 }
-                snapshot.emplace_back(key, std::move(metadata_result->value()));
+                snapshot.push_back(
+                    StandbyObjectEntry{normalized_tenant, key,
+                                       std::move(metadata_result->value())});
             } catch (const std::exception& ex) {
                 LOG(ERROR) << "Failed to parse snapshot metadata item: "
                            << ex.what();
@@ -458,6 +494,52 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+
+        // Extract standby segment registry entries from the deserialized
+        // SegmentManager. The snapshot's SegmentSerializer::Serialize()
+        // currently carries enough data to rebuild only memory segments
+        // (segment_manager.mounted_segments_, where buf_allocator is non-null
+        // by construction — MountSegment is the only path that populates it).
+        //
+        // Local-disk segments are serialized as per-client offloading
+        // bookkeeping (client_local_disk_segment_'s offloading_objects map)
+        // without the transport_endpoint / file_path / capacity fields that
+        // StandbySegmentInfo needs, and NoF segments are not serialized at
+        // all in this snapshot path. Both have to be re-mounted explicitly
+        // via SEGMENT_MOUNT OpLog replay after standby promotion (see
+        // OpLogApplier::Apply / HotStandbyService::LoadSnapshotBaselineLocked).
+        //
+        // If a future change makes the serializer carry richer per-segment
+        // data, the predicate below should be replaced with explicit branches
+        // for each segment type.
+        ScopedSegmentAccess segment_access = segment_manager.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        segment_access.GetAllSegments(all_segments);
+        SegmentView view = segment_manager.getView();
+        for (const auto& [seg, client_id] : all_segments) {
+            MountedSegment mounted;
+            if (view.GetMountedSegment(seg.id, mounted) != ErrorCode::OK) {
+                continue;
+            }
+            if (mounted.buf_allocator == nullptr) {
+                // Defensive: a MountedSegment without an allocator should
+                // not exist in the snapshot today. Log and skip rather
+                // than emitting a half-populated StandbySegmentInfo.
+                LOG(WARNING)
+                    << "snapshot contains MountedSegment without allocator; "
+                    << "skipping segment_name=" << seg.name
+                    << " segment_id=" << seg.id;
+                continue;
+            }
+            StandbySegmentInfo info;
+            info.segment_name = seg.name;
+            info.transport_endpoint = seg.te_endpoint;
+            info.capacity = seg.size;
+            info.is_memory_segment = true;
+            // file_path stays empty for memory segments by contract.
+            snapshot.segments.push_back(std::move(info));
+        }
+
         return std::optional<LoadedSnapshot>(std::move(snapshot));
     }
 

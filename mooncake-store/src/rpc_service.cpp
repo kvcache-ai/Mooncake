@@ -1917,6 +1917,14 @@ WrappedMasterService::QuerySegmentStatusById(const UUID& segment_id) {
     return master_service_.QuerySegmentStatusById(segment_id);
 }
 
+void WrappedMasterService::RestoreFromStandby(
+    const std::vector<StandbyObjectEntry>& objects,
+    uint64_t initial_oplog_sequence_id,
+    const std::vector<StandbySegmentInfo>& segments) {
+    master_service_.RestoreFromStandbySnapshot(
+        objects, initial_oplog_sequence_id, segments);
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {

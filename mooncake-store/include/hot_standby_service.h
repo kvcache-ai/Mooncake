@@ -128,6 +128,17 @@ class HotStandbyService {
     ErrorCode Promote();
 
     /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    /**
      * @brief Get the number of metadata entries in the local store
      */
     size_t GetMetadataCount() const;
@@ -145,8 +156,18 @@ class HotStandbyService {
     // Export a point-in-time snapshot of all replicated metadata.
     // This is used by MasterServiceSupervisor to initialize the new Primary
     // after leader election (fast recovery).
-    bool ExportMetadataSnapshot(
-        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+    bool ExportMetadataSnapshot(std::vector<StandbyObjectEntry>& out) const;
+
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
@@ -222,25 +243,30 @@ class HotStandbyService {
     // Simple in-memory metadata store implementation
     class StandbyMetadataStore : public MetadataStore {
        public:
-        bool PutMetadata(const std::string& key,
+        bool PutMetadata(const std::string& tenant_id, const std::string& key,
                          const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
         std::optional<StandbyObjectMetadata> GetMetadata(
+            const std::string& tenant_id,
             const std::string& key) const override;
-        bool Remove(const std::string& key) override;
-        bool Exists(const std::string& key) const override;
+        bool Remove(const std::string& tenant_id,
+                    const std::string& key) override;
+        bool Exists(const std::string& tenant_id,
+                    const std::string& key) const override;
+        size_t GetKeyCountForTenant(
+            const std::string& tenant_id) const override;
         size_t GetKeyCount() const override;
         void Clear();
 
         // Snapshot for promotion/restore.
-        void Snapshot(
-            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out)
-            const;
+        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StandbyObjectMetadata> store_;
+        std::unordered_map<
+            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
+            store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{

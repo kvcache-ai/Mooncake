@@ -49,54 +49,77 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 
 // StandbyMetadataStore implementation
 bool HotStandbyService::StandbyMetadataStore::PutMetadata(
-    const std::string& key, const StandbyObjectMetadata& metadata) {
+    const std::string& tenant_id, const std::string& key,
+    const StandbyObjectMetadata& metadata) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
-            << ", replicas=" << metadata.replicas.size()
+    store_[normalized][key] = metadata;
+    VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
+            << ", key=" << key << ", replicas=" << metadata.replicas.size()
             << ", size=" << metadata.size;
     return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
                                                   const std::string& payload) {
-    // Legacy interface - create empty metadata
+    // Legacy interface - create empty metadata for default tenant
     StandbyObjectMetadata metadata;
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = metadata;
+    store_["default"][key] = metadata;
     return true;
 }
 
 std::optional<StandbyObjectMetadata>
 HotStandbyService::StandbyMetadataStore::GetMetadata(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        return it->second;
-    }
-    return std::nullopt;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return std::nullopt;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return std::nullopt;
+    return it->second;
 }
 
-bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
+bool HotStandbyService::StandbyMetadataStore::Remove(
+    const std::string& tenant_id, const std::string& key) {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(key);
-    if (it != store_.end()) {
-        store_.erase(it);
-        return true;
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    auto it = tenant_it->second.find(key);
+    if (it == tenant_it->second.end()) return false;
+    tenant_it->second.erase(it);
+    if (tenant_it->second.empty()) {
+        store_.erase(tenant_it);
     }
-    return false;
+    return true;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Exists(
-    const std::string& key) const {
+    const std::string& tenant_id, const std::string& key) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.find(key) != store_.end();
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it == store_.end()) return false;
+    return tenant_it->second.find(key) != tenant_it->second.end();
 }
 
 size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return store_.size();
+    size_t total = 0;
+    for (const auto& [tid, tenant_map] : store_) {
+        total += tenant_map.size();
+    }
+    return total;
+}
+
+size_t HotStandbyService::StandbyMetadataStore::GetKeyCountForTenant(
+    const std::string& tenant_id) const {
+    const auto normalized = NormalizeTenantId(tenant_id);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(normalized);
+    return it == store_.end() ? 0 : it->second.size();
 }
 
 void HotStandbyService::StandbyMetadataStore::Clear() {
@@ -105,12 +128,14 @@ void HotStandbyService::StandbyMetadataStore::Clear() {
 }
 
 void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     out.clear();
-    out.reserve(store_.size());
-    for (const auto& kv : store_) {
-        out.emplace_back(kv.first, kv.second);
+    for (const auto& [tenant_id, tenant_store] : store_) {
+        for (const auto& [key, metadata] : tenant_store) {
+            out.push_back(StandbyObjectEntry{NormalizeTenantId(tenant_id), key,
+                                             metadata});
+        }
     }
 }
 
@@ -286,8 +311,13 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << snapshot.snapshot_id
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
-    for (const auto& kv : snapshot.metadata) {
-        metadata_store_->PutMetadata(kv.first, kv.second);
+    for (const auto& entry : snapshot.metadata) {
+        metadata_store_->PutMetadata(entry.tenant_id, entry.key,
+                                     entry.metadata);
+    }
+    // Load segment registry from snapshot
+    if (oplog_applier_) {
+        oplog_applier_->LoadSegmentRegistry(snapshot.segments);
     }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
@@ -627,6 +657,78 @@ ErrorCode HotStandbyService::Promote() {
     return ErrorCode::OK;
 }
 
+ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (!IsReadyForPromotion()) {
+        LOG(ERROR) << "Standby is not ready for promotion, state="
+                   << StandbyStateToString(GetState());
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    // Trigger PROMOTE event
+    auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!result.allowed) {
+        LOG(ERROR) << "Cannot promote: " << result.reason;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    StandbySyncStatus status = GetSyncStatus();
+    uint64_t current_applied_seq_id = status.applied_seq_id;
+
+    LOG(INFO) << "Promoting Standby to Primary. Applied seq_id: "
+              << current_applied_seq_id << ", lag: " << status.lag_entries
+              << " entries"
+              << ", state: " << StandbyStateToString(GetState());
+
+    if (oplog_replicator_) {
+        oplog_replicator_->Stop();
+    }
+
+    ResolvePromotionGapsLocked();
+
+    auto catch_up_err = FinalCatchUpForPromotionLocked(current_applied_seq_id);
+    if (catch_up_err != ErrorCode::OK) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return catch_up_err;
+    }
+
+    uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
+    applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+    primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
+
+    auto promotion_success =
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
+    if (!promotion_success.allowed) {
+        LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // Export snapshot BEFORE unlocking mutex (atomic promotion + export)
+    out.oplog_sequence_id = latest_applied_seq_id;
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
+    lock.unlock();
+    Stop();
+
+    if (config_.enable_oplog_following) {
+        LOG(INFO) << "Standby promoted to Primary successfully. "
+                  << "All remaining OpLog entries have been synced.";
+    } else {
+        LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
+    }
+    return ErrorCode::OK;
+}
+
 size_t HotStandbyService::GetMetadataCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return metadata_store_ ? metadata_store_->GetKeyCount() : 0;
@@ -644,13 +746,44 @@ uint64_t HotStandbyService::GetLatestAppliedSequenceId() const {
 }
 
 bool HotStandbyService::ExportMetadataSnapshot(
-    std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const {
+    std::vector<StandbyObjectEntry>& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!metadata_store_) {
         out.clear();
         return false;
     }
     metadata_store_->Snapshot(out);
+    return true;
+}
+
+bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!IsRunning()) {
+        return false;
+    }
+
+    // Get applied sequence ID (inline to avoid recursive mutex lock)
+    if (oplog_applier_) {
+        uint64_t expected_seq = oplog_applier_->GetExpectedSequenceId();
+        out.oplog_sequence_id = expected_seq > 0 ? expected_seq - 1 : 0;
+    } else {
+        out.oplog_sequence_id = applied_seq_id_.load();
+    }
+
+    // Export object metadata
+    if (metadata_store_) {
+        metadata_store_->Snapshot(out.objects);
+    } else {
+        out.objects.clear();
+    }
+
+    // Export segments from OpLogApplier's registry (Patch B)
+    if (oplog_applier_) {
+        out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    } else {
+        out.segments.clear();
+    }
+
     return true;
 }
 

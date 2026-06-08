@@ -54,6 +54,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/oplog/localfs_oplog_store.cpp
     ha/oplog/polling_oplog_change_notifier.cpp
     hot_standby_service.cpp
+    metadata_store.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
     store_c.cpp

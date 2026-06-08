@@ -433,6 +433,11 @@ class SegmentManager {
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
 
+    // Endpoint-based segment queries (for standby restore)
+    bool HasSegmentByEndpoint(const std::string& endpoint) const;
+    bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
+                             std::string& te_endpoint) const;
+
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;

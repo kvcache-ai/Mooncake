@@ -27,6 +27,47 @@ enum class OpType : uint8_t {
     // current etcd-based hot-standby design (Standby relies on Primary DELETE
     // operations).
     LEASE_RENEW = 4,
+    // Segment events (for standby segment registry)
+    SEGMENT_MOUNT = 5,
+    SEGMENT_UNMOUNT = 6,
+    SEGMENT_UPDATE = 7,
+};
+
+/**
+ * Payload for SEGMENT_MOUNT OpLog entry.
+ */
+struct SegmentMountOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;  // empty for memory segments
+
+    YLT_REFL(SegmentMountOp, segment_name, transport_endpoint, capacity,
+             is_memory_segment, file_path);
+};
+
+/**
+ * Payload for SEGMENT_UNMOUNT OpLog entry.
+ */
+struct SegmentUnmountOp {
+    std::string transport_endpoint;
+
+    YLT_REFL(SegmentUnmountOp, transport_endpoint);
+};
+
+/**
+ * Payload for SEGMENT_UPDATE OpLog entry.
+ */
+struct SegmentUpdateOp {
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t capacity{0};
+    bool is_memory_segment{false};
+    std::string file_path;
+
+    YLT_REFL(SegmentUpdateOp, segment_name, transport_endpoint, capacity,
+             is_memory_segment, file_path);
 };
 
 // A single operation log entry.
@@ -37,9 +78,10 @@ struct OpLogEntry {
     uint64_t sequence_id{0};   // Monotonically increasing global sequence
     uint64_t timestamp_ms{0};  // Logical timestamp in milliseconds
     OpType op_type{OpType::PUT_END};
-    std::string object_key;  // Target object key
-    std::string payload;     // Serialized extra data (optional)
-    uint32_t checksum{0};    // Checksum of payload (implementation-defined)
+    std::string tenant_id{"default"};  // Tenant identifier
+    std::string object_key;            // Target object key
+    std::string payload;               // Serialized extra data (optional)
+    uint32_t checksum{0};  // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{
         0};  // Hash of the entire key (for verification and optimization)
 };
@@ -97,6 +139,16 @@ class OpLogManager {
     tl::expected<uint64_t, ErrorCode> AppendAndPersist(
         OpType type, const std::string& key,
         const std::string& payload = std::string());
+
+    // NEW: tenant-aware overloads (4-param, NO default payload)
+    uint64_t Append(OpType type, const std::string& tenant_id,
+                    const std::string& key, const std::string& payload);
+    OpLogEntry AllocateEntry(OpType type, const std::string& tenant_id,
+                             const std::string& key,
+                             const std::string& payload);
+    tl::expected<uint64_t, ErrorCode> AppendAndPersist(
+        OpType type, const std::string& tenant_id, const std::string& key,
+        const std::string& payload);
 
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;

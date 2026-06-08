@@ -39,7 +39,7 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     metadata.client_id = UUID{1, 2};
     metadata.size = size;
     metadata.last_sequence_id = seq_id;
-    snapshot.metadata.emplace_back(std::move(key), metadata);
+    snapshot.metadata.emplace_back("default", std::move(key), metadata);
     return snapshot;
 }
 
@@ -88,7 +88,7 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     metadata.client_id = UUID{1, 2};
     metadata.size = 4096;
     metadata.last_sequence_id = 42;
-    snapshot.metadata.emplace_back("key-1", metadata);
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
         std::optional<LoadedSnapshot>(snapshot)));
@@ -249,6 +249,47 @@ TEST_F(HotStandbyServiceTest, TestPromote_WhenReady) {
     EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
 }
 
+TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
+    // Setup: snapshot-only standby with baseline seq=10
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "snap-001";
+    snapshot.snapshot_sequence_id = 10;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 10;
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(10u, service_->GetLatestAppliedSequenceId());
+
+    // Export before promotion: seq should be 10
+    StandbySnapshot pre_snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(pre_snapshot));
+    EXPECT_EQ(10u, pre_snapshot.oplog_sequence_id);
+
+    // Promote and export atomically
+    StandbySnapshot post_snapshot;
+    ErrorCode err = service_->PromoteAndExportSnapshot(post_snapshot);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+
+    // After promotion, exported seq should still be 10 (no new OpLog in
+    // snapshot-only)
+    EXPECT_EQ(10u, post_snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, post_snapshot.objects.size());
+    EXPECT_EQ("key-1", post_snapshot.objects[0].key);
+}
+
 TEST_F(HotStandbyServiceTest, TestPromote_FinalCatchUp) {
 #ifdef STORE_USE_ETCD
     GTEST_SKIP() << "Requires real etcd and OpLog data to exercise final "
@@ -340,11 +381,11 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
     EXPECT_EQ(42u, status.primary_seq_id);
     EXPECT_TRUE(status.is_connected);
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<StandbyObjectEntry> exported;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-1", exported[0].first);
-    EXPECT_EQ(4096u, exported[0].second.size);
+    EXPECT_EQ("key-1", exported[0].key);
+    EXPECT_EQ(4096u, exported[0].metadata.size);
 }
 
 TEST_F(HotStandbyServiceTest,
@@ -372,12 +413,12 @@ TEST_F(HotStandbyServiceTest,
     EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
     EXPECT_EQ(1u, service_->GetMetadataCount());
 
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> exported;
+    std::vector<StandbyObjectEntry> exported;
     ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
     ASSERT_EQ(1u, exported.size());
-    EXPECT_EQ("key-new", exported[0].first);
-    EXPECT_EQ(8192u, exported[0].second.size);
-    EXPECT_EQ(84u, exported[0].second.last_sequence_id);
+    EXPECT_EQ("key-new", exported[0].key);
+    EXPECT_EQ(8192u, exported[0].metadata.size);
+    EXPECT_EQ(84u, exported[0].metadata.last_sequence_id);
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
@@ -400,7 +441,7 @@ TEST_F(HotStandbyServiceTest, TestGetMetadataCount) {
 }
 
 TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
-    std::vector<std::pair<std::string, StandbyObjectMetadata>> snapshot;
+    std::vector<StandbyObjectEntry> snapshot;
     EXPECT_TRUE(service_->ExportMetadataSnapshot(snapshot));
     EXPECT_TRUE(snapshot.empty());
 }
@@ -408,6 +449,45 @@ TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
 TEST_F(HotStandbyServiceTest, TestGetLatestAppliedSequenceId) {
     uint64_t seq = service_->GetLatestAppliedSequenceId();
     EXPECT_EQ(0u, seq);
+}
+
+// ========== 6.1.6a ExportStandbySnapshot tests ==========
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_NotRunning) {
+    StandbySnapshot snapshot;
+    EXPECT_FALSE(service_->ExportStandbySnapshot(snapshot));
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(42u, snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, snapshot.objects.size());
+    EXPECT_EQ("key-1", snapshot.objects[0].key);
+    EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
+    // Segment registry is empty because snapshot-only standby has no
+    // oplog_applier
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(LoadedSnapshot{})));
+
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
+    EXPECT_TRUE(snapshot.objects.empty());
+    EXPECT_TRUE(snapshot.segments.empty());
 }
 
 // ========== 6.1.7 Replication loop tests ==========

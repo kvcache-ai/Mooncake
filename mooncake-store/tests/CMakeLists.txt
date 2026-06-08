@@ -180,6 +180,7 @@ add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
 add_ha_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
 add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
 add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)
+add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 add_ha_test(localfs_hot_standby_integration_test
             ha/oplog/localfs_hot_standby_integration_test.cpp)
 add_ha_test(catalog_backed_snapshot_provider_test

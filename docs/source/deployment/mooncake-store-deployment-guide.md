@@ -35,9 +35,14 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--client_ttl` (int64, default `10` s): Seconds a client stays considered alive after the last heartbeat. If this TTL elapses without a refresh, the master treats the client as disconnected and may unmount its segments.
 
 - High Availability (optional)
-  - `--enable_ha` (bool, default `false`): Enable HA (requires etcd).
+  - `--enable_ha` (bool, default `false`): Enable HA (requires etcd or other backend for leader election).
+  - `--ha_backend_type` (str, default `etcd`): HA backend for leader election: `etcd`, `redis`, or `k8s`.
+  - `--ha_backend_connstring` (str, default empty): Connection string for the HA backend.
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
+  - `--oplog_store_type` (str, default empty): OpLog store type for HA replication: `etcd`, `localfs`, or empty (defaults to `etcd` if compiled with etcd support, else `localfs`).
+  - `--oplog_store_root_dir` (str, default `/tmp/mooncake_oplog`): Root directory for localfs OpLog store. Only used when `oplog_store_type=localfs`.
+  - `--oplog_poll_interval_ms` (int, default `1000`): Poll interval in milliseconds for localfs OpLog store.
 
 - Logging (optional)
   - The master uses glog. When `--log_dir` is set, all severities are merged into a single journal file in that directory (`mooncake_master.INFO.<date>-<time>.<pid>`), reachable through the stable `mooncake_master.INFO` symlink. glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) control the rest.
@@ -114,6 +119,137 @@ For config files, the equivalent setting is:
 rpc_interface: "eth0"
 rpc_port: 50051
 ```
+
+## High Availability (HA)
+
+Mooncake Store supports a Primary-Standby HA model with OpLog-based replication. The active Primary serves all read/write traffic and publishes metadata mutations to an OpLog store. One or more Standby nodes replicate the OpLog to maintain an in-memory copy of the metadata and segment registry. When the Primary fails, a Standby can be promoted to become the new Primary.
+
+### HA Architecture
+
+```
++---------------+          OpLog Store          +---------------+
+|   Primary     |  (etcd / localfs)             |   Standby     |
+|               |  <----------------------------|               |
+|  OpLogManager |                               | OpLogApplier  |
+|  (Append)     |                               | (Apply)       |
+|               |                               |               |
+|  MasterService|                               | MetadataStore |
++---------------+                               +---------------+
+       ^                                                 |
+       |         Leadership Election                      |
+       +---------------- etcd/redis/k8s ------------------+
+```
+
+### HA Configuration
+
+In addition to the basic HA flags listed above, the following parameters control OpLog replication:
+
+- `--oplog_store_type`: Backend for OpLog storage.
+  - `etcd`: Use etcd as the OpLog store (requires `STORE_USE_ETCD` at compile time).
+  - `localfs`: Use local filesystem (default when not compiled with etcd support).
+  - Empty string: Use compile-time default.
+- `--oplog_store_root_dir`: Root directory for the localfs OpLog store. Only used when `oplog_store_type=localfs`.
+- `--oplog_poll_interval_ms`: Polling interval in milliseconds for the localfs OpLog store.
+
+For snapshot-based standby bootstrap, also configure:
+
+- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
+- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
+- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
+
+### Standby Bootstrap
+
+When a Standby starts, it follows this sequence:
+
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
+   - Load the latest snapshot from the configured catalog and object store.
+   - Rebuild object metadata and segment state from the snapshot baseline.
+2. **OpLog Catch-up**:
+   - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
+   - Continuously poll/watch the OpLog store and apply new entries.
+
+Supported OpLog entry types:
+- `PUT_END`: Object write completion
+- `REMOVE`: Object removal
+- `PUT_REVOKE`: Object revocation
+- `BATCH_REMOVE`: Batch removal
+- `SEGMENT_MOUNT`: Segment mount event
+- `SEGMENT_UNMOUNT`: Segment unmount event
+
+### Promotion and Failover
+
+When the Primary fails, the Standby is promoted through the following steps:
+
+1. **Final Catch-up**: The Standby stops the OpLog replicator and performs a final catch-up of any remaining entries.
+2. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
+   - `applied_seq_id`: The latest applied OpLog sequence ID.
+   - `objects`: All object metadata from the in-memory store.
+   - `segments`: All segment registry entries.
+3. **Leadership Transition**: The Standby acquires leadership through the configured HA backend.
+4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
+5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+### Example: HA Deployment with etcd
+
+Primary configuration (`primary.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"
+cluster_id: "mooncake_cluster"
+oplog_store_type: "etcd"
+enable_snapshot: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50051
+```
+
+Standby configuration (`standby.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"
+cluster_id: "mooncake_cluster"
+oplog_store_type: "etcd"
+enable_snapshot_restore: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50052
+```
+
+Environment variable for local snapshot storage:
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
+```
+
+Start the cluster:
+
+```bash
+# Start Primary
+mooncake_master --config_path=primary.yaml
+
+# Start Standby
+mooncake_master --config_path=standby.yaml
+```
+
+### Example: HA Deployment with localfs OpLog (testing)
+
+For local testing without etcd, use the localfs OpLog store:
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "http://localhost:2379"
+cluster_id: "test_cluster"
+oplog_store_type: "localfs"
+oplog_store_root_dir: "/tmp/mooncake_oplog"
+oplog_poll_interval_ms: 1000
+```
+
+> **Note:** The `localfs` OpLog store is suitable for testing and development. Production HA deployments should use `etcd`.
 
 ## Metrics Endpoints
 

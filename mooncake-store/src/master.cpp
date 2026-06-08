@@ -175,6 +175,14 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
 
+// OpLog store configuration
+DEFINE_string(oplog_store_type, "",
+              "OpLog store type: etcd, localfs. Empty means default.");
+DEFINE_string(oplog_store_root_dir, "/tmp/mooncake_oplog",
+              "Root directory for localfs OpLog store.");
+DEFINE_int32(oplog_poll_interval_ms, 1000,
+             "Poll interval for localfs OpLog store.");
+
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 DEFINE_string(
@@ -377,6 +385,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetString("oplog_store_type",
+                             &master_config.oplog_store_type,
+                             FLAGS_oplog_store_type);
+    default_config.GetString("oplog_store_root_dir",
+                             &master_config.oplog_store_root_dir,
+                             FLAGS_oplog_store_root_dir);
+    default_config.GetInt32("oplog_poll_interval_ms",
+                            &master_config.oplog_poll_interval_ms,
+                            FLAGS_oplog_poll_interval_ms);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",

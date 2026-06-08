@@ -78,6 +78,11 @@ class NoopStandbyController final : public StandbyController {
 
     ErrorCode PromoteStandby() override { return ErrorCode::OK; }
 
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
     void UpdateObservedLeader(const std::optional<MasterView>&) override {}
 
     MasterRuntimeState GetStandbyRuntimeState() const override {
@@ -207,6 +212,50 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         NotifyRuntimeStateIfChanged();
         return err;
+    }
+
+    tl::expected<PromotionContext, ErrorCode> PromoteStandbyAndExport()
+        override {
+        // Verify standby is running first (same check as PromoteStandby)
+        ErrorCode promote_error = ErrorCode::OK;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) {
+                promote_error = last_standby_error_ != ErrorCode::OK
+                                    ? last_standby_error_
+                                    : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+            }
+        }
+        if (promote_error != ErrorCode::OK) {
+            return tl::unexpected(promote_error);
+        }
+
+        // Atomic promote + export (final catch-up happens inside)
+        StandbySnapshot snapshot;
+        ErrorCode err = standby_service_->PromoteAndExportSnapshot(snapshot);
+        if (err != ErrorCode::OK) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                standby_running_ = false;
+                last_standby_error_ = err;
+            }
+            NotifyRuntimeStateIfChanged();
+            return tl::unexpected(err);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            standby_running_ = false;
+            last_standby_error_ = ErrorCode::OK;
+        }
+        NotifyRuntimeStateIfChanged();
+
+        PromotionContext ctx;
+        ctx.applied_seq_id = snapshot.oplog_sequence_id;
+        ctx.objects = std::move(snapshot.objects);
+        ctx.segments = std::move(snapshot.segments);
+
+        return ctx;
     }
 
     void UpdateObservedLeader(
