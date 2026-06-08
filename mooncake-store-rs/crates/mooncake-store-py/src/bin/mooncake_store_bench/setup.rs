@@ -226,6 +226,13 @@ fn log_bench_startup_context(
         writer_count,
         reader_count
     );
+    if !global.keyspace.is_empty() {
+        warn!(
+            keyspace = global.keyspace,
+            "custom keyspace is set — make sure you understand its effect on tenant isolation; \
+             misconfigured keyspace can cause nodes to register in different metadata prefixes"
+        );
+    }
     log_relevant_env();
 }
 

@@ -336,6 +336,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     init_tracing(args.trace_filter.as_deref())?;
     build_info::log_build_info();
+    if args.keyspace.is_some() {
+        warn!(
+            keyspace = ?args.keyspace,
+            "custom keyspace is set — make sure you understand its effect on tenant isolation; \
+             misconfigured keyspace can cause nodes to register in different metadata prefixes"
+        );
+    }
 
     match &args.command {
         Command::CleanupStaleSegments => {
