@@ -327,7 +327,14 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
 static int parseTransportHint(const std::string& name) {
 #ifdef USE_TENT
     if (name.empty()) return mooncake::tent::UNSPEC;
-    return mooncake::tent::TransportSelector::parseTransportType(name);
+    auto type = mooncake::tent::TransportSelector::parseTransportType(name);
+    if (type == mooncake::tent::UNSPEC && name != "unspec") {
+        throw std::invalid_argument(
+            "Unknown transport_hint '" + name +
+            "' (valid: rdma, mnnvl, shm, nvlink, gds, io_uring, tcp, "
+            "ascend, sunrise_link, unspec, or empty string for no hint)");
+    }
+    return type;
 #else
     return 0;
 #endif
