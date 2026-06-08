@@ -1380,7 +1380,6 @@ TEST_F(FileStorageTest, BatchGetSingleflight_SerializesSameKey) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     file_storage_config.total_keys_limit = 1000;
-    file_storage_config.total_size_limit = 10 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_FALSE(keys.empty());
@@ -1425,7 +1424,6 @@ TEST_F(FileStorageTest, BatchGetSingleflight_DifferentKeysRunConcurrently) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     file_storage_config.total_keys_limit = 1000;
-    file_storage_config.total_size_limit = 10 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_GE(keys.size(), 2u) << "Need at least 2 keys for this test";
@@ -1461,7 +1459,6 @@ TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBypassesSingleflight) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     file_storage_config.total_keys_limit = 1000;
-    file_storage_config.total_size_limit = 10 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_GE(keys.size(), 2u);
@@ -1480,7 +1477,6 @@ TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     file_storage_config.total_keys_limit = 1000;
-    file_storage_config.total_size_limit = 10 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_FALSE(keys.empty());
@@ -1552,7 +1548,6 @@ TEST_F(FileStorageTest, BatchGetSingleflight_RefCountRelease) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     file_storage_config.total_keys_limit = 1000;
-    file_storage_config.total_size_limit = 10 * 1024 * 1024;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     ASSERT_FALSE(keys.empty());
