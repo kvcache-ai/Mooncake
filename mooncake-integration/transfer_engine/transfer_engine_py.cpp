@@ -709,7 +709,10 @@ batch_id_t TransferEnginePy::transferSubmitWrite(const char* target_hostname,
     entry.target_offset = peer_buffer_address;
 
     Status s = engine_->submitTransfer(batch_id, {entry});
-    if (!s.ok()) return -1;
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        return -1;
+    }
 
     return batch_id;
 }
