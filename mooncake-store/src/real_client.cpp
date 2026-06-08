@@ -761,6 +761,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << toString(result.error());
             return tl::unexpected(result.error());
         }
+        {
+            std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+            local_buffer_region_ = WritableBufferRegion{
+                .base = client_buffer_allocator_->getBase(),
+                .size = local_buffer_size,
+                .offset = 0,
+            };
+        }
     } else {
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
@@ -1098,6 +1106,8 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                 << "Failed to unregister client local buffer on tear down: "
                 << toString(unregister_result.error());
         }
+        std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
+        local_buffer_region_.reset();
     }
 
     // Reset all resources
@@ -3062,8 +3072,8 @@ int RealClient::unregister_buffer(void *buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
-std::optional<RealClient::RegisteredBufferRegion>
-RealClient::resolve_registered_buffer(void *buffer) const {
+std::optional<RealClient::WritableBufferRegion>
+RealClient::resolve_writable_buffer_region(void *buffer) const {
     std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
     const auto target = reinterpret_cast<uintptr_t>(buffer);
     for (const auto &[registered_buffer, registered_size] :
@@ -3074,11 +3084,23 @@ RealClient::resolve_registered_buffer(void *buffer) const {
         }
         const auto offset = target - base;
         if (offset < registered_size) {
-            return RegisteredBufferRegion{
+            return WritableBufferRegion{
                 .base = registered_buffer,
                 .size = registered_size,
                 .offset = static_cast<size_t>(offset),
             };
+        }
+    }
+    if (local_buffer_region_.has_value()) {
+        const auto base =
+            reinterpret_cast<uintptr_t>(local_buffer_region_->base);
+        if (target >= base) {
+            const auto offset = target - base;
+            if (offset < local_buffer_region_->size) {
+                WritableBufferRegion region = *local_buffer_region_;
+                region.offset = static_cast<size_t>(offset);
+                return region;
+            }
         }
     }
     return std::nullopt;
@@ -3358,16 +3380,16 @@ RealClient::get_into_ranges_internal(
         resolved_buffer_capacities = *buffer_capacities;
     } else {
         resolved_buffer_capacities.resize(buffer_count, 0);
-        std::shared_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         for (size_t i = 0; i < buffer_count; ++i) {
-            auto it = registered_buffer_sizes_.find(buffers[i]);
-            if (it == registered_buffer_sizes_.end()) {
+            auto region = resolve_writable_buffer_region(buffers[i]);
+            if (!region.has_value()) {
                 LOG(ERROR)
-                    << "get_into_ranges: buffer is not registered at index "
+                    << "get_into_ranges: buffer is not Store-managed writable "
+                       "memory at index "
                     << i;
                 continue;
             }
-            resolved_buffer_capacities[i] = it->second;
+            resolved_buffer_capacities[i] = region->size - region->offset;
         }
     }
 
@@ -3579,8 +3601,8 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
     const std::string &key, void *buffer, size_t size,
     const ReplicateConfig &config) {
-    // NOTE: The buffer address must be previously registered with
-    // register_buffer() for zero-copy RDMA operations to work correctly
+    // NOTE: The buffer address must resolve to Store-managed registered
+    // memory for zero-copy RDMA operations to work correctly
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -4613,8 +4635,8 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
                                        size_t metadata_size,
                                        const ReplicateConfig &config) {
     const auto start_time = std::chrono::steady_clock::now();
-    // NOTE: The buffer address must be previously registered with
-    // register_buffer() for zero-copy RDMA operations to work correctly
+    // NOTE: The buffer address must resolve to Store-managed registered
+    // memory for zero-copy RDMA operations to work correctly
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return -1;
