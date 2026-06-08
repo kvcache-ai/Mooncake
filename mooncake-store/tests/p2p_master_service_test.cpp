@@ -287,6 +287,33 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
     EXPECT_EQ(3, res.value().candidates.size());
 }
 
+TEST_F(P2PMasterServiceTest, GetWriteRouteRejectsWhenOwnerClientLimitReached) {
+    auto service = CreateService(/* max_replicas_per_key= */ 2);
+    auto owner_seg1 = MakeP2PSegment("owner_seg1", kDefaultSegmentSize, {}, 1);
+    auto owner_seg2 = MakeP2PSegment("owner_seg2", kDefaultSegmentSize, {}, 2);
+    auto new_owner_seg = MakeP2PSegment("new_owner_seg", kDefaultSegmentSize);
+    auto owner1 = generate_uuid();
+    auto owner2 = generate_uuid();
+    auto new_owner = generate_uuid();
+    RegisterP2PClient(*service, owner1, {owner_seg1}, "10.0.0.1", 50051);
+    RegisterP2PClient(*service, owner2, {owner_seg2}, "10.0.0.2", 50052);
+    RegisterP2PClient(*service, new_owner, {new_owner_seg}, "10.0.0.3", 50053);
+
+    AddReplicaHelper(*service, "key1", 1024, owner1, owner_seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, owner2, owner_seg2.id);
+
+    WriteRouteRequest req;
+    req.key = "key1";
+    req.client_id = generate_uuid();
+    req.size = 1024;
+    req.config.max_candidates = 1;
+    req.config.early_return = false;
+
+    auto res = service->GetWriteRoute(req);
+    EXPECT_FALSE(res.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
+}
+
 // ============================================================
 // AddReplica Tests
 // ============================================================
@@ -342,20 +369,28 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
 TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     auto service = CreateService(/* max_replicas_per_key= */ 2);
     auto seg1 = MakeP2PSegment("seg1");
+    auto seg1_b = MakeP2PSegment("seg1_b");
     auto seg2 = MakeP2PSegment("seg2");
     auto seg3 = MakeP2PSegment("seg3");
     auto client1 = generate_uuid();
     auto client2 = generate_uuid();
     auto client3 = generate_uuid();
-    RegisterP2PClient(*service, client1, {seg1}, "10.0.0.1", 50051);
+    RegisterP2PClient(*service, client1, {seg1, seg1_b}, "10.0.0.1", 50051);
     RegisterP2PClient(*service, client2, {seg2}, "10.0.0.2", 50052);
     RegisterP2PClient(*service, client3, {seg3}, "10.0.0.3", 50053);
 
-    // Add first two replicas — should succeed
+    // Multiple replicas on one client are allowed.
     AddReplicaHelper(*service, "key1", 1024, client1, seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, client1, seg1_b.id);
+
+    // The second owner client is allowed.
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
-    // Third replica — should exceed limit
+    auto get_res = service->GetReplicaList("key1");
+    ASSERT_TRUE(get_res.has_value());
+    EXPECT_EQ(3, get_res.value().replicas.size());
+
+    // The third owner client should exceed the limit.
     AddReplicaRequest req;
     req.key = "key1";
     req.size = 1024;

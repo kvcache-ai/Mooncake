@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <algorithm>
+
 #include "p2p_client_meta.h"
 
 namespace mooncake {
@@ -14,6 +15,27 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
         config.view_version);
     InitializeClientManager();
     client_manager_->Start();
+}
+
+auto P2PMasterService::CollectReplicaOwnerClients(
+    const ObjectMetadata& metadata, std::string_view key)
+    -> tl::expected<std::unordered_set<UUID, boost::hash<UUID>>, ErrorCode> {
+    std::unordered_set<UUID, boost::hash<UUID>> owner_clients;
+    for (const auto& replica : metadata.replicas_) {
+        if (!replica.is_p2p_proxy_replica()) {
+            LOG(ERROR) << "unexpected replica type" << ", key: " << key
+                       << ", replica:" << replica;
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+        auto client_id = replica.get_p2p_client_id();
+        if (!client_id) {
+            LOG(ERROR) << "invalid p2p replica" << ", key: " << key
+                       << ", replica:" << replica;
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+        owner_clients.insert(*client_id);
+    }
+    return owner_clients;
 }
 
 std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
@@ -90,19 +112,28 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterReplicas(
 
 auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     -> tl::expected<WriteRouteResponse, ErrorCode> {
-    // pre check replica num.
-    // it might happen that concurrent write for same key.
-    // for this case, we will finally check it when add route replica.
+    // GetWriteRoute represents an external write request. In-client tier
+    // migration updates metadata through AddReplica directly, so once the
+    // owner limit is reached no client can accept another routed write.
     if (!req.key.empty() && max_replicas_per_key_ > 0) {
         MetadataAccessorRO accessor(this, req.key);
         if (accessor.Exists()) {
             auto& metadata = accessor.Get();
-            if (metadata.replicas_.size() >= max_replicas_per_key_) {
+            auto owner_clients_res =
+                CollectReplicaOwnerClients(metadata, req.key);
+            if (!owner_clients_res.has_value()) {
+                LOG(ERROR) << "failed to collect replica owner clients"
+                           << ", key: " << req.key
+                           << ", error: " << owner_clients_res.error();
+                return tl::make_unexpected(owner_clients_res.error());
+            }
+            const auto& owner_clients = owner_clients_res.value();
+            if (owner_clients.size() >= max_replicas_per_key_) {
                 LOG(WARNING)
-                    << "replica num exceeded"
+                    << "replica owner client num exceeded"
                     << ", key: " << req.key << ", client_id: " << req.client_id
-                    << ", current replica num:" << metadata.replicas_.size()
-                    << ", max replica num: " << max_replicas_per_key_;
+                    << ", current owner client num: " << owner_clients.size()
+                    << ", max owner client num: " << max_replicas_per_key_;
                 return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
             }
         }
@@ -204,18 +235,18 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
     auto it = shard.metadata.find(key);
     if (it != shard.metadata.end()) {
         auto& metadata = *it->second;
+        auto owner_clients_res = CollectReplicaOwnerClients(metadata, key);
+        if (!owner_clients_res.has_value()) {
+            LOG(ERROR) << "failed to collect replica owner clients"
+                       << ", key: " << key
+                       << ", error: " << owner_clients_res.error();
+            return tl::make_unexpected(owner_clients_res.error());
+        }
+        const auto& owner_clients = owner_clients_res.value();
         for (const auto& replica : metadata.replicas_) {
-            if (!replica.is_p2p_proxy_replica()) {
-                LOG(ERROR) << "unexpected replica type"
-                           << ", key: " << key
-                           << ", request client_id: " << client_id
-                           << ", request segment_id: " << segment_id
-                           << ", replica:" << replica;
-                return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
-            }
             auto seg_id = replica.get_segment_id();
             auto cli_id = replica.get_p2p_client_id();
-            if (cli_id && seg_id && cli_id == client_id &&
+            if (cli_id && seg_id && *cli_id == client_id &&
                 *seg_id == segment_id) {
                 LOG(WARNING) << "replica has existed"
                              << ", key: " << key << ", client_id: " << client_id
@@ -223,12 +254,18 @@ tl::expected<void, ErrorCode> P2PMasterService::InnerAddReplica(
                 return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
             }
         }
+        // AddReplica is also used by in-client tier migration to publish a new
+        // physical replica. Existing owner clients may add replicas, but a new
+        // owner client must still honor max_replicas_per_key_.
         if (max_replicas_per_key_ > 0 &&
-            metadata.replicas_.size() >= max_replicas_per_key_) {
-            LOG(WARNING) << "replica num exceeded"
+            owner_clients.find(client_id) == owner_clients.end() &&
+            owner_clients.size() >= max_replicas_per_key_) {
+            LOG(WARNING) << "replica owner client num exceeded"
                          << ", key: " << key << ", client_id: " << client_id
                          << ", segment_id: " << segment_id
-                         << ", current replica num:" << max_replicas_per_key_;
+                         << ", current owner client num:"
+                         << owner_clients.size()
+                         << ", max owner client num: " << max_replicas_per_key_;
             return tl::make_unexpected(ErrorCode::REPLICA_NUM_EXCEEDED);
         }
         AddReplicaToSegmentIndex(shard, it->first, new_replica);
