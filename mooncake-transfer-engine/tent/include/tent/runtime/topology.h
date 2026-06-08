@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TOPOLOGY_H
-#define TOPOLOGY_H
+// NOTE: Guard renamed from TOPOLOGY_H to avoid collision with the classic
+// transfer-engine's mooncake-transfer-engine/include/topology.h, which also
+// uses TOPOLOGY_H. 
+#ifndef TENT_TOPOLOGY_H
+#define TENT_TOPOLOGY_H
 
 #include <glog/logging.h>
 #include <netdb.h>
@@ -137,4 +140,4 @@ struct RangeLocation {
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TOPOLOGY_H
+#endif  // TENT_TOPOLOGY_H

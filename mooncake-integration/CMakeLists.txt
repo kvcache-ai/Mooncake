@@ -53,6 +53,11 @@ if(WITH_TE)
     target_compile_definitions(engine PRIVATE USE_EFA)
   endif()
 
+  # Propagate USE_TENT compile definition to engine target
+  if(USE_TENT)
+    target_compile_definitions(engine PRIVATE USE_TENT)
+  endif()
+
   target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)
 
   target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
