@@ -163,18 +163,18 @@ class MasterService {
      * @brief Check if an object exists
      * @return ErrorCode::OK if exists, otherwise return other ErrorCode
      */
-    auto ExistKey(const std::string& key) -> tl::expected<bool, ErrorCode>;
     auto ExistKey(const std::string& key, const std::string& tenant_id)
         -> tl::expected<bool, ErrorCode>;
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys, const std::string& tenant_id);
 
     /**
-     * @brief Fetch all keys
+     * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists
      */
-    auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+    auto GetAllKeys(const std::string& tenant_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
      * @brief Fetch all segments, each node has a unique real client with fixed
@@ -255,10 +255,6 @@ class MasterService {
      * @return An expected object containing a map from object keys to their
      * replica descriptors on success, or an ErrorCode on failure.
      */
-    auto GetReplicaListByRegex(const std::string& regex_pattern)
-        -> tl::expected<
-            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>;
     auto GetReplicaListByRegex(const std::string& regex_pattern,
                                const std::string& tenant_id)
         -> tl::expected<
@@ -271,8 +267,6 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(const std::string& key)
-        -> tl::expected<GetReplicaListResponse, ErrorCode>;
     auto GetReplicaList(const std::string& key, const std::string& tenant_id)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
@@ -285,9 +279,6 @@ class MasterService {
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     auto PutStart(const UUID& client_id, const std::string& key,
-                  const uint64_t slice_length, const ReplicateConfig& config)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    auto PutStart(const UUID& client_id, const std::string& key,
                   const std::string& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -299,16 +290,12 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
-    auto PutEnd(const UUID& client_id, const std::string& key,
                 const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
      */
-    auto AddReplica(const UUID& client_id, const std::string& key,
-                    Replica& replica) -> tl::expected<void, ErrorCode>;
     auto AddReplica(const UUID& client_id, const std::string& key,
                     const std::string& tenant_id, Replica& replica)
         -> tl::expected<void, ErrorCode>;
@@ -320,8 +307,6 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
-    auto PutRevoke(const UUID& client_id, const std::string& key,
                    const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
@@ -332,9 +317,6 @@ class MasterService {
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
         ReplicaType replica_type = ReplicaType::ALL);
 
@@ -343,9 +325,6 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id,
@@ -361,9 +340,6 @@ class MasterService {
      * progress), OBJECT_REPLICA_BUSY (replicas have non-zero refcnt).
      */
     auto UpsertStart(const UUID& client_id, const std::string& key,
-                     const uint64_t slice_length, const ReplicateConfig& config)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-    auto UpsertStart(const UUID& client_id, const std::string& key,
                      const std::string& tenant_id, const uint64_t slice_length,
                      const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -372,8 +348,6 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
-    auto UpsertEnd(const UUID& client_id, const std::string& key,
                    const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
@@ -381,20 +355,12 @@ class MasterService {
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
-    auto UpsertRevoke(const UUID& client_id, const std::string& key,
                       const std::string& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Start a batch of upsert operations.
      */
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchUpsertStart(const UUID& client_id,
-                     const std::vector<std::string>& keys,
-                     const std::vector<uint64_t>& slice_lengths,
-                     const ReplicateConfig& config);
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
                      const std::vector<std::string>& keys,
@@ -406,16 +372,12 @@ class MasterService {
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
-    std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id);
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
      */
-    std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id);
@@ -429,9 +391,6 @@ class MasterService {
      * @return ErrorCode::OK on success, OBJECT_NOT_FOUND if key missing
      */
     auto EvictDiskReplica(const UUID& client_id, const std::string& key,
-                          ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
-    auto EvictDiskReplica(const UUID& client_id, const std::string& key,
                           const std::string& tenant_id,
                           ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -443,9 +402,6 @@ class MasterService {
      * @param replica_type DISK or LOCAL_DISK
      * @return Per-key results (OK or error code)
      */
-    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type);
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
@@ -465,21 +421,13 @@ class MasterService {
      */
     tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment,
-        const std::vector<std::string>& tgt_segments);
-    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
-        const UUID& client_id, const std::string& key,
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
-                                          const std::string& key);
-    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
 
-    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
-                                             const std::string& key);
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
@@ -499,20 +447,13 @@ class MasterService {
      */
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment, const std::string& tgt_segment);
-    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
-        const UUID& client_id, const std::string& key,
         const std::string& tenant_id, const std::string& src_segment,
         const std::string& tgt_segment);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
-                                          const std::string& key);
-    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
 
-    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
-                                             const std::string& key);
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
@@ -524,8 +465,6 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key, bool force = false)
-        -> tl::expected<void, ErrorCode>;
     auto Remove(const std::string& key, const std::string& tenant_id,
                 bool force = false) -> tl::expected<void, ErrorCode>;
 
@@ -536,8 +475,6 @@ class MasterService {
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str, bool force = false)
-        -> tl::expected<long, ErrorCode>;
     auto RemoveByRegex(const std::string& str, const std::string& tenant_id,
                        bool force = false) -> tl::expected<long, ErrorCode>;
 
@@ -562,8 +499,6 @@ class MasterService {
      * @param force If true, skip lease and replication task checks.
      * @return Vector of expected results for each key.
      */
-    auto BatchRemove(const std::vector<std::string>& keys, bool force = false)
-        -> std::vector<tl::expected<void, ErrorCode>>;
     auto BatchRemove(const std::vector<std::string>& keys,
                      const std::string& tenant_id, bool force = false)
         -> std::vector<tl::expected<void, ErrorCode>>;
@@ -620,15 +555,11 @@ class MasterService {
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
-     * @param keys         A list of object keys (names) that were successfully
-     * offloaded.
+     * @param tasks        A list of tenant-scoped objects that were
+     * successfully offloaded.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    auto NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas)
-        -> tl::expected<void, ErrorCode>;
     auto NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas)
@@ -657,10 +588,6 @@ class MasterService {
      * arbitrary buffer size from a buggy or malicious caller.
      */
     auto PromotionAllocStart(const UUID& client_id, const std::string& key,
-                             uint64_t size,
-                             const std::vector<std::string>& preferred_segments)
-        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
-    auto PromotionAllocStart(const UUID& client_id, const std::string& key,
                              const std::string& tenant_id, uint64_t size,
                              const std::vector<std::string>& preferred_segments)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
@@ -670,8 +597,6 @@ class MasterService {
      * refcnt; erase per-shard and per-client task entries. Mirror of
      * NotifyOffloadSuccess.
      */
-    auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key)
-        -> tl::expected<void, ErrorCode>;
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
                                 const std::string& tenant_id)
         -> tl::expected<void, ErrorCode>;
@@ -694,8 +619,6 @@ class MasterService {
      * task, decrement the global in-flight counter, and clear the
      * holder's promotion_objects entry.
      */
-    auto NotifyPromotionFailure(const UUID& client_id, const std::string& key)
-        -> tl::expected<void, ErrorCode>;
     auto NotifyPromotionFailure(const UUID& client_id, const std::string& key,
                                 const std::string& tenant_id)
         -> tl::expected<void, ErrorCode>;
@@ -705,8 +628,6 @@ class MasterService {
      * @return Copy task ID on success, ErrorCode on failure
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
-        const std::string& key, const std::vector<std::string>& targets);
-    tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
 
@@ -715,9 +636,6 @@ class MasterService {
      * to target segment
      * @return Move task ID on success, ErrorCode on failure
      */
-    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
-                                                 const std::string& source,
-                                                 const std::string& target);
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& tenant_id,
                                                  const std::string& source,
@@ -1275,8 +1193,8 @@ class MasterService {
         SharedMutexLocker lock_;
     };
 
-    static ObjectIdentity MakeObjectIdentity(
-        const std::string& user_key, const std::string& tenant_id = "default") {
+    static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
+                                             const std::string& tenant_id) {
         return {NormalizeTenantId(tenant_id), user_key};
     }
 
@@ -1308,7 +1226,6 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const std::string& key) const;
     size_t getMetadataShardIndex(const std::string& tenant_id,
                                  const std::string& key) const;
     std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
@@ -1469,9 +1386,6 @@ class MasterService {
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessorRW {
        public:
-        MetadataAccessorRW(MasterService* service, const std::string& key)
-            : MetadataAccessorRW(service, MakeObjectIdentity(key)) {}
-
         MetadataAccessorRW(MasterService* service,
                            const ObjectIdentity& object_id)
             : service_(service),
@@ -1680,9 +1594,6 @@ class MasterService {
     friend class MetadataAccessor;
     class MetadataAccessorRO {
        public:
-        MetadataAccessorRO(const MasterService* service, const std::string& key)
-            : MetadataAccessorRO(service, MakeObjectIdentity(key)) {}
-
         MetadataAccessorRO(const MasterService* service,
                            const ObjectIdentity& object_id)
             : service_(service),
@@ -1956,10 +1867,6 @@ class MasterService {
     std::string MakeDrainUnitKey(const std::string& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
-    std::string MakeDrainUnitKey(const std::string& key,
-                                 const std::string& source_segment) const {
-        return MakeDrainUnitKey("default", key, source_segment);
-    }
 
     std::thread job_dispatch_thread_;
     std::atomic<bool> job_dispatch_running_{false};
