@@ -40,14 +40,16 @@ Json::Value RuntimeConfigStore::exportConfig() const {
 }
 
 void RuntimeConfigStore::loadFromJson(const Json::Value& root) {
-    if (root.isNull()) return;
+    if (root.isNull() || !root.isObject()) return;
 
+    std::unique_lock lock(mu_);
     if (root.isMember("write")) {
-        updateWriteConfig(root["write"]);
+        std::visit([&](auto& cfg) { applyPatch(cfg, root["write"]); }, write_);
     }
     if (root.isMember("read")) {
-        updateReadConfig(root["read"]);
+        applyPatch(read_, root["read"]);
     }
+    lock.unlock();
 
     LOG(INFO) << "Loaded runtime config: " << root.toStyledString();
 }
@@ -56,23 +58,33 @@ void RuntimeConfigStore::loadFromJson(const Json::Value& root) {
 
 void RuntimeConfigStore::applyPatch(ReplicateConfig& config,
                                     const Json::Value& json) {
-    if (json.isMember("replica_num")) {
-        config.replica_num = json["replica_num"].asUInt64();
+    if (!json.isObject()) return;
+    if (json.isMember("replica_num") && json["replica_num"].isUInt64()) {
+        uint64_t val = json["replica_num"].asUInt64();
+        if (val > 0) {
+            config.replica_num = val;
+        } else {
+            LOG(WARNING) << "Invalid replica_num: " << val;
+        }
     }
-    if (json.isMember("with_soft_pin")) {
+    if (json.isMember("with_soft_pin") && json["with_soft_pin"].isBool()) {
         config.with_soft_pin = json["with_soft_pin"].asBool();
     }
     if (json.isMember("preferred_segments") &&
         json["preferred_segments"].isArray()) {
         config.preferred_segments.clear();
         for (const auto& seg : json["preferred_segments"]) {
-            config.preferred_segments.push_back(seg.asString());
+            if (seg.isString()) {
+                config.preferred_segments.push_back(seg.asString());
+            }
         }
     }
-    if (json.isMember("preferred_segment")) {
+    if (json.isMember("preferred_segment") &&
+        json["preferred_segment"].isString()) {
         config.preferred_segment = json["preferred_segment"].asString();
     }
-    if (json.isMember("prefer_alloc_in_same_node")) {
+    if (json.isMember("prefer_alloc_in_same_node") &&
+        json["prefer_alloc_in_same_node"].isBool()) {
         config.prefer_alloc_in_same_node =
             json["prefer_alloc_in_same_node"].asBool();
     }
@@ -80,36 +92,40 @@ void RuntimeConfigStore::applyPatch(ReplicateConfig& config,
 
 void RuntimeConfigStore::applyPatch(WriteRouteRequestConfig& config,
                                     const Json::Value& json) {
-    if (json.isMember("max_candidates")) {
+    if (!json.isObject()) return;
+    if (json.isMember("max_candidates") && json["max_candidates"].isUInt64()) {
         config.max_candidates = json["max_candidates"].asUInt64();
     }
-    if (json.isMember("strategy")) {
-        int val = json["strategy"].asInt();
-        config.strategy = static_cast<ObjectIterateStrategy>(val);
+    if (json.isMember("strategy") && json["strategy"].isInt()) {
+        config.strategy =
+            static_cast<ObjectIterateStrategy>(json["strategy"].asInt());
     }
-    if (json.isMember("allow_local")) {
+    if (json.isMember("allow_local") && json["allow_local"].isBool()) {
         config.allow_local = json["allow_local"].asBool();
     }
-    if (json.isMember("prefer_local")) {
+    if (json.isMember("prefer_local") && json["prefer_local"].isBool()) {
         config.prefer_local = json["prefer_local"].asBool();
     }
-    if (json.isMember("early_return")) {
+    if (json.isMember("early_return") && json["early_return"].isBool()) {
         config.early_return = json["early_return"].asBool();
     }
     if (json.isMember("tag_filters") && json["tag_filters"].isArray()) {
         config.tag_filters.clear();
         for (const auto& tag : json["tag_filters"]) {
-            config.tag_filters.push_back(tag.asString());
+            if (tag.isString()) {
+                config.tag_filters.push_back(tag.asString());
+            }
         }
     }
-    if (json.isMember("priority_limit")) {
+    if (json.isMember("priority_limit") && json["priority_limit"].isInt()) {
         config.priority_limit = json["priority_limit"].asInt();
     }
 }
 
 void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
                                     const Json::Value& json) {
-    if (json.isMember("max_candidates")) {
+    if (!json.isObject()) return;
+    if (json.isMember("max_candidates") && json["max_candidates"].isUInt64()) {
         config.max_candidates = json["max_candidates"].asUInt64();
     }
     if (json.isMember("p2p_config") && json["p2p_config"].isObject()) {
@@ -122,10 +138,13 @@ void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
             p2p_json["tag_filters"].isArray()) {
             p2p.tag_filters.clear();
             for (const auto& tag : p2p_json["tag_filters"]) {
-                p2p.tag_filters.push_back(tag.asString());
+                if (tag.isString()) {
+                    p2p.tag_filters.push_back(tag.asString());
+                }
             }
         }
-        if (p2p_json.isMember("priority_limit")) {
+        if (p2p_json.isMember("priority_limit") &&
+            p2p_json["priority_limit"].isInt()) {
             p2p.priority_limit = p2p_json["priority_limit"].asInt();
         }
     }

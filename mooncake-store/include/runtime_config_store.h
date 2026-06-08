@@ -16,8 +16,7 @@ namespace mooncake {
 
 class RuntimeConfigStore {
    public:
-    using WriteConfig =
-        std::variant<ReplicateConfig, WriteRouteRequestConfig>;
+    using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
     explicit RuntimeConfigStore(DeploymentMode mode);
 

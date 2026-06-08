@@ -785,9 +785,14 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                                     Json::writeString(writer, val));
     };
 
-    auto parse_body = [](coro_http_request& req, coro_http_response& resp,
+    auto parse_json = [](coro_http_request& req, coro_http_response& resp,
                          Json::Value& out) -> bool {
         auto body = req.get_body();
+        if (body.empty()) {
+            resp.set_status_and_content(status_type::bad_request,
+                                        "Empty request body");
+            return false;
+        }
         Json::CharReaderBuilder builder;
         auto reader =
             std::unique_ptr<Json::CharReader>(builder.newCharReader());
@@ -796,6 +801,18 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                            &errors)) {
             resp.set_status_and_content(status_type::bad_request,
                                         "Invalid JSON: " + errors);
+            return false;
+        }
+        return true;
+    };
+
+    auto parse_body = [parse_json](coro_http_request& req,
+                                   coro_http_response& resp,
+                                   Json::Value& out) -> bool {
+        if (!parse_json(req, resp, out)) return false;
+        if (!out.isObject()) {
+            resp.set_status_and_content(status_type::bad_request,
+                                        "Expected JSON object");
             return false;
         }
         return true;
@@ -829,13 +846,7 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                                          coro_http_response& resp) {
             Json::Value json;
             if (!parse_body(req, resp, json)) return;
-            if (json.isMember("write")) {
-                runtime_config_store_->updateWriteConfig(json["write"]);
-            }
-            if (json.isMember("read")) {
-                runtime_config_store_->updateReadConfig(json["read"]);
-            }
-            LOG(INFO) << "Runtime config updated via HTTP";
+            runtime_config_store_->loadFromJson(json);
             respond_json(resp, runtime_config_store_->exportConfig());
         });
 
@@ -889,7 +900,7 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
     // POST /config/set?section=write&key=prefer_local — set single field
     // Body: the JSON value
     http_server_->set_http_handler<POST>(
-        "/config/set", [this, parse_body, respond_json](
+        "/config/set", [this, parse_json, respond_json](
                            coro_http_request& req, coro_http_response& resp) {
             auto section = req.get_query_value("section");
             auto key = req.get_query_value("key");
@@ -899,21 +910,29 @@ void ClientService::RegisterRuntimeConfigHttpMethods() {
                     "Missing 'section' or 'key' query parameter");
                 return;
             }
-            Json::Value value;
-            if (!parse_body(req, resp, value)) return;
-            Json::Value patch;
-            patch[std::string(key)] = value;
             std::string sec(section);
-            if (sec == "write") {
-                runtime_config_store_->updateWriteConfig(patch);
-            } else if (sec == "read") {
-                runtime_config_store_->updateReadConfig(patch);
-            } else {
+            std::string k(key);
+            if (sec != "write" && sec != "read") {
                 resp.set_status_and_content(status_type::bad_request,
                                             "Unknown section: " + sec);
                 return;
             }
-            LOG(INFO) << "Runtime config field " << sec << "." << key
+            Json::Value current = runtime_config_store_->exportConfig();
+            if (!current.isMember(sec) || !current[sec].isMember(k)) {
+                resp.set_status_and_content(status_type::not_found,
+                                            "Unknown key: " + sec + "." + k);
+                return;
+            }
+            Json::Value value;
+            if (!parse_json(req, resp, value)) return;
+            Json::Value patch;
+            patch[k] = value;
+            if (sec == "write") {
+                runtime_config_store_->updateWriteConfig(patch);
+            } else {
+                runtime_config_store_->updateReadConfig(patch);
+            }
+            LOG(INFO) << "Runtime config field " << sec << "." << k
                       << " updated via HTTP";
             respond_json(resp, runtime_config_store_->exportConfig()[sec]);
         });

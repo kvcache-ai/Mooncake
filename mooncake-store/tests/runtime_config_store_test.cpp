@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 
+#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -72,18 +73,26 @@ class RuntimeConfigTest : public ::testing::Test {
                              : http_base_url_ + path + "?" + query;
     }
 
-    static coro_http::resp_data HttpGet(const std::string& url) {
+    struct HttpResponse {
+        int status;
+        std::string body;
+    };
+
+    static HttpResponse HttpGet(const std::string& url) {
         coro_http::coro_http_client c;
-        return c.get(url);
+        auto resp = c.get(url);
+        return {resp.status, std::string(resp.resp_body)};
     }
 
-    static coro_http::resp_data HttpPost(const std::string& url,
-                                         std::string body = "") {
+    static HttpResponse HttpPost(const std::string& url,
+                                 std::string body = "") {
         coro_http::coro_http_client c;
-        return c.post(url, std::move(body), coro_http::req_content_type::json);
+        auto resp =
+            c.post(url, std::move(body), coro_http::req_content_type::json);
+        return {resp.status, std::string(resp.resp_body)};
     }
 
-    static Json::Value ParseJson(const std::string& str) {
+    static Json::Value ParseJson(std::string_view str) {
         Json::Value val;
         Json::CharReaderBuilder builder;
         auto reader =
@@ -125,10 +134,7 @@ TEST_F(RuntimeConfigTest, P2PModeReturnsWriteRouteRequestConfig) {
     auto& cfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_TRUE(cfg.allow_local);
     EXPECT_TRUE(cfg.prefer_local);
-    EXPECT_EQ(cfg.max_candidates, 0u);
-}
-
-TEST_F(RuntimeConfigTest, DefaultReadConfig) {
+    EXPECT_EQ(cfg.max_candidates, 2u);
     auto rc = p2p_store().getDefaultReadConfig();
     EXPECT_EQ(rc.max_candidates, 0u);
     EXPECT_FALSE(rc.p2p_config.has_value());
@@ -144,8 +150,8 @@ TEST_F(RuntimeConfigTest, UpdateCentralizedWriteConfigPatch) {
     patch["with_soft_pin"] = true;
     centralized_store().updateWriteConfig(patch);
 
-    auto& cfg =
-        std::get<ReplicateConfig>(centralized_store().getDefaultWriteConfig());
+    auto wc = centralized_store().getDefaultWriteConfig();
+    auto& cfg = std::get<ReplicateConfig>(wc);
     EXPECT_EQ(cfg.replica_num, 3u);
     EXPECT_TRUE(cfg.with_soft_pin);
     EXPECT_FALSE(cfg.prefer_alloc_in_same_node);
@@ -160,11 +166,11 @@ TEST_F(RuntimeConfigTest, UpdateCentralizedPreferredSegments) {
     patch["prefer_alloc_in_same_node"] = true;
     centralized_store().updateWriteConfig(patch);
 
-    auto& cfg =
-        std::get<ReplicateConfig>(centralized_store().getDefaultWriteConfig());
-    ASSERT_EQ(cfg.preferred_segments.size(), 2u);
-    EXPECT_EQ(cfg.preferred_segments[0], "seg_a");
-    EXPECT_TRUE(cfg.prefer_alloc_in_same_node);
+    auto wc2 = centralized_store().getDefaultWriteConfig();
+    auto& cfg2 = std::get<ReplicateConfig>(wc2);
+    ASSERT_EQ(cfg2.preferred_segments.size(), 2u);
+    EXPECT_EQ(cfg2.preferred_segments[0], "seg_a");
+    EXPECT_TRUE(cfg2.prefer_alloc_in_same_node);
 }
 
 // ============================================================================
@@ -178,8 +184,8 @@ TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigPatch) {
     patch["priority_limit"] = 10;
     p2p_store().updateWriteConfig(patch);
 
-    auto& cfg =
-        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    auto wc = p2p_store().getDefaultWriteConfig();
+    auto& cfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_FALSE(cfg.prefer_local);
     EXPECT_EQ(cfg.max_candidates, 5u);
     EXPECT_EQ(cfg.priority_limit, 10);
@@ -191,9 +197,9 @@ TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigStrategy) {
     patch["strategy"] = static_cast<int>(ObjectIterateStrategy::RANDOM);
     p2p_store().updateWriteConfig(patch);
 
-    auto& cfg =
-        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
-    EXPECT_EQ(cfg.strategy, ObjectIterateStrategy::RANDOM);
+    auto wc2 = p2p_store().getDefaultWriteConfig();
+    auto& cfg2 = std::get<WriteRouteRequestConfig>(wc2);
+    EXPECT_EQ(cfg2.strategy, ObjectIterateStrategy::RANDOM);
 }
 
 TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigTagFilters) {
@@ -204,10 +210,10 @@ TEST_F(RuntimeConfigTest, UpdateP2PWriteConfigTagFilters) {
     patch["tag_filters"] = tags;
     p2p_store().updateWriteConfig(patch);
 
-    auto& cfg =
-        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
-    ASSERT_EQ(cfg.tag_filters.size(), 2u);
-    EXPECT_EQ(cfg.tag_filters[0], "gpu");
+    auto wc3 = p2p_store().getDefaultWriteConfig();
+    auto& cfg3 = std::get<WriteRouteRequestConfig>(wc3);
+    ASSERT_EQ(cfg3.tag_filters.size(), 2u);
+    EXPECT_EQ(cfg3.tag_filters[0], "gpu");
 }
 
 // ============================================================================
@@ -250,8 +256,8 @@ TEST_F(RuntimeConfigTest, PatchPreservesUnmentionedFields) {
     p2["max_candidates"] = 7;
     p2p_store().updateWriteConfig(p2);
 
-    auto& cfg =
-        std::get<WriteRouteRequestConfig>(p2p_store().getDefaultWriteConfig());
+    auto wc = p2p_store().getDefaultWriteConfig();
+    auto& cfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_FALSE(cfg.prefer_local);
     EXPECT_EQ(cfg.max_candidates, 7u);
 }
@@ -268,8 +274,8 @@ TEST_F(RuntimeConfigTest, LoadFromJsonBothSections) {
     root["read"]["max_candidates"] = 8;
     store.loadFromJson(root);
 
-    auto& wcfg =
-        std::get<WriteRouteRequestConfig>(store.getDefaultWriteConfig());
+    auto wc = store.getDefaultWriteConfig();
+    auto& wcfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_FALSE(wcfg.prefer_local);
     EXPECT_EQ(wcfg.max_candidates, 3u);
     EXPECT_EQ(store.getDefaultReadConfig().max_candidates, 8u);
@@ -278,10 +284,10 @@ TEST_F(RuntimeConfigTest, LoadFromJsonBothSections) {
 TEST_F(RuntimeConfigTest, LoadFromJsonNullIsNoOp) {
     RuntimeConfigStore store(DeploymentMode::P2P);
     store.loadFromJson(Json::Value());
-    auto& cfg =
-        std::get<WriteRouteRequestConfig>(store.getDefaultWriteConfig());
+    auto wc = store.getDefaultWriteConfig();
+    auto& cfg = std::get<WriteRouteRequestConfig>(wc);
     EXPECT_TRUE(cfg.prefer_local);
-    EXPECT_EQ(cfg.max_candidates, 0u);
+    EXPECT_EQ(cfg.max_candidates, 2u);
 }
 
 // ============================================================================
@@ -299,8 +305,10 @@ TEST_F(RuntimeConfigTest, ExportRoundTrip) {
     RuntimeConfigStore s2(DeploymentMode::P2P);
     s2.loadFromJson(s1.exportConfig());
 
-    auto& w1 = std::get<WriteRouteRequestConfig>(s1.getDefaultWriteConfig());
-    auto& w2 = std::get<WriteRouteRequestConfig>(s2.getDefaultWriteConfig());
+    auto wc1 = s1.getDefaultWriteConfig();
+    auto wc2 = s2.getDefaultWriteConfig();
+    auto& w1 = std::get<WriteRouteRequestConfig>(wc1);
+    auto& w2 = std::get<WriteRouteRequestConfig>(wc2);
     EXPECT_EQ(w1.max_candidates, w2.max_candidates);
     EXPECT_EQ(w1.prefer_local, w2.prefer_local);
     EXPECT_EQ(s1.getDefaultReadConfig().max_candidates,
@@ -314,7 +322,7 @@ TEST_F(RuntimeConfigTest, ExportRoundTrip) {
 TEST_F(RuntimeConfigTest, HttpGetAllConfig) {
     auto resp = HttpGet(Url("/config"));
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(resp.resp_body);
+    auto json = ParseJson(resp.body);
     EXPECT_TRUE(json.isMember("write"));
     EXPECT_TRUE(json.isMember("read"));
 }
@@ -322,7 +330,7 @@ TEST_F(RuntimeConfigTest, HttpGetAllConfig) {
 TEST_F(RuntimeConfigTest, HttpGetWriteConfig) {
     auto resp = HttpGet(Url("/config/write"));
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(resp.resp_body);
+    auto json = ParseJson(resp.body);
     EXPECT_TRUE(json.isMember("prefer_local"));
     EXPECT_TRUE(json.isMember("max_candidates"));
 }
@@ -330,7 +338,7 @@ TEST_F(RuntimeConfigTest, HttpGetWriteConfig) {
 TEST_F(RuntimeConfigTest, HttpGetReadConfig) {
     auto resp = HttpGet(Url("/config/read"));
     ASSERT_EQ(resp.status, 200);
-    EXPECT_TRUE(ParseJson(resp.resp_body).isMember("max_candidates"));
+    EXPECT_TRUE(ParseJson(resp.body).isMember("max_candidates"));
 }
 
 // ============================================================================
@@ -341,11 +349,11 @@ TEST_F(RuntimeConfigTest, HttpUpdateWriteConfig) {
     auto resp = HttpPost(Url("/config/update_write"),
                          R"({"prefer_local": false, "max_candidates": 5})");
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(resp.resp_body);
+    auto json = ParseJson(resp.body);
     EXPECT_FALSE(json["prefer_local"].asBool());
     EXPECT_EQ(json["max_candidates"].asUInt64(), 5u);
 
-    auto get_json = ParseJson(HttpGet(Url("/config/write")).resp_body);
+    auto get_json = ParseJson(HttpGet(Url("/config/write")).body);
     EXPECT_EQ(get_json["max_candidates"].asUInt64(), 5u);
 }
 
@@ -357,7 +365,7 @@ TEST_F(RuntimeConfigTest, HttpUpdateReadConfig) {
     auto resp =
         HttpPost(Url("/config/update_read"), R"({"max_candidates": 8})");
     ASSERT_EQ(resp.status, 200);
-    EXPECT_EQ(ParseJson(resp.resp_body)["max_candidates"].asUInt64(), 8u);
+    EXPECT_EQ(ParseJson(resp.body)["max_candidates"].asUInt64(), 8u);
 }
 
 TEST_F(RuntimeConfigTest, HttpUpdateFull) {
@@ -365,7 +373,7 @@ TEST_F(RuntimeConfigTest, HttpUpdateFull) {
         Url("/config/update"),
         R"({"write":{"max_candidates":3},"read":{"max_candidates":7}})");
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(resp.resp_body);
+    auto json = ParseJson(resp.body);
     EXPECT_EQ(json["write"]["max_candidates"].asUInt64(), 3u);
     EXPECT_EQ(json["read"]["max_candidates"].asUInt64(), 7u);
 }
@@ -378,7 +386,7 @@ TEST_F(RuntimeConfigTest, HttpGetSingleField) {
     HttpPost(Url("/config/update_write"), R"({"priority_limit": 42})");
     auto resp = HttpGet(Url("/config/get", "section=write&key=priority_limit"));
     ASSERT_EQ(resp.status, 200);
-    EXPECT_EQ(ParseJson(resp.resp_body).asInt(), 42);
+    EXPECT_EQ(ParseJson(resp.body).asInt(), 42);
 }
 
 TEST_F(RuntimeConfigTest, HttpGetSingleFieldMissingParams) {
@@ -396,7 +404,7 @@ TEST_F(RuntimeConfigTest, HttpSetSingleField) {
     auto resp =
         HttpPost(Url("/config/set", "section=write&key=early_return"), "false");
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(HttpGet(Url("/config/write")).resp_body);
+    auto json = ParseJson(HttpGet(Url("/config/write")).body);
     EXPECT_FALSE(json["early_return"].asBool());
 }
 
@@ -404,8 +412,8 @@ TEST_F(RuntimeConfigTest, HttpSetSingleFieldReadSection) {
     auto resp =
         HttpPost(Url("/config/set", "section=read&key=max_candidates"), "99");
     ASSERT_EQ(resp.status, 200);
-    auto json = ParseJson(HttpGet(Url("/config/read")).resp_body);
-    EXPECT_EQ(json["max_candidates"].asUInt64(), 99u);
+    auto json2 = ParseJson(HttpGet(Url("/config/read")).body);
+    EXPECT_EQ(json2["max_candidates"].asUInt64(), 99u);
 }
 
 TEST_F(RuntimeConfigTest, HttpSetSingleFieldMissingParams) {
@@ -417,6 +425,198 @@ TEST_F(RuntimeConfigTest, HttpSetSingleFieldUnknownSection) {
     EXPECT_EQ(
         HttpPost(Url("/config/set", "section=unknown&key=foo"), "1").status,
         400);
+}
+
+// ============================================================================
+// Review fix: /config/set returns 404 for unknown key
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, HttpSetSingleFieldUnknownKey) {
+    auto resp =
+        HttpPost(Url("/config/set", "section=write&key=nonexistent_key"), "42");
+    EXPECT_EQ(resp.status, 404);
+}
+
+TEST_F(RuntimeConfigTest, HttpSetSingleFieldUnknownKeyReadSection) {
+    auto resp =
+        HttpPost(Url("/config/set", "section=read&key=nonexistent_key"), "42");
+    EXPECT_EQ(resp.status, 404);
+}
+
+// ============================================================================
+// Review fix: applyPatch ignores wrong JSON types (no crash)
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, ApplyPatchIgnoresWrongTypes) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+
+    Json::Value bad;
+    bad["max_candidates"] = "not_a_number";
+    bad["prefer_local"] = 123;
+    bad["strategy"] = Json::Value(Json::arrayValue);
+    bad["tag_filters"] = false;
+    bad["priority_limit"] = Json::Value(Json::objectValue);
+    store.updateWriteConfig(bad);
+
+    auto wc = store.getDefaultWriteConfig();
+    auto& cfg = std::get<WriteRouteRequestConfig>(wc);
+    EXPECT_EQ(cfg.max_candidates, 2u);
+    EXPECT_TRUE(cfg.prefer_local);
+    EXPECT_EQ(cfg.strategy, ObjectIterateStrategy::CAPACITY_PRIORITY);
+    EXPECT_TRUE(cfg.tag_filters.empty());
+    EXPECT_EQ(cfg.priority_limit, 0);
+}
+
+TEST_F(RuntimeConfigTest, ApplyPatchIgnoresWrongTypesCentralized) {
+    RuntimeConfigStore store(DeploymentMode::CENTRALIZATION);
+
+    Json::Value bad;
+    bad["replica_num"] = Json::Value(Json::objectValue);
+    bad["with_soft_pin"] = "yes";
+    bad["preferred_segments"] = 42;
+    bad["preferred_segment"] = true;
+    bad["prefer_alloc_in_same_node"] = Json::Value(Json::arrayValue);
+    store.updateWriteConfig(bad);
+
+    auto wc = store.getDefaultWriteConfig();
+    auto& cfg = std::get<ReplicateConfig>(wc);
+    EXPECT_EQ(cfg.replica_num, 1u);
+    EXPECT_FALSE(cfg.with_soft_pin);
+    EXPECT_TRUE(cfg.preferred_segments.empty());
+    EXPECT_EQ(cfg.preferred_segment, "");
+    EXPECT_FALSE(cfg.prefer_alloc_in_same_node);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateWriteConfigWrongTypesNoEffect) {
+    HttpPost(Url("/config/update_write"),
+             R"({"max_candidates": 10, "prefer_local": true})");
+
+    auto resp = HttpPost(Url("/config/update_write"),
+                         R"({"max_candidates": "bad", "prefer_local": 999})");
+    ASSERT_EQ(resp.status, 200);
+
+    auto json = ParseJson(HttpGet(Url("/config/write")).body);
+    EXPECT_EQ(json["max_candidates"].asUInt64(), 10u);
+    EXPECT_TRUE(json["prefer_local"].asBool());
+}
+
+// ============================================================================
+// Review fix: loadFromJson is atomic (write+read in single lock)
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, LoadFromJsonAtomicUpdate) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+
+    Json::Value root;
+    root["write"]["max_candidates"] = 11;
+    root["read"]["max_candidates"] = 22;
+    store.loadFromJson(root);
+
+    auto exported = store.exportConfig();
+    EXPECT_EQ(exported["write"]["max_candidates"].asUInt64(), 11u);
+    EXPECT_EQ(exported["read"]["max_candidates"].asUInt64(), 22u);
+}
+
+// ============================================================================
+// Store: loadFromJson with non-object input
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, LoadFromJsonArrayIsNoOp) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    Json::Value arr(Json::arrayValue);
+    arr.append(1);
+    store.loadFromJson(arr);
+    auto wc = store.getDefaultWriteConfig();
+    EXPECT_TRUE(std::holds_alternative<WriteRouteRequestConfig>(wc));
+}
+
+TEST_F(RuntimeConfigTest, LoadFromJsonStringIsNoOp) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    store.loadFromJson(Json::Value("hello"));
+    auto wc = store.getDefaultWriteConfig();
+    EXPECT_TRUE(std::holds_alternative<WriteRouteRequestConfig>(wc));
+}
+
+TEST_F(RuntimeConfigTest, LoadFromJsonNumberIsNoOp) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    store.loadFromJson(Json::Value(42));
+    auto wc = store.getDefaultWriteConfig();
+    EXPECT_TRUE(std::holds_alternative<WriteRouteRequestConfig>(wc));
+}
+
+// ============================================================================
+// Store: applyPatch with non-object input
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, UpdateWriteConfigNonObjectIsNoOp) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    store.updateWriteConfig(Json::Value("not an object"));
+    store.updateWriteConfig(Json::Value(Json::arrayValue));
+    store.updateWriteConfig(Json::Value(123));
+    auto wc = store.getDefaultWriteConfig();
+    auto& cfg = std::get<WriteRouteRequestConfig>(wc);
+    EXPECT_EQ(cfg.max_candidates, 2u);
+}
+
+TEST_F(RuntimeConfigTest, UpdateReadConfigNonObjectIsNoOp) {
+    RuntimeConfigStore store(DeploymentMode::P2P);
+    store.updateReadConfig(Json::Value(false));
+    store.updateReadConfig(Json::Value(Json::arrayValue));
+    auto rc = store.getDefaultReadConfig();
+    EXPECT_EQ(rc.max_candidates, 0u);
+}
+
+// ============================================================================
+// HTTP: empty body returns 400
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, HttpUpdateWriteEmptyBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update_write"), "").status, 400);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateReadEmptyBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update_read"), "").status, 400);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateFullEmptyBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update"), "").status, 400);
+}
+
+// ============================================================================
+// HTTP: non-object body returns 400
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, HttpUpdateWriteArrayBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update_write"), "[1,2,3]").status, 400);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateReadStringBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update_read"), R"("hello")").status, 400);
+}
+
+TEST_F(RuntimeConfigTest, HttpUpdateFullNumberBody) {
+    EXPECT_EQ(HttpPost(Url("/config/update"), "42").status, 400);
+}
+
+// ============================================================================
+// HTTP: /config/set accepts primitive body
+// ============================================================================
+
+TEST_F(RuntimeConfigTest, HttpSetPrimitiveBool) {
+    HttpPost(Url("/config/update_write"), R"({"allow_local": true})");
+    auto resp =
+        HttpPost(Url("/config/set", "section=write&key=allow_local"), "false");
+    ASSERT_EQ(resp.status, 200);
+    auto json = ParseJson(HttpGet(Url("/config/write")).body);
+    EXPECT_FALSE(json["allow_local"].asBool());
+}
+
+TEST_F(RuntimeConfigTest, HttpSetPrimitiveInt) {
+    auto resp =
+        HttpPost(Url("/config/set", "section=write&key=max_candidates"), "7");
+    ASSERT_EQ(resp.status, 200);
+    auto json = ParseJson(HttpGet(Url("/config/write")).body);
+    EXPECT_EQ(json["max_candidates"].asUInt64(), 7u);
 }
 
 }  // namespace testing

@@ -607,6 +607,12 @@ class ClientConfigBuilder {
         }
         if (!rc_source.empty()) {
             config.runtime_config_json = LoadJsonConfig(rc_source);
+            if (config.runtime_config_json.isNull() ||
+                !config.runtime_config_json.isObject()) {
+                throw std::runtime_error(
+                    "Invalid runtime configuration provided via runtime_config "
+                    "or MC_RUNTIME_CONFIG");
+            }
         }
     }
 

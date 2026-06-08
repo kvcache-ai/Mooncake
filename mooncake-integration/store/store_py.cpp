@@ -284,23 +284,40 @@ class MooncakeStorePyWrapper {
     }
 
     WriteConfig get_default_write_config() {
-        if (!store_ || !store_->client_service_) {
-            throw std::runtime_error(
-                "call get_default_write_config() but client is not "
-                "initialized");
+        if (!store_) {
+            LOG(ERROR) << "Client is not initialized";
+            return ReplicateConfig{};
+        } else if (store_->client_service_) {
+            // real client
+            return store_->client_service_->getDefaultWriteConfig();
         }
-        return store_->client_service_->getDefaultWriteConfig();
+
+        // dummy client
+        return store_->deployment_mode() == DeploymentMode::P2P
+                   ? WriteConfig{WriteRouteRequestConfig{}}
+                   : WriteConfig{ReplicateConfig{}};
+    }
+
+    ReadRouteConfig get_default_read_config() {
+        if (!store_) {
+            LOG(ERROR) << "Client is not initialized";
+            return ReadRouteConfig{};
+        } else if (store_->client_service_) {
+            // real client
+            return store_->client_service_->getDefaultReadConfig();
+        }
+        // dummy client
+        return ReadRouteConfig{};
     }
 
     pybind11::bytes get(
         const std::string& key,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
         }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
 
         const auto kNullString = pybind11::bytes("\\0", 0);
 
@@ -333,14 +350,13 @@ class MooncakeStorePyWrapper {
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string>& keys,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
         }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
 
         {
             py::gil_scoped_release release_gil;
@@ -389,13 +405,12 @@ class MooncakeStorePyWrapper {
     pybind11::object get_tensor(
         const std::string& key,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
             return pybind11::none();
         }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
 
         std::shared_ptr<BufferHandle> buffer_handle;
         {
@@ -409,8 +424,6 @@ class MooncakeStorePyWrapper {
     pybind11::list batch_get_tensor(
         const std::vector<std::string>& keys,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
@@ -418,6 +431,7 @@ class MooncakeStorePyWrapper {
             for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
             return empty;
         }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
 
         std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
         {
@@ -435,13 +449,12 @@ class MooncakeStorePyWrapper {
     pybind11::object get_tensor_into(
         const std::string& key, uintptr_t buffer_ptr, size_t size,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
-        char* buffer = reinterpret_cast<char*>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
         }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
+        char* buffer = reinterpret_cast<char*>(buffer_ptr);
 
         if (use_dummy_client_) {
             LOG(ERROR) << "get_tensor is not supported for dummy client now";
@@ -465,14 +478,6 @@ class MooncakeStorePyWrapper {
         const std::vector<uintptr_t>& buffer_ptrs,
         const std::vector<size_t>& sizes,
         const std::optional<ReadRouteConfig>& config_opt = std::nullopt) {
-        ReadRouteConfig config = config_opt.value_or(
-            store_->client_service_->getDefaultReadConfig());
-        std::vector<void*> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void*>(ptr));
-        }
-
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             py::list empty_list;
@@ -480,6 +485,12 @@ class MooncakeStorePyWrapper {
                 empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
             }
             return empty_list;
+        }
+        ReadRouteConfig config = config_opt.value_or(get_default_read_config());
+        std::vector<void*> buffers;
+        buffers.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            buffers.push_back(reinterpret_cast<void*>(ptr));
         }
 
         if (use_dummy_client_) {
@@ -848,12 +859,12 @@ class MooncakeStorePyWrapper {
 
     int pub_tensor(const std::string& key, pybind11::object tensor,
                    const std::optional<WriteConfig>& config_opt) {
-        WriteConfig config = config_opt.value_or(get_default_write_config());
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+        WriteConfig config = config_opt.value_or(get_default_write_config());
 
         int validate_result = validate_replicate_config(config);
         if (validate_result) return validate_result;
@@ -886,12 +897,12 @@ class MooncakeStorePyWrapper {
         const std::string& key, pybind11::object tensor,
         const std::optional<WriteConfig>& config_opt = std::nullopt,
         int tp_rank = 0, int tp_size = 1, int split_dim = 0) {
-        WriteConfig config = config_opt.value_or(get_default_write_config());
         if (!is_client_initialized() || use_dummy_client_) {
             LOG(ERROR) << "Client not initialized or Dummy client not "
                           "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+        WriteConfig config = config_opt.value_or(get_default_write_config());
 
         int validate_result = validate_replicate_config(config);
         if (validate_result) return validate_result;
@@ -906,10 +917,10 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string>& keys,
         const pybind11::list& tensors_list,
         const std::optional<WriteConfig>& config_opt = std::nullopt) {
-        WriteConfig config = config_opt.value_or(get_default_write_config());
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
+        WriteConfig config = config_opt.value_or(get_default_write_config());
 
         if (keys.size() != tensors_list.size() || keys.empty()) {
             if (!keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
@@ -931,12 +942,12 @@ class MooncakeStorePyWrapper {
         const pybind11::list& tensors_list,
         const std::optional<WriteConfig>& config_opt = std::nullopt,
         int tp_rank = 0, int tp_size = 1, int split_dim = 0) {
-        WriteConfig config = config_opt.value_or(get_default_write_config());
-        if (tp_size <= 1)
-            return batch_pub_tensor(base_keys, tensors_list, config);
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
+        WriteConfig config = config_opt.value_or(get_default_write_config());
+        if (tp_size <= 1)
+            return batch_pub_tensor(base_keys, tensors_list, config);
 
         if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
             if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
@@ -1227,8 +1238,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("p2p_key_lease_duration_ms") = 5000,
             py::arg("p2p_key_lease_scan_interval_ms") = 1000,
             py::arg("p2p_transfer_direction_mode") = "reverse",
-            py::arg("engine") = py::none(),
-            py::arg("runtime_config") = "",
+            py::arg("engine") = py::none(), py::arg("runtime_config") = "",
             "Setup the store in P2P architecture.")
         .def(
             "setup",
@@ -1383,8 +1393,8 @@ PYBIND11_MODULE(store, m) {
             "get_buffer",
             [](MooncakeStorePyWrapper& self, const std::string& key,
                const std::optional<ReadRouteConfig>& config_opt) {
-                ReadRouteConfig config = config_opt.value_or(
-                    self.store_->client_service_->getDefaultReadConfig());
+                ReadRouteConfig config =
+                    config_opt.value_or(self.get_default_read_config());
                 py::gil_scoped_release release;
                 return self.store_->get_buffer(key, config);
             },
@@ -1395,8 +1405,8 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper& self,
                const std::vector<std::string>& keys,
                const std::optional<ReadRouteConfig>& config_opt) {
-                ReadRouteConfig config = config_opt.value_or(
-                    self.store_->client_service_->getDefaultReadConfig());
+                ReadRouteConfig config =
+                    config_opt.value_or(self.get_default_read_config());
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR) << "batch_get_buffer is not supported for dummy "
@@ -1620,8 +1630,8 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, size_t size,
                const std::optional<ReadRouteConfig>& config_opt) {
-                ReadRouteConfig config = config_opt.value_or(
-                    self.store_->client_service_->getDefaultReadConfig());
+                ReadRouteConfig config =
+                    config_opt.value_or(self.get_default_read_config());
                 // Get data directly into user-provided buffer
                 void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
@@ -1642,8 +1652,8 @@ PYBIND11_MODULE(store, m) {
                const std::vector<uintptr_t>& buffer_ptrs,
                const std::vector<size_t>& sizes,
                const std::optional<ReadRouteConfig>& config_opt) {
-                ReadRouteConfig config = config_opt.value_or(
-                    self.store_->client_service_->getDefaultReadConfig());
+                ReadRouteConfig config =
+                    config_opt.value_or(self.get_default_read_config());
                 std::vector<void*> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
@@ -1835,8 +1845,8 @@ PYBIND11_MODULE(store, m) {
                bool aggregate_same_segment_task = false,
                const std::optional<ReadRouteConfig>& config_opt =
                    std::nullopt) {
-                ReadRouteConfig config = config_opt.value_or(
-                    self.store_->client_service_->getDefaultReadConfig());
+                ReadRouteConfig config =
+                    config_opt.value_or(self.get_default_read_config());
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
