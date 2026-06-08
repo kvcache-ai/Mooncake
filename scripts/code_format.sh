@@ -71,9 +71,9 @@ find_clang_format() {
     local candidates=("clang-format-20" "clang-format")
     for candidate in "${candidates[@]}"; do
         if command -v "${candidate}" &> /dev/null; then
-            local version
-            version=$("${candidate}" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            if [[ "${version}" == 20.* ]]; then
+            local version_out
+            version_out=$("${candidate}" --version 2>/dev/null)
+            if [[ "${version_out}" =~ version[[:space:]]+([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -eq 20 ]]; then
                 echo "${candidate}"
                 return 0
             fi
