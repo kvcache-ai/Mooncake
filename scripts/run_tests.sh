@@ -48,6 +48,7 @@ pip install "${MOONCAKE_TEST_TORCH_SPEC:-torch==2.11.0+cu128}" \
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true
+wait $MASTER_PID 2>/dev/null || true
 
 
 # Check if MOONCAKE_STORAGE_ROOT_DIR is set and not empty
@@ -63,6 +64,7 @@ if [ -n "$TEST_SSD_OFFLOAD_IN_EVICT" ]; then
     sleep 1
     MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_ssd_offload_in_evict.py
     kill $MASTER_PID || true
+    wait $MASTER_PID 2>/dev/null || true
     rm -rf $TEST_ROOT_DIR
 else
     echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
@@ -96,6 +98,7 @@ if [ -n "$TEST_PROMOTION_ON_HIT" ]; then
         MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
         python test_promotion_on_hit.py
     kill $MASTER_PID || true
+    wait $MASTER_PID 2>/dev/null || true
     rm -rf $TEST_ROOT_DIR
 else
     echo "Skipping test: TEST_PROMOTION_ON_HIT environment variable is not set"
@@ -114,6 +117,7 @@ CXL_MASTER_PID=$!
 sleep 3
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
 kill $CXL_MASTER_PID || true
+wait $CXL_MASTER_PID 2>/dev/null || true
 sleep 2
 echo "CXL protocol test completed successfully!"
 
@@ -129,6 +133,7 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 sleep 1
 kill $MASTER_PID || true
+wait $MASTER_PID 2>/dev/null || true
 
 
 echo "All tests completed successfully!"

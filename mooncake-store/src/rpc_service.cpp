@@ -264,8 +264,11 @@ bool MasterAdminServer::Start() {
                         << snapshot.leader_view->view_version;
                 }
                 LOG(INFO) << log_stream.str();
-                std::this_thread::sleep_for(
-                    std::chrono::seconds(kMetricReportIntervalSeconds));
+                if (metric_report_stop_sem_.try_acquire_for(
+                        std::chrono::seconds(
+                            kMetricReportIntervalSeconds))) {
+                    break;
+                }
             }
         });
     }
@@ -275,12 +278,13 @@ bool MasterAdminServer::Start() {
 }
 
 void MasterAdminServer::Stop() {
-    metric_report_running_.store(false);
-    if (metric_report_thread_.joinable()) {
-        metric_report_thread_.join();
-    }
+    metric_report_running_.store(false, std::memory_order_relaxed);
+    metric_report_stop_sem_.release();
     if (started_.exchange(false)) {
         http_server_.stop();
+    }
+    if (metric_report_thread_.joinable()) {
+        metric_report_thread_.join();
     }
 }
 
