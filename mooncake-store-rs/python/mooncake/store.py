@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import Future
 import ctypes
@@ -17,6 +18,8 @@ from dataclasses import dataclass, field
 import warnings
 
 from ._runtime import package_dir, preload_native_libraries
+
+_logger = logging.getLogger("mooncake.store")
 
 
 def _load_native():
@@ -371,6 +374,53 @@ class MooncakeDistributedStore:
             raise AttributeError(name)
         return lambda *args, **kwargs: self._invoke(name, *args, **kwargs)
 
+    @staticmethod
+    def _log_setup_config(
+        local_hostname,
+        metadata_url,
+        transport_metadata_url,
+        global_segment_size,
+        local_buffer_size,
+        protocol,
+        setup_kwargs,
+    ):
+        try:
+            _logger.info(
+                "mooncake-store-py setup: local_hostname=%s metadata_url=%s "
+                "transport_metadata_url=%s global_segment_size=%s "
+                "local_buffer_size=%s protocol=%s tenant=%s keyspace=%s "
+                "stable_id=%s labels=%s initial_state=%s routed_writes=%s "
+                "replica_count=%s route_topk=%s transport_rpc_port=%s "
+                "transport_backend=%s domain=%s object_set=%s "
+                "local_segment_name=%s expires_at_ms=%s use_hugepage=%s "
+                "hugepage_size=%s route_control=%s",
+                local_hostname,
+                metadata_url,
+                transport_metadata_url,
+                global_segment_size,
+                local_buffer_size,
+                protocol,
+                setup_kwargs.get("tenant"),
+                setup_kwargs.get("keyspace"),
+                setup_kwargs.get("stable_id"),
+                setup_kwargs.get("labels"),
+                setup_kwargs.get("initial_state"),
+                setup_kwargs.get("routed_writes"),
+                setup_kwargs.get("replica_count"),
+                setup_kwargs.get("route_topk"),
+                setup_kwargs.get("transport_rpc_port"),
+                setup_kwargs.get("transport_backend"),
+                setup_kwargs.get("domain"),
+                setup_kwargs.get("object_set"),
+                setup_kwargs.get("local_segment_name"),
+                setup_kwargs.get("expires_at_ms"),
+                setup_kwargs.get("use_hugepage"),
+                setup_kwargs.get("hugepage_size"),
+                setup_kwargs.get("route_control"),
+            )
+        except Exception:
+            _logger.error("failed to log setup config", exc_info=True)
+
     def _invoke(self, name: str, *args, **kwargs):
         if self._worker is not None:
             return self._worker.call(name, *args, **kwargs)
@@ -386,6 +436,12 @@ class MooncakeDistributedStore:
         try:
             return self._invoke(name, *args, **kwargs)
         except Exception:
+            _logger.error(
+                "MooncakeDistributedStore.%s raised an exception; "
+                "returning compat fallback status code",
+                name,
+                exc_info=True,
+            )
             return _cache_compat_fallback(name, fallback_count)
 
     def setup(self, *args, **kwargs):
@@ -420,7 +476,17 @@ class MooncakeDistributedStore:
                 kwargs["transport_rpc_port"] = transport_rpc_port
         _warn_setup_policy_fallback(kwargs, source="MooncakeDistributedStore.setup")
         _init_tracing_from_env()
+        self._log_setup_config(
+            local_hostname=args[0] if len(args) > 0 else None,
+            metadata_url=args[6] if len(args) > 6 else None,
+            transport_metadata_url=args[1] if len(args) > 1 else None,
+            global_segment_size=args[2] if len(args) > 2 else None,
+            local_buffer_size=args[3] if len(args) > 3 else None,
+            protocol=args[4] if len(args) > 4 else None,
+            setup_kwargs=kwargs,
+        )
         result = self._invoke("setup", *args, **kwargs)
+        _logger.info("mooncake-store-py ready: stable_id=%s", kwargs.get("stable_id"))
         _start_metrics_server_from_env()
         return result
 
@@ -1253,15 +1319,7 @@ class MooncakeDistributedStore:
             else None
         )
         _init_tracing_from_env()
-        result = self._invoke(
-            "setup",
-            local_hostname,
-            str(transport_metadata_url),
-            _coerce_int(config.get("global_segment_size"), 16 * 1024 * 1024),
-            _coerce_int(config.get("local_buffer_size"), 16 * 1024 * 1024),
-            str(config.get("protocol", "tcp")),
-            str(config.get("rdma_devices", "")),
-            str(metadata_url),
+        setup_kwargs = dict(
             stable_id=_coerce_optional_str(config.get("stable_id")),
             initial_state=initial_state,
             tenant=str(config.get("tenant", "default")),
@@ -1287,6 +1345,34 @@ class MooncakeDistributedStore:
             ),
             route_control=str(config.get("route_control", "embedded_wrh")),
         )
+        global_segment_size = _coerce_int(
+            config.get("global_segment_size"), 16 * 1024 * 1024
+        )
+        local_buffer_size = _coerce_int(
+            config.get("local_buffer_size"), 16 * 1024 * 1024
+        )
+        protocol = str(config.get("protocol", "tcp"))
+        self._log_setup_config(
+            local_hostname=local_hostname,
+            metadata_url=metadata_url,
+            transport_metadata_url=transport_metadata_url,
+            global_segment_size=global_segment_size,
+            local_buffer_size=local_buffer_size,
+            protocol=protocol,
+            setup_kwargs=setup_kwargs,
+        )
+        result = self._invoke(
+            "setup",
+            local_hostname,
+            str(transport_metadata_url),
+            global_segment_size,
+            local_buffer_size,
+            protocol,
+            str(config.get("rdma_devices", "")),
+            str(metadata_url),
+            **setup_kwargs,
+        )
+        _logger.info("mooncake-store-py ready: stable_id=%s", setup_kwargs["stable_id"])
         _start_metrics_server_from_env()
         return result
 
@@ -1709,9 +1795,16 @@ __all__ = [
 ]
 
 _PARALLEL_EXPORTS = [
-    "ParallelAxis", "TensorParallelism", "ReadTarget",
-    "AXIS_DP", "AXIS_TP", "AXIS_EP", "AXIS_PP",
-    "READ_MODE_AS_STORED", "READ_MODE_SHARD", "READ_MODE_FULL",
+    "ParallelAxis",
+    "TensorParallelism",
+    "ReadTarget",
+    "AXIS_DP",
+    "AXIS_TP",
+    "AXIS_EP",
+    "AXIS_PP",
+    "READ_MODE_AS_STORED",
+    "READ_MODE_SHARD",
+    "READ_MODE_FULL",
 ]
 for _name in _PARALLEL_EXPORTS:
     if _name in globals():
