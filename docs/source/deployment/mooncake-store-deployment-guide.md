@@ -39,6 +39,9 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--etcd_endpoints` (str, default empty unless HA config): etcd endpoints, semicolon separated.
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+- Logging (optional)
+  - The master uses glog. When `--log_dir` is set, all severities are merged into a single journal file in that directory (`mooncake_master.INFO.<date>-<time>.<pid>`), reachable through the stable `mooncake_master.INFO` symlink. glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) control the rest.
+
 - Task Manager (optional)
   - `--max_total_finished_tasks` (uint32, default `10000`): Maximum number of finished tasks to keep in memory. When this limit is reached, the oldest finished tasks will be pruned from memory.
   - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.

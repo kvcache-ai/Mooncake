@@ -953,6 +953,16 @@ int main(int argc, char* argv[]) {
 
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
+        // Merge all master logs into a single journal file in --log_dir,
+        // reusing glog: every record is already written to its own severity
+        // file and all lower ones, so the INFO sink is a complete journal.
+        // Disable the higher-severity files so everything lands in one file.
+        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
+        google::SetLogDestination(google::GLOG_FATAL, "");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
 
     // Initialize the master configuration
