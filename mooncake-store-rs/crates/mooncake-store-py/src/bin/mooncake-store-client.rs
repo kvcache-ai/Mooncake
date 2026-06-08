@@ -26,7 +26,7 @@ use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
     METRICS_PORT_LABEL,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
@@ -256,6 +256,13 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     init_tracing(normalize_trace_filter(args.trace_filter.as_deref()))?;
     build_info::log_build_info();
     info!(config = ?args, "mooncake-store-client configuration");
+    if args.keyspace.is_some() {
+        warn!(
+            keyspace = ?args.keyspace,
+            "custom keyspace is set — make sure you understand its effect on tenant isolation; \
+             misconfigured keyspace can cause nodes to register in different metadata prefixes"
+        );
+    }
     emit_compat_warnings(&args);
 
     let timeouts = resolve_timeout_config(&args)?;

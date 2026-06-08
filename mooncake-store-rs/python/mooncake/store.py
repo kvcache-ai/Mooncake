@@ -418,6 +418,14 @@ class MooncakeDistributedStore:
                 setup_kwargs.get("hugepage_size"),
                 setup_kwargs.get("route_control"),
             )
+            keyspace = setup_kwargs.get("keyspace")
+            if keyspace:
+                _logger.warning(
+                    "custom keyspace=%s is set — make sure you understand "
+                    "its effect on tenant isolation; misconfigured keyspace "
+                    "can cause nodes to register in different metadata prefixes",
+                    keyspace,
+                )
         except Exception:
             _logger.error("failed to log setup config", exc_info=True)
 
