@@ -76,13 +76,17 @@ def generate_weight(shape, dtype=torch.float32, seed=42) -> torch.Tensor:
     return torch.randn(shape, dtype=dtype, generator=gen)
 
 
-def compute_tp_shard(weight: torch.Tensor, rank: int, tp_size: int, split_dim: int = 0) -> torch.Tensor:
+def compute_tp_shard(
+    weight: torch.Tensor, rank: int, tp_size: int, split_dim: int = 0
+) -> torch.Tensor:
     total = weight.shape[split_dim]
     chunk = total // tp_size
     return weight.narrow(split_dim, rank * chunk, chunk).contiguous()
 
 
-def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor, context: str = ""):
+def assert_tensor_equal(
+    actual: torch.Tensor, expected: torch.Tensor, context: str = ""
+):
     if not torch.equal(actual, expected):
         diff = (actual - expected).abs()
         raise AssertionError(
@@ -325,7 +329,6 @@ def test_shard_read_into_buffer(store, allocator, tenant):
     if result != 0:
         raise SkipTest(f"register_buffer not supported (result={result})")
 
-
     try:
         par = TensorParallelism([TP(0, tp_size)])
         read_result = store.get_tensor_with_parallelism_into(
@@ -336,9 +339,13 @@ def test_shard_read_into_buffer(store, allocator, tenant):
             tenant=tenant,
         )
         assert read_result.data_bytes == shard_0.nelement() * shard_0.element_size()
-        actual_data = (ctypes.c_ubyte * read_result.data_bytes).from_address(read_result.data_ptr)
+        actual_data = (ctypes.c_ubyte * read_result.data_bytes).from_address(
+            read_result.data_ptr
+        )
         expected_ptr = shard_0.data_ptr()
-        expected_data = (ctypes.c_ubyte * read_result.data_bytes).from_address(expected_ptr)
+        expected_data = (ctypes.c_ubyte * read_result.data_bytes).from_address(
+            expected_ptr
+        )
         assert bytes(actual_data) == bytes(expected_data), "buffer content mismatch"
     finally:
         store.unregister_buffer(ptr, buf_size)
@@ -493,9 +500,7 @@ def test_dtype_float16(store, tenant):
     """float16 tensor round-trip through parallelism API."""
     gen = torch.Generator().manual_seed(22)
     weight = torch.randn([64, 32], dtype=torch.float16, generator=gen)
-    store.put_tensor_with_parallelism(
-        "test_fp16.weight", weight, tenant=tenant
-    )
+    store.put_tensor_with_parallelism("test_fp16.weight", weight, tenant=tenant)
     result = store.get_tensor_with_parallelism(
         "test_fp16.weight",
         target=ReadTarget(READ_MODE_AS_STORED),
@@ -523,7 +528,9 @@ def test_1d_tensor_tp(store, tenant):
             tenant=tenant,
         )
         expected = compute_tp_shard(full_weight, rank, tp_size)
-        assert result.shape == expected.shape, f"1d shape mismatch: {result.shape} vs {expected.shape}"
+        assert result.shape == expected.shape, (
+            f"1d shape mismatch: {result.shape} vs {expected.shape}"
+        )
         assert_tensor_equal(result, expected, f"1d rank {rank}")
 
     result = store.get_tensor_with_parallelism(
@@ -579,9 +586,7 @@ def test_pp_only_shard(store, tenant):
 def test_read_into_preallocated_tensor(store, tenant):
     """Read into a pre-allocated tensor via tensor= parameter."""
     weight = generate_weight([64, 32], seed=26)
-    store.put_tensor_with_parallelism(
-        "test_prealloc.weight", weight, tenant=tenant
-    )
+    store.put_tensor_with_parallelism("test_prealloc.weight", weight, tenant=tenant)
     target_tensor = torch.empty_like(weight)
     result = store.get_tensor_with_parallelism(
         "test_prealloc.weight",
@@ -816,9 +821,15 @@ def build_raw_buffer(tensor: torch.Tensor) -> tuple:
     shape = list(tensor.shape)
 
     dtype_map = {
-        torch.float32: 0, torch.float64: 1, torch.int8: 2, torch.uint8: 3,
-        torch.int16: 4, torch.float16: 11, torch.bfloat16: 12,
-        torch.int32: 6, torch.int64: 8,
+        torch.float32: 0,
+        torch.float64: 1,
+        torch.int8: 2,
+        torch.uint8: 3,
+        torch.int16: 4,
+        torch.float16: 11,
+        torch.bfloat16: 12,
+        torch.int32: 6,
+        torch.int64: 8,
     }
     dtype_i32 = dtype_map[tensor.dtype]
 
@@ -835,7 +846,14 @@ def build_raw_buffer(tensor: torch.Tensor) -> tuple:
 
     axes = b"\x00" * 128
     axis_count = struct.pack("<I", 0)
-    padding = b"\x00" * (TENSOR_METADATA_WIRE_SIZE - len(header) - len(global_shape) - len(local_shape) - len(axes) - len(axis_count))
+    padding = b"\x00" * (
+        TENSOR_METADATA_WIRE_SIZE
+        - len(header)
+        - len(global_shape)
+        - len(local_shape)
+        - len(axes)
+        - len(axis_count)
+    )
 
     metadata_bytes = header + global_shape + local_shape + axes + axis_count + padding
     assert len(metadata_bytes) == TENSOR_METADATA_WIRE_SIZE
@@ -930,7 +948,9 @@ def test_batch_mixed_routing_rejected(store, tenant):
             writer_partitions=[(0, 2, 0)],
             tenant=tenant,
         )
-        raise AssertionError("should have raised for mixed parallelisms + writer_partitions")
+        raise AssertionError(
+            "should have raised for mixed parallelisms + writer_partitions"
+        )
     except (ValueError, RuntimeError):
         pass
 
@@ -1072,9 +1092,12 @@ def test_batch_get_into_tp(store, allocator, tenant):
         )
         assert len(results) == 2, f"expected 2 results, got {len(results)}"
 
-        for idx, (result, expected) in enumerate([(results[0], shard_0), (results[1], shard_1)]):
-            assert result.data_bytes == expected.nelement() * expected.element_size(), \
+        for idx, (result, expected) in enumerate(
+            [(results[0], shard_0), (results[1], shard_1)]
+        ):
+            assert result.data_bytes == expected.nelement() * expected.element_size(), (
                 f"batch_into rank {idx}: data_bytes mismatch"
+            )
     finally:
         store.unregister_buffer(ptr0, buf_size)
         store.unregister_buffer(ptr1, buf_size)
@@ -1119,9 +1142,7 @@ def test_batch_from_put_get(store, tenant):
         szs.append(s)
         buf_refs.append(ref)
 
-    store.batch_put_tensor_with_parallelism_from(
-        keys, ptrs, szs, tenant=tenant
-    )
+    store.batch_put_tensor_with_parallelism_from(keys, ptrs, szs, tenant=tenant)
 
     for i, key in enumerate(keys):
         result = store.get_tensor_with_parallelism(
@@ -1178,8 +1199,7 @@ def test_from_put_with_parallelism(store, tenant):
     for rank in range(tp_size):
         par = TensorParallelism([TP(rank, tp_size)])
         store.put_tensor_with_parallelism_from(
-            "test_from_tp.weight", buf_ptr, buf_size,
-            parallelism=par, tenant=tenant
+            "test_from_tp.weight", buf_ptr, buf_size, parallelism=par, tenant=tenant
         )
 
     for rank in range(tp_size):
@@ -1202,8 +1222,11 @@ def test_from_put_with_writer_partition(store, tenant):
 
     for rank in range(num_writers):
         store.put_tensor_with_parallelism_from(
-            "test_from_wp.weight", buf_ptr, buf_size,
-            writer_partition=(rank, num_writers, 0), tenant=tenant
+            "test_from_wp.weight",
+            buf_ptr,
+            buf_size,
+            writer_partition=(rank, num_writers, 0),
+            tenant=tenant,
         )
 
     result = store.get_tensor_with_parallelism(
@@ -1254,7 +1277,9 @@ def main():
     run_test("upsert overwrites", test_upsert_overwrites, store, tenant)
 
     print("\n  --- Buffer operations ---")
-    run_test("shard read into buffer", test_shard_read_into_buffer, store, allocator, tenant)
+    run_test(
+        "shard read into buffer", test_shard_read_into_buffer, store, allocator, tenant
+    )
 
     print("\n  --- Error handling ---")
     run_test("invalid axis rejected", test_invalid_axis_rejected, store, tenant)
@@ -1273,7 +1298,12 @@ def main():
     run_test("pp only shard", test_pp_only_shard, store, tenant)
 
     print("\n  --- Read path variants ---")
-    run_test("read into preallocated tensor", test_read_into_preallocated_tensor, store, tenant)
+    run_test(
+        "read into preallocated tensor",
+        test_read_into_preallocated_tensor,
+        store,
+        tenant,
+    )
 
     print("\n  --- Large TP fan-out ---")
     run_test("tp split 2->16", test_tp_split_2to16, store, tenant)
@@ -1284,12 +1314,23 @@ def main():
     print("\n  --- Cross-TP split_dim=1 ---")
     run_test("split_dim=1 cross 2->4", test_tp_split_dim1_cross_tp, store, tenant)
     run_test("split_dim=1 merge 4->2", test_tp_split_dim1_merge_cross_tp, store, tenant)
-    run_test("split_dim=1 full reconstruction", test_tp_split_dim1_full_reconstruction, store, tenant)
+    run_test(
+        "split_dim=1 full reconstruction",
+        test_tp_split_dim1_full_reconstruction,
+        store,
+        tenant,
+    )
 
     print("\n  --- Writer partition ---")
-    run_test("writer partition roundtrip", test_writer_partition_roundtrip, store, tenant)
-    run_test("writer partition -> tp read", test_writer_partition_to_tp_read, store, tenant)
-    run_test("writer partition split_dim=1", test_writer_partition_split_dim1, store, tenant)
+    run_test(
+        "writer partition roundtrip", test_writer_partition_roundtrip, store, tenant
+    )
+    run_test(
+        "writer partition -> tp read", test_writer_partition_to_tp_read, store, tenant
+    )
+    run_test(
+        "writer partition split_dim=1", test_writer_partition_split_dim1, store, tenant
+    )
     run_test("writer partition upsert", test_writer_partition_upsert, store, tenant)
 
     print("\n  --- Mock RL E2E ---")
@@ -1298,10 +1339,22 @@ def main():
 
     print("\n  --- Batch API ---")
     run_test("batch put+get tp", test_batch_put_get_tp, store, tenant)
-    run_test("batch put+get writer partition", test_batch_put_get_writer_partition, store, tenant)
+    run_test(
+        "batch put+get writer partition",
+        test_batch_put_get_writer_partition,
+        store,
+        tenant,
+    )
     run_test("batch upsert", test_batch_upsert, store, tenant)
-    run_test("batch mixed routing rejected", test_batch_mixed_routing_rejected, store, tenant)
-    run_test("batch get cross-tp reconstruction", test_batch_get_cross_tp_reconstruction, store, tenant)
+    run_test(
+        "batch mixed routing rejected", test_batch_mixed_routing_rejected, store, tenant
+    )
+    run_test(
+        "batch get cross-tp reconstruction",
+        test_batch_get_cross_tp_reconstruction,
+        store,
+        tenant,
+    )
 
     print("\n  --- _from API ---")
     run_test("from put+get roundtrip", test_from_put_get_roundtrip, store, tenant)
@@ -1309,7 +1362,12 @@ def main():
     run_test("batch from put+get", test_batch_from_put_get, store, tenant)
 
     print("\n  --- Parallelism manifest ---")
-    run_test("parallelism manifest discovery", test_parallelism_manifest_discovery, store, tenant)
+    run_test(
+        "parallelism manifest discovery",
+        test_parallelism_manifest_discovery,
+        store,
+        tenant,
+    )
 
     print("\n  --- Writer key naming ---")
     run_test("writer key format", test_writer_key_naming_format, store, tenant)
@@ -1320,15 +1378,27 @@ def main():
 
     print("\n  --- Auto-slicing validation ---")
     run_test("uniform shard validation", test_uniform_shard_validation, store, tenant)
-    run_test("writer partition shortcut read", test_writer_partition_shortcut_read, store, tenant)
+    run_test(
+        "writer partition shortcut read",
+        test_writer_partition_shortcut_read,
+        store,
+        tenant,
+    )
 
     print("\n  --- _from with parallelism ---")
     run_test("from put with tp", test_from_put_with_parallelism, store, tenant)
-    run_test("from put with writer_partition", test_from_put_with_writer_partition, store, tenant)
+    run_test(
+        "from put with writer_partition",
+        test_from_put_with_writer_partition,
+        store,
+        tenant,
+    )
 
     store.close()
 
-    print(f"\nResults: {passed} passed, {failed} failed, {skipped} skipped, {passed + failed + skipped} total")
+    print(
+        f"\nResults: {passed} passed, {failed} failed, {skipped} skipped, {passed + failed + skipped} total"
+    )
     if failed > 0:
         sys.exit(1)
     print("All tests PASSED.")
