@@ -142,6 +142,7 @@ troubleshooting/troubleshooting
 :maxdepth: 2
 
 deployment/mooncake-store-deployment-guide
+deployment/nvmf-ssd-deployment-guide
 :::
 
 % Community

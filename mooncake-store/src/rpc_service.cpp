@@ -227,7 +227,6 @@ MasterAdminServer::MasterAdminServer(uint16_t http_port,
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
 bool MasterAdminServer::Start() {
-    HAMetricManager::Init();
     InitHttpServer();
 
     auto ec = http_server_.async_start();

@@ -846,6 +846,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -881,6 +882,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -916,6 +918,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
@@ -1024,6 +1027,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 return 0;
             }
             if (ret == ERR_MALFORMED_JSON) {
+                freeaddrinfo(result);
                 return ret;
             }
         }
