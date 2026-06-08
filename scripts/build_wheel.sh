@@ -146,6 +146,8 @@ fi
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Stripping shared libraries to reduce wheel size..."
     find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
+    echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
+    find mooncake-wheel/mooncake -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
 fi
 
 echo "Building wheel package..."
@@ -298,11 +300,6 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
-AUDITWHEEL_EXCLUDES=""
-if [ "$NPU_BUILD" = "1" ]; then
-    AUDITWHEEL_EXCLUDES="--exclude libmooncake_store.so* --exclude libmooncake_common.so* --exclude libtransfer_engine.so* --exclude libetcd_wrapper.so* --exclude libasio.so*"
-fi
-
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -391,7 +388,6 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
-    ${AUDITWHEEL_EXCLUDES} \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
