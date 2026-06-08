@@ -87,8 +87,7 @@ Status NVMeoFTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     for (size_t i = slice_id; i < slice_id + slice_num; ++i) {
         // LOG(INFO) << "task " << task_id << " i " << i << " upper bound " <<
         // slice_num;
-        auto event =
-            desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
+        auto event = desc_pool_->getTransferStatus(nvmeof_desc.desc_idx_, i);
         transfer_status.s = from_cufile_transfer_status(event.status);
         // TODO(FIXME): what to do if multi slices have different status?
         if (transfer_status.s == COMPLETED) {
