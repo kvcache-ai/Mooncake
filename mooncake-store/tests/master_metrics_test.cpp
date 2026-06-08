@@ -11,6 +11,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "utils.h"
+#include "master_admin_service.h"
 #include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
