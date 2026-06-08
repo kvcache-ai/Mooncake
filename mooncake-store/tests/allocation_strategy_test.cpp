@@ -800,9 +800,11 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstLoadBalancingDistribution) {
     ssd_provider.total_capacity["2-segment"] = 1000 * MiB;
     ssd_provider.used_bytes["2-segment"] = 100 * MiB;
 
+    // Use small slices to stay well within DDR capacity (192MB total).
+    // 500 × 64KB = 32MB << 192MB, so all allocations succeed.
     std::array<int, kNumSegments> count = {0};
-    const size_t kSliceLength = 4 * MiB;
-    const int kNumAllocations = 300;
+    const size_t kSliceLength = 64 * 1024;  // 64KB
+    const int kNumAllocations = 500;
     std::vector<std::vector<Replica>> replicas;
 
     for (int i = 0; i < kNumAllocations; i++) {
@@ -836,14 +838,14 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstLoadBalancingDistribution) {
                   << "%): " << count[i] << " allocations\n";
     }
 
-    // Segment 2 (10% SSD used) should get more allocations than
-    // segment 0 (80% SSD used).
+    // With DDR available on all segments, the SSD strategy preferentially
+    // allocates to segments with the most SSD free space (segment 2).
+    EXPECT_GT(count[2], count[1])
+        << "Segment 2 (90% SSD free) should get more allocations than "
+           "segment 1 (60% SSD free)";
     EXPECT_GT(count[2], count[0])
-        << "Segment with more SSD free space should get more allocations";
-
-    // Segment 1 (40% SSD used) should also get more than segment 0.
-    EXPECT_GT(count[1], count[0])
-        << "Segment with more SSD free space should get more allocations";
+        << "Segment 2 (90% SSD free) should get more allocations than "
+           "segment 0 (20% SSD free)";
 }
 
 // Test that SsdFreeRatioFirstAllocationStrategy works without an
