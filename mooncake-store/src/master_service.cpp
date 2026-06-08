@@ -599,10 +599,6 @@ MasterService::getAliveClientsSnapshot() const {
     return ok_client_;
 }
 
-size_t MasterService::getMetadataShardIndex(const std::string& key) const {
-    return getMetadataShardIndex("default", key);
-}
-
 size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
                                             const std::string& key) const {
     const auto normalized_tenant = NormalizeTenantId(tenant_id);

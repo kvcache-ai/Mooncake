@@ -1193,8 +1193,8 @@ class MasterService {
         SharedMutexLocker lock_;
     };
 
-    static ObjectIdentity MakeObjectIdentity(
-        const std::string& user_key, const std::string& tenant_id = "default") {
+    static ObjectIdentity MakeObjectIdentity(const std::string& user_key,
+                                             const std::string& tenant_id) {
         return {NormalizeTenantId(tenant_id), user_key};
     }
 
@@ -1226,7 +1226,6 @@ class MasterService {
         return std::hash<std::string>{}(key) % kNumShards;
     }
 
-    size_t getMetadataShardIndex(const std::string& key) const;
     size_t getMetadataShardIndex(const std::string& tenant_id,
                                  const std::string& key) const;
     std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
