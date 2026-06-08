@@ -370,13 +370,13 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 
         {
             std::unique_lock<std::mutex> lock(singleflight_mutex_);
-            decltype(inflight_cold_reads_)::iterator it;
             singleflight_cv_.wait(lock, [&] {
-                it = inflight_cold_reads_.find(key);
-                if (it != inflight_cold_reads_.end()) return true;
-                return inflight_cold_reads_.size() <
-                       kMaxDistinctColdReadFlights;
+                return inflight_cold_reads_.find(key) !=
+                           inflight_cold_reads_.end() ||
+                       inflight_cold_reads_.size() <
+                           kMaxDistinctColdReadFlights;
             });
+            auto it = inflight_cold_reads_.find(key);
             if (it != inflight_cold_reads_.end()) {
                 flight = it->second;
             } else {
@@ -417,7 +417,14 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         }
 
         // Leader: do SSD IO.
-        auto result = BatchGetOnce(keys, sizes);
+        tl::expected<BatchGetResult, ErrorCode> result;
+        try {
+            result = BatchGetOnce(keys, sizes);
+        } catch (...) {
+            FinishFlight(key, *flight,
+                         tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+            throw;
+        }
         FinishFlight(key, *flight, result);
         return result;
     }
