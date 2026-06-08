@@ -14,7 +14,7 @@
 
 // NOTE: Guard renamed from TOPOLOGY_H to avoid collision with the classic
 // transfer-engine's mooncake-transfer-engine/include/topology.h, which also
-// uses TOPOLOGY_H. 
+// uses TOPOLOGY_H.
 #ifndef TENT_TOPOLOGY_H
 #define TENT_TOPOLOGY_H
 
