@@ -17,6 +17,7 @@
 #include "tent/runtime/platform.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
+#include <algorithm>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -408,39 +409,24 @@ SelectionResult TransportSelector::select(
     if (transport_index < 0) return result;
     const int original_index = transport_index;
 
-    // hint, if present, occupies slot 0.
+    auto candidates = reorderWithHint(raw, hint);
+    if (!candidates) return result;  // UNSPEC -> task FAILED downstream
+
     const bool has_hint = (hint != UNSPEC);
-    if (has_hint) {
-        bool in_raw = false;
-        for (TransportType t : raw) {
-            if (t == hint) {
-                in_raw = true;
-                break;
-            }
-        }
-        if (!in_raw ||
-            !isTransportAvailable(hint, context, available_transports)) {
-            return result;  // UNSPEC -> task FAILED downstream
+    for (size_t i = 0; i < candidates->size(); ++i) {
+        TransportType type = (*candidates)[i];
+        if (!isTransportAvailable(type, context, available_transports)) {
+            // The pinned hint at slot 0 must be available; if it isn't,
+            // reject the request rather than falling through to another
+            // transport the caller did not ask for.
+            if (has_hint && i == 0) return result;
+            continue;
         }
         if (transport_index == 0) {
-            result.transport = hint;
-        } else {
-            --transport_index;
+            result.transport = type;
+            break;
         }
-    }
-
-    // Walk raw skipping hint and decrement transport_index until it hits zero.
-    if (result.transport == UNSPEC) {
-        for (TransportType type : raw) {
-            if (has_hint && type == hint) continue;
-            if (!isTransportAvailable(type, context, available_transports))
-                continue;
-            if (transport_index == 0) {
-                result.transport = type;
-                break;
-            }
-            --transport_index;
-        }
+        --transport_index;
     }
     if (result.transport == UNSPEC) return result;
     VLOG(1) << "Selected transport " << transportTypeName(result.transport)
@@ -449,6 +435,21 @@ SelectionResult TransportSelector::select(
             << "), device_mask=0x" << std::hex << result.device_mask
             << std::dec;
     return result;
+}
+
+std::optional<std::vector<TransportType>> TransportSelector::reorderWithHint(
+    const std::vector<TransportType>& raw, TransportType hint) {
+    if (hint == UNSPEC) return raw;
+    if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
+        return std::nullopt;
+    }
+    std::vector<TransportType> out;
+    out.reserve(raw.size());
+    out.push_back(hint);
+    for (TransportType t : raw) {
+        if (t != hint) out.push_back(t);
+    }
+    return out;
 }
 
 }  // namespace tent

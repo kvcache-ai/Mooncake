@@ -870,22 +870,13 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
             }
         }
 
-        bool prepend_hint = false;
-        if (hint != UNSPEC) {
-            if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
-                return result;  // UNSPEC: hint not authorized for this req
-            }
-            prepend_hint = true;
-        }
-        std::vector<TransportType> candidates;
-        if (prepend_hint) candidates.push_back(hint);
-        for (auto type : raw) {
-            if (prepend_hint && type == hint) continue;
-            candidates.push_back(type);
+        auto candidates = TransportSelector::reorderWithHint(raw, hint);
+        if (!candidates) {
+            return result;  // UNSPEC: hint not authorized for this req
         }
         if (transport_index >= 0 &&
-            (size_t)transport_index < candidates.size()) {
-            result.transport = candidates[transport_index];
+            (size_t)transport_index < candidates->size()) {
+            result.transport = (*candidates)[transport_index];
         }
         return result;
     }

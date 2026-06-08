@@ -169,6 +169,8 @@ class TransportSelector {
 
     static std::string transportTypeName(TransportType type);
     static TransportType parseTransportType(const std::string& str);
+    static std::optional<std::vector<TransportType>> reorderWithHint(
+        const std::vector<TransportType>& raw, TransportType hint);
 
    private:
     std::vector<SelectionPolicy> getDefaultPolicies();
