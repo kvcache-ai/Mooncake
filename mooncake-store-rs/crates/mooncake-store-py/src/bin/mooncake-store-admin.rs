@@ -17,6 +17,7 @@ use _store_rs::admin::{
     RouteMigrationTaskSubmitRequest, TenantQuotaAbortRequest, TenantQuotaReconcileRequest,
     TracingClusterResponse, TracingUpdateRequest,
 };
+use _store_rs::build_info;
 use clap::{builder::FalseyValueParser, Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use mooncake_metadata::MetadataKeyspace;
 use mooncake_store_client::init_tracing;
@@ -31,6 +32,7 @@ use url::Url;
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-admin")]
 #[command(about = "Run explicit Mooncake store metadata maintenance tasks")]
+#[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 struct Args {
     /// Store-RS metadata URL (`redis://...` or `etcd://...`).
     #[arg(long, alias = "metadata_url", env = "MC_STORE_RS_METADATA_URL")]
@@ -333,6 +335,7 @@ impl From<ReservationStateArg> for TenantQuotaReservationState {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     init_tracing(args.trace_filter.as_deref())?;
+    build_info::log_build_info();
 
     match &args.command {
         Command::CleanupStaleSegments => {
@@ -443,7 +446,7 @@ fn run_server_command(args: &Args, server_args: &ServerArgs) -> Result<(), Box<d
     let quota_thread =
         spawn_quota_reconcile_worker(service.clone(), server_args, maintenance_shutdown.clone());
     let mut server = AdminHttpServerHandle::start(&server_args.bind_addr, service)?;
-    info!(address = %server.address(), "admin http server listening");
+    info!(address = %server.address(), "mooncake-store-admin ready");
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     ctrlc::set_handler(move || {

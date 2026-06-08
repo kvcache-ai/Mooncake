@@ -22,6 +22,7 @@ pyo3.workspace = true
 prost = "0.13"
 serde.workspace = true
 serde_json.workspace = true
+shadow-rs.workspace = true
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
@@ -31,6 +32,7 @@ url = "2"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
+shadow-rs.workspace = true
 tonic-build = "0.12"
 
 [dev-dependencies]
