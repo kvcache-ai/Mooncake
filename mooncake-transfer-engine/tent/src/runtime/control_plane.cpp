@@ -243,6 +243,10 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "SendData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
@@ -263,6 +267,10 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "RecvData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
