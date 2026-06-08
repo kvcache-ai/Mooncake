@@ -60,6 +60,19 @@ TEST(AdmissionQueueTest, AllowsEmptySubmitAsNoOp) {
     EXPECT_EQ(queue.outstandingBytes(), 0u);
 }
 
+TEST(AdmissionQueueTest, RejectsSubmitWhenQueueLimitsAreInvalid) {
+    LocalTransferAdmissionQueue queue({1, 128, 2, 0});
+    std::vector<QueueOwnerId> admitted_ids{99};
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+}
+
 TEST(AdmissionQueueTest, RejectsInvalidInputsWithoutPartialAdmission) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids{99};

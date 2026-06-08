@@ -108,6 +108,7 @@ class LocalTransferAdmissionQueue {
     };
 
     QueueLimits limits_;
+    Status limits_status_;
     QueueOwnerId next_owner_id_{1};
     std::map<QueueOwnerId, QueueOwner> owners_;
     std::map<std::pair<uint64_t, size_t>, QueueOwnerId> public_to_owner_;

@@ -61,12 +61,12 @@ Status validateLimits(const QueueLimits& limits) {
 }  // namespace
 
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
-    : limits_(limits) {}
+    : limits_(limits), limits_status_(validateLimits(limits)) {}
 
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {
     admitted_owner_ids.clear();
-    CHECK_STATUS(validateLimits(limits_));
+    CHECK_STATUS(limits_status_);
     if (submit.batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
