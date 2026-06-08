@@ -268,6 +268,7 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 		if err != nil {
 			return err
 		}
+		offset = 0
 		for ; offset < size; offset += maxShardSize {
 			source := addr + uintptr(offset)
 			shard := payload.Shards[taskID]
