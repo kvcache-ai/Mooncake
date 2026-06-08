@@ -265,8 +265,7 @@ bool MasterAdminServer::Start() {
                 }
                 LOG(INFO) << log_stream.str();
                 if (metric_report_stop_sem_.try_acquire_for(
-                        std::chrono::seconds(
-                            kMetricReportIntervalSeconds))) {
+                        std::chrono::seconds(kMetricReportIntervalSeconds))) {
                     break;
                 }
             }
