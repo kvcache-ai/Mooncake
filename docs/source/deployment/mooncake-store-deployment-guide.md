@@ -11,7 +11,7 @@ This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 **Client Node**: Each node contributes DRAM (and optionally VRAM/SSD) to form the distributed cache pool. Clients communicate with the master over RPC for control operations (`Put`/`Get`/`Remove`), but transfer actual data directly between each other via the Transfer Engine — the master is never in the data path.
 
-**Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments.
+**Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service.
 
 For a detailed design discussion, see the [Mooncake Store Design](../design/mooncake-store.md).
 
