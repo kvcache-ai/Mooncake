@@ -180,6 +180,8 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
+    transport_hint_ = TransportSelector::parseTransportType(
+        XferBenchConfig::tent_transport_hint);
     allocateBuffers();
 }
 
@@ -305,8 +307,6 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
-    const TransportType hint = TransportSelector::parseTransportType(
-        XferBenchConfig::tent_transport_hint);
     for (uint64_t i = 0; i < batch_size; ++i) {
         Request entry;
         entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
@@ -314,7 +314,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
-        entry.transport_hint = hint;
+        entry.transport_hint = transport_hint_;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;
