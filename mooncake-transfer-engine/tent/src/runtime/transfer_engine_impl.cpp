@@ -946,7 +946,8 @@ std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
        << " target_id " << request.target_id << " target_offset "
-       << (void*)request.target_offset << " length " << request.length;
+       << (void*)request.target_offset << " length " << request.length
+       << " transport_hint " << transportTypeName(request.transport_hint);
     return ss.str();
 }
 
