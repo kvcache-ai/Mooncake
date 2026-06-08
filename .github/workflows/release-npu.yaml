@@ -1,12 +1,9 @@
 name: Release Ascend NPU
 
 on:
-  pull_request:
-    branches:
-      - main
-  # push:
-  #   tags:
-  #     - 'v*'
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
@@ -20,7 +17,7 @@ jobs:
     strategy:
       max-parallel: 1
       matrix:
-        python-version: ['3.11']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
 
     env:
       BUILD_WITH_EP: "0"
@@ -222,10 +219,10 @@ jobs:
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/
 
-      # - name: Upload wheels to GitHub Release
-      #   uses: softprops/action-gh-release@v1
-      #   with:
-      #     files: mooncake-wheel/dist-release/*.whl
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
