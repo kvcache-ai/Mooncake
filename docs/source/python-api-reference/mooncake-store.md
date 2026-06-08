@@ -432,7 +432,7 @@ from object `all_keys[i][j]`, then writes it into destination buffer
 This lets one buffer gather interleaved fragments from multiple keys, and lets one key contribute multiple disjoint fragments to the same buffer in a single call.
 
 **Parameters:**
-- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Every buffer must be registered with `register_buffer()` before calling this API.
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Each buffer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 - `all_keys`: For each buffer, the ordered list of source object keys to read from.
 - `all_dst_offsets`: For each buffer and key, the destination offsets of that key's fragments.
 - `all_src_offsets`: For each buffer and key, the source offsets of that key's fragments inside the object.
@@ -795,7 +795,7 @@ def batch_get_tensor_with_parallelism(
 
 ### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
 
-Zero-copy unified read forms. The destination buffers must be registered with `register_buffer()` before calling them.
+Zero-copy unified read forms. The destination buffers must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ```python
 def get_tensor_with_parallelism_into(
@@ -860,13 +860,13 @@ The unified write and upsert family also has `_from` variants for registered-mem
 - `upsert_tensor_with_parallelism_from(...)`
 - `batch_upsert_tensor_with_parallelism_from(...)`
 
-These APIs accept registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
+These APIs accept Store-managed registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
 
 ```text
 [TensorObjectHeader + layout metadata][tensor data]
 ```
 
-As with other zero-copy APIs, every source pointer must be registered with `register_buffer()` before use.
+As with other zero-copy APIs, every source pointer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ### Compatibility wrappers
 
@@ -2682,7 +2682,7 @@ def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 
@@ -2758,7 +2758,7 @@ List[int]
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 

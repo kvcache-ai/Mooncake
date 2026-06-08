@@ -104,24 +104,24 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
-    struct RegisteredBufferRegion {
+    struct WritableBufferRegion {
         void *base{nullptr};
         size_t size{0};
         size_t offset{0};
     };
 
-    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
+    std::optional<WritableBufferRegion> resolve_writable_buffer_region(
         void *buffer) const;
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to the pre-allocated buffer (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to a writable Store buffer, either explicitly
+     * registered with register_buffer() or inside the setup-time local buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory
+     * for zero-copy operations
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -141,8 +141,9 @@ class RealClient : public PyClient {
      * @param sizes Vector of sizes of the buffers
      * @return Vector of 64-bit integers, where each element is the number of
      * bytes read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
@@ -157,8 +158,9 @@ class RealClient : public PyClient {
      * @param all_sizes Vector of vectors of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -169,12 +171,14 @@ class RealClient : public PyClient {
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to the buffer containing data (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to Store-managed registered memory, either
+     * explicitly registered with register_buffer() or inside the setup-time
+     * local buffer
      * @param size Size of the data to put
      * @return 0 on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory,
+     * either an explicit register_buffer() region or the setup-time local
+     * buffer
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
@@ -191,8 +195,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,
@@ -208,8 +213,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
 
     std::vector<int> batch_put_from(
@@ -227,8 +233,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
@@ -821,7 +828,7 @@ class RealClient : public PyClient {
 
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
-    std::optional<RegisteredBufferRegion> local_buffer_region_;
+    std::optional<WritableBufferRegion> local_buffer_region_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

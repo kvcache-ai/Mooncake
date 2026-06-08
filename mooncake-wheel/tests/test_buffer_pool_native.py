@@ -25,7 +25,7 @@ def create_store() -> MooncakeDistributedStore:
     return store
 
 
-def test_registered_buffer_pool_acquires_released_buffer() -> None:
+def test_buffer_pool_acquires_released_buffer() -> None:
     store = create_store()
     pool = BufferPool(store, min_size_class=4096, alignment=4096)
 
@@ -39,7 +39,7 @@ def test_registered_buffer_pool_acquires_released_buffer() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_uses_store_local_buffer_by_default() -> None:
+def test_buffer_pool_uses_store_local_buffer_by_default() -> None:
     store = create_store()
     pool = BufferPool(store)
 
@@ -49,7 +49,7 @@ def test_registered_buffer_pool_uses_store_local_buffer_by_default() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_overflows_when_local_buffer_is_full() -> None:
+def test_buffer_pool_overflows_when_local_buffer_is_full() -> None:
     store = create_store()
     pool = BufferPool(store)
 
@@ -62,7 +62,7 @@ def test_registered_buffer_pool_overflows_when_local_buffer_is_full() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_prewarm_and_close() -> None:
+def test_buffer_pool_prewarm_and_close() -> None:
     store = create_store()
     pool = BufferPool(
         store,
@@ -79,7 +79,7 @@ def test_registered_buffer_pool_prewarm_and_close() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_uses_local_buffer_alignment() -> None:
+def test_buffer_pool_uses_local_buffer_alignment() -> None:
     store = create_store()
     pool = BufferPool(store, min_size_class=4096, alignment=65536)
 
@@ -89,14 +89,14 @@ def test_registered_buffer_pool_uses_local_buffer_alignment() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_rejects_invalid_alignment() -> None:
+def test_buffer_pool_rejects_invalid_alignment() -> None:
     store = create_store()
     with pytest.raises(RuntimeError, match="alignment"):
         BufferPool(store, 1024 * 1024, alignment=12345)
 
 
 @pytest.mark.parametrize("size", [0, 1, 128 * 1024 + 1])
-def test_registered_buffer_pool_supports_arbitrary_sizes(size: int) -> None:
+def test_buffer_pool_supports_arbitrary_sizes(size: int) -> None:
     store = create_store()
     pool = BufferPool(
         store, 1024 * 1024, max_size_class=128 * 1024, alignment=4096
@@ -109,7 +109,7 @@ def test_registered_buffer_pool_supports_arbitrary_sizes(size: int) -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_nonblocking_exhaustion() -> None:
+def test_buffer_pool_nonblocking_exhaustion() -> None:
     store = create_store()
     pool = BufferPool(
         store,
@@ -127,7 +127,7 @@ def test_registered_buffer_pool_nonblocking_exhaustion() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_timeout_allows_late_release() -> None:
+def test_buffer_pool_timeout_allows_late_release() -> None:
     store = create_store()
     pool = BufferPool(
         store,
@@ -153,7 +153,7 @@ def test_registered_buffer_pool_timeout_allows_late_release() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_blocking_acquire_releases_gil() -> None:
+def test_buffer_pool_blocking_acquire_releases_gil() -> None:
     store = create_store()
     pool = BufferPool(
         store,
@@ -179,7 +179,7 @@ def test_registered_buffer_pool_blocking_acquire_releases_gil() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_memoryview_keeps_lease_alive() -> None:
+def test_buffer_pool_memoryview_keeps_lease_alive() -> None:
     store = create_store()
     pool = BufferPool(store, 4096, min_size_class=4096, alignment=4096)
 
@@ -196,7 +196,7 @@ def test_registered_buffer_pool_memoryview_keeps_lease_alive() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_releases_from_destructor() -> None:
+def test_buffer_pool_releases_from_destructor() -> None:
     store = create_store()
     pool = BufferPool(store, 4096, min_size_class=4096, alignment=4096)
 
@@ -207,7 +207,7 @@ def test_registered_buffer_pool_releases_from_destructor() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_rejects_close_with_active_lease() -> None:
+def test_buffer_pool_rejects_close_with_active_lease() -> None:
     store = create_store()
     pool = BufferPool(store, 1024 * 1024, min_size_class=4096, alignment=4096)
 
@@ -218,7 +218,7 @@ def test_registered_buffer_pool_rejects_close_with_active_lease() -> None:
     pool.close()
 
 
-def test_registered_buffer_pool_rejects_huge_size_overflow() -> None:
+def test_buffer_pool_rejects_huge_size_overflow() -> None:
     store = create_store()
     pool = BufferPool(store, 1024 * 1024, min_size_class=4096, alignment=4096)
 

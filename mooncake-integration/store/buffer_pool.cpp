@@ -161,7 +161,7 @@ class BufferPoolNative : public std::enable_shared_from_this<BufferPoolNative> {
                                              size_t requested_size);
     std::shared_ptr<BufferHandle> allocate_overflow_unlocked(size_t size);
     void unregister_overflow_unlocked(const Region &region);
-    void release_internal(const std::shared_ptr<BufferHandle> &handle);
+    void release_internal(std::shared_ptr<BufferHandle> &handle);
     void reserve_locked(size_t size_class);
     void unreserve_locked(size_t size_class);
     std::pair<size_t, bool> allocation_size(size_t size) const;
@@ -255,12 +255,10 @@ void BufferLeaseNative::release_lease(bool check_exported_views) {
         throw std::runtime_error(
             "cannot release buffer while exported views exist");
     }
-    auto handle = handle_;
     auto pool = pool_;
-    if (pool && handle) {
-        pool->release_internal(handle);
+    if (pool && handle_) {
+        pool->release_internal(handle_);
     }
-    handle_.reset();
     pool_.reset();
     closed_ = true;
 }
@@ -469,8 +467,7 @@ void BufferPoolNative::unregister_overflow_unlocked(const Region &region) {
     }
 }
 
-void BufferPoolNative::release_internal(
-    const std::shared_ptr<BufferHandle> &handle) {
+void BufferPoolNative::release_internal(std::shared_ptr<BufferHandle> &handle) {
     if (!handle) throw std::runtime_error("buffer lease is closed");
     uintptr_t ptr = reinterpret_cast<uintptr_t>(handle->ptr());
     Region region;
@@ -488,6 +485,8 @@ void BufferPoolNative::release_internal(
     if (region.overflow_registered) {
         unregister_overflow_unlocked(region);
     }
+    region.handle.reset();
+    handle.reset();
     condition_.notify_all();
 }
 

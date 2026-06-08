@@ -1138,24 +1138,25 @@ class MooncakeStorePyWrapper {
         return std::dynamic_pointer_cast<RealClient>(store_);
     }
 
-    std::optional<RealClient::RegisteredBufferRegion>
-    resolve_registered_buffer_region(uintptr_t buffer_ptr, size_t size,
-                                     const std::string &context) const {
+    std::optional<RealClient::WritableBufferRegion>
+    resolve_writable_buffer_region(uintptr_t buffer_ptr, size_t size,
+                                   const std::string &context) const {
         auto real_client = get_real_client();
         if (!real_client) {
             LOG(ERROR) << context << ": real client is not available";
             return std::nullopt;
         }
 
-        auto region = real_client->resolve_registered_buffer(
+        auto region = real_client->resolve_writable_buffer_region(
             reinterpret_cast<void *>(buffer_ptr));
         if (!region.has_value()) {
-            LOG(ERROR) << context << ": buffer is not registered";
+            LOG(ERROR) << context
+                       << ": buffer is not Store-managed writable memory";
             return std::nullopt;
         }
 
         if (region->offset + size > region->size) {
-            LOG(ERROR) << context << ": buffer range exceeds registered region";
+            LOG(ERROR) << context << ": buffer range exceeds writable region";
             return std::nullopt;
         }
 
