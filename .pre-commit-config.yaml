@@ -19,9 +19,14 @@ repos:
       - id: end-of-file-fixer
         exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
       - id: check-yaml
+      - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ['--maxkb=1024']
+      - id: check-symlinks
+      - id: detect-private-key
+      - id: no-commit-to-branch
+        args: ['--branch', 'main']
 
   - repo: local
     hooks:
@@ -62,3 +67,16 @@ repos:
       - id: cmake-format
         files: 'CMakeLists\.txt|.*\.cmake'
         exclude: '^(extern/|build/|.*/build/|FAST25-release/)'
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning']
+        exclude: '^(extern/|FAST25-release/)'
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+        files: '\.github/workflows/.*\.ya?ml$'
