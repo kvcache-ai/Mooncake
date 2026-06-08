@@ -10,6 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use _store_rs::build_info;
 use _store_rs::dispatcher::{CompatNamespaceScope, StoreDispatcher};
 use _store_rs::dummy_service::start_dummy_store_server;
 use _store_rs::runtime::{
@@ -25,7 +26,7 @@ use mooncake_store_core::{
     parse_hugepage_size, ClientEpoch, ClientLifecycleState, ClientRuntimeId, HandoffKind,
     METRICS_PORT_LABEL,
 };
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 fn dummy_worker_scope(keyspace: Option<&str>) -> String {
     keyspace
@@ -218,6 +219,7 @@ enum Command {
 #[derive(Parser, Debug)]
 #[command(name = "mooncake-store-client")]
 #[command(about = "Standalone Mooncake store-rs client commands")]
+#[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 #[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
@@ -252,6 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
     validate_args(&args)?;
     init_tracing(normalize_trace_filter(args.trace_filter.as_deref()))?;
+    build_info::log_build_info();
     emit_compat_warnings(&args);
 
     let timeouts = resolve_timeout_config(&args)?;
@@ -338,6 +341,7 @@ fn run_client(args: RunArgs) -> Result<(), Box<dyn Error>> {
         replica_count = args.replica_count,
         "mooncake-store-client state snapshot"
     );
+    info!(stable_id = %stable_id, "mooncake-store-client ready");
 
     let mut heartbeat_state = HeartbeatLoopState::new(now_ms());
     let mut next_heartbeat = now_ms().saturating_add(initial_heartbeat_delay_ms(

@@ -2,6 +2,8 @@ use std::env;
 use std::process::Command;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    shadow_rs::ShadowBuilder::builder().build()?;
+
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     std::env::set_var("PROTOC", protoc);
     tonic_build::configure()

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod build_info;
 pub mod config;
 pub mod dispatcher;
 mod dummy_client;

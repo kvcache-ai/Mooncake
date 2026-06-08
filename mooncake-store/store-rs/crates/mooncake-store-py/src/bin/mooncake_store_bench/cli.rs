@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use _store_rs::build_info;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_STORAGE_BYTES: usize = 0;
@@ -8,6 +9,7 @@ pub const COMBINED_INTERFACE_ENV: &str = "MC_BENCH_INTERFACES";
 #[derive(Parser)]
 #[command(name = "mooncake-store-bench")]
 #[command(about = "Benchmark and verification tool for mooncake store")]
+#[command(version = build_info::build::PKG_VERSION, long_version = build_info::long_version_static())]
 #[command(arg_required_else_help = true)]
 pub struct Cli {
     #[command(flatten)]

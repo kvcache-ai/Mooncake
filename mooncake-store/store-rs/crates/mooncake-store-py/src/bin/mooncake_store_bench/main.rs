@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     init_bench_tracing(normalize_trace_filter(cli.global.trace_filter.as_deref()))?;
+    _store_rs::build_info::log_build_info();
 
     let metrics_addr = if let Some(ref addr) = cli.global.metrics_addr {
         let bound = start_metrics_http_server(addr)?;
