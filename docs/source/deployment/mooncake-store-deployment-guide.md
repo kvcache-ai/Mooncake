@@ -151,6 +151,28 @@ mooncake_master \
   --rpc-address=10.0.0.1
 ```
 
+
+---
+
+### Snapshot & Restore — Backup / Disaster Recovery
+
+```{caution}
+Metadata Snapshot And Restore is experimental feature.
+```
+
+Periodically persist master metadata to local disk or S3, enabling recovery from a recent snapshot after a crash.
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
+
+mooncake_master \
+  --enable_snapshot=true \
+  --snapshot_interval_seconds=300 \
+  --snapshot_retention_count=5 \
+  --snapshot_object_store_type=local \
+  --enable_snapshot_restore=true
+```
+
 ---
 
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
@@ -198,22 +220,6 @@ mooncake_master \
 
 The master resolves the current IPv4 address of `eth0` at startup and uses it as the advertised RPC address.
 
----
-
-### Snapshot & Restore — Backup / Disaster Recovery
-
-Periodically persist master metadata to local disk or S3, enabling recovery from a recent snapshot after a crash.
-
-```bash
-export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
-
-mooncake_master \
-  --enable_snapshot=true \
-  --snapshot_interval_seconds=300 \
-  --snapshot_retention_count=5 \
-  --snapshot_object_store_type=local \
-  --enable_snapshot_restore=true
-```
 
 ---
 
@@ -315,10 +321,6 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 
 ### High Availability
 
-```{caution}
-High Availability is experimental feature.
-```
-
 **Master Node High Availability**
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -327,6 +329,10 @@ High Availability is experimental feature.
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+
+```{caution}
+Metadata Snapshot And Restore is experimental feature.
+```
 
 **Metadata Snapshot And Restore**
 
