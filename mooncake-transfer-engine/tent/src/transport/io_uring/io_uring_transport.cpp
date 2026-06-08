@@ -265,6 +265,9 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
+        auto& outer_task = io_uring_batch->task_list[task_id];
+        status = TransferStatus{outer_task.status_word,
+                                outer_task.transferred_bytes};
     }
     return Status::OK();
 }
