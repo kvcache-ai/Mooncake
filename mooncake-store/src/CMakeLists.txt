@@ -27,6 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
+    storage/distributed/distributed_storage_backend.cpp
     ha/leadership/leader_coordinator_factory.cpp
     ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
     ha/common/redis/redis_connection.cpp
@@ -55,9 +56,14 @@ set(MOONCAKE_STORE_SOURCES
     hot_standby_service.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
-    store_c.cpp)
+    store_c.cpp
+    memory_alloc.cpp
+    ssd_register_client.cpp
+    engram/engram_store.cpp
+)
 
 set(EXTRA_LIBS "")
+set(SPDK_STATIC_LIBS "")
 
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
@@ -112,6 +118,7 @@ endif()
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SOURCES ${HF3FS_SOURCES})
+  list(APPEND MOONCAKE_STORE_SOURCES storage/distributed/hf3fs_adapter.cpp)
   find_library(
     HF3FS_API_LIB hf3fs_api_shared
     PATHS /usr/lib
@@ -138,10 +145,97 @@ if(STORE_USE_REDIS)
   list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 endif()
 
+if(STORE_USE_K8S_LEASE)
+  list(APPEND MOONCAKE_STORE_SOURCES
+    k8s_lease_helper.cpp
+    ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
+  list(APPEND EXTRA_LIBS ${K8S_LEASE_WRAPPER_LIB})
+endif()
+
+if(USE_NOF)
+  add_subdirectory(spdk)
+  list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
+
+  set(SPDK_INCLUDE_DIR
+      "/usr/local/include"
+      CACHE PATH "SPDK include directory")
+  set(DPDK_INCLUDE_DIR
+      "/usr/local/include"
+      CACHE PATH "DPDK include directory")
+  set(SPDK_LIB_DIR
+      "/usr/local/lib"
+      CACHE PATH "SPDK static library directory")
+  set(DPDK_LIB_DIR
+      "/usr/local/lib"
+      CACHE PATH "DPDK static library directory")
+
+  set(SPDK_STATIC_LIBS
+      -Wl,--whole-archive
+      ${SPDK_LIB_DIR}/libspdk_event.a
+      ${SPDK_LIB_DIR}/libspdk_rdma.a
+      ${SPDK_LIB_DIR}/libspdk_nvme.a
+      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      -Wl,--no-whole-archive
+      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
+      ${SPDK_LIB_DIR}/libspdk_dma.a
+      ${SPDK_LIB_DIR}/libspdk_init.a
+      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
+      ${SPDK_LIB_DIR}/libspdk_log.a
+      ${SPDK_LIB_DIR}/libspdk_util.a
+      ${SPDK_LIB_DIR}/libspdk_blob.a
+      ${SPDK_LIB_DIR}/libspdk_blobfs.a
+      ${SPDK_LIB_DIR}/libspdk_bdev.a
+      ${SPDK_LIB_DIR}/libspdk_conf.a
+      ${SPDK_LIB_DIR}/libspdk_json.a
+      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
+      ${SPDK_LIB_DIR}/libspdk_sock.a
+      ${SPDK_LIB_DIR}/libspdk_thread.a
+      ${SPDK_LIB_DIR}/libspdk_trace.a
+      ${SPDK_LIB_DIR}/libspdk_vmd.a
+      ${SPDK_LIB_DIR}/libspdk_rpc.a
+      ${DPDK_LIB_DIR}/librte_eal.a
+      ${DPDK_LIB_DIR}/librte_mempool.a
+      ${DPDK_LIB_DIR}/librte_ring.a
+      ${DPDK_LIB_DIR}/librte_bus_pci.a
+      ${DPDK_LIB_DIR}/librte_pci.a
+      ${DPDK_LIB_DIR}/librte_timer.a
+      ${DPDK_LIB_DIR}/librte_telemetry.a
+      ${DPDK_LIB_DIR}/librte_kvargs.a
+      ${DPDK_LIB_DIR}/librte_mbuf.a
+      -Wl,--whole-archive
+      ${DPDK_LIB_DIR}/librte_mempool_ring.a
+      -Wl,--no-whole-archive
+      ${DPDK_LIB_DIR}/librte_power.a
+      ${DPDK_LIB_DIR}/librte_ethdev.a
+      ${DPDK_LIB_DIR}/librte_net.a
+      ${DPDK_LIB_DIR}/librte_vhost.a
+      ${DPDK_LIB_DIR}/librte_cryptodev.a
+      ${DPDK_LIB_DIR}/librte_hash.a
+      ${DPDK_LIB_DIR}/librte_rcu.a
+      pthread
+      dl
+      numa
+      rt
+      m
+      uuid
+      crypto
+      aio
+      z
+      elf
+      ibverbs
+      rdmacm
+      ssl
+      bsd)
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
+if(USE_NOF)
+  target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
+                                                    ${DPDK_INCLUDE_DIR})
+endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
   target_include_directories(mooncake_store
@@ -153,10 +247,13 @@ endif()
 target_link_libraries(
   mooncake_store
   PUBLIC cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
-         ${EXTRA_LIBS} asio_shared
+         ${EXTRA_LIBS} ${SPDK_STATIC_LIBS} asio_shared
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+if(STORE_USE_K8S_LEASE)
+    add_dependencies(mooncake_store build_k8s_lease_wrapper)
 endif()
 
 if(URING_LIB AND URING_INCLUDE)
@@ -219,7 +316,7 @@ endif()
 #
 # Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags,
 # because USE_CUDA may be OFF even when GPU pointers are present
-# (e.g. WITH_NVIDIA_PEERMEM=ON uses nvidia-peermem for RDMA without cudart).
+# (e.g. WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart).
 # Each detected toolkit gets both link libraries AND compile definitions,
 # so that gpu_staging_utils.h / pinned_buffer_pool.h pick the correct backend.
 #

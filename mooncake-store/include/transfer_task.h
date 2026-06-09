@@ -4,11 +4,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ostream>
 #include <queue>
+#include <stack>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +20,9 @@
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 
 namespace mooncake {
 
@@ -28,7 +33,8 @@ enum class TransferStrategy {
     LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
     FILE_READ = 2,        // File read operation
-    EMPTY = 3
+    EMPTY = 3,
+    SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
 /**
@@ -41,8 +47,12 @@ inline std::ostream& operator<<(std::ostream& os,
             return os << "LOCAL_MEMCPY";
         case TransferStrategy::TRANSFER_ENGINE:
             return os << "TRANSFER_ENGINE";
+        case TransferStrategy::SPDK_NVMF:
+            return os << "SPDK_NVMF";
         case TransferStrategy::FILE_READ:
             return os << "FILE_READ";
+        case TransferStrategy::EMPTY:
+            return os << "EMPTY";
         default:
             return os << "UNKNOWN";
     }
@@ -138,6 +148,35 @@ class MemcpyOperationState : public OperationState {
 
     TransferStrategy get_strategy() const override {
         return TransferStrategy::LOCAL_MEMCPY;
+    }
+};
+
+/**
+ * @brief Operation state for local memcpy transfers
+ */
+class SpdkNofOperationState : public OperationState {
+   public:
+    bool is_completed() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return result_.has_value();
+    }
+
+    void set_completed(ErrorCode error_code) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            assert(!result_.has_value());
+            result_.emplace(error_code);
+        }
+        cv_.notify_all();
+    }
+
+    void wait_for_completion() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return result_.has_value(); });
+    }
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::SPDK_NVMF;
     }
 };
 
@@ -307,6 +346,127 @@ class MemcpyWorkerPool {
     std::atomic<bool> shutdown_;
 };
 
+#ifdef USE_NOF
+// struct SpdkNofSubTask;
+struct SpdkNofQos;
+
+/**
+ * @brief Spdk nvmf operation descriptor
+ */
+struct SpdkNofTask {
+    nof_seg_handle* seg_handle;
+    void* ptr;
+    uint64_t lba;
+    uint32_t lba_count;
+    int remaining_lba;
+    int outstanding_sub_io;
+    int op;   // kSpdkNofOpRead or kSpdkNofOpWrite
+    int idx;  // subop idx
+    bool failed;
+    bool on_chain;
+    std::shared_ptr<SpdkNofOperationState> state;
+    int64_t* io_count;
+    SpdkNofQos* nof_qos;
+    SpdkNofTask* nxt;
+
+    SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
+                int op_code, std::shared_ptr<SpdkNofOperationState> s)
+        : seg_handle(handle),
+          ptr(buf),
+          lba(off),
+          lba_count(len),
+          remaining_lba(lba_count),
+          outstanding_sub_io(0),
+          op(op_code),
+          idx(0),
+          failed(false),
+          on_chain(false),
+          state(std::move(s)),
+          io_count(nullptr),
+          nof_qos(nullptr),
+          nxt(nullptr) {}
+};
+
+struct SpdkNofSubTask {
+    SpdkNofTask* task;
+    int submit_lba_count;
+    std::stack<SpdkNofSubTask*>* sub_task_pool;
+};
+
+constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
+constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
+struct SpdkNofQos {
+    int inflight_blocks[kSpdkNofOpNum];
+    int blocks_per_chunk;
+    int inflight_blocks_limit;
+    SpdkNofTask* head[kSpdkNofOpNum];
+    SpdkNofTask* tail[kSpdkNofOpNum];
+
+    explicit SpdkNofQos(uint32_t block_size);
+
+    bool Empty() const {
+        return (head[kSpdkNofOpRead] == nullptr &&
+                head[kSpdkNofOpWrite] == nullptr);
+    }
+
+    void PushTask(SpdkNofTask* task) {
+        int op = task->op;
+        if (head[op] == nullptr) {
+            head[op] = task;
+            tail[op] = task;
+        } else {
+            tail[op]->nxt = task;
+            tail[op] = task;
+        }
+    }
+
+    void PopTask(int op) {
+        if (head[op]) {
+            head[op] = head[op]->nxt;
+        }
+    }
+};
+
+/**
+ * @brief Thread pool for asynchronous spdk nvmf operations
+ *
+ * This class manages multiple worker thread that executes spdk nvmf operations
+ * asynchronously.
+ */
+constexpr int kDefaultSpdkNofWorkers = 4;
+class SpdkNofWorkerPool {
+   public:
+    explicit SpdkNofWorkerPool(int numa_socket_id = 0);
+    ~SpdkNofWorkerPool();
+
+    // Non-copyable, non-movable
+    SpdkNofWorkerPool(const SpdkNofWorkerPool&) = delete;
+    SpdkNofWorkerPool& operator=(const SpdkNofWorkerPool&) = delete;
+    SpdkNofWorkerPool(SpdkNofWorkerPool&&) = delete;
+    SpdkNofWorkerPool& operator=(SpdkNofWorkerPool&&) = delete;
+
+    /**
+     * @brief Submit a spdk nvmf task for async execution
+     * @param task The spdk nvmf task to execute
+     */
+    void submitTask(SpdkNofTask task);
+
+   private:
+    void workerThread(int work_idx);
+
+    int worker_count_;
+    int numa_socket_id_;
+    std::vector<std::thread> workers_;
+    std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
+    std::unique_ptr<std::mutex[]> queue_mutex_;
+    std::unique_ptr<std::condition_variable[]> queue_cv_;
+    std::atomic<bool> shutdown_;
+    std::mutex seg_mutex_;
+    int seg_num = 0;
+    std::map<nof_seg_handle*, int> seg_to_worker_;
+};
+#endif
+
 /**
  * @brief Fileread task for async execution
  */
@@ -370,7 +530,9 @@ class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
-                               TransferMetric* transfer_metric = nullptr);
+                               const std::string& local_hostname,
+                               TransferMetric* transfer_metric = nullptr,
+                               int numa_socket_id = 0);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -387,7 +549,8 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code);
+                                         TransferRequest::OpCode op_code,
+                                         void* ptr = nullptr, size_t size = 0);
 
     /**
      * @brief Submit a range read: read [src_offset, src_offset+size) from
@@ -406,13 +569,34 @@ class TransferSubmitter {
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, std::vector<Slice>>&
+            batched_slices);
+
+    /**
+     * @brief Pure comparison helper: returns true iff both endpoints are
+     * non-empty and identical. Exposed for unit testing of the locality
+     * decision without instantiating a full TransferEngine.
+     *
+     * Two endpoints identify the same process only when their ip:port (or
+     * full hostname) match exactly; same-host different-process pairs share
+     * an IP but not a port and must NOT be treated as locally addressable.
+     */
+    static bool isSameProcessEndpoint(const std::string& handle_endpoint,
+                                      const std::string& local_endpoint);
 
    private:
     TransferEngine& engine_;
+    // Cached at construction: the local transport endpoint never changes for
+    // the lifetime of the TransferSubmitter, so we avoid calling
+    // engine_.getLocalIpAndPort() (which allocates a string) on every transfer.
+    const std::string local_endpoint_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
+#ifdef USE_NOF
+    std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+#endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    const std::string local_hostname_;
     TransferMetric* transfer_metric_;
 
     /**
@@ -439,6 +623,15 @@ class TransferSubmitter {
         const AllocatedBuffer::Descriptor& handle,
         const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
         uint64_t src_offset = 0);
+
+#ifdef USE_NOF
+    /**
+     * @brief Submit SPDK NVMe-oF operation asynchronously
+     */
+    std::optional<TransferFuture> submitSpdkNofOperation(
+        const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
+        const TransferRequest::OpCode op_code);
+#endif
 
     /**
      * @brief Submit transfer engine operation asynchronously

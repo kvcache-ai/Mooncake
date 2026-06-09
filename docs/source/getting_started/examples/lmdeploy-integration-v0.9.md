@@ -16,17 +16,17 @@ pip install mooncake-transfer-engine
 
 Note:
 
--   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md).
+-   If any `.so` file is missing, uninstall the pip package with `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually from source following the [build instructions](../build.md).
 
 ### Install the latest version of LMDeploy
 
-##### 1. Clone LMDeploy from the official repo
+#### 1. Clone LMDeploy from the official repo
 
 ```bash
 git clone https://github.com/InternLM/lmdeploy.git
 ```
 
-##### 2. Build
+#### 2. Build
 
 ##### 2.1 Build from source
 
@@ -74,7 +74,7 @@ lmdeploy serve api_server Qwen/Qwen3-8B \
 -   The `--role` parameter sets the node role in the disaggregated system (`Prefill` for token embedding and KV cache generation).
 -   The `--proxy-url` parameter connects the worker instance back to the proxy for coordination.
 -   The `--backend` parameter specifies the model execution backend (e.g., `pytorch`, `turbomind`).
--   The `--migration-backend` parameter defines the KV cache transport mechanism (e.g., `Mooncake` and `DlSllime`).
+-   The `--migration-backend` parameter defines the KV cache transport mechanism (e.g., `Mooncake` and `DLSlime`).
 
 #### Decode:
 

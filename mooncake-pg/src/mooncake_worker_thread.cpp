@@ -1,4 +1,4 @@
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <glog/logging.h>
@@ -85,11 +85,12 @@ void MooncakeWorker::startWorker() {
                 }
 
                 auto group = (TransferGroupMeta*)task.transferGroupMeta;
-                bool skipTransfer = (task.opType == c10d::OpType::BROADCAST &&
-                                     group->rank != task.broadcastRoot) ||
-                                    (task.opType == c10d::OpType::SCATTER &&
-                                     group->rank != task.broadcastRoot) ||
-                                    task.opType == c10d::OpType::BARRIER;
+                bool skipTransfer =
+                    ((c10d::OpType)task.opType == c10d::OpType::BROADCAST &&
+                     group->rank != task.broadcastRoot) ||
+                    ((c10d::OpType)task.opType == c10d::OpType::SCATTER &&
+                     group->rank != task.broadcastRoot) ||
+                    (c10d::OpType)task.opType == c10d::OpType::BARRIER;
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
                     if (skipTransfer) {
@@ -107,15 +108,17 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        if ((task.opType == c10d::OpType::GATHER ||
-                             task.opType == c10d::OpType::REDUCE) &&
+                        if (((c10d::OpType)task.opType ==
+                                 c10d::OpType::GATHER ||
+                             (c10d::OpType)task.opType ==
+                                 c10d::OpType::REDUCE) &&
                             j != task.broadcastRoot) {
                             continue;
                         }
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
-                        switch (task.opType) {
+                        switch ((c10d::OpType)task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
                             case c10d::OpType::ALLGATHER:
@@ -136,7 +139,7 @@ void MooncakeWorker::startWorker() {
                             group->segmentInfos[j]
                                 .recv_buffer[task.bufferOffset];
 
-                        switch (task.opType) {
+                        switch ((c10d::OpType)task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::SCATTER:
                                 break;

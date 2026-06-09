@@ -60,7 +60,7 @@ if command -v apt-get &> /dev/null; then
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
-            libboost-all-dev \
+            libboost-dev \
             libssl-dev \
             libzstd-dev \
             libgrpc-dev \

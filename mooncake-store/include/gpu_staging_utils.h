@@ -15,7 +15,8 @@ namespace gpu_staging {
 // Detect whether ptr resides in accelerator device memory.
 // If so, writes the device ID to *out_device_id for subsequent SetDevice.
 inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
     cudaPointerAttributes attr{};
     if (cudaPointerGetAttributes(&attr, ptr) == cudaSuccess &&
         attr.type == cudaMemoryTypeDevice) {
@@ -45,7 +46,8 @@ inline bool IsDevicePointer(const void* ptr, int* out_device_id) {
 
 // Copy device memory to host. Caller must have called SetDevice first.
 inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
     return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost) == cudaSuccess;
 #elif defined(USE_HIP)
     return hipMemcpy(dst, src, size, hipMemcpyDeviceToHost) == hipSuccess;
@@ -64,7 +66,8 @@ inline bool CopyDeviceToHost(void* dst, const void* src, size_t size) {
 // attributes (cudaMemcpyDefault). Works for H2H, H2D, D2H, and D2D.
 // Caller must have called SetDevice first when device memory is involved.
 inline bool CopyAuto(void* dst, const void* src, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
     return cudaMemcpy(dst, src, size, cudaMemcpyDefault) == cudaSuccess;
 #elif defined(USE_HIP)
     return hipMemcpy(dst, src, size, hipMemcpyDefault) == hipSuccess;
@@ -94,7 +97,8 @@ inline bool CopyAuto(void* dst, const void* src, size_t size) {
 // Bind the calling thread to the given device context.
 inline void SetDevice(int device_id) {
     if (device_id < 0) return;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
     cudaSetDevice(device_id);
 #elif defined(USE_HIP)
     hipSetDevice(device_id);
@@ -103,5 +107,60 @@ inline void SetDevice(int device_id) {
 #endif
 }
 
+// Copy host memory to device. Caller must have called SetDevice first.
+inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    return cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice) == cudaSuccess;
+#elif defined(USE_HIP)
+    return hipMemcpy(dst, src, size, hipMemcpyHostToDevice) == hipSuccess;
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+    return aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE) ==
+           ACL_SUCCESS;
+#else
+    (void)dst;
+    (void)src;
+    (void)size;
+    return false;
+#endif
+}
+
+// Detect whether ptr resides in host (CPU) memory.
+// Used together with IsDevicePointer for safe pointer-type dispatching:
+//   if IsDevicePointer  -> CopyHostToDevice / CopyDeviceToHost
+//   else if IsHostPointer -> memcpy
+//   else                  -> reject (unknown type, e.g. non-standard allocator)
+//
+// Pageable host memory (not tracked by CUDA runtime) is treated as host.
+inline bool IsHostPointer(const void* ptr) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        // Query failed: pageable host memory not tracked by the runtime.
+        cudaGetLastError();  // clear sticky error
+        return true;
+    }
+    return attr.type != cudaMemoryTypeDevice;
+#elif defined(USE_HIP)
+    hipPointerAttribute_t attr{};
+    if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+        hipGetLastError();  // clear sticky error
+        return true;
+    }
+    return attr.type != hipMemoryTypeDevice;
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+    aclrtPtrAttributes attr{};
+    if (aclrtPointerGetAttributes(const_cast<void*>(ptr), &attr) !=
+        ACL_SUCCESS) {
+        // Query failed: likely pageable host memory not tracked by the runtime.
+        return true;
+    }
+    return attr.location.type != ACL_MEM_LOCATION_TYPE_DEVICE;
+#else
+    (void)ptr;
+    return true;  // CPU-only build: all pointers are host
+#endif
+}
 }  // namespace gpu_staging
 }  // namespace mooncake

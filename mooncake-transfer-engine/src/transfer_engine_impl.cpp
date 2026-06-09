@@ -268,6 +268,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
+#elif defined(USE_MACA)
+
+        Transport* t = multi_transports_->installTransport("maca", nullptr);
+        if (!t) {
+            LOG(ERROR) << "Failed to install MACA transport";
+            return -1;
+        }
+        LOG(INFO) << "Using MACA transport";
+
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
@@ -302,8 +311,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 
 #else
-        if (local_topology_->getHcaList().size() > 0 &&
-                !getenv("MC_FORCE_TCP") ||
+        if ((local_topology_->getHcaList().size() > 0 &&
+             !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;
@@ -404,6 +413,24 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA)
+device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
+    int num_ranks) {
+    if (!p2p_transport_) {
+        p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
+    }
+    return p2p_transport_.get();
+}
+
+device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    if (!rdma_transport_) {
+        rdma_transport_ = device::createIbgdaDeviceTransport(device_filter);
+    }
+    return rdma_transport_.get();
+}
+#endif
+
 int TransferEngineImpl::getRpcPort() {
     return metadata_->localRpcMeta().rpc_port;
 }
@@ -421,6 +448,10 @@ int TransferEngineImpl::getNotifies(
 int TransferEngineImpl::sendNotifyByID(
     SegmentID target_id, TransferMetadata::NotifyDesc notify_msg) {
     auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
+        return ERR_METADATA;
+    }
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
     return ret;

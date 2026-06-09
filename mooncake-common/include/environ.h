@@ -40,8 +40,8 @@ class Environ {
         return enable_dest_device_affinity_;
     }
     bool GetUseIpv6() const { return use_ipv6_; }
-    int GetMinPrcPort() const { return min_prc_port_; }
-    int GetMaxPrcPort() const { return max_prc_port_; }
+    int GetMinRpcPort() const { return min_rpc_port_; }
+    int GetMaxRpcPort() const { return max_rpc_port_; }
     int GetEnableParallelRegMr() const { return enable_parallel_reg_mr_; }
     std::string GetEndpointStoreType() const { return endpoint_store_type_; }
     bool GetForceTcp() const { return force_tcp_; }
@@ -49,9 +49,8 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
-
-   private:
-    Environ();
+    bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    int GetEfaCqThreads() const { return efa_cq_threads_; }
 
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
@@ -62,6 +61,9 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
+
+   private:
+    Environ();
 
     // Member variables
     int num_cq_per_ctx_;
@@ -90,8 +92,8 @@ class Environ {
     int fragment_ratio_;
     bool enable_dest_device_affinity_;
     bool use_ipv6_;
-    int min_prc_port_;
-    int max_prc_port_;
+    int min_rpc_port_;
+    int max_rpc_port_;
     int enable_parallel_reg_mr_;
     std::string endpoint_store_type_;
     bool force_tcp_;
@@ -99,6 +101,8 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    bool with_nvidia_peermem_;
+    int efa_cq_threads_;
 };
 
 }  // namespace mooncake

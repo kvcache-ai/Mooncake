@@ -42,9 +42,9 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 #include <cassert>
 
 #if defined(USE_MNNVL) || defined(USE_UBSHMEM)
@@ -108,9 +108,9 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0,
@@ -121,9 +121,9 @@ using namespace mooncake;
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -193,9 +193,9 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void* addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
 #ifdef USE_MNNVL
         if (FLAGS_use_vram) {
@@ -219,19 +219,35 @@ static void freeMemoryPool(void* addr, size_t size) {
 #endif
     } else {
 #ifndef USE_UBSHMEM
-        // check pointer on GPU
-        cudaPointerAttributes attributes;
-        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                       "Failed to get pointer attributes");
-
-        if (attributes.type == cudaMemoryTypeDevice) {
-            cudaFree(addr);
-        } else if (attributes.type == cudaMemoryTypeHost ||
-                   attributes.type == cudaMemoryTypeUnregistered) {
+        // Check FLAGS_use_vram first to avoid unnecessary CUDA calls in non-GPU
+        // environments
+        if (!FLAGS_use_vram) {
+            // Memory was allocated via numa_alloc_onnode, free it directly
             numa_free(addr, size);
         } else {
-            LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type;
+            // Memory may be on GPU, check pointer attributes
+            // Use graceful error handling like transfer engine core
+            // (memory_location.cpp)
+            cudaPointerAttributes attributes;
+            cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
+
+            if (result != cudaSuccess) {
+                // CUDA call failed when FLAGS_use_vram is true - this is an
+                // error
+                LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                           << result << " - " << cudaGetErrorString(result)
+                           << ")";
+                numa_free(addr, size);
+            } else if (attributes.type == cudaMemoryTypeDevice) {
+                cudaFree(addr);
+            } else if (attributes.type == cudaMemoryTypeHost ||
+                       attributes.type == cudaMemoryTypeUnregistered) {
+                numa_free(addr, size);
+            } else {
+                LOG(ERROR) << "Unknown memory type, " << addr << " "
+                           << attributes.type << ", assuming CPU memory";
+                numa_free(addr, size);
+            }
         }
 #endif
     }
@@ -278,8 +294,9 @@ std::atomic<size_t> total_batch_count(0);
 
 // Ensure each worker thread has a valid GPU context before issuing transfers.
 static inline void setWorkerDeviceIfNeeded() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram && FLAGS_gpu_id >= 0) {
         checkCudaError(cudaSetDevice(FLAGS_gpu_id),
                        "Failed to set device in worker");
@@ -289,8 +306,9 @@ static inline void setWorkerDeviceIfNeeded() {
 
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -321,9 +339,9 @@ static int determineBufferCount() {
 static std::vector<void*> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void*> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
     }
@@ -345,9 +363,9 @@ static void freeBuffers(std::vector<void*>& addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
-    defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
-    defined(USE_SUNRISE)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
         return std::string(GPU_PREFIX) + std::to_string(name_suffix);

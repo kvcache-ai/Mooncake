@@ -78,18 +78,40 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
 int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
-    // remove endpoint but leaving it status unchanged
-    // in case it is setting up connection or submitting slice
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
+    // all outstanding WRs have been drained.
     if (iter != endpoint_map_.end()) {
         waiting_list_len_++;
+        iter->second->beginDestroy();
         waiting_list_.insert(iter->second);
-        iter->second->set_active(false);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         fifo_list_.erase(fifo_iter);
         fifo_map_.erase(peer_nic_path);
     }
     return 0;
+}
+
+int FIFOEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            waiting_list_len_++;
+            iter->second->beginDestroy();
+            waiting_list_.insert(iter->second);
+            endpoint_map_.erase(iter);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            return 0;
+        }
+    }
+    return -1;  // Not found
 }
 
 void FIFOEndpointStore::evictEndpoint() {
@@ -99,7 +121,9 @@ void FIFOEndpointStore::evictEndpoint() {
     fifo_map_.erase(victim);
     LOG(INFO) << victim << " evicted";
     waiting_list_len_++;
-    waiting_list_.insert(endpoint_map_[victim]);
+    auto victim_endpoint = endpoint_map_[victim];
+    victim_endpoint->beginDestroy();
+    waiting_list_.insert(victim_endpoint);
     endpoint_map_.erase(victim);
     return;
 }
@@ -108,8 +132,9 @@ void FIFOEndpointStore::reclaimEndpoint() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto &endpoint : waiting_list_)
-        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
 }
@@ -203,12 +228,14 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
 int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     auto iter = endpoint_map_.find(peer_nic_path);
-    // remove endpoint but leaving it status unchanged
-    // in case it is setting up connection or submitting slice
+    // Begin two-phase destruction: mark endpoint as destroying and move QPs
+    // to ERR state so inflight WRs are flushed to CQ. The endpoint is moved
+    // to waiting_list_ and will be fully destroyed by reclaimEndpoint() once
+    // all outstanding WRs have been drained.
     if (iter != endpoint_map_.end()) {
+        iter->second.first->beginDestroy();
         waiting_list_len_++;
         waiting_list_.insert(iter->second.first);
-        iter->second.first->set_active(false);
         endpoint_map_.erase(iter);
         auto fifo_iter = fifo_map_[peer_nic_path];
         if (hand_.has_value() && hand_.value() == fifo_iter) {
@@ -219,6 +246,30 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
         fifo_map_.erase(peer_nic_path);
     }
     return 0;
+}
+
+int SIEVEEndpointStore::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    // Find endpoint by pointer
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         ++iter) {
+        if (iter->second.first.get() == endpoint_ptr) {
+            std::string peer_nic_path = iter->first;
+            iter->second.first->beginDestroy();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return -1;  // Not found
 }
 
 void SIEVEEndpointStore::evictEndpoint() {
@@ -242,7 +293,7 @@ void SIEVEEndpointStore::evictEndpoint() {
     fifo_map_.erase(victim);
     LOG(INFO) << victim << " evicted";
     auto victim_instance = endpoint_map_[victim].first;
-    victim_instance->set_active(false);
+    victim_instance->beginDestroy();
     waiting_list_len_++;
     waiting_list_.insert(victim_instance);
     endpoint_map_.erase(victim);
@@ -253,8 +304,9 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
     RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto &endpoint : waiting_list_)
-        if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
+    for (auto &endpoint : waiting_list_) {
+        if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
+    }
     for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
     waiting_list_len_ -= to_delete.size();
 }

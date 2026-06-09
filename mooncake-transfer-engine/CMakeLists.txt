@@ -61,8 +61,9 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-# Non-peermem requires cuMem allocated memory pointers
-if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
+# is now a runtime environment variable, always build when GPU support is present.
+if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA)
   add_subdirectory(nvlink-allocator)
 endif()
 
@@ -73,5 +74,12 @@ endif()
 
 if (USE_TENT)
   add_subdirectory(tent)
+endif()
+
+# tebench only needs the classic Transfer Engine for its default "classic"
+# backend; the TENT backend is compiled in conditionally (see benchmark/
+# CMakeLists.txt and main.cpp). Keep it gated solely on BUILD_BENCHMARK so it
+# can be built without enabling USE_TENT.
+if (BUILD_BENCHMARK)
   add_subdirectory(benchmark)
 endif()

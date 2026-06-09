@@ -130,6 +130,111 @@ store.close()
 
 </details>
 
+## Structured Object Store Helper
+
+`mooncake.structured_object_store` provides a higher-level helper for one logical object that contains multiple named members.
+It is designed for cases such as rollout / batch transfer where callers want to keep their own object semantics locally while using Mooncake for fast payload movement.
+
+The helper separates two concepts:
+
+- **structured object path**: named members with metadata-aware materialization;
+- **generic bundle path**: manifest + named payloads when the caller only needs raw grouped objects.
+
+### Main types
+
+```python
+from mooncake.structured_object_store import (
+    MooncakeBundleTransfer,
+    StructuredMemberSlice,
+    StructuredObjectPayload,
+)
+```
+
+- `MooncakeBundleTransfer`: public helper facade built on a `MooncakeDistributedStore`.
+- `StructuredObjectPayload`: structured object to write. Members are passed in `buffers`, and optional object metadata is passed in `metadata`.
+- `StructuredMemberSlice`: slice selection for one structured member during reads.
+
+### Structured object write and full read
+
+Use `put_structured_object()` to write one structured object. The default read path is `read_spec(ref)`, and full-object materialization is just the default case of the partial-read API.
+
+```python
+import numpy as np
+from mooncake.store import MooncakeDistributedStore
+from mooncake.structured_object_store import MooncakeBundleTransfer, StructuredObjectPayload
+
+store = MooncakeDistributedStore()
+transfer = MooncakeBundleTransfer(store, key_prefix="demo/structured")
+
+payload = StructuredObjectPayload(
+    metadata={"step": 7, "layout": "rollout"},
+    buffers={
+        "tokens": np.array(range(24), dtype=np.int32).reshape(6, 4),
+        "mask": np.ones((6, 4), dtype=np.int8),
+        "prompt_ids": b"sample-ids",
+    },
+)
+
+ref = transfer.put_structured_object(payload)
+result = transfer.materialize(transfer.read_spec(ref))
+
+tokens = result.objects["tokens"]
+prompt_ids = result.objects["prompt_ids"]
+metadata = result.metadata
+```
+
+### Partial reads
+
+Read narrowing happens on top of `read_spec(ref)`:
+
+- `select_members([...])` keeps only selected members;
+- `slice_member(name, axis=0, start=..., end=...)` slices one ndarray member;
+- `materialize(spec)` returns newly materialized objects.
+
+```python
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize(spec)
+
+selected_tokens = result.objects["tokens"]
+```
+
+Current scope:
+
+- byte members support full-member reads;
+- ndarray members support full reads and sliced reads;
+- full read is the default `read_spec(ref)` case.
+
+### Reusing caller-owned destinations
+
+Use `materialize_into()` when the caller already owns the destination ndarray buffers and wants Mooncake to fill them directly.
+
+```python
+destination = np.empty((3, 4), dtype=np.int32)
+spec = (
+    transfer.read_spec(ref)
+    .select_members(["tokens"])
+    .slice_member("tokens", axis=0, start=2, end=5)
+)
+result = transfer.materialize_into(spec, {"tokens": destination})
+
+assert result.objects["tokens"] is destination
+```
+
+`materialize_into()` is only for members whose destination layout is already known to the caller. For byte members or default object reconstruction, use `materialize()`.
+
+### Generic bundle fallback
+
+If the caller does not need structured member semantics, the same helper also supports raw named bundles:
+
+- `put_bundle(...)`
+- `remove_bundle(...)`
+
+Use the bundle path when the object is just a manifest plus named payloads, and use the structured object path when callers want member selection, slicing, and ndarray-aware materialization.
+
 ## Zero-Copy API (Advanced Performance)
 
 For maximum performance, especially with RDMA networks, use the zero-copy API. This allows direct memory access without intermediate copies.
@@ -138,7 +243,7 @@ For maximum performance, especially with RDMA networks, use the zero-copy API. T
 
 ⚠️ **Important**: `register_buffer` is required for zero-copy RDMA operations. Without proper buffer registration, undefined behavior and memory corruption may occur.
 
-Zero-copy operations require registering memory buffers with the store:
+Zero-copy operations require registered memory buffers. For repeated reads and writes, prefer the Python `BufferPool` helper described below so leases come from the store's setup-time local buffer instead of registering and unregistering memory for every operation.
 
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
@@ -171,6 +276,45 @@ store.unregister_buffer(buffer_ptr)
 ```
 
 </details>
+
+#### BufferPool Helper
+
+`BufferPool` leases scratch buffers from the store's setup-time local buffer for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
+
+```python
+from mooncake.buffer_pool import BufferPool
+
+pool = BufferPool(store)
+
+with pool.buffer(1024 * 1024) as lease:
+    n = store.get_into("my_key", lease.ptr, lease.size)
+    view = lease.buffer[:n]
+    # Consume view directly, or wrap it with np.frombuffer(view, dtype=...).
+    # Copy only if the data must outlive the lease: data = bytes(view)
+
+pool.close()
+```
+
+`acquire(size)` and `buffer(size)` return a lease object. A lease exposes:
+
+- `ptr`: the local-buffer address to pass to zero-copy APIs.
+- `size`: the requested logical size.
+- `buffer`: a Python `memoryview` over the logical requested size.
+- `release()`: returns the local-buffer allocation to the store allocator.
+
+Behavior and lifecycle rules:
+
+- Leases prefer the store local buffer shared with internal Store staging paths.
+- If local-buffer allocation is temporarily exhausted, `BufferPool` can allocate and register a short-lived overflow buffer; the overflow buffer is unregistered when the lease is released.
+- `max_regions` can limit the number of concurrently active external leases.
+- `max_bytes` bounds total active local-buffer and overflow leases; the default allows one local-buffer-sized overflow burst.
+- `acquire(size, block=False)` raises when both local and overflow capacity are exhausted instead of waiting.
+- `acquire(size, timeout=...)` can wait for another lease to be released.
+- Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
+- `release()` fails while exported views are alive. Delete those views first, then release.
+- `close()` fails if leases are still active. Release all leases before closing the pool.
+
+Legacy code may still import `RegisteredBufferPool`, but new examples should prefer `mooncake.buffer_pool.BufferPool`.
 
 ---
 
@@ -288,7 +432,7 @@ from object `all_keys[i][j]`, then writes it into destination buffer
 This lets one buffer gather interleaved fragments from multiple keys, and lets one key contribute multiple disjoint fragments to the same buffer in a single call.
 
 **Parameters:**
-- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Every buffer must be registered with `register_buffer()` before calling this API.
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Each buffer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 - `all_keys`: For each buffer, the ordered list of source object keys to read from.
 - `all_dst_offsets`: For each buffer and key, the destination offsets of that key's fragments.
 - `all_src_offsets`: For each buffer and key, the source offsets of that key's fragments inside the object.
@@ -481,8 +625,36 @@ config.preferred_segment = self.get_hostname()
 
 ```python
 config = ReplicateConfig()
-config.prefer_alloc_in_same_node = "True
+config.prefer_alloc_in_same_node = "True"
 ```
+
+#### group_ids
+**Type:** `List[str] | None`
+**Default:** `None`
+**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped.
+
+For batch write APIs, the number of group IDs must match the number of keys:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a", "", "session-b"]
+
+store.put_batch(
+    ["key-a", "key-b", "key-c"],
+    [b"value-a", b"value-b", b"value-c"],
+    config,
+)
+```
+
+For a single-object write, provide one group ID:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a"]
+
+store.put("key-a", b"value-a", config)
+```
+
 ---
 
 ## Unified Parallel Tensor IO API
@@ -623,7 +795,7 @@ def batch_get_tensor_with_parallelism(
 
 ### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
 
-Zero-copy unified read forms. The destination buffers must be registered with `register_buffer()` before calling them.
+Zero-copy unified read forms. The destination buffers must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ```python
 def get_tensor_with_parallelism_into(
@@ -688,13 +860,13 @@ The unified write and upsert family also has `_from` variants for registered-mem
 - `upsert_tensor_with_parallelism_from(...)`
 - `batch_upsert_tensor_with_parallelism_from(...)`
 
-These APIs accept registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
+These APIs accept Store-managed registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
 
 ```text
 [TensorObjectHeader + layout metadata][tensor data]
 ```
 
-As with other zero-copy APIs, every source pointer must be registered with `register_buffer()` before use.
+As with other zero-copy APIs, every source pointer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ### Compatibility wrappers
 
@@ -1445,7 +1617,7 @@ def mount_segment(
 ```
 
 **Parameters:**
-- `path` (str): File path to map and mount.
+- `path` (str): File or shared-memory path to map and mount.
 - `size` (int): Number of bytes to mount.
 - `offset` (int, optional): File offset in bytes. Defaults to `0`.
 - `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
@@ -1484,20 +1656,104 @@ named shared memory object name instead of an arbitrary path.
 Unmount one or more file or shared-memory segments by segment id.
 
 ```python
-def unmount_segment(self, segment_ids: List[str]) -> int
+def unmount_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
 ```
 
 **Parameters:**
 - `segment_ids` (List[str]): Segment ids returned by `mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted. Defaults to `0`, which keeps the existing immediate unmount
+  behavior. During a positive grace period, the segment remains readable but no
+  longer accepts new allocations.
 
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
 **Example:**
 ```python
-ret = store.unmount_segment(segment_ids)
+ret = store.unmount_segment(segment_ids, grace_period_seconds=30)
 if ret != 0:
     print("Unmount failed:", ret)
+```
+
+---
+
+#### allocate_and_mount_segment()
+Allocate memory inside the store process and mount it as one or more Mooncake
+store segments.
+
+```python
+def allocate_and_mount_segment(
+    self,
+    size: int,
+    protocol: str = "tcp",
+    location: str = "",
+) -> dict
+```
+
+**Parameters:**
+- `size` (int): Number of bytes requested. The allocated size may be rounded up
+  for alignment.
+- `protocol` (str, optional): Transfer protocol. Defaults to `"tcp"`.
+- `location` (str, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Returns:**
+- `dict`: A result dictionary with:
+  - `ret` (int): Status code (0 = success, non-zero = error code)
+  - `segment_ids` (List[str]): Segment ids created by the mount operation
+  - `allocated_size` (int): Actual allocated size in bytes
+
+**Example:**
+```python
+result = store.allocate_and_mount_segment(
+    16 * 1024 * 1024,
+    protocol="tcp",
+    location="",
+)
+
+if result["ret"] == 0:
+    segment_ids = list(result["segment_ids"])
+    allocated_size = result["allocated_size"]
+```
+
+The corresponding HTTP endpoints are `/api/mount` and `/api/unmount`.
+
+---
+
+#### unmount_and_free_segment()
+Unmount one or more internally allocated segments by segment id and free their
+local memory.
+
+```python
+def unmount_and_free_segment(
+    self,
+    segment_ids: List[str],
+    grace_period_seconds: int = 0,
+) -> int
+```
+
+**Parameters:**
+- `segment_ids` (List[str]): Segment ids returned by
+  `allocate_and_mount_segment()`.
+- `grace_period_seconds` (int, optional): Grace period before the segment is
+  fully unmounted and its local allocated memory is released. Defaults to `0`,
+  which keeps the existing immediate unmount-and-free behavior. During a
+  positive grace period, the segment remains readable but no longer accepts new
+  allocations.
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+ret = store.unmount_and_free_segment(segment_ids, grace_period_seconds=30)
+if ret != 0:
+    print("Unmount and free failed:", ret)
 ```
 
 ---
@@ -2426,7 +2682,7 @@ def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 
@@ -2502,7 +2758,7 @@ List[int]
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 
@@ -2631,8 +2887,6 @@ bind_to_numa_node(0)
 
 ---
 
----
-
 ## Error Handling
 
 Most methods return integer status codes:
@@ -2655,5 +2909,3 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 4. **Configure replication** appropriately - more replicas provide better availability but use more storage
 5. **Use soft pinning** for frequently accessed objects to keep them in memory
 6. **Choose RDMA protocol** when available for maximum performance
-
----

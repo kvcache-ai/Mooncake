@@ -6,8 +6,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <fstream>
-#include <mooncake_ibgda/memheap.h>
-#include <mooncake_ibgda/mlx5gda.h>
+#include <transport/device/ibgda/memheap.h>
+#include <transport/device/ibgda/mlx5gda.h>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
