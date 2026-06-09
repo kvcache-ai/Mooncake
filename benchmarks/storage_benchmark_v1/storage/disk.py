@@ -7,7 +7,7 @@ Each key maps to a complete page entry.
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 
 from .interface import Storage, KVKey, KVValue
 
@@ -82,7 +82,8 @@ class DiskHashTable(Storage):
         self.fd = None
 
         # Write buffer
-        self._buffer = bytes(page_size)
+        # Write buffer (use random bytes to prevent SSD compression/deduplication from skewing results)
+        self._buffer = os.urandom(page_size)
 
         # Stats
         self.stats = {
@@ -110,8 +111,9 @@ class DiskHashTable(Storage):
                 os.fsync(f.fileno())
 
     def _get_fd(self):
+    def _get_fd(self):
         if self.fd is None:
-            self.fd = os.open(self.storage_file, os.O_RDWR | os.O_CREAT)
+            self.fd = os.open(self.storage_file, os.O_RDWR | os.O_CREAT, 0o644)
         return self.fd
 
     # ========================================================================
@@ -159,8 +161,7 @@ class DiskHashTable(Storage):
         """
         # Check capacity
         if self.next_page_id >= self.max_pages:
-            print(f"Warning: Storage capacity exceeded (max_pages={self.max_pages})")
-            return 0.0
+            raise OSError(f"Storage capacity exceeded (max_pages={self.max_pages})")
 
         page_id = self.next_page_id
         self.next_page_id += 1
@@ -196,7 +197,8 @@ class DiskHashTable(Storage):
                 latency = (write_done - start) * 1000.0
 
             # Evict from cache
-            os.posix_fadvise(fd, offset, self.page_size, os.POSIX_FADV_DONTNEED)
+            if hasattr(os, 'posix_fadvise'):
+                os.posix_fadvise(fd, offset, self.page_size, os.POSIX_FADV_DONTNEED)
 
             self.stats['write_count'] += 1
             self.stats['write_bytes'] += self.page_size
@@ -270,7 +272,7 @@ class DiskHashTable(Storage):
             return True
         return False
 
-    def get_sequence_keys(self, sequence_id: int) -> list[KVKey]:
+    def get_sequence_keys(self, sequence_id: int) -> List[KVKey]:
         """Get all keys for a sequence"""
         keys = []
         for k in self.index.keys():
@@ -315,14 +317,18 @@ class DiskHashTable(Storage):
     def close(self, force_sync: bool = True):
         """Close file"""
         if force_sync and self.fsync_mode in ['end', 'batch']:
-            if self.fd:
+            if self.fd is not None:
                 try:
                     os.fsync(self.fd)
                     self.stats['sync_count'] += 1
-                except: pass
+                except OSError:
+                    pass
 
-        if self.fd:
-            os.close(self.fd)
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
             self.fd = None
 
     def __enter__(self):

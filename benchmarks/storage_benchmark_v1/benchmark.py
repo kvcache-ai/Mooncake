@@ -44,7 +44,7 @@ class TraceReplay:
 
     def replay(self) -> Iterator[dict]:
         """Replay trace workload"""
-        with open(self.trace_path, 'r') as f:
+        with open(self.trace_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -154,18 +154,22 @@ class StorageBenchmark:
 
         # Use layout to generate keys for this request
         for entry in self.layout.get_entries(req):
-            # Convert KVKey to tuple for storage (storage uses tuple keys internally)
-            key = (entry.key.sequence_id, entry.key.layer_id)
-
+            key = entry.key
             if self.storage.exists(key):
-                latency = self.storage.read(key)
-                if latency > 0:  # Only count successful reads
+                start_io = time.perf_counter()
+                val = self.storage.get(key)
+                latency = (time.perf_counter() - start_io) * 1000.0
+                if val is not None:
                     total_latency += latency
                     io_operations += 1
                 self.stats['read_pages'] += 1
                 self.stats['page_hits'] += 1
             else:
-                latency = self.storage.write(key)
+                from storage.interface import KVValue
+                dummy_value = KVValue(data=bytes(entry.value_size_bytes), page_count=1, token_count=self.layout.page_size_tokens)
+                start_io = time.perf_counter()
+                self.storage.put(key, dummy_value)
+                latency = (time.perf_counter() - start_io) * 1000.0
                 total_latency += latency
                 io_operations += 1
                 self.stats['write_pages'] += 1
@@ -403,9 +407,12 @@ def main():
             print(f"Warning: Trace file not found: {trace_path}")
 
     # Print results
+    # Print results
     if results:
         print_results(results)
-
+    else:
+        print("Error: No trace files were successfully processed.", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
