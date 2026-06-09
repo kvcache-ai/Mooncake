@@ -1,14 +1,14 @@
 #include <cmath>
 
-#include <cuda_runtime_api.h>
+#include "cuda_alike.h"
 
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
-#include <mooncake_ibgda/memheap.h>
-#include <mooncake_ibgda/mlx5gda.h>
-#include <mooncake_ibgda/mlx5_ifc.h>
-#include <mooncake_ibgda/mlx5_prm.h>
+#include <transport/device/ibgda/memheap.h>
+#include <transport/device/ibgda/mlx5gda.h>
+#include <transport/device/ibgda/mlx5_ifc.h>
+#include <transport/device/ibgda/mlx5_prm.h>
 
 template <typename T>
 inline T IBGDA_ILOG2(T _n) {
@@ -30,10 +30,22 @@ constexpr T round_up_pow2(T n) {
 #define IBGDA_ROUND_UP_POW2_OR_0(_n) (((_n) == 0) ? 0 : round_up_pow2(_n))
 
 static void print_cuda_error(const char* msg) {
+#ifdef USE_MUSA
+    const char* err_str = musaGetErrorString(musaGetLastError());
+#else
     const char* err_str = cudaGetErrorString(cudaGetLastError());
+#endif
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
+// Create UAR for BF (Blue Flame) doorbell ringing.
+// On CUDA: registers the BF MMIO region into GPU address space so the
+//          GPU kernel can directly write the doorbell (lowest latency).
+// On MUSA: musaHostRegisterIoMemory is not supported for MMIO addresses,
+//          so we skip BF registration and return a UAR with reg_addr=NULL.
+//          The GPU kernel will use DBR-only mode (write to memory-mapped
+//          doorbell record, NIC polls it) — slightly higher latency but
+//          functionally correct.
 static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
@@ -41,6 +53,15 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         errno = EIO;
         return NULL;
     }
+#ifdef USE_MUSA
+    // MUSA cannot map MMIO addresses into GPU VA.  Skip the
+    // musaHostRegister(IoMemory) call entirely — attempting it
+    // corrupts the MUSA runtime, causing all subsequent device-side
+    // fill operations to fail with "illegal memory access".
+    // Use DBR-only mode: the kernel writes to the doorbell record
+    // in GPU memory instead of the BF MMIO register.
+    uar->reg_addr = NULL;
+#else
     if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
                          cudaHostRegisterPortable | cudaHostRegisterMapped |
                              cudaHostRegisterIoMemory) != cudaSuccess) {
@@ -49,13 +70,16 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         mlx5dv_devx_free_uar(uar);
         return NULL;
     }
+#endif
     return uar;
 }
 
 static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
-    if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
-        print_cuda_error("Failed to unregister MMIO memory");
+    if (uar->reg_addr) {
+        if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
+            print_cuda_error("Failed to unregister MMIO memory");
+        }
     }
     mlx5dv_devx_free_uar(uar);
 }
@@ -444,7 +468,8 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp* qp,
 
         memcpy(DEVX_ADDR_OF(qpc, qpc, primary_address_path.rmac_47_32),
                &dah.av->rmac, sizeof(dah.av->rmac));
-        DEVX_SET(qpc, qpc, primary_address_path.hop_limit, 255);
+        DEVX_SET(qpc, qpc, primary_address_path.hop_limit,
+                 ah_attr.grh.hop_limit);
         DEVX_SET(qpc, qpc, primary_address_path.src_addr_index,
                  ah_attr.grh.sgid_index);
         DEVX_SET(qpc, qpc, primary_address_path.udp_sport, ah_attr.dlid);

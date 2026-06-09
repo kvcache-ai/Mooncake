@@ -207,7 +207,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
 
-    static int access_rights = kBaseAccessRights;
+    int access_rights = kBaseAccessRights;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
@@ -375,7 +375,7 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
     // Store RDMA server name for dual-NIC setups; when it differs from
@@ -400,6 +400,34 @@ int RdmaTransport::allocateLocalSegmentID() {
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
+}
+
+int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
+                                          uint16_t lid,
+                                          const std::string &gid) {
+    std::lock_guard<std::mutex> guard(local_desc_lock_);
+    auto original_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!original_desc) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+    auto updated_desc = std::make_shared<SegmentDesc>(*original_desc);
+    for (auto &device : updated_desc->devices) {
+        if (device.name != device_name) continue;
+        device.lid = lid;
+        device.gid = gid;
+        metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                                   std::move(updated_desc));
+        int ret = metadata_->updateLocalSegmentDesc();
+        if (ret) {
+            auto rollback_desc = original_desc;
+            metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                                       std::move(rollback_desc));
+        }
+        return ret;
+    }
+
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 int RdmaTransport::registerLocalMemoryBatch(

@@ -203,8 +203,10 @@ notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {
     std::vector<TransferMetadata::NotifyDesc> notifies_desc;
     native->getNotifies(notifies_desc);
     *size = notifies_desc.size();
+    if (*size == 0) return nullptr;
     notify_msg_t *notifies =
         (notify_msg_t *)malloc(*size * sizeof(notify_msg_t));
+    if (!notifies) return nullptr;
     memset(notifies, 0, *size * sizeof(notify_msg_t));
     for (int i = 0; i < *size; i++) {
         notifies[i].name = (char *)malloc(notifies_desc[i].name.size() + 1);

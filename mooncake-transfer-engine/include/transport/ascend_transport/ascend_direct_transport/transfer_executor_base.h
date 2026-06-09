@@ -93,6 +93,7 @@ class TransferExecutorBase {
     void cleanupConnections();
     void finalizeEngines();
     void disconnectAllForEngine(size_t engine_idx);
+    void recordConnectedSegment(size_t engine_idx, const std::string& remote);
 
     int checkAndConnect(size_t engine_idx,
                         const std::string& target_adxl_engine_name);

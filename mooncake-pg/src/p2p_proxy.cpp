@@ -1,15 +1,13 @@
 #include <memory>
 #include <mutex>
 #include <p2p_proxy.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <thread>
-#include "cuda_alike.h"
 #include "memory_location.h"
 #include "pg_utils.h"
 
