@@ -80,7 +80,7 @@ class RealClientTest : public ::testing::Test {
                                              ? FLAGS_device_name
                                              : std::string("");
         ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         128 * 1024 * 1024, 128 * 1024 * 1024,
                                          FLAGS_protocol, rdma_devices,
                                          master_address_),
                   0);
@@ -243,7 +243,7 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -285,7 +285,7 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -445,7 +445,7 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
 TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
-    const size_t segment_size = 16 * 1024 * 1024;
+    const size_t segment_size = 128 * 1024 * 1024;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl_)
                                   .build()))
@@ -712,7 +712,7 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
     ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     128 * 1024 * 1024, 128 * 1024 * 1024,
                                      FLAGS_protocol, rdma_devices,
                                      master_address_, transfer_engine),
               0);
@@ -742,7 +742,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -818,7 +818,7 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -867,8 +867,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     // Setup client 1
     const std::string client1_addr = "localhost:17813";
     ASSERT_EQ(
-        py_client_->setup_real(client1_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
-                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+        py_client_->setup_real(client1_addr, "P2PHANDSHAKE", 128 * 1024 * 1024,
+                               128 * 1024 * 1024, FLAGS_protocol, rdma_devices,
                                master_address_),
         0);
 
@@ -876,8 +876,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     auto py_client2 = RealClient::create();
     const std::string client2_addr = "localhost:17814";
     ASSERT_EQ(
-        py_client2->setup_real(client2_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
-                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+        py_client2->setup_real(client2_addr, "P2PHANDSHAKE", 128 * 1024 * 1024,
+                               128 * 1024 * 1024, FLAGS_protocol, rdma_devices,
                                master_address_),
         0);
 
@@ -944,8 +944,8 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     auto result = py_client_->setup_internal(config);
     ASSERT_FALSE(result.has_value()) << "Setup with empty config should fail";
 
-    config = MakeConfigDict("localhost:17813", std::to_string(16 * 1024 * 1024),
-                            std::to_string(16 * 1024 * 1024));
+    config = MakeConfigDict("localhost:17813", std::to_string(128 * 1024 * 1024),
+                            std::to_string(128 * 1024 * 1024));
 
     result = py_client_->setup_internal(config);
     ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
@@ -1028,7 +1028,7 @@ TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
                                          ? FLAGS_device_name
                                          : std::string("");
     int result = py_client_->setup_real(
-        "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+        "localhost:17813", "P2PHANDSHAKE", 128 * 1024 * 1024, 128 * 1024 * 1024,
         FLAGS_protocol, rdma_devices, "192.0.2.1:1");
     EXPECT_NE(result, 0) << "Setup with unreachable master should fail";
 
@@ -1037,13 +1037,13 @@ TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
     master_address_ = master_.master_address();
 
     result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                                    16 * 1024 * 1024, 16 * 1024 * 1024,
+                                    128 * 1024 * 1024, 128 * 1024 * 1024,
                                     "invalid_protocol", "", master_address_);
     EXPECT_NE(result, 0) << "Setup with invalid protocol should fail";
 
     // Case 3: Setup with empty hostname
-    result = py_client_->setup_real("", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                                    16 * 1024 * 1024, FLAGS_protocol,
+    result = py_client_->setup_real("", "P2PHANDSHAKE", 128 * 1024 * 1024,
+                                    128 * 1024 * 1024, FLAGS_protocol,
                                     rdma_devices, master_address_);
     EXPECT_NE(result, 0) << "Setup with empty hostname should fail";
 }
@@ -1088,7 +1088,7 @@ TEST_F(RealClientTest, ErrGetNonExistentKey) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1135,7 +1135,7 @@ TEST_F(RealClientTest, ErrGetAfterRemove) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1174,7 +1174,7 @@ TEST_F(RealClientTest, ErrDuplicatePutSameKey) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1214,7 +1214,7 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1257,7 +1257,7 @@ TEST_F(RealClientTest, UpsertBasic) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1296,7 +1296,7 @@ TEST_F(RealClientTest, UpsertFrom) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1342,7 +1342,7 @@ TEST_F(RealClientTest, UpsertParts) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1393,7 +1393,7 @@ TEST_F(RealClientTest, BatchUpsertFrom) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 
@@ -1445,7 +1445,7 @@ TEST_F(RealClientTest, UpsertBatch) {
                                          : std::string("");
     ASSERT_EQ(
         py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               128 * 1024 * 1024, 128 * 1024 * 1024,
                                FLAGS_protocol, rdma_devices, master_address_),
         0);
 

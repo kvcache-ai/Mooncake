@@ -109,7 +109,7 @@ class StorageBackendE2ETest : public ::testing::Test {
     // ----- client helpers -----
 
     std::shared_ptr<ClientTestWrapper> CreateClient(
-        int port_offset, size_t segment_size = 16 * 1024 * 1024) {
+        int port_offset, size_t segment_size = 128 * 1024 * 1024) {
         std::string hostname =
             "127.0.0.1:" + std::to_string(kClientPortBase + port_offset);
         auto opt = ClientTestWrapper::CreateClientWrapper(
@@ -247,8 +247,8 @@ TEST_F(StorageBackendE2ETest, DiskOnlyReadAfterEviction) {
     opts.default_kv_lease_ttl = 1000;
     StartMaster(opts);
 
-    // Client segment size must be at least 16MB (slab size).
-    constexpr size_t kSegment = 16 * 1024 * 1024;
+    // Client segment size must be at least 64MB (slab size).
+    constexpr size_t kSegment = 128 * 1024 * 1024;
     constexpr size_t kValueSize = 256 * 1024;
     constexpr int kSeedCount = 4;
     constexpr int kPressureCount = 12;

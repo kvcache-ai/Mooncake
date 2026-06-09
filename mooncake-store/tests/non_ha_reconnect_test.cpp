@@ -42,7 +42,7 @@ TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
         MasterMetricManager::instance().get_ping_requests();
     EXPECT_EQ(ping_without_mount, ping_before);
 
-    size_t ram_buffer_size = 16 * 1024 * 1024;
+    size_t ram_buffer_size = 128 * 1024 * 1024;
     void* seg_ptr = allocate_buffer_allocator_memory(ram_buffer_size);
     ASSERT_NE(seg_ptr, nullptr);
 
@@ -115,7 +115,7 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     ASSERT_TRUE(client_opt.has_value());
     auto client = client_opt.value();
 
-    size_t ram_buffer_size = 16 * 1024 * 1024;  // 16MB
+    size_t ram_buffer_size = 128 * 1024 * 1024;  // 16MB
     void* seg_ptr = allocate_buffer_allocator_memory(ram_buffer_size);
     ASSERT_NE(seg_ptr, nullptr);
     auto mount_res = client->MountSegment(seg_ptr, ram_buffer_size);

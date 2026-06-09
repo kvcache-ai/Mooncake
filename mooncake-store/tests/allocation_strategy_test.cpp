@@ -55,7 +55,7 @@ class AllocationStrategyParameterizedTest
     // Using segment_name as transport_endpoint for simplicity
     std::shared_ptr<BufferAllocatorBase> CreateTestAllocator(
         const std::string& segment_name, size_t base_offset,
-        size_t size = 64 * MiB) {
+        size_t size = 256 * MiB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         switch (allocator_type_) {
             case BufferAllocatorType::CACHELIB:
@@ -250,7 +250,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     std::vector<std::vector<Replica>> results;
     // Allocate multiple times to fill up the preferred allocator
     for (int i = 0; i < 4; ++i) {
-        size_t large_slice = 15 * 1024 * 1024;  // 15MB
+        size_t large_slice = 60 * 1024 * 1024;  // 60MB
         auto large_result = strategy_->Allocate(allocator_manager, large_slice,
                                                 1, preferred_segments, {});
         ASSERT_TRUE(large_result.has_value());
@@ -263,7 +263,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     }
 
     // Now try to allocate more than remaining space in preferred segment
-    size_t small_slice = 5 * 1024 * 1024;  // 5MB
+    size_t small_slice = 20 * 1024 * 1024;  // 20MB
     auto result = strategy_->Allocate(allocator_manager, small_slice, 1,
                                       preferred_segments, {});
     ASSERT_TRUE(result.has_value());
@@ -285,11 +285,11 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     allocator_manager.addAllocator("segment2", allocator2);
 
     // Fill up both allocators
-    size_t large_slice = 15 * 1024 * 1024;  // 15MB
+    size_t large_slice = 60 * 1024 * 1024;  // 60MB
     // Store the results of the allocations to avoid deallocation of the buffers
     // before the test is done
     std::vector<std::vector<Replica>> results;
-    // Allocate 8 times to use 120MB total
+    // Allocate 8 times to use 480MB total
     for (int i = 0; i < 8; ++i) {
         auto result =
             strategy_->Allocate(allocator_manager, large_slice, 1, {}, {});
@@ -298,7 +298,7 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     }
 
     // Try to allocate more than remaining space
-    size_t impossible_slice = 5 * 1024 * 1024;  // 5MB (more than remaining)
+    size_t impossible_slice = 20 * 1024 * 1024;  // 20MB (more than remaining)
     auto result =
         strategy_->Allocate(allocator_manager, impossible_slice, 1, {}, {});
     EXPECT_FALSE(result.has_value());
@@ -568,8 +568,8 @@ TEST_P(AllocationStrategyParameterizedTest,
 
     const auto kNumSegments = 3;
     // Different sized segments to test utilization ratio balancing
-    std::array<size_t, kNumSegments> kSegmentSizes = {32 * MiB, 64 * MiB,
-                                                      128 * MiB};
+    std::array<size_t, kNumSegments> kSegmentSizes = {128 * MiB, 256 * MiB,
+                                                      512 * MiB};
 
     AllocatorManager allocator_manager;
     for (size_t i = 0; i < kNumSegments; i++) {
