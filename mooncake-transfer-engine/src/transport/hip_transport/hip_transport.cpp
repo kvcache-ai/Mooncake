@@ -27,6 +27,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "environ.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -360,13 +361,9 @@ static int getNumEvents() {
 static bool supportFabricMem() {
     // By default, use IPC mode. Fabric memory is enabled only when
     // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
-    const char* hip_ipc = getenv("MC_USE_HIP_IPC");
-    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
-
-    bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
-                          (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
-
-    if (!fabric_enabled) {
+    bool hip_ipc = Environ::Get().GetUseHipIpc();
+    bool nvlink_fabric = Environ::Get().GetNvlinkFabricMemEnabled();
+    if (hip_ipc && !nvlink_fabric) {
         return false;
     }
 

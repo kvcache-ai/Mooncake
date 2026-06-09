@@ -73,6 +73,7 @@ setup(
             include_dirs=[
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
+                os.path.join(current_dir, "../mooncake-common/include"),
             ],
             sources=[
                 "src/pg_py.cpp",

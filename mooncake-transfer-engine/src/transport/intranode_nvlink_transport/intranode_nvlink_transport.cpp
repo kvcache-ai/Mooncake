@@ -29,6 +29,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "error.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -677,3 +678,100 @@ void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) {
 }
 
 }  // namespace mooncake
+
+#else
+
+namespace mooncake {
+
+IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {}
+
+IntraNodeNvlinkTransport::~IntraNodeNvlinkTransport() {}
+
+int IntraNodeNvlinkTransport::install(
+    std::string &local_server_name, std::shared_ptr<TransferMetadata> metadata,
+    std::shared_ptr<Topology> topology) {
+    (void)local_server_name;
+    (void)metadata;
+    (void)topology;
+    LOG(ERROR) << "IntraNodeNvlinkTransport requires USE_CUDA=ON";
+    return ERR_NOT_IMPLEMENTED;
+}
+
+Status IntraNodeNvlinkTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest> &entries) {
+    (void)batch_id;
+    (void)entries;
+    return Status::NotImplemented(
+        "IntraNodeNvlinkTransport requires USE_CUDA=ON");
+}
+
+Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
+                                                   size_t task_id,
+                                                   TransferStatus &status) {
+    (void)batch_id;
+    (void)task_id;
+    (void)status;
+    return Status::NotImplemented(
+        "IntraNodeNvlinkTransport requires USE_CUDA=ON");
+}
+
+Status IntraNodeNvlinkTransport::submitTransferTask(
+    const std::vector<TransferTask *> &task_list) {
+    (void)task_list;
+    return Status::NotImplemented(
+        "IntraNodeNvlinkTransport requires USE_CUDA=ON");
+}
+
+int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
+                                                  const std::string &location,
+                                                  bool remote_accessible,
+                                                  bool update_metadata) {
+    (void)addr;
+    (void)length;
+    (void)location;
+    (void)remote_accessible;
+    (void)update_metadata;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
+                                                    bool update_metadata) {
+    (void)addr;
+    (void)update_metadata;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int IntraNodeNvlinkTransport::registerLocalMemoryBatch(
+    const std::vector<Transport::BufferEntry> &buffer_list,
+    const std::string &location) {
+    (void)buffer_list;
+    (void)location;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int IntraNodeNvlinkTransport::unregisterLocalMemoryBatch(
+    const std::vector<void *> &addr_list) {
+    (void)addr_list;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
+                                                          uint64_t length,
+                                                          uint64_t target_id) {
+    (void)dest_addr;
+    (void)length;
+    (void)target_id;
+    return ERR_NOT_IMPLEMENTED;
+}
+
+void *IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size_t size) {
+    (void)size;
+    LOG(ERROR) << "IntraNodeNvlinkTransport requires USE_CUDA=ON";
+    return nullptr;
+}
+
+void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) { (void)ptr; }
+
+}  // namespace mooncake
+
+#endif

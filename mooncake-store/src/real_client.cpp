@@ -24,6 +24,7 @@
 #include "client_buffer.hpp"
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"

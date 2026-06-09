@@ -27,6 +27,7 @@
 #include <regex>
 
 #include "common.h"
+#include "environ.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -41,11 +42,11 @@ CxlTransport::CxlTransport() {
     // cxl_dev_path = "/dev/dax0.0";
     // cxl_dev_size = 1024 * 1024 * 1024;
     // get from env
-    const char *env_cxl_dev_path = std::getenv("MC_CXL_DEV_PATH");
+    std::string env_cxl_dev_path = Environ::Get().GetCxlDevPath();
 
-    if (env_cxl_dev_path) {
+    if (!env_cxl_dev_path.empty()) {
         LOG(INFO) << "MC_CXL_DEV_PATH: " << env_cxl_dev_path;
-        cxl_dev_path = (char *)env_cxl_dev_path;
+        cxl_dev_path = env_cxl_dev_path;
         cxl_dev_size = cxlGetDeviceSize();
     }
 }
@@ -60,13 +61,13 @@ CxlTransport::~CxlTransport() {
 
 size_t CxlTransport::cxlGetDeviceSize() {
     // for now, get cxl_shm size from env
-    const char *env_cxl_dev_size = std::getenv("MC_CXL_DEV_SIZE");
+    std::string env_cxl_dev_size = Environ::Get().GetCxlDevSize();
 
-    if (env_cxl_dev_size) {
+    if (!env_cxl_dev_size.empty()) {
         LOG(INFO) << "MC_CXL_DEV_SIZE: " << env_cxl_dev_size;
         char *end = nullptr;
-        unsigned long long val = strtoull(env_cxl_dev_size, &end, 10);
-        if (end != env_cxl_dev_size && *end == '\0')
+        unsigned long long val = strtoull(env_cxl_dev_size.c_str(), &end, 10);
+        if (end != env_cxl_dev_size.c_str() && *end == '\0')
             return static_cast<size_t>(val);
     } else {
         // try to read dev size from sys
@@ -75,8 +76,7 @@ size_t CxlTransport::cxlGetDeviceSize() {
         std::regex dax_pattern(R"(dax\d+\.\d+)");
         std::smatch match;
         std::string dev_name;
-        std::string str_cxl_dev_path = std::string(cxl_dev_path);
-        if (std::regex_search(str_cxl_dev_path, match, dax_pattern)) {
+        if (std::regex_search(cxl_dev_path, match, dax_pattern)) {
             dev_name = match.str();
         } else {
             LOG(ERROR) << "Can not find CXL device name in path: "
@@ -167,11 +167,11 @@ bool CxlTransport::isAddressInCxlRange(void *addr) {
 }
 
 int CxlTransport::cxlDevInit() {
-    if (!cxl_dev_path || !cxl_dev_size) {
+    if (cxl_dev_path.empty() || !cxl_dev_size) {
         LOG(ERROR) << "CxlTransport: cxl_dev_path or cxl_dev_size is null.";
         return -1;
     }
-    int fd = open(cxl_dev_path, O_RDWR);
+    int fd = open(cxl_dev_path.c_str(), O_RDWR);
     if (fd == -1) {
         LOG(ERROR) << "CxlTransport: Cannot open cxl device."
                    << strerror(errno);

@@ -1,47 +1,51 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake-transfer-engine)
 
-if (NOT GLOBAL_CONFIG)
-  if (USE_ETCD)
-    message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
+if(NOT GLOBAL_CONFIG)
+  if(USE_ETCD)
+    message(
+      FATAL_ERROR
+        "Cannot enable USE_ETCD while building transfer engine independently")
   endif()
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
-  # Build asio_shared in mooncake-common for standalone builds.
   # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-  add_subdirectory(../mooncake-common/src
-                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
+
+  # Build mooncake_common for standalone transfer engine build. mooncake-common
+  # also defines asio_shared, so add it only once.
+  add_subdirectory(../mooncake-common
+                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common)
 endif() # GLOBAL_CONFIG
 
-if (USE_ASCEND)
+if(USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
 
-  include_directories(/usr/local/include
-                      /usr/include
-                      ${ASCEND_INCLUDE_DIR}
-                      ${ASCEND_INCLUDE_DIR}/hccl
-                      ${ASCEND_INCLUDE_DIR}/experiment
-                      ${ASCEND_INCLUDE_DIR}/experiment/hccl
-                      ${ASCEND_INCLUDE_DIR}/experiment/slog/toolchain
-                      ${ASCEND_INCLUDE_DIR}/experiment/metadef/common/util/error_manager
-                      ${ASCEND_INCLUDE_DIR}/experiment/runtime
-                      ${ASCEND_INCLUDE_DIR}/experiment/msprof
-                      ${MPI_INCLUDE_DIR}
-                      /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/
-                      )
+  include_directories(
+    /usr/local/include
+    /usr/include
+    ${ASCEND_INCLUDE_DIR}
+    ${ASCEND_INCLUDE_DIR}/hccl
+    ${ASCEND_INCLUDE_DIR}/experiment
+    ${ASCEND_INCLUDE_DIR}/experiment/hccl
+    ${ASCEND_INCLUDE_DIR}/experiment/slog/toolchain
+    ${ASCEND_INCLUDE_DIR}/experiment/metadef/common/util/error_manager
+    ${ASCEND_INCLUDE_DIR}/experiment/runtime
+    ${ASCEND_INCLUDE_DIR}/experiment/msprof
+    ${MPI_INCLUDE_DIR}
+    /usr/local/Ascend/ascend-toolkit/latest/tools/hccl_test/common/src/)
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if(USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
-  include_directories(/usr/local/include
-                      /usr/include
-                      ${ASCEND_INCLUDE_DIR})
+  include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
 endif()
 
 include_directories(../mooncake-common/include)
@@ -49,30 +53,35 @@ include_directories(include)
 add_subdirectory(include)
 add_subdirectory(src)
 
-if (BUILD_UNIT_TESTS)
+if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)
 endif()
 
-if (BUILD_EXAMPLES)
+if(BUILD_EXAMPLES)
   add_subdirectory(example)
 endif()
 
-if (WITH_RUST_EXAMPLE)
+if(WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
-# is now a runtime environment variable, always build when GPU support is present.
-if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA)
+# Non-peermem requires cuMem allocated memory pointers; since
+# WITH_NVIDIA_PEERMEM is now a runtime environment variable, always build when
+# GPU support is present.
+if(USE_MNNVL
+   OR USE_CUDA
+   OR USE_HIP
+   OR USE_MUSA
+   OR USE_MACA)
   add_subdirectory(nvlink-allocator)
 endif()
 
 # Build ubshmem allocator for Huawei NPU fabric memory
-if (USE_UBSHMEM)
+if(USE_UBSHMEM)
   add_subdirectory(ubshmem-allocator)
 endif()
 
-if (USE_TENT)
+if(USE_TENT)
   add_subdirectory(tent)
 endif()
 

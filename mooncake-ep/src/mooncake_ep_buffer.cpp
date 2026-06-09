@@ -1,16 +1,14 @@
 #include <mooncake_ep_buffer.h>
 #include <arpa/inet.h>
 #include <glog/logging.h>
+#include "environ.h"
 
 namespace mooncake {
 
 // Check if all GPUs support fabric memory handles (MNNVL).
 // Mirrors the check in nvlink_transport.cpp.
 static bool supportFabricMem() {
-    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
-
-    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
-    if (!fabric_enabled) return false;
+    if (!Environ::Get().GetNvlinkFabricMemEnabled()) return false;
 
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);

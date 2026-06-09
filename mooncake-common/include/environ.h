@@ -33,6 +33,7 @@ class Environ {
     int GetHandshakeListenBacklog() const { return handshake_listen_backlog_; }
     int GetHandshakeMaxLength() const { return handshake_max_length_; }
     std::string GetLogDir() const { return log_dir_; }
+    std::string GetRedisUsername() const { return redis_username_; }
     std::string GetRedisPassword() const { return redis_password_; }
     int GetRedisDbIndex() const { return redis_db_index_; }
     int GetFragmentRatio() const { return fragment_ratio_; }
@@ -49,6 +50,54 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
+    std::string GetCustomTopoJson() const { return custom_topo_json_; }
+    uint64_t GetMaxMrSize() const { return max_mr_size_; }
+    std::string GetCxlDevPath() const {
+        return GetString("MC_CXL_DEV_PATH", cxl_dev_path_);
+    }
+    std::string GetCxlDevSize() const {
+        return GetString("MC_CXL_DEV_SIZE", cxl_dev_size_);
+    }
+    bool GetDisableGpuDirectRdma() const { return disable_gpu_direct_rdma_; }
+    bool GetEnableMnnvl() const { return enable_mnnvl_; }
+    int GetHandshakePort() const { return handshake_port_; }
+    int GetHipNumEvents() const { return hip_num_events_; }
+    int GetHipNumStreams() const { return hip_num_streams_; }
+    bool GetIntranodeNvlink() const { return intranode_nvlink_; }
+    bool GetLegacyRpcPortBinding() const { return legacy_rpc_port_binding_; }
+    std::string GetMetadataClusterId() const { return metadata_cluster_id_; }
+    size_t GetMinRegSize() const { return min_reg_size_; }
+    std::string GetMsAutoDisc() const {
+        return GetString("MC_MS_AUTO_DISC", ms_auto_disc_);
+    }
+    std::string GetMsFilters() const { return ms_filters_; }
+    std::string GetRpcProtocol() const { return rpc_protocol_; }
+    int GetSliceTimeout() const { return slice_timeout_; }
+    std::string GetStoreClientMetric() const { return store_client_metric_; }
+    int GetStoreClientMetricInterval() const {
+        return store_client_metric_interval_;
+    }
+    std::string GetStoreClusterId() const { return store_cluster_id_; }
+    std::string GetStoreHugepageSize() const { return store_hugepage_size_; }
+    std::string GetStoreMemcpy() const { return store_memcpy_; }
+    std::string GetStoreUseHugepage() const { return store_use_hugepage_; }
+    std::string GetTcpBindAddress() const { return tcp_bind_address_; }
+    std::string GetTeMetric() const { return te_metric_; }
+    int GetTeMetricIntervalSeconds() const {
+        return te_metric_interval_seconds_;
+    }
+    std::string GetTentConf() const { return tent_conf_; }
+    int GetTransferTimeout() const { return transfer_timeout_; }
+    bool GetUseHipIpc() const { return use_hip_ipc_; }
+    bool GetUseNvlinkIpc() const { return use_nvlink_ipc_; }
+    // Returns true only when MC_USE_NVLINK_IPC is explicitly set to "0",
+    // which opts in to fabric-memory mode on MNNVL clusters.
+    bool GetNvlinkFabricMemEnabled() const {
+        return use_nvlink_ipc_raw_ == "0";
+    }
+    bool GetUseTent() const { return use_tent_; }
+    bool GetUseTev1() const { return use_tev1_; }
+    std::string GetYltLogLevel() const { return ylt_log_level_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
 
@@ -87,6 +136,7 @@ class Environ {
     int handshake_listen_backlog_;
     int handshake_max_length_;
     std::string log_dir_;
+    std::string redis_username_;
     std::string redis_password_;
     int redis_db_index_;
     int fragment_ratio_;
@@ -101,6 +151,40 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    std::string custom_topo_json_;
+    uint64_t max_mr_size_;
+    std::string cxl_dev_path_;
+    std::string cxl_dev_size_;
+    bool disable_gpu_direct_rdma_;
+    bool enable_mnnvl_;
+    int handshake_port_;
+    int hip_num_events_;
+    int hip_num_streams_;
+    bool intranode_nvlink_;
+    bool legacy_rpc_port_binding_;
+    std::string metadata_cluster_id_;
+    size_t min_reg_size_;
+    std::string ms_auto_disc_;
+    std::string ms_filters_;
+    std::string rpc_protocol_;
+    int slice_timeout_;
+    std::string store_client_metric_;
+    int store_client_metric_interval_;
+    std::string store_cluster_id_;
+    std::string store_hugepage_size_;
+    std::string store_memcpy_;
+    std::string store_use_hugepage_;
+    std::string tcp_bind_address_;
+    std::string te_metric_;
+    int te_metric_interval_seconds_;
+    std::string tent_conf_;
+    int transfer_timeout_;
+    bool use_hip_ipc_;
+    bool use_nvlink_ipc_;
+    std::string use_nvlink_ipc_raw_;
+    bool use_tent_;
+    bool use_tev1_;
+    std::string ylt_log_level_;
     bool with_nvidia_peermem_;
     int efa_cq_threads_;
 };

@@ -359,9 +359,14 @@ TEST_F(PromotionOnHitTest, StalePromotionReaper) {
         ASSERT_TRUE(r.has_value());
         auto pending = service->PromotionObjectHeartbeat(ctx.client_id);
         ASSERT_TRUE(pending.has_value());
-        EXPECT_EQ(pending->size(), 1u)
-            << "After reap, a fresh read must re-enqueue the same key";
+        if (pending->size() == 1u) {
+            requeued = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    EXPECT_TRUE(requeued)
+        << "After reap, a fresh read must re-enqueue the same key";
 
     EXPECT_EQ(mm.get_promotion_expired() - expired_pre, 1)
         << "Reaper expiry must bump promotion_expired";

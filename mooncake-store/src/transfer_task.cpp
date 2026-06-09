@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include "environ.h"
 #include <sstream>
 #include <string>
 #include <vector>
@@ -918,26 +919,25 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    std::string env_value = Environ::Get().GetStoreMemcpy();
+    if (env_value.empty()) {
         memcpy_enabled_ = engine_.isTcpOnly();
         LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
                   << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
                                       : "non-TCP transport available, memcpy "
                                         "disabled");
     } else {
-        std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
-        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
+        std::transform(env_value.begin(), env_value.end(), env_value.begin(),
                        ::tolower);
-        if (env_str == "false" || env_str == "0" || env_str == "no" ||
-            env_str == "off") {
+        if (env_value == "false" || env_value == "0" || env_value == "no" ||
+            env_value == "off") {
             memcpy_enabled_ = false;
-        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
-                   env_str == "on") {
+        } else if (env_value == "true" || env_value == "1" ||
+                   env_value == "yes" || env_value == "on") {
             memcpy_enabled_ = true;
         } else {
-            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
+            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_value
                          << ", defaulting to enabled";
             memcpy_enabled_ = true;
         }
