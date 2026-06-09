@@ -41,13 +41,13 @@ std::optional<TensorIntoPlan> build_tensor_into_plan(
         return std::nullopt;
     }
 
-    auto region = resolve_registered_buffer_region(buffer_ptr, size, context);
+    auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
     if (!region.has_value()) {
         return std::nullopt;
     }
     if (region->offset + total_length > region->size) {
         LOG(ERROR) << context
-                   << ": resolved destination range exceeds registered region";
+                   << ": resolved destination range exceeds writable region";
         return std::nullopt;
     }
 
@@ -171,7 +171,7 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
         return std::nullopt;
     }
 
-    auto region = resolve_registered_buffer_region(buffer_ptr, size, context);
+    auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
     if (!region.has_value()) {
         return std::nullopt;
     }

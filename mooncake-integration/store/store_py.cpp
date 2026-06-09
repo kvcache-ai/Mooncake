@@ -11,11 +11,14 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "types.h"
+#include "memory_alloc.h"
+#include "ssd_register_client.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
 
 #include "integration_utils.h"
+#include "buffer_pool.h"
 #include "mooncake_log.h"
 
 // Forward declaration for EngramStore bindings
@@ -1138,24 +1141,25 @@ class MooncakeStorePyWrapper {
         return std::dynamic_pointer_cast<RealClient>(store_);
     }
 
-    std::optional<RealClient::RegisteredBufferRegion>
-    resolve_registered_buffer_region(uintptr_t buffer_ptr, size_t size,
-                                     const std::string &context) const {
+    std::optional<RealClient::WritableBufferRegion>
+    resolve_writable_buffer_region(uintptr_t buffer_ptr, size_t size,
+                                   const std::string &context) const {
         auto real_client = get_real_client();
         if (!real_client) {
             LOG(ERROR) << context << ": real client is not available";
             return std::nullopt;
         }
 
-        auto region = real_client->resolve_registered_buffer(
+        auto region = real_client->resolve_writable_buffer_region(
             reinterpret_cast<void *>(buffer_ptr));
         if (!region.has_value()) {
-            LOG(ERROR) << context << ": buffer is not registered";
+            LOG(ERROR) << context
+                       << ": buffer is not Store-managed writable memory";
             return std::nullopt;
         }
 
         if (region->offset + size > region->size) {
-            LOG(ERROR) << context << ": buffer range exceeds registered region";
+            LOG(ERROR) << context << ": buffer range exceeds writable region";
             return std::nullopt;
         }
 
@@ -1643,6 +1647,21 @@ class MooncakeHostMemAllocatorPyWrapper {
     ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
 };
 
+uintptr_t get_alloc_func_addr() {
+    return reinterpret_cast<uintptr_t>(&hugepage_memory_alloc);
+}
+
+uintptr_t get_free_func_addr() {
+    return reinterpret_cast<uintptr_t>(&hugepage_memory_free);
+}
+
+class MooncakeDistributedNoFRegisterPyWrapper {
+   public:
+    std::shared_ptr<NoFRegisterClient> register_{nullptr};
+
+    MooncakeDistributedNoFRegisterPyWrapper() = default;
+};
+
 PYBIND11_MODULE(store, m) {
     mooncake::InitMooncakeLogging("mooncake-store");
 
@@ -1664,10 +1683,13 @@ PYBIND11_MODULE(store, m) {
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
+        .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
+        .def_readwrite("preferred_nof_segments",
+                       &ReplicateConfig::preferred_nof_segments)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
@@ -1808,6 +1830,8 @@ PYBIND11_MODULE(store, m) {
             }
         });
 
+    bind_buffer_pool(m);
+
     py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
         .def(py::init<>())
         .def("alloc",
@@ -1874,6 +1898,29 @@ PYBIND11_MODULE(store, m) {
             })
         .def_readwrite("parallelism", &ReadTargetSpec::parallelism);
 
+    py::class_<MooncakeDistributedNoFRegisterPyWrapper>(
+        m, "MooncakeDistributedNoFRegister")
+        .def(py::init<>())
+        .def("real_register",
+             [](MooncakeDistributedNoFRegisterPyWrapper &self,
+                const std::string &nqn = "", size_t nsid = 1,
+                const std::string &traddr = "", size_t trsvcid = 4420,
+                uintptr_t base = 0x0, size_t size = 1024,
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 self.register_ = std::make_shared<NoFRegisterClient>();
+                 return self.register_->set_register(nqn, nsid, traddr, trsvcid,
+                                                     base, size,
+                                                     master_server_addr);
+             })
+        .def("real_unregister_by_endpoint",
+             [](MooncakeDistributedNoFRegisterPyWrapper &self,
+                const std::string &nqn = "", size_t nsid = 1,
+                const std::string &traddr = "", size_t trsvcid = 4420,
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 self.register_ = std::make_shared<NoFRegisterClient>();
+                 return self.register_->set_unregister_by_endpoint(
+                     nqn, nsid, traddr, trsvcid, master_server_addr);
+             });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from
@@ -2847,6 +2894,9 @@ PYBIND11_MODULE(store, m) {
         py::arg("node"),
         "Bind the current thread and memory allocation preference to the "
         "specified NUMA node");
+
+    m.def("get_alloc_func_addr", &get_alloc_func_addr);
+    m.def("get_free_func_addr", &get_free_func_addr);
 
     // Add EngramStore bindings
     mooncake::engram::bind_engram_store(m);

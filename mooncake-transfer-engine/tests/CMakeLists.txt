@@ -65,6 +65,10 @@ target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest gtest_main
 add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
 endif()
 
+add_executable(tcp_address_validation_test ${WORKSPACE}/tcp_address_validation_test.cpp)
+target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
+add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
+
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )

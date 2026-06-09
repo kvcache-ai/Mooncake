@@ -43,6 +43,28 @@ struct Notification {
 #define LOCAL_SEGMENT_ID (0ull)
 #endif
 
+enum TransportType : int {
+    UNSPEC = 0,
+    RDMA,
+    MNNVL,
+    SHM,
+    NVLINK,
+    GDS,
+    IOURING,
+    TCP,
+    AscendDirect,
+    SUNRISE_LINK,
+    // Sentinel: must remain the last enumerator.
+    kNumTransportTypes,
+};
+
+const static int kSupportedTransportTypes = (int)kNumTransportTypes;
+
+inline TransportType c_to_transport_hint(int v) {
+    if (v < 0 || v >= kSupportedTransportTypes) return UNSPEC;
+    return static_cast<TransportType>(v);
+}
+
 struct Request {
     enum OpCode { READ, WRITE };
     OpCode opcode;
@@ -54,6 +76,9 @@ struct Request {
         PRIO_HIGH;  // Request priority (PRIO_HIGH, PRIO_MEDIUM, PRIO_LOW)
     std::optional<std::string>
         policy_name;  // Optional: bind to specific policy by name
+    TransportType transport_hint =
+        UNSPEC;  // UNSPEC = follow policy; otherwise pin this request to the
+                 // name transport.
 };
 
 enum TransferStatusEnum {
@@ -79,20 +104,6 @@ enum Permission {
 
 using Location = std::string;
 const static std::string kWildcardLocation = "*";
-
-enum TransportType {
-    RDMA = 0,
-    MNNVL,
-    SHM,
-    NVLINK,
-    GDS,
-    IOURING,
-    TCP,
-    AscendDirect,
-    SUNRISE_LINK,
-    UNSPEC
-};
-const static int kSupportedTransportTypes = (int)TransportType::UNSPEC;
 
 struct MemoryOptions {
     Location location = kWildcardLocation;
