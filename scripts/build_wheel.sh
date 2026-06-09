@@ -185,6 +185,16 @@ elif [ "$CU13_BUILD" = "1" ]; then
     sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
     sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cuda13"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-cuda13"
+# Handle package name modification for CU12 builds
+elif [ "$CU12_BUILD" = "1" ]; then
+    echo "Modifying package name for CU12 build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda12"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 12 version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cuda12"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-cuda12"
 elif [ "$NPU_BUILD" = "1" ]; then
     echo "Modifying package name for Ascend NPU build"
     # Backup original pyproject.toml
