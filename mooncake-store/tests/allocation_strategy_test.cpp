@@ -326,7 +326,8 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
     AllocatorManager allocator_manager;
     allocator_manager.addAllocator("segment1", allocator);
 
-    size_t huge_slice = 100 * 1024 * 1024;  // 100MB (larger than 64MB capacity)
+    size_t huge_slice =
+        300 * 1024 * 1024;  // 300MB (larger than 256MB capacity)
 
     auto result = strategy_->Allocate(allocator_manager, huge_slice, 1, {}, {});
     EXPECT_FALSE(result.has_value());

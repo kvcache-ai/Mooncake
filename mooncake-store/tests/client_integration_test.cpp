@@ -1179,7 +1179,7 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
     const size_t kFillValueSize = 512 * 1024;  // 512KB
     auto fill_keys = FillSegmentUntilFull(
         test_client_, client_buffer_allocator_.get(), target_small_name,
-        kFillValueSize, /*num_keys=*/50);
+        kFillValueSize, /*num_keys=*/300);
 
     ASSERT_FALSE(fill_keys.empty())
         << "Failed to fill anything into target_small; test setup invalid";

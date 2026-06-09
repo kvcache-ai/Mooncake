@@ -976,7 +976,7 @@ TEST_F(RealClientTest, SetupWithConfigDictHumanReadableSizes) {
         << "Failed to start in-proc master";
     master_address_ = master_.master_address();
 
-    ConfigDict config = MakeConfigDict("localhost:17814", "16MB", "16 MB");
+    ConfigDict config = MakeConfigDict("localhost:17814", "128MB", "128 MB");
     auto result = py_client_->setup_internal(config);
     ASSERT_TRUE(result.has_value())
         << "Setup should accept human-readable size strings";

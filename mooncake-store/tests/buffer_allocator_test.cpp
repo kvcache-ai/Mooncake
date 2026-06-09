@@ -219,7 +219,7 @@ class SimpleAllocatorTest : public ::testing::Test {
 
 // Test basic memory allocation and deallocation
 TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     // Test basic allocation
@@ -240,7 +240,7 @@ TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
 
 // Test multiple allocations and deallocations
 TEST_F(SimpleAllocatorTest, MultipleAllocations) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     std::vector<std::pair<void*, size_t>> allocations;
@@ -263,7 +263,7 @@ TEST_F(SimpleAllocatorTest, MultipleAllocations) {
 
 // Test allocation request larger than available space
 TEST_F(SimpleAllocatorTest, AllocationTooLarge) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     void* ptr = allocator.allocate(total_size + 1);

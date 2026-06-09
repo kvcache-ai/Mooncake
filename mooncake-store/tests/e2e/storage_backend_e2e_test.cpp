@@ -247,11 +247,10 @@ TEST_F(StorageBackendE2ETest, DiskOnlyReadAfterEviction) {
     opts.default_kv_lease_ttl = 1000;
     StartMaster(opts);
 
-    // Client segment size must be at least 64MB (slab size).
     constexpr size_t kSegment = 128 * 1024 * 1024;
-    constexpr size_t kValueSize = 256 * 1024;
+    constexpr size_t kValueSize = 4 * 1024 * 1024;
     constexpr int kSeedCount = 4;
-    constexpr int kPressureCount = 12;
+    constexpr int kPressureCount = 10;
 
     auto client = CreateClient(
         /*port_offset=*/0, kSegment);
