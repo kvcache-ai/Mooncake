@@ -67,14 +67,22 @@ This repository also hosts its technical report and the open-sourced traces.
 
 getting_started/build
 getting_started/quick-start
-getting_started/supported-protocols
-getting_started/observability
+
+:::
+
+% Deployment docs
+
+:::{toctree}
+:caption: Deployment
+:maxdepth: 2
+
+deployment/mooncake-store-deployment-guide
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
-getting_started/examples/lmdeploy-integration-v0.9
-getting_started/plugin-usage/3FS-USRBIO-Plugin
+Mooncake x LMDeploy Integration<getting_started/examples/lmdeploy-integration-v0.9>
 :::
+
 
 % Making the most out of Mooncake
 
@@ -84,15 +92,7 @@ getting_started/plugin-usage/3FS-USRBIO-Plugin
 
 performance/vllm/index
 performance/sglang/index
-performance/sglang-benchmark-results-v1
-performance/vllm-benchmark-results-v0.2
-performance/vllm-benchmark-results-v1
-performance/sglang-hicache-benchmark-results-v1
-performance/vllm-v1-support-benchmark
-performance/allocator-benchmark-result
-performance/allocation-strategy-benchmark-result
-performance/ssd-offload-benchmark-results
-performance/storage-benchmark
+performance/mooncake/index
 :::
 
 % Explanation of Mooncake internals
@@ -111,7 +111,6 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
-design/conductor/indexer-api-design
 :::
 
 % API Documentation
@@ -135,15 +134,6 @@ troubleshooting/error-code
 troubleshooting/troubleshooting
 :::
 
-% Deployment docs
-
-:::{toctree}
-:caption: Deployment
-:maxdepth: 2
-
-deployment/mooncake-store-deployment-guide
-deployment/nvmf-ssd-deployment-guide
-:::
 
 % Community
 
