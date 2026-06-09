@@ -17,11 +17,12 @@ pip install mooncake-transfer-engine
 pip install mooncake-transfer-engine-non-cuda
 ```
 
+📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
+
 **Additional dependencies for the examples below:**
 ```bash
 pip install numpy pyzmq
 ```
-📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
 
