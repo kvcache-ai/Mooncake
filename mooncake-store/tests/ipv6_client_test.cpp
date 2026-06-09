@@ -236,8 +236,8 @@ TEST_F(IPv6ClientTest, BasicPutGetOverIPv6Loopback) {
 
     ASSERT_EQ(
         client_->setup_real(FLAGS_server_address, "P2PHANDSHAKE",
-                            128 * 1024 * 1024, 128 * 1024 * 1024, FLAGS_protocol,
-                            rdma_devices, master_address_),
+                            128 * 1024 * 1024, 128 * 1024 * 1024,
+                            FLAGS_protocol, rdma_devices, master_address_),
         0)
         << "Client setup should succeed with IPv6 address";
 
@@ -355,8 +355,8 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
 
     ASSERT_EQ(
         client_->setup_real(FLAGS_server_address, "P2PHANDSHAKE",
-                            128 * 1024 * 1024, 128 * 1024 * 1024, FLAGS_protocol,
-                            rdma_devices, master_address_),
+                            128 * 1024 * 1024, 128 * 1024 * 1024,
+                            FLAGS_protocol, rdma_devices, master_address_),
         0);
 
     // Prepare batch data

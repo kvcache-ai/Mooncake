@@ -944,8 +944,9 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     auto result = py_client_->setup_internal(config);
     ASSERT_FALSE(result.has_value()) << "Setup with empty config should fail";
 
-    config = MakeConfigDict("localhost:17813", std::to_string(128 * 1024 * 1024),
-                            std::to_string(128 * 1024 * 1024));
+    config =
+        MakeConfigDict("localhost:17813", std::to_string(128 * 1024 * 1024),
+                       std::to_string(128 * 1024 * 1024));
 
     result = py_client_->setup_internal(config);
     ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
