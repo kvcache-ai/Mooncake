@@ -132,8 +132,7 @@ class MasterServiceTest : public ::testing::Test {
         auto put_start =
             service.PutStart(client_id, key, tenant_id, slice_length, config);
         ASSERT_TRUE(put_start.has_value())
-            << "PutStart failed for key=" << key
-            << ", tenant_id=" << tenant_id
+            << "PutStart failed for key=" << key << ", tenant_id=" << tenant_id
             << ", error=" << toString(put_start.error());
         ASSERT_TRUE(
             service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
@@ -4327,9 +4326,9 @@ TEST_F(MasterServiceTest, BatchExistKeyGroupedAndIncompletePreservesOrder) {
     PutCompletedObject(*service_, client_id, completed_key, config);
 
     const std::string incomplete_key = "batch_incomplete_key";
-    ASSERT_TRUE(service_->PutStart(client_id, incomplete_key, "default", 1024,
-                                   config)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, incomplete_key, "default", 1024, config)
+            .has_value());
 
     const std::string missing_key = "batch_missing_key";
     std::vector<std::string> keys = {grouped_key_a, completed_key,
@@ -4367,15 +4366,16 @@ TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
     const std::string incomplete_key = "batch_tenant_incomplete";
     const std::string missing_key = "batch_tenant_missing";
 
-    PutCompletedObject(*service_, client_id, tenant_only_key, tenant_id, config);
+    PutCompletedObject(*service_, client_id, tenant_only_key, tenant_id,
+                       config);
     PutCompletedObject(*service_, client_id, default_only_key, config);
-    ASSERT_TRUE(service_->PutStart(client_id, incomplete_key, tenant_id, 1024,
-                                   config)
-                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, incomplete_key, tenant_id, 1024, config)
+            .has_value());
 
-    std::vector<std::string> tenant_keys = {
-        tenant_only_key, default_only_key, missing_key, incomplete_key,
-        tenant_only_key};
+    std::vector<std::string> tenant_keys = {tenant_only_key, default_only_key,
+                                            missing_key, incomplete_key,
+                                            tenant_only_key};
     auto tenant_resp = service_->BatchExistKey(tenant_keys, tenant_id);
     ASSERT_EQ(tenant_resp.size(), tenant_keys.size());
     EXPECT_TRUE(tenant_resp[0].value());
@@ -4411,16 +4411,14 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     std::vector<std::string> tenant_keys = {tenant_key_a, tenant_key_b};
     std::vector<uint64_t> tenant_sizes = {1024, 2048};
-    auto tenant_put_start =
-        service_.BatchPutStart(client_id, tenant_keys, tenant_sizes, config,
-                               tenant_id);
+    auto tenant_put_start = service_.BatchPutStart(
+        client_id, tenant_keys, tenant_sizes, config, tenant_id);
     ASSERT_EQ(tenant_put_start.size(), tenant_keys.size());
     for (const auto& result : tenant_put_start) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
-    auto tenant_put_end =
-        service_.BatchPutEnd(client_id, tenant_keys, ReplicaType::MEMORY,
-                             tenant_id);
+    auto tenant_put_end = service_.BatchPutEnd(client_id, tenant_keys,
+                                               ReplicaType::MEMORY, tenant_id);
     ASSERT_EQ(tenant_put_end.size(), tenant_keys.size());
     for (const auto& result : tenant_put_end) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -4429,8 +4427,9 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     auto default_put_start =
         service_.PutStart(client_id, default_only_key, 1024, config);
     ASSERT_TRUE(default_put_start.has_value());
-    ASSERT_TRUE(service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
-                    .has_value());
+    ASSERT_TRUE(
+        service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
+            .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();
@@ -4439,8 +4438,8 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     const auto base_partial = metrics.get_batch_exist_key_partial_successes();
     const auto base_failed_items = metrics.get_batch_exist_key_failed_items();
 
-    std::vector<std::string> lookup_keys = {
-        tenant_key_a, default_only_key, missing_key, tenant_key_b};
+    std::vector<std::string> lookup_keys = {tenant_key_a, default_only_key,
+                                            missing_key, tenant_key_b};
     auto resp = service_.BatchExistKey(lookup_keys, tenant_id);
     ASSERT_EQ(resp.size(), lookup_keys.size());
     EXPECT_TRUE(resp[0].value());
