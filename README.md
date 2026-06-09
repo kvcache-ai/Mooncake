@@ -341,13 +341,6 @@ cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=/usr/local/neuware
 make -j
 ```
 
-
-<h2 id="milestones"> 🛣️ Incoming Milestones</h2>
-
-- [x] First release of Mooncake and integrate with latest vLLM
-- [ ] Share KV caches across multiple serving engines
-- [ ] User and developer documentation
-
 <h2 id="trace">📦 Open Source Trace</h2>
 
 ```json
