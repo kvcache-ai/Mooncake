@@ -1,117 +1,74 @@
 """
 KVCache Storage Interface
 
-Defines the key-value interface for KVCache storage systems.
-This provides a clean abstraction for different storage backends.
+Simplified storage interface for KVCache benchmark.
+Key = page_id (int), Value = fixed-size bytes.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
-
-
-@dataclass
-class KVKey:
-    """Key for KVCache storage
-
-    Represents a unique identifier for a KVCache entry.
-    """
-    sequence_id: int      # Sequence identifier (hash_id)
-    layer_id: int         # Layer number (0 to num_layers-1)
-
-    def __hash__(self):
-        return hash((self.sequence_id, self.layer_id))
-
-    def __eq__(self, other):
-        if not isinstance(other, KVKey):
-            return False
-        return (self.sequence_id == other.sequence_id and
-                self.layer_id == other.layer_id)
-
-    def __repr__(self):
-        return f"KVKey(seq={self.sequence_id}, layer={self.layer_id})"
-
-
-@dataclass
-class KVValue:
-    """Value for KVCache storage
-
-    Contains the KV tensor data and metadata.
-    """
-    data: bytes           # Raw KV data bytes
-    page_count: int       # Number of pages
-    token_count: int      # Number of tokens
-
-    def size_bytes(self) -> int:
-        """Get size in bytes"""
-        return len(self.data)
+from typing import Dict, Any
 
 
 class Storage(ABC):
     """Abstract base class for KVCache storage
 
-    Manages key-value storage for KVCache entries.
-    Key: (sequence_id, layer_id)
-    Value: KV tensor data for that sequence and layer
+    Simplified design:
+    - Key: page_id (int, hash_id from trace)
+    - Value: fixed-size bytes (page_size)
+    - Direct mapping: page_id -> offset -> payload
 
-    Core operations: get, put, exists, delete.
+    Core operations: read, write, exists, delete.
     """
 
     @abstractmethod
-    def get(self, key: KVKey) -> Optional[KVValue]:
-        """Get KVCache value for a given key
+    def read(self, page_id: int, offset_in_page: int = 0, length: int = None) -> float:
+        """Read page from disk
 
         Args:
-            key: KVKey containing (sequence_id, layer_id)
+            page_id: Page ID (hash_id from trace)
+            offset_in_page: Offset within the page (default: 0)
+            length: Number of bytes to read (default: entire page)
 
         Returns:
-            KVValue if found, None otherwise
+            Read latency in milliseconds
         """
         pass
 
     @abstractmethod
-    def put(self, key: KVKey, value: KVValue) -> None:
-        """Store KVCache value for a given key
+    def write(self, page_id: int, offset_in_page: int = 0, length: int = None) -> float:
+        """Write page to disk
 
         Args:
-            key: KVKey containing (sequence_id, layer_id)
-            value: KVValue to store
+            page_id: Page ID (hash_id from trace)
+            offset_in_page: Offset within the page (default: 0)
+            length: Number of bytes to write (default: entire page)
+
+        Returns:
+            Write latency in milliseconds
         """
         pass
 
     @abstractmethod
-    def exists(self, key: KVKey) -> bool:
-        """Check if KVCache entry exists
+    def exists(self, page_id: int) -> bool:
+        """Check if page exists
 
         Args:
-            key: KVKey containing (sequence_id, layer_id)
+            page_id: Page ID (hash_id from trace)
 
         Returns:
-            True if exists, False otherwise
+            True if page_id is within valid range
         """
         pass
 
     @abstractmethod
-    def delete(self, key: KVKey) -> bool:
-        """Delete KVCache entry
+    def delete(self, page_id: int) -> bool:
+        """Delete page (no-op in direct mapping)
 
         Args:
-            key: KVKey containing (sequence_id, layer_id)
+            page_id: Page ID to delete
 
         Returns:
-            True if deleted, False if not found
-        """
-        pass
-
-    @abstractmethod
-    def get_sequence_keys(self, sequence_id: int) -> list[KVKey]:
-        """Get all keys for a sequence
-
-        Args:
-            sequence_id: Sequence identifier
-
-        Returns:
-            List of KVKeys for all layers of the sequence
+            True (always succeeds in direct mapping)
         """
         pass
 

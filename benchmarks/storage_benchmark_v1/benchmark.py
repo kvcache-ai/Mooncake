@@ -7,16 +7,16 @@ Complete benchmark tool with CLI interface.
 
 import argparse
 import json
-import os
 import sys
 import time
 import statistics
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Dict, Any
 
-from storage import SSDStorage
-from layout import KVLayout, get_model_config, create_layout
+from storage import DiskHashTable
+from layout import get_model_config, create_layout
 
 
 # ============================================================================
@@ -25,7 +25,7 @@ from layout import KVLayout, get_model_config, create_layout
 
 @dataclass
 class KVCacheRequest:
-    """KVCache request"""
+    """KVCache request from trace"""
     timestamp: float
     hash_ids: List[int]
     input_length: int
@@ -42,25 +42,21 @@ class TraceReplay:
     def __init__(self, trace_path: str):
         self.trace_path = trace_path
 
-    def replay(self) -> Iterator[dict]:
-        """Replay trace workload"""
+    def load_all(self) -> List[KVCacheRequest]:
+        """Load all requests from trace file"""
+        requests = []
         with open(self.trace_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    yield json.loads(line)
-
-    def load_all(self) -> List[KVCacheRequest]:
-        """Load all requests"""
-        return [
-            KVCacheRequest(
-                timestamp=req.get('timestamp', 0),
-                hash_ids=req.get('hash_ids', []),
-                input_length=req.get('input_length', 0),
-                output_length=req.get('output_length', 0),
-            )
-            for req in self.replay()
-        ]
+                    req = json.loads(line)
+                    requests.append(KVCacheRequest(
+                        timestamp=req.get('timestamp', 0),
+                        hash_ids=req.get('hash_ids', []),
+                        input_length=req.get('input_length', 0),
+                        output_length=req.get('output_length', 0),
+                    ))
+        return requests
 
 
 # ============================================================================
@@ -70,47 +66,29 @@ class TraceReplay:
 class StorageBenchmark:
     """KVCache storage benchmark
 
-    Uses KVLayout interface to support different architectures.
-    - MLA: Each (sequence_id, layer_id) pair maps to ONE complete entry
-    - Future: Other architectures can be added by implementing KVLayout
+    Processes KVCache requests using layout-generated access patterns.
     """
 
-    def __init__(self, storage_dir: str, model_config: dict = None,
-                 layout: KVLayout = None,
-                 page_size_tokens: int = 64,
+    def __init__(self, storage_dir: str, model_config: dict,
+                 page_size_tokens: int = 512,
                  max_pages: int = 100000,
                  fsync_mode: str = 'none', fsync_batch_size: int = 100):
         """Initialize benchmark
 
         Args:
             storage_dir: Directory for storage files
-            model_config: Model configuration dict (used if layout not provided)
-            layout: KVLayout instance (overrides model_config if provided)
-            page_size_tokens: Tokens per page (default 64)
-            max_pages: Maximum number of pages to store
+            model_config: Model configuration dict
+            page_size_tokens: Tokens per page (default: 512)
+            max_pages: Maximum number of pages
             fsync_mode: When to fsync ('none', 'batch', 'always', 'end')
             fsync_batch_size: Number of writes between fsync in batch mode
         """
-        if layout is None:
-            if model_config is None:
-                # Use default model config
-                model_config = get_model_config("glm5")
-            self.model_config = model_config
-            self.layout = create_layout(model_config, page_size_tokens)
-        else:
-            self.layout = layout
-            self.model_config = model_config or {}
-
-        # Get layout metadata
-        self.num_layers = self._get_num_layers()
-        self.has_indexer = self._get_has_indexer()
-
-        # Get page size from layout
-        # All KVLayout implementations must provide value_size_bytes
+        self.model_config = model_config
+        self.layout = create_layout(model_config, page_size_tokens)
         self.page_size_bytes = self.layout.value_size_bytes
 
         # Initialize storage
-        self.storage = SSDStorage(
+        self.storage = DiskHashTable(
             storage_dir=storage_dir,
             page_size=self.page_size_bytes,
             max_pages=max_pages,
@@ -128,58 +106,41 @@ class StorageBenchmark:
             'request_latencies_ms': [],
         }
 
-    def _get_num_layers(self) -> int:
-        """Get number of layers from layout or config"""
-        # For MLA layout, we can get this from the layout instance
-        if hasattr(self.layout, 'num_layers'):
-            return self.layout.num_layers
-        return self.model_config.get('num_layers', 0)
-
-    def _get_has_indexer(self) -> bool:
-        """Check if layout uses indexer"""
-        if hasattr(self.layout, 'index_head_dim'):
-            return self.layout.index_head_dim > 0
-        return self.model_config.get('index_head_dim', 0) > 0
-
     def process_request(self, req: KVCacheRequest) -> float:
-        """Process a KVCache request using the layout interface"""
+        """Process a KVCache request
+
+        Args:
+            req: KVCache request
+
+        Returns:
+            Total latency in milliseconds
+        """
         self.stats['total_requests'] += 1
+        self.stats['total_tokens'] += req.input_length + req.output_length
 
-        total_tokens = req.input_length + req.output_length
-        self.stats['total_tokens'] += total_tokens
-
-        start_time = time.perf_counter()
         total_latency = 0.0
-        io_operations = 0
 
-        # Use layout to generate keys for this request
-        for entry in self.layout.get_entries(req):
-            key = entry.key
-            if self.storage.exists(key):
-                start_io = time.perf_counter()
-                val = self.storage.get(key)
-                latency = (time.perf_counter() - start_io) * 1000.0
-                if val is not None:
-                    total_latency += latency
-                    io_operations += 1
+        # Process each access requirement from layout
+        for access in self.layout.get_operations(req):
+            if self.storage.exists(access.page_id):
+                # Page exists, perform READ
+                total_latency += self.storage.read(
+                    access.page_id,
+                    offset_in_page=access.offset_in_page,
+                    length=access.length
+                )
                 self.stats['read_pages'] += 1
                 self.stats['page_hits'] += 1
             else:
-                from storage.interface import KVValue
-                dummy_value = KVValue(data=bytes(entry.value_size_bytes), page_count=1, token_count=self.layout.page_size_tokens)
-                start_io = time.perf_counter()
-                self.storage.put(key, dummy_value)
-                latency = (time.perf_counter() - start_io) * 1000.0
-                total_latency += latency
-                io_operations += 1
+                # Page doesn't exist, perform WRITE
+                total_latency += self.storage.write(
+                    access.page_id,
+                    offset_in_page=access.offset_in_page,
+                    length=access.length
+                )
                 self.stats['write_pages'] += 1
 
-        # Only record latency if we actually performed IO operations
-        if io_operations > 0 and total_latency > 0:
-            latency_ms = total_latency
-        else:
-            latency_ms = 0.0
-
+        latency_ms = total_latency if total_latency > 0 else 0.0
         if latency_ms > 0:
             self.stats['request_latencies_ms'].append(latency_ms)
         return latency_ms
@@ -217,8 +178,6 @@ class StorageBenchmark:
             'page_hits': self.stats['page_hits'],
             'page_hit_rate': self.stats['read_pages'] / total_pages if total_pages > 0 else 0,
             'write_ratio': self.stats['write_pages'] / total_pages if total_pages > 0 else 0,
-            'num_layers': self.num_layers,
-            'has_indexer': self.has_indexer,
             'latency': latency_stats,
             'storage': storage_stats,
         }
@@ -238,12 +197,33 @@ class StorageBenchmark:
 # Benchmark Runner
 # ============================================================================
 
+def get_max_page_id(requests: List[KVCacheRequest]) -> int:
+    max_id = 0
+    for req in requests:
+        if req.hash_ids:
+            max_id = max(max_id, max(req.hash_ids))
+    return max_id
+
+
 def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
-                  max_requests: int = None, max_pages: int = 100000,
-                  page_size_tokens: int = 64,
-                  replay_timestamps: bool = False, time_scale: float = 1.0,
+                  max_requests: int = None, max_pages: int = None,
+                  page_size_tokens: int = 512,
                   fsync_mode: str = 'none', fsync_batch_size: int = 100) -> Dict:
-    """Run benchmark"""
+    """Run benchmark
+
+    Args:
+        trace_path: Trace file path
+        storage_dir: Storage directory
+        model_config: Model configuration
+        max_requests: Maximum number of requests (None = all)
+        max_pages: Maximum number of pages (None = auto-calculate)
+        page_size_tokens: Tokens per page
+        fsync_mode: When to fsync
+        fsync_batch_size: Number of writes between fsync
+
+    Returns:
+        Benchmark results dictionary
+    """
     print(f"\n{'='*80}")
     print(f"Running: {Path(trace_path).name}")
     print(f"Model: {model_config['name']}")
@@ -260,6 +240,45 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
 
     print(f"Loaded {len(requests)} requests")
 
+    # Find max page_id from trace
+    max_page_id = get_max_page_id(requests)
+    max_pages_needed = max_page_id + 1  # page_id is 0-based
+
+    # Create layout to get page size
+    layout = create_layout(model_config, page_size_tokens)
+    page_size_bytes = layout.value_size_bytes
+
+    # Determine max_pages
+    if max_pages is None:
+        # Use max page_id from trace
+        max_pages = max_pages_needed
+        # Round up to next thousand for cleaner numbers
+        max_pages = ((max_pages + 999) // 1000) * 1000
+    else:
+        # User specified max_pages
+        pass
+
+    max_size_gb = max_pages * page_size_bytes / (1024**3)
+    trace_size_gb = max_pages_needed * page_size_bytes / (1024**3)
+
+    print(f"\n[Storage Configuration]")
+    print(f"  Max page_id in trace:             {max_page_id:,}")
+    print(f"  Pages needed (trace):             {max_pages_needed:,}")
+    print(f"  Trace storage size:               {trace_size_gb:.2f} GB")
+    print(f"  Max pages configured:             {max_pages:,}")
+    print(f"  Max storage available:            {max_size_gb:.2f} GB")
+
+    if max_pages_needed > max_pages:
+        shortfall = max_pages_needed - max_pages
+        shortfall_gb = shortfall * page_size_bytes / (1024**3)
+        compression_ratio = max_pages / max_pages_needed
+        print(f"\n  ⚠️  Storage insufficient: {shortfall:,} pages shortfall ({shortfall_gb:.2f} GB)")
+        print(f"  ⚠️  Consider increasing --max-pages to at least {max_pages_needed:,} for full simulation")
+    else:
+        surplus = max_pages - max_pages_needed
+        surplus_pct = (surplus / max_pages) * 100 if max_pages > 0 else 0
+        print(f"  ✓ Direct mapping: all {max_pages_needed:,} logical pages uniquely mapped")
+
     # Run benchmark
     with StorageBenchmark(
         storage_dir=storage_dir,
@@ -269,38 +288,53 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         fsync_mode=fsync_mode,
         fsync_batch_size=fsync_batch_size
     ) as benchmark:
-
         start_time = time.perf_counter()
-        total_io_time = 0.0
-        last_timestamp = None
-
-        for i, req in enumerate(requests):
-            if replay_timestamps and last_timestamp is not None:
-                delta_ms = req.timestamp - last_timestamp
-                sleep_time = delta_ms / 1000.0 / time_scale
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-            req_start = time.perf_counter()
-            benchmark.process_request(req)
-            req_io_time = time.perf_counter() - req_start
-            total_io_time += req_io_time
-
-            last_timestamp = req.timestamp
-
-            if (i + 1) % 100 == 0:
-                print(f"  Processed {i + 1}/{len(requests)}...")
+        try:
+            for i, req in enumerate(requests):
+                benchmark.process_request(req)
+                # Print progress for each request
+                elapsed = time.perf_counter() - start_time
+                qps = (i + 1) / elapsed if elapsed > 0 else 0
+                stats = benchmark.get_stats()
+                storage = stats.get('storage', {})
+                read_latency = storage.get('read', {}).get('avg_ms', 0)
+                write_latency = storage.get('write', {}).get('avg_ms', 0)
+                read_mb = storage.get('read', {}).get('mb', 0)
+                write_mb = storage.get('write', {}).get('mb', 0)
+                read_time = storage.get('read', {}).get('time_s', 0)
+                write_time = storage.get('write', {}).get('time_s', 0)
+                read_mbps = read_mb / read_time if read_time > 0 else 0
+                write_mbps = write_mb / write_time if write_time > 0 else 0
+                print(f"  [{i+1:5d}/{len(requests)}] ids={len(req.hash_ids):3d} "
+                      f"tokens={req.input_length+req.output_length:6d} | "
+                      f"QPS={qps:7.2f} | "
+                      f"R={stats['read_pages']:6d} ({read_latency:6.2f}ms, {read_mbps:6.1f}MB/s) | "
+                      f"W={stats['write_pages']:6d} ({write_latency:6.2f}ms, {write_mbps:6.1f}MB/s)")
+        except KeyboardInterrupt:
+            print(f"\n\n{'='*80}")
+            print(f"Interrupted! Showing partial results:")
+            print(f"{'='*80}")
+            elapsed = time.perf_counter() - start_time
+            stats = benchmark.get_stats()
+            print_results([{
+                'trace_file': Path(trace_path).name,
+                'total_requests': i + 1,
+                'io_time_s': elapsed,
+                'requests_per_second': (i + 1) / elapsed if elapsed > 0 else 0,
+                'model': model_config['name'],
+                'fsync_mode': fsync_mode,
+                **stats,
+            }])
+            sys.exit(0)
 
         elapsed = time.perf_counter() - start_time
         stats = benchmark.get_stats()
 
-    io_time = total_io_time if replay_timestamps else elapsed
-
     return {
         'trace_file': Path(trace_path).name,
         'total_requests': len(requests),
-        'io_time_s': io_time,
-        'requests_per_second': len(requests) / io_time if io_time > 0 else 0,
+        'io_time_s': elapsed,
+        'requests_per_second': len(requests) / elapsed if elapsed > 0 else 0,
         'model': model_config['name'],
         'fsync_mode': fsync_mode,
         **stats,
@@ -311,31 +345,68 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
 # Output Formatting
 # ============================================================================
 
+def format_storage_stats(stats: Dict, title: str = "Storage"):
+    """Format storage statistics with clear read/write separation"""
+    storage = stats.get('storage', {})
+    read_stats = storage.get('read', {})
+    write_stats = storage.get('write', {})
+
+    output = []
+    output.append(f"\n[{title}]")
+
+    # General info
+    output.append(f"\n[General]")
+    output.append(f"  Model:            {stats.get('model', 'N/A')}")
+    output.append(f"  Requests:         {stats.get('total_requests', 0):,}")
+    output.append(f"  Tokens:           {stats.get('total_tokens', 0):,}")
+    output.append(f"  Total I/O Time:    {stats.get('io_time_s', 0):.3f} s")
+    output.append(f"  QPS:              {stats.get('requests_per_second', 0):.2f}")
+    output.append(f"  Hit Rate:         {stats.get('page_hit_rate', 0):.2%}")
+
+    # Read Stats
+    output.append(f"\n[Read Operations]")
+    output.append(f"  Count:            {read_stats.get('count', 0):,}")
+    output.append(f"  Data Volume:      {read_stats.get('mb', 0):.2f} MB")
+    read_time = read_stats.get('time_s', 0)
+    read_mbps = read_stats.get('mb', 0) / read_time if read_time > 0 else 0
+    output.append(f"  Total Time:       {read_time:.3f} s")
+    output.append(f"  Bandwidth:        {read_mbps:.2f} MB/s")
+    output.append(f"  Latency:")
+    output.append(f"    Avg:            {read_stats.get('avg_ms', 0):.3f} ms")
+    output.append(f"    P50:            {read_stats.get('p50_ms', 0):.3f} ms")
+    output.append(f"    P95:            {read_stats.get('p95_ms', 0):.3f} ms")
+    output.append(f"    P99:            {read_stats.get('p99_ms', 0):.3f} ms")
+
+    # Write Stats
+    output.append(f"\n[Write Operations]")
+    output.append(f"  Count:            {write_stats.get('count', 0):,}")
+    output.append(f"  Data Volume:      {write_stats.get('mb', 0):.2f} MB")
+    write_time = write_stats.get('time_s', 0)
+    write_mbps = write_stats.get('mb', 0) / write_time if write_time > 0 else 0
+    output.append(f"  Total Time:       {write_time:.3f} s")
+    output.append(f"  Bandwidth:        {write_mbps:.2f} MB/s")
+    output.append(f"  Latency:")
+    output.append(f"    Avg:            {write_stats.get('avg_ms', 0):.3f} ms")
+    output.append(f"    P50:            {write_stats.get('p50_ms', 0):.3f} ms")
+    output.append(f"    P95:            {write_stats.get('p95_ms', 0):.3f} ms")
+    output.append(f"    P99:            {write_stats.get('p99_ms', 0):.3f} ms")
+
+    # Storage Info
+    output.append(f"\n[Storage Info]")
+    output.append(f"  Max Pages:        {storage.get('max_pages', 0):,}")
+    output.append(f"  Written Pages:    {storage.get('written_pages', 0):,}")
+    output.append(f"  Sync Count:       {storage.get('sync_count', 0):,}")
+
+    return "\n".join(output)
+
+
 def print_results(results: List[Dict]):
     """Print benchmark results"""
     for i, r in enumerate(results, 1):
         print(f"\n{'='*80}")
         print(f"  [{i}/{len(results)}] {r['trace_file']}")
         print(f"{'='*80}")
-
-        print(f"\n[Performance]")
-        print(f"  Model:           {r.get('model', 'N/A')}")
-        print(f"  Requests:        {r['total_requests']:,}")
-        print(f"  Tokens:          {r.get('total_tokens', 0):,}")
-        print(f"  QPS:             {r['requests_per_second']:.2f}")
-        print(f"  Hit Rate:        {r['page_hit_rate']:.2%}")
-
-        latency = r.get('latency', {})
-        print(f"\n[Latency]")
-        print(f"  Avg:  {latency.get('avg_ms', 0):.3f} ms")
-        print(f"  P50:  {latency.get('p50_ms', 0):.3f} ms")
-        print(f"  P95:  {latency.get('p95_ms', 0):.3f} ms")
-        print(f"  P99:  {latency.get('p99_ms', 0):.3f} ms")
-
-        storage = r.get('storage', {})
-        print(f"\n[Storage]")
-        print(f"  Read:  {storage.get('read', {}).get('count', 0):,} ops ({storage.get('read', {}).get('mb', 0):.2f} MB)")
-        print(f"  Write: {storage.get('write', {}).get('count', 0):,} ops ({storage.get('write', {}).get('mb', 0):.2f} MB)")
+        print(format_storage_stats(r))
 
 
 # ============================================================================
@@ -357,11 +428,11 @@ def main():
                        help='Storage directory')
     parser.add_argument('--model', type=str, default='glm5', choices=['glm5', 'kimi-k2.6'],
                        help='Model preset')
-    parser.add_argument('--page-size-tokens', type=int, default=64,
-                       help='Page size in tokens (default: 64)')
+    parser.add_argument('--page-size-tokens', type=int, default=512,
+                       help='Page size in tokens (default: 512)')
     parser.add_argument('--max-requests', type=int, default=None,
                        help='Maximum number of requests')
-    parser.add_argument('--max-pages', type=int, default=100000,
+    parser.add_argument('--max-pages', type=int, default=2000,
                        help='Maximum number of pages')
     parser.add_argument('--fsync-mode', type=str, choices=['batch', 'always', 'end', 'none'],
                        default='none', help='When to fsync')
@@ -397,8 +468,6 @@ def main():
                 args.max_requests,
                 args.max_pages,
                 args.page_size_tokens,
-                False,
-                1.0,
                 args.fsync_mode,
                 args.fsync_batch_size
             )
@@ -406,7 +475,6 @@ def main():
         else:
             print(f"Warning: Trace file not found: {trace_path}")
 
-    # Print results
     # Print results
     if results:
         print_results(results)

@@ -2,63 +2,54 @@
 KVCache Layout Interface
 
 Defines the abstract interface for KVCache storage layouts.
+Layout layer converts normalized requests into storage access requirements.
 """
 
 from abc import ABC, abstractmethod
 from typing import Iterator, Any
+from dataclasses import dataclass
 
-from storage.interface import KVKey
 
+@dataclass
+class StorageAccess:
+    """Storage access requirement
+
+    Represents a need to access a page. Whether to READ or WRITE is determined
+    by the upper layer based on whether the page already exists.
+    """
+    page_id: int             # Page ID (hash_id from trace)
+    offset_in_page: int = 0  # Offset within the page (default: 0)
+    length: int = None       # Number of bytes (default: entire page)
+
+    def __repr__(self):
+        if self.offset_in_page == 0 and self.length is None:
+            return f"Access(page_id={self.page_id})"
+        else:
+            return f"Access(page_id={self.page_id}, offset={self.offset_in_page}, length={self.length})"
 
 
 class KVLayout(ABC):
     """Abstract interface for KVCache storage layout
 
-    Different model architectures have different KVCache access patterns.
-    This captures both key generation and value sizing.
+    Converts normalized KVCache requests into storage access requirements.
+
+    Request format:
+        - hash_ids: List[int] - chunk/page identifiers
+        - input_length: int - input token count
+        - output_length: int - output token count
+
+    Output:
+        - Iterator of StorageAccess (page access requirements)
     """
 
     @abstractmethod
-    def get_entries(self, request: Any) -> Iterator:
-        """Generate storage entries for a request
+    def get_operations(self, request: Any) -> Iterator[StorageAccess]:
+        """Generate storage access requirements for a request
 
         Args:
             request: KVCache request with hash_ids, input_length, output_length
 
         Yields:
-            KVEntry: Each entry with key and value size
-        """
-        pass
-
-    @abstractmethod
-    def get_key_count(self, request: Any) -> int:
-        """Get the total number of keys for a request
-
-        Args:
-            request: KVCache request
-
-        Returns:
-            int: Total number of storage keys
-        """
-        pass
-
-    @abstractmethod
-    def get_value_size(self, key: KVKey) -> int:
-        """Get value size for a given key
-
-        Args:
-            key: KVKey
-
-        Returns:
-            int: Value size in bytes
-        """
-        pass
-
-    @abstractmethod
-    def keys_per_layer(self) -> int:
-        """Number of keys per (sequence, layer) pair
-
-        Returns:
-            int: Keys per layer
+            StorageAccess: Page access requirements (READ vs WRITE decided by upper layer)
         """
         pass

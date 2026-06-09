@@ -4,11 +4,9 @@ MLA (Multi-head Latent Attention) KVCache Layout
 Implements the KVLayout interface for MLA architecture.
 """
 
-from typing import Iterator, Any, Dict
-from dataclasses import dataclass
+from typing import Iterator, Any
 
-from .interface import KVLayout
-from storage.interface import KVKey
+from .interface import KVLayout, StorageAccess
 
 
 # ============================================================================
@@ -47,38 +45,31 @@ MLA_MODEL_CONFIG = {
 }
 
 
-@dataclass
-class KVEntry:
-    """Key-value entry for storage
-
-    Contains both the key and the value size information.
-    """
-    key: KVKey
-    value_size_bytes: int
-
-
 class MLALayout(KVLayout):
     """MLA (Multi-head Latent Attention) KVCache layout
 
     MLA Architecture:
-    - Each (sequence_id, layer_id) pair maps to ONE complete entry
-    - Entry contains KV + Indexer data for up to 64 tokens in that layer
-    - Value size is fixed per layer
+    - Each hash_id corresponds to a 512-token chunk
+    - Each hash_id maps to ONE complete entry containing all layers
+    - Entry contains KV + Indexer data for all layers for 512 tokens
+    - Value size is fixed per hash_id (includes all layers)
 
-    Value Size Calculation (per layer entry):
-        value_size = page_size_tokens × (kv_lora_rank + qk_rope_head_dim + index_head_dim) × precision_bytes
+    Value Size Calculation (per hash_id entry):
+        per_layer_size = 512 × (kv_lora_rank + qk_rope_head_dim + index_head_dim) × precision_bytes
+        value_size = per_layer_size × num_layers
 
-    For GLM-5 with 64 tokens per entry:
-        value_size = 64 × (512 + 64 + 128) × 2 = 90,112 bytes = 88 KiB
+    For GLM-5 with 512 tokens per entry:
+        per_layer_size = 512 × (512 + 64 + 128) × 2 = 720,896 bytes
+        value_size = 720,896 × 78 = 56,229,888 bytes = 53.6 MiB
 
-    Key Pattern: (sequence_id, layer_id)
-    Total Keys = len(hash_ids) × num_layers
+    Key Pattern: hash_id → single entry (all layers included)
+    Total Keys = len(hash_ids)
 
     Used in: GLM-5, Kimi-K2.6
     """
 
     def __init__(self, num_layers: int, kv_lora_rank: int, qk_rope_head_dim: int,
-                 index_head_dim: int, precision_bytes: int, page_size_tokens: int = 64):
+                 index_head_dim: int, precision_bytes: int, page_size_tokens: int = 512):
         """Initialize MLA layout
 
         Args:
@@ -87,7 +78,7 @@ class MLALayout(KVLayout):
             qk_rope_head_dim: QK rope head dimension
             index_head_dim: Indexer head dimension
             precision_bytes: Precision in bytes (BF16=2, INT8=1, INT4=0.5)
-            page_size_tokens: Tokens per page (default 64)
+            page_size_tokens: Tokens per page (default: 512)
         """
         self.num_layers = num_layers
         self.kv_lora_rank = kv_lora_rank
@@ -96,50 +87,35 @@ class MLALayout(KVLayout):
         self.precision_bytes = precision_bytes
         self.page_size_tokens = page_size_tokens
 
-        # Calculate fixed value size per entry (per layer)
-        # Each entry contains KV + Indexer for 64 tokens in that layer
-        self.value_size_bytes = (
-            page_size_tokens *
-            (kv_lora_rank + qk_rope_head_dim + index_head_dim) *
-            precision_bytes
-        )
+        # Calculate fixed value size per entry (per hash_id)
+        # Each entry contains KV + Indexer for all layers for page_size_tokens
+        # Per layer: page_size_tokens × (kv_lora_rank + qk_rope_head_dim + index_head_dim) × precision_bytes
+        # Total: per_layer_size × num_layers
+        per_layer_size = page_size_tokens * (kv_lora_rank + qk_rope_head_dim + index_head_dim) * precision_bytes
+        self.value_size_bytes = per_layer_size * num_layers
 
-    def get_entries(self, request: Any) -> Iterator[KVEntry]:
-        """Generate MLA storage entries
+        # Store page_size for backward compatibility
+        self.page_size = self.value_size_bytes
 
-        For each sequence_id in hash_ids, generate one entry per layer.
+    def get_operations(self, request: Any) -> Iterator[StorageAccess]:
+        """Generate storage access requirements for a request
+
+        For MLA architecture:
+        - Each hash_id corresponds to one complete page (512 tokens, all layers)
+        - Generate one access requirement per hash_id
+
+        Args:
+            request: KVCache request with hash_ids, input_length, output_length
 
         Yields:
-            KVEntry: (key, value_size) for each layer
+            StorageAccess: Page access requirements
         """
-        for sequence_id in request.hash_ids:
-            for layer_id in range(self.num_layers):
-                yield KVEntry(
-                    key=KVKey(sequence_id=sequence_id, layer_id=layer_id),
-                    value_size_bytes=self.value_size_bytes
-                )
-
-    def get_key_count(self, request: Any) -> int:
-        """Total keys for MLA request
-
-        Returns:
-            int: len(hash_ids) × num_layers
-        """
-        return len(request.hash_ids) * self.num_layers
-
-    def get_value_size(self, key: KVKey) -> int:
-        """Get value size for MLA entry
-
-        All MLA entries have the same size.
-
-        Returns:
-            int: Value size in bytes
-        """
-        return self.value_size_bytes
-
-    def keys_per_layer(self) -> int:
-        """MLA has 1 key per (sequence, layer)"""
-        return 1
+        for hash_id in request.hash_ids:
+            yield StorageAccess(
+                page_id=hash_id,
+                offset_in_page=0,
+                length=self.value_size_bytes
+            )
 
 
 # ============================================================================
