@@ -19,7 +19,7 @@
 #include "gpu_vendor/sunrise.h"
 #endif
 
-#if !defined(USE_TPU) && !defined(USE_HIP) && !defined(USE_MUSA) && \
+#if !defined(USE_TPU) && !defined(USE_HIP) && !defined(USE_MUSA) &&     \
     !defined(USE_MLU) && !defined(USE_UBSHMEM) && !defined(USE_MACA) && \
     !defined(USE_SUNRISE)
 #include <string>

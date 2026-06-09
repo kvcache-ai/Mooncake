@@ -81,7 +81,7 @@ TEST(TpuCuGetErrorString, NullErrStrReturnsInvalidValue) {
 }
 
 TEST(TpuCuGetErrorString, ReturnsNonNullString) {
-    const char *msg = nullptr;
+    const char* msg = nullptr;
     EXPECT_EQ(cuGetErrorString(cudaSuccess, &msg), cudaSuccess);
     EXPECT_NE(msg, nullptr);
 }
@@ -181,10 +181,10 @@ TEST(TpuNoAdapter, GetLastErrorReflectsSetValue) {
 
 TEST(TpuNoAdapter, MallocHostFallsBackToSystemMalloc) {
     // When malloc_host is absent, shim falls back to std::malloc.
-    void *ptr = nullptr;
+    void* ptr = nullptr;
     EXPECT_EQ(cudaMallocHost(&ptr, 64), cudaSuccess);
     ASSERT_NE(ptr, nullptr);
-    cudaFreeHost(ptr); // must not crash
+    cudaFreeHost(ptr);  // must not crash
 }
 
 TEST(TpuNoAdapter, FreeHostOnNullSucceeds) {
@@ -193,7 +193,8 @@ TEST(TpuNoAdapter, FreeHostOnNullSucceeds) {
 }
 
 TEST(TpuNoAdapter, StreamCreateSucceedsWithNullSentinel) {
-    // When stream_create is absent, shim returns success and sets stream=nullptr.
+    // When stream_create is absent, shim returns success and sets
+    // stream=nullptr.
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(0xdeadbeef);
     EXPECT_EQ(cudaStreamCreate(&stream), cudaSuccess);
     EXPECT_EQ(stream, nullptr);
@@ -251,13 +252,11 @@ TEST(TpuConstants, MemcpyKindValues) {
     EXPECT_EQ(cudaMemcpyDefault, 4);
 }
 
-TEST(TpuConstants, GpuPrefix) {
-    EXPECT_EQ(GPU_PREFIX, "tpu:");
-}
+TEST(TpuConstants, GpuPrefix) { EXPECT_EQ(GPU_PREFIX, "tpu:"); }
 
-} // namespace
+}  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     // Ensure no adapter library is loaded regardless of the host environment.
     unsetenv("MC_TPU_ADAPTER_LIB");
     ::testing::InitGoogleTest(&argc, argv);

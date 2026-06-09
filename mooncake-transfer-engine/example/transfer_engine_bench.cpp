@@ -42,7 +42,7 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
 #include <cassert>
@@ -108,7 +108,7 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
@@ -121,7 +121,7 @@ using namespace mooncake;
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
     if (from_vram) {
@@ -193,7 +193,7 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void* addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
@@ -321,7 +321,7 @@ static int determineBufferCount() {
 static std::vector<void*> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void*> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
@@ -345,7 +345,7 @@ static void freeBuffers(std::vector<void*>& addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) ||    \
     defined(USE_HIP) || defined(USE_MACA) || defined(USE_UBSHMEM) || \
     defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
