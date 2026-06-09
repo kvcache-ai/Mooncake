@@ -21,6 +21,11 @@ KVCache-like allocation pressure. It pre-fills the simulated cluster when
 classes. On allocation failure it randomly evicts a fraction of live objects and
 retries.
 
+This is an allocation-strategy-layer benchmark. It complements the existing
+`dsa` workload by adding explicit fragmentation sampling and configurable
+weighted size-class patterns. It is not a replacement for `allocator_bench`,
+which remains the low-level `OffsetAllocator` microbenchmark.
+
 Run a small local validation:
 
 ```bash
@@ -55,7 +60,9 @@ Key output columns:
   fragmentation ratios.
 - `LargestFreeMB` shows the final largest contiguous free region.
 - `Evictions` counts fail-triggered eviction rounds during measurement.
-- `Succ/Total` reports successful allocation attempts over total attempts.
+- `Full/Partial/Fail/Total` reports allocation outcomes. Only results with
+  `result->size() == replica_num` count as full success; shorter replica
+  results are counted as partial allocations.
 
 Fragmentation is computed per `OffsetBufferAllocator` and then averaged by free
 space:
@@ -68,7 +75,7 @@ The weighted average avoids treating free space in different Store segments as
 one mergeable region. `LargestFreeMB` still reports the final largest contiguous
 free region across all segments.
 
-The benchmark also prints a one-line `Fragmentation summary` and a
-`Size-class breakdown` after each result row, so reviewers can read the key
-fragmentation and per-size-class latency numbers without manually deriving them
-from the table.
+The benchmark also prints a one-line `Prefill summary`, `Fragmentation summary`,
+and `Size-class breakdown` after each result row, so reviewers can read the
+actual prefill utilization, fragmentation, and per-size-class latency numbers
+without manually deriving them from the table.

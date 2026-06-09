@@ -105,6 +105,7 @@ constexpr int kDsaMaxRetries = 5;
 // Lower bound on the auto-derived allocation count per DSA case.
 constexpr int kDsaMinAllocs = 100;
 constexpr int kSizeClassMaxRetries = 5;
+constexpr int kSizeClassPrefillMaxAttempts = 5000;
 
 enum class WorkloadType {
     FILL_UP,    // Only allocate, measure throughput/latency
@@ -181,8 +182,31 @@ struct SizeClassStat {
     size_t size = 0;
     int weight = 0;
     int success_count = 0;
+    int partial_count = 0;
+    int failed_count = 0;
     int total_count = 0;
     DistributionStats latency_stats;
+};
+
+enum class SizeClassAllocationStatus {
+    FAILED,
+    PARTIAL,
+    FULL,
+};
+
+struct SizeClassAllocationResult {
+    SizeClassAllocationStatus status = SizeClassAllocationStatus::FAILED;
+    size_t replica_count = 0;
+};
+
+struct SizeClassPrefillStats {
+    int attempts = 0;
+    int full_count = 0;
+    int partial_count = 0;
+    int failed_count = 0;
+    int requested_pct = 0;
+    double achieved_util_pct = 0.0;
+    bool reached_target = false;
 };
 
 /**
@@ -208,6 +232,8 @@ struct BenchResultBase {
 
     int success_count = 0;  // successful allocations
     int total_count = 0;    // total attempted allocations
+    int partial_count = 0;  // partial allocations, if reported
+    int failed_count = 0;   // failed allocations, if reported
 
     double final_util_stddev;  // utilization stddev at run end
     double final_avg_util;     // average utilization at run end
@@ -247,6 +273,7 @@ struct ScaleOutResult : BenchResultBase {
 
 struct SizeClassChurnResult : BenchResultBase {
     std::string pattern_name;
+    SizeClassPrefillStats prefill_stats;
     DistributionStats fragmentation_stats;
     DistributionStats largest_free_mb_stats;
     FragmentationSnapshot final_fragmentation;
@@ -960,7 +987,7 @@ static bool dsaAllocateWithEvict(
     return false;
 }
 
-static bool sizeClassAllocateWithEvict(
+static SizeClassAllocationResult sizeClassAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, size_t size, int replica_num,
     std::vector<std::vector<Replica>>& live, std::mt19937& rng,
@@ -968,51 +995,76 @@ static bool sizeClassAllocateWithEvict(
     for (int attempt = 0; attempt <= kSizeClassMaxRetries; ++attempt) {
         auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
+            size_t replica_count = result->size();
+            if (replica_count == 0) {
+                return {};
+            }
             live.push_back(std::move(result.value()));
-            return true;
+            return {
+                replica_count == static_cast<size_t>(replica_num)
+                    ? SizeClassAllocationStatus::FULL
+                    : SizeClassAllocationStatus::PARTIAL,
+                replica_count,
+            };
         }
 
-        if (live.empty()) return false;
-        if (attempt == kSizeClassMaxRetries) return false;
+        if (live.empty()) return {};
+        if (attempt == kSizeClassMaxRetries) return {};
 
         evictRandomFraction(live, evict_ratio, rng);
         ++evict_count;
     }
 
-    return false;
+    return {};
 }
 
-static void prefillSizeClassChurn(
+static SizeClassPrefillStats prefillSizeClassChurn(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, const BenchConfig& cfg,
     const std::vector<SizeClassSpec>& specs,
     std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
-    if (cfg.prefill_pct <= 0 || specs.empty()) return;
+    SizeClassPrefillStats stats;
+    if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
+    stats.requested_pct = cfg.prefill_pct;
 
-    int prefill_count = 0;
     int consec_failures = 0;
     int evict_throwaway = 0;
     const int kMaxConsecFailures = 10;
 
-    while (true) {
-        if (prefill_count % kPreFillSampleInterval == 0) {
-            if (computeAverageUtilAll(manager) * 100.0 >= cfg.prefill_pct) {
+    while (stats.attempts < kSizeClassPrefillMaxAttempts) {
+        if (stats.attempts % kPreFillSampleInterval == 0) {
+            stats.achieved_util_pct = computeAverageUtilAll(manager) * 100.0;
+            if (stats.achieved_util_pct >= cfg.prefill_pct) {
+                stats.reached_target = true;
                 break;
             }
         }
 
         size_t class_idx = chooseSizeClassIndex(specs, rng);
-        bool ok = sizeClassAllocateWithEvict(
+        auto alloc_result = sizeClassAllocateWithEvict(
             strategy, manager, specs[class_idx].size, cfg.replica_num,
             live_allocations, rng, evict_throwaway,
             FLAGS_size_class_evict_ratio);
-        if (ok) {
+        ++stats.attempts;
+        if (alloc_result.status == SizeClassAllocationStatus::FULL) {
+            ++stats.full_count;
             consec_failures = 0;
-        } else if (++consec_failures >= kMaxConsecFailures) {
-            break;
+        } else if (alloc_result.status == SizeClassAllocationStatus::PARTIAL) {
+            ++stats.partial_count;
+            consec_failures = 0;
+        } else {
+            ++stats.failed_count;
+            if (++consec_failures >= kMaxConsecFailures) {
+                break;
+            }
         }
-        ++prefill_count;
     }
+
+    stats.achieved_util_pct = computeAverageUtilAll(manager) * 100.0;
+    if (stats.achieved_util_pct >= cfg.prefill_pct) {
+        stats.reached_target = true;
+    }
+    return stats;
 }
 
 // Run DSA workload; the allocation count is derived from cluster capacity.
@@ -1168,9 +1220,12 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     live_allocations.reserve(std::min(cfg.num_allocations, 1 << 20));
 
     std::mt19937 rng(42);
-    prefillSizeClassChurn(strategy, manager, cfg, specs, live_allocations, rng);
+    SizeClassPrefillStats prefill_stats = prefillSizeClassChurn(
+        strategy, manager, cfg, specs, live_allocations, rng);
 
     int success_count = 0;
+    int partial_count = 0;
+    int failed_count = 0;
     int total_count = 0;
     int evict_count = 0;
     double instrumentation_time_us = 0.0;
@@ -1182,7 +1237,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         const auto& spec = specs[class_idx];
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        bool ok = sizeClassAllocateWithEvict(
+        auto alloc_result = sizeClassAllocateWithEvict(
             strategy, manager, spec.size, cfg.replica_num, live_allocations,
             rng, evict_count, FLAGS_size_class_evict_ratio);
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -1194,9 +1249,15 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
 
         ++total_count;
         ++per_class_stats[class_idx].total_count;
-        if (ok) {
+        if (alloc_result.status == SizeClassAllocationStatus::FULL) {
             ++success_count;
             ++per_class_stats[class_idx].success_count;
+        } else if (alloc_result.status == SizeClassAllocationStatus::PARTIAL) {
+            ++partial_count;
+            ++per_class_stats[class_idx].partial_count;
+        } else {
+            ++failed_count;
+            ++per_class_stats[class_idx].failed_count;
         }
 
         if ((i + 1) % sample_interval == 0 || i == cfg.num_allocations - 1) {
@@ -1236,9 +1297,12 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     res.final_util_stddev = computeUtilizationStdDev(manager);
     res.final_avg_util = computeAverageUtilAll(manager);
     res.success_count = success_count;
+    res.partial_count = partial_count;
+    res.failed_count = failed_count;
     res.total_count = total_count;
     res.evict_count = evict_count;
     res.pattern_name = cfg.size_class_pattern;
+    res.prefill_stats = prefill_stats;
     res.fragmentation_stats = computeDistributionStats(fragmentation_samples);
     res.largest_free_mb_stats =
         computeDistributionStats(largest_free_mb_samples);
@@ -1387,14 +1451,16 @@ static void printSizeClassChurnHeader() {
               << std::setw(12) << "Frag_avg" << std::setw(12) << "Frag_p50"
               << std::setw(12) << "Frag_p90" << std::setw(12) << "Frag_p99"
               << std::setw(15) << "LargestFreeMB" << std::setw(10) << "AvgUtil%"
-              << std::setw(15) << "Succ/Total" << std::setw(14) << "Evictions"
-              << std::endl;
+              << std::setw(24) << "Full/Partial/Fail/Total" << std::setw(14)
+              << "Evictions" << std::endl;
     std::cout << std::string(260, '-') << std::endl;
 }
 
 static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
-    std::string alloc_ratio =
-        std::to_string(r.success_count) + "/" + std::to_string(r.total_count);
+    std::string alloc_ratio = std::to_string(r.success_count) + "/" +
+                              std::to_string(r.partial_count) + "/" +
+                              std::to_string(r.failed_count) + "/" +
+                              std::to_string(r.total_count);
     std::ostringstream cap_ss;
     cap_ss << std::fixed << std::setprecision(1) << r.cluster_capacity_gb;
 
@@ -1415,8 +1481,22 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
               << r.fragmentation_stats.p99 << std::setprecision(1)
               << std::setw(15) << final_largest_free_mb << std::setprecision(2)
               << std::setw(9) << (r.final_avg_util * 100.0) << "%"
-              << std::setw(15) << alloc_ratio << std::setw(14) << r.evict_count
+              << std::setw(24) << alloc_ratio << std::setw(14) << r.evict_count
               << std::endl;
+
+    std::cout << "Prefill summary [" << r.strategy_name
+              << ", pattern=" << r.pattern_name
+              << ", segments=" << r.num_segments
+              << ", replica=" << r.replica_num
+              << "]: requested_pct=" << std::fixed << std::setprecision(2)
+              << r.prefill_stats.requested_pct
+              << ", achieved_pct=" << r.prefill_stats.achieved_util_pct
+              << ", reached=" << (r.prefill_stats.reached_target ? "yes" : "no")
+              << ", attempts=" << r.prefill_stats.attempts << "/"
+              << kSizeClassPrefillMaxAttempts
+              << ", full/partial/failed=" << r.prefill_stats.full_count << "/"
+              << r.prefill_stats.partial_count << "/"
+              << r.prefill_stats.failed_count << std::endl;
 
     std::cout << "Fragmentation summary [" << r.strategy_name
               << ", pattern=" << r.pattern_name
@@ -1435,9 +1515,12 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
     std::cout << "Size-class breakdown:";
     for (const auto& stat : r.size_class_stats) {
         std::string ratio = std::to_string(stat.success_count) + "/" +
+                            std::to_string(stat.partial_count) + "/" +
+                            std::to_string(stat.failed_count) + "/" +
                             std::to_string(stat.total_count);
         std::cout << " " << stat.name << "(" << (stat.size / KiB)
-                  << "KB,w=" << stat.weight << ",succ=" << ratio
+                  << "KB,w=" << stat.weight
+                  << ",full/partial/failed/total=" << ratio
                   << ",p99_ns=" << std::fixed << std::setprecision(0)
                   << stat.latency_stats.p99 << ")";
     }
