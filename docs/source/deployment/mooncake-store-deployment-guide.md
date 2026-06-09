@@ -1,4 +1,4 @@
-# Mooncake Store Deployment & Tunnig Guide
+# Mooncake Store Deployment & Tuning Guide
 
 This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
