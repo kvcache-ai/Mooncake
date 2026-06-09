@@ -287,8 +287,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
-                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+        } else if (task_status.s != Transport::TransferStatusEnum::WAITING &&
+                   task_status.s != Transport::TransferStatusEnum::PENDING) {
             status.s = task_status.s;
             return Status::OK();
         }
