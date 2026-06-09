@@ -77,7 +77,9 @@ The core of Mooncake is its KVCache-centric scheduler, which balances maximizing
 <h2 id="show-cases">🔥 Show Cases</h2>
 
 <!-- ![components](image/components.png) -->
-<img src=image/components.png width=74% />
+<div align="center">
+  <img src=image/components.png width=74% />
+</div>
 
 ### Transfer Engine (TE)
 
