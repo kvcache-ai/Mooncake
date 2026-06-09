@@ -51,11 +51,40 @@ class MasterAdminServer {
 
     std::string BuildMetricsSummaryText() const;
 
-    std::string BuildHealthJson() const;
-
-    std::string BuildLeaderJson() const;
-
     std::shared_ptr<WrappedMasterService> GetActiveService() const;
+
+    void HandleMetrics(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp);
+    void HandleMetricsSummary(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
+    void HandleHealth(coro_http::coro_http_request& req,
+                      coro_http::coro_http_response& resp);
+    void HandleRole(coro_http::coro_http_request& req,
+                    coro_http::coro_http_response& resp);
+    void HandleHaStatus(coro_http::coro_http_request& req,
+                        coro_http::coro_http_response& resp);
+    void HandleLeader(coro_http::coro_http_request& req,
+                      coro_http::coro_http_response& resp);
+    void HandleQueryKey(coro_http::coro_http_request& req,
+                        coro_http::coro_http_response& resp);
+    void HandleGetAllKeys(coro_http::coro_http_request& req,
+                          coro_http::coro_http_response& resp);
+    void HandleGetAllSegments(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
+    void HandleGetSegmentsDetail(coro_http::coro_http_request& req,
+                                 coro_http::coro_http_response& resp);
+    void HandleQuerySegment(coro_http::coro_http_request& req,
+                            coro_http::coro_http_response& resp);
+    void HandleCreateDrainJob(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
+    void HandleQueryDrainJob(coro_http::coro_http_request& req,
+                             coro_http::coro_http_response& resp);
+    void HandleCancelDrainJob(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
+    void HandleSegmentStatus(coro_http::coro_http_request& req,
+                             coro_http::coro_http_response& resp);
+    void HandleBatchQueryKeys(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
 
     void InitHttpServer();
 
