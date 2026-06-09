@@ -64,6 +64,8 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
     };
 
     enum TransferStatusEnum {

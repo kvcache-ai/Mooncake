@@ -929,7 +929,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
         std::string env_str(env_value);
         // Convert to lowercase for case-insensitive comparison
         std::transform(env_str.begin(), env_str.end(), env_str.begin(),
-                       ::tolower);
+                       [](unsigned char c) { return std::tolower(c); });
         if (env_str == "false" || env_str == "0" || env_str == "no" ||
             env_str == "off") {
             memcpy_enabled_ = false;

@@ -69,7 +69,6 @@ getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
 getting_started/observability
-getting_started/examples/sglang-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
