@@ -80,7 +80,7 @@ class TENTBenchRunner : public BenchRunner {
     int publishSegment(const std::string& segment_name) override;
 
     int connectToAllTargets(const std::vector<std::string>& target_segments,
-                           int sync_timeout_sec = 120) override;
+                            int sync_timeout_sec = 120) override;
 
     size_t getTargetCount() const override;
 

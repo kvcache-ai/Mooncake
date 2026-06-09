@@ -71,11 +71,12 @@ class TEBenchRunner : public BenchRunner {
                              uint64_t block_size, uint64_t batch_size,
                              OpCode opcode);
 
-    // Multi-target methods for all-to-all testing (not supported for TE backend)
+    // Multi-target methods for all-to-all testing (not supported for TE
+    // backend)
     int publishSegment(const std::string& segment_name) override;
 
     int connectToAllTargets(const std::vector<std::string>& target_segments,
-                          int sync_timeout_sec = 120) override;
+                            int sync_timeout_sec = 120) override;
 
     size_t getTargetCount() const override;
 

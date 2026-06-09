@@ -69,7 +69,8 @@ void signalHandlerV0(int signum) {
     g_te_running.store(false);
 }
 
-void* TEBenchRunner::allocateMemoryPool(size_t size, int buffer_id, bool from_vram) {
+void* TEBenchRunner::allocateMemoryPool(size_t size, int buffer_id,
+                                        bool from_vram) {
 #ifdef USE_CUDA
     if (from_vram) {
         int gpu_id = buffer_id;
@@ -95,7 +96,8 @@ void* TEBenchRunner::allocateMemoryPool(size_t size, int buffer_id, bool from_vr
 #endif
 
         if (d_buf == nullptr) {
-            LOG(ERROR) << "Memory allocation returned nullptr for GPU " << gpu_id;
+            LOG(ERROR) << "Memory allocation returned nullptr for GPU "
+                       << gpu_id;
         }
         return d_buf;
     }
@@ -132,7 +134,8 @@ void TEBenchRunner::freeMemoryPool(void* addr, size_t size) {
         if (attributes.type == cudaMemoryTypeDevice) {
             auto free_err = cudaFree(addr);
             if (free_err != cudaSuccess) {
-                LOG(WARNING) << "cudaFree failed: " << cudaGetErrorString(free_err);
+                LOG(WARNING)
+                    << "cudaFree failed: " << cudaGetErrorString(free_err);
             }
             return;
         } else if (attributes.type == cudaMemoryTypeHost ||
@@ -140,13 +143,14 @@ void TEBenchRunner::freeMemoryPool(void* addr, size_t size) {
             numa_free(addr, size);
             return;
         } else {
-            LOG(ERROR) << "Unknown memory type for ptr " << addr << ", type: "
-                       << attributes.type;
+            LOG(ERROR) << "Unknown memory type for ptr " << addr
+                       << ", type: " << attributes.type;
         }
     } else {
         // cudaPointerGetAttributes failed - assume it's host memory
         LOG(WARNING) << "cudaPointerGetAttributes failed for ptr " << addr
-                     << ": " << cudaGetErrorString(err) << ", assuming host memory";
+                     << ": " << cudaGetErrorString(err)
+                     << ", assuming host memory";
     }
 #endif
 
@@ -166,7 +170,8 @@ int TEBenchRunner::allocateBuffers() {
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
             auto location = "cpu:" + std::to_string(i);
-            pinned_buffer_list_[i] = allocateMemoryPool(total_buffer_size, i, false);
+            pinned_buffer_list_[i] =
+                allocateMemoryPool(total_buffer_size, i, false);
             if (pinned_buffer_list_[i] == nullptr) {
                 LOG(ERROR) << "Failed to allocate buffer for node " << i;
                 // Clean up already allocated buffers
@@ -178,8 +183,8 @@ int TEBenchRunner::allocateBuffers() {
                 return -1;
             }
 
-            auto ret = engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                                     total_buffer_size, location);
+            auto ret = engine_->registerLocalMemory(
+                pinned_buffer_list_[i], total_buffer_size, location);
             if (ret != 0) {
                 LOG(ERROR) << "Failed to register memory for " << location
                            << ", error code: " << ret;
@@ -199,8 +204,10 @@ int TEBenchRunner::allocateBuffers() {
         int gpu_count = 0;
         auto err = cudaGetDeviceCount(&gpu_count);
         if (err != cudaSuccess || gpu_count <= 0) {
-            LOG(ERROR) << "Failed to get CUDA device count or no devices available: "
-                       << (err != cudaSuccess ? cudaGetErrorString(err) : "no devices");
+            LOG(ERROR)
+                << "Failed to get CUDA device count or no devices available: "
+                << (err != cudaSuccess ? cudaGetErrorString(err)
+                                       : "no devices");
             return -1;
         }
 
@@ -209,8 +216,8 @@ int TEBenchRunner::allocateBuffers() {
             start_gpu = XferBenchConfig::local_gpu_id;
             num_buffers = 1;
             if (start_gpu < 0 || start_gpu >= gpu_count) {
-                LOG(ERROR) << "local_gpu_id " << start_gpu << " out of range [0, "
-                           << gpu_count << ")";
+                LOG(ERROR) << "local_gpu_id " << start_gpu
+                           << " out of range [0, " << gpu_count << ")";
                 return -1;
             }
         }
@@ -219,7 +226,8 @@ int TEBenchRunner::allocateBuffers() {
         for (int i = 0; i < num_buffers; ++i) {
             int gpu_id = start_gpu + i;
             auto location = "cuda:" + std::to_string(gpu_id);
-            pinned_buffer_list_[i] = allocateMemoryPool(total_buffer_size, gpu_id, true);
+            pinned_buffer_list_[i] =
+                allocateMemoryPool(total_buffer_size, gpu_id, true);
             if (pinned_buffer_list_[i] == nullptr) {
                 LOG(ERROR) << "Failed to allocate buffer for GPU " << gpu_id;
                 // Clean up already allocated buffers
@@ -231,8 +239,8 @@ int TEBenchRunner::allocateBuffers() {
                 return -1;
             }
 
-            auto ret = engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                                     total_buffer_size, location);
+            auto ret = engine_->registerLocalMemory(
+                pinned_buffer_list_[i], total_buffer_size, location);
             if (ret != 0) {
                 LOG(ERROR) << "Failed to register memory for " << location
                            << ", error code: " << ret;
@@ -409,26 +417,30 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
 
 // Multi-target methods (not supported for classic TE backend)
 int TEBenchRunner::publishSegment(const std::string& segment_name) {
-    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
-    LOG(ERROR) << "Please use TENT backend (--backend=tent) for all-to-all testing";
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic "
+                  "TE backend";
+    LOG(ERROR)
+        << "Please use TENT backend (--backend=tent) for all-to-all testing";
     return -1;
 }
 
-int TEBenchRunner::connectToAllTargets(const std::vector<std::string>& target_segments,
-                                      int sync_timeout_sec) {
-    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
-    LOG(ERROR) << "Please use TENT backend (--backend=tent) for all-to-all testing";
+int TEBenchRunner::connectToAllTargets(
+    const std::vector<std::string>& target_segments, int sync_timeout_sec) {
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic "
+                  "TE backend";
+    LOG(ERROR)
+        << "Please use TENT backend (--backend=tent) for all-to-all testing";
     return -1;
 }
 
-size_t TEBenchRunner::getTargetCount() const {
-    return 0;
-}
+size_t TEBenchRunner::getTargetCount() const { return 0; }
 
-double TEBenchRunner::runTransferToTarget(uint64_t local_addr, size_t target_idx,
-                                        uint64_t block_size, uint64_t batch_size,
-                                        OpCode opcode) {
-    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
+double TEBenchRunner::runTransferToTarget(uint64_t local_addr,
+                                          size_t target_idx,
+                                          uint64_t block_size,
+                                          uint64_t batch_size, OpCode opcode) {
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic "
+                  "TE backend";
     return -1.0;
 }
 

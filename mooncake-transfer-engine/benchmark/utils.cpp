@@ -56,10 +56,10 @@ DEFINE_string(
 // All-to-all multi-node configuration flags
 DEFINE_bool(enable_alltoall, false,
             "Enable all-to-all multi-node testing mode");
-DEFINE_string(test_id, "default-test",
-              "Unique identifier for this test run (must be same on all nodes)");
-DEFINE_int32(num_nodes, 1,
-             "Total number of nodes in the test");
+DEFINE_string(
+    test_id, "default-test",
+    "Unique identifier for this test run (must be same on all nodes)");
+DEFINE_int32(num_nodes, 1, "Total number of nodes in the test");
 DEFINE_int32(node_rank, 0,
              "Rank of this node (0-based, must be unique per node)");
 DEFINE_int32(sync_timeout_sec, 120,

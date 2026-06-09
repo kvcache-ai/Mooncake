@@ -354,7 +354,8 @@ int TENTBenchRunner::publishSegment(const std::string& segment_name) {
  * This is used for node synchronization - wait for all nodes' segments
  * to be published before starting the test.
  */
-static bool isSegmentAvailable(TransferEngine* engine, const std::string& segment_name) {
+static bool isSegmentAvailable(TransferEngine* engine,
+                               const std::string& segment_name) {
     SegmentID test_handle;
     auto status = engine->openSegment(test_handle, segment_name);
     if (!status.ok()) {
@@ -371,25 +372,31 @@ static bool isSegmentAvailable(TransferEngine* engine, const std::string& segmen
     return true;
 }
 
-int TENTBenchRunner::connectToAllTargets(const std::vector<std::string>& target_segments,
-                                         int sync_timeout_sec) {
+int TENTBenchRunner::connectToAllTargets(
+    const std::vector<std::string>& target_segments, int sync_timeout_sec) {
     target_names_ = target_segments;
     target_handles_.clear();
     target_infos_.resize(target_segments.size());
 
-    LOG(INFO) << "Connecting to " << target_segments.size() << " target segments...";
+    LOG(INFO) << "Connecting to " << target_segments.size()
+              << " target segments...";
 
-    // Phase 1: Wait for all target segments to become available (synchronization)
+    // Phase 1: Wait for all target segments to become available
+    // (synchronization)
     if (sync_timeout_sec > 0) {
-        LOG(INFO) << "Waiting for all nodes to be ready (timeout: " << sync_timeout_sec << "s)...";
+        LOG(INFO) << "Waiting for all nodes to be ready (timeout: "
+                  << sync_timeout_sec << "s)...";
 
         std::vector<bool> segment_ready(target_segments.size(), false);
         int all_ready_rounds = 0;
         auto start_time = std::chrono::steady_clock::now();
 
-        while (all_ready_rounds < 2) {  // Need 2 consecutive rounds to ensure stability
+        while (all_ready_rounds <
+               2) {  // Need 2 consecutive rounds to ensure stability
             auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                               now - start_time)
+                               .count();
 
             if (elapsed >= sync_timeout_sec) {
                 LOG(ERROR) << "Timeout waiting for all nodes to be ready";
@@ -406,7 +413,8 @@ int TENTBenchRunner::connectToAllTargets(const std::vector<std::string>& target_
             for (size_t i = 0; i < target_segments.size(); ++i) {
                 if (!segment_ready[i]) {
                     if (isSegmentAvailable(engine_.get(), target_segments[i])) {
-                        LOG(INFO) << "Segment " << target_segments[i] << " is now ready";
+                        LOG(INFO) << "Segment " << target_segments[i]
+                                  << " is now ready";
                         segment_ready[i] = true;
                     } else {
                         all_ready_this_round = false;
@@ -416,7 +424,8 @@ int TENTBenchRunner::connectToAllTargets(const std::vector<std::string>& target_
 
             if (all_ready_this_round) {
                 all_ready_rounds++;
-                LOG(INFO) << "All segments ready (round " << all_ready_rounds << "/2)";
+                LOG(INFO) << "All segments ready (round " << all_ready_rounds
+                          << "/2)";
             } else {
                 all_ready_rounds = 0;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -438,10 +447,11 @@ int TENTBenchRunner::connectToAllTargets(const std::vector<std::string>& target_
         SegmentInfo target_info;
         CHECK_FAIL(engine_->getSegmentInfo(target_handle, target_info));
 
-        std::sort(target_info.buffers.begin(), target_info.buffers.end(),
-                  [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
-                      return a.location < b.location;
-                  });
+        std::sort(
+            target_info.buffers.begin(), target_info.buffers.end(),
+            [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
+                return a.location < b.location;
+            });
         target_infos_[i] = target_info;
 
         LOG(INFO) << "Connected to target " << i << " with "
@@ -454,7 +464,8 @@ int TENTBenchRunner::connectToAllTargets(const std::vector<std::string>& target_
         info_ = target_infos_[0];
     }
 
-    LOG(INFO) << "Successfully connected to all " << target_handles_.size() << " targets";
+    LOG(INFO) << "Successfully connected to all " << target_handles_.size()
+              << " targets";
     return 0;
 }
 
@@ -462,8 +473,10 @@ size_t TENTBenchRunner::getTargetCount() const {
     return target_handles_.size();
 }
 
-double TENTBenchRunner::runTransferToTarget(uint64_t local_addr, size_t target_idx,
-                                            uint64_t block_size, uint64_t batch_size,
+double TENTBenchRunner::runTransferToTarget(uint64_t local_addr,
+                                            size_t target_idx,
+                                            uint64_t block_size,
+                                            uint64_t batch_size,
                                             OpCode opcode) {
     if (target_idx >= target_handles_.size()) {
         LOG(ERROR) << "Invalid target index: " << target_idx
@@ -485,8 +498,9 @@ double TENTBenchRunner::runTransferToTarget(uint64_t local_addr, size_t target_i
         entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = target_handle;
         // Calculate target offset based on the target's buffer layout
-        entry.target_offset = target_info.buffers[i % target_info.buffers.size()].base +
-                              block_size * (i / target_info.buffers.size());
+        entry.target_offset =
+            target_info.buffers[i % target_info.buffers.size()].base +
+            block_size * (i / target_info.buffers.size());
         entry.transport_hint = transport_hint_;
         requests.emplace_back(entry);
     }

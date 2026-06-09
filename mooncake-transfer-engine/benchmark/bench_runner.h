@@ -62,8 +62,9 @@ class BenchRunner {
     // Multi-target methods for all-to-all testing
     virtual int publishSegment(const std::string& segment_name) = 0;
 
-    virtual int connectToAllTargets(const std::vector<std::string>& target_segments,
-                                  int sync_timeout_sec = 120) = 0;
+    virtual int connectToAllTargets(
+        const std::vector<std::string>& target_segments,
+        int sync_timeout_sec = 120) = 0;
 
     virtual size_t getTargetCount() const = 0;
 
