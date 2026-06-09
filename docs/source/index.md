@@ -69,7 +69,6 @@ getting_started/build
 getting_started/quick-start
 getting_started/supported-protocols
 getting_started/observability
-getting_started/examples/sglang-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 Mooncake x LMCache Integration<getting_started/examples/lmcache-integration>
@@ -84,6 +83,7 @@ getting_started/plugin-usage/3FS-USRBIO-Plugin
 :maxdepth: 1
 
 performance/vllm/index
+performance/sglang/index
 performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
