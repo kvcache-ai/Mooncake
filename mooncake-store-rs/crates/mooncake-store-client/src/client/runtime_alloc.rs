@@ -120,6 +120,23 @@ impl StoreClient {
             specific_indices: Vec<usize>,
         }
 
+        struct RemoteReservationJob {
+            storage_runtime: ClientRuntimeId,
+            lease: ClientLease,
+            any_indices: Vec<usize>,
+            any_lengths: Vec<u64>,
+            specific_indices: Vec<usize>,
+            specific_ops: Vec<ReserveSpecificOp>,
+        }
+
+        struct RemoteReservationJobResult {
+            storage_runtime: ClientRuntimeId,
+            any_indices: Vec<usize>,
+            any_results: Option<Result<Vec<Result<mooncake_store_core::SegmentReservation>>>>,
+            specific_indices: Vec<usize>,
+            specific_results: Option<Result<Vec<Result<mooncake_store_core::SegmentReservation>>>>,
+        }
+
         let mut remote_groups = BTreeMap::<ClientRuntimeId, RemoteReservationGroup>::new();
         for (index, request) in requests.iter().enumerate() {
             if request.storage_runtime == self.lease.runtime {
@@ -168,63 +185,16 @@ impl StoreClient {
             }
         }
 
-        for (storage_runtime, group) in remote_groups {
-            if !group.any_indices.is_empty() {
-                let lengths = group
+        let control_client = self.control_client.clone();
+        let remote_jobs = remote_groups
+            .into_iter()
+            .map(|(storage_runtime, group)| {
+                let any_lengths = group
                     .any_indices
                     .iter()
                     .map(|index| requests[*index].length_bytes)
                     .collect::<Vec<_>>();
-                match self
-                    .control_client
-                    .batch_reserve_any(&group.lease, &storage_runtime, &lengths)
-                {
-                    Ok(results) => {
-                        for ((index, _length_bytes), result) in group
-                            .any_indices
-                            .iter()
-                            .copied()
-                            .zip(lengths)
-                            .zip(results)
-                        {
-                            let reservation = match result {
-                                Ok(reservation) => reservation,
-                                Err(error) => {
-                                    if should_mark_runtime_suspect_after_allocator_error(&error) {
-                                        self.mark_runtime_suspect(
-                                            &storage_runtime,
-                                            "allocator_batch_reserve_any_failed",
-                                        );
-                                    }
-                                    resolved[index] = Some(Err(error.clone()));
-                                    continue;
-                                }
-                            };
-                            resolved[index] = Some(
-                                self.replica_write_target(
-                                    &storage_runtime,
-                                    &reservation.segment_name,
-                                )
-                                .map(|target| (target, reservation)),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if should_mark_runtime_suspect_after_allocator_error(&error) {
-                            self.mark_runtime_suspect(
-                                &storage_runtime,
-                                "allocator_batch_reserve_any_failed",
-                            );
-                        }
-                        for index in group.any_indices {
-                            resolved[index] = Some(Err(error.clone()));
-                        }
-                    }
-                }
-            }
-
-            if !group.specific_indices.is_empty() {
-                let ops = group
+                let specific_ops = group
                     .specific_indices
                     .iter()
                     .map(|index| ReserveSpecificOp {
@@ -235,25 +205,56 @@ impl StoreClient {
                         length_bytes: requests[*index].length_bytes,
                     })
                     .collect::<Vec<_>>();
-                match self
-                    .control_client
-                    .batch_reserve_specific(&group.lease, &storage_runtime, &ops)
-                {
+                RemoteReservationJob {
+                    storage_runtime,
+                    lease: group.lease,
+                    any_indices: group.any_indices,
+                    any_lengths,
+                    specific_indices: group.specific_indices,
+                    specific_ops,
+                }
+            })
+            .collect::<Vec<_>>();
+        let remote_results = run_bounded_parallel_jobs(remote_jobs, 8, move |job| {
+            let any_results = if job.any_lengths.is_empty() {
+                None
+            } else {
+                Some(control_client.batch_reserve_any(
+                    &job.lease,
+                    &job.storage_runtime,
+                    &job.any_lengths,
+                ))
+            };
+            let specific_results = if job.specific_ops.is_empty() {
+                None
+            } else {
+                Some(control_client.batch_reserve_specific(
+                    &job.lease,
+                    &job.storage_runtime,
+                    &job.specific_ops,
+                ))
+            };
+            RemoteReservationJobResult {
+                storage_runtime: job.storage_runtime,
+                any_indices: job.any_indices,
+                any_results,
+                specific_indices: job.specific_indices,
+                specific_results,
+            }
+        });
+
+        for job in remote_results {
+            if let Some(any_results) = job.any_results {
+                match any_results {
                     Ok(results) => {
-                        for ((index, _request), result) in group
-                            .specific_indices
-                            .iter()
-                            .copied()
-                            .zip(ops.iter())
-                            .zip(results)
-                        {
+                        for (index, result) in job.any_indices.into_iter().zip(results) {
                             let reservation = match result {
                                 Ok(reservation) => reservation,
                                 Err(error) => {
                                     if should_mark_runtime_suspect_after_allocator_error(&error) {
                                         self.mark_runtime_suspect(
-                                            &storage_runtime,
-                                            "allocator_batch_reserve_specific_failed",
+                                            &job.storage_runtime,
+                                            "allocator_batch_reserve_any_failed",
                                         );
                                     }
                                     resolved[index] = Some(Err(error.clone()));
@@ -262,7 +263,7 @@ impl StoreClient {
                             };
                             resolved[index] = Some(
                                 self.replica_write_target(
-                                    &storage_runtime,
+                                    &job.storage_runtime,
                                     &reservation.segment_name,
                                 )
                                 .map(|target| (target, reservation)),
@@ -272,11 +273,51 @@ impl StoreClient {
                     Err(error) => {
                         if should_mark_runtime_suspect_after_allocator_error(&error) {
                             self.mark_runtime_suspect(
-                                &storage_runtime,
+                                &job.storage_runtime,
+                                "allocator_batch_reserve_any_failed",
+                            );
+                        }
+                        for index in job.any_indices {
+                            resolved[index] = Some(Err(error.clone()));
+                        }
+                    }
+                }
+            }
+
+            if let Some(specific_results) = job.specific_results {
+                match specific_results {
+                    Ok(results) => {
+                        for (index, result) in job.specific_indices.into_iter().zip(results) {
+                            let reservation = match result {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    if should_mark_runtime_suspect_after_allocator_error(&error) {
+                                        self.mark_runtime_suspect(
+                                            &job.storage_runtime,
+                                            "allocator_batch_reserve_specific_failed",
+                                        );
+                                    }
+                                    resolved[index] = Some(Err(error.clone()));
+                                    continue;
+                                }
+                            };
+                            resolved[index] = Some(
+                                self.replica_write_target(
+                                    &job.storage_runtime,
+                                    &reservation.segment_name,
+                                )
+                                .map(|target| (target, reservation)),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if should_mark_runtime_suspect_after_allocator_error(&error) {
+                            self.mark_runtime_suspect(
+                                &job.storage_runtime,
                                 "allocator_batch_reserve_specific_failed",
                             );
                         }
-                        for index in group.specific_indices {
+                        for index in job.specific_indices {
                             resolved[index] = Some(Err(error.clone()));
                         }
                     }
@@ -1043,4 +1084,67 @@ impl StoreClient {
             .collect::<Vec<_>>();
         self.release_segment_allocations_batch(&releases)
     }
+}
+
+fn run_bounded_parallel_jobs<Input, Output, F>(
+    jobs: Vec<Input>,
+    max_parallelism: usize,
+    worker: F,
+) -> Vec<Output>
+where
+    Input: Send,
+    Output: Send,
+    F: Fn(Input) -> Output + Sync,
+{
+    debug_assert!(
+        max_parallelism > 0,
+        "parallel job max_parallelism should be greater than zero"
+    );
+    let workers = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(jobs.len())
+        .min(max_parallelism.max(1));
+    if workers <= 1 || jobs.len() <= 1 {
+        return jobs.into_iter().map(worker).collect();
+    }
+
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
+        jobs.into_iter().enumerate().collect::<Vec<_>>(),
+    ));
+    let results = std::sync::Mutex::new(Vec::<(usize, Output)>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let queue = &queue;
+            let results = &results;
+            let worker = &worker;
+            scope.spawn(move || {
+                let mut local_results = Vec::new();
+                loop {
+                    // Keep the queue lock scoped to pop_front only. Running worker(job)
+                    // while holding the lock would let a panic poison later queue access.
+                    let next_job = queue
+                        .lock()
+                        .expect("parallel job queue lock should succeed")
+                        .pop_front();
+                    let Some((index, job)) = next_job else {
+                        break;
+                    };
+                    local_results.push((index, worker(job)));
+                }
+                if !local_results.is_empty() {
+                    results
+                        .lock()
+                        .expect("parallel job results lock should succeed")
+                        .extend(local_results);
+                }
+            });
+        }
+    });
+
+    let mut results = results
+        .into_inner()
+        .expect("parallel job results lock should succeed");
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, output)| output).collect()
 }
