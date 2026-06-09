@@ -2,6 +2,7 @@
 #include "master_metric_manager.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_test_utils.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/oplog/etcd_oplog_store.h"
@@ -158,7 +159,44 @@ class SnapshotChildProcessTest : public ::testing::Test {
         size_t shard_idx = svc->getShardIndex(key);
         auto& shard = svc->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        return shard.metadata.find(key) != shard.metadata.end();
+        auto tenant_it = shard.tenants.find("default");
+        return tenant_it != shard.tenants.end() &&
+               tenant_it->second.metadata.find(key) !=
+                   tenant_it->second.metadata.end();
+    }
+
+    uint32_t GetShardIndexForTest(const std::string& key) {
+        return static_cast<uint32_t>(service_->getShardIndex(key));
+    }
+
+    tl::expected<void, SerializationError> DeserializeMetadataForTest(
+        const std::vector<uint8_t>& data) {
+        MasterService::MetadataSerializer serializer(service_.get());
+        return serializer.Deserialize(data);
+    }
+
+    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
+        auto& shard = service_->metadata_shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
+        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+            auto it = tenant_state.metadata.find(key);
+            if (it != tenant_state.metadata.end()) {
+                return it->second.IsGrouped();
+            }
+        }
+        return false;
+    }
+
+    std::string FindGroupIdOnDifferentShard(MasterService* svc,
+                                            const std::string& key) {
+        const size_t key_shard = svc->getShardIndex(key);
+        for (int i = 0; i < 1024; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (svc->getShardIndex(group_id) != key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_group";
     }
 
    private:
@@ -407,6 +445,110 @@ TEST_F(SnapshotChildProcessTest, PersistState_UsesFrozenSnapshotDescriptor) {
     EXPECT_EQ(latest->value().created_at_ms, descriptor.created_at_ms);
 }
 
+TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "grouped_snapshot_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "snapshot_grouped_route_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.group_ids = std::vector<std::string>{
+        FindGroupIdOnDifferentShard(service_.get(), key)};
+
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, "default").value_or(false));
+
+    auto persist_result = CallPersistState("20240701_130000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    auto restored_replicas = service_->GetReplicaList(key, "default");
+    ASSERT_TRUE(restored_replicas.has_value())
+        << "Grouped key should remain reachable by key after restore";
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+    EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
+    CreateDefaultService();
+    const std::string key = "legacy_snapshot_no_group_id_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(8);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+
+    auto compressed_shard =
+        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                      shard_buffer.size(), 3);
+
+    msgpack::sbuffer root_buffer;
+    MsgpackPacker root_packer(&root_buffer);
+    root_packer.pack_map(3);
+    root_packer.pack(std::string("shards"));
+    root_packer.pack_map(1);
+    root_packer.pack(shard_idx);
+    root_packer.pack_bin(compressed_shard.size());
+    root_packer.pack_bin_body(
+        reinterpret_cast<const char*>(compressed_shard.data()),
+        compressed_shard.size());
+    root_packer.pack(std::string("discarded_replicas"));
+    root_packer.pack_array(0);
+    root_packer.pack(std::string("replica_next_id"));
+    root_packer.pack(uint64_t{10});
+
+    auto deserialize_result =
+        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+}
+
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
     MasterConfig legacy_config;
     legacy_config.enable_ha = true;
@@ -563,12 +705,14 @@ TEST_F(SnapshotChildProcessTest,
         << "MountSegment failed";
 
     const std::string key1 = "restore_fallback_key_1";
-    auto put1 = service_->PutStart(client_id, key1, {1024}, {.replica_num = 1});
+    auto put1 = service_->PutStart(client_id, key1, "default", {1024},
+                                   {.replica_num = 1});
     ASSERT_TRUE(put1.has_value()) << "PutStart for key1 failed";
     ASSERT_TRUE(
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY).has_value())
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd for key1 failed";
-    EXPECT_TRUE(service_->ExistKey(key1).value_or(false))
+    EXPECT_TRUE(service_->ExistKey(key1, "default").value_or(false))
         << "ExistKey should refresh lease for key1 before snapshot1";
 
     const std::string snapshot_id1 = "20240702_120000_000";
@@ -578,12 +722,14 @@ TEST_F(SnapshotChildProcessTest,
         << persist_result.error().message;
 
     const std::string key2 = "restore_fallback_key_2";
-    auto put2 = service_->PutStart(client_id, key2, {1024}, {.replica_num = 1});
+    auto put2 = service_->PutStart(client_id, key2, "default", {1024},
+                                   {.replica_num = 1});
     ASSERT_TRUE(put2.has_value()) << "PutStart for key2 failed";
     ASSERT_TRUE(
-        service_->PutEnd(client_id, key2, ReplicaType::MEMORY).has_value())
+        service_->PutEnd(client_id, key2, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd for key2 failed";
-    EXPECT_TRUE(service_->ExistKey(key2).value_or(false))
+    EXPECT_TRUE(service_->ExistKey(key2, "default").value_or(false))
         << "ExistKey should refresh lease for key2 before snapshot2";
 
     const std::string snapshot_id2 = "20240702_120500_000";
@@ -614,9 +760,9 @@ TEST_F(SnapshotChildProcessTest,
                               .build();
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
-    EXPECT_TRUE(restored_service->ExistKey(key1).value_or(false))
+    EXPECT_TRUE(restored_service->ExistKey(key1, "default").value_or(false))
         << "Restore should fall back to the previous healthy snapshot";
-    EXPECT_FALSE(restored_service->ExistKey(key2).value_or(false))
+    EXPECT_FALSE(restored_service->ExistKey(key2, "default").value_or(false))
         << "Corrupted latest snapshot must not be partially restored";
 
     restored_service.reset();
@@ -687,22 +833,22 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
 
     // Add a complete object (clean data)
     std::string clean_key = "clean_object";
-    auto put_result =
-        service_->PutStart(client_id, clean_key, {1024}, {.replica_num = 1});
+    auto put_result = service_->PutStart(client_id, clean_key, "default",
+                                         {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_result.has_value()) << "PutStart clean failed";
     auto put_end_result =
-        service_->PutEnd(client_id, clean_key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, clean_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value()) << "PutEnd clean failed";
 
     // Add an incomplete object (PutStart without PutEnd -> non-COMPLETE)
     std::string dirty_key = "dirty_incomplete";
-    auto put_dirty_result =
-        service_->PutStart(client_id, dirty_key, {1024}, {.replica_num = 1});
+    auto put_dirty_result = service_->PutStart(client_id, dirty_key, "default",
+                                               {1024}, {.replica_num = 1});
     ASSERT_TRUE(put_dirty_result.has_value()) << "PutStart dirty failed";
     // Intentionally NO PutEnd -> replica stays in PENDING status
 
     // Verify both keys exist in metadata before snapshot
-    EXPECT_TRUE(service_->ExistKey(clean_key).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(clean_key, "default").value_or(false));
     EXPECT_TRUE(KeyExistsInMetadata(service_.get(), dirty_key))
         << "Dirty key should exist in raw metadata after PutStart";
 
@@ -725,7 +871,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify non-COMPLETE replica was cleaned, complete one remains
-    EXPECT_TRUE(restored_service->ExistKey(clean_key).value_or(false))
+    EXPECT_TRUE(
+        restored_service->ExistKey(clean_key, "default").value_or(false))
         << "Complete object should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), dirty_key))
         << "Non-COMPLETE object should be cleaned from metadata during restore";
@@ -761,23 +908,25 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     // Add two complete objects via PutStart + PutEnd
     // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
     std::string expired_key = "expired_lease_object";
-    auto put_exp =
-        service_->PutStart(client_id, expired_key, {1024}, {.replica_num = 1});
+    auto put_exp = service_->PutStart(client_id, expired_key, "default", {1024},
+                                      {.replica_num = 1});
     ASSERT_TRUE(put_exp.has_value()) << "PutStart expired failed";
-    ASSERT_TRUE(service_->PutEnd(client_id, expired_key, ReplicaType::MEMORY)
-                    .has_value())
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, expired_key, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd expired failed";
 
     std::string normal_key = "normal_lease_object";
-    auto put_norm =
-        service_->PutStart(client_id, normal_key, {1024}, {.replica_num = 1});
+    auto put_norm = service_->PutStart(client_id, normal_key, "default", {1024},
+                                       {.replica_num = 1});
     ASSERT_TRUE(put_norm.has_value()) << "PutStart normal failed";
-    ASSERT_TRUE(service_->PutEnd(client_id, normal_key, ReplicaType::MEMORY)
-                    .has_value())
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, normal_key, "default", ReplicaType::MEMORY)
+            .has_value())
         << "PutEnd normal failed";
 
     // ExistKey grants a fresh lease (now + 600s) to normal_key
-    EXPECT_TRUE(service_->ExistKey(normal_key).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(normal_key, "default").value_or(false));
     // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
 
     // Step 2: Persist state
@@ -799,7 +948,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     auto restored_service = std::make_unique<MasterService>(restore_config);
 
     // Step 4: Verify normal data retained, expired-lease data cleaned
-    EXPECT_TRUE(restored_service->ExistKey(normal_key).value_or(false))
+    EXPECT_TRUE(
+        restored_service->ExistKey(normal_key, "default").value_or(false))
         << "Normal object with valid lease should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";

@@ -75,11 +75,7 @@ The design favors predictable behavior and operational simplicity over manual tu
 
 ## TENT C++ API Reference 
 
-:::{toctree}
-:maxdepth: 1
-
-cpp-api
-:::
+[TENT C++ API Reference](cpp-api.md)
 
 ## TENT Metrics System
 
@@ -87,4 +83,36 @@ cpp-api
 :maxdepth: 1
 
 metrics
+:::
+
+## TENT Transport Selection
+
+:::{toctree}
+:maxdepth: 1
+
+transport-selector
+:::
+
+## TENT Quality of Service
+
+:::{toctree}
+:maxdepth: 1
+
+qos
+:::
+
+## TENT Slice Spraying
+
+:::{toctree}
+:maxdepth: 1
+
+slice-spraying
+:::
+
+## TENT Failover
+
+:::{toctree}
+:maxdepth: 1
+
+failover
 :::

@@ -80,6 +80,34 @@ cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
 pip install -e ../mooncake-wheel --no-build-isolation
 ```
 
+### 3. Building a Distributable Wheel (optional)
+
+To produce a relocatable wheel for distribution (instead of the editable
+install above), use `scripts/build_wheel.sh`, which runs `auditwheel
+repair` to bundle non-system dependencies:
+
+```bash
+# After the cmake/make build above completes:
+PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+pip install dist/mooncake_transfer_engine-*.whl
+```
+
+> **Important (EFA builds):** `auditwheel repair` excludes `libfabric`
+> and `libefa` from the wheel so they resolve to the system EFA
+> installation (`/opt/amazon/efa/lib`) at runtime. This is required
+> because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the
+> **same** system `libfabric`. If the wheel bundled its own copy, the
+> process would load two independent libfabric instances — Mooncake's
+> bundled one and NCCL's system one — and whichever initializes first
+> claims the EFA device, leaving the other with an empty provider list
+> (`fi_getinfo: provider efa output empty list`). NCCL then silently
+> falls back to the TCP provider and cross-node collectives such as
+> `all_gather_object` hang. Excluding libfabric/libefa (see
+> `scripts/build_wheel.sh`) keeps a single shared libfabric in the
+> process. If you are on an older Mooncake build whose wheel still bundles
+> libfabric, force the system copy with
+> `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+
 ## Verification
 
 Test EFA transport initialization:
@@ -92,7 +120,7 @@ result = te.initialize('127.0.0.1', 'P2PHANDSHAKE', 'efa', '')
 print(f'Initialize result: {result}')  # Should be 0
 
 # You should see logs like:
-# EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, provider: efa
+# EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, fabric: efa, provider: efa
 ```
 
 ## Unit Tests
@@ -211,32 +239,33 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
+(benchmark-results)=
 ### Benchmark Results
 
 #### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
 
-Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group.
-
-> **Note:** numbers below predate the SRD shared-endpoint refactor (#1944) and current EFA tuning work. They are a lower bound for the current code; we will re-sweep and update when the hardware is available again.
+Tested on two p6-b300.48xlarge instances (Intel Xeon Platinum 8559C, 8× B300, 16 EFA devices) in the same AWS placement group. Numbers below are post-SRD-shared-endpoint (#1944) on a fresh `main` build with the DLAMI pytorch env (CUDA 13).
 
 **GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=2147483648`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| block=1MB, threads=16, batch=128 | 701 GB/s | **697 GB/s** |
-| **block=1MB, threads=32, batch=64** | **752 GB/s** | 713 GB/s |
-| block=1MB, threads=32, batch=32 | 751 GB/s | - |
-| block=1MB, threads=64, batch=32 | 728 GB/s | - |
+| block=1MB, threads=16, batch=128 | 758.88 GB/s | 720.35 GB/s |
+| block=1MB, threads=32, batch=64 | 753.32 GB/s | **755.78 GB/s** |
+| **block=1MB, threads=32, batch=32** | **780.33 GB/s** | - |
+| block=1MB, threads=64, batch=32 | 780.23 GB/s | - |
 
-> **Peak: 752 GB/s write**, reaching ~94% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
+> **Peak: 780 GB/s write**, reaching ~97.5% of the 800 GB/s theoretical line rate (16×400 Gbps). GPUDirect RDMA bypasses DRAM entirely (HBM3e → PCIe switch → NIC), so performance is not bottlenecked by CPU memory bandwidth.
 
-**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`):
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
 
 | Configuration | Write | Read |
 |---------------|-------|------|
-| **block=1MB, threads=32, batch=128, buf=4GB** | **230 GB/s** | 180 GB/s |
+| **block=1MB, threads=32, batch=128** | **282.93 GB/s** | **270.47 GB/s** |
+| block=1MB, threads=16, batch=128 | 282.04 GB/s | 249.67 GB/s |
+| block=1MB, threads=32, batch=64 | 282.84 GB/s | 256.26 GB/s |
 
-> CPU-to-CPU is bounded by DRAM bandwidth (~250 GB/s/socket on Xeon 8559C). Per-NIC sampling shows NUMA-0 NICs at 90 Gbps and NUMA-1 NICs at 53 Gbps, confirming DRAM controller saturation rather than NIC limit.
+> CPU-to-CPU is bounded by DRAM bandwidth on the Xeon 8559C — write throughput is essentially flat across thread/batch combinations (~282 GB/s), confirming DRAM controller saturation rather than a NIC or in-flight-WR limit.
 
 #### 2. p6-b200.48xlarge (B200, 8 EFA × 400 Gbps)
 
@@ -311,11 +340,100 @@ Tested on two p5en.48xlarge instances (Intel Xeon 8488C, 8× H200 141GB, 16 EFA 
 
 > `buffer_size` only needs to satisfy `buffer_size ≥ block_size × batch_size × threads` (the bench auto-adjusts if smaller, but silently). Anything larger than that minimum does not change throughput — 2 GB vs 4 GB differs by ~3% on write, read is flat within noise. The example commands use 4 GB because it is safe for any reasonable threads/batch combination without having to recompute the minimum.
 
+#### 4. p5.48xlarge (H100, 32 EFA × 100 Gbps)
+
+Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA devices) in the same AWS placement group. Per-NIC line rate is half of p5en's, but with twice the NIC count the aggregate ceiling is the same 400 GB/s. The shared-endpoint WR cap scales with NIC count: `32 NICs × 256 = 8192` in-flight slots, so `threads × batch_size ≤ 8192` (vs 4096 on p5en).
+
+**GPU-to-GPU** (build with `-DUSE_CUDA=ON`, `--gpu_id=-1` for all 8 GPUs, `--buffer_size=4294967296`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=8, batch=128 | 335.11 GB/s | - |
+| block=1MB, threads=16, batch=128 | 388.52 GB/s | 379.10 GB/s |
+| block=1MB, threads=32, batch=64 | 388.83 GB/s | 379.78 GB/s |
+| **block=1MB, threads=32, batch=128** | **388.90 GB/s** | **381.64 GB/s** |
+| block=1MB, threads=16, batch=32 | - | 356.94 GB/s |
+| block=1MB, threads=32, batch=32 | - | 380.66 GB/s |
+
+> **Peak write: 389 GB/s** at `threads=32, batch=128` — ~97% of the 400 GB/s theoretical line rate (32×100 Gbps). The plateau is wide: any `(threads, batch)` between `(16, 128)` and `(32, 128)` lands within 0.1% of peak. **Peak read: 382 GB/s** at `threads=32, batch=128` — unlike p5en, reads on this host scale with batch size up to 128 because the wider 32-NIC fabric absorbs larger in-flight queues without backoff. `(32, 256)` and `(64, 128)` (both at the 8192 WR cap) fail with no headroom for retries.
+
+**CPU-to-CPU** (build with `-DUSE_CUDA=OFF`, or `--use_vram=false` on a CUDA build, `--buffer_size=4294967296`):
+
+| Configuration | Write | Read |
+|---------------|-------|------|
+| block=1MB, threads=16, batch=128 | 39.83 GB/s | 40.43 GB/s |
+| block=1MB, threads=32, batch=64 | 47.31 GB/s | 48.06 GB/s |
+| block=1MB, threads=32, batch=128 | 47.75 GB/s | 48.62 GB/s |
+| block=1MB, threads=32, batch=32 | 55.66 GB/s | 56.68 GB/s |
+| **block=1MB, threads=48, batch=16** | **63.60 GB/s** | 63.00 GB/s |
+| **block=1MB, threads=64, batch=16** | 63.39 GB/s | 63.05 GB/s |
+| block=1MB, threads=32, batch=16 | 63.21 GB/s | 60.82 GB/s |
+| block=1MB, threads=96, batch=32 | 57.61 GB/s | 59.63 GB/s |
+
+> **Peak: ~64 GB/s** on both write and read — far below the GPU-to-GPU number despite identical NIC count. The bottleneck is DDR4-3200 DRAM bandwidth on the EPYC 7R13 (Milan): `batch=16` consistently wins because larger in-flight queues only deepen DRAM contention without unlocking new NIC capacity. p5.48xlarge CPU-to-CPU runs around **3× slower than p5en** (DDR5 Xeon 8488C, ~213 GB/s) at the same NIC aggregate. For PD KV transfer, the GPU-to-GPU path is the relevant one.
+
+### Single-host loopback
+
+EFA NICs have no hardware loopback short-circuit: when a transfer's source and
+destination resolve to the same host, the data does not go out on the wire as
+GPUDirect/device RDMA. libfabric handles the same-host case in software, and
+there are **two distinct provider knobs** that select how:
+
+- **`FI_EFA_ENABLE_SHM_TRANSFER`** (default `1`, on): when on, the EFA
+  provider routes same-host peers through the **`shm` provider** — verifiable
+  at runtime, where libfabric reports `Opened fabric: shm` alongside
+  `Opened fabric: efa` even on a default (device-RDMA-enabled) configuration.
+  This SHM path is the one that supplies the same-host memcpy fast path; it is
+  active **by default**, independent of `FI_EFA_USE_DEVICE_RDMA`.
+- **`FI_EFA_USE_DEVICE_RDMA`** (default `1` after #2041): controls whether the
+  EFA RDM data path uses device RDMA vs libfabric's emulated RDM path. It is a
+  provider-level flag resolved at `fi_getinfo` time; Mooncake does not wrap it.
+
+```{warning}
+**GPU (FI_HMEM_CUDA) buffers — known segfault.** The default same-host **SHM**
+path (`FI_EFA_ENABLE_SHM_TRANSFER=1`) performs a **host `memcpy` into the
+destination buffer** during SHM SAR reassembly, *without* honoring an
+`FI_HMEM_CUDA` destination's iface. On a GPU buffer this writes host memory
+straight into a device pointer and **segfaults** on the first same-host
+transfer — `__memcpy_avx_unaligned` ← `ofi_copy_to_mr_iov` ← `smr_copy_from_sar`
+← `efa_rdm_cq_readfrom` ← `fi_cq_read`. Reported upstream as
+[ofiwg/libfabric#12328](https://github.com/ofiwg/libfabric/issues/12328).
+
+- **Same-process self-loopback** (e.g. a TP-colocated rank reading its own
+  registered GPU weights — checkpoint-engine p2p weight update) is handled
+  inside Mooncake: `EfaContext::tryLoopbackCopy` detects a same-process peer
+  (matched on `local_server_name`, which embeds this process's unique RPC
+  port) and satisfies the transfer with a local `cudaMemcpy` instead of routing
+  it over EFA, so it never reaches the broken SHM path.
+- **Same-host cross-process GPU transfers** are *not* short-circuited (the
+  peer is a different process / address space). Until libfabric#12328 is fixed,
+  set `FI_EFA_ENABLE_SHM_TRANSFER=0` on such processes — same-host transfers
+  then fall back to device RDMA, which is GPU-aware and correct.
+```
+
+For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is
+the same-host fast path the measurements below exercise.
+
+Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, host DRAM buffer,
+same-host producer/consumer in **separate processes**):
+
+| same-host path | per-write latency |
+|---|---:|
+| device RDMA (NIC round-trip, no fast-path for loopback) | ~830 ms |
+| SHM memcpy fast path (default) | ~390 ms |
+
+For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC)
+is ~340 ms — i.e., driving a same-host loopback through the NIC is *slower* than
+going over the wire to another host, because the NIC has no fast-path for
+loopback. Cross-host transfers always use device RDMA and are unaffected by
+`FI_EFA_ENABLE_SHM_TRANSFER`: leave it at its default on any process that also
+talks to remote peers.
+
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
-- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` with a 256 WR cap (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a 16-NIC host. Exceeding this trips "timed out waiting for CQ drain". In practice `threads=16, batch=128` is a solid baseline; going higher rarely adds throughput and routinely hits the cap.
-- **Write vs read:** write benefits from larger batches (peak at `batch=128`); read prefers smaller in-flight queues (peak at `batch=32` on p5en).
+- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` with a 256 WR cap (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a 16-NIC host (b300, b200, p5en) and `32 NICs × 256 = 8192` on p5. Exceeding this trips "timed out waiting for CQ drain". `threads=16, batch=128` is a solid baseline on 16-NIC hosts; on 32-NIC p5, `threads=32, batch=128` works the same way.
+- **Write vs read:** write benefits from larger batches (peak at `batch=128`); on 16-NIC p5en read prefers smaller queues (peak at `batch=32`), but on 32-NIC p5 reads scale up to `batch=128` because the wider fabric absorbs larger in-flight queues.
 - For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
 - For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
 - `--buffer_size` only needs `≥ block × batch × threads`; larger
@@ -425,52 +543,105 @@ vllm serve <model_path> -tp 8 \
    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"efa"}}'
 ```
 
+### 3. Router
+
+Front the prefill / decode pair with `vllm-router`. **`PREFILL_HOST` / `DECODE_HOST` must be each node's reachable private IP, not `127.0.0.1`** — the router forwards these addresses to the peer for the KV handshake; localhost will fail with `Connection refused` and stall traffic.
+
+```bash
+vllm-router --policy round_robin \
+  --vllm-pd-disaggregation \
+  --prefill http://<prefill_ip>:8010 \
+  --decode  http://<decode_ip>:8020 \
+  --kv-connector mooncake \
+  --host 0.0.0.0 --port 30000 \
+  --intra-node-data-parallel-size 8
+```
+
+`--intra-node-data-parallel-size` should match the per-node DP size of your prefill / decode instances (8 in this example, matching `-tp 8`).
+
 ## Usage with SGLang
 
-SGLang's Mooncake integration currently hardcodes the `"rdma"` protocol. To use EFA transport, apply the provided patch and set environment variables.
+SGLang's PD-disaggregation Mooncake integration reads the transport from `MOONCAKE_PROTOCOL`. Set it to `efa` and select the Mooncake backend with `--disaggregation-transfer-backend mooncake`.
 
-### 1. Apply EFA Patch
+### 1. Apply EFA Patch (only if SGLang version predates PR #25083)
 
-SGLang's transfer engine initialization needs to be patched to read the protocol from an environment variable instead of using hardcoded `"rdma"`. Use the [patch script](https://github.com/whn09/kimi-k2-sglang):
+Older SGLang releases hardcode `"rdma"` in the transfer engine init. [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) has been **merged into SGLang `main`**, so the protocol is now read from `MOONCAKE_PROTOCOL`. If your SGLang build includes that PR (any recent `main` or release built after it), **this step is unnecessary** — skip to step 2.
+
+Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
 
 ```bash
 bash patch_sglang_efa.sh
 ```
 
-This is idempotent and safe to rerun.
+The script is idempotent and safe to rerun.
 
 ### 2. Environment Variables
 
+Only one Mooncake-specific env is required:
+
 ```bash
 export MOONCAKE_PROTOCOL=efa
+```
+
+If your container does not already export libfabric/EFA paths in its `Dockerfile`, also set:
+
+```bash
 export FI_PROVIDER=efa
 export FI_EFA_USE_DEVICE_RDMA=1
-export GLOO_SOCKET_IFNAME=enp71s0  # adjust to your instance's primary interface
+export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
 
-For multi-node expert parallelism (EP) deployments, also set:
+> **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
+
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. Default is `1`, which reaches 99.93% of peak GPU-to-GPU throughput while saving CPU for other workloads. Set to `0` to disable the cap (one poller per EFA context — the legacy behavior). Higher values (e.g., `MC_EFA_CQ_THREADS=4`) are available as an escape hatch for throughput tuning but rarely help in practice.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # default: single CQ poller (recommended)
+> export MC_EFA_CQ_THREADS=0   # disable cap: one poller per EFA context (legacy)
+> ```
+>
+> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
+
+### 3. Prefill Instance
 
 ```bash
-export NVSHMEM_REMOTE_TRANSPORT=libfabric
-export NVSHMEM_LIBFABRIC_PROVIDER=efa
+MOONCAKE_PROTOCOL=efa \
+sglang serve <model_path> \
+  --trust-remote-code \
+  --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head \
+  --host 0.0.0.0 --port 8010 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998
 ```
 
-> **Warning:** Do **not** set NVSHMEM variables on single-node deployments — doing so causes segmentation faults.
-
-### 3. Docker Launch Example
+### 4. Decode Instance
 
 ```bash
-docker run -d --name sglang \
-  --runtime=nvidia --gpus all --network host \
-  --privileged --shm-size=600g \
-  --device=/dev/infiniband \
-  -e MOONCAKE_PROTOCOL=efa \
-  -e FI_PROVIDER=efa \
-  -e FI_EFA_USE_DEVICE_RDMA=1 \
-  <image> bash start.sh
+MOONCAKE_PROTOCOL=efa \
+sglang serve <model_path> \
+  --trust-remote-code \
+  --tp 8 --dp 2 --enable-dp-attention --enable-dp-lm-head \
+  --host 0.0.0.0 --port 8020 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-bootstrap-port 8998
 ```
 
-> **Note:** Ensure the Docker image's libfabric version matches the host's EFA driver. If not, mount the host's EFA libraries into the container (see [Troubleshooting](#libfabric-version-mismatch-in-docker)).
+### 5. Router
+
+Front the pair with `sglang_router` from the prefill host. **`PREFILL_HOST` must be the prefill node's reachable IP, not `127.0.0.1`** — the router forwards this address to the decode node for the bootstrap_room handshake; localhost will fail with `Connection refused` and stall traffic at 0/N.
+
+```bash
+python3 -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill "http://<prefill_ip>:8010" 8998 \
+  --decode  "http://<decode_ip>:8020" \
+  --policy round_robin \
+  --host 0.0.0.0 --port 8000
+```
+
+The trailing `8998` after `--prefill` must match the prefill's `--disaggregation-bootstrap-port`.
 
 ## Technical Details
 

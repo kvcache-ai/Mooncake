@@ -28,7 +28,7 @@
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
 #include "common/base/status.h"
 
@@ -45,7 +45,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #include "transport/transport.h"
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA)
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 

@@ -21,6 +21,7 @@
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
+#include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
 
@@ -104,23 +105,10 @@ void StorageBackend::RecalculateAvailableSpace() {
     }
 }
 
-bool StorageBackend::IsEvictionEnabled() const {
-    // First check user configuration
-    if (!enable_eviction_) {
-        return false;
-    }
-
-#ifdef USE_3FS
-    // Eviction is only enabled for local storage, not for 3FS
-    return !is_3fs_dir_;
-#else
-    // If 3FS is not compiled in, eviction is enabled if user config allows
-    return true;
-#endif
-}
+bool StorageBackend::IsEvictionEnabled() const { return enable_eviction_; }
 
 tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
-    // Skip eviction initialization for 3FS mode
+    // Skip eviction initialization if disabled
     if (!IsEvictionEnabled()) {
         initialized_.store(true, std::memory_order_release);
         return {};
@@ -208,7 +196,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         if (total_space_ >= used_space_) {
             RecalculateAvailableSpace();
         } else {
-            // Only enable eviction for local storage, not for 3FS
+            // Only enable eviction for local storage
             if (IsEvictionEnabled()) {
                 eviction_needed = true;
                 available_space_ = -1;
@@ -217,10 +205,11 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                     << ") exceeds the new quota (" << total_space_
                     << "). Eviction will be triggered after initial setup.";
             } else {
-                // For 3FS mode, just log a warning but don't trigger eviction
+                // Eviction disabled, just log a warning but don't trigger
+                // eviction
                 LOG(WARNING) << "Existing used space (" << used_space_
                              << ") exceeds the new quota (" << total_space_
-                             << "). Eviction is disabled for 3FS mode.";
+                             << "). Eviction is disabled.";
                 RecalculateAvailableSpace();  // Still calculate available space
             }
         }
@@ -496,7 +485,7 @@ void StorageBackend::RemoveFile(const std::string& path) {
     std::this_thread::sleep_for(
         std::chrono::microseconds(50));  // sleep for 50 us
 
-    // For 3FS mode, use original logic (no queue tracking)
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
         if (fs::exists(path)) {
             std::error_code ec;
@@ -552,7 +541,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         return;
     }
 
-    // For 3FS mode, use original logic (no queue tracking)
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
         fs::path storage_root = fs::path(root_dir_) / fsdir_;
         if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
@@ -625,7 +614,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
 void StorageBackend::RemoveAll() {
     namespace fs = std::filesystem;
 
-    // For 3FS mode, use original logic (no queue tracking)
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
         // Iterate through the root directory and remove all files
         for (const auto& entry : fs::directory_iterator(root_dir_)) {
@@ -788,18 +777,6 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
         return nullptr;
     }
 
-#ifdef USE_3FS
-    if (is_3fs_dir_) {
-        if (hf3fs_reg_fd(fd, 0) > 0) {
-            close(fd);
-            return nullptr;
-        }
-        return resource_manager_ ? std::make_unique<ThreeFSFile>(
-                                       path, fd, resource_manager_.get())
-                                 : nullptr;
-    }
-#endif
-
 #ifdef USE_URING
     if (use_uring_) {
         // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
@@ -836,8 +813,7 @@ bool StorageBackend::CheckDiskSpace(size_t required_size) {
 FileRecord StorageBackend::EvictFile() {
     // Eviction is only enabled for local storage
     if (!IsEvictionEnabled()) {
-        LOG(WARNING)
-            << "Eviction is disabled for 3FS mode. Cannot evict files.";
+        LOG(WARNING) << "Eviction is disabled. Cannot evict files.";
         return {};
     }
 
@@ -909,8 +885,7 @@ FileRecord StorageBackend::SelectFileToEvictByFIFO() {
 tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackend::EnsureDiskSpace(size_t required_size) {
     std::vector<std::string> evicted_keys;
-    // If eviction is disabled (3FS mode), skip space checking and eviction
-    // Let 3FS filesystem handle space management itself
+    // If eviction is disabled, skip space checking and eviction
     if (!IsEvictionEnabled()) {
         return evicted_keys;
     }
@@ -1155,7 +1130,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
     if (!fs::exists(root)) {
-        meta_scanned_.store(true, std::memory_order_acquire);
+        meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
@@ -1228,7 +1203,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
-    meta_scanned_.store(true, std::memory_order_acquire);
+    meta_scanned_.store(true, std::memory_order_release);
     return {};
 }
 
@@ -1764,6 +1739,13 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
+    // When eviction is enabled, always allow offloading since PrepareEviction
+    // will manage capacity by evicting old buckets as needed.
+    if (bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE &&
+        bucket_backend_config_.max_total_size > 0) {
+        return true;
+    }
+
     auto store_metadata_result = GetStoreMetadata();
     if (!store_metadata_result) {
         LOG(ERROR) << "Failed to get store metadata: "
@@ -3214,9 +3196,30 @@ CreateStorageBackend(const FileStorageConfig& config) {
         case StorageBackendType::kOffsetAllocator: {
             return std::make_shared<OffsetAllocatorStorageBackend>(config);
         }
+        case StorageBackendType::kDistributed: {
+            auto distributed_config =
+                DistributedStorageConfig::FromEnvironment();
+            if (!distributed_config.Validate()) {
+                throw std::invalid_argument(
+                    "Invalid DistributedStorage configuration");
+            }
+            std::unique_ptr<FileSystemAdapter> adapter;
+            if (distributed_config.fs_adapter_type == "hf3fs") {
+#ifdef USE_3FS
+                adapter = std::make_unique<Hf3fsAdapter>();
+#else
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return std::make_shared<DistributedStorageBackend>(
+                config, distributed_config, std::move(adapter));
+        }
         default: {
-            LOG(FATAL) << "Unsupported backend type";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            LOG(ERROR) << "Unsupported backend type: "
+                       << static_cast<int>(config.storage_backend_type);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 }

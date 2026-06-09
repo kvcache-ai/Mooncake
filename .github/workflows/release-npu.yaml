@@ -1,0 +1,230 @@
+name: Release Ascend NPU
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    if: ${{ github.repository == 'kvcache-ai/Mooncake' && !contains(github.ref_name, '-') }}
+
+    runs-on: self-hosted
+
+    permissions:
+      contents: write
+
+    strategy:
+      max-parallel: 1
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    env:
+      BUILD_WITH_EP: "0"
+      NPU_BUILD: "1"
+
+    container:
+      image: localhost:5000/mooncake-hixl-ci:v6-release
+
+      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
+                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
+                    --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
+
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi:ro
+        - /usr/local/Ascend/driver/:/usr/local/Ascend/driver/:ro
+        - /etc/ascend_install.info:/etc/ascend_install.info:ro
+        - /etc/hccn.conf:/etc/hccn.conf:ro
+
+    steps:
+      - name: Configure GitHub fetch defaults
+        shell: bash
+        run: |
+          git config --global protocol.version 2
+          git config --global http.version HTTP/1.1
+          git config --global http.lowSpeedLimit 1024
+          git config --global http.lowSpeedTime 30
+
+      - name: Checkout code
+        id: checkout_code
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Retry checkout via GitHub mirror
+        if: steps.checkout_code.outcome == 'failure'
+        shell: bash
+        env:
+          ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
+            echo "Checkout from GitHub failed and ASCEND_GITHUB_MIRROR_URLS is not set"
+            exit 1
+          fi
+
+          normalize_base() {
+            local base="$1"
+            base="${base#${base%%[![:space:]]*}}"
+            base="${base%${base##*[![:space:]]}}"
+            [ -n "$base" ] || return 1
+            [ "$base" != "https://github.com/" ] && base="${base%/}/"
+            printf '%s\n' "$base"
+          }
+
+          candidates=()
+          while IFS= read -r raw; do
+            base="$(normalize_base "$raw" || true)"
+            [ -n "$base" ] || continue
+            [ "$base" = "https://github.com/" ] && continue
+            candidates+=("$base")
+          done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
+
+          if [ ${#candidates[@]} -eq 0 ]; then
+            echo "Checkout from GitHub failed and no valid mirror candidates were configured"
+            exit 1
+          fi
+
+          workdir="${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory "$workdir"
+
+          for base in "${candidates[@]}"; do
+            mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
+            echo "Retrying checkout with ${mirror_url}"
+
+            find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+            git init "$workdir"
+            git -C "$workdir" remote add origin "$mirror_url"
+
+            if git -C "$workdir" fetch --depth=1 origin "${{ github.sha }}" && \
+               git -C "$workdir" checkout --force --detach FETCH_HEAD; then
+              echo "Mirror checkout succeeded via ${base}"
+              exit 0
+            fi
+
+            echo "Mirror checkout failed via ${base}"
+            rm -rf "$workdir/.git"
+          done
+
+          echo "Direct GitHub checkout failed and all mirror retries failed"
+          exit 1
+
+      - name: Use container Python ${{ matrix.python-version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON_BIN="$(command -v python${{ matrix.python-version }})"
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -m pip --version
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        shell: bash
+        env:
+          ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
+        run: |
+          set -euo pipefail
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          if command -v apt-get >/dev/null 2>&1; then
+            bash -x dependencies.sh -y
+          else
+            bash -x scripts/ascend/dependencies_openeuler.sh -y
+          fi
+          bash scripts/ascend/dependencies_ascend_installation.sh
+          echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "GOPROXY=https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct" >> "$GITHUB_ENV"
+          echo "GOSUMDB=sum.golang.google.cn" >> "$GITHUB_ENV"
+          /usr/local/go/bin/go env -w GOPROXY="https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct"
+          /usr/local/go/bin/go env -w GOSUMDB=sum.golang.google.cn
+
+      - name: Configure project
+        shell: bash
+        run: |
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          rm -rf build
+          mkdir build
+          cd build
+          cmake_args=(
+            -DUSE_ASCEND_DIRECT=ON
+            -DUSE_ETCD=ON
+            -DSTORE_USE_ETCD=ON
+            -DBUILD_UNIT_TESTS=OFF
+            -DCMAKE_BUILD_TYPE=Release
+            -DPython3_EXECUTABLE="${PYTHON_BIN}"
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
+          )
+          cmake .. "${cmake_args[@]}"
+
+      - name: Build project
+        shell: bash
+        env:
+          GOPROXY: 'https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct'
+          GOSUMDB: sum.golang.google.cn
+        run: |
+          set -euo pipefail
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          export PATH="/usr/local/go/bin:${PATH}"
+          cd build
+          cmake --build . -j"$(nproc)"
+          cmake --install .
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          NPU_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: pypi
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-npu-py*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mooncake-wheel/dist-release/*.whl
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/

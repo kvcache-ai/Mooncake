@@ -155,7 +155,12 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
-enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
+enum class StorageBackendType {
+    kFilePerKey,
+    kBucket,
+    kOffsetAllocator,
+    kDistributed
+};
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
@@ -267,6 +272,11 @@ class StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
+    // Reset internal scan iterator so that the next ScanMeta() call
+    // starts from the beginning.  Required for backends that use
+    // cursor-based iteration (e.g. BucketStorageBackend).
+    virtual void ResetScanIterator() {}
+
     // Test-only: Set predicate to force failures for specific keys in
     // BatchOffload. Default implementation does nothing (no failures injected).
     // Concrete backends can override to provide test failure injection.
@@ -289,40 +299,25 @@ class StorageBackendInterface {
  */
 class StorageBackend {
    public:
-/**
- * @brief Constructs a new StorageBackend instance
- * @param root_dir Root directory path for object storage
- * @param fsdir  subdirectory name
- * @note Directory existence is not checked in constructor
- */
-#ifdef USE_3FS
-    explicit StorageBackend(const std::string& root_dir,
-                            const std::string& fsdir, bool is_3fs_dir,
-                            bool enable_eviction = true)
-        : root_dir_(root_dir),
-          fsdir_(fsdir),
-          is_3fs_dir_(is_3fs_dir),
-          enable_eviction_(enable_eviction) {
-        resource_manager_ = std::make_unique<USRBIOResourceManager>();
-        Hf3fsConfig config;
-        config.mount_root = root_dir;
-        resource_manager_->setDefaultParams(config);
-    }
-#else
+    /**
+     * @brief Constructs a new StorageBackend instance
+     * @param root_dir Root directory path for object storage
+     * @param fsdir  subdirectory name
+     * @note Directory existence is not checked in constructor
+     */
     explicit StorageBackend(const std::string& root_dir,
                             const std::string& fsdir,
                             bool enable_eviction = true)
         : root_dir_(root_dir),
           fsdir_(fsdir),
           enable_eviction_(enable_eviction) {}
-#endif
 
     /**
      * @brief Factory method to create a StorageBackend instance
      * @param root_dir Root directory path for object storage
      * @param fsdir  subdirectory name
      * @param enable_eviction Whether to enable disk eviction feature (default:
-     * true) Note: Eviction is automatically disabled for 3FS mode
+     * true) Note: Eviction is controlled by the enable_eviction parameter
      * @return shared_ptr to new instance or nullptr if directory is invalid
      *
      * Performs validation of the root directory before creating the instance:
@@ -347,15 +342,8 @@ class StorageBackend {
         fs::path root_path(root_dir);
 
         std::string real_fsdir = "moon_" + fsdir;
-#ifdef USE_3FS
-        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") &&
-                          fs::is_directory(root_path / "3fs-virt");
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir,
-                                                is_3fs_dir, enable_eviction);
-#else
         return std::make_shared<StorageBackend>(root_dir, real_fsdir,
                                                 enable_eviction);
-#endif
     }
 
     /**
@@ -471,12 +459,6 @@ class StorageBackend {
         true};  // User-configurable flag to enable/disable eviction
     bool use_uring_{false};  // Use io_uring for file I/O
 
-#ifdef USE_3FS
-    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
-                              // directory structure
-    std::unique_ptr<USRBIOResourceManager> resource_manager_;
-#endif
-
    private:
     // File write queue for disk eviction - tracks files in FIFO order
     std::list<FileRecord> file_write_queue_;
@@ -578,8 +560,7 @@ class StorageBackend {
 
     /**
      * @brief Checks if disk eviction is enabled for this storage backend.
-     * @return true if eviction is enabled (local mode), false if disabled (3FS
-     * mode).
+     * @return true if eviction is enabled, false otherwise.
      */
     bool IsEvictionEnabled() const;
 
@@ -780,6 +761,11 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    void ResetScanIterator() override {
+        MutexLocker locker(&iterator_mutex_);
+        next_bucket_ = -1;
+    }
 
     /**
      * @brief Checks whether the backend is allowed to continue offloading.

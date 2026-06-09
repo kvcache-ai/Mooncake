@@ -16,49 +16,169 @@
  * RDMA Endpoint Re-establishment Test
  *
  * Purpose:
- * This test verifies that TE correctly handles endpoint re-establish
- * during simulated Initiator restarts.
+ * This test verifies that TE correctly handles endpoint re-establish during
+ * simulated initiator restarts, and that classic RDMA can recover from a first
+ * RTR/EINVAL by reprobeing the next auto-selected local GID.
  *
  * How to run:
- * 1. Start etcd:
- *    etcd --listen-client-urls http://127.0.0.1:18222 \
- *      --advertise-client-urls http://127.0.0.1:18222
- *
- * 2. Run test
- *    sudo env MC_METADATA_SERVER=127.0.0.1:18222 \
- *      MC_TARGET_SERVER_NAME=127.0.0.1:12345 \
- *      MC_INITIATOR_SERVER_NAME=127.0.0.1:12346 \
- *      MC_TARGET_DEVICE_NAME=erdma_0 MC_INITIATOR_DEVICE_NAME=erdma_1 \
- *      ./build/mooncake-transfer-engine/tests/rdma_endpoint_reestablish_test
+ *   sudo env MC_METADATA_SERVER=P2PHANDSHAKE \
+ *     MC_TARGET_SERVER_NAME=127.0.0.1:12345 \
+ *     MC_INITIATOR_SERVER_NAME=127.0.0.1:12346 \
+ *     MC_TARGET_DEVICE_NAME=erdma_0 MC_INITIATOR_DEVICE_NAME=erdma_1 \
+ *     ./build/mooncake-transfer-engine/tests/rdma_endpoint_reestablish_test
  */
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
-#include <gtest/gtest.h>
-#include <numa.h>
-#include <sys/time.h>
-#include <unistd.h>
-
+#include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+#include <infiniband/verbs.h>
+#include <numa.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include "common.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#include "common.h"
 
 using namespace mooncake;
 
-// Size of the pre-registered memory.
-constexpr size_t kRAMBufSize = 256ull << 24;  // 256 MB
+namespace {
 
-// Actual data payload size for RDMA Read/Write.
-constexpr size_t kDataLength = 16ull << 24;  // 16MB
+constexpr size_t kRAMBufSize = 256ull << 24;
+constexpr size_t kDataLength = 16ull << 24;
 
-std::string formatDeviceNames(const std::string &device_names) {
+bool usesP2PHandshake(const std::string& metadata_server) {
+    return metadata_server == P2PHANDSHAKE;
+}
+
+std::vector<std::string> getAvailableRdmaDevices() {
+    int num_devices = 0;
+    ibv_device** device_list = ibv_get_device_list(&num_devices);
+    std::vector<std::string> devices;
+    if (device_list == nullptr) {
+        return devices;
+    }
+    devices.reserve(num_devices);
+    for (int i = 0; i < num_devices; ++i) {
+        devices.emplace_back(ibv_get_device_name(device_list[i]));
+    }
+    ibv_free_device_list(device_list);
+    return devices;
+}
+
+struct RtrFaultInjectionState {
+    std::mutex mu;
+    bool synthetic_gid_swap_enabled = false;
+    std::string synthetic_gid_device;
+    bool fail_first_rtr_einval = false;
+    std::string fail_rtr_device;
+    int injected_failures = 0;
+    std::unordered_map<std::string, std::vector<int>> rtr_sgid_history;
+    std::unordered_map<std::string, std::vector<std::string>> rtr_gid_history;
+} g_rtr_fault_injection_state;
+
+std::string formatGidBytes(const uint8_t* raw) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < 16; ++i) {
+        if (i != 0) {
+            oss << ":";
+        }
+        oss << std::setw(2) << static_cast<int>(raw[i]);
+    }
+    return oss.str();
+}
+
+void resetRtrFaultInjectionState() {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    g_rtr_fault_injection_state.synthetic_gid_swap_enabled = false;
+    g_rtr_fault_injection_state.synthetic_gid_device.clear();
+    g_rtr_fault_injection_state.fail_first_rtr_einval = false;
+    g_rtr_fault_injection_state.fail_rtr_device.clear();
+    g_rtr_fault_injection_state.injected_failures = 0;
+    g_rtr_fault_injection_state.rtr_sgid_history.clear();
+    g_rtr_fault_injection_state.rtr_gid_history.clear();
+}
+
+void configureRtrFaultInjection(const std::string& device_name) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    g_rtr_fault_injection_state.synthetic_gid_swap_enabled = true;
+    g_rtr_fault_injection_state.synthetic_gid_device = device_name;
+    g_rtr_fault_injection_state.fail_first_rtr_einval = true;
+    g_rtr_fault_injection_state.fail_rtr_device = device_name;
+    g_rtr_fault_injection_state.injected_failures = 0;
+    g_rtr_fault_injection_state.rtr_sgid_history.clear();
+    g_rtr_fault_injection_state.rtr_gid_history.clear();
+}
+
+std::vector<int> getRtrSgidHistory(const std::string& device_name) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    auto iter = g_rtr_fault_injection_state.rtr_sgid_history.find(device_name);
+    if (iter == g_rtr_fault_injection_state.rtr_sgid_history.end()) {
+        return {};
+    }
+    return iter->second;
+}
+
+int getInjectedFailureCount() {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    return g_rtr_fault_injection_state.injected_failures;
+}
+
+std::vector<std::string> getRtrGidHistory(const std::string& device_name) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    auto iter = g_rtr_fault_injection_state.rtr_gid_history.find(device_name);
+    if (iter == g_rtr_fault_injection_state.rtr_gid_history.end()) {
+        return {};
+    }
+    return iter->second;
+}
+
+void recordRtrAttempt(const std::string& device_name, int sgid_index,
+                      const std::string& gid) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    g_rtr_fault_injection_state.rtr_sgid_history[device_name].push_back(
+        sgid_index);
+    g_rtr_fault_injection_state.rtr_gid_history[device_name].push_back(gid);
+}
+
+int maybeSwapSyntheticGidIndex(const std::string& device_name, int gid_index) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    if (!g_rtr_fault_injection_state.synthetic_gid_swap_enabled ||
+        g_rtr_fault_injection_state.synthetic_gid_device != device_name) {
+        return gid_index;
+    }
+    if (gid_index == 0) return 1;
+    if (gid_index == 1) return 0;
+    return gid_index;
+}
+
+bool shouldInjectRtrEinval(const std::string& device_name, int sgid_index) {
+    std::lock_guard<std::mutex> guard(g_rtr_fault_injection_state.mu);
+    if (!g_rtr_fault_injection_state.fail_first_rtr_einval ||
+        g_rtr_fault_injection_state.fail_rtr_device != device_name ||
+        sgid_index != 0) {
+        return false;
+    }
+    g_rtr_fault_injection_state.fail_first_rtr_einval = false;
+    g_rtr_fault_injection_state.synthetic_gid_swap_enabled = false;
+    ++g_rtr_fault_injection_state.injected_failures;
+    return true;
+}
+
+std::string formatDeviceNames(const std::string& device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -76,7 +196,7 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
-std::string makeNicPriorityMatrix(const std::string &device_name) {
+std::string makeNicPriorityMatrix(const std::string& device_name) {
     auto formatted_devices = formatDeviceNames(device_name);
     return "{\"cpu:0\": [[" + formatted_devices +
            "],[]], "
@@ -84,8 +204,8 @@ std::string makeNicPriorityMatrix(const std::string &device_name) {
            formatted_devices + "],[]]}";
 }
 
-void wait_for_transfer(TransferEngine *engine, BatchID batch_id,
-                       const std::string &op_name) {
+void waitForTransfer(TransferEngine* engine, BatchID batch_id,
+                     const std::string& op_name) {
     bool completed = false;
     TransferStatus status;
     while (!completed) {
@@ -103,27 +223,26 @@ void wait_for_transfer(TransferEngine *engine, BatchID batch_id,
 
 struct TEContext {
     std::unique_ptr<TransferEngine> engine_{};
-    uint8_t *local_addr_{};
+    uint8_t* local_addr_{};
     bool segment_opened_{false};
     SegmentHandle segment_handle_{};
     uint64_t remote_base_{};
 
-    TEContext(const std::string &local_server_name,
-              const std::string &metadata_server, const std::string &segment_id,
-              const std::string &device_name) {
+    TEContext(const std::string& local_server_name,
+              const std::string& metadata_server, const std::string& segment_id,
+              const std::string& device_name) {
         engine_ = std::make_unique<TransferEngine>(false);
         auto hostname_port = parseHostNameWithPort(local_server_name);
         engine_->init(metadata_server, local_server_name, hostname_port.first,
                       hostname_port.second);
 
         auto nic_priority_matrix = makeNicPriorityMatrix(device_name);
-        void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()),
+        void* args[2] = {const_cast<char*>(nic_priority_matrix.c_str()),
                          nullptr};
-
-        Transport *xport = engine_->installTransport("rdma", args);
+        Transport* xport = engine_->installTransport("rdma", args);
         LOG_ASSERT(xport);
 
-        local_addr_ = static_cast<uint8_t *>(numa_alloc_onnode(kRAMBufSize, 0));
+        local_addr_ = static_cast<uint8_t*>(numa_alloc_onnode(kRAMBufSize, 0));
         memset(local_addr_, 0, kDataLength);
 
         int rc =
@@ -145,16 +264,21 @@ struct TEContext {
         numa_free(local_addr_, kRAMBufSize);
         if (segment_opened_) engine_->closeSegment(segment_handle_);
     }
+
+    std::string localSegmentName() const {
+        return engine_->getLocalIpAndPort();
+    }
 };
 
 class RDMAEndpointReestablishTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        resetRtrFaultInjectionState();
         google::InitGoogleLogging("RDMAEndpointReestablishTest");
         FLAGS_logtostderr = true;
 
-        const char *env = std::getenv("MC_METADATA_SERVER");
-        metadata_server = env ? env : "127.0.0.1:18222";
+        const char* env = std::getenv("MC_METADATA_SERVER");
+        metadata_server = env ? env : P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_TARGET_SERVER_NAME");
@@ -165,16 +289,99 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
         initiator_server_name = env ? env : "127.0.0.1:12346";
         LOG(INFO) << "initiator_server_name: " << initiator_server_name;
 
+        auto devices = getAvailableRdmaDevices();
+        if (devices.size() < 2) {
+            GTEST_SKIP() << "Need at least two RDMA devices, found "
+                         << devices.size();
+        }
+
         env = std::getenv("MC_TARGET_DEVICE_NAME");
-        target_device_name = env ? env : "erdma_0";
+        target_device_name = env ? env : devices[0];
         LOG(INFO) << "target_device_name: " << target_device_name;
 
         env = std::getenv("MC_INITIATOR_DEVICE_NAME");
-        initiator_device_name = env ? env : "erdma_1";
+        initiator_device_name = env ? env : devices[1];
         LOG(INFO) << "initiator_device_name: " << initiator_device_name;
     }
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {
+        google::ShutdownGoogleLogging();
+        resetRtrFaultInjectionState();
+    }
+
+    void runEndpointReestablishScenario(const std::string& target_device,
+                                        const std::string& initiator_device) {
+        LOG(INFO) << "========== Setting up Target ==========";
+        TEContext target_ctx(target_server_name, metadata_server, "",
+                             target_device);
+        const std::string target_segment_name =
+            usesP2PHandshake(metadata_server) ? target_ctx.localSegmentName()
+                                              : target_server_name;
+        LOG(INFO) << "Resolved target segment name: " << target_segment_name;
+        LOG(INFO)
+            << "Target is up. Waiting for RDMA connections and operations...";
+
+        LOG(INFO) << "========== Phase 1: Start, Connect & Write ==========";
+        {
+            TEContext init_ctx(initiator_server_name, metadata_server,
+                               target_segment_name, initiator_device);
+            for (size_t i = 0; i < kDataLength; ++i) {
+                init_ctx.local_addr_[i] = static_cast<uint8_t>(i % 256);
+            }
+
+            LOG(INFO) << "Writing " << kDataLength << " bytes to Target...";
+            auto batch_id = init_ctx.engine_->allocateBatchID(1);
+            TransferRequest entry;
+            entry.opcode = TransferRequest::WRITE;
+            entry.length = kDataLength;
+            entry.source = init_ctx.local_addr_;
+            entry.target_id = init_ctx.segment_handle_;
+            entry.target_offset = init_ctx.remote_base_;
+
+            Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+            ASSERT_EQ(s, Status::OK());
+            waitForTransfer(init_ctx.engine_.get(), batch_id, "WRITE");
+            LOG(INFO) << "Phase 1: Write Completed. Tearing down connection...";
+        }
+
+        LOG(INFO) << "Simulating Initiator Crash/Restart... Waiting 2 seconds.";
+        sleep(2);
+
+        LOG(INFO)
+            << "========== Phase 2: Restart, Re-establish Endpoint & Read "
+               "==========";
+        {
+            TEContext init_ctx(initiator_server_name, metadata_server,
+                               target_segment_name, initiator_device);
+            LOG(INFO) << "Reading data back over new Endpoint...";
+            auto batch_id = init_ctx.engine_->allocateBatchID(1);
+            TransferRequest entry;
+            entry.opcode = TransferRequest::READ;
+            entry.length = kDataLength;
+            entry.source = init_ctx.local_addr_;
+            entry.target_id = init_ctx.segment_handle_;
+            entry.target_offset = init_ctx.remote_base_;
+
+            Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
+            ASSERT_EQ(s, Status::OK());
+            waitForTransfer(init_ctx.engine_.get(), batch_id, "READ");
+
+            bool ok = true;
+            for (size_t i = 0; i < kDataLength; ++i) {
+                if (init_ctx.local_addr_[i] != static_cast<uint8_t>(i % 256)) {
+                    ok = false;
+                    LOG(ERROR) << "Data mismatch at offset " << i
+                               << ", expected " << (i % 256) << ", got "
+                               << (int)init_ctx.local_addr_[i];
+                    break;
+                }
+            }
+
+            ASSERT_TRUE(ok) << "Endpoint Reconstruction Verification Failed!";
+            LOG(INFO) << ">>> ENDPOINT RECONSTRUCTION VERIFICATION: "
+                         "\033[32mSUCCESS\033";
+        }
+    }
 
     std::string metadata_server;
     std::string target_server_name;
@@ -184,77 +391,94 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
 };
 
 TEST_F(RDMAEndpointReestablishTest, EndpointReestablish) {
-    // 1. Setup Target (will stay alive until test function exits)
-    LOG(INFO) << "========== Setting up Target ==========";
-    TEContext target_ctx(target_server_name, metadata_server, "",
-                         target_device_name);
-    LOG(INFO) << "Target is up. Waiting for RDMA connections and operations...";
+    runEndpointReestablishScenario(target_device_name, initiator_device_name);
+}
 
-    // 2. Phase 1: Initiator Start, Connect & Write
-    LOG(INFO) << "========== Phase 1: Start, Connect & Write ==========";
-    {
-        TEContext init_ctx(initiator_server_name, metadata_server,
-                           target_server_name, initiator_device_name);
+TEST_F(RDMAEndpointReestablishTest, EndpointReestablishReverseDevices) {
+    runEndpointReestablishScenario(initiator_device_name, target_device_name);
+}
 
-        // Fill buffer with test pattern
-        for (size_t i = 0; i < kDataLength; ++i) {
-            init_ctx.local_addr_[i] = static_cast<uint8_t>(i % 256);
+TEST_F(RDMAEndpointReestablishTest, ActiveHandshakeRetriesAfterAutoGidReprobe) {
+    configureRtrFaultInjection(initiator_device_name);
+    runEndpointReestablishScenario(target_device_name, initiator_device_name);
+
+    EXPECT_EQ(getInjectedFailureCount(), 1);
+    auto sgid_history = getRtrSgidHistory(initiator_device_name);
+    auto gid_history = getRtrGidHistory(initiator_device_name);
+    ASSERT_EQ(sgid_history.size(), gid_history.size());
+    ASSERT_GE(sgid_history.size(), 2u);
+    EXPECT_EQ(sgid_history.front(), 0);
+    EXPECT_FALSE(gid_history.front().empty());
+    EXPECT_TRUE(std::any_of(
+        gid_history.begin() + 1, gid_history.end(),
+        [&](const std::string& gid) { return gid != gid_history.front(); }));
+}
+
+TEST_F(RDMAEndpointReestablishTest,
+       PassiveHandshakeRetriesAfterAutoGidReprobe) {
+    configureRtrFaultInjection(target_device_name);
+    runEndpointReestablishScenario(target_device_name, initiator_device_name);
+
+    EXPECT_EQ(getInjectedFailureCount(), 1);
+    auto sgid_history = getRtrSgidHistory(target_device_name);
+    auto gid_history = getRtrGidHistory(target_device_name);
+    ASSERT_EQ(sgid_history.size(), gid_history.size());
+    ASSERT_GE(sgid_history.size(), 2u);
+    EXPECT_EQ(sgid_history.front(), 0);
+    EXPECT_FALSE(gid_history.front().empty());
+    EXPECT_TRUE(std::any_of(
+        gid_history.begin() + 1, gid_history.end(),
+        [&](const std::string& gid) { return gid != gid_history.front(); }));
+}
+
+}  // namespace
+
+extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
+                                        int gid_index,
+                                        struct ibv_gid_entry* entry,
+                                        uint32_t flags, size_t entry_size);
+
+extern "C" int __wrap__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
+                                        int gid_index,
+                                        struct ibv_gid_entry* entry,
+                                        uint32_t flags, size_t entry_size) {
+    const std::string device_name = ibv_get_device_name(context->device);
+    int wrapped_gid_index = maybeSwapSyntheticGidIndex(device_name, gid_index);
+    return __real__ibv_query_gid_ex(context, port_num, wrapped_gid_index, entry,
+                                    flags, entry_size);
+}
+
+extern "C" int __real_ibv_query_gid(ibv_context* context, uint8_t port_num,
+                                    int gid_index, union ibv_gid* gid);
+
+extern "C" int __wrap_ibv_query_gid(ibv_context* context, uint8_t port_num,
+                                    int gid_index, union ibv_gid* gid) {
+    const std::string device_name = ibv_get_device_name(context->device);
+    int wrapped_gid_index = maybeSwapSyntheticGidIndex(device_name, gid_index);
+    return __real_ibv_query_gid(context, port_num, wrapped_gid_index, gid);
+}
+
+extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
+                                    int attr_mask);
+
+extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
+                                    int attr_mask) {
+    if (qp != nullptr && attr != nullptr && attr->qp_state == IBV_QPS_RTR &&
+        (attr_mask & IBV_QP_AV)) {
+        const std::string device_name =
+            ibv_get_device_name(qp->context->device);
+        int sgid_index = attr->ah_attr.grh.sgid_index;
+        union ibv_gid actual_gid = {};
+        std::string gid_string;
+        if (__real_ibv_query_gid(qp->context, attr->ah_attr.port_num,
+                                 sgid_index, &actual_gid) == 0) {
+            gid_string = formatGidBytes(actual_gid.raw);
         }
-
-        LOG(INFO) << "Writing " << kDataLength << " bytes to Target...";
-        auto batch_id = init_ctx.engine_->allocateBatchID(1);
-        TransferRequest entry;
-        entry.opcode = TransferRequest::WRITE;
-        entry.length = kDataLength;
-        entry.source = init_ctx.local_addr_;
-        entry.target_id = init_ctx.segment_handle_;
-        entry.target_offset = init_ctx.remote_base_;
-
-        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
-        ASSERT_EQ(s, Status::OK());
-
-        wait_for_transfer(init_ctx.engine_.get(), batch_id, "WRITE");
-
-        LOG(INFO) << "Phase 1: Write Completed. Tearing down connection...";
-    }
-
-    LOG(INFO) << "Simulating Initiator Crash/Restart... Waiting 2 seconds.";
-    sleep(2);
-
-    // 3. Phase 2: Restart, Re-establish Endpoint & Read
-    LOG(INFO) << "========== Phase 2: Restart, Re-establish Endpoint & Read "
-                 "==========";
-    {
-        TEContext init_ctx(initiator_server_name, metadata_server,
-                           target_server_name, initiator_device_name);
-
-        LOG(INFO) << "Reading data back over new Endpoint...";
-        auto batch_id = init_ctx.engine_->allocateBatchID(1);
-        TransferRequest entry;
-        entry.opcode = TransferRequest::READ;
-        entry.length = kDataLength;
-        entry.source = init_ctx.local_addr_;
-        entry.target_id = init_ctx.segment_handle_;
-        entry.target_offset = init_ctx.remote_base_;
-
-        Status s = init_ctx.engine_->submitTransfer(batch_id, {entry});
-        ASSERT_EQ(s, Status::OK());
-
-        wait_for_transfer(init_ctx.engine_.get(), batch_id, "READ");
-
-        bool ok = true;
-        for (size_t i = 0; i < kDataLength; ++i) {
-            if (init_ctx.local_addr_[i] != static_cast<uint8_t>(i % 256)) {
-                ok = false;
-                LOG(ERROR) << "Data mismatch at offset " << i << ", expected "
-                           << (i % 256) << ", got "
-                           << (int)init_ctx.local_addr_[i];
-                break;
-            }
+        recordRtrAttempt(device_name, sgid_index, gid_string);
+        if (shouldInjectRtrEinval(device_name, sgid_index)) {
+            errno = EINVAL;
+            return -1;
         }
-
-        ASSERT_TRUE(ok) << "Endpoint Reconstruction Verification Failed!";
-        LOG(INFO)
-            << ">>> ENDPOINT RECONSTRUCTION VERIFICATION: \033[32mSUCCESS\033";
     }
+    return __real_ibv_modify_qp(qp, attr, attr_mask);
 }

@@ -19,17 +19,23 @@
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 #include "common.h"
+#include "rdma_gid_probe.h"
 #include "rdma_transport.h"
 #include "transport/transport.h"
 
@@ -37,6 +43,7 @@ namespace mooncake {
 
 class RdmaEndPoint;
 class RdmaTransport;
+class RdmaContextTestPeer;
 class WorkerPool;
 class EndpointStore;
 
@@ -45,6 +52,11 @@ enum class GidNetworkState {
     GID_WITH_NETWORK = 0,     // Found a GID with network device (best choice)
     GID_WITHOUT_NETWORK = 1,  // Found a GID without network device
     GID_NOT_FOUND = 2         // No suitable GID found
+};
+
+struct GidSelectionSnapshot {
+    std::string gid;
+    int gid_index = -1;
 };
 
 struct RdmaCq {
@@ -64,6 +76,8 @@ struct MemoryRegionMeta {
 // including Memory Region, CQ, EndPoint (QPs), etc.
 class RdmaContext {
    public:
+    friend class RdmaContextTestPeer;
+
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
     ~RdmaContext();
@@ -111,6 +125,22 @@ class RdmaContext {
         const RdmaEndPoint *endpoint_ptr);
 
     int deleteEndpoint(const std::string &peer_nic_path);
+    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr);
+
+    // Drain the endpoint store's waiting list. Safe to call on any thread;
+    // intended to be invoked periodically from monitorWorker so reclaim is
+    // not gated on new endpoint insertions (which can stall under failure
+    // load while evictions/deletions continue). See issue #1845.
+    void reclaimEndpoints();
+
+    // Number of endpoints awaiting reclaim. For tests and operator
+    // observability.
+    size_t waitingListSize() const;
+
+    // Test-only: push a pre-constructed endpoint into the store's
+    // waiting_list_ so the reclaim path can be exercised without standing up
+    // a real RDMA QP.
+    void testOnlyInsertWaiting(std::shared_ptr<RdmaEndPoint> ep);
 
     int disconnectAllEndpoints();
 
@@ -129,7 +159,16 @@ class RdmaContext {
 
     std::string gid() const;
 
-    int gidIndex() const { return gid_index_; }
+    GidSelectionSnapshot gidSelection() const;
+
+    int gidIndex() const;
+
+    bool autoGidSelectionEnabled() const { return auto_gid_selection_enabled_; }
+
+    bool reprobeAutoGid(
+        const GidSelectionSnapshot &expected_selection,
+        const std::vector<AutoGidSelectionIdentity> &tried_selections = {},
+        std::string *previous_gid = nullptr, std::string *next_gid = nullptr);
 
     ibv_context *context() const { return context_; }
 
@@ -138,6 +177,8 @@ class RdmaContext {
     ibv_pd *pd() const { return pd_; }
 
     uint8_t portNum() const { return port_; }
+
+    uint8_t numLagPorts() const { return num_lag_ports_; }
 
     int activeSpeed() const { return active_speed_; }
 
@@ -192,7 +233,11 @@ class RdmaContext {
     int gid_index_ = -1;
     int active_speed_ = -1;
     ibv_mtu active_mtu_;
+    uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
     ibv_gid gid_;
+    mutable std::mutex gid_lock_;
+    mutable std::mutex gid_reprobe_lock_;
+    bool auto_gid_selection_enabled_ = false;
 
     RWSpinlock memory_regions_lock_;
     MemoryRegionMap memory_region_map_;

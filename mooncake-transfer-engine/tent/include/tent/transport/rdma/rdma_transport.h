@@ -47,7 +47,7 @@ class LocalBuffers;
 using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 
 struct RdmaSubBatch : public Transport::SubBatch {
-    std::vector<RdmaTask> task_list;
+    std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
     size_t max_size;
     virtual size_t size() const { return task_list.size(); }
@@ -114,10 +114,17 @@ class RdmaTransport : public Transport {
    public:
     Status setupLocalSegment();
 
+    std::shared_ptr<Config> config() const { return conf_; }
+
    private:
     bool installed_;
     std::shared_ptr<Config> conf_;
     std::string local_segment_name_;
+    // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
+    // rdma_server_name_ holds the RDMA-reachable address for NIC path
+    // construction, while local_segment_name_ keeps the TCP-reachable
+    // address for P2P routing.
+    std::string rdma_server_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     LocalBufferManager local_buffer_manager_;

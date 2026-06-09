@@ -17,7 +17,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <dirent.h>
+#include <filesystem>
+#include <sstream>
 #include <unistd.h>
 
 namespace mooncake {
@@ -65,6 +66,24 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_GID_INDEX";
+    }
+
+    const char* pkey_index_env = std::getenv("MC_PKEY_INDEX");
+    if (pkey_index_env) {
+        try {
+            int val = std::stoi(pkey_index_env);
+            if (val >= 0 && val <= UINT16_MAX) {
+                config.pkey_index = static_cast<uint16_t>(val);
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_PKEY_INDEX, "
+                    << "value " << pkey_index_env
+                    << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_PKEY_INDEX environment value: "
+                         << pkey_index_env << ". Error: " << e.what();
+        }
     }
 
     const char* max_cqe_per_ctx_env = std::getenv("MC_MAX_CQE_PER_CTX");
@@ -139,7 +158,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         else {
             LOG(ERROR) << "Ignore value from environment variable MC_MTU, it "
                           "should be 512|1024|2048|4096";
-            exit(EXIT_FAILURE);
         }
     }
 
@@ -205,6 +223,18 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
+    const char* auto_gid_max_retries_env =
+        std::getenv("MC_AUTO_GID_MAX_RETRIES");
+    if (auto_gid_max_retries_env) {
+        int val = atoi(auto_gid_max_retries_env);
+        if (val >= 0 && val <= 16) {
+            config.auto_gid_max_retries = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_AUTO_GID_MAX_RETRIES";
+        }
+    }
+
     const char* disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
@@ -213,12 +243,18 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
-        int val = std::stoi(handshake_listen_backlog);
-        if (val > 0) {
-            config.handshake_listen_backlog = val;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_HANDSHAKE_LISTEN_BACKLOG";
+        try {
+            int val = std::stoi(handshake_listen_backlog);
+            if (val > 0) {
+                config.handshake_listen_backlog = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_LISTEN_BACKLOG";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_LISTEN_BACKLOG environment "
+                            "value: "
+                         << handshake_listen_backlog << ". Error: " << e.what();
         }
     }
 
@@ -251,7 +287,8 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (opendir(log_dir_path) == NULL) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";
@@ -267,24 +304,17 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    const char* min_port_env = std::getenv("MC_MIN_PRC_PORT");
-    if (min_port_env) {
-        int val = atoi(min_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_min_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MIN_PORT";
-    }
-
-    const char* max_port_env = std::getenv("MC_MAX_PRC_PORT");
-    if (max_port_env) {
-        int val = atoi(max_port_env);
-        if (val > 0 && val < 65536)
-            config.rpc_max_port = val;
-        else
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_PRC_MAX_PORT";
+    const char* min_port_env = std::getenv("MC_MIN_RPC_PORT");
+    if (!min_port_env) min_port_env = std::getenv("MC_MIN_PRC_PORT");
+    const char* max_port_env = std::getenv("MC_MAX_RPC_PORT");
+    if (!max_port_env) max_port_env = std::getenv("MC_MAX_PRC_PORT");
+    {
+        int raw_min = min_port_env ? atoi(min_port_env) : config.rpc_min_port;
+        int raw_max = max_port_env ? atoi(max_port_env) : config.rpc_max_port;
+        auto [validated_min, validated_max] =
+            ValidatePortRange(raw_min, raw_max, 15000, 17000);
+        config.rpc_min_port = validated_min;
+        config.rpc_max_port = validated_max;
     }
 
     if (std::getenv("MC_USE_IPV6")) {
@@ -359,6 +389,62 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
     }
+
+    const char* mlx5_qp_udp_sports_env = std::getenv("MC_MLX5_QP_UDP_SPORTS");
+    if (mlx5_qp_udp_sports_env && *mlx5_qp_udp_sports_env) {
+        std::vector<uint16_t> ports;
+        std::stringstream ss(mlx5_qp_udp_sports_env);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            // Trim leading/trailing whitespace.
+            auto l = item.find_first_not_of(" \t");
+            auto r = item.find_last_not_of(" \t");
+            if (l == std::string::npos) continue;
+            item = item.substr(l, r - l + 1);
+            try {
+                int val = std::stoi(item);
+                if (val < 0 || val > 65535) {
+                    LOG(WARNING)
+                        << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
+                    ok = false;
+                    break;
+                }
+                ports.push_back(static_cast<uint16_t>(val));
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Invalid MC_MLX5_QP_UDP_SPORTS entry: " << item
+                             << ". Error: " << e.what();
+                ok = false;
+                break;
+            }
+        }
+        if (ok && !ports.empty()) {
+            config.mlx5_qp_udp_sports = std::move(ports);
+        } else if (!ok) {
+            LOG(WARNING) << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to "
+                            "parse errors";
+        }
+    }
+
+    const char* mlx5_qp_lag_port_balance_env =
+        std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
+    if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
+        std::string val(mlx5_qp_lag_port_balance_env);
+        // Trim leading/trailing whitespace.
+        auto l = val.find_first_not_of(" \t");
+        auto r = val.find_last_not_of(" \t");
+        if (l != std::string::npos) {
+            val = val.substr(l, r - l + 1);
+            if (val == "1" || val == "true")
+                config.mlx5_qp_lag_port_balance = true;
+            else if (val == "0" || val == "false")
+                config.mlx5_qp_lag_port_balance = false;
+            else
+                LOG(WARNING) << "Ignore MC_MLX5_QP_LAG_PORT_BALANCE: expected "
+                                "0/1/true/false, got: "
+                             << val;
+        }
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -399,6 +485,7 @@ void dumpGlobalConfig() {
               << config.num_comp_channels_per_ctx;
     LOG(INFO) << "port = " << config.port;
     LOG(INFO) << "gid_index = " << config.gid_index;
+    LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
@@ -409,6 +496,18 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
+            if (i) oss << ",";
+            oss << config.mlx5_qp_udp_sports[i];
+        }
+        LOG(INFO) << "mlx5_qp_udp_sports = ["
+                  << (config.mlx5_qp_udp_sports.empty() ? "<unset>" : oss.str())
+                  << "]";
+    }
+    LOG(INFO) << "mlx5_qp_lag_port_balance = "
+              << (config.mlx5_qp_lag_port_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {
@@ -419,4 +518,26 @@ GlobalConfig& globalConfig() {
 }
 
 uint16_t getDefaultHandshakePort() { return globalConfig().handshake_port; }
+
+std::pair<int, int> ValidatePortRange(int min_port, int max_port,
+                                      int default_min, int default_max) {
+    constexpr int kMinAllowed = 1024;
+    constexpr int kEphemeralStart = 32768;
+    constexpr int kEphemeralEnd = 60999;
+    constexpr int kMaxAllowed = 65535;
+
+    auto is_valid_port = [&](int p) {
+        return p >= kMinAllowed && p <= kMaxAllowed &&
+               !(p >= kEphemeralStart && p <= kEphemeralEnd);
+    };
+
+    if (!is_valid_port(min_port) || !is_valid_port(max_port) ||
+        min_port > max_port) {
+        LOG(WARNING) << "Invalid port range [" << min_port << ", " << max_port
+                     << "], falling back to default [" << default_min << ", "
+                     << default_max << "]";
+        return {default_min, default_max};
+    }
+    return {min_port, max_port};
+}
 }  // namespace mooncake

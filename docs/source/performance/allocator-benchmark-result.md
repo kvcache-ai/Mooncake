@@ -1,5 +1,14 @@
 # Allocator Performance
 
+Mooncake Store uses two allocators at different layers:
+
+- **MmapArena** — backs the mmap buffer path used by SGLang HiCache for host KV cache memory. When explicitly enabled, it pre-allocates a hugepage-backed pool at startup and serves allocations via lock-free atomic bump pointer (~50ns per allocation). Configured via `MC_MMAP_ARENA_POOL_SIZE` (explicit opt-in) and `MC_DISABLE_MMAP_ARENA`.
+- **OffsetAllocator** — manages object-level allocation within Mooncake Store segments for KV cache entries. Evaluated below.
+
+These are complementary: MmapArena handles the backing memory, OffsetAllocator manages logical object placement within that memory.
+
+## OffsetAllocator
+
 We evaluated the performance of [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), the default memory allocator in Mooncake Store. This allocator is responsible for allocating memory from mounted segments to store the KV cache.
 
 In this context, the most important metric is **memory utilization**, defined as the ratio between the amount of memory that can be successfully allocated and the total available memory. A higher utilization means that more KV tensors can be cached, thereby accelerating LLM tasks. However, due to memory fragmentation, allocation may fail even when the allocated memory is well below the total available capacity.
@@ -185,4 +194,33 @@ avg alloc time: 145.575738 ns/op
 util ratio (min / p99 / p90 / p50 / max / avg):
 0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
 avg alloc time: 142.508508 ns/op
+```
+
+**OffsetAllocator (Before Optimization)**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.569255 / 0.712076 / 0.781224 / 0.855046 / 0.976057 / 0.848873
+avg alloc time: 142.508508 ns/op
+```
+
+### Paired KV/Indexer Allocation Benchmark (DSA)
+
+In the DSA scenario, Mooncake Store stores both KV cache objects and indexer objects.
+We evaluated OffsetAllocator under a paired allocation workload using object sizes derived from a GLM-5.1-FP8 DSA serving configuration.
+
+In this configuration, Mooncake Store stores data at the page granularity, where each page contains 64 tokens. Therefore, the object sizes observed by the allocator are the packed page-level sizes rather than the per-token sizes:
+
+- KV cache object size: 3.12 MB
+- Indexer object size: 643 KB
+
+Each benchmark round samples `N` uniformly from `[1, 128]`, then issues `N` KV cache allocations followed by `N` indexer allocations. The pool size is 1024 GB. On allocation failure, the benchmark randomly evicts 5% of all live objects and retries. The utilization ratio below is sampled only when eviction is triggered, immediately before evicting objects.
+
+**OffsetAllocator**
+
+```
+util ratio (min / p99 / p90 / p50 / max / avg):
+0.951814 / 0.951879 / 0.952077 / 0.952382 / 0.952621 / 0.952343
+eviction-trigger samples: 243
+avg alloc time: 352.207986 ns/op
 ```
