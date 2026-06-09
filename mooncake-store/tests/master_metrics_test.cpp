@@ -210,13 +210,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
     // Test ExistKey request
-    auto exist_result = service_.ExistKey(key);
+    auto exist_result = service_.ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value() && exist_result.value());
     ASSERT_EQ(metrics.get_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
 
     // Test GetReplicaList request
-    auto get_replica_result = service_.GetReplicaList(key);
+    auto get_replica_result = service_.GetReplicaList(key, "default");
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(metrics.get_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_get_replica_list_failures(), 0);
@@ -224,7 +224,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test Remove request
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.Remove(key, "default");
     ASSERT_TRUE(remove_result.has_value());
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
@@ -368,7 +368,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_HITS], base_memory_hits);
     ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
 
-    auto get_replica_result = service_.GetReplicaList(key);
+    auto get_replica_result = service_.GetReplicaList(key, "default");
     ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
     expect_aliases(stats_dict);
@@ -386,7 +386,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
                                 stats_dict[CacheHitStat::MEMORY_HITS]) +
                1);
     for (int64_t i = 0; i < extra_gets; ++i) {
-        get_replica_result = service_.GetReplicaList(key);
+        get_replica_result = service_.GetReplicaList(key, "default");
         ASSERT_TRUE(get_replica_result.has_value());
     }
     stats_dict = metrics.calculate_cache_stats();
@@ -397,7 +397,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.Remove(key, "default");
     ASSERT_TRUE(remove_result.has_value());
 }
 
@@ -429,6 +429,11 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 503);
     EXPECT_NE(segments_resp.body.find("service plane is not active"),
+              std::string::npos);
+
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 503);
+    EXPECT_NE(detail_resp.body.find("service plane is not active"),
               std::string::npos);
 
     admin_server.Stop();
@@ -466,6 +471,16 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_NE(query_resp.body.find(segment.name), std::string::npos);
     EXPECT_NE(query_resp.body.find("Capacity(bytes)"), std::string::npos);
 
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 200);
+    EXPECT_NE(detail_resp.body.find("\"total_segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find(segment.name), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_used_bytes\""),
+              std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
+              std::string::npos);
+
     admin_server.Stop();
 }
 
@@ -497,7 +512,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
 
     // Test BatchExistKey request (should all return false initially)
-    auto batch_exist_result = service_.BatchExistKey(keys);
+    auto batch_exist_result = service_.BatchExistKey(keys, "default");
     ASSERT_EQ(batch_exist_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -534,7 +549,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_end_failed_items(), 0);
 
     // Test BatchExistKey again (should all return true now)
-    auto batch_exist_result2 = service_.BatchExistKey(keys);
+    auto batch_exist_result2 = service_.BatchExistKey(keys, "default");
     ASSERT_EQ(batch_exist_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -593,14 +608,18 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
                                     const std::string& key) {
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto put_start = svc.PutStart(client_id, key, value_size, cfg);
+    auto put_start = svc.PutStart(client_id, key, "default", value_size, cfg);
     if (!put_start) return "";
-    svc.PutEnd(client_id, key, ReplicaType::MEMORY);
+    svc.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
 
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
     meta.transport_endpoint = "127.0.0.1:9999";
-    svc.NotifyOffloadSuccess(client_id, {key}, {meta});
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "default",
+                        .key = key,
+                        .size = static_cast<int64_t>(value_size)}};
+    svc.NotifyOffloadSuccess(client_id, tasks, {meta});
     return key;
 }
 
@@ -636,7 +655,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
 
     // After removing the key the LocalDiskReplica is destroyed; gauge resets.
-    ASSERT_TRUE(svc.Remove(key).has_value());
+    ASSERT_TRUE(svc.Remove(key, "default").has_value());
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
 }
 
