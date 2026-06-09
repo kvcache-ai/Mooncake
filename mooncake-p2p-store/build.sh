@@ -35,7 +35,7 @@ EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
-EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -ljsoncpp -lmooncake_common"
+EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64/stubs"
@@ -51,6 +51,10 @@ fi
 
 if [ -d "/usr/local/musa/lib" ]; then
     EXT_LDFLAGS+=" -L/usr/local/musa/lib -lmusart"
+fi
+
+if [ -e "/usr/lib64/liburma.so" ]; then
+   EXT_LDFLAGS+=" -L/usr/lib64 -lurma"
 fi
 
 if [ "$USE_ETCD" = "ON" ]; then

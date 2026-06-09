@@ -5,6 +5,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -83,6 +84,23 @@ class RealClientTest : public ::testing::Test {
                                          FLAGS_protocol, rdma_devices,
                                          master_address_),
                   0);
+    }
+
+    ConfigDict MakeConfigDict(const std::string& local_hostname,
+                              const std::string& global_segment_size,
+                              const std::string& local_buffer_size) const {
+        const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                             ? FLAGS_device_name
+                                             : std::string("");
+        ConfigDict config;
+        config[CONFIG_KEY_LOCAL_HOSTNAME] = local_hostname;
+        config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+        config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = global_segment_size;
+        config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = local_buffer_size;
+        config[CONFIG_KEY_PROTOCOL] = FLAGS_protocol;
+        config[CONFIG_KEY_RDMA_DEVICES] = rdma_devices;
+        config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+        return config;
     }
 
     std::string CreateTempSegmentFile(size_t size) {
@@ -255,6 +273,39 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     // Test isExist
     int exist_result = py_client_->isExist(key);
     EXPECT_EQ(exist_result, 1) << "Key should exist";
+}
+
+TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "local_buffer_subrange_key";
+    const std::string test_data = "shared-local-buffer-read";
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    auto local_alloc =
+        py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
+    ASSERT_TRUE(local_alloc.has_value());
+    BufferHandle handle = std::move(*local_alloc);
+    auto* dst = static_cast<char*>(handle.ptr()) + 16;
+    std::memset(handle.ptr(), 0, handle.size());
+
+    auto bytes_read = py_client_->get_into(key, dst, test_data.size());
+    ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
+    EXPECT_EQ(std::string(dst, test_data.size()), test_data);
 }
 
 // Test Get Operation will fail if the lease has expired.
@@ -889,22 +940,12 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     master_address_ = master_.master_address();
     LOG(INFO) << "Started in-proc master at " << master_address_;
 
-    // Setup the client using ConfigDict
-    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
-                                         ? FLAGS_device_name
-                                         : std::string("");
-
     ConfigDict config;
     auto result = py_client_->setup_internal(config);
     ASSERT_FALSE(result.has_value()) << "Setup with empty config should fail";
 
-    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
-    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
-    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
-    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
-    config[CONFIG_KEY_PROTOCOL] = FLAGS_protocol;
-    config[CONFIG_KEY_RDMA_DEVICES] = rdma_devices;
-    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+    config = MakeConfigDict("localhost:17813", std::to_string(16 * 1024 * 1024),
+                            std::to_string(16 * 1024 * 1024));
 
     result = py_client_->setup_internal(config);
     ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
@@ -927,6 +968,57 @@ TEST_F(RealClientTest, SetupWithConfigDict) {
     std::string retrieved_data(static_cast<const char*>(buffer_handle->ptr()),
                                buffer_handle->size());
     EXPECT_EQ(retrieved_data, test_data) << "Retrieved data should match";
+}
+
+TEST_F(RealClientTest, SetupWithConfigDictHumanReadableSizes) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict("localhost:17814", "16MB", "16 MB");
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "Setup should accept human-readable size strings";
+}
+
+TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict("localhost:17815", "0", "0");
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "Setup should preserve zero-size pure client/server semantics";
+}
+
+TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
+    GLogMuter muter;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    struct InvalidSizeCase {
+        const char* local_hostname;
+        const char* global_segment_size;
+        const char* local_buffer_size;
+    };
+
+    const InvalidSizeCase invalid_size_cases[] = {
+        {"localhost:17816", "50%", "16MB"},
+        {"localhost:17817", "16MB", "16XB"},
+        {"localhost:17818", "-5", "16MB"},
+    };
+
+    for (const auto& test_case : invalid_size_cases) {
+        ConfigDict config = MakeConfigDict(test_case.local_hostname,
+                                           test_case.global_segment_size,
+                                           test_case.local_buffer_size);
+        auto result = py_client_->setup_internal(config);
+        EXPECT_FALSE(result.has_value())
+            << "Invalid explicit size values should fail instead of being "
+               "partially parsed or silently defaulted";
+    }
 }
 
 TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {

@@ -243,7 +243,7 @@ For maximum performance, especially with RDMA networks, use the zero-copy API. T
 
 ⚠️ **Important**: `register_buffer` is required for zero-copy RDMA operations. Without proper buffer registration, undefined behavior and memory corruption may occur.
 
-Zero-copy operations require registering memory buffers with the store:
+Zero-copy operations require registered memory buffers. For repeated reads and writes, prefer the Python `BufferPool` helper described below so leases come from the store's setup-time local buffer instead of registering and unregistering memory for every operation.
 
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
@@ -276,6 +276,45 @@ store.unregister_buffer(buffer_ptr)
 ```
 
 </details>
+
+#### BufferPool Helper
+
+`BufferPool` leases scratch buffers from the store's setup-time local buffer for repeated zero-copy operations. It is useful when a caller repeatedly needs temporary memory, for example as the destination buffer for `get_into()` or `get_into_ranges()`.
+
+```python
+from mooncake.buffer_pool import BufferPool
+
+pool = BufferPool(store)
+
+with pool.buffer(1024 * 1024) as lease:
+    n = store.get_into("my_key", lease.ptr, lease.size)
+    view = lease.buffer[:n]
+    # Consume view directly, or wrap it with np.frombuffer(view, dtype=...).
+    # Copy only if the data must outlive the lease: data = bytes(view)
+
+pool.close()
+```
+
+`acquire(size)` and `buffer(size)` return a lease object. A lease exposes:
+
+- `ptr`: the local-buffer address to pass to zero-copy APIs.
+- `size`: the requested logical size.
+- `buffer`: a Python `memoryview` over the logical requested size.
+- `release()`: returns the local-buffer allocation to the store allocator.
+
+Behavior and lifecycle rules:
+
+- Leases prefer the store local buffer shared with internal Store staging paths.
+- If local-buffer allocation is temporarily exhausted, `BufferPool` can allocate and register a short-lived overflow buffer; the overflow buffer is unregistered when the lease is released.
+- `max_regions` can limit the number of concurrently active external leases.
+- `max_bytes` bounds total active local-buffer and overflow leases; the default allows one local-buffer-sized overflow burst.
+- `acquire(size, block=False)` raises when both local and overflow capacity are exhausted instead of waiting.
+- `acquire(size, timeout=...)` can wait for another lease to be released.
+- Do not keep `lease.ptr` or a `memoryview` after releasing the lease.
+- `release()` fails while exported views are alive. Delete those views first, then release.
+- `close()` fails if leases are still active. Release all leases before closing the pool.
+
+Legacy code may still import `RegisteredBufferPool`, but new examples should prefer `mooncake.buffer_pool.BufferPool`.
 
 ---
 
@@ -393,7 +432,7 @@ from object `all_keys[i][j]`, then writes it into destination buffer
 This lets one buffer gather interleaved fragments from multiple keys, and lets one key contribute multiple disjoint fragments to the same buffer in a single call.
 
 **Parameters:**
-- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Every buffer must be registered with `register_buffer()` before calling this API.
+- `buffer_ptrs`: Memory addresses of pre-allocated destination buffers. Each buffer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 - `all_keys`: For each buffer, the ordered list of source object keys to read from.
 - `all_dst_offsets`: For each buffer and key, the destination offsets of that key's fragments.
 - `all_src_offsets`: For each buffer and key, the source offsets of that key's fragments inside the object.
@@ -586,8 +625,36 @@ config.preferred_segment = self.get_hostname()
 
 ```python
 config = ReplicateConfig()
-config.prefer_alloc_in_same_node = "True
+config.prefer_alloc_in_same_node = "True"
 ```
+
+#### group_ids
+**Type:** `List[str] | None`
+**Default:** `None`
+**Description:** Optionally assigns object metadata to routing groups during writes. When this field is unset, Mooncake Store preserves the default ungrouped behavior. When it is set, each group ID maps to the object at the same position in the write request. Empty string (`""`) explicitly stores that object as ungrouped.
+
+For batch write APIs, the number of group IDs must match the number of keys:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a", "", "session-b"]
+
+store.put_batch(
+    ["key-a", "key-b", "key-c"],
+    [b"value-a", b"value-b", b"value-c"],
+    config,
+)
+```
+
+For a single-object write, provide one group ID:
+
+```python
+config = ReplicateConfig()
+config.group_ids = ["session-a"]
+
+store.put("key-a", b"value-a", config)
+```
+
 ---
 
 ## Unified Parallel Tensor IO API
@@ -728,7 +795,7 @@ def batch_get_tensor_with_parallelism(
 
 ### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
 
-Zero-copy unified read forms. The destination buffers must be registered with `register_buffer()` before calling them.
+Zero-copy unified read forms. The destination buffers must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ```python
 def get_tensor_with_parallelism_into(
@@ -793,13 +860,13 @@ The unified write and upsert family also has `_from` variants for registered-mem
 - `upsert_tensor_with_parallelism_from(...)`
 - `batch_upsert_tensor_with_parallelism_from(...)`
 
-These APIs accept registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
+These APIs accept Store-managed registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
 
 ```text
 [TensorObjectHeader + layout metadata][tensor data]
 ```
 
-As with other zero-copy APIs, every source pointer must be registered with `register_buffer()` before use.
+As with other zero-copy APIs, every source pointer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
 
 ### Compatibility wrappers
 
@@ -2615,7 +2682,7 @@ def batch_get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[in
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 
@@ -2691,7 +2758,7 @@ List[int]
 **Returns:**
 - `List[int]`: List of bytes read for each operation (positive = success, negative = error)
 
-⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed registered memory before batch zero-copy operations.
 
 **Example:**
 
@@ -2820,8 +2887,6 @@ bind_to_numa_node(0)
 
 ---
 
----
-
 ## Error Handling
 
 Most methods return integer status codes:
@@ -2844,5 +2909,3 @@ For methods that return data (`get`, `get_batch`, `get_buffer`, `get_tensor`):
 4. **Configure replication** appropriately - more replicas provide better availability but use more storage
 5. **Use soft pinning** for frequently accessed objects to keep them in memory
 6. **Choose RDMA protocol** when available for maximum performance
-
----

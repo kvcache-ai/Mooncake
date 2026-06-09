@@ -80,6 +80,34 @@ cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
 pip install -e ../mooncake-wheel --no-build-isolation
 ```
 
+### 3. Building a Distributable Wheel (optional)
+
+To produce a relocatable wheel for distribution (instead of the editable
+install above), use `scripts/build_wheel.sh`, which runs `auditwheel
+repair` to bundle non-system dependencies:
+
+```bash
+# After the cmake/make build above completes:
+PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+pip install dist/mooncake_transfer_engine-*.whl
+```
+
+> **Important (EFA builds):** `auditwheel repair` excludes `libfabric`
+> and `libefa` from the wheel so they resolve to the system EFA
+> installation (`/opt/amazon/efa/lib`) at runtime. This is required
+> because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the
+> **same** system `libfabric`. If the wheel bundled its own copy, the
+> process would load two independent libfabric instances — Mooncake's
+> bundled one and NCCL's system one — and whichever initializes first
+> claims the EFA device, leaving the other with an empty provider list
+> (`fi_getinfo: provider efa output empty list`). NCCL then silently
+> falls back to the TCP provider and cross-node collectives such as
+> `all_gather_object` hang. Excluding libfabric/libefa (see
+> `scripts/build_wheel.sh`) keeps a single shared libfabric in the
+> process. If you are on an older Mooncake build whose wheel still bundles
+> libfabric, force the system copy with
+> `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+
 ## Verification
 
 Test EFA transport initialization:
@@ -92,7 +120,7 @@ result = te.initialize('127.0.0.1', 'P2PHANDSHAKE', 'efa', '')
 print(f'Initialize result: {result}')  # Should be 0
 
 # You should see logs like:
-# EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, provider: efa
+# EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, fabric: efa, provider: efa
 ```
 
 ## Unit Tests
@@ -211,6 +239,7 @@ address shown in the target's startup log (e.g., `ip-172-31-29-226:12345`).
 
 > **Note:** `buffer_size` must be >= `block_size * batch_size * threads`. The benchmark auto-adjusts if too small.
 
+(benchmark-results)=
 ### Benchmark Results
 
 #### 1. p6-b300.48xlarge (B300, 16 EFA × 400 Gbps)
@@ -342,6 +371,63 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 | block=1MB, threads=96, batch=32 | 57.61 GB/s | 59.63 GB/s |
 
 > **Peak: ~64 GB/s** on both write and read — far below the GPU-to-GPU number despite identical NIC count. The bottleneck is DDR4-3200 DRAM bandwidth on the EPYC 7R13 (Milan): `batch=16` consistently wins because larger in-flight queues only deepen DRAM contention without unlocking new NIC capacity. p5.48xlarge CPU-to-CPU runs around **3× slower than p5en** (DDR5 Xeon 8488C, ~213 GB/s) at the same NIC aggregate. For PD KV transfer, the GPU-to-GPU path is the relevant one.
+
+### Single-host loopback
+
+EFA NICs have no hardware loopback short-circuit: when a transfer's source and
+destination resolve to the same host, the data does not go out on the wire as
+GPUDirect/device RDMA. libfabric handles the same-host case in software, and
+there are **two distinct provider knobs** that select how:
+
+- **`FI_EFA_ENABLE_SHM_TRANSFER`** (default `1`, on): when on, the EFA
+  provider routes same-host peers through the **`shm` provider** — verifiable
+  at runtime, where libfabric reports `Opened fabric: shm` alongside
+  `Opened fabric: efa` even on a default (device-RDMA-enabled) configuration.
+  This SHM path is the one that supplies the same-host memcpy fast path; it is
+  active **by default**, independent of `FI_EFA_USE_DEVICE_RDMA`.
+- **`FI_EFA_USE_DEVICE_RDMA`** (default `1` after #2041): controls whether the
+  EFA RDM data path uses device RDMA vs libfabric's emulated RDM path. It is a
+  provider-level flag resolved at `fi_getinfo` time; Mooncake does not wrap it.
+
+```{warning}
+**GPU (FI_HMEM_CUDA) buffers — known segfault.** The default same-host **SHM**
+path (`FI_EFA_ENABLE_SHM_TRANSFER=1`) performs a **host `memcpy` into the
+destination buffer** during SHM SAR reassembly, *without* honoring an
+`FI_HMEM_CUDA` destination's iface. On a GPU buffer this writes host memory
+straight into a device pointer and **segfaults** on the first same-host
+transfer — `__memcpy_avx_unaligned` ← `ofi_copy_to_mr_iov` ← `smr_copy_from_sar`
+← `efa_rdm_cq_readfrom` ← `fi_cq_read`. Reported upstream as
+[ofiwg/libfabric#12328](https://github.com/ofiwg/libfabric/issues/12328).
+
+- **Same-process self-loopback** (e.g. a TP-colocated rank reading its own
+  registered GPU weights — checkpoint-engine p2p weight update) is handled
+  inside Mooncake: `EfaContext::tryLoopbackCopy` detects a same-process peer
+  (matched on `local_server_name`, which embeds this process's unique RPC
+  port) and satisfies the transfer with a local `cudaMemcpy` instead of routing
+  it over EFA, so it never reaches the broken SHM path.
+- **Same-host cross-process GPU transfers** are *not* short-circuited (the
+  peer is a different process / address space). Until libfabric#12328 is fixed,
+  set `FI_EFA_ENABLE_SHM_TRANSFER=0` on such processes — same-host transfers
+  then fall back to device RDMA, which is GPU-aware and correct.
+```
+
+For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is
+the same-host fast path the measurements below exercise.
+
+Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, host DRAM buffer,
+same-host producer/consumer in **separate processes**):
+
+| same-host path | per-write latency |
+|---|---:|
+| device RDMA (NIC round-trip, no fast-path for loopback) | ~830 ms |
+| SHM memcpy fast path (default) | ~390 ms |
+
+For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC)
+is ~340 ms — i.e., driving a same-host loopback through the NIC is *slower* than
+going over the wire to another host, because the NIC has no fast-path for
+loopback. Cross-host transfers always use device RDMA and are unaffected by
+`FI_EFA_ENABLE_SHM_TRANSFER`: leave it at its default on any process that also
+talks to remote peers.
 
 ### Tuning Tips
 
@@ -479,9 +565,9 @@ SGLang's PD-disaggregation Mooncake integration reads the transport from `MOONCA
 
 ### 1. Apply EFA Patch (only if SGLang version predates PR #25083)
 
-Older SGLang releases hardcode `"rdma"` in the transfer engine init. Since [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) the protocol is read from `MOONCAKE_PROTOCOL`, so once that PR is in your build (or upstream `main`) **this step is unnecessary** — skip to step 2.
+Older SGLang releases hardcode `"rdma"` in the transfer engine init. [SGLang PR #25083](https://github.com/sgl-project/sglang/pull/25083) has been **merged into SGLang `main`**, so the protocol is now read from `MOONCAKE_PROTOCOL`. If your SGLang build includes that PR (any recent `main` or release built after it), **this step is unnecessary** — skip to step 2.
 
-If you are pinned to an older release, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
+Only if you are pinned to an older release that predates PR #25083, apply the [patch script](https://github.com/whn09/kimi-k2-sglang):
 
 ```bash
 bash patch_sglang_efa.sh
@@ -506,6 +592,15 @@ export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
 
 > **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
+
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. Default is `1`, which reaches 99.93% of peak GPU-to-GPU throughput while saving CPU for other workloads. Set to `0` to disable the cap (one poller per EFA context — the legacy behavior). Higher values (e.g., `MC_EFA_CQ_THREADS=4`) are available as an escape hatch for throughput tuning but rarely help in practice.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # default: single CQ poller (recommended)
+> export MC_EFA_CQ_THREADS=0   # disable cap: one poller per EFA context (legacy)
+> ```
+>
+> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
 
 ### 3. Prefill Instance
 

@@ -193,6 +193,7 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
 
     LOG(INFO) << "EFA device (libfabric): " << device_name_
               << ", domain: " << fi_info_->domain_attr->name
+              << ", fabric: " << fi_info_->fabric_attr->name
               << ", provider: " << fi_info_->fabric_attr->prov_name
               << " (shared endpoint, max_wr=" << max_wr_depth_ << ")";
 
@@ -626,6 +627,72 @@ void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
     }
 }
 
+bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
+    // Only intra-process self-transfers qualify.  We compare the SERVER name
+    // (host:rpc_port), NOT the full nic path: local_server_name embeds this
+    // process's unique RPC port, so a server-name match guarantees the peer
+    // is *this very process* — meaning both source_addr and dest_addr are
+    // pointers we can dereference directly.  We deliberately ignore the
+    // device suffix: with multiple NICs the source slice is routed by its
+    // source buffer's device while peer_nic_path names the destination
+    // buffer's device, so the two device names often differ even for a pure
+    // self-loopback.  Same-host *cross-process* peers carry a different RPC
+    // port and never match, so we never memcpy across address spaces.
+    if (getServerNameFromNicPath(slice->peer_nic_path) !=
+        engine_.local_server_name()) {
+        return false;
+    }
+
+    // Direction depends on opcode, mirroring fi_read / fi_write below:
+    //   WRITE: fi_write(buf=source_addr -> addr=dest_addr)  data src->dst
+    //   READ : fi_read (buf=source_addr <- addr=dest_addr)  data dst->src
+    // source_addr and rdma.dest_addr are two distinct local buffers here, so
+    // the copy is NOT symmetric — we must honor the opcode's direction.
+    void* local_buf = slice->source_addr;
+    void* remote_buf = reinterpret_cast<void*>(slice->rdma.dest_addr);
+    void* dst;
+    void* src;
+    if (slice->opcode == Transport::TransferRequest::READ) {
+        dst = local_buf;   // read INTO local
+        src = remote_buf;  // FROM remote (== local) buffer
+    } else {
+        dst = remote_buf;  // write INTO remote (== local) buffer
+        src = local_buf;   // FROM local
+    }
+    size_t len = slice->length;
+    // GPU-aware copy.  Guard on the SAME backends that register GPU memory
+    // as FI_HMEM (see the FI_MR_HMEM hint and the registration path: only
+    // USE_CUDA / USE_HIP tag MRs with a device iface).  Every other build —
+    // including non-EFA GPU backends such as MUSA/MLU/MACA, which never run
+    // on AWS EFA hardware — registers loopback buffers as host memory, so a
+    // plain memcpy is both correct and the only portable option (those
+    // backends do not expose the cuda* symbols).  *MemcpyDefault picks
+    // H2H/H2D/D2H/D2D from the pointer attributes.
+#if defined(USE_CUDA)
+    auto rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
+    if (rc != cudaSuccess) {
+        LOG(ERROR) << "EFA loopback cudaMemcpy failed: "
+                   << cudaGetErrorString(rc) << " (dst=" << dst
+                   << ", src=" << src << ", len=" << len << ")";
+        slice->markFailed();
+        return true;
+    }
+#elif defined(USE_HIP)
+    auto rc = hipMemcpy(dst, src, len, hipMemcpyDefault);
+    if (rc != hipSuccess) {
+        LOG(ERROR) << "EFA loopback hipMemcpy failed: " << hipGetErrorString(rc)
+                   << " (dst=" << dst << ", src=" << src << ", len=" << len
+                   << ")";
+        slice->markFailed();
+        return true;
+    }
+#else
+    memcpy(dst, src, len);
+#endif
+    slice->markSuccess();
+    return true;
+}
+
 int EfaContext::submitPostSend(
     const std::vector<Transport::Slice*>& slice_list) {
     // Route slices to appropriate peer handles.  Group by peer NIC path.
@@ -638,6 +705,8 @@ int EfaContext::submitPostSend(
         // Fast path: peer info already filled in by the caller
         // (dest_rkey and peer_nic_path set on the slice before dispatch).
         if (!slice->peer_nic_path.empty()) {
+            // Self-loopback: satisfy locally, skip EFA entirely.
+            if (tryLoopbackCopy(slice)) continue;
             slices_by_peer[slice->peer_nic_path].push_back(slice);
             continue;
         }
@@ -665,9 +734,12 @@ int EfaContext::submitPostSend(
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
 
-        std::string peer_nic_path = peer_segment_desc->name + "@" +
+        std::string peer_nic_path = peer_segment_desc->nicPathServerName() +
+                                    "@" +
                                     peer_segment_desc->devices[device_id].name;
         slice->peer_nic_path = peer_nic_path;
+        // Self-loopback: satisfy locally, skip EFA entirely.
+        if (tryLoopbackCopy(slice)) continue;
         slices_by_peer[peer_nic_path].push_back(slice);
     }
 

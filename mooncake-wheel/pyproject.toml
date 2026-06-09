@@ -21,7 +21,7 @@ readme = ""
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
-Documentation = "https://github.com/kvcache-ai/Mooncake/tree/main/doc"
+Documentation = "https://kvcache-ai.github.io/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 

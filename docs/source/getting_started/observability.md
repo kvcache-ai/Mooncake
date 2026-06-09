@@ -156,7 +156,7 @@ curl http://<master-host>:9003/health
 
 The admin HTTP server is configured in the master config file (`master.json` or `master.yaml`):
 
-```json
+```text
 {
   "enable_metric_reporting": true,
   "metrics_port": 9003,

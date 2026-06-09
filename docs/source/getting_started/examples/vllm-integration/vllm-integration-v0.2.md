@@ -1,5 +1,10 @@
 # vLLM V0 Disaggregated Serving Demo
 
+```{admonition} Archived
+:class: warning
+This page has been **consolidated** into the unified [Disaggregated Prefill-Decode](disagg-prefill-decode) guide (see the V0 Legacy section). Please use that guide for up-to-date information.
+```
+
 ## Overview
 This is the latest version of mooncake-transfer-engine integration doc with the vLLM project based on [PR 10502](https://github.com/vllm-project/vllm/pull/10502) and [PR 10884](https://github.com/vllm-project/vllm/pull/10884) (vllm version: v0.6.4.post1/main) to accelerate KVCache transfer for inter-node disaggregated serving scenario. We have run some experiments to obtain some [preview benchmark results](../../../performance/vllm-benchmark-results-v0.2.md). More benchmark results will be released in due time.
 
@@ -16,7 +21,7 @@ pip3 install mooncake-transfer-engine
 ```
 
 Note:
-  - If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](build.md).
+  - If you encounter problems such as missing `lib*.so`, you should uninstall this package by `pip3 uninstall mooncake-transfer-engine`, and build the binaries manually according to the [instructions](../../build.md).
   - For vLLM version <= v0.8.4, it requires mooncake-transfer-engine <= 0.3.3.post2. In the latest release, interface `mooncake_vllm_adaptor` has been deprecated.
 
 ### Install the latest version of vLLM
@@ -89,10 +94,20 @@ etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://loc
 # You may need to terminate other etcd processes before running the above command
 
 # 2. Run on the prefilling side (producer role)
-MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8100 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":2e9}'
+MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8100 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":2e9}'
 
 # 3. Run on the decoding side (consumer role)
-MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 --port 8200 --max-model-len 10000 --gpu-memory-utilization 0.8 --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":2e9}'
+MOONCAKE_CONFIG_PATH=./mooncake.json VLLM_USE_MODELSCOPE=True python3 -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4 \
+    --port 8200 \
+    --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":2e9}'
 ```
 
 - `MOONCAKE_CONFIG_PATH` is the path to the mooncake.json configuration file.

@@ -164,10 +164,14 @@ Gets the address of the first buffer in a specified segment.
 
 ### Data Transfer Operations
 
+```{note}
+The optional `transport_hint` argument pins the request onto a named transport (`"rdma"`, `"tcp"`, ...), overriding policy-driven selection for that one call. **TENT backend only** (`MC_USE_TENT=1`); silently ignored on the classic backend. See [TENT transport selector](../design/tent/transport-selector.md) for more details.
+```
+
 #### transfer_sync_write()
 
 ```python
-transfer_sync_write(target_hostname, buffer, peer_buffer_address, length)
+transfer_sync_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
 ```
 
 Performs a synchronous write operation to transfer data from local buffer to remote buffer.
@@ -177,6 +181,7 @@ Performs a synchronous write operation to transfer data from local buffer to rem
 - `buffer` (int): The local buffer address
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -184,7 +189,7 @@ Performs a synchronous write operation to transfer data from local buffer to rem
 #### transfer_sync_read()
 
 ```python
-transfer_sync_read(target_hostname, buffer, peer_buffer_address, length)
+transfer_sync_read(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
 ```
 
 Performs a synchronous read operation to transfer data from remote buffer to local buffer.
@@ -194,6 +199,7 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 - `buffer` (int): The local buffer address
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -201,7 +207,7 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 #### transfer_sync()
 
 ```python
-transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode, notify=None)
+transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode, notify=None, transport_hint="")
 ```
 
 Performs a synchronous transfer operation with specified opcode and optional notification.
@@ -213,6 +219,7 @@ Performs a synchronous transfer operation with specified opcode and optional not
 - `length` (int): The number of bytes to transfer
 - `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
 - `notify` (TransferNotify, optional): Notification object to send after transfer completion
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -220,7 +227,7 @@ Performs a synchronous transfer operation with specified opcode and optional not
 #### transfer_submit_write()
 
 ```python
-transfer_submit_write(target_hostname, buffer, peer_buffer_address, length)
+transfer_submit_write(target_hostname, buffer, peer_buffer_address, length, transport_hint="")
 ```
 
 Submits an asynchronous write operation and returns immediately.
@@ -230,6 +237,7 @@ Submits an asynchronous write operation and returns immediately.
 - `buffer` (int): The local buffer address
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: Batch ID for tracking the operation, or negative value on failure
@@ -255,7 +263,7 @@ Checks the status of an asynchronous transfer operation.
 #### transfer_write_on_cuda()
 
 ```python
-transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
+transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="")
 ```
 
 Performs a write operation to transfer data from local buffer to remote buffer on a given cuda stream.
@@ -266,6 +274,7 @@ Performs a write operation to transfer data from local buffer to remote buffer o
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
 - `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note at the top of this section. Default `""` (policy-driven).
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -279,7 +288,7 @@ Performs a write operation to transfer data from local buffer to remote buffer o
 #### transfer_read_on_cuda()
 
 ```python
-transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
+transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr=0, transport_hint="")
 ```
 
 Performs a read operation to transfer data from remote buffer to local buffer on a given cuda stream.
@@ -290,6 +299,7 @@ Performs a read operation to transfer data from remote buffer to local buffer on
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
 - `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+- `transport_hint` (str, optional): TENT-only per-request transport pin. See the note at the top of this section. Default `""` (policy-driven).
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -307,7 +317,7 @@ Performs a read operation to transfer data from remote buffer to local buffer on
 #### batch_transfer_sync_write()
 
 ```python
-batch_transfer_sync_write(target_hostname, buffers, peer_buffer_addresses, lengths)
+batch_transfer_sync_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
 ```
 
 Performs a batch synchronous write operation to transfer multiple data chunks from local buffers to remote buffers.
@@ -317,6 +327,7 @@ Performs a batch synchronous write operation to transfer multiple data chunks fr
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -324,7 +335,7 @@ Performs a batch synchronous write operation to transfer multiple data chunks fr
 #### batch_transfer_sync_read()
 
 ```python
-batch_transfer_sync_read(target_hostname, buffers, peer_buffer_addresses, lengths)
+batch_transfer_sync_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
 ```
 
 Performs a batch synchronous read operation to transfer multiple data chunks from remote buffers to local buffers.
@@ -334,6 +345,7 @@ Performs a batch synchronous read operation to transfer multiple data chunks fro
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -341,7 +353,7 @@ Performs a batch synchronous read operation to transfer multiple data chunks fro
 #### batch_transfer_sync()
 
 ```python
-batch_transfer_sync(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, notify=None)
+batch_transfer_sync(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, notify=None, transport_hint="")
 ```
 
 Performs a batch synchronous transfer operation with specified opcode and optional notification.
@@ -353,6 +365,7 @@ Performs a batch synchronous transfer operation with specified opcode and option
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
 - `notify` (TransferNotify, optional): Notification object to send after transfer completion
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -360,7 +373,7 @@ Performs a batch synchronous transfer operation with specified opcode and option
 #### batch_transfer_async_write()
 
 ```python
-batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths)
+batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
 ```
 
 Submits a batch asynchronous write operation and returns immediately.
@@ -370,6 +383,7 @@ Submits a batch asynchronous write operation and returns immediately.
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: Batch ID for tracking the operation, or 0 on failure
@@ -377,7 +391,7 @@ Submits a batch asynchronous write operation and returns immediately.
 #### batch_transfer_async_read()
 
 ```python
-batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths)
+batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths, transport_hint="")
 ```
 
 Submits a batch asynchronous read operation and returns immediately.
@@ -387,6 +401,7 @@ Submits a batch asynchronous read operation and returns immediately.
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: Batch ID for tracking the operation, or 0 on failure
@@ -394,7 +409,7 @@ Submits a batch asynchronous read operation and returns immediately.
 #### batch_transfer_async()
 
 ```python
-batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode)
+batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, transport_hint="")
 ```
 
 Submits a batch asynchronous transfer operation with specified opcode and returns immediately.
@@ -405,6 +420,7 @@ Submits a batch asynchronous transfer operation with specified opcode and return
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `int`: Batch ID for tracking the operation, or 0 on failure
@@ -426,7 +442,7 @@ Waits for multiple batch asynchronous transfer operations to complete.
 #### batch_transfer_write_on_cuda()
 
 ```python
-batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
+batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="")
 ```
 
 Performs a batch write operation to transfer multiple data chunks from local buffers to remote buffers on a given cuda stream.
@@ -437,6 +453,7 @@ Performs a batch write operation to transfer multiple data chunks from local buf
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -450,7 +467,7 @@ Performs a batch write operation to transfer multiple data chunks from local buf
 #### batch_transfer_read_on_cuda()
 
 ```python
-batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
+batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr=0, transport_hint="")
 ```
 
 Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on a given cuda stream.
@@ -461,6 +478,7 @@ Performs a batch read operation to transfer multiple data chunks from remote buf
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
 - `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+- `transport_hint` (str, optional): TENT-only per-batch transport pin. Default `""` (policy-driven).
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -615,6 +633,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_METADATA_SERVER`: Default metadata server address
 - `MC_LEGACY_RPC_PORT_BINDING`: Enables legacy RPC port binding behavior
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address
+- `MC_RDMA_BIND_ADDRESS`: Specifies the RDMA bind address for NIC path construction in dual-NIC environments. When set, RDMA NIC paths use this address while TCP handshake uses the address from `local_hostname`. This is useful when TCP and RDMA traffic use separate network interfaces (e.g., `eth0` for TCP and `rdma-net1` for RDMA).
 - `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
@@ -624,6 +643,7 @@ The Transfer Engine respects the following environment variables:
 ### Basic Setup and Data Transfer
 
 ```python
+import numpy as np
 from mooncake.engine import TransferEngine
 import os
 
@@ -650,7 +670,7 @@ data_len = len(data)
 engine.register_memory(buffer_data, buffer_data_len)
 
 # Get Remote Addr from ZMQ or upper-layer inference framework
-remote_addr = ??
+remote_addr = REMOTE_ADDR
 
 # Transfer data to remote node
 ret = engine.transfer_sync_write(
@@ -815,3 +835,32 @@ The Transfer Engine Python API is thread-safe for most operations. However, it's
 2. **Transfer Failures**: Verify target hostname is correct and network connectivity is established
 3. **Memory Issues**: Ensure sufficient system memory and proper buffer alignment
 4. **Performance Issues**: Check RDMA device configuration and network topology
+
+## Compile-time Feature Support Attributes
+
+The `mooncake.engine` module provides boolean attributes that indicate whether specific features were enabled during compilation:
+
+### Module Attributes
+
+- `engine.SUPPORT_CUDA`: Whether CUDA support is enabled
+- `engine.SUPPORT_EFA`: Whether EFA (Elastic Fabric Adapter) support is enabled
+- `engine.SUPPORT_HIP`: Whether HIP (Heterogeneous-compute Interface for Portability) support is enabled
+- `engine.SUPPORT_MNNVL`: Whether MNNVL transport protocol support is enabled
+- `engine.SUPPORT_INTRA_NVLINK`: Whether intra-node NVLink support is enabled
+
+### Usage Example
+
+```python
+from mooncake import engine
+
+# Check if CUDA is supported
+if engine.SUPPORT_CUDA:
+    print("CUDA support is available")
+
+# Check all features
+print(f"CUDA: {engine.SUPPORT_CUDA}")
+print(f"EFA: {engine.SUPPORT_EFA}")
+print(f"HIP: {engine.SUPPORT_HIP}")
+print(f"MNNVL: {engine.SUPPORT_MNNVL}")
+print(f"Intra-NVLink: {engine.SUPPORT_INTRA_NVLINK}")
+```

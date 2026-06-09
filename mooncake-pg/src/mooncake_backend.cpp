@@ -1,8 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
-#include <cuda_alike.h>
 #include <mooncake_backend.h>
 #include <p2p_proxy.h>
 #include <thread>
@@ -256,7 +255,7 @@ MooncakeBackend::MooncakeBackend(
 
     } else {
         for (size_t i = 0; i < 2; i++) {
-            cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_->registerLocalMemory(send_buffer_[i], kBufferSize,
@@ -265,7 +264,7 @@ MooncakeBackend::MooncakeBackend(
         }
 
         for (size_t i = 0; i < 2; i++) {
-            cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            cudaError_t err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_->registerLocalMemory(recv_buffer_[i], kBufferSize,
@@ -385,8 +384,9 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(options_->activeRanks_.device().is_cpu(),
                         "activeRanks must be on CPU.");
         } else {
-            TORCH_CHECK(options_->activeRanks_.device().is_cuda(),
-                        "activeRanks must be on CUDA.");
+            TORCH_CHECK(
+                options_->activeRanks_.device().type() == c10::DeviceType::CUDA,
+                "activeRanks must be on GPU.");
         }
         if (max_size != size) {
             TORCH_CHECK(options_->activeRanks_.numel() == max_size,
@@ -424,7 +424,9 @@ MooncakeBackend::MooncakeBackend(
     auto deviceType = isCpu ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
     auto shim = c10::make_intrusive<MooncakeP2PShim>(this);
     setBackend(deviceType, BackendType::CUSTOM, shim);
+#ifndef MOONCAKE_EP_USE_MUSA
     setDefaultBackend(BackendType::CUSTOM);
+#endif
 
     // Increment backend index
     ++backendIndex_;
@@ -1011,6 +1013,13 @@ void MooncakeBackend::shutdown() {
                 cudaFree(recv_buffer_[i]);
             }
         }
+        if (isCpu_) {
+            delete[] meta_->activeRanks;
+        } else {
+            cudaFreeHost(meta_->activeRanks);
+        }
+        meta_->activeRanks = nullptr;
+        meta_->activeRanksDevice = nullptr;
     }
 }
 

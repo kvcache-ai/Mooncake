@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'kvcache-ai/Mooncake'
+    if: ${{ github.repository == 'kvcache-ai/Mooncake' && !contains(github.ref_name, '-') }}
 
     runs-on: self-hosted
 
@@ -149,15 +149,14 @@ jobs:
           cd build
           cmake_args=(
             -DUSE_ASCEND_DIRECT=ON
-            -DUSE_CUDA=OFF
-            -DWITH_EP=OFF
-            -DUSE_HTTP=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON
             -DBUILD_UNIT_TESTS=OFF
-            -DBUILD_EXAMPLES=ON
             -DCMAKE_BUILD_TYPE=Release
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
           )
           cmake .. "${cmake_args[@]}"
 
@@ -194,6 +193,7 @@ jobs:
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi

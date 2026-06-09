@@ -2,6 +2,7 @@
 #include "mmap_arena.h"
 #include "config.h"
 #include "common.h"
+#include "ub_allocator.h"
 
 #include <Slab.h>
 #include <gflags/gflags.h>
@@ -41,6 +42,10 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#endif
+
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -101,7 +106,7 @@ AutoPortBinder::~AutoPortBinder() {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment) {
+                                       size_t alignment, bool use_spdk_dma) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -113,7 +118,17 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return ascend_allocate_memory(total_size, protocol);
     }
 #endif
-
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        return mooncake::ub_allocate_memory(alignment, total_size);
+    }
+#endif
+#ifdef USE_NOF
+    if (use_spdk_dma && total_size > 0) {
+        return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
+                                                          -1);
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
@@ -362,7 +377,12 @@ void free_memory(const std::string &protocol, void *ptr) {
         return ascend_free_memory(protocol, ptr);
     }
 #endif
-
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        mooncake::ub_free_memory(ptr);
+        return;
+    }
+#endif
     free(ptr);
 }
 
@@ -539,8 +559,9 @@ static std::string SanitizeKey(const std::string &key) {
 
     for (char c : key) {
         // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+        const bool invalid =
+            c == '\0' || kInvalidChars.find(c) != std::string_view::npos;
+        sanitized_key.push_back(invalid ? '_' : c);
     }
     return sanitized_key;
 }

@@ -3,7 +3,12 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef USE_MUSA
+#include <musa_runtime.h>
+#define cudaStream_t musaStream_t
+#else
 #include <cuda_runtime.h>
+#endif
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
