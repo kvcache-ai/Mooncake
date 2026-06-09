@@ -1,0 +1,80 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+  issues: write
+
+jobs:
+  slash_command:
+    if: >
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '/rerun-ci') ||
+       contains(github.event.comment.body, '/rerun-failed'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check commenter permission
+        id: perm
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission' 2>/dev/null || echo "none")
+          if [[ "$PERM" == "admin" || "$PERM" == "maintain" || "$PERM" == "write" ]]; then
+            echo "allowed=true" >> $GITHUB_OUTPUT
+          else
+            echo "allowed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: React to comment
+        if: steps.perm.outputs.allowed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='+1' --silent
+
+      - name: Handle /rerun-ci
+        if: >
+          steps.perm.outputs.allowed == 'true' &&
+          contains(github.event.comment.body, '/rerun-ci')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.issue.number }}
+          gh pr edit $PR_NUMBER --repo ${{ github.repository }} --add-label "run-ci"
+          gh pr comment $PR_NUMBER --repo ${{ github.repository }} \
+            --body "🔄 CI rerun triggered by @${{ github.event.comment.user.login }}"
+
+      - name: Handle /rerun-failed
+        if: >
+          steps.perm.outputs.allowed == 'true' &&
+          contains(github.event.comment.body, '/rerun-failed')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.issue.number }}
+          RUN_ID=$(gh run list --repo ${{ github.repository }} \
+            --branch $(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json headRefName --jq '.headRefName') \
+            --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -n "$RUN_ID" ]; then
+            gh run rerun $RUN_ID --repo ${{ github.repository }} --failed
+            gh pr comment $PR_NUMBER --repo ${{ github.repository }} \
+              --body "🔄 Rerunning failed jobs from run #$RUN_ID (triggered by @${{ github.event.comment.user.login }})"
+          else
+            gh pr comment $PR_NUMBER --repo ${{ github.repository }} \
+              --body "⚠️ No workflow runs found to rerun."
+          fi
+
+      - name: Deny unauthorized command
+        if: steps.perm.outputs.allowed == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='-1' --silent
