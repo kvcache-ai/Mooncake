@@ -278,11 +278,11 @@ bool MasterAdminServer::Start() {
 
 void MasterAdminServer::Stop() {
     metric_report_running_.store(false, std::memory_order_relaxed);
-    metric_report_stop_sem_.release();
     if (started_.exchange(false)) {
         http_server_.stop();
     }
     if (metric_report_thread_.joinable()) {
+        metric_report_stop_sem_.release();
         metric_report_thread_.join();
     }
 }
