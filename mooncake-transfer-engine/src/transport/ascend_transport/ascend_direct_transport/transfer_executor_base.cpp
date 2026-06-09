@@ -14,6 +14,7 @@
 // limitations under the License.
 
 #include "transport/ascend_transport/ascend_direct_transport/transfer_executor_base.h"
+#include "adxl/adxl_types.h"
 #include "transport/ascend_transport/ascend_direct_transport/async_transfer_executor.h"
 #include "transport/ascend_transport/ascend_direct_transport/local_copy_engine.h"
 #include "transport/ascend_transport/ascend_direct_transport/sync_transfer_executor.h"
@@ -270,17 +271,34 @@ int TransferExecutorBase::checkAndConnect(
     return 0;
 }
 
+void TransferExecutorBase::recordConnectedSegment(size_t engine_idx,
+                                                  const std::string& remote) {
+    if (!params_.auto_connect) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    connected_segments_[engine_idx].insert(remote);
+}
+
 int TransferExecutorBase::disconnect(size_t engine_idx,
                                      const std::string& target_adxl_engine_name,
                                      int32_t timeout_in_millis) {
     if (params_.auto_connect) {
         auto status = adxl_engines_[engine_idx]->Disconnect(
             target_adxl_engine_name.c_str(), timeout_in_millis);
-        if (status != adxl::SUCCESS) {
+        if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
             LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
                        << ", status: " << status
                        << ", errmsg: " << aclGetRecentErrMsg();
             return -1;
+        }
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        auto it = connected_segments_.find(engine_idx);
+        if (it != connected_segments_.end()) {
+            it->second.erase(target_adxl_engine_name);
+            if (it->second.empty()) {
+                connected_segments_.erase(it);
+            }
         }
         return 0;
     }
@@ -319,7 +337,7 @@ void TransferExecutorBase::disconnectAllForEngine(size_t engine_idx) {
     for (const auto& connected_segment : it->second) {
         auto status = adxl_engines_[engine_idx]->Disconnect(
             connected_segment.c_str(), params_.connect_timeout);
-        if (status != adxl::SUCCESS) {
+        if (status != adxl::SUCCESS && status != adxl::NOT_CONNECTED) {
             LOG(ERROR) << "Failed to disconnect AdxlEngine: "
                        << connected_segment
                        << ", errmsg: " << aclGetRecentErrMsg();
@@ -475,23 +493,31 @@ int TransferExecutorBase::deregisterMem(void* addr) {
         return 0;
     }
 
-    if (params_.dummy_real_mode) {
-        std::set<size_t> engine_indices;
-        for (const auto& [engine_idx, mem_handle] : it->second) {
-            (void)mem_handle;
-            engine_indices.insert(engine_idx);
-        }
-        for (size_t engine_idx : engine_indices) {
-            disconnectAllForEngine(engine_idx);
-        }
+    std::set<size_t> engine_indices;
+    for (const auto& [engine_idx, mem_handle] : it->second) {
+        (void)mem_handle;
+        engine_indices.insert(engine_idx);
+    }
+    for (size_t engine_idx : engine_indices) {
+        disconnectAllForEngine(engine_idx);
     }
 
+    bool deregister_failed = false;
     for (const auto& [engine_idx, mem_handle] : it->second) {
         if (engine_idx >= local_engine_contexts_.size()) {
             continue;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[engine_idx]));
-        (void)adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
+        auto status = adxl_engines_[engine_idx]->DeregisterMem(mem_handle);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "DeregisterMem failed, engine_idx: " << engine_idx
+                       << ", status: " << status
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            deregister_failed = true;
+        }
+    }
+    if (deregister_failed) {
+        return -1;
     }
     addr_to_mem_handles_.erase(it);
     return 0;

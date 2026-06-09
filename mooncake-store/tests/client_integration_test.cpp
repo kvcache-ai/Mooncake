@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -650,6 +651,82 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
                   0);
         client_buffer_allocator_->deallocate(
             target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+    }
+}
+
+TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
+    auto find_group_id_on_different_shard = [](const std::string& key) {
+        static constexpr size_t kMetadataShardCountForTest = 1024;
+        const size_t key_shard =
+            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+        for (int i = 0; i < 10000; ++i) {
+            std::string group_id = key + "_group_" + std::to_string(i);
+            if (std::hash<std::string>{}(group_id) %
+                    kMetadataShardCountForTest !=
+                key_shard) {
+                return group_id;
+            }
+        }
+        return key + "_fallback_group";
+    };
+
+    const std::vector<std::string> keys = {
+        "client_batch_grouped_a",
+        "client_batch_ungrouped",
+        "client_batch_grouped_b",
+    };
+    const std::vector<std::string> values = {
+        "grouped-value-a",
+        "ungrouped-value",
+        "grouped-value-b",
+    };
+
+    std::vector<void*> source_buffers;
+    std::vector<std::vector<Slice>> batched_slices;
+    source_buffers.reserve(values.size());
+    batched_slices.reserve(values.size());
+    for (const auto& value : values) {
+        void* buffer = client_buffer_allocator_->allocate(value.size());
+        memcpy(buffer, value.data(), value.size());
+        source_buffers.push_back(buffer);
+        batched_slices.push_back({Slice{buffer, value.size()}});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.group_ids =
+        std::vector<std::string>{find_group_id_on_different_shard(keys[0]), "",
+                                 find_group_id_on_different_shard(keys[2])};
+
+    auto put_results = test_client_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(put_results.size(), keys.size());
+    for (const auto& result : put_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchPut failed: " << toString(result.error());
+    }
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        client_buffer_allocator_->deallocate(source_buffers[i],
+                                             values[i].size());
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        void* target_buffer =
+            client_buffer_allocator_->allocate(values[i].size());
+        std::vector<Slice> slices{Slice{target_buffer, values[i].size()}};
+        auto get_result = test_client_->Get(keys[i], slices);
+        ASSERT_TRUE(get_result.has_value())
+            << "Get failed: " << toString(get_result.error());
+        EXPECT_EQ(slices[0].size, values[i].size());
+        EXPECT_EQ(memcmp(slices[0].ptr, values[i].data(), values[i].size()), 0);
+        client_buffer_allocator_->deallocate(target_buffer, values[i].size());
+    }
+
+    auto remove_results = test_client_->BatchRemove(keys, /*force=*/true);
+    ASSERT_EQ(remove_results.size(), keys.size());
+    for (const auto& result : remove_results) {
+        ASSERT_TRUE(result.has_value())
+            << "BatchRemove failed: " << toString(result.error());
     }
 }
 
@@ -1732,6 +1809,40 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
         EXPECT_TRUE(r.has_value())
             << "Remove failed for " << key << ": " << toString(r.error());
     }
+}
+
+TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
+    // Allocate a small buffer for this test
+    size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    void* test_buffer = allocate_buffer_allocator_memory(test_size);
+    ASSERT_NE(test_buffer, nullptr);
+
+    // Test MountSegmentAndGetId returns a valid UUID
+    auto mount_result = test_client_->MountSegmentAndGetId(
+        test_buffer, test_size, FLAGS_protocol);
+    ASSERT_TRUE(mount_result.has_value())
+        << "MountSegmentAndGetId failed: " << toString(mount_result.error());
+    UUID segment_id = mount_result.value();
+    EXPECT_NE(segment_id.first, 0u);
+    EXPECT_NE(segment_id.second, 0u);
+
+    // Test UnmountSegmentById succeeds
+    auto unmount_result = test_client_->UnmountSegmentById(segment_id);
+    EXPECT_TRUE(unmount_result.has_value())
+        << "UnmountSegmentById failed: " << toString(unmount_result.error());
+
+    // Test MountSegment delegates to MountSegmentAndGetId (equivalent behavior)
+    auto mount2 =
+        test_client_->MountSegment(test_buffer, test_size, FLAGS_protocol);
+    EXPECT_TRUE(mount2.has_value())
+        << "MountSegment failed: " << toString(mount2.error());
+
+    // Test UnmountSegment delegates to UnmountSegmentImpl (equivalent behavior)
+    auto unmount2 = test_client_->UnmountSegment(test_buffer, test_size);
+    EXPECT_TRUE(unmount2.has_value())
+        << "UnmountSegment failed: " << toString(unmount2.error());
+
+    free(test_buffer);
 }
 
 }  // namespace testing

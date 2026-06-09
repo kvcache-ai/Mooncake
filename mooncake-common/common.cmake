@@ -1,8 +1,16 @@
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wall -Wextra -Wno-unused-parameter -fPIC")
+option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
+
+if(ENABLE_DEBUG_SYMBOLS)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g")
+endif()
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcoroutines")
@@ -59,11 +67,14 @@ add_compile_options(-fno-tree-slp-vectorize)
 option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
+option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
+option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -79,7 +90,9 @@ option(USE_UB "option for using UB protocol transport" OFF)
 if (USE_UB)
   add_compile_definitions(USE_UB)
   message(STATUS "ub transport is enabled")
+  include(${CMAKE_CURRENT_LIST_DIR}/FindUrma.cmake)
 endif()
+
 if (USE_EFA)
   # Find libfabric headers and library; default to AWS EFA installer path
   find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
@@ -108,7 +121,6 @@ option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
-option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
 option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
@@ -119,6 +131,7 @@ if (ENABLE_MULTI_PROTOCOL)
 endif()
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
+option(USE_MLX5DV "enable mlx5 direct verbs (libmlx5) for QP UDP source port override" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
 if (USE_LRU_MASTER)
@@ -173,6 +186,26 @@ if (NOT DEFINED MLU_LIB_DIR OR MLU_LIB_DIR STREQUAL "")
   set(MLU_LIB_DIR "${NEUWARE_ROOT}/lib64")
 endif()
 
+if (NOT DEFINED MACA_ROOT OR MACA_ROOT STREQUAL "")
+  if (DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
+    set(MACA_ROOT "$ENV{MACA_HOME}" CACHE PATH "Path to MACA SDK" FORCE)
+  else()
+    set(MACA_ROOT "/opt/maca" CACHE PATH "Path to MACA SDK" FORCE)
+  endif()
+endif()
+
+if (NOT DEFINED MACA_INCLUDE_DIR OR MACA_INCLUDE_DIR STREQUAL "")
+  set(MACA_INCLUDE_DIR "${MACA_ROOT}/include")
+endif()
+
+if (NOT DEFINED MACA_LIB_DIR OR MACA_LIB_DIR STREQUAL "")
+  if (EXISTS "${MACA_ROOT}/lib64")
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib64")
+  else()
+    set(MACA_LIB_DIR "${MACA_ROOT}/lib")
+  endif()
+endif()
+
 if (USE_MLU)
   add_compile_definitions(USE_MLU)
   message(STATUS "MLU support is enabled")
@@ -183,20 +216,12 @@ if (USE_MLU)
 endif()
 
 if (USE_MACA)
-  # MACA toolchain is CUDA-compatible in first-stage porting.
-  # Reuse CUDA code paths to get a runnable baseline quickly.
   add_compile_definitions(USE_MACA)
   message(STATUS "MACA support is enabled")
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
+  include_directories(${MACA_INCLUDE_DIR})
+  if (EXISTS "${MACA_LIB_DIR}")
+    link_directories(${MACA_LIB_DIR})
   endif()
-  include_directories(${MACA_HOME}/include)
-  link_directories(
-    ${MACA_HOME}/lib
-    ${MACA_HOME}/lib64
-  )
 endif()
 
 if (USE_MUSA)
@@ -206,6 +231,56 @@ if (USE_MUSA)
   link_directories(
     /usr/local/musa/lib
   )
+endif()
+
+if (USE_HYGON)
+  if (NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
+    if (DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
+      set(DTK_ROOT "$ENV{DTK_HOME}" CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    else()
+      set(DTK_ROOT "/opt/dtk" CACHE PATH "Path to Hygon DTK SDK" FORCE)
+    endif()
+  endif()
+
+  if (NOT DEFINED DTK_INCLUDE_DIR OR DTK_INCLUDE_DIR STREQUAL "")
+    set(DTK_INCLUDE_DIR "${DTK_ROOT}/cuda/cuda-11/include")
+  endif()
+
+  if (NOT DEFINED DTK_LIB_DIR OR DTK_LIB_DIR STREQUAL "")
+    set(DTK_LIB_DIR "${DTK_ROOT}/cuda/cuda-11/lib64")
+  endif()
+
+  add_compile_definitions(USE_HYGON)
+  message(STATUS "Hygon DCU/DTK support is enabled")
+  include_directories(${DTK_INCLUDE_DIR})
+  if (EXISTS "${DTK_LIB_DIR}")
+    link_directories(${DTK_LIB_DIR})
+  endif()
+endif()
+
+if (USE_COREX)
+  if (NOT DEFINED COREX_ROOT OR COREX_ROOT STREQUAL "")
+    if (DEFINED ENV{COREX_HOME} AND NOT "$ENV{COREX_HOME}" STREQUAL "")
+      set(COREX_ROOT "$ENV{COREX_HOME}" CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    else()
+      set(COREX_ROOT "/usr/local/corex" CACHE PATH "Path to Iluvatar CoreX SDK" FORCE)
+    endif()
+  endif()
+
+  if (NOT DEFINED COREX_INCLUDE_DIR OR COREX_INCLUDE_DIR STREQUAL "")
+    set(COREX_INCLUDE_DIR "${COREX_ROOT}/include")
+  endif()
+
+  if (NOT DEFINED COREX_LIB_DIR OR COREX_LIB_DIR STREQUAL "")
+    set(COREX_LIB_DIR "${COREX_ROOT}/lib")
+  endif()
+
+  add_compile_definitions(USE_COREX)
+  message(STATUS "Iluvatar CoreX support is enabled")
+  include_directories(${COREX_INCLUDE_DIR})
+  if (EXISTS "${COREX_LIB_DIR}")
+    link_directories(${COREX_LIB_DIR})
+  endif()
 endif()
 
 if (USE_HIP)
@@ -334,10 +409,6 @@ endif()
 if(USE_3FS)
   add_compile_definitions(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
-endif()
-
-if(WITH_NVIDIA_PEERMEM)
-  add_compile_definitions(WITH_NVIDIA_PEERMEM)
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")

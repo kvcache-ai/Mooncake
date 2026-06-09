@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -32,6 +33,9 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#if defined(USE_CUDA) || defined(USE_MUSA)
+#include "transport/device/device_transport.h"
+#endif
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -132,6 +136,9 @@ class TransferEngineImpl {
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
+        if (entries.empty()) {
+            return Status::InvalidArgument("entries must not be empty");
+        }
         auto target_id = entries[0].target_id;
         Status s = multi_transports_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
@@ -190,6 +197,9 @@ class TransferEngineImpl {
     Status mp_submitTransferWithNotify(
         BatchID batch_id, const std::vector<TransferRequest>& entries,
         TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+        if (entries.empty()) {
+            return Status::InvalidArgument("entries must not be empty");
+        }
         auto target_id = entries[0].target_id;
         Status s =
             multi_transports_->mp_submitTransfer(batch_id, entries, proto);
@@ -334,6 +344,15 @@ class TransferEngineImpl {
         return multi_transports_->getTransport(proto);
     }
 
+#if defined(USE_CUDA) || defined(USE_MUSA)
+    // Device transport accessors — lazily created, owned by this impl.
+    device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
+    device::RdmaTransport* getOrCreateRdmaTransport(
+        const std::vector<std::string>& device_filter = {});
+#endif
+
+    bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
+
     int syncSegmentCache(const std::string& segment_name = "") {
         return metadata_->syncSegmentCache(segment_name);
     }
@@ -377,11 +396,24 @@ class TransferEngineImpl {
         bool remote_accessible;
     };
 
+    using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
+
+    MemoryRegionMap::iterator findMemoryRegionContaining(uintptr_t addr);
+
+    MemoryRegionMap::const_iterator findMemoryRegionContaining(
+        uintptr_t addr) const;
+
+    bool hasOverlapLocked(uintptr_t addr, uint64_t length) const;
+
+    void insertMemoryRegionLocked(const MemoryRegion& region);
+
+    void eraseMemoryRegionLocked(void* addr);
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
-    std::vector<MemoryRegion> local_memory_regions_;
+    MemoryRegionMap local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
 
     RWSpinlock send_notifies_lock_;
@@ -394,6 +426,13 @@ class TransferEngineImpl {
     bool auto_discover_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+    // Device transports (P2P + IBGDA) — lazily created, owned by this impl.
+    // Referenced by EP and future CPU-proxy paths.
+    std::unique_ptr<device::P2pTransport> p2p_transport_;
+    std::unique_ptr<device::RdmaTransport> rdma_transport_;
+#endif
 
 #ifdef WITH_METRICS
     // Latency bucket in microseconds

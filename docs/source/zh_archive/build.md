@@ -16,7 +16,7 @@
      请切换安装如下 PyPI 源的 wheel 包:
      ```bash
       pip install mooncake-transfer-engine-non-cuda
-      ```
+     ```
      或者请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
 
 ## 自动安装
@@ -71,7 +71,7 @@
                    libnuma-dev \
                    libcurl4-openssl-dev \
                    libhiredis-dev
-
+    
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -95,12 +95,12 @@
     ```
 
 2. 如果你要编译Nvidia GPUDirect 支持模块，首先需按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的指引安装 CUDA (确保启用 `nvidia-fs` 以正确编译 `cuFile` 模块)。之后:
-    1) 按照 https://docs.nvidia.com/cuda/gpudirect-rdma/ 的第 3.7 节说明安装 `nvidia-peermem` 以启用 GPU-Direct RDMA
-    2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
+    1) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
+    > **注意：** Mooncake 可以使用 DMA-BUF 路径进行 GPU-Direct RDMA，**无需** `nvidia-peermem` 内核模块。如需使用 DMA-BUF 路径，请在启动 Mooncake 前设置运行时环境变量 `WITH_NVIDIA_PEERMEM=0`。如果偏好依赖 `nvidia-peermem` 的传统 `ibv_reg_mr` 路径，请设置运行时环境变量 `WITH_NVIDIA_PEERMEM=1`。安装 `nvidia-peermem` 的说明见 https://docs.nvidia.com/cuda/gpudirect-rdma/ 第 3.7 节。
 
 3. 如果你要编译Moore Threads GPUDirect RDMA 支持模块，首先需按照 https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide 的指引安装 MUSA SDK。之后:
     1) 安装 `mthreads-peermem` 以启用 GPU-Direct RDMA
@@ -132,15 +132,32 @@
     make -j
     ```
 
-5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_HOME`（未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`；CMake 会同时搜索 `${MACA_HOME}/lib` 与 `${MACA_HOME}/lib64`，建议在环境变量中也同时加入两者，避免链接或运行时找不到共享库：
+5. 若需编译沐曦 MetaX MACA 支持（如 C500），请安装 MACA SDK，使头文件与库位于 `MACA_ROOT`（优先取 `MACA_HOME` 环境变量，未设置时默认 `/opt/maca`）。不同安装包可能把库放在 `lib` 或 `lib64`，建议在环境变量中同时加入两者，避免链接或运行时找不到共享库：
     ```bash
     export MACA_HOME=/opt/maca
     export LIBRARY_PATH=$LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${MACA_HOME}/lib:${MACA_HOME}/lib64
     ```
-    使用 `-DUSE_MACA=ON` 配置构建。如需覆盖默认链接的运行库，可在配置阶段传入 CMake 列表，例如 `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔）。该变量在 **`mooncake-transfer-engine/src/CMakeLists.txt`** 的 `if(USE_MACA)` 中用于 `target_link_libraries`，**不在** `mooncake-common/common.cmake` 中。
+    使用 `-DUSE_MACA=ON` 配置构建。可选覆盖项：
+    - `-DMACA_ROOT=/path/to/maca`
+    - `-DMACA_INCLUDE_DIR=/path/to/maca/include`
+    - `-DMACA_LIB_DIR=/path/to/maca/lib64`
+    - `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`（分号分隔的 CMake 列表）
 
-6. 安装 yalantinglibs
+6. 若需编译华为 Ascend NPU 支持，请先按照 https://www.hiascend.com/document 的指引安装 Ascend CANN Toolkit。之后：
+    1) 在 CANN 安装目录下执行 `source set_env.sh` 配置编译环境（无需手动设置 `ASCEND_HOME_PATH` 等环境变量）。
+    2) Mooncake 提供两种 Ascend NPU 传输路径，按需选择其中一个：
+       - `-DUSE_ASCEND_DIRECT=ON`（**推荐**）：基于 ADXL 引擎的 Ascend Direct 传输（[版本配套关系参考](https://gitcode.com/cann/hixl/wiki/Mooncake%20+%20HIXL%20%E5%BF%AB%E9%80%9F%E4%B8%8A%E6%89%8B%E6%8C%87%E5%8D%97.md)）。
+       - `-DUSE_UBSHMEM=ON`：基于 CANN VMM接口传输（CANN版本 >= 9.0.0 、驱动版本 >= 26.0.0、灵衢版本 >= 1.5）
+
+    启用 Ascend NPU 编译示例：
+    ```bash
+    source /usr/local/Ascend/cann/set_env.sh
+    cmake .. -DUSE_ASCEND_DIRECT=ON
+    make -j
+    ```
+
+7. 安装 yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -150,7 +167,7 @@
     make install
     ```
 
-7. 进入项目根目录，运行下列命令进行编译
+8. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
@@ -158,7 +175,7 @@
    make -j
    ```
 
-8. 安装 Mooncake python 包和 mooncake_master 可执行文件
+9. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
    make install
    ```
@@ -167,15 +184,26 @@
 在执行 `cmake ..` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
 - `-DUSE_MUSA=[ON|OFF]`: 通过 MUSA 启用对摩尔线程 GPU 的支持
-- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持（`MACA_HOME` 指向 SDK 根目录，默认 `/opt/maca`；可选 `-DMACA_RUNTIME_LIBS` 覆盖 `transfer_engine` 默认链接库，见 `mooncake-transfer-engine/src/CMakeLists.txt`）
+- `-DUSE_MACA=[ON|OFF]`: 通过 MACA 启用对沐曦 MetaX GPU 的支持。
+- `-DMACA_ROOT=/path/to/maca`: 覆盖 MACA SDK 根路径（也支持 `MACA_HOME` 环境变量，默认 `/opt/maca`）。
+- `-DMACA_INCLUDE_DIR=/path/to/include`: 在 `-DUSE_MACA=ON` 时覆盖 MACA 头文件目录。
+- `-DMACA_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MACA=ON` 时覆盖 MACA 库目录。
+- `-DMACA_RUNTIME_LIBS="mcruntime;mxc-runtime64;rt"`: 覆盖 `transfer_engine` 链接的 MACA 运行时库列表。
 - `-DUSE_MLU=[ON|OFF]`: 通过 Neuware 启用寒武纪 MLU 显存支持。默认 OFF；支持 MLU 显存探测、拓扑发现及 Transfer Engine 的 RDMA 注册。
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
+- `-DUSE_HYGON=[ON|OFF]`: 通过 DTK SDK 启用对海光 DCU 的支持。默认 OFF；使用 CUDA 兼容运行时。
+- `-DDTK_ROOT=/path/to/dtk`: 在 `-DUSE_HYGON=ON` 时覆盖默认 DTK SDK 根路径；未设置时使用 `DTK_HOME` 或 `/opt/dtk`。
+- `-DDTK_INCLUDE_DIR=/path/to/include` / `-DDTK_LIB_DIR=/path/to/lib64`: 在 `-DUSE_HYGON=ON` 时覆盖 DTK 头文件与库目录。
+- `-DUSE_COREX=[ON|OFF]`: 启用对天数智芯 CoreX GPU 的支持。默认 OFF；使用 CUDA 兼容运行时。
+- `-DCOREX_ROOT=/path/to/corex`: 在 `-DUSE_COREX=ON` 时覆盖默认 CoreX SDK 根路径；未设置时使用 `COREX_HOME` 或 `/usr/local/corex`。
+- `-DCOREX_INCLUDE_DIR=/path/to/include` / `-DCOREX_LIB_DIR=/path/to/lib`: 在 `-DUSE_COREX=ON` 时覆盖 CoreX 头文件与库目录。
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
 - `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+
-- `-DWITH_WITH_RUST_EXAMPLE=[ON|OFF]`: 启用 Rust 支持
+- `-DWITH_RUST_EXAMPLE=[ON|OFF]`: 编译 Transfer Engine Rust 接口与示例代码，默认关闭。
+- `-DWITH_STORE_RUST=[ON|OFF]`: 编译 Mooncake Store Rust 绑定和 CMake Rust targets，默认开启。
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
 - `-DUSE_ETCD=[ON|OFF]`: 启用基于 etcd 的元数据服务，需要 go 1.23+
@@ -183,7 +211,8 @@
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
-- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 通过 ADXL 引擎启用 Ascend Direct 传输及 HCCS 支持（**NPU 推荐方式**）
+- `-DUSE_UBSHMEM=[ON|OFF]`: 通过 CANN VMM API 启用华为 Ascend NPU 共享内存传输
 - `-DUSE_MUSA=[ON|OFF]`: 启用Moore Threads GPUDirect RDMA
 
 ## 在 Docker 容器中使用 Mooncake

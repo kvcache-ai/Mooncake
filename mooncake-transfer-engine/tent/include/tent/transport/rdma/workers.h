@@ -16,6 +16,7 @@
 #define TENT_WORKERS_H
 
 #include <future>
+#include <memory>
 #include <queue>
 #include <thread>
 #include <unordered_set>
@@ -28,11 +29,14 @@
 #include "rail_monitor.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/concurrent/bounded_mpsc_queue.h"
+#include "tent/common/types.h"
 
 namespace mooncake {
 namespace tent {
 
 class RdmaTransport;
+class DeviceSelector;
+
 class Workers {
    public:
     static constexpr size_t kCapacity = 1024 * 8;
@@ -52,6 +56,8 @@ class Workers {
     Status submit(RdmaSliceList &slice_list, int worker_id = -1);
 
     Status cancel(RdmaSliceList &slice_list);
+
+    DeviceSelector *getDeviceSelector() const { return device_selector_.get(); }
 
    private:
     using Task = std::function<void()>;
@@ -175,9 +181,11 @@ class Workers {
         PerfMetric inflight_lat;
     };
 
+    static constexpr int kNumPriorityLevels = PRIO_LOW + 1;
+
     struct WorkerContext {
         std::thread thread;
-        BoundedSliceQueue queue;
+        BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
         std::unordered_set<RdmaSlice *> inflight_slice_set;
         std::atomic<int64_t> inflight_slices = 0;
@@ -186,15 +194,25 @@ class Workers {
         std::condition_variable cv;
         volatile bool in_suspend = false;
 
-        std::unordered_map<std::string, RailMonitor> rails;
+        // Next time to check for priority promotions (nanoseconds)
+        uint64_t next_promotion_check_ns = 0;
+
+        // Values are held via unique_ptr so that map rehashing does not
+        // invalidate pointers into RailMonitor stored on in-flight slices
+        // (see RdmaSlice::rail_monitor).
+        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
-        uint64_t padding[16];
+        uint64_t padding[15];
     };
+
+    // Promote timed-out low priority requests to higher priority queues
+    void promoteTimedOutRequests(WorkerContext &worker);
 
     WorkerContext *worker_context_;
     uint64_t slice_timeout_ns_;
+    uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
 
-    std::unique_ptr<DeviceQuota> device_quota_;
+    std::unique_ptr<DeviceSelector> device_selector_;
     bool always_tier1_ = false;
 };
 }  // namespace tent

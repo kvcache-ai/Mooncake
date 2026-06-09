@@ -37,6 +37,10 @@
 #include "tent/transport/ascend/ascend_direct_transport.h"
 #endif
 
+#ifdef USE_SUNRISE
+#include "tent/transport/sunrise_link/sunrise_link_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -80,6 +84,13 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/ascend_direct/enable", true)) {
         transport_list_[AscendDirect] =
             std::make_shared<AscendDirectTransport>();
+    }
+#endif
+
+#ifdef USE_SUNRISE
+    if (conf_->get("transports/sunrise_link/enable", true)) {
+        transport_list_[SUNRISE_LINK] =
+            std::make_shared<SunriseLinkTransport>();
     }
 #endif
 

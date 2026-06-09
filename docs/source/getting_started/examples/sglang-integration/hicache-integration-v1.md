@@ -6,22 +6,6 @@ This document describes how to use Mooncake as the storage backend for SGLang Hi
 
 ## Introduction
 
-### About Mooncake
-
-Mooncake aims to enhance the inference efficiency of large language models (LLMs), especially in slow object storage environments, by constructing a multi-level caching pool on high-speed interconnected DRAM/SSD resources. Compared to traditional caching systems, Mooncake utilizes (GPUDirect) RDMA technology to transfer data directly in a zero-copy manner, while maximizing the use of multi-NIC resources on a single machine.
-
-For more details about Mooncake, please refer to [Mooncake project](https://github.com/kvcache-ai/Mooncake) and [Mooncake documents](https://kvcache-ai.github.io/Mooncake/).
-
-### About SGLang HiCache
-
-SGLang HiCache is a hierarchical KV caching system that extends SGLang's RadixAttention with advanced multi-tier memory management capabilities. It implements a scalable hierarchical storage architecture that spans GPU memory, CPU memory, and external storage layers, delivering significant performance improvements for large language model inference.
-
-HiCache introduces a **HiRadixTree** that acts as a page table for referencing KV caches across different memory tiers: **GPU Memory (L1)**, **CPU Memory (L2)**, **Mooncake and other Storage Backends (L3)**.
-
-The system includes an intelligent cache controller that automatically manages data movement between tiers, implementing optimized prefetching strategies and multiple write policies (write-through, write-through-selective, and write-back).
-
-For more details about SGLang HiCache, please refer to [HiCache system design document](https://docs.sglang.ai/advanced_features/hicache_design.html) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
-
 ### Mooncake & SGLang HiCache
 
 Mooncake serves as a high-performance L3 storage backend for SGLang HiCache, enabling distributed KV cache storage across multiple servers with RDMA-accelerated data transfer. This integration addresses the capacity limitations of traditional GPU-only or GPU+CPU caching by providing virtually unlimited cache storage through a distributed memory pool.
@@ -42,21 +26,26 @@ This integration is particularly valuable for production deployments involving l
 
 ### Install SGLang
 
-1. Clone SGLang from official repo
+It is recommended to use uv for faster installation:
 
 ```bash
-git clone git@github.com:sgl-project/sglang.git
-```
-
-2. Build
-
-```bash
-cd sglang
 pip install --upgrade pip
-pip install -e "python[all]"
+pip install uv
+uv pip install sglang
 ```
 
-For more details, please refer to [SGLang official installation guide](https://docs.sglang.ai/get_started/install.html).
+The major version of Cuda is 13 by default. To install sglang under Cuda 12 with pip or uv, please try the following commands:
+
+```bash
+pip install --upgrade pip
+pip install uv
+uv pip install sglang
+uv pip install --force-reinstall  torch==2.11.0 torchaudio==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu129
+uv pip install --force-reinstall sglang-kernel --index-url https://docs.sglang.ai/whl/cu129/
+uv pip install --force-reinstall sgl-deep-gemm --index-url https://docs.sglang.ai/whl/cu129/ --no-deps
+```
+
+See the [SGLang official compilation guide](https://docs.sglang.ai/start/install.html) if you encounter issues.
 
 ### Install Mooncake
 
@@ -66,37 +55,7 @@ For more details, please refer to [SGLang official installation guide](https://d
 pip install mooncake-transfer-engine
 ```
 
-**Method 2: from source**
-
-Clone Mooncake project:
-
-```bash
-git clone https://github.com/kvcache-ai/Mooncake --recursive
-```
-
-Install dependencies:
-
-```bash
-cd Mooncake
-bash dependencies.sh
-```
-
-Build the project:
-
-```bash
-mkdir build
-cd build
-cmake ..
-make -j
-```
-
-Install Mooncake:
-
-```bash
-sudo make install
-```
-
-For more details, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
+If you want to build from source or using some other advanced features which not contained in prebuilt pip package, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ## Deployment
 
@@ -365,54 +324,12 @@ python -m sglang.launch_server \
 
 ### Prefill/Decode Disaggregation
 
-In **PD disaggregation**, the configurations for the `metadata service`, `mooncake master`, and the optional `store service` remain the same as described above. The difference is that SGLang introduces three distinct roles: `prefill worker`, `decode worker`, and `router`.
+Mooncake HiCache works with SGLang's **PD disaggregation** mode. The `master service`, `metadata service`, and optional `store service` configurations are the same as described above.
 
-Among these, the `prefill worker` supports enabling **HiCache**. To run with PD disaggregation, start from the [PD configuration](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration-v1.html), and add the HiCache-related parameters (as previously described for the `SGLang server`) to the `prefill worker`.
+1. Follow the [PD Disaggregation Guide](../sglang-integration-v1) to set up the prefill, decode, and router workers.
+2. Add the HiCache-related parameters (`--enable-hierarchical-cache`, `--hicache-storage-backend mooncake`, `--hicache-storage-prefetch-policy`, etc.) to the **prefill worker** only, as described in the HiCache sections above.
 
-In the example below, one `prefill worker`, one `decode worker`, and one `router` are launched. HiCache is enabled on the `prefill worker` to optimize prefill performance.
-
-**Prefill worker**:
-
-```bash
-MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="mlx5_1" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
-python -m sglang.launch_server \
-    --model-path [model_path] \
-    --page-size 64 \
-    --enable-hierarchical-cache \
-    --hicache-storage-prefetch-policy timeout \
-    --hicache-storage-backend mooncake \
-    --disaggregation-mode prefill \
-    --disaggregation-ib-device "mlx5_1" \
-    --base-gpu-id 0 \
-    --port 30000
-```
-
-**Decode worker**:
-
-```bash
-python -m sglang.launch_server \
-    --model-path [model_path] \
-    --page-size 64 \
-    --disaggregation-mode decode \
-    --disaggregation-ib-device "mlx5_1" \
-    --base-gpu-id 1 \
-    --port 30001
-```
-
-**Router**:
-
-```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill "http://127.0.0.1:30000" \
-    --decode "http://127.0.0.1:30001" \
-    --host 0.0.0.0 \
-    --port 8000
-```
+The Mooncake and HiCache configuration (environment variables or JSON config) is applied identically to the prefill worker — no changes are needed on the decode worker or router.
 
 ## Troubleshooting
 
@@ -428,6 +345,72 @@ When using HiCache, the default L2 host DRAM (CPU memory) size for KV cache is *
 If the model is small but the GPU memory is large — especially in multi-TP (tensor parallel) setups — this may cause the L1 KV cache to become very large, which in turn can consume excessive CPU DRAM.
 
 In such cases, you should manually configure an appropriate L2 cache size based on your hardware. This can be done by setting `--hicache-ratio` or `--hicache-size`.
+
+**HugeTLB Bring-up Checklist:**
+
+Before enabling HugeTLB-backed HiCache memory, size the host's hugepage pool against your planned `--hicache-size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`, and `MC_MMAP_ARENA_POOL_SIZE` values.
+
+From a source checkout:
+
+```bash
+python3 scripts/check_hicache_hugepage_requirements.py \
+    --tp-size 4 \
+    --hicache-size 64gb \
+    --global-segment-size 8gb \
+    --arena-pool-size 56gb \
+    --available-hugetlb 512gb
+```
+
+From the source-built Docker image:
+
+```bash
+mooncake-hicache-sizing \
+    --tp-size 4 \
+    --hicache-size 64gb \
+    --global-segment-size 8gb \
+    --arena-pool-size 56gb
+```
+
+The `64gb` / `56gb` values above are tuned examples for large multi-GPU HiCache deployments, not defaults. Arena enablement remains opt-in, and the default pool is `8gb` only when you enable the arena via gflag without an explicit env override. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper.
+
+The helper reports two numbers:
+
+* **Baseline floor** = `hicache-size + MOONCAKE_GLOBAL_SEGMENT_SIZE` per rank. Falling below this usually means startup or allocation failure.
+* **Clean arena target** = baseline floor + `MC_MMAP_ARENA_POOL_SIZE` per rank. Reaching this target makes arena-backed launches less likely to spill onto the regular-page fallback path.
+
+Treat the helper as a planning tool rather than a hard proof: runs can still succeed between the baseline floor and the clean arena target if some arena allocations fall back to regular pages.
+
+Reserve HugeTLB pages on the host before launching SGLang:
+
+```bash
+sudo sysctl -w vm.nr_hugepages=262144
+grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+```
+
+With `2 MiB` pages, `262144` pages equals `512 GiB`; `49152` pages equals `96 GiB`. Persist the setting with `/etc/sysctl.d/90-mooncake-hugepages.conf` if you need it across reboots.
+
+**Memory Allocator Tuning:**
+
+Mooncake's mmap arena is opt-in for HiCache host KV allocations. Setting `MC_MMAP_ARENA_POOL_SIZE` explicitly enables the arena and sizes the pool; the arena then pre-allocates a hugepage-backed pool and serves subsequent allocations via atomic bump pointer, reducing per-allocation latency from ~1000ns to ~50ns. The `56gb` example below is a benchmark-scale tuning value, not the allocator default.
+
+For HugeTLB-backed runs, export the hugepage and allocator settings together:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+export MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb
+export MC_MMAP_ARENA_POOL_SIZE=56gb
+```
+
+To disable the arena and fall back to direct `mmap()` while keeping the hugepage-backed baseline path, set the flag before the first Mooncake mmap-buffer allocation in the process:
+
+```bash
+export MC_DISABLE_MMAP_ARENA=1
+```
+
+Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. If `MC_STORE_USE_HUGEPAGE=1` is set, Mooncake treats hugepages as a hard requirement for both the arena path and the direct-`mmap()` baseline path. It will not silently retry those host-buffer allocations on regular pages.
+
+If the helper reports `baseline_fits_arena_may_fallback`, either increase `vm.nr_hugepages` or reduce `MC_MMAP_ARENA_POOL_SIZE`. For containerized launches, pass the same environment variables through `docker run -e ...` and use `--ipc=host --ulimit memlock=-1 --shm-size=128g`.
 
 **More Information:**
 

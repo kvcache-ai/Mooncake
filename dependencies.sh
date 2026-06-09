@@ -23,7 +23,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.23.8
+GOVER=1.25.9
 
 # Function to print section headers
 print_section() {
@@ -48,23 +48,43 @@ check_success() {
     fi
 }
 
+# Function to detect OS
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+        OS_VERSION=$VERSION_ID
+    elif [ -f /etc/redhat-release ]; then
+        OS="centos"
+    else
+        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, and openEuler."
+    fi
+
+    echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
+}
+
 if [ $(id -u) -ne 0 ]; then
 	print_error "Require root permission, try sudo ./dependencies.sh"
 fi
 
 # Parse command line arguments
 SKIP_CONFIRM=false
+INSTALL_SPDK=false
 for arg in "$@"; do
     case $arg in
         -y|--yes)
             SKIP_CONFIRM=true
             ;;
+        --with-spdk)
+            INSTALL_SPDK=true
+            ;;
         -h|--help)
             echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
             echo -e "Usage: ./dependencies.sh [OPTIONS]"
             echo -e "\nOptions:"
-            echo -e "  -y, --yes    Skip confirmation and install all dependencies"
-            echo -e "  -h, --help   Show this help message and exit"
+            echo -e "  -y, --yes       Skip confirmation and install all dependencies"
+            echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  -h, --help      Show this help message and exit"
             exit 0
             ;;
     esac
@@ -77,6 +97,9 @@ echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
 echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
 echo -e "  - Go $GOVER"
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "  - SPDK (for NVMe-oF support)"
+fi
 echo
 
 # Ask for confirmation unless -y flag is used
@@ -89,51 +112,97 @@ if [ "$SKIP_CONFIRM" = false ]; then
     fi
 fi
 
+# Detect OS
+detect_os
 
 # Update package lists
 print_section "Updating package lists"
-apt-get update
-check_success "Failed to update package lists"
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    apt-get update
+    check_success "Failed to update package lists"
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "openeuler" ]; then
+    yum clean all
+    yum makecache
+    check_success "Failed to update package lists"
+else
+    print_error "Unsupported OS: $OS"
+fi
 
 # Install system packages
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
-SYSTEM_PACKAGES="build-essential \
-                  cmake \
-                  ninja-build \
-                  git \
-                  wget \
-                  unzip \
-                  libibverbs-dev \
-                  libgoogle-glog-dev \
-                  libgtest-dev \
-                  libjsoncpp-dev \
-                  libunwind-dev \
-                  libnuma-dev \
-                  libpython3-dev \
-                  libboost-all-dev \
-                  libssl-dev \
-                  libgrpc-dev \
-                  libgrpc++-dev \
-                  libprotobuf-dev \
-                  libyaml-cpp-dev \
-                  protobuf-compiler-grpc \
-                  libcurl4-openssl-dev \
-                  libhiredis-dev \
-                  liburing-dev \
-                  libjemalloc-dev \
-                  libmsgpack-dev \
-                  libzstd-dev \
-                  libasio-dev \
-                  libxxhash-dev \
-                  pkg-config \
-                  patchelf \
-                  libc6-dev \
-                  libc-bin"
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    SYSTEM_PACKAGES="build-essential \
+                     cmake \
+                     ninja-build \
+                     git \
+                     wget \
+                     unzip \
+                     libibverbs-dev \
+                     libgoogle-glog-dev \
+                     libgtest-dev \
+                     libjsoncpp-dev \
+                     libunwind-dev \
+                     libnuma-dev \
+                     libpython3-dev \
+                     libboost-all-dev \
+                     libssl-dev \
+                     libgrpc-dev \
+                     libgrpc++-dev \
+                     libprotobuf-dev \
+                     libyaml-cpp-dev \
+                     protobuf-compiler-grpc \
+                     libcurl4-openssl-dev \
+                     libhiredis-dev \
+                     liburing-dev \
+                     libjemalloc-dev \
+                     libmsgpack-dev \
+                     libzstd-dev \
+                     libasio-dev \
+                     libxxhash-dev \
+                     pkg-config \
+                     patchelf \
+                     libc6-dev \
+                     libc-bin"
 
-apt-get install -y $SYSTEM_PACKAGES
-check_success "Failed to install system packages"
+    apt-get install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "openeuler" ]; then
+    SYSTEM_PACKAGES="@development \
+                     cmake \
+                     git \
+                     wget \
+                     rdma-core-devel \
+                     glog-devel \
+                     gtest-devel \
+                     jsoncpp-devel \
+                     libunwind-devel \
+                     numactl-devel \
+                     python3-devel \
+                     boost-devel \
+                     openssl-devel \
+                     grpc-devel \
+                     protobuf-devel \
+                     yaml-cpp-devel \
+                     grpc-plugins \
+                     libcurl-devel \
+                     hiredis-devel \
+                     liburing-devel \
+                     jemalloc-devel \
+                     pkgconf-pkg-config \
+                     elfutils-libelf-devel \
+                     patchelf  \
+                     xxhash-devel \
+                     libbsd-devel"
+
+    yum install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+else
+    print_error "Unsupported OS: $OS"
+fi
+
 print_success "System packages installed successfully"
 
 # Initialize and update git submodules
@@ -185,15 +254,16 @@ cd "${REPO_ROOT}"
 print_section "Verifying essential build tools"
 
 # Verify getconf and ldd (required for glibc version detection in build_wheel.sh)
-# Both are provided by libc-bin, which is included in SYSTEM_PACKAGES
-if ! command -v getconf >/dev/null 2>&1; then
-    print_error "getconf not found after installing system packages. This should not happen."
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    if ! command -v getconf >/dev/null 2>&1; then
+        print_error "getconf not found after installing system packages. This should not happen."
+    fi
+    if ! command -v ldd >/dev/null 2>&1; then
+        print_error "ldd not found after installing system packages. This should not happen."
+    fi
+    print_success "getconf found: $(getconf --version 2>&1 | head -1)"
+    print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 fi
-if ! command -v ldd >/dev/null 2>&1; then
-    print_error "ldd not found after installing system packages. This should not happen."
-fi
-print_success "getconf found: $(getconf --version 2>&1 | head -1)"
-print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 
 print_section "Installing Go $GOVER"
 
@@ -224,8 +294,6 @@ install_go() {
         echo "Downloading Go $GOVER from ${url}..."
         if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
             DOWNLOAD_SUCCESS=true
-            # If the official source (go.dev) failed and we fell back to a CN mirror,
-            # it likely means the network has restricted access to international sites.
             if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
                 USED_CN_MIRROR=true
             fi
@@ -241,19 +309,16 @@ install_go() {
         print_error "Failed to download Go $GOVER from all mirrors"
     fi
 
-    # Install Go
     echo "Installing Go $GOVER..."
     tar -C /usr/local -xzf "${GO_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
-    # Clean up downloaded file
     rm -f "${GO_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"
 }
 
-# Check if Go is already installed
 if command -v go &> /dev/null; then
     GO_VERSION=$(go version | awk '{print $3}')
     if [[ "$GO_VERSION" == "go$GOVER" ]]; then
@@ -273,8 +338,7 @@ if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
     echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
 fi
 
-# Set GOPROXY only if Go download fell back to a CN mirror, indicating restricted
-# network access to international sites. Skip if user already configured GOPROXY.
+# Set GOPROXY only if Go download fell back to a CN mirror
 if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
     export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
     echo -e "${YELLOW}Detected restricted network (Go was downloaded from a CN mirror).${NC}"
@@ -285,6 +349,69 @@ if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
     fi
 elif [ -n "$GOPROXY" ]; then
     echo -e "${GREEN}GOPROXY already set to: ${GOPROXY}${NC}"
+fi
+
+# Install SPDK if requested
+if [ "$INSTALL_SPDK" = true ]; then
+    print_section "Installing SPDK"
+
+    cd "${REPO_ROOT}/extern"
+    check_success "Failed to change to extern directory"
+
+    # Remove existing SPDK if present
+    if [ -d "spdk" ]; then
+        echo -e "${YELLOW}SPDK directory already exists. Removing for fresh install...${NC}"
+        rm -rf spdk
+        check_success "Failed to remove existing SPDK directory"
+    fi
+
+    # Clone SPDK
+    echo "Cloning SPDK from ${GITHUB_PROXY}/spdk/spdk.git..."
+    git clone ${GITHUB_PROXY}/spdk/spdk.git
+    check_success "Failed to clone SPDK"
+
+    cd spdk
+    check_success "Failed to change to SPDK directory"
+
+    # Checkout specific version
+    echo "Checking out SPDK version v23.01.1..."
+    git checkout v23.01.1
+    check_success "Failed to checkout SPDK version v23.01.1"
+
+    # Initialize submodules
+    echo "Initializing SPDK submodules..."
+    git submodule update --init
+    check_success "Failed to initialize SPDK submodules"
+
+    # Install SPDK dependencies
+    echo "Installing SPDK dependencies..."
+    ./scripts/pkgdep.sh
+    check_success "Failed to install SPDK dependencies"
+
+    # Configure SPDK with RDMA support
+    echo "Configuring SPDK with RDMA support..."
+    ./configure --with-rdma
+    check_success "Failed to configure SPDK"
+
+    # Build SPDK
+    echo "Building SPDK (using $(nproc) cores)..."
+    make -j$(nproc)
+    check_success "Failed to build SPDK"
+
+    # Install SPDK
+    echo "Installing SPDK..."
+    make install
+    check_success "Failed to install SPDK"
+
+    # Copy DPDK libraries to system library path
+    if ls dpdk/build/lib/*.a >/dev/null 2>&1; then
+        echo "Copying DPDK libraries to /usr/local/lib..."
+        cp dpdk/build/lib/*.a /usr/local/lib/
+        check_success "Failed to copy DPDK libraries"
+    fi
+
+    print_success "SPDK installed successfully"
+    cd "${REPO_ROOT}"
 fi
 
 # Return to the repository root
@@ -298,6 +425,13 @@ echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} yalantinglibs"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+fi
 echo
 echo -e "You can now build and run Mooncake."
 echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
+
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "${YELLOW}Note: SPDK requires hugepages and RDMA configuration. Please refer to SPDK documentation for setup.${NC}"
+fi

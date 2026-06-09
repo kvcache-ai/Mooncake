@@ -55,6 +55,14 @@ class MultiTransport {
 
     Transport *getTransport(const std::string &proto);
 
+    /**
+     * @brief Check if TCP is the only installed transport.
+     *
+     * When only TCP transport is available (no RDMA, NVLink, etc.),
+     * local memcpy is preferred over TCP loopback for same-host transfers.
+     */
+    bool isTcpOnly() const;
+
     std::vector<Transport *> listTransports();
 
     void *getBaseAddr();

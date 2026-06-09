@@ -1,19 +1,28 @@
 #ifndef MOONCAKE_WORKER_CUH
 #define MOONCAKE_WORKER_CUH
 
+#if !defined(__MUSA__)
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-#include <torch/torch.h>
+#include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+#else
+// MUSA device compilation: minimal includes to avoid mcc compiler crash
+#include <cstddef>
+#include <cstdint>
+#endif
+
+#include <cuda_alike.h>
 #include <transfer_engine.h>
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace mooncake {
 
@@ -23,38 +32,47 @@ static constexpr size_t kMaxNumRanks = 64;
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
         warmup_buffer[2];
-    uint64_t p2p_send_buffer;
-    uint64_t p2p_recv_buffer;
-    uint64_t p2p_ctrl_send;
-    uint64_t p2p_ctrl_recv;
+    uint64_t p2p_credit_region;
+    uint64_t p2p_ack_region;
 };
 
 struct TransferGroupMeta {
     int rank;
-    int size;
+    int size;        // capacity: number of slots allocated (incl. inactive)
+    int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
     bool* activeRanks;
     bool* activeRanksDevice;
+#if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
+#endif
     bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
+#if !defined(__MUSA__)
     c10::intrusive_ptr<::c10d::Store> store;
+#endif
     int bufferBaseIndex;
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
 };
 
-__global__ struct Task {
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+    struct Task {
     volatile bool active = false;
-    c10d::OpType opType = c10d::OpType::UNKNOWN;
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
     size_t tensorSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
+    uint64_t submitSequence = 0;
     BatchID batchID;
     void* transferGroupMeta;
 };
 
+#if !defined(__MUSA__)
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
@@ -64,6 +82,12 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 void preloadReduceKernels();
 
 class ConnectionContext;
+
+struct CudaTaskSubmissionToken {
+    size_t task_id;
+    uint64_t sequence;
+};
+
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
@@ -82,11 +106,11 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& stream,
-        const std::function<void(void* dst, size_t pos, size_t realSize)>&
-            tensorToBuffer,
-        const std::function<void(void* src, size_t pos, size_t realSize)>&
-            bufferToTensor);
+        const at::cuda::CUDAStream& issue_stream,
+        const std::function<void(void* dst, size_t pos, size_t realSize,
+                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
+        const std::function<void(void* src, size_t pos, size_t realSize,
+                                 const at::cuda::CUDAStream&)>& bufferToTensor);
 
     void Start();
 
@@ -104,6 +128,10 @@ class MooncakeWorker {
      */
     bool drainTasks(const TransferGroupMeta* meta) const;
 
+    bool waitUntilTasksSubmitted(
+        const std::vector<CudaTaskSubmissionToken>& tasks,
+        std::chrono::milliseconds timeout) const;
+
    private:
     void startWorker();
 
@@ -112,7 +140,7 @@ class MooncakeWorker {
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
-    bool running_ = false;
+    std::atomic<bool> running_{false};
     std::atomic<bool> started_{false};
     int cuda_device_index_;
 
@@ -122,6 +150,8 @@ class MooncakeWorker {
 
     int cpuTaskCount = 0;
     int cudaTaskCount = 0;
+    std::atomic<uint64_t> next_cuda_task_sequence_{1};
+    std::atomic<uint64_t> submitted_task_sequence_[kNumTasks_]{};
 
     std::thread worker_thread_;
 };
@@ -145,6 +175,7 @@ class MooncakeWorkerManager {
     // detached threads must not outlive the MooncakeWorker object.
     std::unordered_map<int, std::shared_ptr<MooncakeWorker>> workers_;
 };
+#endif  // !defined(__MUSA__)
 
 }  // namespace mooncake
 

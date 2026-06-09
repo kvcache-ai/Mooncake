@@ -10,6 +10,10 @@ The HTTP service serves multiple purposes:
 - **Data Inspection**: Examine stored objects and their replicas
 - **Health Checks**: Service availability and status verification
 
+The Python `mooncake.mooncake_store_service` module also provides a lightweight
+Store REST API for data operations and standalone segment mount/unmount
+workflows. Unless configured otherwise, it listens on port `8080`.
+
 ## HTTP Endpoints
 
 ### Metrics Endpoints
@@ -54,7 +58,7 @@ curl "http://localhost:8080/query_key?key=my_object"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "transport_endpoint_": "hostname:port",
   "buffer_descriptors": [...]
@@ -75,7 +79,7 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "success": true,
   "data": {
@@ -142,6 +146,57 @@ Used(bytes): 1073741824
 Capacity(bytes): 4294967296
 ```
 
+#### `/get_segments_detail`
+Get detailed information of all segments in JSON format, including segment metadata, allocator usage, and status.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object containing an array of segment details
+
+**Example**:
+```bash
+curl http://localhost:8080/get_segments_detail
+```
+
+**Response Format**:
+```json
+{
+  "total_segments": 2,
+  "segments": [
+    {
+      "segment_name": "segment_0",
+      "segment_id": "00000000-0000-0000-0000-000000000001",
+      "client_id": "00000000-0000-0000-0000-000000000002",
+      "base_address": "0x300000000",
+      "size_bytes": 17179869184,
+      "size_human": "16 GiB",
+      "te_endpoint": "192.168.1.1:12345",
+      "protocol": "rdma",
+      "status": "MOUNTED",
+      "allocator_used_bytes": 1073741824,
+      "allocator_capacity_bytes": 17179869184,
+      "allocator_usage_percent": 6.25
+    }
+  ]
+}
+```
+
+**Fields**:
+- `total_segments` (integer): Total number of segments in the cluster
+- `segments` (array): Array of segment detail objects
+  - `segment_name` (string): Name of the segment
+  - `segment_id` (string): UUID of the segment
+  - `client_id` (string): UUID of the client that owns the segment
+  - `base_address` (string): Base memory address in hex
+  - `size_bytes` (integer): Segment size in bytes
+  - `size_human` (string): Human-readable segment size
+  - `te_endpoint` (string): Transport endpoint address
+  - `protocol` (string): Transfer protocol (e.g., rdma, tcp)
+  - `status` (string): Current segment status
+  - `allocator_used_bytes` (integer): Bytes currently allocated
+  - `allocator_capacity_bytes` (integer): Total allocator capacity in bytes
+  - `allocator_usage_percent` (number): Percentage of allocator capacity used
+
 ### Health Check Endpoints
 
 #### `/health`
@@ -159,3 +214,183 @@ Basic health check endpoint for service availability verification.
 curl http://localhost:8080/health
 ```
 
+## Store REST API Endpoints
+
+The following endpoints are served by the Python store REST service, which wraps
+`MooncakeDistributedStore` with an aiohttp service. The HTTP handlers live in
+Python, while mount and unmount operations are delegated to the underlying store
+binding. Start the service with:
+
+```bash
+python -m mooncake.mooncake_store_service \
+  --config /path/to/mooncake_config.json \
+  --port 8080
+```
+
+If the wheel console scripts are installed, the equivalent command is:
+
+```bash
+mc_store_rest_server --config /path/to/mooncake_config.json --port 8080
+```
+
+### `/api/mount_shm`
+Mount a named shared memory object as one or more Mooncake store segments. If
+the requested size exceeds the maximum registration size, the service may split
+the region and return multiple segment ids.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "name": "mooncake_segment",
+  "size": 16777216,
+  "offset": 0,
+  "protocol": "tcp",
+  "location": ""
+}
+```
+
+**Fields**:
+- `name` (string, required): Named shared memory object name. A leading `/` is
+  accepted, but path separators are not.
+- `size` (integer, required): Number of bytes to mount.
+- `offset` (integer, optional): File offset in bytes. Defaults to `0`.
+- `protocol` (string, optional): Transfer protocol. Defaults to the service
+  configuration protocol.
+- `location` (string, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Success Response**:
+```json
+{
+  "status": "success",
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"]
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/mount_shm \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "mooncake_segment",
+        "size": 16777216,
+        "offset": 0,
+        "protocol": "tcp",
+        "location": ""
+      }'
+```
+
+### `/api/unmount_shm`
+Unmount one or more segment ids previously returned by `/api/mount_shm`.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"],
+  "grace_period_seconds": 0
+}
+```
+
+`segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount behavior. When set to a positive value, the master
+keeps the segment readable for that grace period while preventing new
+allocations, then completes the unmount.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/unmount_shm \
+  -H "Content-Type: application/json" \
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"],
+       "grace_period_seconds": 30}'
+```
+
+### `/api/mount`
+Allocate memory inside the store process and mount it as one or more Mooncake
+store segments. If the requested size exceeds the maximum registration size,
+the service may split it and return multiple segment ids. The response includes
+the actual allocated size after alignment.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "size": 16777216,
+  "protocol": "tcp",
+  "location": ""
+}
+```
+
+**Fields**:
+- `size` (integer, required): Number of bytes requested. Must be positive.
+- `protocol` (string, optional): Transfer protocol. Defaults to the service
+  configuration protocol.
+- `location` (string, optional): Device or locality hint. Defaults to an empty
+  string.
+
+**Success Response**:
+```json
+{
+  "status": "success",
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"],
+  "allocated_size": 16777216
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/mount \
+  -H "Content-Type: application/json" \
+  -d '{"size": 16777216, "protocol": "tcp", "location": ""}'
+```
+
+### `/api/unmount`
+Unmount one or more segment ids previously returned by `/api/mount` and free
+the memory allocated by the store process.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"],
+  "grace_period_seconds": 0
+}
+```
+
+`segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount-and-free behavior. When set to a positive value, the
+master keeps the segment readable for that grace period while preventing new
+allocations, then the store releases the local allocated memory after cleanup.
+
+**Success Response**:
+```json
+{
+  "status": "success"
+}
+```
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/unmount \
+  -H "Content-Type: application/json" \
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"],
+       "grace_period_seconds": 30}'
+```

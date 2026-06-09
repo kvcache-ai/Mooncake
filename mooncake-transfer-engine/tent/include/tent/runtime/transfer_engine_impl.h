@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/common/concurrent/thread_local_storage.h"
+#include "tent/runtime/transport_selector.h"
 
 namespace mooncake {
 namespace tent {
@@ -45,12 +46,15 @@ class ControlService;
 class SegmentTracker;
 class Platform;
 class ProxyManager;
+class ProgressWorker;
 
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};  // merged by other tasks
-    int xport_priority{0};
+    bool derived{false};          // merged by other tasks
+    int xport_priority{0};        // transport priority (for fallback)
+    int failover_count{0};        // number of failover attempts
+    uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     Request request;
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -149,6 +153,8 @@ class TransferEngineImpl {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
+    Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
     Status waitTransferCompletion(BatchID batch_id);
 
     Status transferSync(const std::vector<Request>& request_list);
@@ -156,6 +162,23 @@ class TransferEngineImpl {
     uint64_t lockStageBuffer(const std::string& location);
 
     Status unlockStageBuffer(uint64_t addr);
+
+    // Test-only hook: replace the transport in a given slot after construct().
+    // Production code never calls this. Used by failover integration tests to
+    // inject a FaultProxyTransport without bypassing resubmitTransferTask,
+    // resolveTransport, or any other engine state. Not thread-safe with any
+    // in-flight transfer on that slot.
+    void swapTransportForTest(TransportType type,
+                              std::shared_ptr<Transport> xport) {
+        if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
+            transport_list_[type] = std::move(xport);
+        }
+    }
+
+    // Wake the optional event-driven progress worker for `batch_id`. No-op if
+    // enable_progress_worker is false. Currently used by test/integration
+    // hooks; transports will be migrated to call this in a follow-up PR.
+    void notifyBatchMaybeReady(BatchID batch_id);
 
    private:
     Status construct();
@@ -166,15 +189,29 @@ class TransferEngineImpl {
 
     Status lazyFreeBatch();
 
-    TransportType getTransportType(const Request& request, int priority = 0);
+    SelectionResult getTransportType(const Request& request,
+                                     int transport_index = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
-    TransportType resolveTransport(const Request& req, int priority,
-                                   bool invalidate_on_fail = true);
+    Status pollTaskStatus(Batch* batch, size_t task_id,
+                          TransferStatus& task_status);
+
+    void updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
+                                   TransferStatus& task_status,
+                                   bool allow_failover);
+
+    Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
+                          bool allow_failover);
+
+    SelectionResult resolveTransport(const Request& req, int transport_index,
+                                     bool invalidate_on_fail = true);
+
+    // Verify that req.transport_hint is usable for this request
+    Status validateTransportHint(const Request& req, size_t request_index);
 
     Status loadTransports();
 
@@ -204,6 +241,7 @@ class TransferEngineImpl {
     std::shared_ptr<Config> conf_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
+    std::unique_ptr<TransportSelector> transport_selector_;
     bool available_;
 
     std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
@@ -222,6 +260,17 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
+    int max_failover_attempts_{3};
+    bool enable_auto_failover_on_poll_{true};
+    bool enable_progress_worker_{false};
+
+    // Guards alive_batches_ and serializes pollTaskStatus /
+    // updateTaskStatusAfterPoll / lazyFreeBatch against the optional
+    // ProgressWorker thread. Recursive because freeBatch -> lazyFreeBatch ->
+    // getTransferStatus can re-enter on the same thread. See issue #2116.
+    std::recursive_mutex progress_mutex_;
+    std::unordered_set<BatchID> alive_batches_;
+    std::unique_ptr<ProgressWorker> progress_worker_;
 };
 }  // namespace tent
 }  // namespace mooncake

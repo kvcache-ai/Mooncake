@@ -48,6 +48,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         mooncake_common
          ibverbs
          glog::glog
          gflags::gflags
@@ -63,22 +64,17 @@ endif()
 
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
-  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
 endif()
 
 if(USE_MACA)
-  if(DEFINED ENV{MACA_HOME})
-    set(MACA_HOME $ENV{MACA_HOME})
-  else()
-    set(MACA_HOME /opt/maca)
-  endif()
   if(NOT DEFINED MACA_RUNTIME_LIBS)
     set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
   endif()
-  target_include_directories(transfer_engine PRIVATE ${MACA_HOME}/include)
+  target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
 endif()
 
@@ -87,29 +83,57 @@ if(USE_MUSA)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
 endif()
 
+if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
+if(USE_COREX)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
+
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a
+  # kernel with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
+  if(USE_HIP_DMABUF)
+    find_package(hsa-runtime64 CONFIG)
+    if(hsa-runtime64_FOUND)
+      target_compile_definitions(transfer_engine PRIVATE USE_HIP_DMABUF)
+      target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
+      message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
+    else()
+      message(STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+    endif()
+  else()
+    message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
+  endif()
 endif()
 
 if(USE_MLU)
   target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
-if (USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+if(USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
+                                               MPI::MPI)
 endif()
 
-if (USE_ASCEND_DIRECT)
+if(USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if (USE_UBSHMEM)
+if(USE_UBSHMEM)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if(USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
@@ -117,12 +141,17 @@ endif()
 
 if(USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
-  target_link_libraries(transfer_engine PUBLIC tent)
+  target_link_libraries(transfer_engine PUBLIC tent_link_group)
 endif()
 
 if(USE_INTRA_NVLINK)
   message(STATUS "Enabled USE_INTRA_NVLINK support")
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+endif()
+
+if(USE_MLX5DV)
+  message(STATUS "Enabled USE_MLX5DV support (mlx5 direct verbs)")
+  target_link_libraries(transfer_engine PUBLIC mlx5)
 endif()
 
 if(USE_EFA)

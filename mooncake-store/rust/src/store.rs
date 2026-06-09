@@ -42,6 +42,8 @@ pub struct ReplicateConfig {
     pub replica_num: usize,
     /// Prefer a replica on the same NUMA node / host ("soft pin").
     pub with_soft_pin: bool,
+    /// Declare whether the object will never be evicted.
+    pub with_hard_pin: bool,
     /// Whitelist of segment names that should host a replica.
     pub preferred_segments: Vec<String>,
 }
@@ -69,6 +71,7 @@ impl ReplicateConfig {
         let c_config = ffi::mooncake_replicate_config_t {
             replica_num: self.replica_num,
             with_soft_pin: i32::from(self.with_soft_pin),
+            with_hard_pin: i32::from(self.with_hard_pin),
             preferred_segments: if ptrs.is_empty() {
                 std::ptr::null_mut()
             } else {
@@ -416,6 +419,156 @@ impl MooncakeStore {
     }
 
     // -----------------------------------------------------------------------
+    // Batch operations
+    // -----------------------------------------------------------------------
+
+    /// Batch version of [`put_from`](MooncakeStore::put_from).
+    ///
+    /// Returns a `Vec<i32>` where each element is the result code for the
+    /// corresponding key (0 = success, non-zero = error).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `put_from`: each buffer must be registered.
+    pub unsafe fn batch_put_from(
+        &self,
+        keys: &[&str],
+        buffers: &[*mut c_void],
+        sizes: &[usize],
+        config: Option<&ReplicateConfig>,
+    ) -> Result<Vec<i32>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if buffers.len() != count || sizes.len() != count {
+            return Err(StoreError::InvalidArgument(
+                "keys, buffers, and sizes must have the same length".to_string(),
+            ));
+        }
+
+        let key_strings: Vec<CString> = keys
+            .iter()
+            .map(|k| CString::new(*k))
+            .collect::<Result<_, _>>()?;
+        let key_ptrs: Vec<*const libc::c_char> =
+            key_strings.iter().map(|s| s.as_ptr()).collect();
+
+        let (_c_config, _strings, _ptrs) = Self::prepare_config(config)?;
+        let cfg_ptr = _c_config
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c as *const _);
+
+        let mut results = vec![0i32; count];
+
+        let rc = ffi::mooncake_store_batch_put_from(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            buffers.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            count,
+            cfg_ptr,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// Batch version of [`get_into`](MooncakeStore::get_into).
+    ///
+    /// Returns a `Vec<i64>` where each element is the number of bytes written
+    /// (≥ 0) or an error code (< 0).
+    ///
+    /// # Safety
+    ///
+    /// Same safety requirements as `get_into`: each buffer must be writable.
+    pub unsafe fn batch_get_into(
+        &self,
+        keys: &[&str],
+        buffers: &[*mut c_void],
+        sizes: &[usize],
+    ) -> Result<Vec<i64>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if buffers.len() != count || sizes.len() != count {
+            return Err(StoreError::InvalidArgument(
+                "keys, buffers, and sizes must have the same length".to_string(),
+            ));
+        }
+
+        let key_strings: Vec<CString> = keys
+            .iter()
+            .map(|k| CString::new(*k))
+            .collect::<Result<_, _>>()?;
+        let key_ptrs: Vec<*const libc::c_char> =
+            key_strings.iter().map(|s| s.as_ptr()).collect();
+
+        let mut results = vec![0i64; count];
+
+        let rc = ffi::mooncake_store_batch_get_into(
+            self.handle,
+            key_ptrs.as_ptr() as *mut *const libc::c_char,
+            buffers.as_ptr() as *mut *mut c_void,
+            sizes.as_ptr(),
+            count,
+            results.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        Ok(results)
+    }
+
+    /// Batch check existence of multiple keys.
+    pub fn batch_is_exist(
+        &self,
+        keys: &[&str],
+    ) -> Result<Vec<bool>, StoreError> {
+        let count = keys.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let key_strings: Vec<CString> = keys
+            .iter()
+            .map(|k| CString::new(*k))
+            .collect::<Result<_, _>>()?;
+        let key_ptrs: Vec<*const libc::c_char> =
+            key_strings.iter().map(|s| s.as_ptr()).collect();
+
+        let mut results = vec![0i32; count];
+
+        let rc = unsafe {
+            ffi::mooncake_store_batch_is_exist(
+                self.handle,
+                key_ptrs.as_ptr() as *mut *const libc::c_char,
+                count,
+                results.as_mut_ptr(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(StoreError::OperationFailed(rc));
+        }
+
+        results
+            .into_iter()
+            .map(|r| match r {
+                1 => Ok(true),
+                0 => Ok(false),
+                _ => Err(StoreError::OperationFailed(r)),
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -465,12 +618,14 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 2,
             with_soft_pin: true,
+            with_hard_pin: false,
             preferred_segments: Vec::new(),
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 2);
         assert_eq!(ffi_cfg.with_soft_pin, 1);
+        assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 0);
         assert!(strings.is_empty());
@@ -482,12 +637,14 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 3,
             with_soft_pin: false,
+            with_hard_pin: false,
             preferred_segments: vec!["seg-a".to_string(), "seg-b".to_string()],
         };
 
         let (ffi_cfg, strings, ptrs) = config.to_ffi().expect("to_ffi should succeed");
         assert_eq!(ffi_cfg.replica_num, 3);
         assert_eq!(ffi_cfg.with_soft_pin, 0);
+        assert_eq!(ffi_cfg.with_hard_pin, 0);
         assert!(!ffi_cfg.preferred_segments.is_null());
         assert_eq!(ffi_cfg.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
@@ -504,6 +661,7 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 1,
             with_soft_pin: false,
+            with_hard_pin: false,
             preferred_segments: vec!["bad\0segment".to_string()],
         };
 
@@ -526,6 +684,7 @@ mod tests {
         let config = ReplicateConfig {
             replica_num: 4,
             with_soft_pin: true,
+            with_hard_pin: false,
             preferred_segments: vec!["x".to_string(), "y".to_string()],
         };
 
@@ -534,8 +693,48 @@ mod tests {
         let cfg_ref = c_cfg.as_ref().expect("expected Some config");
         assert_eq!(cfg_ref.replica_num, 4);
         assert_eq!(cfg_ref.with_soft_pin, 1);
+        assert_eq!(cfg_ref.with_hard_pin, 0);
         assert_eq!(cfg_ref.preferred_segments_count, 2);
         assert_eq!(strings.len(), 2);
         assert_eq!(ptrs.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch API tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn batch_is_exist_empty() {
+        let store = MooncakeStore::new().expect("new should succeed");
+        let results = store.batch_is_exist(&[]).expect("empty batch should succeed");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn batch_put_from_rejects_mismatched_lengths() {
+        let store = MooncakeStore::new().expect("new should succeed");
+        let keys = &["key1", "key2"];
+        let buffers: Vec<*mut c_void> = vec![std::ptr::null_mut(); 3];
+        let sizes = &[100usize, 200];
+
+        let result = unsafe { store.batch_put_from(keys, &buffers, sizes, None) };
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn batch_get_into_rejects_mismatched_lengths() {
+        let store = MooncakeStore::new().expect("new should succeed");
+        let keys = &["key1"];
+        let buffers: Vec<*mut c_void> = vec![std::ptr::null_mut(); 2];
+        let sizes = &[100usize];
+
+        let result = unsafe { store.batch_get_into(keys, &buffers, sizes) };
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidArgument(_))
+        ));
     }
 }

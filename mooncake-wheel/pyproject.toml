@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.10.post1"
+version = "0.3.11.post1"
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }
@@ -24,7 +24,7 @@ file-io = ["safetensors", "torch"]
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
-Documentation = "https://github.com/kvcache-ai/Mooncake/tree/main/doc"
+Documentation = "https://kvcache-ai.github.io/Mooncake"
 Source = "https://github.com/kvcache-ai/Mooncake"
 Issues = "https://github.com/kvcache-ai/Mooncake/issues"
 

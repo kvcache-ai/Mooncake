@@ -1,77 +1,24 @@
-#include <mooncake_backend.h>
-#include <cstdio>
-#include <memory>
-#include <thread>
-#include <mooncake_worker.cuh>
+// mooncake_worker.cu — GPU kernel functions and launch wrappers.
+// Compiled by nvcc (CUDA) and mcc (MUSA, via mooncake_worker.mu symlink).
+// The __MUSA__ branch avoids torch headers to stay compatible with mcc.
+
+#include <mooncake_worker_kernels.cuh>
+
+#ifdef __MUSA__
+#include <musa_bf16.h>
+#endif
 
 namespace mooncake {
 
-class MooncakeWorkCpu : public ::c10d::Work {
-   public:
-    MooncakeWorkCpu(c10d::OpType opType,
-                    c10::intrusive_ptr<c10::ivalue::Future> future,
-                    std::shared_ptr<TransferGroupMeta> meta)
-        : Work(-1, opType),
-          future_(std::move(future)),
-          meta_(std::move(meta)) {}
+// ── Kernel functions ──────────────────────────────────────────────
+// Both CUDA and MUSA share the same kernel bodies. Parameters use plain
+// C++ types (int instead of c10d::OpType / c10d::ReduceOp::RedOpType)
+// so that mcc can compile them without torch headers.
 
-    bool isCompleted() override { return future_->completed(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        future_->wait();
-        return future_->completed() && !future_->hasError();
-    }
-
-   private:
-    c10::intrusive_ptr<c10::ivalue::Future> future_;
-    std::shared_ptr<TransferGroupMeta> meta_;
-};
-
-class MooncakeWorkCuda : public ::c10d::Work {
-   public:
-    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event,
-                     std::shared_ptr<TransferGroupMeta> meta)
-        : Work(-1, opType), event_(std::move(event)), meta_(std::move(meta)) {}
-
-    bool isCompleted() override { return event_->query(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        return true;  // This should be a no-op
-    }
-
-   protected:
-    std::shared_ptr<torch::Event> event_;
-    std::shared_ptr<TransferGroupMeta> meta_;
-};
-
-class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
-   public:
-    using MooncakeWorkCuda::MooncakeWorkCuda;
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        if (timeout == kNoTimeout) {
-            event_->synchronize();
-            return true;
-        }
-
-        auto start = std::chrono::steady_clock::now();
-        while (!event_->query()) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                      start);
-            if (elapsed >= timeout) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
-        return true;
-    }
-};
-
-__global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
+__global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  void* meta, Task* tasks, int numRanks,
+                                  uint64_t submitSequence, void* meta,
+                                  Task* tasks, int numRanks,
                                   const bool* activeRanks,
                                   int* activeRanksTensor, size_t taskId) {
     // Copy task into slot
@@ -79,15 +26,16 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
     tasks[taskId].tensorSize = tensorSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
+    tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
-    // Mark active
-    __threadfence();  // Ensure writes visible to host
+    // Publish task metadata before notifying the host worker thread.
+    __threadfence_system();
     tasks[taskId].active = true;
 
     // Spin-wait until CPU proxy sets DONE
     while (tasks[taskId].active) {
-        __threadfence();
+        __threadfence_system();
     }
     for (int i = 0; i < numRanks; ++i) {
         activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
@@ -96,349 +44,173 @@ __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
-                             size_t numElements, size_t numRanks,
-                             c10d::ReduceOp::RedOpType op, bool* activeRanks) {
+                             size_t numElements, size_t numRanks, int op,
+                             bool* activeRanks) {
     size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
     size_t stride = blockDim.x * gridDim.x;
+
+#ifdef __MUSA__
+    // mt_bfloat16 lacks arithmetic and comparison operators; use float
+    // accumulator and fminf/fmaxf for that type only.  Other types
+    // (float, double, int64_t, etc.) use their native accumulator to
+    // preserve full precision.
+    constexpr bool kIsBf16 = std::is_same_v<scalar_t, mt_bfloat16>;
+#else
+    constexpr bool kIsBf16 = false;
+#endif
+    using acc_t = std::conditional_t<kIsBf16, float, scalar_t>;
+
     for (size_t elem_idx = thread_idx; elem_idx < numElements;
          elem_idx += stride) {
         bool valid = false;
-        scalar_t acc = 0;
+        acc_t acc = 0;
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {
-                    acc = src[rank * numElements + elem_idx];
+                    if constexpr (kIsBf16) {
+                        acc = (float)src[rank * numElements + elem_idx];
+                    } else {
+                        acc = src[rank * numElements + elem_idx];
+                    }
                     valid = true;
                 } else {
-                    switch (op) {
-                        case c10d::ReduceOp::SUM:
-                            acc += src[rank * numElements + elem_idx];
-                            break;
-                        case c10d::ReduceOp::MIN:
-                            acc = std::min(src[rank * numElements + elem_idx],
-                                           acc);
-                            break;
-                        case c10d::ReduceOp::MAX:
-                            acc = std::max(src[rank * numElements + elem_idx],
-                                           acc);
-                            break;
-                        case c10d::ReduceOp::PRODUCT:
-                            acc *= src[rank * numElements + elem_idx];
-                            break;
-                        default:
-                            // never
-                    }
-                }
-            }
-        }
-        dst[elem_idx] = acc;
-    }
-}
-
-namespace {
-
-template <typename scalar_t>
-void preload_reduce_kernel(const char* name) {
-    cudaFuncAttributes attr{};
-    auto err = cudaFuncGetAttributes(
-        &attr, reinterpret_cast<const void*>(reduceKernel<scalar_t>));
-    TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
-                cudaGetErrorString(err));
-}
-
-}  // namespace
-
-void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                        size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        cudaStream_t stream) {
-    TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
-                    op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
-                "Only support SUM/MIN/MAX/PRODUCT for reduction.");
-    auto ptr = (char*)dst.data_ptr() + pos;
-    size_t num = realSize / dst.element_size();
-
-    switch (dst.scalar_type()) {
-        case c10::kByte:
-            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*)ptr, (uint8_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
-            break;
-        case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (int8_t*)ptr, (int8_t*)src, num, numRanks, op.op_, activeRanks);
-            break;
-        case c10::kShort:
-            reduceKernel<<<64, 256, 0, stream>>>((int16_t*)ptr, (int16_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
-            break;
-        case c10::kInt:
-            reduceKernel<<<64, 256, 0, stream>>>((int*)ptr, (int*)src, num,
-                                                 numRanks, op.op_, activeRanks);
-            break;
-        case c10::kLong:
-            reduceKernel<<<64, 256, 0, stream>>>((int64_t*)ptr, (int64_t*)src,
-                                                 num, numRanks, op.op_,
-                                                 activeRanks);
-            break;
-        case c10::kFloat:
-            reduceKernel<<<64, 256, 0, stream>>>((float*)ptr, (float*)src, num,
-                                                 numRanks, op.op_, activeRanks);
-            break;
-        case c10::kDouble:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                (double*)ptr, (double*)src, num, numRanks, op.op_, activeRanks);
-            break;
-        case c10::kBool:
-            reduceKernel<<<64, 256, 0, stream>>>((bool*)ptr, (bool*)src, num,
-                                                 numRanks, op.op_, activeRanks);
-            break;
-        case c10::kBFloat16:
-            reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)ptr,
-                                                 (at::BFloat16*)src, num,
-                                                 numRanks, op.op_, activeRanks);
-            break;
-        default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
-    }
-}
-
-template <typename T>
-T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
-    switch (op) {
-        case c10d::ReduceOp::SUM:
-            return a + b;
-        case c10d::ReduceOp::PRODUCT:
-            return a * b;
-        case c10d::ReduceOp::MIN:
-            return std::min(a, b);
-        case c10d::ReduceOp::MAX:
-            return std::max(a, b);
-        default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
-    }
-}
-
-template <typename T>
-void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks) {
-    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            bool valid = false;
-            T acc{};
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                if (activeRanks[rank]) {
-                    if (!valid) {
-                        acc = src[i + rank * numElements];
-                        valid = true;
+                    if constexpr (kIsBf16) {
+                        float val = (float)src[rank * numElements + elem_idx];
+                        switch (op) {
+                            case 0:  // SUM
+                                acc += val;
+                                break;
+                            case 2:  // PRODUCT
+                                acc *= val;
+                                break;
+                            case 3:  // MIN
+                                acc = fminf(acc, val);
+                                break;
+                            case 4:  // MAX
+                                acc = fmaxf(acc, val);
+                                break;
+                            default:
+                                break;
+                        }
                     } else {
-                        acc =
-                            applyReduceOp(acc, src[i + rank * numElements], op);
+                        switch (op) {
+                            case 0:  // SUM
+                                acc += src[rank * numElements + elem_idx];
+                                break;
+                            case 2:  // PRODUCT
+                                acc *= src[rank * numElements + elem_idx];
+                                break;
+                            case 3:  // MIN
+                                acc = std::min(
+                                    src[rank * numElements + elem_idx], acc);
+                                break;
+                            case 4:  // MAX
+                                acc = std::max(
+                                    src[rank * numElements + elem_idx], acc);
+                                break;
+                            default:
+                                break;
+                        }
                     }
                 }
             }
-            dst[i] = acc;
         }
-    });
+        if constexpr (kIsBf16) {
+            dst[elem_idx] = (scalar_t)acc;
+        } else {
+            dst[elem_idx] = acc;
+        }
+    }
 }
 
-void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
-    auto ptr = (char*)dst.data_ptr() + pos;
-    size_t num = realSize / dst.element_size();
+}  // namespace mooncake
 
-    switch (dst.scalar_type()) {
-        case c10::kByte:
-            reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kChar:
-            reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kShort:
-            reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kInt:
-            reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
-            break;
-        case c10::kLong:
-            reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kFloat:
-            reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
-            break;
-        case c10::kDouble:
-            reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
-                      activeRanks);
-            break;
-        case c10::kBool:
-            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
-            break;
-        default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+// ── Kernel launch wrappers ────────────────────────────────────────
+// g++ cannot compile <<<>>> syntax, so these wrappers are compiled by
+// the GPU compiler (nvcc/mcc) and provide plain C++ functions that the
+// host code can call.
+
+#ifdef __MUSA__
+#include <musa_runtime.h>
+#endif
+
+namespace mooncake {
+
+void launchEnqueueTaskKernel(int opType, size_t tensorSize,
+                             int64_t broadcastRoot, int bufferOffset,
+                             uint64_t submitSequence, void* meta, Task* tasks,
+                             int numRanks, const bool* activeRanks,
+                             int* activeRanksTensor, size_t taskId,
+                             cudaStream_t stream) {
+    enqueueTaskKernel<<<1, 1, 0, stream>>>(
+        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence, meta,
+        tasks, numRanks, activeRanks, activeRanksTensor, taskId);
+}
+
+#define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
+    void launchReduceKernel_##suffix(                                         \
+        scalar_t* dst, const scalar_t* src, size_t numElements,               \
+        size_t numRanks, int op, bool* activeRanks, cudaStream_t stream) {    \
+        reduceKernel<<<64, 256, 0, stream>>>(dst, src, numElements, numRanks, \
+                                             op, activeRanks);                \
     }
+
+DEF_LAUNCH_REDUCE(uint8_t, uint8)
+DEF_LAUNCH_REDUCE(int8_t, int8)
+DEF_LAUNCH_REDUCE(int16_t, int16)
+DEF_LAUNCH_REDUCE(int, int32)
+DEF_LAUNCH_REDUCE(int64_t, int64)
+DEF_LAUNCH_REDUCE(float, float)
+DEF_LAUNCH_REDUCE(double, double)
+DEF_LAUNCH_REDUCE(bool, bool)
+
+#undef DEF_LAUNCH_REDUCE
+
+void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
+                             size_t numRanks, int op, bool* activeRanks,
+                             cudaStream_t stream) {
+#ifdef __MUSA__
+    reduceKernel<<<64, 256, 0, stream>>>((mt_bfloat16*)dst,
+                                         (const mt_bfloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
+#else
+    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
+                                         (const at::BFloat16*)src, numElements,
+                                         numRanks, op, activeRanks);
+#endif
 }
 
 void preloadReduceKernels() {
-    preload_reduce_kernel<uint8_t>("reduceKernel<uint8_t>");
-    preload_reduce_kernel<int8_t>("reduceKernel<int8_t>");
-    preload_reduce_kernel<int16_t>("reduceKernel<int16_t>");
-    preload_reduce_kernel<int>("reduceKernel<int>");
-    preload_reduce_kernel<int64_t>("reduceKernel<int64_t>");
-    preload_reduce_kernel<float>("reduceKernel<float>");
-    preload_reduce_kernel<double>("reduceKernel<double>");
-    preload_reduce_kernel<bool>("reduceKernel<bool>");
-    preload_reduce_kernel<at::BFloat16>("reduceKernel<BFloat16>");
-}
-
-MooncakeWorker::MooncakeWorker(int cuda_device_index)
-    : cuda_device_index_(cuda_device_index) {
-    int deviceCount = 0;
-    cudaError err = cudaGetDeviceCount(&deviceCount);
-    if (!err && deviceCount > 0) {
-        // Pin memory for task array
-        cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
-        cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
-    } else {
-        LOG(WARNING) << "No CUDA device found. Only the `mooncake-cpu` backend "
-                        "can be used.";
-        tasks_ = new Task[kNumTasks_];
-    }
-    for (size_t i = 0; i < kNumTasks_; ++i) {
-        tasks_[i].active = false;
-    }
-}
-
-MooncakeWorker::~MooncakeWorker() {
-    running_ = false;
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
-}
-
-c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
-    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    const std::shared_ptr<TransferGroupMeta>& meta,
-    const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const std::function<void(void* dst, size_t pos, size_t realSize)>&
-        tensorToBuffer,
-    const std::function<void(void* src, size_t pos, size_t realSize)>&
-        bufferToTensor) {
-    connection_ctx->waitUntilNewRanksConnected();
-
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
-    auto future = c10::make_intrusive<c10::ivalue::Future>(
-        c10::ListType::create(c10::TensorType::get()));
-
-    struct IterState {
-        size_t currentPos = 0;
+#ifdef __MUSA__
+    // MUSA: mcc has no cudaFuncGetAttributes, kernels are JIT-compiled on
+    // first use.
+#else
+    // CUDA: preload kernels to avoid JIT compilation overhead on first use.
+    auto preload = [](const char* name, auto kernel_ptr) {
+        cudaFuncAttributes attr{};
+        auto err = cudaFuncGetAttributes(&attr, kernel_ptr);
+        TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                    cudaGetErrorString(err));
     };
-    auto state = std::make_shared<IterState>();
-
-    auto processNextChunk = std::make_shared<std::function<void()>>();
-    std::weak_ptr<std::function<void()>> weakProcessNextChunk =
-        processNextChunk;
-
-    *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
-                         chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future]() {
-        auto processNextChunk = weakProcessNextChunk.lock();
-
-        if (state->currentPos >= tensorSize) {
-            future->markCompleted(c10::IValue());
-            return;
-        }
-
-        int taskId = cpuTaskCount % 2;
-        TORCH_CHECK(!tasks_[taskId].active);
-
-        size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
-        int bufferOffset = meta->taskCount % 2;
-
-        tasks_[taskId].opType = opType;
-        tasks_[taskId].tensorSize = realSize;
-        tasks_[taskId].broadcastRoot = broadcastRoot;
-        tasks_[taskId].bufferOffset = bufferOffset;
-        tasks_[taskId].transferGroupMeta = meta.get();
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            state->currentPos, realSize);
-
-        hasCallback_[taskId] = true;
-
-        callbacks_[taskId] = [this, processNextChunk, state, meta,
-                              bufferToTensor, bufferOffset, realSize,
-                              future]() {
-            for (int i = 0; i < meta->size; ++i) {
-                meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
-            }
-            bufferToTensor(
-                (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-                state->currentPos, realSize);
-
-            state->currentPos += realSize;
-
-            (*processNextChunk)();
-        };
-
-        tasks_[taskId].active = true;
-        ++cpuTaskCount;
-        ++meta->taskCount;
-    };
-
-    (*processNextChunk)();
-
-    return c10::make_intrusive<MooncakeWorkCpu>(opType, future, meta);
-}
-
-c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
-    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    const std::shared_ptr<TransferGroupMeta>& meta,
-    const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& stream,
-    const std::function<void(void* dst, size_t pos, size_t realSize)>&
-        tensorToBuffer,
-    const std::function<void(void* src, size_t pos, size_t realSize)>&
-        bufferToTensor) {
-    connection_ctx->waitUntilNewRanksConnected();
-
-    // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
-    //  Alternately use even-odd items to maintain tasks
-    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
-
-    for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
-        size_t realSize = min(tensorSize, pos + chunkSize) - pos;
-        int taskId = cudaTaskCount % 2 + 2;
-        int bufferOffset = meta->taskCount % 2;
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize);
-
-        hasCallback_[taskId] = false;
-        enqueueTaskKernel<<<1, 1, 0, stream>>>(
-            opType, realSize, broadcastRoot, bufferOffset, meta.get(),
-            tasks_device_, meta->size, meta->activeRanksDevice,
-            meta->activeRanksTensor.data_ptr<int>(), taskId);
-        bufferToTensor(
-            (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize);
-
-        ++cudaTaskCount;
-        ++meta->taskCount;
-    }
-
-    auto event = std::make_shared<torch::Event>(torch::kCUDA);
-    event->record(stream);
-    if (opType == c10d::OpType::BARRIER) {
-        return c10::make_intrusive<MooncakeBarrierWorkCuda>(opType, event,
-                                                            meta);
-    }
-    return c10::make_intrusive<MooncakeWorkCuda>(opType, event, meta);
+    preload("reduceKernel<uint8_t>",
+            reinterpret_cast<const void*>(reduceKernel<uint8_t>));
+    preload("reduceKernel<int8_t>",
+            reinterpret_cast<const void*>(reduceKernel<int8_t>));
+    preload("reduceKernel<int16_t>",
+            reinterpret_cast<const void*>(reduceKernel<int16_t>));
+    preload("reduceKernel<int>",
+            reinterpret_cast<const void*>(reduceKernel<int>));
+    preload("reduceKernel<int64_t>",
+            reinterpret_cast<const void*>(reduceKernel<int64_t>));
+    preload("reduceKernel<float>",
+            reinterpret_cast<const void*>(reduceKernel<float>));
+    preload("reduceKernel<double>",
+            reinterpret_cast<const void*>(reduceKernel<double>));
+    preload("reduceKernel<bool>",
+            reinterpret_cast<const void*>(reduceKernel<bool>));
+    preload("reduceKernel<BFloat16>",
+            reinterpret_cast<const void*>(reduceKernel<at::BFloat16>));
+#endif
 }
 
 }  // namespace mooncake

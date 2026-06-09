@@ -20,7 +20,7 @@
 namespace mooncake {
 namespace tent {
 
-enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA };
+enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM };
 
 class Platform {
    public:

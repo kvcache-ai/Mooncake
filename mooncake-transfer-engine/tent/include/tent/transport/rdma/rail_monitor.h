@@ -21,8 +21,26 @@
 
 namespace mooncake {
 namespace tent {
+// Not thread-safe. Each RDMA worker owns its own RailMonitor via
+// WorkerContext::rails, so markFailed / markRecovered / available / load
+// all execute on a single worker thread. Do not share across threads
+// without adding external synchronization.
 class RailMonitor {
     const static size_t kMaxNuma = 16;
+
+    // Upper bound on the exponential-backoff cooldown; prevents the
+    // per-rail pause from growing without bound under repeated failure.
+    static constexpr std::chrono::seconds kMaxCooldown{300};
+
+   public:
+    // Config keys. Exposed as constants so callers (and docs) reference
+    // a single source of truth instead of duplicating the string path.
+    static constexpr const char *kCfgErrorThreshold =
+        "transports/rdma/rail_error_threshold";
+    static constexpr const char *kCfgErrorWindowSecs =
+        "transports/rdma/rail_error_window_secs";
+    static constexpr const char *kCfgCooldownSecs =
+        "transports/rdma/rail_cooldown_secs";
 
    public:
     RailMonitor() = default;
@@ -33,8 +51,13 @@ class RailMonitor {
     RailMonitor &operator=(const RailMonitor &) = delete;
 
    public:
+    // rail_topo_json: optional JSON string describing rail topology.
+    // conf: optional Config pointer; when non-null, overrides the default
+    //   error_threshold / error_window_secs / cooldown_secs values via
+    //   kCfgErrorThreshold / kCfgErrorWindowSecs / kCfgCooldownSecs.
     Status load(const Topology *local, const Topology *remote,
-                const std::string &rail_topo_json = "");
+                const std::string &rail_topo_json = "",
+                const Config *conf = nullptr);
 
     bool ready() { return ready_; }
 
@@ -71,8 +94,12 @@ class RailMonitor {
         int error_count = 0;
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
-        bool paused = false;
         std::chrono::steady_clock::time_point resume_time{};
+
+        // Derived: a rail is paused iff a resume_time has been armed.
+        bool paused() const {
+            return resume_time != std::chrono::steady_clock::time_point{};
+        }
     };
 
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;

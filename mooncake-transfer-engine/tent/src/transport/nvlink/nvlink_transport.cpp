@@ -33,6 +33,28 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+Status setCudaDeviceForLocation(const LocationParser& location,
+                                int& saved_dev) {
+    saved_dev = -1;
+    CHECK_CUDA(cudaGetDevice(&saved_dev));
+    if (location.index() >= 0 && saved_dev != location.index()) {
+        CHECK_CUDA(cudaSetDevice(location.index()));
+    }
+    return Status::OK();
+}
+
+Status restoreCudaDeviceForLocation(const LocationParser& location,
+                                    int saved_dev) {
+    if (saved_dev >= 0 && location.index() >= 0 &&
+        saved_dev != location.index()) {
+        CHECK_CUDA(cudaSetDevice(saved_dev));
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 NVLinkTransport::NVLinkTransport() : installed_(false) {}
 
@@ -47,6 +69,7 @@ Status NVLinkTransport::install(std::string& local_segment_name,
             "NVLink transport has been installed" LOC_MARK);
     }
 
+    platform_ = dynamic_cast<CudaPlatform*>(&Platform::getLoader());
     metadata_ = metadata;
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
@@ -76,16 +99,6 @@ Status NVLinkTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamNVLinkRAII {
-    cudaStream_t stream_;
-    CudaStreamNVLinkRAII() {
-        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
-    }
-    ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
-};
-
-thread_local CudaStreamNVLinkRAII tl_stream_nvlink;
-
 Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto shm_batch = Slab<NVLinkSubBatch>::Get().allocate();
     if (!shm_batch)
@@ -93,9 +106,8 @@ Status NVLinkTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    shm_batch->stream = tl_stream_nvlink.stream_;
-    // CHECK_CUDA(cudaStreamCreateWithFlags(&shm_batch->stream,
-    // cudaStreamNonBlocking));
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream));
+    CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream));
     return Status::OK();
 }
 
@@ -116,6 +128,7 @@ Status NVLinkTransport::submitTransferTasks(
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
     if (request_list.size() + shm_batch->task_list.size() > shm_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+    std::vector<NVLinkTask*> new_tasks;
     for (auto& request : request_list) {
         shm_batch->task_list.push_back(NVLinkTask{});
         auto& task = shm_batch->task_list[shm_batch->task_list.size() - 1];
@@ -128,63 +141,89 @@ Status NVLinkTransport::submitTransferTasks(
         task.target_addr = target_addr;
         task.request = request;
         task.status_word = TransferStatusEnum::PENDING;
-        startTransfer(&task, shm_batch);
+        new_tasks.push_back(&task);
     }
+    startTransfer(new_tasks, shm_batch);
     return Status::OK();
 }
 
-void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
-    cudaError_t err;
-    void *src = nullptr, *dst = nullptr;
+void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
+                                    NVLinkSubBatch* batch) {
+    if (tasks.empty()) return;
 
-    // Determine direction and addresses
-    if (task->request.opcode == Request::READ) {
-        dst = task->request.source;      // read into source buffer
-        src = (void*)task->target_addr;  // from remote
-    } else {
-        src = task->request.source;      // write from source buffer
-        dst = (void*)task->target_addr;  // to remote
-    }
-
-    bool is_async = (task->request.length >= async_memcpy_threshold_);
-
-    cudaPointerAttributes src_attr_info, dst_attr_info;
-    cudaMemoryType src_type = cudaMemoryTypeHost, dst_type = cudaMemoryTypeHost;
-    if (cudaPointerGetAttributes(&src_attr_info, src) == cudaSuccess) {
-        src_type = src_attr_info.type;
-    }
-    if (cudaPointerGetAttributes(&dst_attr_info, dst) == cudaSuccess) {
-        dst_type = dst_attr_info.type;
-    }
-
-    cudaMemcpyKind kind = cudaMemcpyDefault;
-    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyDeviceToHost;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyHostToDevice;
-    } else if (src_type == cudaMemoryTypeDevice &&
-               dst_type == cudaMemoryTypeDevice) {
-        kind = cudaMemcpyDeviceToDevice;
-    } else if (src_type == cudaMemoryTypeHost &&
-               dst_type == cudaMemoryTypeHost) {
-        kind = cudaMemcpyHostToHost;
-    }
-
-    if (!is_async) {
-        err = cudaMemcpy(dst, src, task->request.length, kind);
-        if (err != cudaSuccess) {
-            task->status_word = TransferStatusEnum::FAILED;
+    std::vector<void*> srcs;
+    std::vector<void*> dsts;
+    std::vector<size_t> sizes;
+    for (auto* task : tasks) {
+        void *src = nullptr, *dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;      // read into source buffer
+            src = (void*)task->target_addr;  // from remote
         } else {
-            task->transferred_bytes = task->request.length;
-            task->status_word = TransferStatusEnum::COMPLETED;
+            src = task->request.source;      // write from source buffer
+            dst = (void*)task->target_addr;  // to remote
         }
-        return;
+        srcs.push_back(src);
+        dsts.push_back(dst);
+        sizes.push_back(task->request.length);
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
+    cudaError_t err;
 
-    if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
+#if CUDART_VERSION >= 13000
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    err = cudaMemcpyBatchAsync(const_cast<const void**>(dsts.data()),
+                               const_cast<const void**>(srcs.data()),
+                               sizes.data(), srcs.size(), &attr, &attrs_idx, 1,
+                               batch->async_stream.get());
+#elif CUDART_VERSION >= 12080
+    cudaMemcpyAttributes attr{};
+    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    size_t attrs_idx = 0;
+    size_t fail_idx = tasks.size();
+    err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                               srcs.size(), &attr, &attrs_idx, 1, &fail_idx,
+                               batch->async_stream.get());
+    if (err != cudaSuccess && err != cudaErrorCallRequiresNewerDriver &&
+        fail_idx < tasks.size()) {
+        LOG(ERROR) << "NVLinkTransport::startTransfer internal error: "
+                   << "cudaMemcpyBatchAsync failed at task index " << fail_idx
+                   << " (src=" << srcs[fail_idx] << ", dst=" << dsts[fail_idx]
+                   << ", size=" << sizes[fail_idx]
+                   << "): " << cudaGetErrorString(err);
+        tasks[fail_idx]->status_word = TransferStatusEnum::FAILED;
+    }
+#else
+    err = cudaErrorCallRequiresNewerDriver;
+#endif
+
+    if (err == cudaErrorCallRequiresNewerDriver) {
+        cudaGetLastError();
+        err = cudaSuccess;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            auto single_err =
+                cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault,
+                                batch->async_stream.get());
+            if (single_err != cudaSuccess) {
+                tasks[i]->status_word = TransferStatusEnum::FAILED;
+                err = single_err;
+            }
+        }
+    }
+
+    if (err != cudaSuccess) {
+        for (auto* task : tasks) {
+            if (task->status_word == TransferStatusEnum::PENDING)
+                task->status_word = TransferStatusEnum::FAILED;
+        }
+    }
+
+    cudaEvent_t event;
+    cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    cudaEventRecord(event, batch->async_stream.get());
+    for (auto* task : tasks) task->completion_event = event;
 }
 
 Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -196,9 +235,8 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
     auto& task = shm_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     if (task.status_word == TransferStatusEnum::PENDING) {
-        auto err = cudaStreamQuery(shm_batch->stream);
+        auto err = cudaEventQuery(task.completion_event);
         if (err == cudaSuccess) {
-            cudaStreamSynchronize(shm_batch->stream);
             task.transferred_bytes = task.request.length;
             task.status_word = TransferStatusEnum::COMPLETED;
         } else if (err != cudaErrorNotReady) {
@@ -212,9 +250,24 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                                         const MemoryOptions& options) {
     LocationParser location(desc.location);
     if (location.type() == "cuda") {
-        // If the memory region is allocated using cuMemAlloc,
-        // we cannot use cudaIpcGetMemHandle, so skip it
+        // MNNVL allocations are exported by MnnvlTransport instead of CUDA IPC.
         if (options.type == MNNVL) return Status::OK();
+
+        int saved_dev = -1;
+        CHECK_STATUS(setCudaDeviceForLocation(location, saved_dev));
+
+        // VMM allocations have driver allocation handles, but
+        // cudaIpcGetMemHandle only supports cudaMalloc-backed pointers.
+        CUmemGenericAllocationHandle generic_handle;
+        CUresult retain_result =
+            cuMemRetainAllocationHandle(&generic_handle, (void*)desc.addr);
+        if (retain_result == CUDA_SUCCESS) {
+            cuMemRelease(generic_handle);
+            CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
+            LOG(INFO) << "NVLinkTransport: memory region " << (void*)desc.addr
+                      << " is not cudaMalloc-backed; skip CUDA IPC export.";
+            return Status::OK();
+        }
 
         // Resolve the true cudaMalloc base address. Caching allocators
         // (e.g. PyTorch) sub-allocate tensors within larger cudaMalloc
@@ -228,6 +281,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
             LOG(ERROR) << "NVLinkTransport: cuMemGetAddressRange failed for "
                        << "addr 0x" << std::hex << desc.addr << std::dec
                        << " (error " << cu_err << ")";
+            CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
             return Status::InternalError(
                 "cuMemGetAddressRange failed" LOC_MARK);
         }
@@ -239,12 +293,24 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
                 desc.addr = (uint64_t)base_ptr;
                 desc.length = alloc_size;
                 desc.transports.push_back(TransportType::NVLINK);
+                CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
                 return Status::OK();
             }
         }
 
         cudaIpcMemHandle_t handle;
-        CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void*)base_ptr));
+        auto cuda_err = cudaIpcGetMemHandle(&handle, (void*)base_ptr);
+        CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
+        if (cuda_err != cudaSuccess) {
+            LOG(ERROR) << "NVLinkTransport: cudaIpcGetMemHandle failed for "
+                       << "addr 0x" << std::hex << desc.addr << ", base 0x"
+                       << (uint64_t)base_ptr << std::dec << ", device "
+                       << location.index() << ": "
+                       << cudaGetErrorString(cuda_err);
+            return Status::InternalError(
+                std::string("cudaIpcGetMemHandle(&handle, (void*)base_ptr): ") +
+                cudaGetErrorString(cuda_err) + LOC_MARK);
+        }
         desc.addr = (uint64_t)base_ptr;
         desc.length = alloc_size;
         desc.shm_path =
@@ -271,10 +337,14 @@ Status NVLinkTransport::removeMemoryBuffer(BufferDesc& desc) {
     if (location.type() == "cuda") {
         // Resolve base the same way we did in addMemoryBuffer, so we
         // remove the right entry even for sub-allocated addresses.
+        int saved_dev = -1;
+        CHECK_STATUS(setCudaDeviceForLocation(location, saved_dev));
+
         CUdeviceptr base_ptr = 0;
         size_t alloc_size = 0;
         CUresult cu_err = cuMemGetAddressRange(&base_ptr, &alloc_size,
                                                (CUdeviceptr)desc.addr);
+        CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
 
         uint64_t key = desc.addr;
         if (cu_err == CUDA_SUCCESS) {

@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <random>
 
@@ -36,7 +37,17 @@
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
-const static size_t kDefaultBufferSize = 65536;
+static size_t getChunkSize() {
+    static const size_t val = [] {
+        const char* env = std::getenv("MC_TCP_SLICE_SIZE");
+        if (env) {
+            size_t v = std::stoull(env);
+            if (v > 0) return v;
+        }
+        return size_t(65536);  // 64KB default
+    }();
+    return val;
+}
 
 struct SessionHeader {
     uint64_t size;
@@ -44,26 +55,42 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
 static bool isCudaMemory(void* addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
     if (status != cudaSuccess) return false;
-    if (attributes.type == cudaMemoryTypeDevice) return true;
-    return false;
+    return attributes.type == cudaMemoryTypeDevice;
+}
+
+// Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
+// Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
+// GPU 0 context creation.
+static int getCudaDeviceId(void* addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return -1;
+    if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
+    return -1;
 }
 #endif
 
 // Forward declaration
 class TcpTransport;
 
+using ValidateAddrFn = std::function<bool(uint64_t, uint64_t)>;
+
 // Server-side session: handles one transfer request on a persistent connection
 struct ServerSession : public std::enable_shared_from_this<ServerSession> {
-    explicit ServerSession(std::shared_ptr<tcpsocket> socket)
-        : socket_(std::move(socket)) {}
+    explicit ServerSession(std::shared_ptr<tcpsocket> socket,
+                           ValidateAddrFn validate_addr)
+        : socket_(std::move(socket)),
+          validate_addr_(std::move(validate_addr)) {}
 
     std::shared_ptr<tcpsocket> socket_;
+    ValidateAddrFn validate_addr_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
@@ -83,8 +110,6 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code& ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    // If client closed connection (EOF), this is normal - don't
-                    // log
                     if (ec.value() != asio::error::eof) {
                         LOG(WARNING)
                             << "ServerSession::readHeader failed. Error: "
@@ -92,10 +117,20 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ", bytes read: " << len;
                     }
                     session_mutex_.unlock();
-                    return;  // Don't continue, socket will be closed
+                    return;
                 }
 
                 local_buffer_ = (char*)(le64toh(header_.addr));
+                uint64_t size = le64toh(header_.size);
+                if (validate_addr_ &&
+                    !validate_addr_((uint64_t)local_buffer_, size)) {
+                    LOG(ERROR) << "ServerSession: remote-supplied address 0x"
+                               << std::hex << (uint64_t)local_buffer_
+                               << std::dec << " with size " << size
+                               << " is not within any registered buffer";
+                    session_mutex_.unlock();
+                    return;
+                }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
                     readBody();
                 else
@@ -109,7 +144,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
             // Transfer complete, wait for next request on this connection
@@ -118,11 +153,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-        if (isCudaMemory(addr)) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        cuda_device = getCudaDeviceId(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
+            cudaSetDevice(cuda_device);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);
@@ -139,11 +178,12 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code& ec,
-                                            std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                if (isCudaMemory(addr)) {
+            [this, addr, dram_buffer, cuda_device, self](
+                const asio::error_code& ec, std::size_t transferred_bytes) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
 #endif
@@ -168,7 +208,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             session_mutex_.unlock();
             // Transfer complete, wait for next request on this connection
@@ -177,20 +217,20 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-        bool is_cuda_memory = isCudaMemory(addr);
-        if (is_cuda_memory) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        cuda_device = getCudaDeviceId(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
-#else
-        bool is_cuda_memory = false;
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, is_cuda_memory, self](
+            [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
@@ -205,16 +245,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << " (value: " << ec.value() << ")";
                     }
                     session_mutex_.unlock();
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                    if (is_cuda_memory) delete[] dram_buffer;
-#endif
+                    if (cuda_device >= 0) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                if (is_cuda_memory) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                if (cuda_device >= 0) {
+                    cudaSetDevice(cuda_device);
                     cudaError_t cuda_status =
                         cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                                    transferred_bytes, cudaMemcpyDefault);
@@ -268,12 +307,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code& ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR) << "ClientSession::writeHeader failed. Error: "
-                               << ec.message() << " (value: " << ec.value()
-                               << ")" << ", bytes written: " << len;
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    session_mutex_.unlock();
-                    if (on_complete_) on_complete_();
+                    LOG(ERROR)
+                        << "ClientSession::writeHeader failed. Error: "
+                        << ec.message() << " (value: " << ec.value() << ")"
+                        << ", bytes written: " << len;
+                    asio::post(
+                        socket_->get_executor(),
+                        [this, self, on_finalize = std::move(on_finalize_),
+                         on_complete = std::move(on_complete_)]() {
+                            if (on_finalize)
+                                on_finalize(TransferStatusEnum::FAILED);
+                            session_mutex_.unlock();
+                            if (on_complete) on_complete();
+                        });
                     return;
                 }
                 if (header_.opcode == (uint8_t)TransferRequest::WRITE)
@@ -289,29 +335,34 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            if (on_complete_) on_complete_();
+            asio::post(socket_->get_executor(),
+                       [this, self, on_finalize = std::move(on_finalize_),
+                        on_complete = std::move(on_complete_)]() {
+                           if (on_finalize)
+                               on_finalize(TransferStatusEnum::COMPLETED);
+                           session_mutex_.unlock();
+                           if (on_complete) on_complete();
+                       });
             return;
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-        bool is_cuda_memory = isCudaMemory(addr);
-        if (is_cuda_memory) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        cuda_device = getCudaDeviceId(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
         }
-#else
-        bool is_cuda_memory = false;
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, is_cuda_memory, self](
+            [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
@@ -320,19 +371,30 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    if (on_complete_) on_complete_();
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                    if (is_cuda_memory) delete[] dram_buffer;
+                    // Post entire cleanup to ensure it runs after callback
+                    // returns
+                    asio::post(socket_->get_executor(),
+                               [this, self, dram_buffer, cuda_device,
+                                on_finalize = std::move(on_finalize_),
+                                on_complete = std::move(on_complete_)]() {
+                                   if (on_finalize)
+                                       on_finalize(TransferStatusEnum::FAILED);
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                                   if (cuda_device >= 0) delete[] dram_buffer;
 #endif
-                    session_mutex_.unlock();
+                                   session_mutex_.unlock();
+                                   if (on_complete) on_complete();
+                               });
                     return;
                 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                if (is_cuda_memory) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                if (cuda_device >= 0) {
+                    cudaSetDevice(cuda_device);
                     cudaError_t cuda_status =
                         cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                                    transferred_bytes, cudaMemcpyDefault);
@@ -341,11 +403,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        if (on_finalize_)
-                            on_finalize_(TransferStatusEnum::FAILED);
-                        if (on_complete_) on_complete_();
-                        delete[] dram_buffer;
-                        session_mutex_.unlock();
+                        // Post entire cleanup to ensure it runs after callback
+                        // returns
+                        asio::post(
+                            socket_->get_executor(),
+                            [this, self, dram_buffer,
+                             on_finalize = std::move(on_finalize_),
+                             on_complete = std::move(on_complete_)]() {
+                                if (on_finalize)
+                                    on_finalize(TransferStatusEnum::FAILED);
+                                delete[] dram_buffer;
+                                session_mutex_.unlock();
+                                if (on_complete) on_complete();
+                            });
                         return;
                     }
                     delete[] dram_buffer;
@@ -362,20 +432,30 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* addr = local_buffer_;
 
         size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
+            std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            if (on_complete_) on_complete_();
+            // Post cleanup to ensure it runs after callback returns
+            asio::post(socket_->get_executor(),
+                       [this, self, on_finalize = std::move(on_finalize_),
+                        on_complete = std::move(on_complete_)]() {
+                           if (on_finalize)
+                               on_finalize(TransferStatusEnum::COMPLETED);
+                           session_mutex_.unlock();
+                           if (on_complete) on_complete();
+                       });
             return;
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
+        int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-        if (isCudaMemory(addr)) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+        cuda_device = getCudaDeviceId(addr);
+        if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
+            cudaSetDevice(cuda_device);
             cudaError_t cuda_status =
                 cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                            buffer_size, cudaMemcpyDefault);
@@ -383,10 +463,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                if (on_complete_) on_complete_();
-                session_mutex_.unlock();
-                delete[] dram_buffer;
+                // Post entire cleanup to ensure it runs after callback returns
+                asio::post(socket_->get_executor(),
+                           [this, self, dram_buffer,
+                            on_finalize = std::move(on_finalize_),
+                            on_complete = std::move(on_complete_)]() {
+                               if (on_finalize)
+                                   on_finalize(TransferStatusEnum::FAILED);
+                               delete[] dram_buffer;
+                               session_mutex_.unlock();
+                               if (on_complete) on_complete();
+                           });
                 return;
             }
         }
@@ -394,14 +481,11 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code& ec,
-                                            std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MLU) || defined(USE_MACA)
-                if (isCudaMemory(addr)) {
+            [this, addr, dram_buffer, cuda_device, self](
+                const asio::error_code& ec, std::size_t transferred_bytes) {
+                if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
-#endif
                 if (ec) {
                     LOG(ERROR)
                         << "ClientSession::writeBody failed. "
@@ -409,9 +493,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    if (on_complete_) on_complete_();
-                    session_mutex_.unlock();
+                    // Post entire cleanup to ensure it runs after callback
+                    // returns
+                    asio::post(
+                        socket_->get_executor(),
+                        [this, self, on_finalize = std::move(on_finalize_),
+                         on_complete = std::move(on_complete_)]() {
+                            if (on_finalize)
+                                on_finalize(TransferStatusEnum::FAILED);
+                            session_mutex_.unlock();
+                            if (on_complete) on_complete();
+                        });
                     return;
                 }
                 total_transferred_bytes_ += transferred_bytes;
@@ -421,7 +513,8 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 };
 
 struct TcpContext {
-    TcpContext(short port) : acceptor(io_context) {
+    TcpContext(short port, ValidateAddrFn validate_addr)
+        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -451,11 +544,13 @@ struct TcpContext {
     void doAccept() {
         acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
             if (!ec) {
+                asio::error_code nodelay_ec;
+                socket.set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                 auto socket_ptr =
                     std::make_shared<tcpsocket>(std::move(socket));
-                auto session = std::make_shared<ServerSession>(socket_ptr);
-                session->start();  // Start processing requests on this
-                                   // persistent connection
+                auto session =
+                    std::make_shared<ServerSession>(socket_ptr, validate_addr_);
+                session->start();
             }
             doAccept();
         });
@@ -463,6 +558,7 @@ struct TcpContext {
 
     asio::io_context io_context;
     asio::ip::tcp::acceptor acceptor;
+    ValidateAddrFn validate_addr_;
 };
 
 TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
@@ -539,7 +635,9 @@ int TcpTransport::install(std::string& local_server_name,
 
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
-    context_ = new TcpContext(tcp_port);
+    context_ = new TcpContext(tcp_port, [this](uint64_t addr, uint64_t size) {
+        return validateAddress(addr, size);
+    });
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
@@ -688,6 +786,7 @@ void TcpTransport::worker() {
             LOG(ERROR) << "TcpTransport::worker encountered an exception "
                           "during doAccept/run: "
                        << e.what();
+            context_->io_context.restart();
         }
     }
 }
@@ -703,6 +802,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
             auto socket_ptr =
                 std::make_shared<asio::ip::tcp::socket>(context_->io_context);
             asio::connect(*socket_ptr, endpoint_iterator);
+            socket_ptr->set_option(asio::ip::tcp::no_delay(true));
             return socket_ptr;
         } catch (std::exception& e) {
             LOG(ERROR)
@@ -755,6 +855,7 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
         new_socket =
             std::make_shared<asio::ip::tcp::socket>(context_->io_context);
         asio::connect(*new_socket, endpoint_iterator);
+        new_socket->set_option(asio::ip::tcp::no_delay(true));
     } catch (std::exception& e) {
         LOG(ERROR)
             << "TcpTransport::getConnection failed to create connection to "
@@ -829,9 +930,8 @@ void TcpTransport::cleanupIdleConnections() {
     for (auto it = connection_pool_.begin(); it != connection_pool_.end();) {
         auto& queue = it->second;
 
-        // Remove idle connections that exceed timeout
-        while (!queue.empty()) {
-            auto& entry = queue.back();
+        for (auto entry_it = queue.begin(); entry_it != queue.end();) {
+            auto& entry = *entry_it;
             if (!entry->in_use) {
                 auto idle_duration =
                     std::chrono::duration_cast<std::chrono::seconds>(
@@ -842,22 +942,34 @@ void TcpTransport::cleanupIdleConnections() {
                         asio::error_code ec;
                         entry->socket->close(ec);
                     }
-                    queue.pop_back();
-                } else {
-                    break;
+                    entry_it = queue.erase(entry_it);
+                    continue;
                 }
-            } else {
-                break;
             }
+            ++entry_it;
         }
 
-        // Remove empty endpoint queues
         if (queue.empty()) {
             it = connection_pool_.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+bool TcpTransport::validateAddress(uint64_t addr, uint64_t size) const {
+    if (size == 0) return false;
+    if (addr + size < addr) return false;
+
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc) return false;
+
+    for (const auto& buffer : desc->buffers) {
+        if (buffer.addr + buffer.length < buffer.addr) continue;
+        if (buffer.addr <= addr && addr + size <= buffer.addr + buffer.length)
+            return true;
+    }
+    return false;
 }
 
 void TcpTransport::startTransfer(Slice* slice) {
@@ -933,7 +1045,8 @@ void TcpTransport::startTransfer(Slice* slice) {
         }
         if (enable_connection_pool_) {
             // Remove the connection from pool if it was pooled
-            ConnectionKey key{meta_entry.ip_or_host_name, desc->tcp_data_port};
+            ConnectionKey key{meta_entry.ip_or_host_name,
+                              static_cast<uint16_t>(desc->tcp_data_port)};
             std::lock_guard<std::mutex> lock(pool_mutex_);
             auto it = connection_pool_.find(key);
             if (it != connection_pool_.end()) {

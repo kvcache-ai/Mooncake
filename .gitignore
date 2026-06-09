@@ -5,6 +5,7 @@ build_ofed4
 old
 local_test
 go.sum
+!mooncake-common/etcd/go.sum
 *.so
 bin
 mod
@@ -205,3 +206,6 @@ _codeql_detected_source_root
 
 # CodeBuddy Memory
 .codebuddy/
+
+# MacOS 
+.DS_Store
