@@ -20,6 +20,9 @@
 #include <algorithm>
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
+
 namespace mooncake {
 namespace tent {
 
@@ -160,7 +163,8 @@ void TransportSelector::loadPolicies() {
                     policy_json["priority"].get<std::string>();
                 // Convert to lowercase for case-insensitive matching
                 std::transform(prio_str.begin(), prio_str.end(),
-                               prio_str.begin(), ::tolower);
+                               prio_str.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
                 if (prio_str == "high" || prio_str == "0") {
                     policy.priority = PRIO_HIGH;
                 } else if (prio_str == "medium" || prio_str == "1") {
