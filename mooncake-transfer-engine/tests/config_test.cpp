@@ -181,6 +181,16 @@ TEST_F(SliceSizeEnvTest, ZeroIsRejected) {
     EXPECT_EQ(config.slice_size, 99999u);
 }
 
+TEST_F(SliceSizeEnvTest, NegativeWrapsToLargeValue) {
+    ASSERT_EQ(::setenv("MC_SLICE_SIZE", "-100", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    // atoi("-100") returns -100, cast to size_t wraps to a large value.
+    // val > 0 passes, so config.slice_size gets the wrapped value.
+    // This documents existing (buggy) behavior.
+    EXPECT_NE(config.slice_size, 65536u);
+}
+
 // --- MC_LOG_LEVEL (string match) ---
 
 class LogLevelEnvTest : public ::testing::Test {
@@ -216,6 +226,14 @@ TEST_F(LogLevelEnvTest, TraceEnablesTrace) {
     loadGlobalConfig(config);
     EXPECT_EQ(config.log_level, google::INFO);
     EXPECT_TRUE(config.trace);
+}
+
+TEST_F(LogLevelEnvTest, InvalidLevelKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_LOG_LEVEL", "INVALID", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.log_level, google::INFO);
+    EXPECT_FALSE(config.trace);
 }
 
 // --- MC_DISABLE_METACACHE (presence check) ---
@@ -307,8 +325,9 @@ TEST_F(EndpointStoreTypeEnvTest, FifoOverride) {
 TEST_F(EndpointStoreTypeEnvTest, InvalidIsRejected) {
     ASSERT_EQ(::setenv("MC_ENDPOINT_STORE_TYPE", "LRU", 1), 0);
     GlobalConfig config;
+    config.endpoint_store_type = EndpointStoreType::FIFO;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.endpoint_store_type, EndpointStoreType::SIEVE);
+    EXPECT_EQ(config.endpoint_store_type, EndpointStoreType::FIFO);
 }
 
 // --- ValidatePortRange (pure function) ---
