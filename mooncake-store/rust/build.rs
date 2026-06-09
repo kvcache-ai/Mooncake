@@ -331,6 +331,7 @@ fn main() {
         ("curl", &["curl"]),
         ("cuda", &["cuda"]),
         ("cudart", &["cudart"]),
+        ("mlx5", &["mlx5"]), // IBGDA device transport (mlx5 DevX) pulled into transfer_engine, CUDA-only
         ("uring", &["uring"]),
         ("zmq", &["zmq"]),
     ] {

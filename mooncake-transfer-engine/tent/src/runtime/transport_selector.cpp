@@ -17,7 +17,11 @@
 #include "tent/runtime/platform.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
+#include <algorithm>
 #include <glog/logging.h>
+
+#include <algorithm>
+#include <cctype>
 
 namespace mooncake {
 namespace tent {
@@ -25,16 +29,20 @@ namespace tent {
 // Transport type name mapping
 static const std::unordered_map<std::string, TransportType> kTransportNameMap =
     {
-        {"rdma", RDMA},           {"tcp", TCP},     {"shm", SHM},
-        {"nvlink", NVLINK},       {"gds", GDS},     {"io_uring", IOURING},
-        {"ascend", AscendDirect}, {"mnnvl", MNNVL},
+        {"unspec", UNSPEC},       {"rdma", RDMA},
+        {"mnnvl", MNNVL},         {"shm", SHM},
+        {"nvlink", NVLINK},       {"gds", GDS},
+        {"io_uring", IOURING},    {"tcp", TCP},
+        {"ascend", AscendDirect}, {"sunrise_link", SUNRISE_LINK},
 };
 
 static const std::unordered_map<TransportType, std::string>
     kTransportTypeNames = {
-        {RDMA, "rdma"},           {TCP, "tcp"},     {SHM, "shm"},
-        {NVLINK, "nvlink"},       {GDS, "gds"},     {IOURING, "io_uring"},
-        {AscendDirect, "ascend"}, {MNNVL, "mnnvl"}, {UNSPEC, "unspec"},
+        {UNSPEC, "unspec"},       {RDMA, "rdma"},
+        {MNNVL, "mnnvl"},         {SHM, "shm"},
+        {NVLINK, "nvlink"},       {GDS, "gds"},
+        {IOURING, "io_uring"},    {TCP, "tcp"},
+        {AscendDirect, "ascend"}, {SUNRISE_LINK, "sunrise_link"},
 };
 
 // Memory type name mapping for pattern matching
@@ -155,7 +163,8 @@ void TransportSelector::loadPolicies() {
                     policy_json["priority"].get<std::string>();
                 // Convert to lowercase for case-insensitive matching
                 std::transform(prio_str.begin(), prio_str.end(),
-                               prio_str.begin(), ::tolower);
+                               prio_str.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
                 if (prio_str == "high" || prio_str == "0") {
                     policy.priority = PRIO_HIGH;
                 } else if (prio_str == "medium" || prio_str == "1") {
@@ -237,6 +246,13 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
 
 bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
                                       const SelectionContext& context) const {
+    // If context specifies a policy_name, only match that exact policy with
+    // matching segment type
+    if (context.policy_name.has_value()) {
+        return context.policy_name.value() == policy.name &&
+               policy.segment_type == context.segment_type;
+    }
+
     // Check segment type
     if (policy.segment_type != context.segment_type) {
         return false;
@@ -347,7 +363,7 @@ SelectionResult TransportSelector::select(
     const SelectionContext& context,
     const std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>&
         available_transports,
-    int transport_index) {
+    int transport_index, TransportType hint) {
     SelectionResult result;
 
     // Find the first matching policy (JSON order wins)
@@ -385,42 +401,59 @@ SelectionResult TransportSelector::select(
         }
     }
 
-    // If policy has transports list, use it
-    if (!matching_policy->transports.empty()) {
-        int priority_index = transport_index;
-        for (size_t i = 0; i < matching_policy->transports.size(); ++i) {
-            TransportType type = matching_policy->transports[i];
-            if (isTransportAvailable(type, context, available_transports)) {
-                if (priority_index-- <= 0) {
-                    result.transport = type;
-                    VLOG(1) << "Selected transport " << transportTypeName(type)
-                            << " for policy " << matching_policy->name
-                            << ", device_mask=0x" << std::hex
-                            << result.device_mask << std::dec;
-                    return result;
-                }
-            }
-        }
-        return result;  // UNSPEC
-    }
+    // The "raw" candidate set is whatever the matching policy authorizes:
+    // the policy's explicit transports list, or the buffer's registered
+    // transports as a fallback.
+    static const std::vector<TransportType> kEmpty;
+    const auto& raw = !matching_policy->transports.empty()
+                          ? matching_policy->transports
+                      : context.buffer_transports ? *context.buffer_transports
+                                                  : kEmpty;
 
-    // Otherwise, use buffer_transports order (original behavior)
-    if (context.buffer_transports) {
-        for (auto type : *context.buffer_transports) {
-            if (isTransportAvailable(type, context, available_transports)) {
-                if (transport_index-- <= 0) {
-                    result.transport = type;
-                    VLOG(1) << "Selected transport " << transportTypeName(type)
-                            << " from buffer_transports"
-                            << ", device_mask=0x" << std::hex
-                            << result.device_mask << std::dec;
-                    return result;
-                }
-            }
-        }
-    }
+    if (transport_index < 0) return result;
+    const int original_index = transport_index;
 
+    auto candidates = reorderWithHint(raw, hint);
+    if (!candidates) return result;  // UNSPEC -> task FAILED downstream
+
+    const bool has_hint = (hint != UNSPEC);
+    for (size_t i = 0; i < candidates->size(); ++i) {
+        TransportType type = (*candidates)[i];
+        if (!isTransportAvailable(type, context, available_transports)) {
+            // The pinned hint at slot 0 must be available; if it isn't,
+            // reject the request rather than falling through to another
+            // transport the caller did not ask for.
+            if (has_hint && i == 0) return result;
+            continue;
+        }
+        if (transport_index == 0) {
+            result.transport = type;
+            break;
+        }
+        --transport_index;
+    }
+    if (result.transport == UNSPEC) return result;
+    VLOG(1) << "Selected transport " << transportTypeName(result.transport)
+            << " for policy " << matching_policy->name << " at index "
+            << original_index << " (hint=" << transportTypeName(hint)
+            << "), device_mask=0x" << std::hex << result.device_mask
+            << std::dec;
     return result;
+}
+
+std::optional<std::vector<TransportType>> TransportSelector::reorderWithHint(
+    const std::vector<TransportType>& raw, TransportType hint) {
+    if (hint == UNSPEC) return raw;
+    if (std::find(raw.begin(), raw.end(), hint) == raw.end()) {
+        return std::nullopt;
+    }
+    std::vector<TransportType> out;
+    out.reserve(raw.size());
+    out.push_back(hint);
+    for (TransportType t : raw) {
+        if (t != hint) out.push_back(t);
+    }
+    return out;
 }
 
 }  // namespace tent

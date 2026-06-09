@@ -16,6 +16,8 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 
 namespace mooncake {
@@ -120,7 +122,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
     std::string lower_str = str;
     std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
-                   ::tolower);
+                   [](unsigned char c) { return std::tolower(c); });
 
     if (lower_str == "true" || lower_str == "1" || lower_str == "yes" ||
         lower_str == "on") {

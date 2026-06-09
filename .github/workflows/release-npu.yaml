@@ -149,15 +149,14 @@ jobs:
           cd build
           cmake_args=(
             -DUSE_ASCEND_DIRECT=ON
-            -DUSE_CUDA=OFF
-            -DWITH_EP=OFF
-            -DUSE_HTTP=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON
             -DBUILD_UNIT_TESTS=OFF
-            -DBUILD_EXAMPLES=ON
             -DCMAKE_BUILD_TYPE=Release
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
           )
           cmake .. "${cmake_args[@]}"
 

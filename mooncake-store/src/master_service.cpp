@@ -6,6 +6,7 @@
 #include <limits>
 #include <random>
 #include <shared_mutex>
+#include <sstream>
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
@@ -603,10 +604,6 @@ MasterService::getAliveClientsSnapshot() const {
     return ok_client_;
 }
 
-size_t MasterService::getMetadataShardIndex(const std::string& key) const {
-    return getMetadataShardIndex("default", key);
-}
-
 size_t MasterService::getMetadataShardIndex(const std::string& tenant_id,
                                             const std::string& key) const {
     const auto normalized_tenant = NormalizeTenantId(tenant_id);
@@ -937,11 +934,6 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
 #endif
 }
 
-auto MasterService::ExistKey(const std::string& key)
-    -> tl::expected<bool, ErrorCode> {
-    return ExistKey(key, "default");
-}
-
 auto MasterService::ExistKey(const std::string& key,
                              const std::string& tenant_id)
     -> tl::expected<bool, ErrorCode> {
@@ -970,21 +962,22 @@ auto MasterService::ExistKey(const std::string& key,
 }
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const std::string& tenant_id) {
     std::vector<tl::expected<bool, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(ExistKey(key));
+        results.emplace_back(ExistKey(key, tenant_id));
     }
     return results;
 }
 
-auto MasterService::GetAllKeys()
+auto MasterService::GetAllKeys(const std::string& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
-        auto tenant_it = shard->tenants.find("default");
+        auto tenant_it = shard->tenants.find(normalized_tenant);
         if (tenant_it == shard->tenants.end()) {
             continue;
         }
@@ -1024,6 +1017,45 @@ auto MasterService::GetAllNoFSegments()
 auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
     -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> {
     return nof_segment_manager_.GetSegmentsByName(segment_name);
+}
+
+auto MasterService::GetSegmentsDetail()
+    -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    // Get full info of all segments (including Segment and client_id)
+    std::vector<std::pair<Segment, UUID>> all_segments;
+    auto err = segment_access.GetAllSegments(all_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    std::vector<SegmentDetailInfo> result;
+    result.reserve(all_segments.size());
+
+    for (const auto& [segment, client_id] : all_segments) {
+        SegmentDetailInfo info;
+        info.segment_name = segment.name;
+        info.segment_id = segment.id;
+        info.client_id = client_id;
+        info.base_address = segment.base;
+        info.size_bytes = segment.size;
+        info.te_endpoint = segment.te_endpoint;
+        info.protocol = segment.protocol;
+
+        // Query segment status
+        segment_access.GetSegmentStatusByName(segment.name, info.status);
+
+        // Query allocator used/capacity
+        size_t used = 0, capacity = 0;
+        segment_access.QuerySegments(segment.name, used, capacity);
+        info.allocator_used_bytes = used;
+        info.allocator_capacity_bytes = capacity;
+
+        result.push_back(std::move(info));
+    }
+
+    return result;
 }
 
 auto MasterService::QuerySegments(const std::string& segment)
@@ -1124,7 +1156,8 @@ auto MasterService::BatchReplicaClear(
             LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
             continue;
         }
-        MetadataAccessorRW accessor(this, key);
+        // BatchReplicaClear is a default-tenant compatibility/admin helper.
+        MetadataAccessorRW accessor(this, MakeObjectIdentity(key, "default"));
         if (!accessor.Exists()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " not found, skipping";
@@ -1228,13 +1261,6 @@ auto MasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
-auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
-    -> tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode> {
-    return GetReplicaListByRegex(regex_pattern, "default");
-}
-
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const std::string& tenant_id)
     -> tl::expected<
@@ -1282,11 +1308,6 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     }
 
     return results;
-}
-
-auto MasterService::GetReplicaList(const std::string& key)
-    -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    return GetReplicaList(key, "default");
 }
 
 auto MasterService::GetReplicaList(const std::string& key,
@@ -1517,13 +1538,6 @@ auto MasterService::AllocateAndInsertMetadata(
 }
 
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
-                             const uint64_t slice_length,
-                             const ReplicateConfig& config)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    return PutStart(client_id, key, "default", slice_length, config);
-}
-
-auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const std::string& tenant_id,
                              const uint64_t slice_length,
                              const ReplicateConfig& config)
@@ -1648,12 +1662,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, "default", replica_type);
-}
-
-auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const std::string& tenant_id,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -1731,12 +1739,6 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
-                               Replica& replica)
-    -> tl::expected<void, ErrorCode> {
-    return AddReplica(client_id, key, "default", replica);
-}
-
-auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const std::string& tenant_id, Replica& replica)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -1779,12 +1781,6 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     .object_size;
         });
     return {};
-}
-
-auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
-                              ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
-    return PutRevoke(client_id, key, "default", replica_type);
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
@@ -1848,12 +1844,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type) {
-    return BatchPutEnd(client_id, keys, "default", replica_type);
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
@@ -1861,12 +1851,6 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
         results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
     }
     return results;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type) {
-    return BatchPutRevoke(client_id, keys, "default", replica_type);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
@@ -1895,13 +1879,6 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 //
 // Note: during Case B the key is temporarily unreadable (all replicas are
 // PROCESSING).  Readers will get REPLICA_IS_NOT_READY until UpsertEnd.
-auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
-                                const uint64_t slice_length,
-                                const ReplicateConfig& config)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    return UpsertStart(client_id, key, "default", slice_length, config);
-}
-
 auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 const std::string& tenant_id,
                                 const uint64_t slice_length,
@@ -2158,12 +2135,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
-                              ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
-    return UpsertEnd(client_id, key, "default", replica_type);
-}
-
-auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const std::string& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -2171,24 +2142,10 @@ auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
-                                 ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
-    return UpsertRevoke(client_id, key, "default", replica_type);
-}
-
-auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  const std::string& tenant_id,
                                  ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     return PutRevoke(client_id, key, tenant_id, replica_type);
-}
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchUpsertStart(const UUID& client_id,
-                                const std::vector<std::string>& keys,
-                                const std::vector<uint64_t>& slice_lengths,
-                                const ReplicateConfig& config) {
-    return BatchUpsertStart(client_id, keys, "default", slice_lengths, config);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -2225,32 +2182,15 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys) {
-    return BatchUpsertEnd(client_id, keys, "default");
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
     return BatchPutEnd(client_id, keys, tenant_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
-    const UUID& client_id, const std::vector<std::string>& keys) {
-    return BatchUpsertRevoke(client_id, keys, "default");
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id) {
     return BatchPutRevoke(client_id, keys, tenant_id);
-}
-
-auto MasterService::EvictDiskReplica(const UUID& client_id,
-                                     const std::string& key,
-                                     ReplicaType replica_type)
-    -> tl::expected<void, ErrorCode> {
-    return EvictDiskReplica(client_id, key, "default", replica_type);
 }
 
 auto MasterService::EvictDiskReplica(const UUID& client_id,
@@ -2293,12 +2233,6 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type) {
-    return BatchEvictDiskReplica(client_id, keys, "default", replica_type);
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
-    const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
@@ -2307,13 +2241,6 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
             EvictDiskReplica(client_id, key, tenant_id, replica_type));
     }
     return results;
-}
-
-tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
-    const UUID& client_id, const std::string& key,
-    const std::string& src_segment,
-    const std::vector<std::string>& tgt_segments) {
-    return CopyStart(client_id, key, "default", src_segment, tgt_segments);
 }
 
 tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
@@ -2413,11 +2340,6 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     return response;
 }
 
-tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
-                                                     const std::string& key) {
-    return CopyEnd(client_id, key, "default");
-}
-
 tl::expected<void, ErrorCode> MasterService::CopyEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
@@ -2491,11 +2413,6 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 }
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
-    const UUID& client_id, const std::string& key) {
-    return CopyRevoke(client_id, key, "default");
-}
-
-tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2547,12 +2464,6 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     return {};
-}
-
-tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
-    const UUID& client_id, const std::string& key,
-    const std::string& src_segment, const std::string& tgt_segment) {
-    return MoveStart(client_id, key, "default", src_segment, tgt_segment);
 }
 
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
@@ -2647,11 +2558,6 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     return response;
 }
 
-tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
-                                                     const std::string& key) {
-    return MoveEnd(client_id, key, "default");
-}
-
 tl::expected<void, ErrorCode> MasterService::MoveEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
@@ -2740,11 +2646,6 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
 }
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
-    const UUID& client_id, const std::string& key) {
-    return MoveRevoke(client_id, key, "default");
-}
-
-tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2798,11 +2699,6 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key, bool force)
-    -> tl::expected<void, ErrorCode> {
-    return Remove(key, "default", force);
-}
-
 auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2841,11 +2737,6 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
     ErasePromotionTaskIfPresent(tenant_state, key);
     accessor.Erase();
     return {};
-}
-
-auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
-    -> tl::expected<long, ErrorCode> {
-    return RemoveByRegex(regex_pattern, "default", force);
 }
 
 auto MasterService::RemoveByRegex(const std::string& regex_pattern,
@@ -3004,12 +2895,6 @@ long MasterService::RemoveAll(const std::string& tenant_id, bool force) {
             << ", removed_count=" << removed_count
             << ", total_freed_size=" << total_freed_size;
     return removed_count;
-}
-
-auto MasterService::BatchRemove(const std::vector<std::string>& keys,
-                                bool force)
-    -> std::vector<tl::expected<void, ErrorCode>> {
-    return BatchRemove(keys, "default", force);
 }
 
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
@@ -3318,19 +3203,6 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
 }
 
 auto MasterService::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas)
-    -> tl::expected<void, ErrorCode> {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(keys.size());
-    for (const auto& key : keys) {
-        tasks.push_back(
-            OffloadTaskItem{.tenant_id = "default", .key = key, .size = 0});
-    }
-    return NotifyOffloadSuccess(client_id, tasks, metadatas);
-}
-
-auto MasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas)
     -> tl::expected<void, ErrorCode> {
@@ -3469,13 +3341,15 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
         return;
     }
     const auto& key = object_id.user_key;
+    const auto admission_key =
+        MakeTenantScopedStorageKey(object_id.tenant_id, key);
 
     // Frequency gate: bump and compare against the threshold. The sketch
     // returns uint8_t (saturating at 255); promotion_admission_threshold_
     // is clamped into [1, 255] at config parse time (see master.cpp), so
     // direct comparison is well-defined and threshold=0 (which would
     // bypass the gate entirely since freq is uint8_t) cannot reach here.
-    const uint8_t freq = promotion_sketch_->increment(key);
+    const uint8_t freq = promotion_sketch_->increment(admission_key);
     if (freq < promotion_admission_threshold_) {
         MasterMetricManager::instance().inc_promotion_rejected_frequency();
         return;
@@ -3595,14 +3469,6 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
 }
 
 auto MasterService::PromotionAllocStart(
-    const UUID& client_id, const std::string& key, uint64_t size,
-    const std::vector<std::string>& preferred_segments)
-    -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
-    return PromotionAllocStart(client_id, key, "default", size,
-                               preferred_segments);
-}
-
-auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
     uint64_t size, const std::vector<std::string>& preferred_segments)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
@@ -3697,12 +3563,6 @@ auto MasterService::PromotionAllocStart(
 }
 
 auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
-                                           const std::string& key)
-    -> tl::expected<void, ErrorCode> {
-    return NotifyPromotionSuccess(client_id, key, "default");
-}
-
-auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const std::string& key,
                                            const std::string& tenant_id)
     -> tl::expected<void, ErrorCode> {
@@ -3775,12 +3635,6 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
     return {};
-}
-
-auto MasterService::NotifyPromotionFailure(const UUID& client_id,
-                                           const std::string& key)
-    -> tl::expected<void, ErrorCode> {
-    return NotifyPromotionFailure(client_id, key, "default");
 }
 
 auto MasterService::NotifyPromotionFailure(const UUID& client_id,
@@ -6498,15 +6352,18 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // Format detection:
+    // Format detection (decode optional fields by type for back-compat):
     //   v1: 7 + replicas_count, no optional fields
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
-    constexpr uint32_t kBaseFieldCount = 7;
-    constexpr uint32_t kMaxOptionalFieldCount = 3;
-    const uint32_t total_elements = obj.via.array.size;
-    const uint32_t min_elements = kBaseFieldCount + replicas_count;
+    // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
+    // replicas_count from wrapping the bounds and slipping an out-of-bounds
+    // index past the size check.
+    constexpr uint64_t kBaseFieldCount = 7;
+    constexpr uint64_t kMaxOptionalFieldCount = 3;
+    const uint64_t total_elements = obj.via.array.size;
+    const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
         total_elements > min_elements + kMaxOptionalFieldCount) {
         return tl::unexpected(SerializationError(
@@ -6525,6 +6382,15 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     replicas.reserve(replicas_count);
 
     for (uint32_t i = 0; i < replicas_count; i++) {
+        // Defensive bound: the data_type skip above can consume a slot the
+        // size check counted on, so a crafted entry whose first post-count
+        // field looks like a data_type could otherwise read past the array.
+        // Mirrors the standby reader in catalog_backed_snapshot_provider.cpp.
+        if (index >= total_elements) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize ObjectMetadata truncated"));
+        }
         auto result = Serializer<Replica>::deserialize(
             array[index++], service_->segment_manager_.getView());
         if (!result) {
@@ -6584,11 +6450,6 @@ std::string MasterService::FormatTimestamp(
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
-    const std::string& key, const std::vector<std::string>& targets) {
-    return CreateCopyTask(key, "default", targets);
-}
-
-tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::string& tenant_id,
     const std::vector<std::string>& targets) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -6644,12 +6505,6 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                             .key = object_id.user_key,
                             .source = selected_source_segment,
                             .targets = targets});
-}
-
-tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
-    const std::string& key, const std::string& source,
-    const std::string& target) {
-    return CreateMoveTask(key, "default", source, target);
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(

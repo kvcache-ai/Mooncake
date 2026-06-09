@@ -458,6 +458,11 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
+    if (length == 0) {
+        LOG(ERROR) << "readString: zero length from socket";
+        return {type, ""};
+    }
+
     std::string str;
     std::vector<char> buffer(length);
     n = readFully(fd, buffer.data(), length);

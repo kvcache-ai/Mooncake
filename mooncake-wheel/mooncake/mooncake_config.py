@@ -53,20 +53,37 @@ from typing import Optional
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
+_SIZE_SUFFIXES = [
+    ("kb", 1024),
+    ("mb", 1024 ** 2),
+    ("gb", 1024 ** 3),
+    ("tb", 1024 ** 4),
+    ("k", 1024),
+    ("m", 1024 ** 2),
+    ("g", 1024 ** 3),
+    ("t", 1024 ** 4),
+    ("b", 1),
+]
+
+
 def _parse_segment_size(value) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, str):
         s = value.strip().lower()
-        if s.endswith("gb"):
-            num = s[:-2].strip()
-            if not num:
-                raise ValueError(
-                    "Invalid segment size: missing number before 'gb'"
-                )
-            return int(num) * 1024 * 1024 * 1024
-        return int(s)
+        if not s:
+            raise ValueError("Invalid segment size: empty string")
+        for suffix, multiplier in _SIZE_SUFFIXES:
+            if s.endswith(suffix):
+                num = s[: -len(suffix)].strip()
+                if not num:
+                    raise ValueError(
+                        f"Invalid segment size: missing number before '{suffix}'"
+                    )
+                return int(float(num) * multiplier)
+        return int(float(s))
     return int(value)
+
 
 @dataclass
 class MooncakeConfig:
@@ -85,6 +102,8 @@ class MooncakeConfig:
             (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
             Required when protocol is "rdma", optional for other protocols.
         master_server_address (str): The address of the master server.
+        enable_ssd_offload (bool): Enable SSD offload. Default is False.
+        ssd_offload_path (str): The path to the SSD directory for offloading.
 
     Example of configuration file:
         {
@@ -94,7 +113,9 @@ class MooncakeConfig:
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
             "device_name": "",
-            "master_server_address": "localhost:8081"
+            "master_server_address": "localhost:8081",
+            "enable_ssd_offload": true,
+            "ssd_offload_path": "/nvme/mooncake_offload"
         }
         
         For RDMA:
@@ -105,7 +126,9 @@ class MooncakeConfig:
             "local_buffer_size": 1073741824,
             "protocol": "rdma",
             "device_name": "mlx5_0",
-            "master_server_address": "master:8081"
+            "master_server_address": "master:8081",
+            "enable_ssd_offload": true,
+            "ssd_offload_path": "/nvme/mooncake_offload"
         }
     """
     local_hostname: str
@@ -115,6 +138,8 @@ class MooncakeConfig:
     protocol: str
     device_name: Optional[str]
     master_server_address: str
+    enable_ssd_offload: bool = False
+    ssd_offload_path: str = ""
 
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
@@ -141,6 +166,8 @@ class MooncakeConfig:
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
+            enable_ssd_offload=bool(config.get("enable_ssd_offload", False)),
+            ssd_offload_path=str(config.get("ssd_offload_path", "")),
         )
 
     @staticmethod
@@ -167,5 +194,7 @@ class MooncakeConfig:
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),
+                enable_ssd_offload=os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false").lower() in ("true", "1"),
+                ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
             )
         return MooncakeConfig.from_file(config_file_path)
