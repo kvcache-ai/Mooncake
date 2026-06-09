@@ -77,27 +77,7 @@ static size_t detectBufferPageSize(void* addr) {
     return fallback;
 }
 
-static constexpr size_t kMaxAllowedPteEntries = 100ULL * 1024 * 1024;  // 100M
-
-static size_t getMaxPteEntries() {
-    static size_t cached = []() {
-        const char* env = std::getenv("MC_EFA_MAX_PTE_ENTRIES");
-        if (env) {
-            try {
-                size_t val = std::stoull(env);
-                if (val > 0 && val <= kMaxAllowedPteEntries) {
-                    LOG(INFO) << "MC_EFA_MAX_PTE_ENTRIES override: " << val;
-                    return val;
-                }
-                LOG(ERROR) << "MC_EFA_MAX_PTE_ENTRIES out of range: " << env;
-            } catch (const std::exception& e) {
-                LOG(ERROR) << "Invalid MC_EFA_MAX_PTE_ENTRIES value: " << env;
-            }
-        }
-        return kDefaultMaxPteEntries;
-    }();
-    return cached;
-}
+static size_t getMaxPteEntries() { return kDefaultMaxPteEntries; }
 
 EfaTransport::EfaTransport() {
     LOG(INFO) << "[EFA] AWS Elastic Fabric Adapter transport initialized";
