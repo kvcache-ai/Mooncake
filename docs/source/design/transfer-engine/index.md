@@ -318,6 +318,14 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 
 For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
 
+## Supported Protocols
+
+:::{toctree}
+:maxdepth: 1
+
+../../getting_started/supported-protocols
+:::
+
 ## EFA Transport (AWS)
 
 :::{toctree}
@@ -343,14 +351,6 @@ heterogeneous_ascend
 
 kunpeng_ub_transport
 sunrise_link_transport
-:::
-
-## Supported Protocols
-
-:::{toctree}
-:maxdepth: 1
-
-../../getting_started/supported-protocols
 :::
 
 ## Benchmark and Tuning Guide

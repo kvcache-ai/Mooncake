@@ -42,7 +42,7 @@ def main():
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
     PROTOCOL = "rdma" # [rdma, tcp, ...]
     DEVICE_NAME = "" # auto discovery if empty
-    
+
     # Initialize server engine
     server_engine = TransferEngine()
     server_engine.initialize(
@@ -52,12 +52,12 @@ def main():
         DEVICE_NAME
     )
     session_id = f"{HOSTNAME}:{server_engine.get_rpc_port()}"
-    
+
     # Allocate memory on server side (1MB buffer)
     server_buffer = np.zeros(1024 * 1024, dtype=np.uint8)
     server_ptr = server_buffer.ctypes.data
     server_len = server_buffer.nbytes
-    
+
     # Register memory with Mooncake
     if PROTOCOL == "rdma":
         ret_value = server_engine.register_memory(server_ptr, server_len)
@@ -67,7 +67,7 @@ def main():
 
     print(f"Server initialized with session ID: {session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
+
     # Send buffer info to client
     buffer_info = {
         "session_id": session_id,
@@ -76,7 +76,7 @@ def main():
     }
     socket.send_json(buffer_info)
     print("Buffer information sent to client")
-    
+
     # Keep server running
     try:
         while True:
@@ -95,8 +95,8 @@ def main():
         context.term()
 
 if __name__ == "__main__":
-    main() 
- 
+    main()
+
 ```
 
 ### Start Transfer Engine Sender (Client)
@@ -113,7 +113,7 @@ def main():
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     socket.connect(f"tcp://localhost:5555")
-    
+
     # Wait for buffer info from server
     print("Waiting for server buffer information...")
     buffer_info = socket.recv_json()
@@ -122,7 +122,7 @@ def main():
     server_len = buffer_info["len"]
     print(f"Received server info - Session ID: {server_session_id}")
     print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
+
     # Initialize client engine
     HOSTNAME = "localhost" # localhost for simple demo
     METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
@@ -137,12 +137,12 @@ def main():
         DEVICE_NAME
     )
     session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-    
+
     # Allocate and initialize client buffer (1MB)
     client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
     client_ptr = client_buffer.ctypes.data
     client_len = client_buffer.nbytes
-    
+
     # Register memory with Mooncake
     if PROTOCOL == "rdma":
         ret_value = client_engine.register_memory(client_ptr, client_len)
@@ -161,12 +161,12 @@ def main():
             server_ptr,
             min(client_len, server_len)  # Transfer minimum of both lengths
         )
-    
+
         if ret >= 0:
             print("Transfer successful!")
         else:
             print("Transfer failed!")
-    
+
     # Cleanup
     if PROTOCOL == "rdma":
         ret_value = client_engine.unregister_memory(client_ptr)
@@ -178,7 +178,7 @@ def main():
     context.term()
 
 if __name__ == "__main__":
-    main() 
+    main()
 
 ```
 
@@ -245,4 +245,4 @@ store.close()
 
 ### More Examples and Documentation
 
-Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Operations Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
+Please refer to the [Mooncake Store Python API](../python-api-reference/mooncake-store.md), [Mooncake Store](../design/mooncake-store.md) and [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for more examples and documentation.
