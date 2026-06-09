@@ -131,17 +131,17 @@ TEST_F(NumCqEnvTest, ValidOverride) {
 TEST_F(NumCqEnvTest, ZeroIsRejected) {
     ASSERT_EQ(::setenv("MC_NUM_CQ_PER_CTX", "0", 1), 0);
     GlobalConfig config;
-    config.num_cq_per_ctx = 1;
+    config.num_cq_per_ctx = 42;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.num_cq_per_ctx, 1u);
+    EXPECT_EQ(config.num_cq_per_ctx, 42u);
 }
 
 TEST_F(NumCqEnvTest, OverMaxIsRejected) {
     ASSERT_EQ(::setenv("MC_NUM_CQ_PER_CTX", "256", 1), 0);
     GlobalConfig config;
-    config.num_cq_per_ctx = 1;
+    config.num_cq_per_ctx = 42;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.num_cq_per_ctx, 1u);
+    EXPECT_EQ(config.num_cq_per_ctx, 42u);
 }
 
 TEST_F(NumCqEnvTest, AlsoSetsJfcAndJfce) {
@@ -176,9 +176,9 @@ TEST_F(SliceSizeEnvTest, ValidOverride) {
 TEST_F(SliceSizeEnvTest, ZeroIsRejected) {
     ASSERT_EQ(::setenv("MC_SLICE_SIZE", "0", 1), 0);
     GlobalConfig config;
-    config.slice_size = 65536;
+    config.slice_size = 99999;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.slice_size, 65536u);
+    EXPECT_EQ(config.slice_size, 99999u);
 }
 
 // --- MC_LOG_LEVEL (string match) ---
@@ -353,6 +353,66 @@ TEST(ValidatePortRangeTest, MaxPort65535IsValid) {
     auto [min_p, max_p] = ValidatePortRange(61000, 65535, 15000, 17000);
     EXPECT_EQ(min_p, 61000);
     EXPECT_EQ(max_p, 65535);
+}
+
+TEST(ValidatePortRangeTest, FirstValidPort1024) {
+    auto [min_p, max_p] = ValidatePortRange(1024, 2000, 15000, 17000);
+    EXPECT_EQ(min_p, 1024);
+    EXPECT_EQ(max_p, 2000);
+}
+
+TEST(ValidatePortRangeTest, LastBeforeEphemeral32767) {
+    auto [min_p, max_p] = ValidatePortRange(1024, 32767, 15000, 17000);
+    EXPECT_EQ(min_p, 1024);
+    EXPECT_EQ(max_p, 32767);
+}
+
+TEST(ValidatePortRangeTest, AboveMaxRejected) {
+    auto [min_p, max_p] = ValidatePortRange(61000, 65536, 15000, 17000);
+    EXPECT_EQ(min_p, 15000);
+    EXPECT_EQ(max_p, 17000);
+}
+
+// --- MC_MTU (valid values only; invalid causes exit()) ---
+
+class MtuEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MTU"); }
+};
+
+TEST_F(MtuEnvTest, DefaultIs4096) {
+    ::unsetenv("MC_MTU");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
+}
+
+TEST_F(MtuEnvTest, Mtu512) {
+    ASSERT_EQ(::setenv("MC_MTU", "512", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_512);
+}
+
+TEST_F(MtuEnvTest, Mtu1024) {
+    ASSERT_EQ(::setenv("MC_MTU", "1024", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_1024);
+}
+
+TEST_F(MtuEnvTest, Mtu2048) {
+    ASSERT_EQ(::setenv("MC_MTU", "2048", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_2048);
+}
+
+TEST_F(MtuEnvTest, Mtu4096) {
+    ASSERT_EQ(::setenv("MC_MTU", "4096", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
 }
 
 }  // namespace
