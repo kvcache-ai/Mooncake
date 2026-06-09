@@ -192,3 +192,83 @@ gpu_id + thread_id
 
 * `--metadata_type` : `p2p | etcd | redis | http` (default: `p2p`)
 * `--metadata_url_list` : comma-separated URLs (ignored in `p2p` mode)
+
+---
+
+## 6. All-to-All Multi-Node Testing
+
+`tebench` supports **all-to-all** testing for measuring aggregate bandwidth in multi-node clusters. In this mode, every node connects to all other nodes simultaneously, and results are aggregated across the cluster.
+
+### 6.1 When to Use All-to-All Mode
+
+All-to-all testing is useful for:
+
+* **Cluster-scale validation** — verify full bisection bandwidth
+* **Network tuning** — identify bottlenecks before production deployment
+* **Scaling tests** — measure how performance changes with node count
+
+### 6.2 All-to-All Configuration
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `--enable_alltoall` | Enable all-to-all mode | `true` |
+| `--test_id` | Unique identifier for the test run | `test_run_001` |
+| `--num_nodes` | Total number of nodes in the test | `4` |
+| `--node_rank` | This node's rank (0-based) | `0, 1, 2, 3` |
+| `--sync_timeout_sec` | Timeout for node synchronization (default: 120s) | `120` |
+
+> **Note**: All-to-all mode requires the **TENT backend** (`--backend=tent`).
+
+### 6.3 Running an All-to-All Test
+
+On each node, start `tebench` with a unique `node_rank`:
+
+```bash
+# Node 0
+./tebench \
+  --backend=tent \
+  --enable_alltoall=true \
+  --test_id=my_test \
+  --num_nodes=4 \
+  --node_rank=0 \
+  --seg_type=DRAM \
+  --op_type=read
+
+# Node 1 (on different machine)
+./tebench \
+  --backend=tent \
+  --enable_alltoall=true \
+  --test_id=my_test \
+  --num_nodes=4 \
+  --node_rank=1 \
+  --seg_type=DRAM \
+  --op_type=read
+
+# Node 2
+./tebench ... --node_rank=2
+
+# Node 3
+./tebench ... --node_rank=3
+```
+
+The test automatically:
+
+1. **Generates segment names** for all nodes (`tebench_alltoall_<test_id>_node_<rank>`)
+2. **Synchronizes** — waits for all nodes to be ready
+3. **Connects** each node to all other nodes
+4. **Runs tests** and aggregates results on rank 0
+
+### 6.4 All-to-All Output
+
+Results on rank 0 show **aggregated metrics** across all nodes:
+
+```text
+===== All-to-All Aggregated Results (4 nodes) =====
+BlkSize(B)  Batch  Thrd  Flows   BW(GB/s)  AvgLat(us)  AvgTx(us)  P99Tx(us)  P999Tx(us)
+      4096      8     1     12       48.2        2.1        1.8        3.2         4.1
+```
+
+Where:
+* **Flows** = `num_threads × target_count × num_nodes` (total concurrent flows)
+* **BW** = Aggregate bandwidth across all nodes
+* **Latency** = Per-transfer latency (averaged across all nodes)

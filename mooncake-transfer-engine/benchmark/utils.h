@@ -77,6 +77,13 @@ struct XferBenchConfig {
 
     static int local_gpu_id;
     static int target_gpu_id;
+
+    // All-to-all multi-node configuration
+    static bool enable_alltoall;
+    static std::string test_id;
+    static int32_t num_nodes;
+    static int32_t node_rank;
+    static int32_t sync_timeout_sec;
 };
 
 struct XferMetricStats {
@@ -97,22 +104,22 @@ struct XferMetricStats {
         return sum / samples.size();
     }
 
-    double p90() { return percentile(90.0); }
+    double p90() const { return percentile(90.0); }
 
-    double p95() { return percentile(95.0); }
+    double p95() const { return percentile(95.0); }
 
-    double p99() { return percentile(99.0); }
+    double p99() const { return percentile(99.0); }
 
-    double p999() { return percentile(99.9); }
+    double p999() const { return percentile(99.9); }
 
     void add(double value) { samples.push_back(value); }
 
     void clear() { samples.clear(); }
 
-    size_t count() { return samples.size(); }
+    size_t count() const { return samples.size(); }
 
    private:
-    double percentile(double p);
+    double percentile(double p) const;
 
    private:
     std::vector<double> samples;

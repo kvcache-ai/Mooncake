@@ -53,6 +53,18 @@ DEFINE_string(
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
 
+// All-to-all multi-node configuration flags
+DEFINE_bool(enable_alltoall, false,
+            "Enable all-to-all multi-node testing mode");
+DEFINE_string(test_id, "default-test",
+              "Unique identifier for this test run (must be same on all nodes)");
+DEFINE_int32(num_nodes, 1,
+             "Total number of nodes in the test");
+DEFINE_int32(node_rank, 0,
+             "Rank of this node (0-based, must be unique per node)");
+DEFINE_int32(sync_timeout_sec, 120,
+             "Timeout for node synchronization (seconds)");
+
 namespace mooncake {
 namespace tent {
 std::string XferBenchConfig::seg_name;
@@ -81,6 +93,13 @@ std::string XferBenchConfig::tent_transport_hint;
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
+// All-to-all multi-node configuration
+bool XferBenchConfig::enable_alltoall = false;
+std::string XferBenchConfig::test_id;
+int32_t XferBenchConfig::num_nodes = 1;
+int32_t XferBenchConfig::node_rank = 0;
+int32_t XferBenchConfig::sync_timeout_sec = 120;
+
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
     seg_name = FLAGS_seg_name;
@@ -108,9 +127,16 @@ void XferBenchConfig::loadFromFlags() {
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
+
+    // All-to-all configuration
+    enable_alltoall = FLAGS_enable_alltoall;
+    test_id = FLAGS_test_id;
+    num_nodes = FLAGS_num_nodes;
+    node_rank = FLAGS_node_rank;
+    sync_timeout_sec = FLAGS_sync_timeout_sec;
 }
 
-double XferMetricStats::percentile(double p) {
+double XferMetricStats::percentile(double p) const {
     if (samples.empty()) return 0.0;
     if (p <= 0) return min();
     if (p >= 100) return max();

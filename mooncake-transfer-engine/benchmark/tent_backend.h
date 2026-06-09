@@ -57,6 +57,8 @@ class TENTBenchRunner : public BenchRunner {
 
     std::string getSegmentName() const { return engine_->getSegmentName(); }
 
+    TransferEngine* getEngine() const { return engine_.get(); }
+
     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
                                 uint64_t batch_size) const {
         const size_t num_buffers = pinned_buffer_list_.size();
@@ -74,6 +76,18 @@ class TENTBenchRunner : public BenchRunner {
                              uint64_t block_size, uint64_t batch_size,
                              OpCode opcode);
 
+    // Multi-target methods for all-to-all testing
+    int publishSegment(const std::string& segment_name) override;
+
+    int connectToAllTargets(const std::vector<std::string>& target_segments,
+                           int sync_timeout_sec = 120) override;
+
+    size_t getTargetCount() const override;
+
+    double runTransferToTarget(uint64_t local_addr, size_t target_idx,
+                               uint64_t block_size, uint64_t batch_size,
+                               OpCode opcode) override;
+
    private:
     int allocateBuffers();
 
@@ -87,6 +101,11 @@ class TENTBenchRunner : public BenchRunner {
     SegmentID handle_;
     SegmentInfo info_;
     TransportType transport_hint_{UNSPEC};
+
+    // Multi-target support for all-to-all testing
+    std::vector<SegmentID> target_handles_;
+    std::vector<SegmentInfo> target_infos_;
+    std::vector<std::string> target_names_;
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;

@@ -54,40 +54,66 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
 
-volatile bool g_te_running = true;
-volatile bool g_te_triggered_sig = false;
+// Use atomic<bool> for thread-safe signal handling
+std::atomic<bool> g_te_running{true};
+std::atomic<bool> g_te_triggered_sig{false};
 
+// Signal handler that only performs async-signal-safe operations
 void signalHandlerV0(int signum) {
-    if (g_te_triggered_sig) {
-        LOG(ERROR) << "Received signal " << signum
-                   << " again, forcefully terminating...";
-        std::exit(EXIT_FAILURE);
+    // Only set atomic flags - this is async-signal-safe
+    bool was_already_triggered = g_te_triggered_sig.exchange(true);
+    if (was_already_triggered) {
+        // Second signal - terminate immediately
+        _exit(EXIT_FAILURE);
     }
-    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_te_running = false;
-    g_te_triggered_sig = true;
+    g_te_running.store(false);
 }
 
-static void* allocateMemoryPool(size_t size, int buffer_id,
-                                bool from_vram = false) {
+void* TEBenchRunner::allocateMemoryPool(size_t size, int buffer_id, bool from_vram) {
 #ifdef USE_CUDA
     if (from_vram) {
         int gpu_id = buffer_id;
-        void* d_buf;
+        void* d_buf = nullptr;
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
-        cudaSetDevice(gpu_id);
+
+        auto err = cudaSetDevice(gpu_id);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "cudaSetDevice failed for GPU " << gpu_id << ": "
+                       << cudaGetErrorString(err);
+            return nullptr;
+        }
+
 #ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
 #else
-        cudaMalloc(&d_buf, size);
+        err = cudaMalloc(&d_buf, size);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "cudaMalloc failed for GPU " << gpu_id << ": "
+                       << cudaGetErrorString(err);
+            return nullptr;
+        }
 #endif
+
+        if (d_buf == nullptr) {
+            LOG(ERROR) << "Memory allocation returned nullptr for GPU " << gpu_id;
+        }
         return d_buf;
     }
 #endif
-    return numa_alloc_onnode(size, buffer_id);
+
+    void* buf = numa_alloc_onnode(size, buffer_id);
+    if (buf == nullptr) {
+        LOG(ERROR) << "numa_alloc_onnode failed for node " << buffer_id;
+    }
+    return buf;
 }
 
-static void freeMemoryPool(void* addr, size_t size) {
+void TEBenchRunner::freeMemoryPool(void* addr, size_t size) {
+    if (addr == nullptr) {
+        LOG(WARNING) << "Attempt to free nullptr";
+        return;
+    }
+
 #ifdef USE_CUDA
 #ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
@@ -97,69 +123,148 @@ static void freeMemoryPool(void* addr, size_t size) {
         return;
     }
 #endif
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    cudaPointerGetAttributes(&attributes, addr);
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(addr, size);
+    // Check pointer type
+    cudaPointerAttributes attributes;
+    auto err = cudaPointerGetAttributes(&attributes, addr);
+
+    if (err == cudaSuccess) {
+        if (attributes.type == cudaMemoryTypeDevice) {
+            auto free_err = cudaFree(addr);
+            if (free_err != cudaSuccess) {
+                LOG(WARNING) << "cudaFree failed: " << cudaGetErrorString(free_err);
+            }
+            return;
+        } else if (attributes.type == cudaMemoryTypeHost ||
+                   attributes.type == cudaMemoryTypeUnregistered) {
+            numa_free(addr, size);
+            return;
+        } else {
+            LOG(ERROR) << "Unknown memory type for ptr " << addr << ", type: "
+                       << attributes.type;
+        }
     } else {
-        LOG(ERROR) << "Unknown memory type, " << addr << " " << attributes.type;
+        // cudaPointerGetAttributes failed - assume it's host memory
+        LOG(WARNING) << "cudaPointerGetAttributes failed for ptr " << addr
+                     << ": " << cudaGetErrorString(err) << ", assuming host memory";
     }
-#else
-    numa_free(addr, size);
 #endif
+
+    numa_free(addr, size);
 }
 
 int TEBenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
+
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
+        if (num_buffers <= 0) {
+            LOG(ERROR) << "Invalid NUMA node count: " << num_buffers;
+            return -1;
+        }
+
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
             auto location = "cpu:" + std::to_string(i);
-            pinned_buffer_list_[i] =
-                allocateMemoryPool(total_buffer_size, i, false);
-            engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                         total_buffer_size, location);
+            pinned_buffer_list_[i] = allocateMemoryPool(total_buffer_size, i, false);
+            if (pinned_buffer_list_[i] == nullptr) {
+                LOG(ERROR) << "Failed to allocate buffer for node " << i;
+                // Clean up already allocated buffers
+                for (int j = 0; j < i; ++j) {
+                    engine_->unregisterLocalMemory(pinned_buffer_list_[j]);
+                    freeMemoryPool(pinned_buffer_list_[j], total_buffer_size);
+                }
+                pinned_buffer_list_.clear();
+                return -1;
+            }
+
+            auto ret = engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                     total_buffer_size, location);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to register memory for " << location
+                           << ", error code: " << ret;
+                freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+                // Clean up already allocated buffers
+                for (int j = 0; j < i; ++j) {
+                    engine_->unregisterLocalMemory(pinned_buffer_list_[j]);
+                    freeMemoryPool(pinned_buffer_list_[j], total_buffer_size);
+                }
+                pinned_buffer_list_.clear();
+                return -1;
+            }
         }
+
 #ifdef USE_CUDA
     } else if (XferBenchConfig::seg_type == "VRAM") {
         int gpu_count = 0;
-        cudaGetDeviceCount(&gpu_count);
+        auto err = cudaGetDeviceCount(&gpu_count);
+        if (err != cudaSuccess || gpu_count <= 0) {
+            LOG(ERROR) << "Failed to get CUDA device count or no devices available: "
+                       << (err != cudaSuccess ? cudaGetErrorString(err) : "no devices");
+            return -1;
+        }
+
         int start_gpu = 0, num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
             start_gpu = XferBenchConfig::local_gpu_id;
             num_buffers = 1;
-            LOG_ASSERT(start_gpu >= 0 && start_gpu < gpu_count)
-                << "local_gpu_id " << start_gpu << " out of range [0, "
-                << gpu_count << ")";
+            if (start_gpu < 0 || start_gpu >= gpu_count) {
+                LOG(ERROR) << "local_gpu_id " << start_gpu << " out of range [0, "
+                           << gpu_count << ")";
+                return -1;
+            }
         }
+
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
             int gpu_id = start_gpu + i;
             auto location = "cuda:" + std::to_string(gpu_id);
-            pinned_buffer_list_[i] =
-                allocateMemoryPool(total_buffer_size, gpu_id, true);
-            engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                         total_buffer_size, location);
+            pinned_buffer_list_[i] = allocateMemoryPool(total_buffer_size, gpu_id, true);
+            if (pinned_buffer_list_[i] == nullptr) {
+                LOG(ERROR) << "Failed to allocate buffer for GPU " << gpu_id;
+                // Clean up already allocated buffers
+                for (int j = 0; j < i; ++j) {
+                    engine_->unregisterLocalMemory(pinned_buffer_list_[j]);
+                    freeMemoryPool(pinned_buffer_list_[j], total_buffer_size);
+                }
+                pinned_buffer_list_.clear();
+                return -1;
+            }
+
+            auto ret = engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                     total_buffer_size, location);
+            if (ret != 0) {
+                LOG(ERROR) << "Failed to register memory for " << location
+                           << ", error code: " << ret;
+                freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+                // Clean up already allocated buffers
+                for (int j = 0; j < i; ++j) {
+                    engine_->unregisterLocalMemory(pinned_buffer_list_[j]);
+                    freeMemoryPool(pinned_buffer_list_[j], total_buffer_size);
+                }
+                pinned_buffer_list_.clear();
+                return -1;
+            }
         }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << XferBenchConfig::seg_type;
+        return -1;
     }
+
     return 0;
 }
 
 int TEBenchRunner::freeBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
+
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
-        engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-        freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+        if (pinned_buffer_list_[i] != nullptr && engine_) {
+            engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
+            freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+        }
     }
+
     pinned_buffer_list_.clear();
     return 0;
 }
@@ -193,7 +298,7 @@ int TEBenchRunner::startInitiator(int num_threads) {
         [](const TransferMetadata::BufferDesc& a,
            const TransferMetadata::BufferDesc& b) { return a.name < b.name; });
     threads_.resize(num_threads);
-    g_te_running = true;
+    g_te_running.store(true);
     current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&TEBenchRunner::runner, this, i);
@@ -203,7 +308,7 @@ int TEBenchRunner::startInitiator(int num_threads) {
 int TEBenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_te_running = false;
+        g_te_running.store(false);
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -300,6 +405,31 @@ double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
     auto duration = timer.lap_us();
     CHECK_FAIL(engine_->freeBatchID(batch_id));
     return duration;
+}
+
+// Multi-target methods (not supported for classic TE backend)
+int TEBenchRunner::publishSegment(const std::string& segment_name) {
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
+    LOG(ERROR) << "Please use TENT backend (--backend=tent) for all-to-all testing";
+    return -1;
+}
+
+int TEBenchRunner::connectToAllTargets(const std::vector<std::string>& target_segments,
+                                      int sync_timeout_sec) {
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
+    LOG(ERROR) << "Please use TENT backend (--backend=tent) for all-to-all testing";
+    return -1;
+}
+
+size_t TEBenchRunner::getTargetCount() const {
+    return 0;
+}
+
+double TEBenchRunner::runTransferToTarget(uint64_t local_addr, size_t target_idx,
+                                        uint64_t block_size, uint64_t batch_size,
+                                        OpCode opcode) {
+    LOG(ERROR) << "Multi-target all-to-all mode is not supported for classic TE backend";
+    return -1.0;
 }
 
 }  // namespace tent

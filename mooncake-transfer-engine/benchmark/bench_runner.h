@@ -58,6 +58,18 @@ class BenchRunner {
     virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                                      uint64_t block_size, uint64_t batch_size,
                                      OpCode opcode) = 0;
+
+    // Multi-target methods for all-to-all testing
+    virtual int publishSegment(const std::string& segment_name) = 0;
+
+    virtual int connectToAllTargets(const std::vector<std::string>& target_segments,
+                                  int sync_timeout_sec = 120) = 0;
+
+    virtual size_t getTargetCount() const = 0;
+
+    virtual double runTransferToTarget(uint64_t local_addr, size_t target_idx,
+                                       uint64_t block_size, uint64_t batch_size,
+                                       OpCode opcode) = 0;
 };
 
 }  // namespace tent
