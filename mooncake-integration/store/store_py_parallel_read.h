@@ -346,10 +346,6 @@ std::optional<TensorIntoPlan> build_reconstructed_tensor_into_plan_from_sources(
     const size_t target_tensor_bytes = target_tensor_numel * *element_size;
     const size_t total_length = sizeof(TensorMetadata) + target_tensor_bytes;
 
-    auto region = resolve_writable_buffer_region(buffer_ptr, size, context);
-    if (!region.has_value()) {
-        return std::nullopt;
-    }
     if (total_length > size || region->offset + total_length > region->size) {
         LOG(ERROR) << context << ": buffer too small for reconstructed tensor";
         return std::nullopt;
