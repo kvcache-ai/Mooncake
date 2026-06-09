@@ -102,6 +102,9 @@ func newStoreClientConfig(validEndpoints []string) clientv3.Config {
 }
 
 func parseEtcdEndpoints(endpoints *C.char) []string {
+	if endpoints == nil {
+		return nil
+	}
 	endpointStr := C.GoString(endpoints)
 	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
 	endpointList := strings.Split(endpointStr, ";")
