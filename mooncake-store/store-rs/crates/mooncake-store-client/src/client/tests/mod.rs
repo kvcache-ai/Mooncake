@@ -25,11 +25,11 @@ use super::{
     align_up_u64, bootstrap_route_policy, cached_live_client_snapshot, compatibility_matches,
     control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
     flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
-    scatter_into_buffers, shared_suspect_runtime_cache, stable_debug_log_sample,
-    startup_prewarm_delay, AllocationSpan, ColdTierBackendResolver, LiveClientCache,
-    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
-    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
-    SuspectRuntimeCache,
+    run_bounded_parallel_jobs, scatter_into_buffers, shared_suspect_runtime_cache,
+    stable_debug_log_sample, startup_prewarm_delay, AllocationSpan, ColdTierBackendResolver,
+    LiveClientCache, LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter,
+    PendingReclaim, ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState,
+    StoreState, SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -13778,6 +13778,51 @@ fn flush_due_reclaims_skips_duplicate_remote_release() {
         writer.state.lock().pending_reclaims.is_empty(),
         "writer reclaim queue should be drained after duplicate remote cleanup"
     );
+}
+
+#[test]
+fn bounded_parallel_jobs_parallelize_and_preserve_order() {
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let max_inflight = Arc::new(AtomicUsize::new(0));
+    let jobs = vec![0usize, 1, 2, 3];
+    let parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+
+    let results = run_bounded_parallel_jobs(jobs, 2, {
+        let inflight = inflight.clone();
+        let max_inflight = max_inflight.clone();
+        move |job| {
+            let current = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_inflight.fetch_max(current, Ordering::SeqCst);
+            sleep(Duration::from_millis(20));
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            job * 10
+        }
+    });
+
+    assert_eq!(results, vec![0, 10, 20, 30]);
+    if parallelism < 2 {
+        assert_eq!(
+            max_inflight.load(Ordering::SeqCst),
+            1,
+            "single-core fallback should stay on the serial path"
+        );
+        return;
+    }
+    assert!(
+        max_inflight.load(Ordering::SeqCst) >= 2,
+        "jobs should overlap when parallelism is greater than one"
+    );
+}
+
+#[test]
+fn bounded_parallel_jobs_handles_empty_and_single_job_inputs() {
+    let empty_results = run_bounded_parallel_jobs::<usize, usize, _>(Vec::new(), 8, |job| job * 10);
+    assert!(empty_results.is_empty());
+
+    let single_results = run_bounded_parallel_jobs(vec![7usize], 8, |job| job * 10);
+    assert_eq!(single_results, vec![70]);
 }
 
 #[test]
