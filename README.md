@@ -252,7 +252,7 @@ pip install mooncake-transfer-engine-non-cuda
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
 
-To produce an image that compiles Mooncake from source, builds the wheel via `scripts/build_wheel.sh`, and installs that wheel inside the container, use `build-wheel.dockerfile`:
+To produce an image that compiles Mooncake from source, builds the wheel via `scripts/build_wheel.sh`, and installs that wheel inside the container, use `docker/mooncake.Dockerfile`:
 
 ```bash
 docker build -f docker/mooncake.Dockerfile \
