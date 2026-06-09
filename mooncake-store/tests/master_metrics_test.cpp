@@ -431,6 +431,11 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     EXPECT_NE(segments_resp.body.find("service plane is not active"),
               std::string::npos);
 
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 503);
+    EXPECT_NE(detail_resp.body.find("service plane is not active"),
+              std::string::npos);
+
     admin_server.Stop();
 }
 
@@ -465,6 +470,16 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_EQ(query_resp.http_status, 200);
     EXPECT_NE(query_resp.body.find(segment.name), std::string::npos);
     EXPECT_NE(query_resp.body.find("Capacity(bytes)"), std::string::npos);
+
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 200);
+    EXPECT_NE(detail_resp.body.find("\"total_segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find(segment.name), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_used_bytes\""),
+              std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
+              std::string::npos);
 
     admin_server.Stop();
 }

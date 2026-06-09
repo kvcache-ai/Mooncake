@@ -203,6 +203,33 @@ class MasterService {
         -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
 
     /**
+     * @brief Detailed information about a single segment.
+     * Keeps original types so callers can use values directly without
+     * needing to parse strings back to uuid/address/enum.
+     */
+    struct SegmentDetailInfo {
+        std::string segment_name;
+        UUID segment_id{0, 0};
+        UUID client_id{0, 0};
+        uintptr_t base_address{0};
+        uint64_t size_bytes{0};
+        std::string te_endpoint;
+        std::string protocol;
+        SegmentStatus status{SegmentStatus::UNDEFINED};
+        uint64_t allocator_used_bytes{0};
+        uint64_t allocator_capacity_bytes{0};
+    };
+
+    /**
+     * @brief Get detailed information of all segments, including the
+     * relationships between segment_id, client_id, segment_name, status,
+     * allocator used/capacity, etc.
+     * @return A vector of SegmentDetailInfo on success, error code otherwise.
+     */
+    auto GetSegmentsDetail()
+        -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode>;
+
+    /**
      * @brief Query a segment's capacity and used size in bytes.
      * Conductor should use these information to schedule new requests.
      * @return ErrorCode::OK if exists
