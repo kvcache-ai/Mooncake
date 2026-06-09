@@ -58,7 +58,7 @@ curl "http://localhost:8080/query_key?key=my_object"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "transport_endpoint_": "hostname:port",
   "buffer_descriptors": [...]
@@ -79,7 +79,7 @@ curl "http://localhost:8080/batch_query_keys?keys=key1,key2,key3"
 ```
 
 **Response Format**:
-```json
+```text
 {
   "success": true,
   "data": {
@@ -145,6 +145,57 @@ segment_name
 Used(bytes): 1073741824
 Capacity(bytes): 4294967296
 ```
+
+#### `/get_segments_detail`
+Get detailed information of all segments in JSON format, including segment metadata, allocator usage, and status.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object containing an array of segment details
+
+**Example**:
+```bash
+curl http://localhost:8080/get_segments_detail
+```
+
+**Response Format**:
+```json
+{
+  "total_segments": 2,
+  "segments": [
+    {
+      "segment_name": "segment_0",
+      "segment_id": "00000000-0000-0000-0000-000000000001",
+      "client_id": "00000000-0000-0000-0000-000000000002",
+      "base_address": "0x300000000",
+      "size_bytes": 17179869184,
+      "size_human": "16 GiB",
+      "te_endpoint": "192.168.1.1:12345",
+      "protocol": "rdma",
+      "status": "MOUNTED",
+      "allocator_used_bytes": 1073741824,
+      "allocator_capacity_bytes": 17179869184,
+      "allocator_usage_percent": 6.25
+    }
+  ]
+}
+```
+
+**Fields**:
+- `total_segments` (integer): Total number of segments in the cluster
+- `segments` (array): Array of segment detail objects
+  - `segment_name` (string): Name of the segment
+  - `segment_id` (string): UUID of the segment
+  - `client_id` (string): UUID of the client that owns the segment
+  - `base_address` (string): Base memory address in hex
+  - `size_bytes` (integer): Segment size in bytes
+  - `size_human` (string): Human-readable segment size
+  - `te_endpoint` (string): Transport endpoint address
+  - `protocol` (string): Transfer protocol (e.g., rdma, tcp)
+  - `status` (string): Current segment status
+  - `allocator_used_bytes` (integer): Bytes currently allocated
+  - `allocator_capacity_bytes` (integer): Total allocator capacity in bytes
+  - `allocator_usage_percent` (number): Percentage of allocator capacity used
 
 ### Health Check Endpoints
 
@@ -241,11 +292,16 @@ Unmount one or more segment ids previously returned by `/api/mount_shm`.
 **Request Body**:
 ```json
 {
-  "segment_ids": ["00000000-0000-0000-0000-000000000001"]
+  "segment_ids": ["00000000-0000-0000-0000-000000000001"],
+  "grace_period_seconds": 0
 }
 ```
 
 `segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount behavior. When set to a positive value, the master
+keeps the segment readable for that grace period while preventing new
+allocations, then completes the unmount.
 
 **Success Response**:
 ```json
@@ -258,7 +314,8 @@ Unmount one or more segment ids previously returned by `/api/mount_shm`.
 ```bash
 curl -X POST http://localhost:8080/api/unmount_shm \
   -H "Content-Type: application/json" \
-  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"]}'
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000001"],
+       "grace_period_seconds": 30}'
 ```
 
 ### `/api/mount`
@@ -312,11 +369,16 @@ the memory allocated by the store process.
 **Request Body**:
 ```json
 {
-  "segment_ids": ["00000000-0000-0000-0000-000000000002"]
+  "segment_ids": ["00000000-0000-0000-0000-000000000002"],
+  "grace_period_seconds": 0
 }
 ```
 
 `segment_ids` may also be provided as a single string for one segment.
+`grace_period_seconds` is optional and defaults to `0`, which keeps the
+existing immediate unmount-and-free behavior. When set to a positive value, the
+master keeps the segment readable for that grace period while preventing new
+allocations, then the store releases the local allocated memory after cleanup.
 
 **Success Response**:
 ```json
@@ -329,5 +391,6 @@ the memory allocated by the store process.
 ```bash
 curl -X POST http://localhost:8080/api/unmount \
   -H "Content-Type: application/json" \
-  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"]}'
+  -d '{"segment_ids": ["00000000-0000-0000-0000-000000000002"],
+       "grace_period_seconds": 30}'
 ```

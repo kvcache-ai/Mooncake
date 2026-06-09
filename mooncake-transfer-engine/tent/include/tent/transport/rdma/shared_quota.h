@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef TENT_SHARED_QUOTA_H
-#define TENT_SHARED_QUOTA_H
+#ifndef TENT_SHARED_SLOT_H
+#define TENT_SHARED_SLOT_H
 
 #include "quota.h"
 #include "tent/common/status.h"
@@ -31,60 +31,54 @@
 #include <vector>
 #include <iostream>
 #include <errno.h>
+#include <thread>
 
 namespace mooncake {
 namespace tent {
 
-static constexpr int MAX_DEVICES = 64;
-static constexpr int MAX_PID_SLOTS = 256;
-static constexpr uint64_t SHM_MAGIC = 0x2025082772805202ULL;
-static constexpr int SHM_VERSION = 1;
+static constexpr uint64_t SHM_MAGIC = 0x2025082772805203ULL;
+static constexpr int SHM_VERSION = 10;
 
-struct PidUsage {
-    pid_t pid;                     // 0 == free slot
-    volatile uint64_t used_bytes;  // local used bytes reported by this pid
-    uint8_t reserved[56];          // padding -> total 64B
-};
-
-struct SharedDeviceEntry {
-    char dev_name[56];  // NUL-terminated device name, empty means unused
-    volatile uint64_t active_bytes;
-    PidUsage pid_usages[MAX_PID_SLOTS];
-};
+// Time slice configuration for process-level coordination
+// Slot 0:            HIGH only
+// Slot 1:            MEDIUM + HIGH
+// Slot 2:            ALL (LOW + MEDIUM + HIGH)
+// Then repeat
+static constexpr int NUM_SLOTS = PRIO_LOW + 1;
 
 struct SharedHeader {
     uint64_t magic;
     int32_t version;
-    int32_t num_devices;
+    std::atomic<int> current_slot;
     pthread_mutex_t global_mutex;
-    SharedDeviceEntry devices[MAX_DEVICES];
 };
 
-class DeviceQuota;
-class SharedQuotaManager {
+class DeviceSelector;
+class SharedSlotManager {
    public:
-    explicit SharedQuotaManager(DeviceQuota* local_quota);
-    ~SharedQuotaManager();
+    explicit SharedSlotManager(DeviceSelector* local_quota);
+    ~SharedSlotManager();
 
     Status attach(const std::string& shm_name);
     Status detach();
 
-    Status diffusion();
+    // Check if current process can send (global slot)
+    // Returns true if given priority is allowed in current global slot
+    bool canSend(int priority = PRIO_HIGH);
+
+    // Set slot duration in milliseconds (must be > 0)
+    void setRotationIntervalMs(int ms) { rotation_interval_ms_ = ms; }
+    int getRotationIntervalMs() const { return rotation_interval_ms_; }
 
    private:
-    Status attachProcess();
-    Status detachProcess();
-
-   private:
-    PidUsage* findOrCreatePidSlotLocked(int dev_id, pid_t pid);
-    PidUsage* findPidSlotLocked(int dev_id, pid_t pid);
-    int findDeviceIdByNameLocked(const std::string& dev_name);
+    void startBackgroundThread();
+    void stopBackgroundThread();
+    void backgroundThreadLoop();
     Status initializeHeader();
     Status initMutex(pthread_mutex_t* m);
-    void reclaimDeadPidsInternal();
-    static bool isPidAlive(pid_t pid);
-    int lock();
-    int unlock();
+
+    // Check if a priority is allowed in the given slot
+    bool isPriorityAllowedInSlot(int priority, int slot) const;
 
    private:
     std::string name_;
@@ -92,10 +86,15 @@ class SharedQuotaManager {
     int fd_;
     size_t size_;
     bool created_;
-    DeviceQuota* local_quota_;
+    DeviceSelector* device_selector_;
+    int rotation_interval_ms_ = 2;  // Default: 2ms per slot
+
+    // Background thread
+    std::thread background_thread_;
+    std::atomic<bool> background_running_;
 };
 
 }  // namespace tent
 }  // namespace mooncake
 
-#endif  // TENT_SHARED_QUOTA_H
+#endif  // TENT_SHARED_SLOT_H

@@ -8,6 +8,7 @@ source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
 USE_NVCC=false
 USE_HIPCC=false
 USE_MCC=false
+USE_MACA=false
 CI_BUILD=false
 
 if [[ "$1" == "--use-nvcc" ]]; then
@@ -18,6 +19,9 @@ elif [[ "$1" == "--use-hipcc" ]]; then
     shift
 elif [[ "$1" == "--use-mcc" ]]; then
     USE_MCC=true
+    shift
+elif [[ "$1" == "--use-maca" ]]; then
+    USE_MACA=true
     shift
 elif [[ "$1" == "--ci-build" ]]; then
     CI_BUILD=true
@@ -45,6 +49,11 @@ elif [ "$USE_HIPCC" = true ]; then
     hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1
 elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
+elif [ "$USE_MACA" = true ]; then
+    MACA_ROOT=${MACA_HOME:-/opt/maca}
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC \
+        -I"${MACA_ROOT}/include" ${INCLUDE_FLAGS} \
+        -L"${MACA_ROOT}/lib64" -L"${MACA_ROOT}/lib" -lmcruntime -DUSE_MACA=1
 else
     # Default g++ build
     g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1

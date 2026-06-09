@@ -18,6 +18,26 @@ using gpu_staging::CopyDeviceToHost;
 using gpu_staging::IsDevicePointer;
 using gpu_staging::SetDevice;
 
+namespace {
+
+std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
+    const std::vector<std::string>& storage_keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    std::vector<OffloadTaskItem> tasks;
+    tasks.reserve(storage_keys.size());
+    for (size_t i = 0; i < storage_keys.size(); ++i) {
+        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
+        const int64_t size =
+            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
+        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                                        .key = std::move(key),
+                                        .size = size});
+    }
+    return tasks;
+}
+
+}  // namespace
+
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
@@ -32,6 +52,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     } else if (storage_backend_descriptor ==
                "offset_allocator_storage_backend") {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    } else if (storage_backend_descriptor == "distributed_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kDistributed;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }
@@ -58,7 +80,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
+                           config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
         GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
@@ -161,8 +183,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      client_buffer_allocator_(
-          AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
+      client_buffer_allocator_(AlignedClientBufferAllocator::create(
+          config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -264,8 +286,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
+            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
             auto add_object_result =
-                client_->NotifyOffloadSuccess(keys, metadatas);
+                client_->NotifyOffloadSuccess(tasks, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -339,12 +362,26 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
-    const std::unordered_map<std::string, int64_t>& offloading_objects) {
+    const std::vector<OffloadTaskItem>& offloading_objects) {
+    if (offloading_objects.empty()) {
+        return {};
+    }
+    std::unordered_map<std::string, int64_t> storage_object_sizes;
+    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
+    storage_object_sizes.reserve(offloading_objects.size());
+    task_by_storage_key.reserve(offloading_objects.size());
+    for (const auto& task : offloading_objects) {
+        const auto storage_key =
+            MakeTenantScopedStorageKey(task.tenant_id, task.key);
+        storage_object_sizes.emplace(storage_key, task.size);
+        task_by_storage_key.emplace(storage_key, task);
+    }
+
     std::vector<std::vector<std::string>> buckets_keys;
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            offloading_objects, buckets_keys);
+            storage_object_sizes, buckets_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -352,21 +389,32 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     } else {
         std::vector<std::string> keys;
-        keys.reserve(offloading_objects.size());
-        for (const auto& it : offloading_objects) {
+        keys.reserve(storage_object_sizes.size());
+        for (const auto& it : storage_object_sizes) {
             keys.emplace_back(it.first);
         }
         buckets_keys.emplace_back(std::move(keys));
     }
 
     auto complete_handler =
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        [this, &task_by_storage_key](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }
-        auto result = client_->NotifyOffloadSuccess(keys, metadatas);
+        std::vector<OffloadTaskItem> tasks;
+        tasks.reserve(keys.size());
+        for (const auto& key : keys) {
+            auto it = task_by_storage_key.find(key);
+            if (it == task_by_storage_key.end()) {
+                LOG(ERROR) << "Offload task not found for storage key";
+                return ErrorCode::INVALID_KEY;
+            }
+            tasks.push_back(it->second);
+        }
+        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
             LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
                        << result.error();
@@ -377,24 +425,63 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     for (const auto& keys : buckets_keys) {
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        auto query_result = BatchQuerySegmentSlices(keys, batch_object);
-        if (!query_result) {
-            LOG(ERROR) << "BatchQuerySlices failed with error: "
-                       << query_result.error();
+        std::unordered_map<std::string, std::vector<std::string>>
+            storage_keys_by_tenant;
+        for (const auto& storage_key : keys) {
+            const auto it = task_by_storage_key.find(storage_key);
+            if (it != task_by_storage_key.end()) {
+                storage_keys_by_tenant[it->second.tenant_id].push_back(
+                    storage_key);
+            }
+        }
+        for (const auto& [tenant_id, storage_keys] : storage_keys_by_tenant) {
+            std::vector<std::string> user_keys;
+            user_keys.reserve(storage_keys.size());
+            for (const auto& storage_key : storage_keys) {
+                user_keys.push_back(task_by_storage_key[storage_key].key);
+            }
+            std::unordered_map<std::string, std::vector<Slice>>
+                user_batch_object;
+            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
+                                                        user_batch_object);
+            if (!query_result) {
+                LOG(ERROR) << "BatchQuerySlices failed with error: "
+                           << query_result.error();
+                continue;
+            }
+            for (size_t i = 0; i < storage_keys.size(); ++i) {
+                auto it = user_batch_object.find(user_keys[i]);
+                if (it != user_batch_object.end()) {
+                    batch_object.emplace(storage_keys[i],
+                                         std::move(it->second));
+                }
+            }
+        }
+        if (batch_object.empty()) {
             continue;
         }
 
         auto eviction_handler = [this](const std::vector<std::string>&
                                            evicted_keys) {
             if (evicted_keys.empty()) return;
-            auto results = client_->BatchEvictDiskReplica(
-                evicted_keys, ReplicaType::LOCAL_DISK);
-            for (size_t i = 0; i < results.size(); ++i) {
-                if (!results[i]) {
-                    LOG(WARNING)
-                        << "Failed to notify master about evicted local disk "
-                           "key: "
-                        << evicted_keys[i] << ", error: " << results[i].error();
+            std::unordered_map<std::string, std::vector<std::string>>
+                keys_by_tenant;
+            for (const auto& storage_key : evicted_keys) {
+                auto [tenant_id, key] =
+                    ParseTenantScopedStorageKey(storage_key);
+                keys_by_tenant[tenant_id].push_back(key);
+            }
+            for (const auto& [tenant_id, keys] : keys_by_tenant) {
+                auto results = client_->BatchEvictDiskReplica(
+                    keys, tenant_id, ReplicaType::LOCAL_DISK);
+                for (size_t i = 0; i < results.size(); ++i) {
+                    if (!results[i]) {
+                        LOG(WARNING)
+                            << "Failed to notify master about evicted local "
+                               "disk key: "
+                            << keys[i] << ", tenant_id=" << tenant_id
+                            << ", error: " << results[i].error();
+                    }
                 }
             }
         };
@@ -498,7 +585,27 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::unordered_map<std::string, int64_t>
+    // Join previous rescan if completed
+    if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
+                                      0)) == std::future_status::ready) {
+        rescan_future_ = std::future<void>();
+    }
+
+    // Retry metadata resync if previous attempt failed.
+    if (metadata_resync_pending_.load() && !rescan_future_.valid()) {
+        LOG(INFO) << "Retrying background metadata rescan";
+        rescan_future_ = std::async(std::launch::async, [this]() {
+            auto result = ReRegisterOffloadedObjects();
+            if (!result) {
+                LOG(ERROR) << "Background metadata rescan retry "
+                           << "failed: " << result.error();
+            } else {
+                metadata_resync_pending_.store(false);
+            }
+        });
+    }
+
+    std::vector<OffloadTaskItem>
         offloading_objects;  // Objects selected for offloading
 
     // === STEP 1: Send heartbeat and get offloading decisions ===
@@ -507,12 +614,58 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
             enable_offloading_, offloading_objects);
         if (!heartbeat_result) {
-            LOG(ERROR) << "Failed to send heartbeat with error: "
-                       << heartbeat_result.error();
-            return heartbeat_result;
+            ErrorCode err = heartbeat_result.error();
+            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                // Master lost our LOCAL_DISK segment (likely restarted).
+                // Re-register the segment, retry the heartbeat, and
+                // trigger async ScanMeta to re-register object metadata.
+                LOG(WARNING) << "OffloadObjectHeartbeat returned "
+                             << "SEGMENT_NOT_FOUND, attempting to "
+                             << "re-register local disk segment and "
+                             << "re-register object metadata";
+                auto remount_result =
+                    client_->MountLocalDiskSegment(enable_offloading_);
+                if (remount_result) {
+                    heartbeat_result = client_->OffloadObjectHeartbeat(
+                        enable_offloading_, offloading_objects);
+                    if (!heartbeat_result) {
+                        LOG(ERROR) << "Heartbeat failed after re-registration: "
+                                   << heartbeat_result.error();
+                        return heartbeat_result;
+                    }
+                    // Master lost all object metadata on restart.
+                    // Trigger async ScanMeta to re-register them,
+                    // same as what Init() does on startup.
+                    if (!rescan_future_.valid()) {
+                        LOG(INFO) << "Triggering background metadata rescan "
+                                  << "after LOCAL_DISK segment re-registration";
+                        metadata_resync_pending_.store(true);
+                        rescan_future_ =
+                            std::async(std::launch::async, [this]() {
+                                auto result = ReRegisterOffloadedObjects();
+                                if (!result) {
+                                    LOG(ERROR) << "Background metadata rescan "
+                                               << "failed: " << result.error();
+                                } else {
+                                    metadata_resync_pending_.store(false);
+                                }
+                            });
+                    }
+                } else {
+                    LOG(ERROR) << "Failed to re-register local disk segment: "
+                               << remount_result.error();
+                    return tl::make_unexpected(remount_result.error());
+                }
+            } else {
+                LOG(ERROR) << "Failed to send heartbeat with error: " << err;
+                return heartbeat_result;
+            }
         }
     }
 
+    if (offloading_objects.empty()) {
+        return {};
+    }
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
@@ -521,8 +674,162 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return offload_result;
     }
 
+    // Drive any pending L2->L1 promotion work for this client. Failures
+    // inside ProcessPromotionTasks are logged per-key and do not propagate;
+    // promotion is best-effort and must never break offload.
+    (void)ProcessPromotionTasks();
+
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<PromotionTaskItem> promotion_objects;
+    auto heartbeat_result =
+        client_->PromotionObjectHeartbeat(promotion_objects);
+    if (!heartbeat_result) {
+        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
+        // first heartbeat tick if the master forgets us (e.g. across a master
+        // restart): benign no-op until next ReMount.
+        if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            return {};
+        }
+        LOG(WARNING) << "PromotionObjectHeartbeat failed: "
+                     << heartbeat_result.error();
+        return tl::make_unexpected(heartbeat_result.error());
+    }
+    if (promotion_objects.empty()) {
+        return {};
+    }
+
+    VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
+            << " promotion candidate(s) from master";
+
+    // No segment preference from the client: let master pick from any
+    // DRAM segment.
+    const std::vector<std::string> preferred_segments;
+
+    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
+    // returning at most one task per call so the heartbeat thread stays
+    // within the client-liveness window even for large objects. Leftover
+    // work stays queued in the master's promotion_objects map and is
+    // returned on subsequent heartbeats; we process whatever we received
+    // here without a second client-side cap.
+    for (const auto& task : promotion_objects) {
+        const auto& key = task.key;
+        const auto& tenant_id = task.tenant_id;
+        const int64_t size = task.size;
+        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
+        if (size <= 0) {
+            LOG(WARNING) << "Skipping promotion for key=" << key
+                         << " with non-positive size=" << size;
+            continue;
+        }
+
+        auto alloc_result = client_->PromotionAllocStart(
+            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+        if (!alloc_result) {
+            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
+            // DRAM pressure). No staged buffer to release, but the
+            // task entry already claimed a promotion_in_flight_ slot
+            // at admission. Notify the master to release it
+            // immediately; otherwise the slot stays pinned for the
+            // reaper TTL (~10 min default), turning transient DRAM
+            // pressure into a sustained outage of promotion_queue_limit_.
+            // Notify is idempotent and handles alloc_id == 0 correctly.
+            VLOG(1) << "PromotionAllocStart failed for key=" << key
+                    << ", error=" << alloc_result.error()
+                    << " (likely no free DRAM); releasing master slot";
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+            continue;
+        }
+
+        // Every failure path past this point has a master-side staged
+        // PROCESSING MEMORY buffer and an incremented in-flight slot.
+        // Eagerly notify the master on failure so the buffer is
+        // reclaimed and the slot is freed; otherwise transient SSD
+        // throttling or RDMA flakes saturate promotion_queue_limit_
+        // for the full reaper TTL. NotifyPromotionFailure is
+        // idempotent and best-effort — the reaper is the long-stop.
+        auto release_master_state = [this, &key, &tenant_id]() {
+            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            if (!release) {
+                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
+                        << key << ", error=" << release.error()
+                        << "; master reaper will reclaim on TTL expiry";
+            }
+        };
+
+        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
+        // from the local SSD backend into it. AllocateBatch returns a
+        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
+        // staging space when the local goes out of scope.
+        std::vector<std::string> single_key{storage_key};
+        std::vector<int64_t> single_size{size};
+        auto allocate_res = AllocateBatch(single_key, single_size);
+        if (!allocate_res) {
+            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
+                         << ", error=" << allocate_res.error();
+            release_master_state();
+            continue;
+        }
+        auto staging = allocate_res.value();
+        auto load_res = BatchLoad(staging->slices);
+        if (!load_res) {
+            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
+                         << ", error=" << load_res.error();
+            release_master_state();
+            continue;
+        }
+
+        // (b) TE-write from the staging slice into the freshly-allocated
+        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
+        // correction in BatchLoad, so re-read it from the slice map.
+        auto slice_it = staging->slices.find(storage_key);
+        if (slice_it == staging->slices.end()) {
+            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
+            release_master_state();
+            continue;
+        }
+        std::vector<Slice> tx_slices{slice_it->second};
+        ErrorCode write_err = client_->PromotionWrite(
+            alloc_result.value().memory_descriptor, tx_slices);
+        if (write_err != ErrorCode::OK) {
+            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
+                         << ", error=" << write_err;
+            release_master_state();
+            continue;
+        }
+
+        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
+        // becomes visible to readers.
+        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+        if (!notify_res) {
+            // The write landed but the commit failed. We can't retry the
+            // commit (the success path is one-shot via alloc_id), and we
+            // don't know whether the failure was transient or structural.
+            // Release the master-side state so the slot is reusable; the
+            // bytes we wrote become stranded under a soon-to-be-erased
+            // PROCESSING replica, which is harmless.
+            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
+                         << key << ", error=" << notify_res.error();
+            release_master_state();
+            continue;
+        }
+
+        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+    }
+
     return {};
 }
 
@@ -556,9 +863,9 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
-    const std::vector<std::string>& keys,
+    const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys);
+    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
     if (batched_query_results.empty())
         return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
@@ -603,6 +910,11 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
+    if (keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
+                   << ", sizes=" << sizes.size();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
@@ -614,7 +926,11 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
-        assert(sizes[i] <= kMaxSliceSize);
+        if (sizes[i] < 0 || sizes[i] > config_.local_buffer_size) {
+            LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
+                       << " (limit: " << config_.local_buffer_size << ")";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         // Allocate oversized buffer for O_DIRECT alignment:
         //   +4096 for aligning the ptr to 4096 boundary
@@ -705,6 +1021,61 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     VLOG(1) << "batch_id " << batch_id
             << " not found (may have been GC'd already)";
     return false;
+}
+
+tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
+              << "offloaded objects with master";
+    int total_keys = 0;
+    int total_batches = 0;
+    int total_failures = 0;
+    // Reset the scan iterator so ScanMeta starts from the beginning.
+    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
+    // after Init() completes the cursor is 0 and HasNext() returns false,
+    // which would make ScanMeta skip all buckets.
+    storage_backend_->ResetScanIterator();
+    LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
+                 "storage_backend_->ScanMeta()";
+    auto scan_meta_result =
+        storage_backend_->ScanMeta(
+            [this, &total_keys, &total_batches, &total_failures](
+                const std::vector<std::string>& keys,
+                std::vector<StorageObjectMetadata>& metadatas) {
+                total_batches++;
+                total_keys += keys.size();
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = local_rpc_addr_;
+                }
+                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+                auto add_object_result =
+                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                if (!add_object_result) {
+                    total_failures++;
+                    LOG(ERROR)
+                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                        << "failed for batch " << total_batches << " with "
+                        << keys.size()
+                        << " keys, error: " << add_object_result.error();
+                    return add_object_result.error();
+                }
+                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                          << "succeeded for batch " << total_batches << " with "
+                          << keys.size() << " keys";
+                return ErrorCode::OK;
+            });
+
+    LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
+              << scan_meta_result.has_value();
+    if (!scan_meta_result) {
+        LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
+    }
+    LOG(INFO) << "ReRegisterOffloadedObjects: completed. "
+              << "total_keys=" << total_keys
+              << " total_batches=" << total_batches
+              << " total_failures=" << total_failures;
+    return {};
 }
 
 }  // namespace mooncake

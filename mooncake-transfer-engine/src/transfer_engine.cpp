@@ -179,6 +179,17 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
 
+#if defined(USE_CUDA) || defined(USE_MUSA)
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
+
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
@@ -449,6 +460,8 @@ Status TransferEngine::submitTransfer(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -473,6 +486,8 @@ Status TransferEngine::submitTransferWithNotify(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -579,6 +594,19 @@ Transport* TransferEngine::getTransport(const std::string& proto) {
     else
         return impl_->getTransport(proto);
 }
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
 
 bool TransferEngine::isTcpOnly() const {
     if (use_tent_)

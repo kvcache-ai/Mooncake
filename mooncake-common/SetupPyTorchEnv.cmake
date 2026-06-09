@@ -23,6 +23,18 @@ function(install_pytorch_wheel _version _cuda_major _cuda_minor _module_prefix)
     # TODO: Fix when we need to support more CUDA 13 versions or when the CI env is fixed.
     set(_cu_tag "cu130")
 
+  elseif(_cuda_major EQUAL 12 AND _version VERSION_GREATER_EQUAL "2.12.0")
+    # PyTorch 2.12.0+ no longer publishes cu128 wheels.
+    # Use cu126 for all CUDA 12 builds.
+    if(_cuda_minor GREATER_EQUAL 6)
+      set(_cu_tag "cu126")
+    else()
+      message(FATAL_ERROR
+        "${_module_prefix} Can't find a matching PyTorch wheel for version ${_version} "
+        "with CUDA ${_cuda_major}.${_cuda_minor}"
+      )
+    endif()
+
   elseif(_cuda_major EQUAL 12 AND _version VERSION_GREATER_EQUAL "2.11.0")
     # PyTorch 2.11.0+ defaults to CUDA 13.
     # We must explicitly point to CUDA 12 wheels for these newer versions.

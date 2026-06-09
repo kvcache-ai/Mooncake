@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import pg
 
-
 DEVICE_FILTER_ENV_VAR = "MOONCAKE_PGTEST_DEVICE_FILTERS"
 MASTER_ADDR_ENV_VAR = "MOONCAKE_PGTEST_MASTER_ADDR"
 MASTER_PORT_ENV_VAR = "MOONCAKE_PGTEST_MASTER_PORT"
@@ -74,6 +73,12 @@ def temporary_env(updates: dict[str, str]):
                 os.environ[key] = value
 
 
+def musa_runtime_available(min_devices: int = 1) -> bool:
+    if not hasattr(torch, "musa") or not torch.musa.is_available():
+        return False
+    return torch.musa.device_count() >= min_devices
+
+
 def cuda_runtime_available(min_devices: int = 1) -> bool:
     if not torch.cuda.is_available():
         return False
@@ -81,6 +86,18 @@ def cuda_runtime_available(min_devices: int = 1) -> bool:
 
 
 def require_test_device(rank: int, device_type: str) -> torch.device:
+    if device_type == "musa":
+        device_count = torch.musa.device_count()
+        if device_count <= 0:
+            raise RuntimeError(
+                "MUSA backend requested but no MUSA devices are available"
+            )
+        if rank >= device_count:
+            raise RuntimeError(
+                f"rank {rank} requires a dedicated MUSA device but only {device_count} are visible"
+            )
+        torch.musa.set_device(rank)
+        return torch.device("musa", rank)
     if device_type == "cuda":
         device_count = torch.cuda.device_count()
         if device_count <= 0:
@@ -104,17 +121,21 @@ def mooncake_backend_options(
     *,
     active_value: int = 0,
     is_extension: bool = False,
+    max_world_size: int | None = None,
 ) -> pg.MooncakeBackendOptions:
     device = torch.device(device_type)
+    tensor_size = world_size if max_world_size is None else int(max_world_size)
     active_ranks = torch.full(
-        (world_size,),
+        (tensor_size,),
         int(active_value),
         dtype=torch.int32,
         device=device,
     )
-    if is_extension:
-        return pg.MooncakeBackendOptions(active_ranks, True)
-    return pg.MooncakeBackendOptions(active_ranks)
+    if max_world_size is None:
+        if is_extension:
+            return pg.MooncakeBackendOptions(active_ranks, True)
+        return pg.MooncakeBackendOptions(active_ranks)
+    return pg.MooncakeBackendOptions(active_ranks, bool(is_extension), tensor_size)
 
 
 def mooncake_cpu_options(world_size: int) -> pg.MooncakeBackendOptions:
@@ -140,6 +161,7 @@ def init_mooncake_group(
     use_pg_options: bool = True,
     is_extension: bool = False,
     active_value: int | None = None,
+    max_world_size: int | None = None,
 ) -> torch.device:
     device = require_test_device(rank, device_type)
     configure_mooncake_device_filter(device_filters)
@@ -157,6 +179,7 @@ def init_mooncake_group(
             device_type,
             active_value=resolved_active_value,
             is_extension=is_extension,
+            max_world_size=max_world_size,
         )
     dist.init_process_group(**kwargs)
     return device
@@ -214,6 +237,7 @@ class MooncakePGWorkerContext:
         use_pg_options: bool = True,
         is_extension: bool = False,
         active_value: int | None = None,
+        max_world_size: int | None = None,
     ) -> torch.device:
         self._device = init_mooncake_group(
             self.proc_rank if rank is None else rank,
@@ -226,6 +250,7 @@ class MooncakePGWorkerContext:
             use_pg_options=use_pg_options,
             is_extension=is_extension,
             active_value=active_value,
+            max_world_size=max_world_size,
         )
         return self._device
 
@@ -501,9 +526,16 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
             raise RuntimeError(
                 f"{cls.__name__} must inherit a concrete Mooncake PG backend test base class"
             )
+        if cls.device_type == "musa":
+            device_count = torch.musa.device_count() if hasattr(torch, "musa") and torch.musa.is_available() else 0
+            cls.configure_for_cuda_device_count(device_count)
         if cls.device_type == "cuda":
             device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
             cls.configure_for_cuda_device_count(device_count)
+        if cls.device_type == "musa" and not musa_runtime_available(cls.world_size):
+            raise unittest.SkipTest(
+                f"{cls.__name__} requires {cls.world_size} visible MUSA devices"
+            )
         if cls.device_type == "cuda" and not cuda_runtime_available(cls.world_size):
             raise unittest.SkipTest(
                 f"{cls.__name__} requires {cls.world_size} visible CUDA devices"
@@ -575,3 +607,8 @@ class MooncakePGCPUBackendTestCase(BackendMultiProcessTestCase):
 class MooncakePGCUDABackendTestCase(BackendMultiProcessTestCase):
     backend_name = "mooncake"
     device_type = "cuda"
+
+
+class MooncakePGMUSABackendTestCase(BackendMultiProcessTestCase):
+    backend_name = "mooncake"
+    device_type = "musa"

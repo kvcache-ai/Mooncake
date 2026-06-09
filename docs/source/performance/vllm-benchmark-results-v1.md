@@ -2,7 +2,7 @@
 Here are some preview MooncakeStore benchmark results on A10 with "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4".
 
 
-### Varying PD ratio (input length = 1024, qps = 2, output length =6, num of requests = 200)
+## Varying PD ratio (input length = 1024, qps = 2, output length =6, num of requests = 200)
 | Configuration              | Backend              | Duration (s) | Output Token Throughput (tok/s) | Total Token Throughput (tok/s) | Mean TTFT (ms) | Median TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | Median TPOT (ms) | P99 TPOT (ms) | Mean ITL (ms) | Median ITL (ms) | P99 ITL (ms) |
 |----------------------------|----------------------|--------------|---------------------------------|-------------------------------|----------------|-----------------|--------------|---------------|------------------|--------------|--------------|----------------|-------------|
 | 2P2D tp = 1       | Redis                | 99.47        | 12.06                           | 2042.75                      | 844.28         | 666.84           | 2270.91      | 16.88         | 11.57            | 104.83       | 16.84         | 11.56           | 239.67      |

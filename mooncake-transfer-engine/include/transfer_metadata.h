@@ -104,6 +104,19 @@ class TransferMetadata {
 
         int tcp_data_port;
 
+        // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable
+        // address may differ from the TCP-routable segment name.  When
+        // non-empty, NIC paths are constructed using this value instead
+        // of `name`.
+        std::string rdma_server_name;
+
+        // Returns the server name to use for NIC path construction.
+        // Uses rdma_server_name when available, otherwise falls back
+        // to name.
+        const std::string &nicPathServerName() const {
+            return rdma_server_name.empty() ? name : rdma_server_name;
+        }
+
         void dump() const;
     };
 
@@ -177,6 +190,9 @@ class TransferMetadata {
     int addRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
 
     int removeRpcMetaEntry(const std::string &server_name);
+
+    // Re-publish the local RPC meta entry to the HTTP metadata server.
+    int rePublishRpcMetaEntry(const std::string &server_name);
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);

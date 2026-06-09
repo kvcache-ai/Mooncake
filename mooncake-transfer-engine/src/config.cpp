@@ -17,7 +17,8 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <dirent.h>
+#include <filesystem>
+#include <sstream>
 #include <unistd.h>
 
 namespace mooncake {
@@ -157,7 +158,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         else {
             LOG(ERROR) << "Ignore value from environment variable MC_MTU, it "
                           "should be 512|1024|2048|4096";
-            exit(EXIT_FAILURE);
         }
     }
 
@@ -223,6 +223,18 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_RETRY_CNT";
     }
 
+    const char* auto_gid_max_retries_env =
+        std::getenv("MC_AUTO_GID_MAX_RETRIES");
+    if (auto_gid_max_retries_env) {
+        int val = atoi(auto_gid_max_retries_env);
+        if (val >= 0 && val <= 16) {
+            config.auto_gid_max_retries = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_AUTO_GID_MAX_RETRIES";
+        }
+    }
+
     const char* disable_metacache = std::getenv("MC_DISABLE_METACACHE");
     if (disable_metacache) {
         config.metacache = false;
@@ -231,12 +243,18 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
-        int val = std::stoi(handshake_listen_backlog);
-        if (val > 0) {
-            config.handshake_listen_backlog = val;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_HANDSHAKE_LISTEN_BACKLOG";
+        try {
+            int val = std::stoi(handshake_listen_backlog);
+            if (val > 0) {
+                config.handshake_listen_backlog = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_LISTEN_BACKLOG";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_LISTEN_BACKLOG environment "
+                            "value: "
+                         << handshake_listen_backlog << ". Error: " << e.what();
         }
     }
 
@@ -269,7 +287,8 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");
-        if (opendir(log_dir_path) == NULL) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(log_dir_path, ec)) {
             LOG(WARNING)
                 << "Path [" << log_dir_path
                 << "] is not a valid directory path. Still logging to stderr.";
@@ -370,6 +389,62 @@ void loadGlobalConfig(GlobalConfig& config) {
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
     }
+
+    const char* mlx5_qp_udp_sports_env = std::getenv("MC_MLX5_QP_UDP_SPORTS");
+    if (mlx5_qp_udp_sports_env && *mlx5_qp_udp_sports_env) {
+        std::vector<uint16_t> ports;
+        std::stringstream ss(mlx5_qp_udp_sports_env);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            // Trim leading/trailing whitespace.
+            auto l = item.find_first_not_of(" \t");
+            auto r = item.find_last_not_of(" \t");
+            if (l == std::string::npos) continue;
+            item = item.substr(l, r - l + 1);
+            try {
+                int val = std::stoi(item);
+                if (val < 0 || val > 65535) {
+                    LOG(WARNING)
+                        << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
+                    ok = false;
+                    break;
+                }
+                ports.push_back(static_cast<uint16_t>(val));
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Invalid MC_MLX5_QP_UDP_SPORTS entry: " << item
+                             << ". Error: " << e.what();
+                ok = false;
+                break;
+            }
+        }
+        if (ok && !ports.empty()) {
+            config.mlx5_qp_udp_sports = std::move(ports);
+        } else if (!ok) {
+            LOG(WARNING) << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to "
+                            "parse errors";
+        }
+    }
+
+    const char* mlx5_qp_lag_port_balance_env =
+        std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
+    if (mlx5_qp_lag_port_balance_env && *mlx5_qp_lag_port_balance_env) {
+        std::string val(mlx5_qp_lag_port_balance_env);
+        // Trim leading/trailing whitespace.
+        auto l = val.find_first_not_of(" \t");
+        auto r = val.find_last_not_of(" \t");
+        if (l != std::string::npos) {
+            val = val.substr(l, r - l + 1);
+            if (val == "1" || val == "true")
+                config.mlx5_qp_lag_port_balance = true;
+            else if (val == "0" || val == "false")
+                config.mlx5_qp_lag_port_balance = false;
+            else
+                LOG(WARNING) << "Ignore MC_MLX5_QP_LAG_PORT_BALANCE: expected "
+                                "0/1/true/false, got: "
+                             << val;
+        }
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -421,6 +496,18 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
+            if (i) oss << ",";
+            oss << config.mlx5_qp_udp_sports[i];
+        }
+        LOG(INFO) << "mlx5_qp_udp_sports = ["
+                  << (config.mlx5_qp_udp_sports.empty() ? "<unset>" : oss.str())
+                  << "]";
+    }
+    LOG(INFO) << "mlx5_qp_lag_port_balance = "
+              << (config.mlx5_qp_lag_port_balance ? "true" : "false");
 }
 
 GlobalConfig& globalConfig() {

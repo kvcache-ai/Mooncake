@@ -128,7 +128,10 @@ class MooncakeStoreService:
                     self.config.local_buffer_size,
                     self.config.protocol,
                     self.config.device_name,
-                    self.config.master_server_address
+                    self.config.master_server_address,
+                    None,
+                    self.config.enable_ssd_offload,
+                    self.config.ssd_offload_path
                 )
 
                 if ret != 0:
@@ -336,10 +339,11 @@ class MooncakeStoreService:
                     content_type="application/json",
                 )
 
+            grace_period_seconds = data.get("grace_period_seconds", 0)
             failed_segment_ids = []
             async with self._state_lock:
                 for sid in segment_ids:
-                    ret = self.store.unmount_segment([sid])
+                    ret = self.store.unmount_segment([sid], grace_period_seconds)
                     if ret != 0:
                         failed_segment_ids.append(sid)
                         continue
@@ -427,7 +431,10 @@ class MooncakeStoreService:
                     content_type="application/json",
                 )
 
-            ret = self.store.unmount_and_free_segment(segment_ids)
+            grace_period_seconds = data.get("grace_period_seconds", 0)
+            ret = self.store.unmount_and_free_segment(
+                segment_ids, grace_period_seconds
+            )
             if ret != 0:
                 return web.Response(
                     status=500,
@@ -454,15 +461,16 @@ class MooncakeStoreService:
         try:
             data = await request.json()
             key = data.get('key')
-            value = data.get('value').encode()
+            raw_value = data.get('value')
 
-            if not key or not value:
+            if not key or raw_value is None:
                 return web.Response(
                     status=400,
                     text=json.dumps({'error': 'Missing key or value'}),
                     content_type='application/json'
                 )
 
+            value = raw_value.encode()
             ret = self.store.put(key, value)
             if ret != 0:
                 return web.Response(

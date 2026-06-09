@@ -16,6 +16,8 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 
 namespace mooncake {
@@ -84,16 +86,43 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         }
     }
 
-    // Legacy keys for backward compatibility
+    // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
+    setConfig(config, "MC_NUM_CQ_PER_CTX",
+              "transports/rdma/device/num_cq_list");
+    setConfig(config, "MC_NUM_COMP_CHANNELS_PER_CTX",
+              "transports/rdma/device/num_comp_channels");
     setConfig(config, "MC_IB_PORT", "transports/rdma/device/port");
     setConfig(config, "MC_GID_INDEX", "transports/rdma/device/gid_index");
+    setConfig(config, "NCCL_IB_GID_INDEX", "transports/rdma/device/gid_index");
+    setConfig(config, "MC_MAX_CQE_PER_CTX", "transports/rdma/device/max_cqe");
+    setConfig(config, "MC_MAX_EP_PER_CTX",
+              "transports/rdma/endpoint/endpoint_store_cap");
+    setConfig(config, "MC_NUM_QP_PER_EP",
+              "transports/rdma/endpoint/qp_mul_factor");
+    setConfig(config, "MC_MAX_SGE", "transports/rdma/endpoint/max_sge");
+    setConfig(config, "MC_MAX_WR", "transports/rdma/endpoint/max_qp_wr");
+    setConfig(config, "MC_MAX_INLINE",
+              "transports/rdma/endpoint/max_inline_bytes");
+    setConfig(config, "MC_PKEY_INDEX", "transports/rdma/endpoint/pkey_index");
+    setConfig(config, "MC_MTU", "transports/rdma/endpoint/path_mtu");
+    setConfig(config, "MC_IB_TC", "transports/rdma/endpoint/traffic_class");
+    setConfig(config, "MC_IB_PCI_RELAXED_ORDERING",
+              "transports/rdma/pci_relaxed_ordering");
+    setConfig(config, "MC_WORKERS_PER_CTX",
+              "transports/rdma/workers/num_workers");
+    setConfig(config, "MC_SLICE_SIZE", "transports/rdma/workers/block_size");
+    setConfig(config, "MC_RETRY_CNT",
+              "transports/rdma/workers/max_retry_count");
+    setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
+              "transports/rdma/disable_gpu_direct_rdma");
     return status;
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
     std::string lower_str = str;
     std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
-                   ::tolower);
+                   [](unsigned char c) { return std::tolower(c); });
 
     if (lower_str == "true" || lower_str == "1" || lower_str == "yes" ||
         lower_str == "on") {

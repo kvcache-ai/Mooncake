@@ -1,6 +1,10 @@
 #include "environ.h"
+#include <cerrno>
+#include <climits>
 #include <cstring>
 #include <algorithm>
+#include <cctype>
+#include <iostream>
 
 namespace mooncake {
 
@@ -12,7 +16,17 @@ Environ& Environ::Get() {
 int Environ::GetInt(const char* name, int default_value) {
     const char* val = std::getenv(name);
     if (val) {
-        return std::atoi(val);
+        char* endptr = nullptr;
+        errno = 0;
+        long result = std::strtol(val, &endptr, 10);
+        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
+            result < INT_MIN || result > INT_MAX) {
+            std::cerr << "[Mooncake] Warning: invalid value '" << val
+                      << "' for env " << name << ", using default "
+                      << default_value << std::endl;
+            return default_value;
+        }
+        return static_cast<int>(result);
     }
     return default_value;
 }
@@ -20,7 +34,17 @@ int Environ::GetInt(const char* name, int default_value) {
 size_t Environ::GetSizeT(const char* name, size_t default_value) {
     const char* val = std::getenv(name);
     if (val) {
-        return static_cast<size_t>(std::strtoull(val, nullptr, 10));
+        char* endptr = nullptr;
+        errno = 0;
+        long long result = std::strtoll(val, &endptr, 10);
+        if (endptr == val || *endptr != '\0' || errno == ERANGE || result < 0 ||
+            static_cast<unsigned long long>(result) > SIZE_MAX) {
+            std::cerr << "[Mooncake] Warning: invalid value '" << val
+                      << "' for env " << name << ", using default "
+                      << default_value << std::endl;
+            return default_value;
+        }
+        return static_cast<size_t>(result);
     }
     return default_value;
 }
@@ -29,7 +53,8 @@ bool Environ::GetBool(const char* name, bool default_value) {
     const char* val = std::getenv(name);
     if (val) {
         std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
         return s == "1" || s == "true" || s == "on" || s == "yes";
     }
     return default_value;
@@ -81,6 +106,8 @@ Environ::Environ() {
     force_mnnvl_ = GetBool("MC_FORCE_MNNVL", false);
     intra_nvlink_ = GetBool("MC_INTRA_NVLINK", false);
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
+    with_nvidia_peermem_ = GetBool("WITH_NVIDIA_PEERMEM", true);
+    efa_cq_threads_ = GetInt("MC_EFA_CQ_THREADS", 1);
 }
 
 }  // namespace mooncake
