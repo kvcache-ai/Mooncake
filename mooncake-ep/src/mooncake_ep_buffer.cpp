@@ -23,9 +23,9 @@ static bool initRdmaTransport(device::RdmaTransport* t, void* gdr_buffer,
     return ret == 0;
 }
 
-MooncakeEpBuffer::MooncakeEpBuffer(
-    int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-    TransferEngine* engine)
+MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
+                                   int64_t num_ep_buffer_bytes,
+                                   TransferEngine* engine)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
@@ -55,8 +55,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
         rdma_transport_ = engine->getOrCreateRdmaTransport();
         if (rdma_transport_) {
             if (!initRdmaTransport(rdma_transport_, gdr_buffer,
-                                   num_ep_buffer_bytes, num_ranks,
-                                   USE_QP_COUNT, comm_stream.stream())) {
+                                   num_ep_buffer_bytes, num_ranks, USE_QP_COUNT,
+                                   comm_stream.stream())) {
                 rdma_transport_ = nullptr;
                 ibgda_disabled_ = true;
                 LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
@@ -65,7 +65,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
             ibgda_disabled_ = true;
         }
     } else {
-        // Read optional NIC whitelist from env var (same convention as PG tests).
+        // Read optional NIC whitelist from env var (same convention as PG
+        // tests).
         std::vector<std::string> device_filter;
         if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
             std::string s(env);
@@ -77,8 +78,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(
         }
         auto t = device::createIbgdaDeviceTransport(device_filter);
         if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT,
-                              comm_stream.stream())) {
+                              num_ranks, USE_QP_COUNT, comm_stream.stream())) {
             owned_rdma_transport_ = std::move(t);
             rdma_transport_ = owned_rdma_transport_.get();
         } else {
@@ -93,8 +93,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf teardown.
-    // When engine owns it, just clear the pointer.
+    // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
+    // teardown. When engine owns it, just clear the pointer.
     owned_rdma_transport_.reset();
     rdma_transport_ = nullptr;
 
@@ -364,8 +364,8 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
     auto buffer = layout.buffers[buffer_idx];
     auto dtype = torch::kBFloat16;
     size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
-    auto num_msg_elems = static_cast<int>(num_bytes_per_combine_msg /
-                                          elementSize(dtype));
+    auto num_msg_elems =
+        static_cast<int>(num_bytes_per_combine_msg / elementSize(dtype));
 
     EP_HOST_ASSERT(num_bytes_per_combine_msg % elementSize(dtype) == 0);
     return torch::from_blob(
@@ -414,7 +414,8 @@ void MooncakeEpBuffer::sync_ibgda_peers(
         flat_lids, subnet_prefixes, interface_ids, active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
-        LOG(WARNING) << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
+        LOG(WARNING)
+            << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
     }
 }
 
