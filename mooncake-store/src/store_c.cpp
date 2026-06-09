@@ -45,6 +45,7 @@ mooncake::ReplicateConfig to_replicate_config(
 
     config.replica_num = c_config->replica_num;
     config.with_soft_pin = c_config->with_soft_pin != 0;
+    config.with_hard_pin = c_config->with_hard_pin != 0;
     if (c_config->preferred_segments &&
         c_config->preferred_segments_count > 0) {
         for (size_t i = 0; i < c_config->preferred_segments_count; ++i) {

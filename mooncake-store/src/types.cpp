@@ -34,12 +34,16 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
         {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
+        {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
+        {ErrorCode::OPLOG_ENTRY_NOT_FOUND, "OPLOG_ENTRY_NOT_FOUND"},
+        {ErrorCode::K8S_LEASE_OPERATION_ERROR, "K8S_LEASE_OPERATION_ERROR"},
+        {ErrorCode::K8S_LEASE_NOT_FOUND, "K8S_LEASE_NOT_FOUND"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
@@ -59,7 +63,10 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
         {ErrorCode::SERIALIZE_FAIL, "SERIALIZE_FAIL"},
         {ErrorCode::DESERIALIZE_FAIL, "DESERIALIZE_FAIL"},
-        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"}};
+        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
+        {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
+        {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

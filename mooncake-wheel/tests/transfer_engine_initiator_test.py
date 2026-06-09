@@ -268,6 +268,26 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
             f"[✓] {circles} rounds of batch_write_async_read passed, batch size {batch_size}."
         )
 
+    def test_send_probe_reachable_peer(self):
+        """send_probe against a registered, reachable peer returns 0."""
+        rc = self.adaptor.send_probe(self.target_server_name)
+        self.assertEqual(
+            rc,
+            0,
+            f"send_probe to reachable peer {self.target_server_name} returned {rc}",
+        )
+
+    def test_send_probe_unknown_peer(self):
+        """send_probe against an unknown peer returns non-zero (does not crash)."""
+        # "unreachable_peer:9" is not registered with the metadata server, so the
+        # metadata lookup itself should fail and sendProbe returns ERR_METADATA.
+        rc = self.adaptor.send_probe("unreachable_peer:9")
+        self.assertNotEqual(
+            rc,
+            0,
+            "send_probe to unknown peer unexpectedly succeeded",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

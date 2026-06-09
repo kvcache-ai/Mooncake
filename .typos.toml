@@ -1,10 +1,14 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa"]
 
 [default.extend-words]
 CANN = "CANN"
 ASO = "ASO"
 fre = "fre"
+wqs = "wqs"
+# AMD HSA runtime symbol prefix (hsa_*, hsaRes, hsaErr, etc.) — used by the
+# ROCm dmabuf MR registration path.
+hsa = "hsa"
 
 [files]
 extend-exclude = [

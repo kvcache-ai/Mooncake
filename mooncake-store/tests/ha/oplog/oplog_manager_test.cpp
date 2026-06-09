@@ -1,4 +1,4 @@
-#include "oplog_manager.h"
+#include "ha/oplog/oplog_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -67,14 +67,14 @@ TEST_F(OpLogManagerTest, TestAllocateEntry) {
     EXPECT_NE(0u, e1.prefix_hash);
 }
 
-TEST_F(OpLogManagerTest, TestPersistEntryToEtcd) {
-    // Without an EtcdOpLogStore configured, PersistEntryToEtcd should return an
+TEST_F(OpLogManagerTest, TestPersistEntry) {
+    // Without an OpLogStore configured, PersistEntry should return an
     // error
     OpLogEntry entry =
         M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
 
-    ErrorCode err = M().PersistEntryToEtcd(entry);
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, err);
+    ErrorCode err = M().PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 }
 
 TEST_F(OpLogManagerTest, TestAppendAndPersist) {
@@ -82,7 +82,7 @@ TEST_F(OpLogManagerTest, TestAppendAndPersist) {
     // error
     auto res = M().AppendAndPersist(OpType::REMOVE, "key", "");
     ASSERT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, res.error());
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, res.error());
 }
 
 // ========== Initial Sequence Id Tests ==========
@@ -198,8 +198,8 @@ TEST_F(OpLogManagerTest, TestWriteToEtcd_Success) {
 TEST_F(OpLogManagerTest, TestWriteToEtcd_Failure) {
     OpLogEntry entry =
         M().AllocateEntry(OpType::PUT_END, "key", "payload-data");
-    ErrorCode err = M().PersistEntryToEtcd(entry);
-    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, err);
+    ErrorCode err = M().PersistEntry(entry);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
 }
 
 TEST_F(OpLogManagerTest, TestWriteToEtcd_Retry) {
@@ -281,6 +281,38 @@ TEST_F(OpLogManagerTest, TestLargePayload) {
     uint64_t id = M().Append(OpType::PUT_END, key, payload);
     EXPECT_LT(0u, id);
     EXPECT_EQ(1u, M().GetEntryCount());
+}
+
+TEST_F(OpLogManagerTest, TestAppendMultipleTypes) {
+    uint64_t id1 = M().Append(OpType::PUT_END, "k1", "payload");
+    uint64_t id2 = M().Append(OpType::PUT_REVOKE, "k2", "");
+    uint64_t id3 = M().Append(OpType::REMOVE, "k3", "");
+    EXPECT_EQ(id1 + 1, id2);
+    EXPECT_EQ(id2 + 1, id3);
+    EXPECT_EQ(3u, M().GetEntryCount());
+}
+
+TEST_F(OpLogManagerTest, TestBufferEviction) {
+    for (int i = 0; i < 10; ++i) {
+        M().Append(OpType::PUT_END, "key_" + std::to_string(i), "val");
+    }
+    EXPECT_EQ(10u, M().GetEntryCount());
+}
+
+TEST_F(OpLogManagerTest, TestAllocateEntry_ChecksumValid) {
+    OpLogEntry e = M().AllocateEntry(OpType::REMOVE, "del-key", "some-data");
+    EXPECT_TRUE(OpLogManager::VerifyChecksum(e));
+}
+
+TEST_F(OpLogManagerTest, TestAllocateEntry_FieldsComplete) {
+    OpLogEntry e = M().AllocateEntry(OpType::REMOVE, "del-key", "");
+    EXPECT_EQ(OpType::REMOVE, e.op_type);
+    EXPECT_EQ("del-key", e.object_key);
+    EXPECT_EQ("", e.payload);
+    EXPECT_NE(0u, e.timestamp_ms);
+    EXPECT_TRUE(OpLogManager::VerifyChecksum(e));
+    // "del-key" prefix hash
+    EXPECT_NE(0u, e.prefix_hash);
 }
 
 }  // namespace mooncake::test

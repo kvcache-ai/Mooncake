@@ -15,8 +15,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,8 +72,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // LocalDiskSegment state for comparison
     struct LocalDiskSegmentState {
         bool enable_offloading = false;
-        std::map<std::string, int64_t>
-            offloading_objects;  // key -> timestamp (sorted)
+        std::map<std::string, OffloadTaskItem>
+            offloading_objects;  // storage key -> task (sorted)
     };
 
     // Task state for comparison
@@ -174,12 +176,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::tm tm_now;
         localtime_r(&time_t_now, &tm_now);
 
-        char buffer[32];
-        std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d_%02d%02d%02d_%03d",
-                      tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
-                      tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec,
-                      static_cast<int>(ms.count()));
-        return std::string(buffer);
+        std::ostringstream snapshot_id;
+        snapshot_id << std::setfill('0') << std::setw(4)
+                    << (tm_now.tm_year + 1900) << std::setw(2)
+                    << (tm_now.tm_mon + 1) << std::setw(2) << tm_now.tm_mday
+                    << "_" << std::setw(2) << tm_now.tm_hour << std::setw(2)
+                    << tm_now.tm_min << std::setw(2) << tm_now.tm_sec << "_"
+                    << std::setw(3) << ms.count();
+        return snapshot_id.str();
     }
 
     // Get msgpack snapshot directory path
@@ -200,7 +204,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         ServiceStateSnapshot state;
 
         // === Basic State ===
-        auto keys_result = service->GetAllKeys();
+        auto keys_result = service->GetAllKeys("default");
         if (keys_result.has_value()) {
             state.all_keys = std::move(keys_result.value());
             std::sort(state.all_keys.begin(), state.all_keys.end());
@@ -213,7 +217,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         for (const auto& key : state.all_keys) {
-            auto replica_result = service->GetReplicaList(key);
+            auto replica_result = service->GetReplicaList(key, "default");
             if (replica_result.has_value()) {
                 state.replica_lists[key] = std::move(replica_result.value());
             }
@@ -243,9 +247,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 seg_state.enable_offloading = segment->enable_offloading;
                 // Copy offloading_objects to sorted map
                 std::lock_guard<Mutex> lock(segment->offloading_mutex_);
-                for (const auto& [key, timestamp] :
-                     segment->offloading_objects) {
-                    seg_state.offloading_objects[key] = timestamp;
+                for (const auto& [key, task] : segment->offloading_objects) {
+                    seg_state.offloading_objects[key] = task;
                 }
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
@@ -526,8 +529,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         const std::string key = "snapshot_putstart_consistency_key";
         const uint64_t slice_length = 1024;
 
-        auto before = original->PutStart(client_id, key, slice_length, config);
-        auto after = restored->PutStart(client_id, key, slice_length, config);
+        auto before =
+            original->PutStart(client_id, key, "default", slice_length, config);
+        auto after =
+            restored->PutStart(client_id, key, "default", slice_length, config);
 
         ASSERT_EQ(before.has_value(), after.has_value())
             << "PutStart has_value mismatch between original and restored "

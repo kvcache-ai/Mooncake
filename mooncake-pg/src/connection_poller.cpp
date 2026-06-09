@@ -1,9 +1,6 @@
 #include <c10/util/Exception.h>
 #include <connection_poller.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
 #include <cuda_alike.h>
-#include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <atomic>
 #include <chrono>
@@ -15,6 +12,7 @@
 #include <limits>
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
+#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -22,6 +20,7 @@ namespace mooncake {
 // On MNNVL clusters all GPUs support fabric mem handles, meaning
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
+#ifndef MOONCAKE_EP_USE_MUSA
 static bool supportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
 
@@ -40,6 +39,10 @@ static bool supportFabricMem() {
     }
     return true;
 }
+#else
+// MUSA does not support NVLink fabric memory handles.
+static bool supportFabricMem() { return false; }
+#endif
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
                                      bool isDummy,
                                      uint64_t* local2global_rank_map,
@@ -50,6 +53,7 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
     : backendIndex_(backendIndex),
       rank_(rank),
       groupSize_(size),
+      pollingLimit_(size),
       isDummy_(isDummy),
       establishedGroupSize_(0),
       local2global_rank_map_(local2global_rank_map),
@@ -80,6 +84,12 @@ ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
 }
 
 ConnectionContext::~ConnectionContext() {
+    if (resource_abandoned_) {
+        LOG(WARNING) << "Resource leak in ConnectionContext: cleanup skipped "
+                        "due to hung operations.";
+        return;
+    }
+
     for (int i = 0; i < groupSize_; ++i) {
         if (peerStates_[i].segmentId.has_value()) {
             engine_->closeSegment(peerStates_[i].segmentId.value());
@@ -115,6 +125,18 @@ void ConnectionContext::extendGroupSizeTo(int newGroupSize) {
     }
 
     groupSize_.store(newGroupSize, std::memory_order_release);
+    // Keep polling range aligned with the largest known size.
+    pollingLimit_.store(newGroupSize, std::memory_order_release);
+}
+
+void ConnectionContext::setPollingLimitTo(int pollingLimit) {
+    const int groupSize = groupSize_.load(std::memory_order_acquire);
+    TORCH_CHECK(pollingLimit >= groupSize,
+                "pollingLimit must be >= current groupSize");
+    TORCH_CHECK(
+        pollingLimit >= 0 && static_cast<size_t>(pollingLimit) < kMaxNumRanks,
+        "Size out of range");
+    pollingLimit_.store(pollingLimit, std::memory_order_release);
 }
 
 bool ConnectionContext::isAllPeerConnected() const {
@@ -176,6 +198,7 @@ void ConnectionContext::bootstrapLocalPeer(const std::string& localServerName,
     ConnectionPoller::GetInstance()
         .global_peerConnected_[local2global_rank_map_[rank_]] = true;
     peerState.state = PeerConnectionState::CONNECTED;
+    peerState.countedInGroup = true;
 
     {
         std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
@@ -203,7 +226,8 @@ bool ConnectionContext::poll() {
     bool did_work = false;
 
     // Poll all peers sequentially.
-    for (int pollingRank = 0; pollingRank < groupSize_; ++pollingRank) {
+    const int pollingLimit = pollingLimit_.load(std::memory_order_acquire);
+    for (int pollingRank = 0; pollingRank < pollingLimit; ++pollingRank) {
         did_work |= pollPeer(pollingRank);
     }
 
@@ -272,9 +296,13 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnectedPeers_.fetch_add(1,
-                                                   std::memory_order_release);
-                    backend_wakeup_cv_.notify_all();
+                    if (pollingRank <
+                        groupSize_.load(std::memory_order_acquire)) {
+                        totalConnectedPeers_.fetch_add(
+                            1, std::memory_order_release);
+                        peerState.countedInGroup = true;
+                        backend_wakeup_cv_.notify_all();
+                    }
                 }
             } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
@@ -315,9 +343,13 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnectedPeers_.fetch_add(1,
-                                                   std::memory_order_release);
-                    backend_wakeup_cv_.notify_all();
+                    if (pollingRank <
+                        groupSize_.load(std::memory_order_acquire)) {
+                        totalConnectedPeers_.fetch_add(
+                            1, std::memory_order_release);
+                        peerState.countedInGroup = true;
+                        backend_wakeup_cv_.notify_all();
+                    }
                 }
                 state_changed = true;
             } else if (status.s == TransferStatusEnum::FAILED) {
@@ -342,9 +374,13 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 peerState.state = PeerConnectionState::CONNECTED;
                 {
                     std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
-                    totalConnectedPeers_.fetch_add(1,
-                                                   std::memory_order_release);
-                    backend_wakeup_cv_.notify_all();
+                    if (pollingRank <
+                        groupSize_.load(std::memory_order_acquire)) {
+                        totalConnectedPeers_.fetch_add(
+                            1, std::memory_order_release);
+                        peerState.countedInGroup = true;
+                        backend_wakeup_cv_.notify_all();
+                    }
                 }
                 state_changed = true;
             }
@@ -352,6 +388,11 @@ bool ConnectionContext::pollPeer(int pollingRank) {
         }
 
         case PeerConnectionState::CONNECTED: {
+            // A peer may be warmed up (CONNECTED) while still outside of the
+            // current groupSize_. When it later enters the group, we need to
+            // update totalConnectedPeers_ lazily here; otherwise
+            // waitUntilAllConnected()/isAllPeerConnected() may hang.
+
             // ATTENTION: Ensure consistency of local (meta_->peerConnected)
             //            and global (global_peerConnected_).
             //
@@ -375,6 +416,14 @@ bool ConnectionContext::pollPeer(int pollingRank) {
 
             if (meta_->peerConnected[pollingRank] &&
                 global_peerConnected_[globalPollingRank]) {
+                if (!peerState.countedInGroup &&
+                    pollingRank < groupSize_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(backend_wakeup_mutex_);
+                    totalConnectedPeers_.fetch_add(1,
+                                                   std::memory_order_release);
+                    peerState.countedInGroup = true;
+                    backend_wakeup_cv_.notify_all();
+                }
                 // happy path: both are connected.
                 break;
             }
@@ -387,26 +436,36 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             meta_->activeRanksTensor[pollingRank] = 0;
 
             // Reset store
-            store_->deleteKey(
-                getServerNameStoreKey(backendIndex_, pollingRank));
-            store_->deleteKey(getBufferStoreKey(backendIndex_, pollingRank));
-            store_->deleteKey(
-                getExtensionTaskCountStoreKey(backendIndex_, pollingRank));
-            store_->deleteKey(
-                getExtensionActiveRanksStoreKey(backendIndex_, pollingRank));
+            try {
+                store_->deleteKey(
+                    getServerNameStoreKey(backendIndex_, pollingRank));
+                store_->deleteKey(
+                    getBufferStoreKey(backendIndex_, pollingRank));
+                store_->deleteKey(
+                    getExtensionStateStoreKey(backendIndex_, pollingRank));
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Rank " << rank_
+                             << " got an exception when deleteKey for peer "
+                             << pollingRank << ": " << e.what();
+            }
 
             // Reset warmup region
-            *reinterpret_cast<volatile int32_t*>(
-                &warmup_recv_region_[pollingRank]) = 0;
+            if (warmup_recv_region_) {
+                *reinterpret_cast<volatile int32_t*>(
+                    &warmup_recv_region_[pollingRank]) = 0;
+            }
 
             // Reset P2PProxy states
-            p2p_proxy_->ResetPeerState(pollingRank);
+            p2p_proxy_->resetPeerState(pollingRank);
 
             // Back to WAITING_STORE to reconnect it.
             peerState.state = PeerConnectionState::WAITING_STORE;
             engine_->closeSegment(peerState.segmentId.value());
             peerState.segmentId = std::nullopt;
-            totalConnectedPeers_.fetch_sub(1);
+            if (peerState.countedInGroup) {
+                totalConnectedPeers_.fetch_sub(1, std::memory_order_release);
+                peerState.countedInGroup = false;
+            }
             state_changed = true;
             break;
         }
@@ -420,22 +479,47 @@ bool ConnectionContext::pollPeer(int pollingRank) {
     return state_changed;
 }
 
+bool ConnectionContext::isStopped() const {
+    for (auto& peerState : peerStates_) {
+        if (peerState.state != PeerConnectionState::EXPIRING) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ConnectionContext::drainPoller() const {
+    BackoffWaiter waiter;
+    return waiter.wait_for(std::chrono::milliseconds(kDrainPollerTimeoutMs),
+                           [this] { return isStopped(); });
+}
+
+void ConnectionContext::abandonResources() { resource_abandoned_ = true; }
+
 bool ConnectionContext::tryStop() {
     bool stopped = true;
     for (auto& peerState : peerStates_) {
-        if (peerState.state == PeerConnectionState::WAITING_WARMUP_TRANSFER) {
-            TransferStatus status;
-            engine_->getTransferStatus(peerState.warmupBatchId.value(), 0,
-                                       status);
+        if (peerState.state == PeerConnectionState::EXPIRING) {
+            continue;
+        }
 
-            if (status.s == TransferStatusEnum::COMPLETED ||
-                status.s == TransferStatusEnum::FAILED) {
-                engine_->freeBatchID(peerState.warmupBatchId.value());
-                peerState.warmupBatchId = std::nullopt;
-                peerState.state = PeerConnectionState::EXPIRING;
-            } else {
-                stopped = false;
-            }
+        if (peerState.state != PeerConnectionState::WAITING_WARMUP_TRANSFER) {
+            peerState.state = PeerConnectionState::EXPIRING;
+            continue;
+        }
+
+        // For WAITING_WARMUP_TRANSFER, wait for the existing transfer to
+        // complete so that we can safely release the registered memory.
+        TransferStatus status;
+        engine_->getTransferStatus(peerState.warmupBatchId.value(), 0, status);
+
+        if (status.s == TransferStatusEnum::COMPLETED ||
+            status.s == TransferStatusEnum::FAILED) {
+            engine_->freeBatchID(peerState.warmupBatchId.value());
+            peerState.warmupBatchId = std::nullopt;
+            peerState.state = PeerConnectionState::EXPIRING;
+        } else {
+            stopped = false;
         }
     }
     return stopped;
@@ -466,6 +550,7 @@ void ConnectionPoller::registerContext(
 void ConnectionPoller::removeContext(
     const std::shared_ptr<ConnectionContext>& ctx) {
     TORCH_CHECK(ctx->isShutdown_, "connection context hasn't shutdown.");
+
     {
         std::lock_guard<std::mutex> lock(contexts_mutex_);
         contexts_.erase(std::remove(contexts_.begin(), contexts_.end(), ctx),
@@ -529,8 +614,8 @@ void ConnectionPoller::pollerLoop() {
         if (did_work) continue;
 
         std::unique_lock<std::mutex> lock(wakeup_mutex_);
-        auto sleep_ms = all_connected ? ALL_CONNECTED_IDLE_SLEEP_MS
-                                      : CONNECTING_IDLE_SLEEP_MS;
+        auto sleep_ms =
+            all_connected ? kAllConnectedIdleSleepMs : kConnectingIdleSleepMs;
         wakeup_cv_.wait_for(lock, std::chrono::milliseconds(sleep_ms), [&]() {
             if (local_version !=
                 contexts_version_.load(std::memory_order_acquire))

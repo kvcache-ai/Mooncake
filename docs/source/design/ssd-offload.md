@@ -154,7 +154,7 @@ A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space wi
 
 ## Eviction (BucketStorageBackend)
 
-When `MOONCAKE_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
+When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
 
 ### Policies
 
@@ -195,7 +195,7 @@ This ordering guarantees:
 
 ## io_uring File I/O
 
-When `MOONCAKE_USE_URING=true`, the storage backends replace POSIX `pread`/`pwrite` calls with an io_uring-based implementation (`UringFile`). The design prioritizes eliminating inter-thread lock contention, which was the dominant latency source in the previous global-ring approach.
+When `MOONCAKE_OFFLOAD_USE_URING=true`, the storage backends replace POSIX `pread`/`pwrite` calls with an io_uring-based implementation (`UringFile`). The design prioritizes eliminating inter-thread lock contention, which was the dominant latency source in the previous global-ring approach.
 
 ### Thread-local rings (`SharedUringRing`)
 
@@ -242,4 +242,6 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 
 ## Metadata Recovery on Restart
 
-On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads all on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention.
+On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
+
+`OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.

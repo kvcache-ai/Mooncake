@@ -16,7 +16,9 @@
 
 #include "bench_runner.h"
 #include "te_backend.h"
+#ifdef USE_TENT
 #include "tent_backend.h"
+#endif
 
 using namespace mooncake::tent;
 
@@ -101,10 +103,18 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
     std::unique_ptr<BenchRunner> runner;
-    if (XferBenchConfig::backend == "classic")
+    if (XferBenchConfig::backend == "classic") {
         runner = std::make_unique<TEBenchRunner>();
-    else
+    } else {
+#ifdef USE_TENT
         runner = std::make_unique<TENTBenchRunner>();
+#else
+        LOG(ERROR) << "Backend '" << XferBenchConfig::backend
+                   << "' requires building with -DUSE_TENT=ON; only the "
+                      "'classic' backend is available in this build";
+        return EXIT_FAILURE;
+#endif
+    }
     if (XferBenchConfig::target_seg_name.empty()) {
         std::cout << "\033[33mTo start initiators, run " << std::endl
                   << "  ./tebench --target_seg_name="

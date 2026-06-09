@@ -19,6 +19,11 @@ DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
+DEFINE_bool(start_offload_rpc_server, true,
+            "Expose TCP RPC for disk-tier reads "
+            "(batch_get_offload_object / release_offload_buffer). "
+            "Effective only when --enable_offload is true. "
+            "Disable for a write-only owner.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
 
@@ -37,17 +42,31 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
+    server.register_handler<
+        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::upsert_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::upsert_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::upsert_parts_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::batch_upsert_from_dummy_helper>(
+        &real_client);
+    server.register_handler<&RealClient::upsert_batch_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(
         &real_client);
     server.register_handler<
-        &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
-    server.register_handler<
         &RealClient::batch_get_into_multi_buffers_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::get_into_range_shm_helper>(
+        &real_client);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(
+        &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_ipc_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_unmap_shm_internal>(
         &real_client);
+    server.register_handler<&RealClient::is_shm_mapped_internal>(&real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(
         &real_client);
@@ -78,6 +97,10 @@ int main(int argc, char *argv[]) {
     mooncake::ResourceTracker::getInstance();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(argv[0]);
+    }
+
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
 #ifdef USE_ASCEND_DIRECT
     // just set to true, does not affect GPU process.
@@ -89,7 +112,7 @@ int main(int argc, char *argv[]) {
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_port, FLAGS_enable_offload);
+        FLAGS_port, FLAGS_enable_offload, FLAGS_start_offload_rpc_server);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
@@ -100,10 +123,11 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on 127.0.0.1:" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
+              << FLAGS_port;
 
     return server.start();
 }

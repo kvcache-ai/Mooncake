@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
+#include <optional>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
@@ -168,14 +171,15 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 }
 
 /**
- * @brief Convert a string representation of size to bytes
+ * @brief Parse a string representation of size to bytes
  * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
  * "1048576")
- * @return uint64_t Number of bytes, or 0 if parsing fails
+ * @return Parsed byte size, or std::nullopt if parsing fails
  */
-[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+[[nodiscard]] inline std::optional<uint64_t> try_string_to_byte_size(
+    const std::string& str) {
     if (str.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Create a copy for manipulation
@@ -186,7 +190,7 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
 
     if (s.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Handle special case for "infinite"
@@ -201,7 +205,10 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     try {
         value = std::stod(s, &pos);
     } catch (const std::exception&) {
-        return 0;  // Failed to parse number
+        return std::nullopt;  // Failed to parse number
+    }
+    if (value < 0) {
+        return std::nullopt;
     }
 
     if (pos >= s.length()) {
@@ -235,8 +242,45 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
         return static_cast<uint64_t>(value);
     } else {
         // Unknown unit
-        return 0;
+        return std::nullopt;
     }
+}
+
+/**
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
+ */
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    auto parsed = try_string_to_byte_size(str);
+    return parsed.value_or(0);
+}
+
+/**
+ * @brief Convert a boolean-like string to a bool
+ * @param str String representation ("1"/"true"/"yes"/"on" or
+ * "0"/"false"/"no"/"off")
+ * @return std::optional<bool> Parsed value, or std::nullopt if parsing fails
+ */
+[[nodiscard]] inline std::optional<bool> string_to_bool(std::string str) {
+    if (str.empty()) {
+        return std::nullopt;
+    }
+
+    str.erase(0, str.find_first_not_of(" \t\r\n"));
+    str.erase(str.find_last_not_of(" \t\r\n") + 1);
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    if (str == "1" || str == "true" || str == "yes" || str == "on") {
+        return true;
+    }
+    if (str == "0" || str == "false" || str == "no" || str == "off") {
+        return false;
+    }
+
+    return std::nullopt;
 }
 
 /**
@@ -256,6 +300,7 @@ std::vector<std::string> splitString(const std::string& str,
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -264,7 +309,8 @@ constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -286,9 +332,6 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (use_hp_env == nullptr) {
         return 0;
     }
-
-    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
-    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 
     size_t size = SZ_2MB;  // Default to 2MB
 
@@ -333,8 +376,33 @@ inline size_t align_up(size_t size, size_t alignment) {
     return size;
 }
 
-// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+/**
+ * Allocate mmap-backed buffer memory for host KV / transfer buffers.
+ *
+ * When the global mmap arena is enabled, this function serves allocations
+ * from the arena and still honors the caller's requested alignment.
+ * Arena-owned allocations remain owned by the arena until process shutdown.
+ *
+ * When the arena is disabled or unavailable, this falls back to a direct
+ * mmap() allocation and returns a pointer aligned to at least the system page
+ * size (or the configured hugepage size when available).
+ *
+ * @param total_size Total buffer size in bytes.
+ * @param alignment Minimum alignment requested by the caller.
+ * @return Pointer to the allocation, or nullptr on failure.
+ */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Release memory previously returned by allocate_buffer_mmap_memory().
+ *
+ * Direct-mmap allocations are unmapped immediately. Arena-owned pointers are
+ * intentionally not unmapped individually; in that case this function is a
+ * no-op and the arena releases the backing pool during process teardown.
+ *
+ * @param ptr Pointer previously returned by allocate_buffer_mmap_memory().
+ * @param total_size Original allocation size in bytes.
+ */
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
 /**
@@ -398,6 +466,12 @@ tl::expected<std::string, std::string> GetInterfaceIPv4Address(
 
 // Network utility: obtain an available TCP port on loopback by binding to 0
 int getFreeTcpPort();
+
+// Obtain multiple unique available TCP ports atomically.
+// All ports are bound simultaneously before any are released, preventing
+// duplicate port assignments that can occur with repeated getFreeTcpPort()
+// calls.
+std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
 

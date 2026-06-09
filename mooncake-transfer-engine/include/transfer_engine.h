@@ -25,6 +25,12 @@ class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
 };
+#if defined(USE_CUDA) || defined(USE_MUSA)
+namespace device {
+class P2pTransport;
+class RdmaTransport;
+}  // namespace device
+#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -34,8 +40,33 @@ using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 
+enum class PeerLiveness : uint8_t {
+    Alive = 0,
+    Unreachable = 1,
+};
+
 class TransferEngine {
    public:
+#ifdef ENABLE_MULTI_PROTOCOL
+    struct RegisteredBuffer {
+        void* addr;
+        size_t length;
+        std::string location;
+        bool remote_accessible;
+        bool update_metadata;
+
+        RegisteredBuffer(void* addr, size_t length = 0,
+                         std::string location = kWildcardLocation,
+                         bool remote_accessible = true,
+                         bool update_metadata = true)
+            : addr(addr),
+              length(length),
+              location(location),
+              remote_accessible(remote_accessible),
+              update_metadata(update_metadata) {}
+    };
+#endif
+
     TransferEngine(bool auto_discover = false);
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
@@ -72,6 +103,33 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest>& entries);
+
+    Status submitTransferWithNotify(BatchID batch_id,
+                                    const std::vector<TransferRequest>& entries,
+                                    TransferMetadata::NotifyDesc notify_msg);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol API
+    // Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+    int mp_registerLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    int mp_unregisterLocalMemory(
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+            buffer_map);
+
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest>& entries,
+                             std::string& proto);
+
+    Status mp_submitTransferWithNotify(
+        BatchID batch_id, const std::vector<TransferRequest>& entries,
+        TransferMetadata::NotifyDesc notify_msg, std::string& proto);
+#endif
+
     int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
                                  const std::string& location);
 
@@ -81,13 +139,6 @@ class TransferEngine {
 
     Status freeBatchID(BatchID batch_id);
 
-    Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest>& entries);
-
-    Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest>& entries,
-                                    TransferMetadata::NotifyDesc notify_msg);
-
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,
@@ -96,12 +147,32 @@ class TransferEngine {
     int sendNotifyByName(std::string remote_agent,
                          TransferMetadata::NotifyDesc notify_msg);
 
+    PeerLiveness probePeerAliveByID(SegmentID target_id);
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
     Transport* getTransport(const std::string& proto);
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+    // Device transport accessors (P2P + IBGDA).  Lazily created on first
+    // call and owned by the TransferEngine.  These allow EP (and future
+    // CPU-proxy paths) to obtain device transports from an engine instance
+    // instead of calling the global factory functions directly.
+    device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
+    device::RdmaTransport* getOrCreateRdmaTransport(
+        const std::vector<std::string>& device_filter = {});
+#endif
+
+    /**
+     * @brief Check if TCP is the only installed transport.
+     *
+     * When only TCP transport is available (no RDMA, NVLink, etc.),
+     * local memcpy is preferred over TCP loopback for same-host transfers.
+     */
+    bool isTcpOnly() const;
 
     int syncSegmentCache(const std::string& segment_name = "");
 

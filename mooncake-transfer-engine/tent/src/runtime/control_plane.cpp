@@ -92,6 +92,11 @@ Status ControlClient::notify(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
+Status ControlClient::probe(const std::string& server_addr) {
+    std::string request, response;
+    return tl_rpc_agent.call(server_addr, Probe, request, response);
+}
+
 inline void to_json(json& j, const Request& r) {
     j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
              {"source", reinterpret_cast<uintptr_t>(r.source)},
@@ -151,26 +156,12 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
-    : ControlService(type, servers, "", "", 0, impl) {}
-
-ControlService::ControlService(const std::string& type,
-                               const std::string& servers,
-                               const std::string& password, uint8_t db_index,
-                               TransferEngineImpl* impl)
-    : ControlService(type, servers, "", password, db_index, impl) {}
-
-ControlService::ControlService(const std::string& type,
-                               const std::string& servers,
-                               const std::string& username,
-                               const std::string& password, uint8_t db_index,
-                               TransferEngineImpl* impl)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralSegmentRegistry>(
-            type, servers, username, password, db_index);
+        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
@@ -199,6 +190,10 @@ ControlService::ControlService(const std::string& type,
             onNotify(request, response);
         });
     rpc_server_->registerFunction(
+        Probe, [this](const std::string_view& request, std::string& response) {
+            onProbe(request, response);
+        });
+    rpc_server_->registerFunction(
         Delegate,
         [this](const std::string_view& request, std::string& response) {
             onDelegate(request, response);
@@ -210,6 +205,16 @@ ControlService::ControlService(const std::string& type,
     rpc_server_->registerFunction(
         Unpin, [this](const std::string_view& request, std::string& response) {
             onUnpinStageBuffer(request, response);
+        });
+    rpc_server_->registerFunction(
+        SubscribeSegmentUpdate,
+        [this](const std::string_view& request, std::string& response) {
+            onSubscribeSegmentUpdate(request, response);
+        });
+    rpc_server_->registerFunction(
+        NotifySegmentUpdated,
+        [this](const std::string_view& request, std::string& response) {
+            onSegmentUpdated(request, response);
         });
 }
 
@@ -238,6 +243,10 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "SendData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
@@ -258,6 +267,10 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "RecvData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
@@ -285,6 +298,12 @@ void ControlService::onNotify(const std::string_view& request,
     if (notify_callback_) notify_callback_(message);
 }
 
+void ControlService::onProbe(const std::string_view& request,
+                             std::string& response) {
+    (void)request;
+    (void)response;
+}
+
 void ControlService::onDelegate(const std::string_view& request,
                                 std::string& response) {
     Request user_request = json::parse(std::string(request)).get<Request>();
@@ -304,6 +323,52 @@ void ControlService::onUnpinStageBuffer(const std::string_view& request,
                                         std::string& response) {
     uint64_t addr = json::parse(request).get<uint64_t>();
     impl_->unlockStageBuffer(addr);
+}
+
+void ControlService::onSubscribeSegmentUpdate(const std::string_view& request,
+                                              std::string& response) {
+    std::string peer_addr =
+        json::parse(std::string(request)).get<std::string>();
+    manager_->addSubscriber(peer_addr);
+}
+
+void ControlService::onSegmentUpdated(const std::string_view& request,
+                                      std::string& response) {
+    std::string segment_name =
+        json::parse(std::string(request)).get<std::string>();
+
+    manager_->invalidateAllCacheForRemote(segment_name);
+
+    VLOG(1) << "Invalidated cache for segment " << segment_name
+            << " due to remote update notification";
+}
+
+void ControlClient::subscribeSegmentUpdateAsync(
+    const std::string& server_addr, const std::string& subscriber_addr) {
+    json j = subscriber_addr;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, SubscribeSegmentUpdate, request,
+        [](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
+                           << status.ToString();
+            }
+        });
+}
+
+void ControlClient::notifySegmentUpdatedAsync(
+    const std::string& server_addr, const std::string& segment_name,
+    const onNotifySegmentUpdateFailure& on_failure) {
+    json j = segment_name;
+    std::string request = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, NotifySegmentUpdated, request,
+        [on_failure](const Status& status, const std::string&) {
+            if (!status.ok()) {
+                on_failure();
+            }
+        });
 }
 
 }  // namespace tent

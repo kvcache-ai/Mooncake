@@ -5,13 +5,18 @@
 #
 #   SOURCE_DIR          - mooncake-pg source directory
 #   EP_CUDA_MAJOR       - CUDA major version (integer)
+#   EP_CUDA_MINOR       - CUDA minor version (integer)
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 
 cmake_minimum_required(VERSION 3.16)
+
+# Include common build utilities.
+include("${SOURCE_DIR}/../mooncake-common/SetupPyTorchEnv.cmake")
 
 # Restore pipe-separated strings back to CMake semicolon-separated lists.
 if(EP_TORCH_VERSIONS)
@@ -31,6 +36,11 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+if(EP_USE_MUSA)
+  set(ENV{MOONCAKE_EP_USE_MUSA} "1")
+else()
+  unset(ENV{MOONCAKE_EP_USE_MUSA})
+endif()
 
 # ---------------------------------------------------------------------------
 # 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.
@@ -53,7 +63,7 @@ endif()
 if("${EP_TORCH_VERSIONS}" STREQUAL "")
   message(STATUS "[PG] Building with currently-installed PyTorch")
   execute_process(
-    COMMAND python setup.py build_ext --build-lib .
+    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
     WORKING_DIRECTORY "${SOURCE_DIR}"
     RESULT_VARIABLE _ret
   )
@@ -63,26 +73,10 @@ if("${EP_TORCH_VERSIONS}" STREQUAL "")
 else()
   message(STATUS "[PG] Building for PyTorch versions: ${EP_TORCH_VERSIONS}")
   foreach(_version IN LISTS EP_TORCH_VERSIONS)
-    message(STATUS "[PG] Installing PyTorch ${_version}")
-    if(EP_CUDA_MAJOR GREATER_EQUAL 13)
-      # TODO: Fix when we need to support more CUDA 13 versions or when the CI
-      #       env is fixed.
-      execute_process(
-        COMMAND pip install "torch==${_version}" --index-url https://download.pytorch.org/whl/cu130
-        RESULT_VARIABLE _ret
-      )
-    else()
-      execute_process(
-        COMMAND pip install "torch==${_version}"
-        RESULT_VARIABLE _ret
-      )
-    endif()
-    if(NOT _ret EQUAL 0)
-      message(FATAL_ERROR "[PG] Failed to install PyTorch ${_version}")
-    endif()
+    install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[PG]")
 
     execute_process(
-      COMMAND python setup.py build_ext --build-lib . --force
+      COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
       WORKING_DIRECTORY "${SOURCE_DIR}"
       RESULT_VARIABLE _ret
     )

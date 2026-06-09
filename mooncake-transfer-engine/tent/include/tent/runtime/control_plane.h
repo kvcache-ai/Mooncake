@@ -89,6 +89,8 @@ class ControlClient {
     static Status notify(const std::string& server_addr,
                          const Notification& message);
 
+    static Status probe(const std::string& server_addr);
+
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
@@ -97,20 +99,20 @@ class ControlClient {
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
+
+    static void subscribeSegmentUpdateAsync(const std::string& server_addr,
+                                            const std::string& subscriber_addr);
+
+    using onNotifySegmentUpdateFailure = std::function<void()>;
+    static void notifySegmentUpdatedAsync(
+        const std::string& server_addr, const std::string& segment_name,
+        const onNotifySegmentUpdateFailure& on_failure);
 };
 
 class ControlService {
    public:
     ControlService(const std::string& type, const std::string& servers,
                    TransferEngineImpl* impl);
-
-    ControlService(const std::string& type, const std::string& servers,
-                   const std::string& password, uint8_t db_index,
-                   TransferEngineImpl* impl);
-
-    ControlService(const std::string& type, const std::string& servers,
-                   const std::string& username, const std::string& password,
-                   uint8_t db_index, TransferEngineImpl* impl);
 
     ~ControlService();
 
@@ -142,6 +144,8 @@ class ControlService {
 
     void onNotify(const std::string_view& request, std::string& response);
 
+    void onProbe(const std::string_view& request, std::string& response);
+
     void onDelegate(const std::string_view& request, std::string& response);
 
     void onPinStageBuffer(const std::string_view& request,
@@ -149,6 +153,12 @@ class ControlService {
 
     void onUnpinStageBuffer(const std::string_view& request,
                             std::string& response);
+
+    void onSubscribeSegmentUpdate(const std::string_view& request,
+                                  std::string& response);
+
+    void onSegmentUpdated(const std::string_view& request,
+                          std::string& response);
 
    private:
     std::unique_ptr<SegmentManager> manager_;

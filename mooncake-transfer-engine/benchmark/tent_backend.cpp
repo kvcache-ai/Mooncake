@@ -17,9 +17,14 @@
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
+#include "tent/runtime/transport_selector.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
+
+#ifdef USE_HIP
+#include <hip/hip_runtime.h>
 #endif
 
 namespace mooncake {
@@ -50,9 +55,9 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
+            {"rdma", "rdma"},        {"tcp", "tcp"},     {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -74,6 +79,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "shm") return SHM;
     if (xport_type == "gds") return GDS;
     if (xport_type == "mnnvl") return MNNVL;
+    if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
     return UNSPEC;
@@ -105,39 +111,57 @@ int TENTBenchRunner::allocateBuffers() {
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << gpu_count << ")";
         }
+#elif defined(USE_HIP)
+    } else if (seg_type == "VRAM") {
+        device_prefix = "rocm";
+        int gpu_count = 0;
+        hipGetDeviceCount(&gpu_count);
+        start_idx = 0;
+        num_buffers = gpu_count;
+        if (XferBenchConfig::local_gpu_id != -1) {
+            start_idx = XferBenchConfig::local_gpu_id;
+            num_buffers = 1;
+            LOG_ASSERT(start_idx >= 0 && start_idx < gpu_count)
+                << "local_gpu_id " << start_idx << " out of range [0, "
+                << gpu_count << ")";
+        }
 #endif
     } else {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
         return -1;
     }
 
-    // Allocate
     pinned_buffer_list_.resize(num_buffers, nullptr);
-    auto start_ts = getCurrentTimeInNano();
+    uint64_t alloc_ns = 0, reg_ns = 0;
     for (int i = 0; i < num_buffers; ++i) {
         auto location = device_prefix + ":" + std::to_string(start_idx + i);
+        MemoryOptions options;
         if (!xport_type.empty()) {
-            MemoryOptions options;
             options.type = getTransportType(xport_type);
-            options.location = std::move(location);
+        }
+
+        auto t0 = getCurrentTimeInNano();
+        if (!xport_type.empty()) {
+            options.location = location;
             CHECK_FAIL(engine_->allocateLocalMemory(
                 &pinned_buffer_list_[i], total_buffer_size, options));
         } else {
             CHECK_FAIL(engine_->allocateLocalMemory(
                 &pinned_buffer_list_[i], total_buffer_size, location));
         }
+        auto t1 = getCurrentTimeInNano();
+
+        CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                                total_buffer_size, options));
+        auto t2 = getCurrentTimeInNano();
+
+        alloc_ns += (t1 - t0);
+        reg_ns += (t2 - t1);
     }
 
-    // Register
-    auto allocated_ts = getCurrentTimeInNano();
-    std::vector<size_t> buffers_size(num_buffers, total_buffer_size);
-    CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_, buffers_size));
-    auto registered_ts = getCurrentTimeInNano();
-
     LOG(INFO) << "Allocated " << total_buffer_size * num_buffers << " bytes "
-              << seg_type << " buffers in " << (allocated_ts - start_ts) / 1e6
-              << " ms, registered in " << (registered_ts - allocated_ts) / 1e6
-              << " ms";
+              << seg_type << " buffers in " << alloc_ns / 1e6
+              << " ms, registered in " << reg_ns / 1e6 << " ms";
     return 0;
 }
 
@@ -156,6 +180,8 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
+    transport_hint_ = TransportSelector::parseTransportType(
+        XferBenchConfig::tent_transport_hint);
     allocateBuffers();
 }
 
@@ -195,7 +221,6 @@ int TENTBenchRunner::stopInitiator() {
     return 0;
 }
 
-#ifdef USE_CUDA
 static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
@@ -205,9 +230,11 @@ static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     if (numa_file.fail()) return -1;
     return numa_node;
 }
-static inline int getCudaDeviceNumaID(int cuda_id) {
+
+#ifdef USE_CUDA
+static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
-    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_id);
+    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
     if (err != cudaSuccess) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
@@ -215,8 +242,17 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
     for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
+#elif defined(USE_HIP)
+static inline int getGpuDeviceNumaID(int gpu_id) {
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, gpu_id) != hipSuccess) return 0;
+    char pci_bus_id[20];
+    snprintf(pci_bus_id, sizeof(pci_bus_id), "%04x:%02x:%02x.0",
+             prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+    return getNumaNodeFromPciDevice(pci_bus_id);
+}
 #else
-static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
+static inline int getGpuDeviceNumaID(int gpu_id) { return 0; }
 #endif
 
 void TENTBenchRunner::pinThread(int thread_id) {
@@ -227,9 +263,9 @@ void TENTBenchRunner::pinThread(int thread_id) {
     if (location.type() == "cpu") {
         auto socket_id = location.index();
         bindToSocket(socket_id);
-    } else if (location.type() == "cuda") {
+    } else if (location.type() == "cuda" || location.type() == "rocm") {
         auto device_id = location.index();
-        auto socket_id = getCudaDeviceNumaID(device_id);
+        auto socket_id = getGpuDeviceNumaID(device_id);
         bindToSocket(socket_id);
     }
 }
@@ -278,6 +314,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
+        entry.transport_hint = transport_hint_;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

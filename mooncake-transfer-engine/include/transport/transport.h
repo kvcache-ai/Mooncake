@@ -35,6 +35,8 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -64,6 +66,8 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
     };
 
     enum TransferStatusEnum {
@@ -124,9 +128,21 @@ class Transport {
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
+                uint64_t dest_addr;
+                volatile int *jetty_depth;
+                uint32_t retry_cnt;
+                uint32_t max_retry_cnt;
+                void *r_seg;
+                void *l_seg;
+                void *endpoint;
+            } ub;
+            struct {
                 void *dest_addr;
+                void *cuda_stream;  // cudaStream_t, used by async NVLink
+                                    // transport
             } local;
             struct {
                 uint64_t dest_addr;
@@ -278,6 +294,12 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+        // Pointer to the transport that handles this task, set by
+        // MultiTransport::submitTransfer(). Used to delegate
+        // transport-specific completion polling (e.g., CUDA stream
+        // query for NVLink async transfers) in getTransferStatus().
+        Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;

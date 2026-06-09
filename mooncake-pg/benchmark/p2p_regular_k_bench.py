@@ -10,7 +10,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pgbench_utils import parse_size, resolve_dtype
+from pgbench_utils import (
+    configure_mooncake_device_filter,
+    parse_size,
+    resolve_dtype,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -53,9 +57,9 @@ def _init_backend_device(args: argparse.Namespace) -> None:
 
     if args.backend in ("mooncake", "mooncake-cpu"):
         try:
-            import mooncake.pg as pg  # noqa: F401
+            import mooncake.pg as pg
 
-            pg.set_device_filter(["mlx5_1", "mlx5_2", "mlx5_3", "mlx5_4"])
+            configure_mooncake_device_filter(pg)
         except Exception as exc:
             raise RuntimeError(
                 "Failed to import mooncake.pg; ensure PYTHONPATH includes mooncake-pg"

@@ -42,8 +42,9 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 #include <cassert>
 
 #if defined(USE_MNNVL) || defined(USE_UBSHMEM)
@@ -55,16 +56,16 @@
 #endif
 
 #if defined(USE_UBSHMEM)
-static void checkAclError(aclError result, const char *message) {
+static void checkAclError(aclError result, const char* message) {
     if (result != ACL_ERROR_NONE) {
-        const char *errMsg = aclGetRecentErrMsg();
+        const char* errMsg = aclGetRecentErrMsg();
         LOG(ERROR) << message << " (Error code: " << result << " - " << errMsg
                    << ")";
         exit(EXIT_FAILURE);
     }
 }
 #else
-static void checkCudaError(cudaError_t result, const char *message) {
+static void checkCudaError(cudaError_t result, const char* message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
                    << cudaGetErrorString(result) << ")" << std::endl;
@@ -88,7 +89,8 @@ DEFINE_string(mode, "initiator",
 DEFINE_string(operation, "read", "Operation type: read or write");
 
 DEFINE_string(protocol, "rdma",
-              "Transfer protocol: rdma|barex|tcp|efa|nvlink|nvlink_intra|hip");
+              "Transfer protocol: "
+              "rdma|barex|tcp|efa|nvlink|nvlink_intra|hip|sunrise_link");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -106,8 +108,9 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0,
@@ -116,10 +119,11 @@ DEFINE_int32(gpu_id, 0,
 
 using namespace mooncake;
 
-static void *allocateMemoryPool(size_t size, int buffer_id,
+static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -127,7 +131,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         } else {
             gpu_id = FLAGS_gpu_id;
         }
-        void *d_buf;
+        void* d_buf;
 #if defined(USE_UBSHMEM)
         LOG(INFO) << "Allocating memory on NPU " << gpu_id;
         checkAclError(aclrtSetDevice(gpu_id), "Failed to set device");
@@ -188,9 +192,10 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
     return numa_alloc_onnode(size, buffer_id);
 }
 
-static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+static void freeMemoryPool(void* addr, size_t size) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
 #ifdef USE_MNNVL
         if (FLAGS_use_vram) {
@@ -214,23 +219,42 @@ static void freeMemoryPool(void *addr, size_t size) {
 #endif
     } else {
 #ifndef USE_UBSHMEM
-        // check pointer on GPU
-        cudaPointerAttributes attributes;
-        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                       "Failed to get pointer attributes");
-
-        if (attributes.type == cudaMemoryTypeDevice) {
-            cudaFree(addr);
-        } else if (attributes.type == cudaMemoryTypeHost ||
-                   attributes.type == cudaMemoryTypeUnregistered) {
+        // Check FLAGS_use_vram first to avoid unnecessary CUDA calls in non-GPU
+        // environments
+        if (!FLAGS_use_vram) {
+            // Memory was allocated via numa_alloc_onnode, free it directly
             numa_free(addr, size);
         } else {
-            LOG(ERROR) << "Unknown memory type, " << addr << " "
-                       << attributes.type;
+            // Memory may be on GPU, check pointer attributes
+            // Use graceful error handling like transfer engine core
+            // (memory_location.cpp)
+            cudaPointerAttributes attributes;
+            cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
+
+            if (result != cudaSuccess) {
+                // CUDA call failed when FLAGS_use_vram is true - this is an
+                // error
+                LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                           << result << " - " << cudaGetErrorString(result)
+                           << ")";
+                numa_free(addr, size);
+            } else if (attributes.type == cudaMemoryTypeDevice) {
+                cudaFree(addr);
+            } else if (attributes.type == cudaMemoryTypeHost ||
+                       attributes.type == cudaMemoryTypeUnregistered) {
+                numa_free(addr, size);
+            } else {
+                LOG(ERROR) << "Unknown memory type, " << addr << " "
+                           << attributes.type << ", assuming CPU memory";
+                numa_free(addr, size);
+            }
         }
 #endif
     }
 #else
+    if (FLAGS_protocol == "ub") {
+        munmap(addr, size);  // for urma
+    }
     numa_free(addr, size);
 #endif
 }
@@ -268,9 +292,23 @@ static inline std::string calculateRate(uint64_t data_bytes, double duration) {
 volatile bool running = true;
 std::atomic<size_t> total_batch_count(0);
 
+// Ensure each worker thread has a valid GPU context before issuing transfers.
+static inline void setWorkerDeviceIfNeeded() {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUNRISE)
+    if (FLAGS_use_vram && FLAGS_gpu_id >= 0) {
+        checkCudaError(cudaSetDevice(FLAGS_gpu_id),
+                       "Failed to set device in worker");
+    }
+#endif
+}
+
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
@@ -297,11 +335,12 @@ static int determineBufferCount() {
 }
 
 // Common helper to allocate memory buffers
-static std::vector<void *> allocateBuffers() {
+static std::vector<void*> allocateBuffers() {
     buffer_num = determineBufferCount();
-    std::vector<void *> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+    std::vector<void*> addr(buffer_num);
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
     }
@@ -314,7 +353,7 @@ static std::vector<void *> allocateBuffers() {
 }
 
 // Common helper to free memory buffers
-static void freeBuffers(std::vector<void *> &addr) {
+static void freeBuffers(std::vector<void*>& addr) {
     for (int i = 0; i < buffer_num; ++i) {
         freeMemoryPool(addr[i], FLAGS_buffer_size);
     }
@@ -323,8 +362,9 @@ static void freeBuffers(std::vector<void *> &addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_UBSHMEM)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
         return std::string(GPU_PREFIX) + std::to_string(name_suffix);
@@ -333,8 +373,8 @@ static std::string getLocationName(int buffer_id) {
     return "cpu:" + std::to_string(buffer_id);
 }
 
-Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
-                       int thread_id, void *addr) {
+Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
+                       int thread_id, void* addr) {
     bindToSocket(thread_id % NR_SOCKETS);
     TransferRequest::OpCode opcode;
     if (FLAGS_operation == "read")
@@ -363,7 +403,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
             TransferRequest entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
-            entry.source = (uint8_t *)(addr) +
+            entry.source = (uint8_t*)(addr) +
                            FLAGS_block_size * (i * FLAGS_threads + thread_id);
             entry.target_id = segment_id;
             entry.target_offset =
@@ -400,7 +440,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     return Status::OK();
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
+std::string formatDeviceNames(const std::string& device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -439,26 +479,32 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
 // Common helper to install transport based on protocol flag
 // Returns the installed transport, or nullptr if auto_discovery is enabled
-static Transport *installTransportFromFlags(TransferEngine *engine) {
+static Transport* installTransportFromFlags(TransferEngine* engine) {
     if (FLAGS_auto_discovery) {
         return nullptr;
     }
 
-    Transport *xport = nullptr;
+    Transport* xport = nullptr;
     std::string nic_priority_matrix;
-    std::unique_ptr<void *, decltype(&free)> args(nullptr, free);
+    std::unique_ptr<void*, decltype(&free)> args(nullptr, free);
 
     if (FLAGS_protocol == "rdma" || FLAGS_protocol == "barex") {
         nic_priority_matrix = loadNicPriorityMatrix();
-        args.reset(static_cast<void **>(malloc(2 * sizeof(void *))));
-        args.get()[0] = const_cast<char *>(nic_priority_matrix.c_str());
+        args.reset(static_cast<void**>(malloc(2 * sizeof(void*))));
+        args.get()[0] = const_cast<char*>(nic_priority_matrix.c_str());
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
+    } else if (FLAGS_protocol == "ub") {
+        engine->getLocalTopology()->discover({FLAGS_device_name});
+        xport = engine->installTransport(FLAGS_protocol, nullptr);
     } else if (FLAGS_protocol == "efa") {
         // EFA needs topology discovery to find devices, but auto_discovery
         // would auto-install RDMA transport. Manually discover instead.
@@ -466,7 +512,8 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
-               FLAGS_protocol == "ubshmem") {
+               FLAGS_protocol == "ubshmem" ||
+               FLAGS_protocol == "sunrise_link") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -484,7 +531,7 @@ int initiator() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     if (!FLAGS_auto_discovery) {
-        Transport *xport = installTransportFromFlags(engine.get());
+        Transport* xport = installTransportFromFlags(engine.get());
         LOG_ASSERT(xport);
     }
 
@@ -580,8 +627,8 @@ int target() {
 namespace tent_backend {
 
 // Helper function to register buffers for TENT backend
-static void registerBuffers(mooncake::tent::TransferEngine *engine,
-                            std::vector<void *> &addr) {
+static void registerBuffers(mooncake::tent::TransferEngine* engine,
+                            std::vector<void*>& addr) {
     for (int i = 0; i < buffer_num; ++i) {
         auto status = engine->registerLocalMemory(addr[i], FLAGS_buffer_size);
         LOG_ASSERT(status.ok())
@@ -590,8 +637,8 @@ static void registerBuffers(mooncake::tent::TransferEngine *engine,
 }
 
 // Helper function to unregister buffers for TENT backend
-static void unregisterBuffers(mooncake::tent::TransferEngine *engine,
-                              std::vector<void *> &addr) {
+static void unregisterBuffers(mooncake::tent::TransferEngine* engine,
+                              std::vector<void*>& addr) {
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i], FLAGS_buffer_size);
     }
@@ -629,11 +676,12 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     return config;
 }
 
-void initiatorWorker(mooncake::tent::TransferEngine *engine,
+void initiatorWorker(mooncake::tent::TransferEngine* engine,
                      mooncake::tent::SegmentID segment_id, int thread_id,
-                     void *addr,
-                     const mooncake::tent::SegmentInfo &segment_info) {
+                     void* addr,
+                     const mooncake::tent::SegmentInfo& segment_info) {
     bindToSocket(thread_id % NR_SOCKETS);
+    setWorkerDeviceIfNeeded();
     mooncake::tent::Request::OpCode opcode;
     if (FLAGS_operation == "read")
         opcode = mooncake::tent::Request::READ;
@@ -662,7 +710,7 @@ void initiatorWorker(mooncake::tent::TransferEngine *engine,
             mooncake::tent::Request entry;
             entry.opcode = opcode;
             entry.length = FLAGS_block_size;
-            entry.source = (uint8_t *)(addr) +
+            entry.source = (uint8_t*)(addr) +
                            FLAGS_block_size * (i * FLAGS_threads + thread_id);
             entry.target_id = segment_id;
             entry.target_offset =
@@ -796,7 +844,7 @@ void check_total_buffer_size() {
     }
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
 

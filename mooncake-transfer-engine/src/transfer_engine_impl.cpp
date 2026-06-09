@@ -29,9 +29,19 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
+#endif
 
 namespace mooncake {
+
+namespace {
+bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
+                       uint64_t region_length) {
+    return overlap(reinterpret_cast<void*>(addr), length, region_addr,
+                   region_length);
+}
+}  // namespace
 
 static bool setFilesLimit() {
     struct rlimit filesLimit;
@@ -242,6 +252,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
+#ifdef USE_UB
+        Transport* ub_transport =
+            multi_transports_->installTransport("ub", local_topology_);
+        if (!ub_transport) {
+            LOG(ERROR) << "Failed to install ub transport";
+            return -1;
+        }
+#endif
+
 #ifdef USE_ASCEND_HETEROGENEOUS
         Transport* ascend_transport =
             multi_transports_->installTransport("ascend", local_topology_);
@@ -249,6 +268,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
+#elif defined(USE_MACA)
+
+        Transport* t = multi_transports_->installTransport("maca", nullptr);
+        if (!t) {
+            LOG(ERROR) << "Failed to install MACA transport";
+            return -1;
+        }
+        LOG(INFO) << "Using MACA transport";
+
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
@@ -283,8 +311,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 
 #else
-        if (local_topology_->getHcaList().size() > 0 &&
-                !getenv("MC_FORCE_TCP") ||
+        if ((local_topology_->getHcaList().size() > 0 &&
+             !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport* rdma_transport = nullptr;
@@ -318,6 +346,21 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #endif
         // TODO: install other transports automatically
+
+#ifdef USE_HIP
+        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
+        // coexist with the cross-node transport (RDMA/TCP) selected above.
+        {
+            Transport* hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(WARNING) << "Failed to install HIP transport "
+                                "(intra-node GPU P2P unavailable)";
+            } else {
+                LOG(INFO) << "HIP transport installed for intra-node GPU P2P";
+            }
+        }
+#endif
     }
 #endif
 
@@ -358,7 +401,7 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
     // shared lock here. If future modifications allow installTransport() to be
     // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
     // added to ensure thread safety.
-    for (auto& entry : local_memory_regions_) {
+    for (auto& [_, entry] : local_memory_regions_) {
         int ret = transport->registerLocalMemory(
             entry.addr, entry.length, entry.location, entry.remote_accessible);
         if (ret < 0) return nullptr;
@@ -369,6 +412,24 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
 int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
+device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
+    int num_ranks) {
+    if (!p2p_transport_) {
+        p2p_transport_ = device::createP2pDeviceTransport(num_ranks);
+    }
+    return p2p_transport_.get();
+}
+
+device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    if (!rdma_transport_) {
+        rdma_transport_ = device::createIbgdaDeviceTransport(device_filter);
+    }
+    return rdma_transport_.get();
+}
+#endif
 
 int TransferEngineImpl::getRpcPort() {
     return metadata_->localRpcMeta().rpc_port;
@@ -387,6 +448,10 @@ int TransferEngineImpl::getNotifies(
 int TransferEngineImpl::sendNotifyByID(
     SegmentID target_id, TransferMetadata::NotifyDesc notify_msg) {
     auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
+        return ERR_METADATA;
+    }
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
     return ret;
@@ -397,6 +462,14 @@ int TransferEngineImpl::sendNotifyByName(
     Transport::NotifyDesc peer_desc;
     int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
     return ret;
+}
+
+int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        return ERR_METADATA;
+    }
+    return metadata_->sendProbe(desc->name);
 }
 
 Transport::SegmentHandle TransferEngineImpl::openSegment(
@@ -454,13 +527,7 @@ int TransferEngineImpl::removeLocalSegment(const std::string& segment_name) {
 
 bool TransferEngineImpl::checkOverlap(void* addr, uint64_t length) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (auto& local_memory_region : local_memory_regions_) {
-        if (overlap(addr, length, local_memory_region.addr,
-                    local_memory_region.length)) {
-            return true;
-        }
-    }
-    return false;
+    return hasOverlapLocked(reinterpret_cast<uintptr_t>(addr), length);
 }
 
 int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
@@ -484,8 +551,7 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    local_memory_regions_.push_back(
-        {addr, length, location, remote_accessible});
+    insertMemoryRegionLocked({addr, length, location, remote_accessible});
     return 0;
 }
 
@@ -497,15 +563,129 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     }
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto it = local_memory_regions_.begin();
-         it != local_memory_regions_.end(); ++it) {
-        if (it->addr == addr) {
-            local_memory_regions_.erase(it);
-            break;
+    eraseMemoryRegionLocked(addr);
+    return 0;
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol API (only available when ENABLE_MULTI_PROTOCOL is defined)
+// Supports registering memory for multiple protocols (CXL, TCP / RDMA)
+int TransferEngineImpl::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    // ========== Phase 1: Pre-check ==========
+    for (const auto& entry : buffer_map) {
+        for (const auto& buffer : entry.second) {
+            if (checkOverlap(buffer.addr, buffer.length)) {
+                LOG(ERROR) << "Transfer Engine does not support overlapped "
+                              "memory region";
+                return ERR_ADDRESS_OVERLAPPED;
+            }
+            if (buffer.length == 0) {
+                LOG(ERROR) << "Transfer Engine does not support zero length "
+                              "memory region";
+                return ERR_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    // ========== Phase 2: Prepare rollback records ==========
+    std::vector<TransferEngineImpl::RegisteredRecord> success_records;
+
+    // Reserve space to reduce reallocations
+    size_t total_buffers = 0;
+    for (const auto& entry : buffer_map) {
+        total_buffers += entry.second.size();
+    }
+    success_records.reserve(total_buffers);
+
+    // ========== Phase 3: Execute registration ==========
+    for (const auto& entry : buffer_map) {
+        const std::string& protocol = entry.first;
+        const auto& buffer_list = entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            rollbackAllRegistrations(success_records);
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->registerLocalMemory(
+                buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible, buffer.update_metadata);
+
+            if (ret < 0) {
+                LOG(ERROR) << "Failed to register memory with transport "
+                           << protocol << " addr=" << buffer.addr
+                           << " length=" << buffer.length;
+
+                // ========== Phase 4: Rollback on failure ==========
+                rollbackAllRegistrations(success_records);
+                return ret;
+            }
+
+            // Record successful registration for potential rollback
+            success_records.push_back(TransferEngineImpl::RegisteredRecord{
+                transport, buffer.addr, buffer.length, buffer.location,
+                buffer.remote_accessible});
+        }
+    }
+
+    // ========== Phase 5: Commit to system state ==========
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& record : success_records) {
+            insertMemoryRegionLocked({record.addr, record.length,
+                                      record.location,
+                                      record.remote_accessible});
+        }
+    }
+
+    return 0;
+}
+
+void TransferEngineImpl::rollbackAllRegistrations(
+    const std::vector<RegisteredRecord>& records) {
+    LOG(INFO) << "Rolling back " << records.size() << " registered regions";
+
+    for (const auto& record : records) {
+        if (record.transport) {
+            record.transport->unregisterLocalMemory(record.addr, true);
+        }
+    }
+}
+
+int TransferEngineImpl::mp_unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    for (const auto& buffer_entry : buffer_map) {
+        const std::string& protocol = buffer_entry.first;
+        const std::vector<RegisteredBuffer>& buffer_list = buffer_entry.second;
+
+        auto transport = multi_transports_->getTransport(protocol);
+        if (!transport) {
+            LOG(ERROR) << "Transport " << protocol << " not found";
+            return -1;
+        }
+
+        for (const auto& buffer : buffer_list) {
+            int ret = transport->unregisterLocalMemory(buffer.addr,
+                                                       buffer.update_metadata);
+            if (ret) {
+                return ret;
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (const auto& buffer : buffer_list) {
+            eraseMemoryRegionLocked(buffer.addr);
         }
     }
     return 0;
 }
+#endif
 
 int TransferEngineImpl::registerLocalMemoryBatch(
     const std::vector<BufferEntry>& buffer_list, const std::string& location) {
@@ -523,8 +703,7 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& buffer : buffer_list) {
-        local_memory_regions_.push_back(
-            {buffer.addr, buffer.length, location, true});
+        insertMemoryRegionLocked({buffer.addr, buffer.length, location, true});
     }
     return 0;
 }
@@ -538,15 +717,72 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {
-        for (auto it = local_memory_regions_.begin();
-             it != local_memory_regions_.end(); ++it) {
-            if (it->addr == addr) {
-                local_memory_regions_.erase(it);
-                break;
-            }
-        }
+        eraseMemoryRegionLocked(addr);
     }
     return 0;
+}
+
+TransferEngineImpl::MemoryRegionMap::iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
+}
+
+TransferEngineImpl::MemoryRegionMap::const_iterator
+TransferEngineImpl::findMemoryRegionContaining(uintptr_t addr) const {
+    auto upper = local_memory_regions_.upper_bound(addr);
+    if (upper == local_memory_regions_.begin()) {
+        return local_memory_regions_.end();
+    }
+    auto candidate = std::prev(upper);
+    return overlapWithRegion(addr, 1, candidate->second.addr,
+                             candidate->second.length)
+               ? candidate
+               : local_memory_regions_.end();
+}
+
+bool TransferEngineImpl::hasOverlapLocked(uintptr_t addr,
+                                          uint64_t length) const {
+    if (length == 0) {
+        return false;
+    }
+
+    auto containing = findMemoryRegionContaining(addr);
+    if (containing != local_memory_regions_.end()) {
+        return true;
+    }
+
+    auto next = local_memory_regions_.lower_bound(addr);
+    if (next != local_memory_regions_.end() &&
+        overlapWithRegion(addr, length, next->second.addr,
+                          next->second.length)) {
+        return true;
+    }
+
+    if (next != local_memory_regions_.begin()) {
+        auto prev = std::prev(next);
+        if (overlapWithRegion(addr, length, prev->second.addr,
+                              prev->second.length)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
+    local_memory_regions_[reinterpret_cast<uintptr_t>(region.addr)] = region;
+}
+
+void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
+    local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
 }
 
 #ifdef WITH_METRICS
