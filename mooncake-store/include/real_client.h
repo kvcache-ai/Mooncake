@@ -82,7 +82,8 @@ class RealClient : public PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
-        const std::string &ssd_offload_path = "");
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default");
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -103,24 +104,24 @@ class RealClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
-    struct RegisteredBufferRegion {
+    struct WritableBufferRegion {
         void *base{nullptr};
         size_t size{0};
         size_t offset{0};
     };
 
-    std::optional<RegisteredBufferRegion> resolve_registered_buffer(
+    std::optional<WritableBufferRegion> resolve_writable_buffer_region(
         void *buffer) const;
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to the pre-allocated buffer (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to a writable Store buffer, either explicitly
+     * registered with register_buffer() or inside the setup-time local buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory
+     * for zero-copy operations
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -140,8 +141,9 @@ class RealClient : public PyClient {
      * @param sizes Vector of sizes of the buffers
      * @return Vector of 64-bit integers, where each element is the number of
      * bytes read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
@@ -156,8 +158,9 @@ class RealClient : public PyClient {
      * @param all_sizes Vector of vectors of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -168,12 +171,14 @@ class RealClient : public PyClient {
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to the buffer containing data (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to Store-managed registered memory, either
+     * explicitly registered with register_buffer() or inside the setup-time
+     * local buffer
      * @param size Size of the data to put
      * @return 0 on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory,
+     * either an explicit register_buffer() region or the setup-time local
+     * buffer
      */
     int put_from(const std::string &key, void *buffer, size_t size,
                  const ReplicateConfig &config = ReplicateConfig{});
@@ -190,8 +195,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     int put_from_with_metadata(
         const std::string &key, void *buffer, void *metadata_buffer,
@@ -207,8 +213,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
 
     std::vector<int> batch_put_from(
@@ -226,8 +233,9 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_put_from_multi_buffers(
         const std::vector<std::string> &keys,
@@ -484,6 +492,9 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
         const UUID &client_id);
 
+    tl::expected<bool, ErrorCode> is_shm_mapped_internal(
+        uint64_t dummy_base_addr, const UUID &client_id);
+
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
@@ -500,7 +511,8 @@ class RealClient : public PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
-        const std::string &ssd_offload_path = "");
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -683,6 +695,10 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects);
 
+    int64_t get_offload_rpc_read_count() const {
+        return offload_rpc_read_count_.load(std::memory_order_relaxed);
+    }
+
     /**
      * @brief Mount a shared memory file region and return segment ids.
      *        If size > max_mr_size, it will be split into multiple chunks
@@ -695,8 +711,10 @@ class RealClient : public PyClient {
 
     /**
      * @brief Unmount segments by their ids and clean up local mmap/fd.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
      */
-    int unmountSegment(const std::vector<std::string> &segment_ids);
+    int unmountSegment(const std::vector<std::string> &segment_ids,
+                       uint64_t grace_period_seconds = 0);
 
     /**
      * @brief Allocate memory internally and mount segments to master.
@@ -712,8 +730,10 @@ class RealClient : public PyClient {
 
     /**
      * @brief Unmount segments by their ids and free locally allocated memory.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
      */
-    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids);
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
+                              uint64_t grace_period_seconds = 0);
 
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
@@ -755,11 +775,22 @@ class RealClient : public PyClient {
         }
     };
 
+    struct UbSegmentDeleter {
+        size_t size = 0;
+        std::string protocol = "ub";
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
         hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -797,6 +828,7 @@ class RealClient : public PyClient {
 
     mutable std::shared_mutex registered_buffer_mutex_;
     std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    std::optional<WritableBufferRegion> local_buffer_region_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -826,9 +858,13 @@ class RealClient : public PyClient {
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
+    // Counts every LOCAL_DISK read served via peer offload-RPC.
+    std::atomic<int64_t> offload_rpc_read_count_{0};
+
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
+    void stop_dummy_client_monitor();
     std::thread dummy_client_monitor_thread_;
     std::atomic<bool> dummy_client_monitor_running_{false};
     static constexpr uint64_t kDummyClientMonitorSleepMs =
@@ -872,6 +908,11 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;
     std::mutex allocated_segment_records_mutex_;
+
+    void ReleaseMountedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllMountedSegmentRecords();
+    void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllAllocatedSegmentRecords();
 };
 
 }  // namespace mooncake

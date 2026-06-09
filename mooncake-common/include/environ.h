@@ -49,9 +49,8 @@ class Environ {
     bool GetForceMnnvl() const { return force_mnnvl_; }
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
-
-   private:
-    Environ();
+    bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
+    int GetEfaCqThreads() const { return efa_cq_threads_; }
 
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
@@ -62,6 +61,9 @@ class Environ {
     // Helper method to get string from env
     static std::string GetString(const char* name,
                                  const std::string& default_value);
+
+   private:
+    Environ();
 
     // Member variables
     int num_cq_per_ctx_;
@@ -99,6 +101,8 @@ class Environ {
     bool force_mnnvl_;
     bool intra_nvlink_;
     bool path_roundrobin_;
+    bool with_nvidia_peermem_;
+    int efa_cq_threads_;
 };
 
 }  // namespace mooncake

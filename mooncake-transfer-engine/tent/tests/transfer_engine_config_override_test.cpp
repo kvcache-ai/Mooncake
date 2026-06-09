@@ -261,6 +261,29 @@ class TestHttpMetadataServer {
 #endif
 
 TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaBindAddressEnvLoadsIntoTentConfig) {
+    EnvVarGuard guard("MC_RDMA_BIND_ADDRESS", "10.0.0.2");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     LegacyRdmaBindAddressEnvOverridesMcTentConf) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"rdma":{"bind_address":"10.0.0.1"}}})");
+    EnvVarGuard bind_guard("MC_RDMA_BIND_ADDRESS", "10.0.0.2");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
+}
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";

@@ -12,7 +12,7 @@ RUN apt-get install -y libibverbs-dev \
     libjsoncpp-dev \
     libnuma-dev \
     libpython3-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -26,6 +26,7 @@ RUN apt-get install -y libibverbs-dev \
     libzstd-dev \
     libmsgpack-dev \
     libgflags-dev \
+    libxxhash-dev \
     pkg-config \
     patchelf
 

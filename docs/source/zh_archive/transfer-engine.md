@@ -407,6 +407,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_WORKERS_PER_CTX` 每个设备实例对应的异步工作线程数量
 - `MC_SLICE_SIZE` Transfer Engine 中用户请求的切分粒度
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
+- `MC_AUTO_GID_MAX_RETRIES` classic RDMA 握手恢复过程中自动重探测本地 GID 的最大重试次数，默认值 2。设置为 0 可以关闭自动 GID 重试。
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 - `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
 - `MC_HANDSHAKE_MAX_LENGTH` P2P 模式下握手消息的最大长度（字节）。有效范围：1MB 到 128MB。默认值为 1MB (1048576 字节)。当单个 RDMA 实例注册大量内存缓冲区（>10,000）时，需要增大此值以避免握手失败。示例：设置为 10485760 表示 10MB
@@ -422,4 +423,5 @@ int init(const std::string &metadata_conn_string,
 - `MC_MIN_RPC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_RPC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
 - `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式，这对于传输大块数据可能有利。
+- `WITH_NVIDIA_PEERMEM` 设置为 `1`、`ON` 或 `TRUE` 时，Mooncake 使用 `ibv_reg_mr()` 直接注册 GPU 内存（需要 `nvidia-peermem` 内核模块）。默认情况下（未设置或为 `0`），Mooncake 使用不需要 `nvidia-peermem` 的 DMA-BUF 路径。
 - `MC_ENDPOINT_STORE_TYPE` 选择 FIFO Endpoint Store (`FIFO`) 或者 Sieve Endpoint Store (`SIEVE`)，模式是 `SIEVE`。

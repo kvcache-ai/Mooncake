@@ -83,7 +83,8 @@ class PinnedBufferPool {
         buf.capacity = size;
         buf.is_pinned = false;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
         if (cudaMallocHost(reinterpret_cast<void**>(&buf.data), size) ==
             cudaSuccess) {
             buf.is_pinned = true;
@@ -119,7 +120,8 @@ class PinnedBufferPool {
             delete[] buf.data;
             return;
         }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
         cudaFreeHost(buf.data);
 #elif defined(USE_HIP)
         hipHostFree(buf.data);

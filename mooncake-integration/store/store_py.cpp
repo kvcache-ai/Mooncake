@@ -11,11 +11,14 @@
 #include "dummy_client.h"
 #include "real_client.h"
 #include "types.h"
+#include "memory_alloc.h"
+#include "ssd_register_client.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
 
 #include "integration_utils.h"
+#include "buffer_pool.h"
 
 // Forward declaration for EngramStore bindings
 namespace mooncake {
@@ -50,7 +53,7 @@ struct PyTensorInfo {
         // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
         // excluding UNKNOWN=-1)
         if (validated.header.dtype >=
-            static_cast<uint32_t>(TensorDtype::NR_DTYPES)) {
+            static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
             return false;
         }
 
@@ -340,14 +343,15 @@ class MooncakeStorePyWrapper {
         return result;
     }
 
-    int unmount_segment(const std::vector<std::string> &segment_ids) {
+    int unmount_segment(const std::vector<std::string> &segment_ids,
+                        uint64_t grace_period_seconds = 0) {
         auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
         if (!real_client) {
             LOG(ERROR) << "unmount_segment requires RealClient";
             return -1;
         }
         py::gil_scoped_release release;
-        return real_client->unmountSegment(segment_ids);
+        return real_client->unmountSegment(segment_ids, grace_period_seconds);
     }
 
     py::dict allocate_and_mount_segment(size_t size,
@@ -377,14 +381,16 @@ class MooncakeStorePyWrapper {
         return result;
     }
 
-    int unmount_and_free_segment(const std::vector<std::string> &segment_ids) {
+    int unmount_and_free_segment(const std::vector<std::string> &segment_ids,
+                                 uint64_t grace_period_seconds = 0) {
         auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
         if (!real_client) {
             LOG(ERROR) << "unmount_and_free_segment requires RealClient";
             return -1;
         }
         py::gil_scoped_release release;
-        return real_client->unmountAndFreeSegment(segment_ids);
+        return real_client->unmountAndFreeSegment(segment_ids,
+                                                  grace_period_seconds);
     }
 
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
@@ -674,6 +680,56 @@ class MooncakeStorePyWrapper {
                                ReplicateConfig{});  // Default config
     }
 
+    ReplicateConfig MakeIndexedConfig(
+        const ReplicateConfig &config,
+        const std::vector<size_t> &original_indices) const {
+        if (!config.group_ids.has_value()) {
+            return config;
+        }
+
+        ReplicateConfig indexed_config = config;
+        std::vector<std::string> group_ids;
+        group_ids.reserve(original_indices.size());
+        for (size_t index : original_indices) {
+            group_ids.push_back(config.group_ids->at(index));
+        }
+        indexed_config.group_ids = std::move(group_ids);
+        return indexed_config;
+    }
+
+    ReplicateConfig MakeRepeatedIndexedConfig(
+        const ReplicateConfig &config,
+        const std::vector<size_t> &original_indices, int repeat_count) const {
+        if (!config.group_ids.has_value()) {
+            return config;
+        }
+
+        ReplicateConfig indexed_config = config;
+        std::vector<std::string> group_ids;
+        group_ids.reserve(original_indices.size() *
+                          static_cast<size_t>(repeat_count));
+        for (size_t index : original_indices) {
+            for (int i = 0; i < repeat_count; ++i) {
+                group_ids.push_back(config.group_ids->at(index));
+            }
+        }
+        indexed_config.group_ids = std::move(group_ids);
+        return indexed_config;
+    }
+
+    std::vector<int> ValidateGroupIdsForBatchConfig(
+        const ReplicateConfig &config, size_t key_count,
+        const char *operation_name) const {
+        if (config.group_ids.has_value() &&
+            config.group_ids->size() != key_count) {
+            LOG(ERROR) << operation_name
+                       << ": group_ids size must match keys size";
+            return std::vector<int>(key_count,
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+        return {};
+    }
+
     int put_tensor_with_tp_impl(
         const std::string &key, pybind11::object tensor,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
@@ -722,11 +778,12 @@ class MooncakeStorePyWrapper {
         const ReplicateConfig &config = ReplicateConfig{}) {
         return batch_write_tensor_impl(
             keys, infos, config, "put",
-            [this, &config](const std::vector<std::string> &write_keys,
-                            const std::vector<void *> &buffer_ptrs,
-                            const std::vector<size_t> &buffer_sizes) {
+            [this](const std::vector<std::string> &write_keys,
+                   const std::vector<void *> &buffer_ptrs,
+                   const std::vector<size_t> &buffer_sizes,
+                   const ReplicateConfig &write_config) {
                 return store_->batch_put_from(write_keys, buffer_ptrs,
-                                              buffer_sizes, config);
+                                              buffer_sizes, write_config);
             });
     }
 
@@ -766,6 +823,11 @@ class MooncakeStorePyWrapper {
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(),
                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+        auto group_ids_error = ValidateGroupIdsForBatchConfig(
+            config, base_keys.size(), "batch_put_tensor_with_tp");
+        if (!group_ids_error.empty()) {
+            return group_ids_error;
+        }
         try {
             // Chunking phase (GIL Held)
             for (size_t i = 0; i < base_keys.size(); ++i) {
@@ -796,8 +858,10 @@ class MooncakeStorePyWrapper {
             if (all_chunk_keys.empty()) return final_results;
 
             // Reuse the standard batch_put implementation
-            std::vector<int> chunk_results =
-                batch_put_tensor_impl(all_chunk_keys, all_chunks_list, config);
+            ReplicateConfig chunk_config =
+                MakeRepeatedIndexedConfig(config, processed_indices, tp_size);
+            std::vector<int> chunk_results = batch_put_tensor_impl(
+                all_chunk_keys, all_chunks_list, chunk_config);
 
             // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
@@ -1076,24 +1140,25 @@ class MooncakeStorePyWrapper {
         return std::dynamic_pointer_cast<RealClient>(store_);
     }
 
-    std::optional<RealClient::RegisteredBufferRegion>
-    resolve_registered_buffer_region(uintptr_t buffer_ptr, size_t size,
-                                     const std::string &context) const {
+    std::optional<RealClient::WritableBufferRegion>
+    resolve_writable_buffer_region(uintptr_t buffer_ptr, size_t size,
+                                   const std::string &context) const {
         auto real_client = get_real_client();
         if (!real_client) {
             LOG(ERROR) << context << ": real client is not available";
             return std::nullopt;
         }
 
-        auto region = real_client->resolve_registered_buffer(
+        auto region = real_client->resolve_writable_buffer_region(
             reinterpret_cast<void *>(buffer_ptr));
         if (!region.has_value()) {
-            LOG(ERROR) << context << ": buffer is not registered";
+            LOG(ERROR) << context
+                       << ": buffer is not Store-managed writable memory";
             return std::nullopt;
         }
 
         if (region->offset + size > region->size) {
-            LOG(ERROR) << context << ": buffer range exceeds registered region";
+            LOG(ERROR) << context << ": buffer range exceeds writable region";
             return std::nullopt;
         }
 
@@ -1231,6 +1296,12 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        auto group_ids_error = ValidateGroupIdsForBatchConfig(
+            config, keys.size(), "batch_upsert_tensor");
+        if (!group_ids_error.empty()) {
+            return group_ids_error;
+        }
+
         std::vector<PyTensorInfo> infos(keys.size());
         std::vector<int> results(keys.size(), 0);
 
@@ -1284,8 +1355,10 @@ class MooncakeStorePyWrapper {
             }
 
             if (!valid_keys.empty()) {
+                ReplicateConfig write_config =
+                    MakeIndexedConfig(config, original_indices);
                 std::vector<int> op_results = store_->batch_upsert_from(
-                    valid_keys, buffer_ptrs, buffer_sizes, config);
+                    valid_keys, buffer_ptrs, buffer_sizes, write_config);
                 for (size_t i = 0; i < op_results.size(); ++i) {
                     results[original_indices[i]] = op_results[i];
                 }
@@ -1573,18 +1646,52 @@ class MooncakeHostMemAllocatorPyWrapper {
     ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
 };
 
+uintptr_t get_alloc_func_addr() {
+    return reinterpret_cast<uintptr_t>(&hugepage_memory_alloc);
+}
+
+uintptr_t get_free_func_addr() {
+    return reinterpret_cast<uintptr_t>(&hugepage_memory_free);
+}
+
+class MooncakeDistributedNoFRegisterPyWrapper {
+   public:
+    std::shared_ptr<NoFRegisterClient> register_{nullptr};
+
+    MooncakeDistributedNoFRegisterPyWrapper() = default;
+};
+
 PYBIND11_MODULE(store, m) {
+    // Object data type classification
+    py::enum_<ObjectDataType>(m, "ObjectDataType")
+        .value("UNKNOWN", ObjectDataType::UNKNOWN)
+        .value("KVCACHE", ObjectDataType::KVCACHE)
+        .value("TENSOR", ObjectDataType::TENSOR)
+        .value("WEIGHT", ObjectDataType::WEIGHT)
+        .value("SAMPLE", ObjectDataType::SAMPLE)
+        .value("ACTIVATION", ObjectDataType::ACTIVATION)
+        .value("GRADIENT", ObjectDataType::GRADIENT)
+        .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
+        .value("METADATA", ObjectDataType::METADATA)
+        .value("GENERAL", ObjectDataType::GENERAL)
+        .export_values();
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
+        .def_readwrite("nof_replica_num", &ReplicateConfig::nof_replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
         .def_readwrite("with_hard_pin", &ReplicateConfig::with_hard_pin)
         .def_readwrite("preferred_segments",
                        &ReplicateConfig::preferred_segments)
+        .def_readwrite("preferred_nof_segments",
+                       &ReplicateConfig::preferred_nof_segments)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("data_type", &ReplicateConfig::data_type)
+        .def_readwrite("group_ids", &ReplicateConfig::group_ids)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
@@ -1616,6 +1723,9 @@ PYBIND11_MODULE(store, m) {
         .def("is_disk_replica",
              static_cast<bool (Replica::Descriptor::*)() const noexcept>(
                  &Replica::Descriptor::is_disk_replica))
+        .def("is_local_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_local_disk_replica))
         .def(
             "get_memory_descriptor",
             static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
@@ -1717,6 +1827,8 @@ PYBIND11_MODULE(store, m) {
             }
         });
 
+    bind_buffer_pool(m);
+
     py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
         .def(py::init<>())
         .def("alloc",
@@ -1783,6 +1895,29 @@ PYBIND11_MODULE(store, m) {
             })
         .def_readwrite("parallelism", &ReadTargetSpec::parallelism);
 
+    py::class_<MooncakeDistributedNoFRegisterPyWrapper>(
+        m, "MooncakeDistributedNoFRegister")
+        .def(py::init<>())
+        .def("real_register",
+             [](MooncakeDistributedNoFRegisterPyWrapper &self,
+                const std::string &nqn = "", size_t nsid = 1,
+                const std::string &traddr = "", size_t trsvcid = 4420,
+                uintptr_t base = 0x0, size_t size = 1024,
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 self.register_ = std::make_shared<NoFRegisterClient>();
+                 return self.register_->set_register(nqn, nsid, traddr, trsvcid,
+                                                     base, size,
+                                                     master_server_addr);
+             })
+        .def("real_unregister_by_endpoint",
+             [](MooncakeDistributedNoFRegisterPyWrapper &self,
+                const std::string &nqn = "", size_t nsid = 1,
+                const std::string &traddr = "", size_t trsvcid = 4420,
+                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 self.register_ = std::make_shared<NoFRegisterClient>();
+                 return self.register_->set_unregister_by_endpoint(
+                     nqn, nsid, traddr, trsvcid, master_server_addr);
+             });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
     // Helper function to extract PyClient shared_ptr from
@@ -1831,7 +1966,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &master_server_addr = "127.0.0.1:50051",
                const py::object &engine = py::none(),
                bool enable_ssd_offload = false,
-               const std::string &ssd_offload_path = "") {
+               const std::string &ssd_offload_path = "",
+               const std::string &tenant_id = "default") {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1843,14 +1979,14 @@ PYBIND11_MODULE(store, m) {
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path);
+                    ssd_offload_path, tenant_id);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none(),
             py::arg("enable_ssd_offload") = false,
-            py::arg("ssd_offload_path") = "")
+            py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -1909,14 +2045,14 @@ PYBIND11_MODULE(store, m) {
              py::arg("path"), py::arg("size"), py::arg("offset") = 0,
              py::arg("protocol") = "tcp", py::arg("location") = "")
         .def("unmount_segment", &MooncakeStorePyWrapper::unmount_segment,
-             py::arg("segment_ids"))
+             py::arg("segment_ids"), py::arg("grace_period_seconds") = 0)
         .def("allocate_and_mount_segment",
              &MooncakeStorePyWrapper::allocate_and_mount_segment,
              py::arg("size"), py::arg("protocol") = "tcp",
              py::arg("location") = "")
         .def("unmount_and_free_segment",
              &MooncakeStorePyWrapper::unmount_and_free_segment,
-             py::arg("segment_ids"))
+             py::arg("segment_ids"), py::arg("grace_period_seconds") = 0)
         .def("alloc_from_mem_pool",
              [](MooncakeStorePyWrapper &self, size_t size) {
                  py::gil_scoped_release release;
@@ -1924,6 +2060,13 @@ PYBIND11_MODULE(store, m) {
              })
         .def("get", &mooncake::MooncakeStorePyWrapper::get)
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get_offload_rpc_read_count",
+             [](MooncakeStorePyWrapper &self) -> int64_t {
+                 auto real_client =
+                     std::dynamic_pointer_cast<RealClient>(self.store_);
+                 return real_client ? real_client->get_offload_rpc_read_count()
+                                    : 0;
+             })
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
@@ -2748,6 +2891,9 @@ PYBIND11_MODULE(store, m) {
         py::arg("node"),
         "Bind the current thread and memory allocation preference to the "
         "specified NUMA node");
+
+    m.def("get_alloc_func_addr", &get_alloc_func_addr);
+    m.def("get_free_func_addr", &get_free_func_addr);
 
     // Add EngramStore bindings
     mooncake::engram::bind_engram_store(m);

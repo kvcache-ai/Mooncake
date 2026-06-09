@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <boost/functional/hash.hpp>
+#include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -60,9 +62,10 @@ class QueryResult {
  */
 class Client {
    public:
-    ~Client();
+    virtual ~Client();
 
     const UUID& getClientId() const { return client_id_; }
+    const std::string& tenant_id() const { return master_client_.tenant_id(); }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -84,7 +87,8 @@ class Client {
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
-        std::map<std::string, std::string> labels = {});
+        std::map<std::string, std::string> labels = {},
+        const std::string& tenant_id = "default");
 
     /**
      * @brief Retrieves data for a given key
@@ -142,6 +146,9 @@ class Client {
      */
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id);
 
     /**
      * @brief Batch clear KV cache for specified object keys on a specific
@@ -272,9 +279,15 @@ class Client {
      */
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    ReplicaType replica_type);
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   const std::string& tenant_id,
+                                                   ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -306,8 +319,11 @@ class Client {
     /**
      * @brief Unmounts a segment by its UUID.
      *        Logic is identical to UnmountSegment, but looks up by id.
+     * @param grace_period_ms 0 = immediate unmount (legacy behavior).
      */
-    tl::expected<void, ErrorCode> UnmountSegmentById(const UUID& segment_id);
+    tl::expected<void, ErrorCode> UnmountSegmentById(
+        const UUID& segment_id, uint64_t grace_period_ms = 0,
+        std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
      * @brief Registers memory buffer with TransferEngine for data transfer
@@ -356,6 +372,9 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -367,6 +386,10 @@ class Client {
      * failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& tenant_id,
                                                  const std::string& source,
                                                  const std::string& target);
 
@@ -395,15 +418,66 @@ class Client {
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
      * segment.
-     * @param offloading_objects On return, contains a map from object key to
-     * size (in bytes) for all objects that require offload.
+     * @param offloading_objects On return, contains the tenant-scoped object
+     * tasks that require offload.
      */
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
-        std::unordered_map<std::string, int64_t>& offloading_objects);
+        std::vector<OffloadTaskItem>& offloading_objects);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
+
+    /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
+     * client. Mirror of OffloadObjectHeartbeat. Returns tenant-scoped tasks the
+     * caller (FileStorage) must read from local SSD and stage as MEMORY
+     * replicas via PromotionAllocStart + NotifyPromotionSuccess.
+     */
+    // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
+        std::vector<PromotionTaskItem>& promotion_objects);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * L2->L1 promotion. Returns the new replica's descriptor that the caller
+     * writes via Transfer Engine before calling NotifyPromotionSuccess.
+     */
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, const std::string& tenant_id,
+                        uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Release master-side promotion task after a client-side failure
+     * between PromotionAllocStart and the transfer's completion. Idempotent.
+     */
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Write `slices` into the memory replica described by
+     * `memory_descriptor` via Transfer Engine. Used by FileStorage to fill a
+     * PROCESSING memory replica staged by PromotionAllocStart before calling
+     * NotifyPromotionSuccess.
+     */
+    virtual ErrorCode PromotionWrite(
+        const Replica::Descriptor& memory_descriptor,
+        std::vector<Slice>& slices);
 
     /**
      * @brief Performs a batched read of multiple objects using a
@@ -433,6 +507,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
@@ -491,6 +568,8 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
+
+    [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
     /**
      * @brief Get the endpoint address for segment operations.
@@ -570,14 +649,17 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
-   private:
+   protected:
     /**
-     * @brief Private constructor to enforce creation through Create() method
+     * @brief Constructor exposed to subclasses for testing only; production
+     * code must go through Create().
      */
     Client(const std::string& local_hostname,
            const std::string& metadata_connstring, const std::string& protocol,
-           const std::map<std::string, std::string>& labels = {});
+           const std::map<std::string, std::string>& labels = {},
+           const std::string& tenant_id = "default");
 
+   private:
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -705,12 +787,28 @@ class Client {
     mutable std::mutex mounted_segments_mutex_;
     std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
 
+    // Segments in graceful unmount: readable by remote peers, not allocatable
+    // locally. TE MR remains registered until master confirms removal.
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>
+        gracefully_unmounting_segments_;
+    std::unordered_map<UUID, std::function<void(const UUID&)>,
+                       boost::hash<UUID>>
+        graceful_unmount_cleanup_callbacks_;
+
     /**
      * @brief Internal helper to unmount a segment by iterator.
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
         std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+
+    void StartGracefulUnmountTimer(const UUID& segment_id,
+                                   uint64_t grace_period_ms);
+    void OnGracefulUnmountTimer(const UUID& segment_id, int retry_left);
+    bool WaitForGracefulUnmountDelay(std::chrono::milliseconds delay);
+    std::mutex graceful_unmount_timer_mutex_;
+    std::condition_variable graceful_unmount_timer_cv_;
+    bool graceful_unmount_timer_stopping_{false};
 
     // Configuration
     const std::string local_hostname_;
@@ -736,6 +834,8 @@ class Client {
     std::thread task_poll_thread_;
     std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};
+    std::atomic<bool> segment_desc_publish_pending_{false};
+    std::atomic<bool> rpc_meta_publish_pending_{false};
     ErrorCode SwitchLeader(const ha::MasterView& target_view);
     void LeaderMonitorThreadMain();
     void StorageHeartbeatThreadMain();
@@ -772,6 +872,10 @@ class Client {
     tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& tenant_id,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -781,6 +885,10 @@ class Client {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& tenant_id,
                                        const std::string& source,
                                        const std::string& target);
 

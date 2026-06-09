@@ -33,10 +33,17 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
     kwargsCpu["devices"] = py::make_tuple("cpu");
     register_backend("mooncake-cpu", py::cpp_function(createMooncakeCpuBackend),
                      /* extended_api */ true, **kwargsCpu);
+#ifndef MOONCAKE_EP_USE_MUSA
     py::dict kwargsCuda;
     kwargsCuda["devices"] = py::make_tuple("cuda");
     register_backend("mooncake", py::cpp_function(createMooncakeBackend),
                      /* extended_api */ true, **kwargsCuda);
+#else
+    py::dict kwargsMusa;
+    kwargsMusa["devices"] = py::make_tuple("musa");
+    register_backend("mooncake", py::cpp_function(createMooncakeBackend),
+                     /* extended_api */ true, **kwargsMusa);
+#endif
 }
 
 std::string getPreferredHca(c10::intrusive_ptr<c10d::ProcessGroup> backend,
@@ -85,11 +92,32 @@ void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     mooncakeBackend->joinGroup();
 }
 
+/// Python-facing wrapper that extracts the raw TransferEngine* from a
+/// mooncake.engine.TransferEngine Python object and passes it to
+/// MooncakeBackend::setExternalEngine().  The caller must ensure the
+/// TransferEnginePy object outlives all MooncakeBackend instances.
+void setTransferEnginePy(pybind11::object engine_obj) {
+    if (engine_obj.is_none()) {
+        MooncakeBackend::setExternalEngine(nullptr);
+        return;
+    }
+    auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
+    uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
+    auto* engine = reinterpret_cast<TransferEngine*>(ptr);
+    MooncakeBackend::setExternalEngine(engine);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
+    m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
+          "Set an external TransferEngine to be used by MooncakeBackend. "
+          "Must be called before init_process_group(). The engine must already "
+          "be initialized. Pass None to reset to default behavior. "
+          "The caller must ensure the TransferEngine object outlives all "
+          "MooncakeBackend instances.");
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
@@ -103,7 +131,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         m, "MooncakeBackendOptions")
         .def(py::init<at::Tensor>(), py::arg("active_ranks"))
         .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
-             py::arg("is_extension"));
+             py::arg("is_extension"))
+        .def(py::init<at::Tensor, bool, int>(), py::arg("active_ranks"),
+             py::arg("is_extension"), py::arg("max_world_size"));
 }
 
 }  // namespace mooncake

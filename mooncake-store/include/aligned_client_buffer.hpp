@@ -56,6 +56,7 @@ class AlignedClientBufferAllocator : public ClientBufferAllocator {
     // Store whether we own the memory (for cleanup)
     bool owns_memory_;
     size_t allocated_size_;  // Store the actual allocated size for cleanup
+    std::string protocol_;
 };
 
 }  // namespace mooncake
