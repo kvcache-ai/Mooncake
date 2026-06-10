@@ -2,6 +2,10 @@
 #include <memory>
 #include <utility>
 
+#ifdef USE_ASCEND_DRAM_TIER
+#include "acl/acl.h"
+#endif
+
 #include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/copier_registry.h"
 #include "tiered_cache/data_copier.h"
@@ -42,7 +46,18 @@ tl::expected<void, ErrorCode> CopyDramToDram(const DataSource& src,
         return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
+    #ifdef USE_ASCEND_DRAM_TIER
+    aclError acl_ret = aclrtMemcpy(dest_ptr, dest.buffer->size(),
+                                    src_ptr, size,
+                                    ACL_MEMCPY_HOST_TO_HOST);
+    if (acl_ret != ACL_SUCCESS) {
+        LOG(ERROR) << "aclrtMemcpy(HOST_TO_HOST) failed for " << size
+                   << " bytes, ACL error: " << acl_ret;
+        return tl::unexpected(ErrorCode::DATA_COPY_FAILED);
+    }
+#else
     memcpy(dest_ptr, src_ptr, size);
+#endif
     return tl::expected<void, ErrorCode>{};
 }
 
