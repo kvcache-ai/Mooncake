@@ -167,7 +167,9 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
-Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects. The table below is organized by hardware vendor / ecosystem so related accelerator, network, and transport paths are visible together.
+Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects.
+
+The following hardware partners and cloud platforms are supported by the Mooncake, covering GPUs, specialized AI accelerators, and cloud-native interconnects:
 
 <div align="center">
   <table>
@@ -184,22 +186,6 @@ Mooncake supports hardware backends across accelerator vendors, cloud fabrics, a
     </tr>
   </table>
 </div>
-
-| Vendor / ecosystem | Accelerator support | Network / fabric support | Transport path | Availability and enablement |
-|--------------------|---------------------|--------------------------|----------------|-----------------------------|
-| NVIDIA | CUDA GPUs; CUDA 12.1+ and CUDA 13.x wheels | GPUDirect RDMA / Storage; intra-node NVLink; multi-node NVLink | CUDA memory support, RDMA, GDS, NVLink, MNNVL | PyPI: `mooncake-transfer-engine` for CUDA < 13.0, `mooncake-transfer-engine-cuda13` for CUDA >= 13.0. Source: `-DUSE_CUDA=ON`, `-DUSE_INTRA_NVLINK=ON`, `-DUSE_MNNVL=ON` |
-| AMD | ROCm / HIP GPUs | GPU communication through HIP runtime | HIP transport | Source build with `-DUSE_HIP=ON` |
-| Huawei | Ascend NPUs with CANN / HCCL / ADXL | HCCL, Ascend Direct, UBShmem, heterogeneous Ascend-GPU transfer | `hccl`, Ascend Direct, `ubshmem`, Ascend heterogeneous transport | Source build with `-DUSE_ASCEND=ON`, `-DUSE_ASCEND_DIRECT=ON`, `-DUSE_UBSHMEM=ON`, `-DUSE_ASCEND_HETEROGENEOUS=ON` |
-| Cambricon | MLU with Neuware | MLU memory registration over the standard RDMA data path | MLU-aware RDMA registration and topology discovery | Source build with `-DUSE_MLU=ON` |
-| Moore Threads | MUSA GPUs | MUSA runtime integration | Accelerator-aware data movement for MUSA memory | Source build with `-DUSE_MUSA=ON` |
-| MetaX (Muxi) | MACA GPUs | MACA runtime integration | Accelerator-aware data movement for MACA memory | Source build with `-DUSE_MACA=ON` |
-| Hygon | DCU with DTK | CUDA-compatible DTK runtime | DCU memory support through DTK | Source build with `-DUSE_HYGON=ON` |
-| Iluvatar | CoreX SDK | CUDA-compatible CoreX runtime | CoreX memory support | Source build with `-DUSE_COREX=ON` |
-| Alibaba Cloud | Host memory / accelerator memory through standard Mooncake paths | eRDMA NICs | `rdma` protocol over eRDMA devices such as `erdma_0` | Available through packages or source builds when the host eRDMA driver / SDK is installed |
-| AWS | Host memory / accelerator memory through standard Mooncake paths | Elastic Fabric Adapter (EFA) | EFA transport built on libfabric SRD | Source build with `-DUSE_EFA=ON` |
-| T-Head | PPU deployments | Barex fabric | Barex transport | Source build with `-DUSE_BAREX=ON` |
-| Sunrise | GPU memory through TENT | Sunrise Link based on Tang Runtime | Sunrise Link transport in the TENT framework | Source build with `-DUSE_TENT=ON`, `-DUSE_SUNRISE=ON`, plus TENT config |
-| Standard datacenter hardware | CPU / host memory; non-CUDA environments | TCP/IP, InfiniBand / RoCE, NVMe-oF, CXL | `tcp`, `rdma`, NVMe-oF, CXL | PyPI: `mooncake-transfer-engine-non-cuda` for non-CUDA use. Source: default TCP/RDMA paths, `-DUSE_NVMEOF=ON`, `-DUSE_CXL=ON` |
 
 For complete protocol behavior, SDK requirements, and vendor-specific configuration, see the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html), [build guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html), and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html).
 
@@ -250,7 +236,7 @@ For the default source build, use the automatic dependency script and standard C
 git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
-bash dependencies.sh
+sudo bash dependencies.sh
 
 mkdir build
 cd build
