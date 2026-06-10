@@ -167,7 +167,9 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
-Mooncake supports heterogeneous accelerators, NICs, and specialized transport paths. The summary below focuses on runtime and transport coverage that is already exposed through build options, documented protocols, or dedicated examples in this repository.
+Mooncake supports hardware backends across accelerator vendors, cloud fabrics, and standard datacenter interconnects.
+
+The following hardware partners and cloud platforms are supported by the Mooncake, covering GPUs, specialized AI accelerators, and cloud-native interconnects:
 
 <div align="center">
   <table>
@@ -185,42 +187,7 @@ Mooncake supports heterogeneous accelerators, NICs, and specialized transport pa
   </table>
 </div>
 
-#### Accelerator runtimes
-
-| Vendor / Platform | Hardware / Runtime | Current support in Mooncake | How it is exposed |
-|-------------------|--------------------|-----------------------------|-------------------|
-| Huawei Ascend | Ascend NPUs | Supported | `-DUSE_ASCEND=ON`, `-DUSE_ASCEND_DIRECT=ON`, `-DUSE_UBSHMEM=ON`, `-DUSE_ASCEND_HETEROGENEOUS=ON`; covers HCCL transport, Ascend Direct transport, UBShmem transport, and heterogeneous Ascend-GPU transport |
-| Cambricon | MLU + Neuware | Supported | `-DUSE_MLU=ON`; MLU memory detection, topology discovery, and registration reuse the standard `rdma` data path |
-| Moore Threads | MUSA GPUs | Supported | `-DUSE_MUSA=ON`; accelerator-aware data transfer with MUSA runtime integration |
-| MetaX (Muxi) | MACA GPUs | Supported | `-DUSE_MACA=ON`; source build support through the MACA SDK |
-| T-Head | PPU / Barex | Supported | T-Head PPU deployments are represented here through Barex-based transport support |
-| NVIDIA | CUDA GPUs / NVLink | Supported | `-DUSE_CUDA=ON`, `-DUSE_INTRA_NVLINK=ON`, `-DUSE_MNNVL=ON`; covers CUDA memory, GPUDirect RDMA, GPUDirect Storage, intra-node NVLink, and multi-node NVLink |
-| AMD | ROCm / HIP GPUs | Supported | `-DUSE_HIP=ON`; HIP transport for AMD GPU communication |
-| Hygon | DCU / DTK | Supported | `-DUSE_HYGON=ON`; CUDA-compatible runtime via Hygon DTK SDK |
-| Iluvatar | CoreX | Supported | `-DUSE_COREX=ON`; CUDA-compatible runtime via Iluvatar CoreX SDK |
-
-#### Network and fabric support
-
-| Vendor / Fabric | Hardware / Transport | Current support in Mooncake | How it is exposed |
-|-----------------|----------------------|-----------------------------|-------------------|
-| Alibaba Cloud | eRDMA NICs | Supported | `rdma` data path with eRDMA devices such as `erdma_0`; the build also enables `CONFIG_ERDMA` |
-| Standard RDMA ecosystem | InfiniBand / RoCE NICs | Supported | Available through the standard `rdma` protocol path with topology-aware NIC selection |
-| AWS | Elastic Fabric Adapter (EFA) | Supported | `-DUSE_EFA=ON`; EFA transport built on libfabric SRD |
-| Storage disaggregation | NVMe-oF | Supported | Enabled with `-DUSE_NVMEOF=ON` |
-| Memory pooling | CXL | Supported | Enabled with `-DUSE_CXL=ON` |
-| Baseline networking | TCP/IP | Supported | `tcp` works in all environments |
-
-#### Specialized transport paths
-
-| Transport path | Current support in Mooncake | How it is exposed |
-|----------------|-----------------------------|-------------------|
-| Ascend HCCL transport | Supported | Enabled by `-DUSE_ASCEND=ON`; examples use `hccl` for Ascend NPU data movement |
-| Ascend Direct transport | Supported | Enabled by `-DUSE_ASCEND_DIRECT=ON`; dedicated Ascend Direct examples and docs are included |
-| UBShmem transport | Supported | Enabled by `-DUSE_UBSHMEM=ON`; Transfer Engine examples accept `--protocol=ubshmem` |
-| Heterogeneous Ascend transport | Supported | Enabled by `-DUSE_ASCEND_HETEROGENEOUS=ON`; used for Ascend-GPU heterogeneous transfer |
-| Barex transport | Supported | Enabled by `-DUSE_BAREX=ON`; documented as the `barex` advanced transport |
-| Sunrise Transport | Supported | Included here as an additional specialized transport path to reflect current hardware support positioning |
-| T-Head PPU / Barex | Supported | Barex-based transport coverage is available for T-Head PPU deployments |
+For complete protocol behavior, SDK requirements, and vendor-specific configuration, see the [supported protocols](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html), [build guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html), and [Transfer Engine design docs](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html).
 
 <h2 id="quick-start">🚀 Quick Start</h2>
 
@@ -261,88 +228,24 @@ pip install mooncake-transfer-engine-non-cuda
 > - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
 > - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
-### Use Docker image
-Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
+### Build From Source
 
-To produce an image that compiles Mooncake from source, builds the wheel via `scripts/build_wheel.sh`, and installs that wheel inside the container, use `build-wheel.dockerfile`:
-
-```bash
-docker build -f docker/mooncake.Dockerfile \
-  --build-arg PYTHON_VERSION=3.10 \
-  --build-arg EP_TORCH_VERSIONS="2.9.1" \
-  -t mooncake:from-source .
-```
-
-The resulting image already has a virtual environment at `/opt/venv` with the freshly built wheel installed. Launch it with GPU/RDMA access as needed, for example:
+For the default source build, use the automatic dependency script and standard CMake flow:
 
 ```bash
-python3 scripts/check_hicache_hugepage_requirements.py \
-  --tp-size 4 \
-  --hicache-size 64gb \
-  --global-segment-size 8gb \
-  --arena-pool-size 56gb \
-  --available-hugetlb 512gb
+git clone https://github.com/kvcache-ai/Mooncake.git
+cd Mooncake
 
-sudo sysctl -w vm.nr_hugepages=262144
-grep -E 'HugePages_Total|HugePages_Free|Hugepagesize' /proc/meminfo
+sudo bash dependencies.sh
 
-docker run --gpus all \
-  --network host \
-  --ipc=host \
-  --ulimit memlock=-1 \
-  --shm-size=128g \
-  -e MC_STORE_USE_HUGEPAGE=1 \
-  -e MC_STORE_HUGEPAGE_SIZE=2MB \
-  -e MOONCAKE_GLOBAL_SEGMENT_SIZE=8gb \
-  -e MC_MMAP_ARENA_POOL_SIZE=56gb \
-  -it mooncake:from-source /bin/bash
-```
-
-The `64gb` / `56gb` values above are tuned examples for large HiCache deployments, not allocator defaults. The arena is off by default. Setting `MC_MMAP_ARENA_POOL_SIZE=...` explicitly both enables and sizes the arena; if you enable it via gflag instead, the default pool size is `8gb`. On smaller hosts, start with `8gb` or `16gb` and size upward with the helper. Set `MC_DISABLE_MMAP_ARENA=1` (also accepts `true`, `yes`, or `on`) instead when you want the baseline direct-`mmap()` path. Like the arena size itself, this must be set before the first Mooncake mmap-buffer allocation in the process. Arena bring-up is a one-shot lazy init, so after a failed first attempt you need to restart the process to retry with corrected env / hugepage settings. Without `MC_STORE_USE_HUGEPAGE=1`, the arena may opportunistically try hugepages and then retry on regular pages if HugeTLB is unavailable. When `MC_STORE_USE_HUGEPAGE=1` is present, Mooncake instead preserves the strict hugepage contract for both arena and direct-`mmap()` host-buffer allocation instead of silently downgrading to regular pages.
-
-> [!NOTE]
-> Make sure you build the image from the repository root so that Git metadata and submodules are available inside the build context.
-
-### Build and use binaries
-The following are additional dependencies for building Mooncake:
-- Build essentials, including gcc, g++ (9.4+) and cmake (3.16+).
-- Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
-- Cambricon Neuware, if you want to build with `-DUSE_MLU`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `NEUWARE_HOME` or `/usr/local/neuware` by default, and also supports overriding `MLU_INCLUDE_DIR` / `MLU_LIB_DIR` during CMake configure.
-- Hygon DTK SDK, if you want to build with `-DUSE_HYGON`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `DTK_HOME` or `/opt/dtk` by default, and also supports overriding `DTK_INCLUDE_DIR` / `DTK_LIB_DIR` during CMake configure.
-- Iluvatar CoreX SDK, if you want to build with `-DUSE_COREX`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `COREX_HOME` or `/usr/local/corex` by default, and also supports overriding `COREX_INCLUDE_DIR` / `COREX_LIB_DIR` during CMake configure.
-- [Optional] Rust Toolchain and libclang, if you want to build Transfer Engine Rust examples with `-DWITH_RUST_EXAMPLE=ON` or Mooncake Store Rust bindings with `-DWITH_STORE_RUST=ON`. *This is NOT included in the `dependencies.sh` script.*
-- [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers, or with `-DSTORE_USE_REDIS` to use Redis for Mooncake Store failover.
-- [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
-
-The build and installation steps are as follows:
-1. Retrieve source code from GitHub repo
-   ```bash
-   git clone https://github.com/kvcache-ai/Mooncake.git
-   cd Mooncake
-   ```
-
-2. Install dependencies
-   ```bash
-   bash dependencies.sh
-   ```
-
-3. Compile Mooncake and examples
-   ```bash
-   mkdir build
-   cd build
-   cmake ..
-   make -j
-   sudo make install # optional, make it ready to be used by vLLM/SGLang
-   ```
-
-For Cambricon MLU builds, configure CMake with `-DUSE_MLU=ON`. For example:
-```bash
 mkdir build
 cd build
-cmake .. -DUSE_MLU=ON -DNEUWARE_ROOT=/usr/local/neuware
+cmake ..
 make -j
+sudo make install # optional, make it ready to be used by vLLM/SGLang
 ```
+
+For custom accelerator backends, Docker deployment, NVMe-oF, EFA, CXL, Redis / HTTP metadata, Rust bindings, or other advanced build options, see the [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 <h2 id="trace">📦 Open Source Trace</h2>
 
