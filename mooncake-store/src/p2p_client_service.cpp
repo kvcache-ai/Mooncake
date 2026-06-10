@@ -943,9 +943,8 @@ P2PClientService::RemoteForwardWriteOp::Dispatch() {
     }
     auto promise = std::make_shared<WritePromise>();
     auto future = promise->getFuture();
-    RemoteForwardWriteOp::RunForwardRemotePut(std::move(promise), peer_ptr,
-                                              metrics, te_transfer, write_req,
-                                              slices)
+    RemoteForwardWriteOp::RunForwardRemotePut(
+        std::move(promise), peer_ptr, metrics, te_transfer, write_req, slices)
         .start([](auto&&) {});
     return FutureHandle<void>::Create(write_req, std::move(future));
 }
@@ -1523,12 +1522,12 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
         cleanup.read_operation_id = pin.value().read_operation_id;
-        if (metrics_) {
-            metrics_->local_request.unpin_key_requests.inc();
-        }
         Stopwatch rollback_sw;
         tl::expected<void, ErrorCode> cleanup_unpin;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            if (metrics_) {
+                metrics_->local_request.unpin_key_requests.inc();
+            }
             cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
             if (cleanup_unpin) {
                 break;
@@ -2101,12 +2100,12 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         WriteRevokeRequest revoke_req;
         revoke_req.key = write_req->key;
         revoke_req.write_operation_id = pre.value().write_operation_id;
-        if (metrics) {
-            metrics->local_request.write_revoke_requests.inc();
-        }
         Stopwatch rollback_sw;
         tl::expected<void, ErrorCode> revoke_res;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            if (metrics) {
+                metrics->local_request.write_revoke_requests.inc();
+            }
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
             if (revoke_res) {
                 break;

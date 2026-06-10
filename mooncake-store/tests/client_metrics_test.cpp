@@ -352,12 +352,12 @@ TEST_F(ClientMetricsTest, P2PClientMetricSerializeTest) {
     // Verify Prometheus format output
     EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total 100") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find(
-                    "mooncake_p2p_local_write_revoke_requests_total 4") !=
-                std::string::npos);
-    EXPECT_TRUE(serialized.find(
-                    "mooncake_p2p_local_unpin_key_requests_total 6") !=
-                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_write_revoke_requests_total 4") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_local_unpin_key_requests_total 6") !=
+        std::string::npos);
     EXPECT_TRUE(
         serialized.find("mooncake_p2p_local_put_bytes_total 52428800") !=
         std::string::npos);
@@ -461,12 +461,12 @@ TEST_F(ClientMetricsTest, P2PClientMetricPeerRequestTest) {
     EXPECT_TRUE(serialized.find(
                     "mooncake_p2p_peer_read_remote_data_requests_total 100") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find(
-                    "mooncake_p2p_peer_read_remote_data_hits_total 80") !=
-                std::string::npos);
-    EXPECT_TRUE(serialized.find(
-                    "mooncake_p2p_peer_read_remote_data_misses_total 15") !=
-                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_peer_read_remote_data_hits_total 80") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_peer_read_remote_data_misses_total 15") !=
+        std::string::npos);
     EXPECT_TRUE(serialized.find(
                     "mooncake_p2p_peer_read_remote_data_failures_total 5") !=
                 std::string::npos);
@@ -476,9 +476,9 @@ TEST_F(ClientMetricsTest, P2PClientMetricPeerRequestTest) {
     EXPECT_TRUE(serialized.find(
                     "mooncake_p2p_peer_write_remote_data_requests_total 50") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find(
-                    "mooncake_p2p_peer_prewrite_requests_total 20") !=
-                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_peer_prewrite_requests_total 20") !=
+        std::string::npos);
 
     std::string summary = metrics.summary_metrics();
     EXPECT_TRUE(summary.find("P2P Peer Request Metrics") != std::string::npos);
@@ -510,8 +510,9 @@ TEST_F(ClientMetricsTest, P2PClientMetricBothLocalAndPeerTest) {
 
     EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 1000") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_peer_pin_key_requests_total 500") !=
-                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_p2p_peer_pin_key_requests_total 500") !=
+        std::string::npos);
     EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 900") !=
                 std::string::npos);
     EXPECT_TRUE(serialized.find("mooncake_p2p_peer_pin_key_hits_total 400") !=

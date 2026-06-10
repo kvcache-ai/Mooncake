@@ -70,8 +70,8 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request_metrics.read_remote_data.failures.inc();
-            metrics_->peer_request_metrics.read_remote_data.latency_failure.observe(
-                sw.elapsed_us());
+            metrics_->peer_request_metrics.read_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -93,8 +93,8 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
             } else {
                 metrics_->peer_request_metrics.read_remote_data.failures.inc();
             }
-            metrics_->peer_request_metrics.read_remote_data.latency_failure.observe(
-                sw.elapsed_us());
+            metrics_->peer_request_metrics.read_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return result;
     }
@@ -125,8 +125,8 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
         timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
         if (metrics_) {
             metrics_->peer_request_metrics.write_remote_data.failures.inc();
-            metrics_->peer_request_metrics.write_remote_data.latency_failure.observe(
-                sw.elapsed_us());
+            metrics_->peer_request_metrics.write_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -141,15 +141,15 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
         timer.LogResponse("error_code=", result.error());
         if (metrics_) {
             metrics_->peer_request_metrics.write_remote_data.failures.inc();
-            metrics_->peer_request_metrics.write_remote_data.latency_failure.observe(
-                sw.elapsed_us());
+            metrics_->peer_request_metrics.write_remote_data.latency_failure
+                .observe(sw.elapsed_us());
         }
         return result;
     }
 
     if (metrics_) {
-        metrics_->peer_request_metrics.write_remote_data.latency_success.observe(
-            sw.elapsed_us());
+        metrics_->peer_request_metrics.write_remote_data.latency_success
+            .observe(sw.elapsed_us());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);

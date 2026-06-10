@@ -124,8 +124,7 @@ void RpcHandlerMetric::serialize(std::string& str) {
     latency_failure.serialize(str);
 }
 
-std::string RpcHandlerMetric::summary_line(
-    const std::string& display_name) {
+std::string RpcHandlerMetric::summary_line(const std::string& display_name) {
     std::stringstream ss;
     ss << display_name << ": " << requests.value() << " requests, "
        << hits.value() << " hits, " << misses.value() << " misses, "
