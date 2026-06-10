@@ -53,6 +53,10 @@ class MasterAdminServer {
 
     std::shared_ptr<WrappedMasterService> GetActiveService() const;
 
+    template <typename Handler>
+    void WithActiveService(coro_http::coro_http_response& resp,
+                           Handler&& handler) const;
+
     void HandleMetrics(coro_http::coro_http_request& req,
                        coro_http::coro_http_response& resp);
     void HandleMetricsSummary(coro_http::coro_http_request& req,

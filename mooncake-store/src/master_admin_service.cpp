@@ -295,6 +295,17 @@ std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
     return snapshot.service;
 }
 
+template <typename Handler>
+void MasterAdminServer::WithActiveService(coro_http::coro_http_response& resp,
+                                          Handler&& handler) const {
+    auto service = GetActiveService();
+    if (!service) {
+        SetServiceUnavailable(resp, "service plane is not active");
+        return;
+    }
+    std::forward<Handler>(handler)(service);
+}
+
 void MasterAdminServer::HandleMetrics(coro_http::coro_http_request&,
                                       coro_http::coro_http_response& resp) {
     resp.add_header("Content-Type", "text/plain; version=0.0.4");
@@ -326,85 +337,75 @@ void MasterAdminServer::HandleHaStatus(coro_http::coro_http_request&,
 
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
-
-    auto key = req.get_query_value("key");
-    auto get_result = service->GetReplicaList(std::string(key), "default");
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
-    if (get_result) {
-        std::string body;
-        const auto& replicas = get_result.value().replicas;
-        for (const auto& replica : replicas) {
-            if (!replica.is_memory_replica()) {
-                continue;
+    WithActiveService(resp, [&](auto service) {
+        auto key = req.get_query_value("key");
+        auto get_result = service->GetReplicaList(std::string(key), "default");
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        if (get_result) {
+            std::string body;
+            const auto& replicas = get_result.value().replicas;
+            for (const auto& replica : replicas) {
+                if (!replica.is_memory_replica()) {
+                    continue;
+                }
+                std::string tmp;
+                struct_json::to_json(
+                    replica.get_memory_descriptor().buffer_descriptor, tmp);
+                body += tmp;
+                body += "\n";
             }
-            std::string tmp;
-            struct_json::to_json(
-                replica.get_memory_descriptor().buffer_descriptor, tmp);
-            body += tmp;
-            body += "\n";
+            resp.set_status_and_content(coro_http::status_type::ok,
+                                        std::move(body));
+            return;
         }
-        resp.set_status_and_content(coro_http::status_type::ok,
-                                    std::move(body));
-        return;
-    }
 
-    resp.set_status_and_content(coro_http::status_type::not_found,
-                                toString(get_result.error()));
+        resp.set_status_and_content(coro_http::status_type::not_found,
+                                    toString(get_result.error()));
+    });
 }
 
 void MasterAdminServer::HandleGetAllKeys(coro_http::coro_http_request&,
                                          coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        auto result = service->GetAllKeysForAdmin();
+        if (!result) {
+            resp.set_status_and_content(
+                coro_http::status_type::internal_server_error,
+                "Failed to get all keys");
+            return;
+        }
 
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
-    auto result = service->GetAllKeysForAdmin();
-    if (!result) {
-        resp.set_status_and_content(
-            coro_http::status_type::internal_server_error,
-            "Failed to get all keys");
-        return;
-    }
-
-    std::string body;
-    for (const auto& key : result.value()) {
-        body += key;
-        body += "\n";
-    }
-    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
+        std::string body;
+        for (const auto& key : result.value()) {
+            body += key;
+            body += "\n";
+        }
+        resp.set_status_and_content(coro_http::status_type::ok,
+                                    std::move(body));
+    });
 }
 
 void MasterAdminServer::HandleGetAllSegments(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        auto result = service->GetAllSegmentsForAdmin();
+        if (!result) {
+            resp.set_status_and_content(
+                coro_http::status_type::internal_server_error,
+                "Failed to get all segments");
+            return;
+        }
 
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
-    auto result = service->GetAllSegmentsForAdmin();
-    if (!result) {
-        resp.set_status_and_content(
-            coro_http::status_type::internal_server_error,
-            "Failed to get all segments");
-        return;
-    }
-
-    std::string body;
-    for (const auto& segment_name : result.value()) {
-        body += segment_name;
-        body += "\n";
-    }
-    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
+        std::string body;
+        for (const auto& segment_name : result.value()) {
+            body += segment_name;
+            body += "\n";
+        }
+        resp.set_status_and_content(coro_http::status_type::ok,
+                                    std::move(body));
+    });
 }
 
 struct HttpSegmentDetailItem {
@@ -434,77 +435,71 @@ YLT_REFL(HttpSegmentsDetailResponse, total_segments, segments);
 
 void MasterAdminServer::HandleGetSegmentsDetail(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetSegmentsDetailForAdmin();
+        if (!result) {
+            WriteErrorResponse(resp,
+                               coro_http::status_type::internal_server_error,
+                               result.error(), "Failed to get segments detail");
+            return;
+        }
 
-    auto result = service->GetSegmentsDetailForAdmin();
-    if (!result) {
-        WriteErrorResponse(resp, coro_http::status_type::internal_server_error,
-                           result.error(), "Failed to get segments detail");
-        return;
-    }
+        HttpSegmentsDetailResponse payload;
+        payload.total_segments = result.value().size();
+        for (const auto& info : result.value()) {
+            HttpSegmentDetailItem item;
+            item.segment_name = info.segment_name;
+            item.segment_id = UuidToString(info.segment_id);
+            item.client_id = UuidToString(info.client_id);
 
-    HttpSegmentsDetailResponse payload;
-    payload.total_segments = result.value().size();
-    for (const auto& info : result.value()) {
-        HttpSegmentDetailItem item;
-        item.segment_name = info.segment_name;
-        item.segment_id = UuidToString(info.segment_id);
-        item.client_id = UuidToString(info.client_id);
+            std::ostringstream addr_oss;
+            addr_oss << "0x" << std::hex << info.base_address;
+            item.base_address = addr_oss.str();
 
-        std::ostringstream addr_oss;
-        addr_oss << "0x" << std::hex << info.base_address;
-        item.base_address = addr_oss.str();
+            item.size_bytes = info.size_bytes;
+            std::ostringstream size_oss;
+            size_oss << (info.size_bytes / 1024.0 / 1024.0 / 1024.0) << " GiB";
+            item.size_human = size_oss.str();
 
-        item.size_bytes = info.size_bytes;
-        std::ostringstream size_oss;
-        size_oss << (info.size_bytes / 1024.0 / 1024.0 / 1024.0) << " GiB";
-        item.size_human = size_oss.str();
-
-        item.te_endpoint = info.te_endpoint;
-        item.protocol = info.protocol;
-        item.status = EnumToString(info.status);
-        item.allocator_used_bytes = info.allocator_used_bytes;
-        item.allocator_capacity_bytes = info.allocator_capacity_bytes;
-        item.allocator_usage_percent =
-            info.allocator_capacity_bytes > 0
-                ? (static_cast<double>(info.allocator_used_bytes) /
-                   info.allocator_capacity_bytes * 100.0)
-                : 0.0;
-        payload.segments.push_back(std::move(item));
-    }
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+            item.te_endpoint = info.te_endpoint;
+            item.protocol = info.protocol;
+            item.status = EnumToString(info.status);
+            item.allocator_used_bytes = info.allocator_used_bytes;
+            item.allocator_capacity_bytes = info.allocator_capacity_bytes;
+            item.allocator_usage_percent =
+                info.allocator_capacity_bytes > 0
+                    ? (static_cast<double>(info.allocator_used_bytes) /
+                       info.allocator_capacity_bytes * 100.0)
+                    : 0.0;
+            payload.segments.push_back(std::move(item));
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 void MasterAdminServer::HandleQuerySegment(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto segment = req.get_query_value("segment");
+        resp.add_header("Content-Type", "text/plain; version=0.0.4");
+        auto result = service->QuerySegmentForAdmin(std::string(segment));
+        if (!result) {
+            resp.set_status_and_content(
+                coro_http::status_type::internal_server_error,
+                "Failed to query segment");
+            return;
+        }
 
-    auto segment = req.get_query_value("segment");
-    resp.add_header("Content-Type", "text/plain; version=0.0.4");
-    auto result = service->QuerySegmentForAdmin(std::string(segment));
-    if (!result) {
-        resp.set_status_and_content(
-            coro_http::status_type::internal_server_error,
-            "Failed to query segment");
-        return;
-    }
-
-    const auto [used, capacity] = result.value();
-    std::string body(segment);
-    body += "\nUsed(bytes): ";
-    body += std::to_string(used);
-    body += "\nCapacity(bytes) : ";
-    body += std::to_string(capacity);
-    body += "\n";
-    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
+        const auto [used, capacity] = result.value();
+        std::string body(segment);
+        body += "\nUsed(bytes): ";
+        body += std::to_string(used);
+        body += "\nCapacity(bytes) : ";
+        body += std::to_string(capacity);
+        body += "\n";
+        resp.set_status_and_content(coro_http::status_type::ok,
+                                    std::move(body));
+    });
 }
 
 struct HttpCreateDrainJobResponse {
@@ -529,24 +524,20 @@ void MasterAdminServer::HandleCreateDrainJob(
         return;
     }
 
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->CreateDrainJob(request);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
 
-    auto result = service->CreateDrainJob(request);
-    if (!result.has_value()) {
-        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                           result.error());
-        return;
-    }
-
-    HttpCreateDrainJobResponse payload;
-    payload.success = true;
-    payload.job_id = UuidToString(result.value());
-    payload.status = "CREATED";
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        HttpCreateDrainJobResponse payload;
+        payload.success = true;
+        payload.job_id = UuidToString(result.value());
+        payload.status = "CREATED";
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 struct HttpQueryDrainJobResponse {
@@ -607,21 +598,17 @@ void MasterAdminServer::HandleQueryDrainJob(
         return;
     }
 
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->QueryDrainJob(job_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
 
-    auto result = service->QueryDrainJob(job_id_result.value());
-    if (!result.has_value()) {
-        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                           result.error());
-        return;
-    }
-
-    WriteJsonResponse(resp, coro_http::status_type::ok,
-                      ToHttpQueryDrainJobResponse(result.value()));
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          ToHttpQueryDrainJobResponse(result.value()));
+    });
 }
 
 struct HttpCancelDrainJobResponse {
@@ -643,24 +630,20 @@ void MasterAdminServer::HandleCancelDrainJob(
         return;
     }
 
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->CancelDrainJob(job_id_result.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
 
-    auto result = service->CancelDrainJob(job_id_result.value());
-    if (!result.has_value()) {
-        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                           result.error());
-        return;
-    }
-
-    HttpCancelDrainJobResponse payload;
-    payload.success = true;
-    payload.job_id = UuidToString(job_id_result.value());
-    payload.status = "CANCELED";
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        HttpCancelDrainJobResponse payload;
+        payload.success = true;
+        payload.job_id = UuidToString(job_id_result.value());
+        payload.status = "CANCELED";
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 struct HttpSegmentStatusResponse {
@@ -684,25 +667,21 @@ void MasterAdminServer::HandleSegmentStatus(
         return;
     }
 
-    auto service = GetActiveService();
-    if (!service) {
-        SetServiceUnavailable(resp, "service plane is not active");
-        return;
-    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->QuerySegmentStatus(std::string(segment_name));
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
 
-    auto result = service->QuerySegmentStatus(std::string(segment_name));
-    if (!result.has_value()) {
-        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
-                           result.error());
-        return;
-    }
-
-    HttpSegmentStatusResponse payload;
-    payload.success = true;
-    payload.segment = std::string(segment_name);
-    payload.status = static_cast<int32_t>(result.value());
-    payload.status_name = EnumToString(result.value());
-    WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        HttpSegmentStatusResponse payload;
+        payload.success = true;
+        payload.segment = std::string(segment_name);
+        payload.status = static_cast<int32_t>(result.value());
+        payload.status_name = EnumToString(result.value());
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
 }
 
 struct HttpBatchQueryKeyResult {
