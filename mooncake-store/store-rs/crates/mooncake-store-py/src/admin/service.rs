@@ -2975,6 +2975,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas,
+            cold_backing: None,
         }
     }
 
@@ -3292,6 +3293,7 @@ mod tests {
                         tier: ReplicaTier::Nvme,
                         priority: 0,
                     }],
+                    cold_backing: None,
                 }),
             )
             .expect("route cas should succeed");

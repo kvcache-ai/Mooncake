@@ -248,7 +248,6 @@ impl RecordingRouteDirectory {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
-
             cold_backing: None,
         })
     }

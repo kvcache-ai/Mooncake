@@ -930,6 +930,7 @@ mod tests {
                 tier: ReplicaTier::Nvme,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
