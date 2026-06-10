@@ -560,7 +560,7 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
     LOG(INFO) << "Connecting to " << target_segments.size() << " targets...";
 
     // Use connectToAllTargets with 0 timeout to skip sync
-    int rc = runner.connectToAllTargets(target_segments, 0);
+    int rc = runner.connectToAllTargets(target_segments, wait_timeout);
     if (rc != 0) {
         LOG(ERROR) << "Failed to connect to targets";
         return rc;
