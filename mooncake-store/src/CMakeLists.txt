@@ -360,6 +360,7 @@ set_target_properties(mooncake_master mooncake_client
 # Optimize binary sizes only in Release mode
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_link_options(mooncake_store PRIVATE -s)
   target_compile_options(mooncake_master PRIVATE -Os)
   target_link_options(mooncake_master PRIVATE -Os -s)
   target_compile_options(mooncake_client PRIVATE -Os)
