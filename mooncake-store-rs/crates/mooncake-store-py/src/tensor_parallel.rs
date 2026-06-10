@@ -3,12 +3,13 @@
 //! Adds parallelism-aware put/get operations that handle shard key naming,
 //! metadata tagging, and cross-TP scatter-gather reconstruction.
 
+use mooncake_store_client::ReadQueryResultCache;
 use mooncake_tensor::{
     build_raw_shard_write_plan, calculate_shard_range, calculate_strided_shard_ranges,
     get_parallelism_key_name, get_parallelism_manifest_key, get_writer_partition_key_name,
     parallelism_matches_metadata, validate_uniform_shard, ParallelAxisKind, ParallelAxisSpec,
-    RawShardWritePlan, ReadTargetMode, ReadTargetSpec, TensorDtype, TensorMetadata,
-    TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
+    ParsedTensorMetadata, RawShardWritePlan, ReadTargetMode, ReadTargetSpec, TensorDtype,
+    TensorMetadata, TensorParallelismSpec, WriterPartitionSpec, WriterShardManifest,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -963,6 +964,8 @@ impl PyMooncakeDistributedStore {
         // Phase 3: Handle items that failed in phase 2
         // Try writer-partition shortcut for Shard misses, then reconstruction.
         // Full reads also handled here.
+        let mut full_plan_indices = Vec::new();
+        let mut full_plans = Vec::new();
         for i in 0..n {
             if results[i].is_some() {
                 continue;
@@ -988,7 +991,21 @@ impl PyMooncakeDistributedStore {
                     }
                 }
                 BatchReadPlan::Full(k) => {
-                    results[i] = Some(self.read_full_into(k, buffer_ptrs[i], sizes[i], tenant)?);
+                    if let Ok(result) =
+                        self.get_tensor_into_internal(k, buffer_ptrs[i], sizes[i], tenant)
+                    {
+                        results[i] = Some(result);
+                    } else {
+                        let plan = self.build_full_into_reconstruction_plan(
+                            k,
+                            buffer_ptrs[i],
+                            sizes[i],
+                            tenant,
+                            "batch_get_tensor_with_parallelism_into",
+                        )?;
+                        full_plan_indices.push(i);
+                        full_plans.push(plan);
+                    }
                 }
                 BatchReadPlan::Direct(_) => {
                     return Err(PyRuntimeError::new_err(format!(
@@ -997,6 +1014,16 @@ impl PyMooncakeDistributedStore {
                     )));
                 }
             }
+        }
+
+        let full_results = self.execute_full_into_plans(full_plans, tenant)?;
+        for (plan_index, result) in full_plan_indices.into_iter().zip(full_results) {
+            results[plan_index] = Some(result.ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "batch_get_into: full reconstruction failed for key={}",
+                    keys[plan_index]
+                ))
+            })?);
         }
 
         let final_results: Vec<TensorReadResult> =
@@ -1689,7 +1716,12 @@ impl PyMooncakeDistributedStore {
         target_par: &TensorParallelismSpec,
         tenant: Option<&str>,
     ) -> PyResult<TensorReadResult> {
-        let sources = self.discover_shard_sources(base_key, tenant)?;
+        let discovered =
+            self.discover_shard_sources_cached(base_key, tenant, "read_shard_via_reconstruction")?;
+        let DiscoveredShardSources {
+            sources,
+            query_cache,
+        } = discovered;
 
         let first = sources.first().ok_or_else(|| {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
@@ -1810,7 +1842,7 @@ impl PyMooncakeDistributedStore {
             );
         }
 
-        let results = self.get_into_ranges(
+        let results = self.get_into_ranges_internal(
             vec![buffer_ptr],
             vec![keys],
             vec![dst_offsets],
@@ -1818,6 +1850,7 @@ impl PyMooncakeDistributedStore {
             vec![sizes],
             Some(vec![buffer_size]),
             tenant,
+            query_cache,
         )?;
 
         for key_results in &results[0] {
@@ -1961,19 +1994,19 @@ impl PyMooncakeDistributedStore {
 
     // ── Full reconstruction path ───────────────────────────────────────────
 
-    fn read_full_into(
+    fn build_full_into_reconstruction_plan(
         &self,
         base_key: &str,
         buffer_ptr: usize,
         buffer_size: usize,
         tenant: Option<&str>,
-    ) -> PyResult<TensorReadResult> {
-        if let Ok(result) = self.get_tensor_into_internal(base_key, buffer_ptr, buffer_size, tenant)
-        {
-            return Ok(result);
-        }
-
-        let sources = self.discover_shard_sources(base_key, tenant)?;
+        context: &str,
+    ) -> PyResult<FullIntoPlan> {
+        let discovered = self.discover_shard_sources_cached(base_key, tenant, context)?;
+        let DiscoveredShardSources {
+            sources,
+            query_cache,
+        } = discovered;
 
         let first = sources.first().ok_or_else(|| {
             PyRuntimeError::new_err(format!("no shard sources found for key={base_key}"))
@@ -2051,33 +2084,123 @@ impl PyMooncakeDistributedStore {
             }
         }
 
-        let results = self.get_into_ranges(
-            vec![buffer_ptr],
-            vec![keys],
-            vec![dst_offsets],
-            vec![src_offsets],
-            vec![sizes],
-            Some(vec![buffer_size]),
-            tenant,
-        )?;
+        Ok(FullIntoPlan {
+            buffer_ptr,
+            buffer_size,
+            keys,
+            dst_offsets,
+            src_offsets,
+            sizes,
+            result: TensorReadResult {
+                data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
+                data_bytes: total_data_size,
+                shape: global_shape,
+                dtype: first.dtype,
+                total_bytes_read: total_needed,
+            },
+            query_cache,
+        })
+    }
 
-        for key_results in &results[0] {
-            for &val in key_results {
-                if val <= 0 {
-                    return Err(PyRuntimeError::new_err(
-                        "full reconstruction: get_into_ranges fragment failed",
-                    ));
-                }
-            }
+    fn execute_full_into_plans(
+        &self,
+        plans: Vec<FullIntoPlan>,
+        tenant: Option<&str>,
+    ) -> PyResult<Vec<Option<TensorReadResult>>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
         }
 
-        Ok(TensorReadResult {
-            data_ptr: buffer_ptr + TensorMetadata::WIRE_SIZE,
-            data_bytes: total_data_size,
-            shape: global_shape,
-            dtype: first.dtype,
-            total_bytes_read: total_needed,
-        })
+        let mut merged_query_cache = ReadQueryResultCache::default();
+        let mut has_query_cache = false;
+        let mut buffer_ptrs = Vec::with_capacity(plans.len());
+        let mut buffer_sizes = Vec::with_capacity(plans.len());
+        let mut all_keys = Vec::with_capacity(plans.len());
+        let mut all_dst_offsets = Vec::with_capacity(plans.len());
+        let mut all_src_offsets = Vec::with_capacity(plans.len());
+        let mut all_sizes = Vec::with_capacity(plans.len());
+        let mut expected = Vec::with_capacity(plans.len());
+
+        for mut plan in plans {
+            if let Some(cache) = plan.query_cache.take() {
+                merged_query_cache.merge(cache);
+                has_query_cache = true;
+            }
+            buffer_ptrs.push(plan.buffer_ptr);
+            buffer_sizes.push(plan.buffer_size);
+            all_keys.push(plan.keys);
+            all_dst_offsets.push(plan.dst_offsets);
+            all_src_offsets.push(plan.src_offsets);
+            all_sizes.push(plan.sizes);
+            expected.push(plan.result);
+        }
+        let expected_fragment_sizes = all_sizes.clone();
+
+        let range_results = self.get_into_ranges_internal(
+            buffer_ptrs,
+            all_keys,
+            all_dst_offsets,
+            all_src_offsets,
+            all_sizes,
+            Some(buffer_sizes),
+            tenant,
+            if has_query_cache {
+                Some(merged_query_cache)
+            } else {
+                None
+            },
+        )?;
+
+        let mut results = Vec::with_capacity(expected.len());
+        for (i, result) in expected.into_iter().enumerate() {
+            let success = range_results
+                .get(i)
+                .zip(expected_fragment_sizes.get(i))
+                .map(|(key_results, expected_key_sizes)| {
+                    key_results.len() == expected_key_sizes.len()
+                        && key_results.iter().zip(expected_key_sizes).all(
+                            |(fragments, expected_sizes)| {
+                                fragments.len() == expected_sizes.len()
+                                    && fragments.iter().zip(expected_sizes).all(
+                                        |(&value, &expected_size)| {
+                                            i64::try_from(expected_size) == Ok(value)
+                                        },
+                                    )
+                            },
+                        )
+                })
+                .unwrap_or(false);
+            results.push(if success { Some(result) } else { None });
+        }
+        Ok(results)
+    }
+
+    fn read_full_into(
+        &self,
+        base_key: &str,
+        buffer_ptr: usize,
+        buffer_size: usize,
+        tenant: Option<&str>,
+    ) -> PyResult<TensorReadResult> {
+        if let Ok(result) = self.get_tensor_into_internal(base_key, buffer_ptr, buffer_size, tenant)
+        {
+            return Ok(result);
+        }
+
+        let plan = self.build_full_into_reconstruction_plan(
+            base_key,
+            buffer_ptr,
+            buffer_size,
+            tenant,
+            "read_full_into",
+        )?;
+        self.execute_full_into_plans(vec![plan], tenant)?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("full reconstruction: get_into_ranges fragment failed")
+            })
     }
 
     fn read_full_bytes(&self, base_key: &str, tenant: Option<&str>) -> PyResult<Vec<u8>> {
@@ -2162,6 +2285,118 @@ impl PyMooncakeDistributedStore {
     }
 
     // ── Source discovery ────────────────────────────────────────────────────
+
+    fn load_tensor_metadata_prefixes(
+        &self,
+        keys: &[String],
+        tenant: Option<&str>,
+        context: &str,
+    ) -> PyResult<Option<(Vec<ParsedTensorMetadata>, ReadQueryResultCache)>> {
+        let Some(query_cache) = self.batch_query_read_cache_internal(keys, tenant)? else {
+            return Ok(None);
+        };
+        if keys.is_empty() {
+            return Ok(Some((Vec::new(), query_cache)));
+        }
+
+        let scratch_size = keys
+            .len()
+            .checked_mul(TensorMetadata::WIRE_SIZE)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("{context}: metadata scratch overflow"))
+            })?;
+        let mut scratch = vec![0u8; scratch_size];
+        let scratch_ptr = scratch.as_mut_ptr() as usize;
+        if self.register_buffer(scratch_ptr, scratch_size)? != 0 {
+            return Ok(None);
+        }
+
+        let dst_offsets = (0..keys.len())
+            .map(|i| vec![i * TensorMetadata::WIRE_SIZE])
+            .collect::<Vec<_>>();
+        let src_offsets = (0..keys.len()).map(|_| vec![0]).collect::<Vec<_>>();
+        let sizes = (0..keys.len())
+            .map(|_| vec![TensorMetadata::WIRE_SIZE])
+            .collect::<Vec<_>>();
+
+        let range_results = self.get_into_ranges_internal(
+            vec![scratch_ptr],
+            vec![keys.to_vec()],
+            vec![dst_offsets],
+            vec![src_offsets],
+            vec![sizes],
+            Some(vec![scratch_size]),
+            tenant,
+            Some(query_cache.clone()),
+        );
+        let unregister_result = self.unregister_buffer(scratch_ptr, scratch_size);
+        match unregister_result {
+            Ok(0) => {}
+            Ok(_) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let range_results = match range_results {
+            Ok(results) => results,
+            Err(_) => return Ok(None),
+        };
+        if range_results.len() != 1 || range_results[0].len() != keys.len() {
+            return Ok(None);
+        }
+
+        let mut parsed = Vec::with_capacity(keys.len());
+        for (i, key_results) in range_results[0].iter().enumerate() {
+            if key_results.len() != 1 || key_results[0] != TensorMetadata::WIRE_SIZE as i64 {
+                return Ok(None);
+            }
+            let offset = i * TensorMetadata::WIRE_SIZE;
+            let metadata =
+                TensorMetadata::parse_prefix(&scratch[offset..offset + TensorMetadata::WIRE_SIZE])
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "{context}: invalid tensor metadata prefix for key={}",
+                            keys[i]
+                        ))
+                    })?;
+            parsed.push(metadata);
+        }
+
+        Ok(Some((parsed, query_cache)))
+    }
+
+    fn sources_from_metadata_prefixes(
+        &self,
+        keys: Vec<String>,
+        global_shape: Vec<i64>,
+        split_dim: i32,
+        tenant: Option<&str>,
+        context: &str,
+    ) -> PyResult<Option<DiscoveredShardSources>> {
+        let Some((metadata, query_cache)) =
+            self.load_tensor_metadata_prefixes(&keys, tenant, context)?
+        else {
+            return Ok(None);
+        };
+        if metadata.len() != keys.len() {
+            return Ok(None);
+        }
+        let sources = keys
+            .into_iter()
+            .zip(metadata)
+            .enumerate()
+            .map(|(rank, (storage_key, parsed))| ShardSource {
+                storage_key,
+                data_bytes: parsed.data_bytes,
+                global_shape: global_shape.clone(),
+                split_dim,
+                src_rank: rank,
+                dtype: parsed.metadata.header.dtype,
+            })
+            .collect();
+        Ok(Some(DiscoveredShardSources {
+            sources,
+            query_cache: Some(query_cache),
+        }))
+    }
 
     fn discover_shard_sources(
         &self,
@@ -2309,6 +2544,81 @@ impl PyMooncakeDistributedStore {
 
         Ok(sources)
     }
+
+    fn discover_shard_sources_cached(
+        &self,
+        base_key: &str,
+        tenant: Option<&str>,
+        context: &str,
+    ) -> PyResult<DiscoveredShardSources> {
+        let manifest_key = WriterShardManifest::manifest_key(base_key);
+        if let Ok(manifest_data) = self.get_raw_bytes(&manifest_key, tenant) {
+            if let Some(manifest) = WriterShardManifest::parse(&manifest_data) {
+                let global_shape = manifest.global_shape.to_vec(manifest.ndim as usize);
+                let keys = (0..manifest.shard_count)
+                    .map(|rank| {
+                        get_writer_partition_key_name(
+                            base_key,
+                            rank,
+                            manifest.shard_count,
+                            manifest.split_dim,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(discovered) = self.sources_from_metadata_prefixes(
+                    keys,
+                    global_shape,
+                    manifest.split_dim,
+                    tenant,
+                    context,
+                )? {
+                    return Ok(discovered);
+                }
+                return Ok(DiscoveredShardSources {
+                    sources: self.sources_from_writer_manifest(base_key, &manifest, tenant)?,
+                    query_cache: None,
+                });
+            }
+        }
+
+        let par_manifest_key = get_parallelism_manifest_key(base_key);
+        if let Ok(manifest_data) = self.get_raw_bytes(&par_manifest_key, tenant) {
+            if let Some(manifest) = WriterShardManifest::parse(&manifest_data) {
+                let global_shape = manifest.global_shape.to_vec(manifest.ndim as usize);
+                let keys = (0..manifest.shard_count)
+                    .map(|rank| {
+                        let tp_spec = TensorParallelismSpec::new(vec![ParallelAxisSpec {
+                            kind: ParallelAxisKind::TP,
+                            rank,
+                            size: manifest.shard_count,
+                            split_dim: manifest.split_dim,
+                            expert_id: 0,
+                            stage_id: 0,
+                        }]);
+                        get_parallelism_key_name(base_key, &tp_spec)
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(discovered) = self.sources_from_metadata_prefixes(
+                    keys,
+                    global_shape,
+                    manifest.split_dim,
+                    tenant,
+                    context,
+                )? {
+                    return Ok(discovered);
+                }
+                return Ok(DiscoveredShardSources {
+                    sources: self.sources_from_parallelism_manifest(base_key, &manifest, tenant)?,
+                    query_cache: None,
+                });
+            }
+        }
+
+        Ok(DiscoveredShardSources {
+            sources: self.sources_from_legacy_tp(base_key, tenant)?,
+            query_cache: None,
+        })
+    }
 }
 
 struct ShardSource {
@@ -2318,4 +2628,20 @@ struct ShardSource {
     split_dim: i32,
     src_rank: usize,
     dtype: i32,
+}
+
+struct DiscoveredShardSources {
+    sources: Vec<ShardSource>,
+    query_cache: Option<ReadQueryResultCache>,
+}
+
+struct FullIntoPlan {
+    buffer_ptr: usize,
+    buffer_size: usize,
+    keys: Vec<String>,
+    dst_offsets: Vec<Vec<usize>>,
+    src_offsets: Vec<Vec<usize>>,
+    sizes: Vec<Vec<usize>>,
+    result: TensorReadResult,
+    query_cache: Option<ReadQueryResultCache>,
 }

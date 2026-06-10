@@ -171,7 +171,7 @@ impl ClassicTransferEngine {
     }
 
     pub fn rpc_server_address_text(&self) -> Result<String> {
-        let mut buffer = vec![0i8; 256];
+        let mut buffer = vec![0u8; 256];
         let rc = unsafe { ffi::getLocalIpAndPort(self.raw, buffer.as_mut_ptr(), buffer.len()) };
         check_zero(rc, "getLocalIpAndPort")?;
         Ok(read_c_buffer(&buffer))
@@ -377,7 +377,7 @@ impl ClassicTransferEngine {
         if len == 0 {
             return Ok(None);
         }
-        let mut buffer = vec![0i8; len];
+        let mut buffer = vec![0u8; len];
         let rc = unsafe {
             ffi::mooncake_classic_get_local_segment_descriptor_json(
                 self.raw,
@@ -465,12 +465,11 @@ fn to_cstring(field: &str, value: &str) -> Result<CString> {
         .map_err(|_| StoreError::Transport(format!("{field} contains an embedded NUL byte")))
 }
 
-fn read_c_buffer(buffer: &[i8]) -> String {
+fn read_c_buffer(buffer: &[u8]) -> String {
     let bytes = buffer
         .iter()
         .copied()
         .take_while(|byte| *byte != 0)
-        .map(|byte| byte as u8)
         .collect::<Vec<_>>();
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -546,7 +545,7 @@ mod tests {
 
     #[test]
     fn read_c_buffer_stops_at_first_nul() {
-        let buffer = vec![b'a' as i8, b'b' as i8, 0, b'c' as i8];
+        let buffer = vec![b'a', b'b', 0, b'c'];
         assert_eq!(read_c_buffer(&buffer), "ab");
     }
 
