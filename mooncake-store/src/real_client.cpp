@@ -627,7 +627,6 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
-#ifdef ENABLE_MULTI_PROTOCOL
 tl::expected<void, ErrorCode> RealClient::start_auxiliary_services(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path) {
@@ -685,6 +684,7 @@ tl::expected<void, ErrorCode> RealClient::start_auxiliary_services(
     return {};
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
 // Multi-protocol setup implementation
 tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
