@@ -26,7 +26,7 @@ use mooncake_store_client::{
     init_tracing as init_store_tracing, metrics_http_server_addr, render_prometheus_metrics,
     start_metrics_http_server, stop_metrics_http_server, MooncakeCompatibilityFacade,
     MultiBufferPutRequest, ObjectRef, OperationTracker, PutFromRequest, PutRequest,
-    ReadQueryResultCache, ReplicationPolicy, RouteControlMode,
+    ReplicationPolicy, RouteControlMode,
 };
 use mooncake_store_core::{
     ClientLifecycleState, NamespaceScope, ObjectRoute, SegmentAnnouncement, SegmentName, StoreError,
@@ -665,16 +665,51 @@ impl PyMooncakeDistributedStore {
         buffer_sizes: Option<Vec<usize>>,
         tenant: Option<&str>,
     ) -> PyResult<Vec<Vec<Vec<i64>>>> {
-        self.get_into_ranges_internal(
-            buffer_ptrs,
-            all_keys,
-            all_dst_offsets,
-            all_src_offsets,
-            all_sizes,
-            buffer_sizes,
-            tenant,
-            None,
-        )
+        let resolved_buffer_sizes =
+            buffer_sizes.unwrap_or_else(|| vec![usize::MAX; buffer_ptrs.len()]);
+        match self.backend_ref()? {
+            StoreBackend::Dummy(dummy) => {
+                for &ptr in &buffer_ptrs {
+                    pointer_from_usize(ptr)?;
+                }
+                run_without_gil(move || {
+                    dummy.get_into_ranges(
+                        &buffer_ptrs,
+                        &resolved_buffer_sizes,
+                        &all_keys,
+                        &all_dst_offsets,
+                        &all_src_offsets,
+                        &all_sizes,
+                        tenant,
+                    )
+                })
+                .map_err(store_error_to_py)
+            }
+            StoreBackend::Real(dispatcher) => {
+                let validated: Vec<(usize, usize)> = buffer_ptrs
+                    .iter()
+                    .zip(resolved_buffer_sizes.iter())
+                    .map(|(&ptr, &size)| {
+                        pointer_from_usize(ptr)?;
+                        Ok((ptr, size))
+                    })
+                    .collect::<PyResult<Vec<_>>>()?;
+                let ptrs = validated.iter().map(|(p, _)| *p).collect();
+                let sizes = validated.iter().map(|(_, s)| *s).collect();
+                run_without_gil(move || {
+                    dispatcher.get_into_ranges(
+                        ptrs,
+                        sizes,
+                        all_keys,
+                        all_dst_offsets,
+                        all_src_offsets,
+                        all_sizes,
+                        tenant.map(str::to_string),
+                    )
+                })
+                .map_err(store_error_to_py)
+            }
+        }
     }
 
     #[pyo3(signature = (
@@ -1609,93 +1644,6 @@ impl PyMooncakeDistributedStore {
                 )
             })
             .map_err(store_error_to_py),
-        }
-    }
-
-    pub(crate) fn batch_query_read_cache_internal(
-        &self,
-        keys: &[String],
-        tenant: Option<&str>,
-    ) -> PyResult<Option<ReadQueryResultCache>> {
-        if keys.is_empty() {
-            return Ok(Some(ReadQueryResultCache::default()));
-        }
-        match self.backend_ref()? {
-            StoreBackend::Real(dispatcher) => run_without_gil({
-                let keys = keys.to_vec();
-                let tenant = tenant.map(str::to_string);
-                move || dispatcher.batch_query_read_cache(keys, tenant)
-            })
-            .map(Some)
-            .map_err(store_error_to_py),
-            StoreBackend::Dummy(_) => Ok(None),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn get_into_ranges_internal(
-        &self,
-        buffer_ptrs: Vec<usize>,
-        all_keys: Vec<Vec<String>>,
-        all_dst_offsets: Vec<Vec<Vec<usize>>>,
-        all_src_offsets: Vec<Vec<Vec<usize>>>,
-        all_sizes: Vec<Vec<Vec<usize>>>,
-        buffer_sizes: Option<Vec<usize>>,
-        tenant: Option<&str>,
-        query_cache: Option<ReadQueryResultCache>,
-    ) -> PyResult<Vec<Vec<Vec<i64>>>> {
-        let resolved_buffer_sizes =
-            buffer_sizes.unwrap_or_else(|| vec![usize::MAX; buffer_ptrs.len()]);
-        if resolved_buffer_sizes.len() != buffer_ptrs.len() {
-            return Err(PyValueError::new_err(format!(
-                "buffer_sizes length {} does not match buffer_ptrs length {}",
-                resolved_buffer_sizes.len(),
-                buffer_ptrs.len()
-            )));
-        }
-        match self.backend_ref()? {
-            StoreBackend::Dummy(dummy) => {
-                for &ptr in &buffer_ptrs {
-                    pointer_from_usize(ptr)?;
-                }
-                run_without_gil(move || {
-                    dummy.get_into_ranges(
-                        &buffer_ptrs,
-                        &resolved_buffer_sizes,
-                        &all_keys,
-                        &all_dst_offsets,
-                        &all_src_offsets,
-                        &all_sizes,
-                        tenant,
-                    )
-                })
-                .map_err(store_error_to_py)
-            }
-            StoreBackend::Real(dispatcher) => {
-                let validated: Vec<(usize, usize)> = buffer_ptrs
-                    .iter()
-                    .zip(resolved_buffer_sizes.iter())
-                    .map(|(&ptr, &size)| {
-                        pointer_from_usize(ptr)?;
-                        Ok((ptr, size))
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                let ptrs = validated.iter().map(|(p, _)| *p).collect();
-                let sizes = validated.iter().map(|(_, s)| *s).collect();
-                run_without_gil(move || {
-                    dispatcher.get_into_ranges_with_query_cache(
-                        ptrs,
-                        sizes,
-                        all_keys,
-                        all_dst_offsets,
-                        all_src_offsets,
-                        all_sizes,
-                        tenant.map(str::to_string),
-                        query_cache,
-                    )
-                })
-                .map_err(store_error_to_py)
-            }
         }
     }
 

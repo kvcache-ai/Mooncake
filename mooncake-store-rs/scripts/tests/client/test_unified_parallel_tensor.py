@@ -1103,68 +1103,6 @@ def test_batch_get_into_tp(store, allocator, tenant):
         store.unregister_buffer(ptr1, buf_size)
 
 
-def test_batch_get_into_full_reconstruction(store, allocator, tenant):
-    """batch_get_tensor_with_parallelism_into: reconstruct full tensors into buffers."""
-    weight_sd0 = generate_weight([64, 32], seed=641)
-    weight_sd1 = generate_weight([16, 48], seed=642)
-    tp_size = 2
-
-    for rank in range(tp_size):
-        store.put_tensor_with_parallelism(
-            "test_batch_into_full_sd0.weight",
-            weight_sd0,
-            parallelism=TensorParallelism([TP(rank, tp_size, split_dim=0)]),
-            tenant=tenant,
-        )
-        store.put_tensor_with_parallelism(
-            "test_batch_into_full_sd1.weight",
-            weight_sd1,
-            parallelism=TensorParallelism([TP(rank, tp_size, split_dim=1)]),
-            tenant=tenant,
-        )
-
-    size0 = TENSOR_METADATA_WIRE_SIZE + weight_sd0.nelement() * weight_sd0.element_size()
-    size1 = TENSOR_METADATA_WIRE_SIZE + weight_sd1.nelement() * weight_sd1.element_size()
-    ptr0 = allocator.alloc(size0)
-    ptr1 = allocator.alloc(size1)
-    r0 = store.register_buffer(ptr0, size0)
-    r1 = store.register_buffer(ptr1, size1)
-    if r0 != 0 or r1 != 0:
-        if r0 == 0:
-            store.unregister_buffer(ptr0, size0)
-        if r1 == 0:
-            store.unregister_buffer(ptr1, size1)
-        raise SkipTest("register_buffer not supported")
-
-    try:
-        results = store.batch_get_tensor_with_parallelism_into(
-            [
-                "test_batch_into_full_sd0.weight",
-                "test_batch_into_full_sd1.weight",
-            ],
-            [ptr0, ptr1],
-            [size0, size1],
-            targets=[ReadTarget(READ_MODE_FULL), ReadTarget(READ_MODE_FULL)],
-            tenant=tenant,
-        )
-        assert len(results) == 2, f"expected 2 results, got {len(results)}"
-
-        for result, expected, context in [
-            (results[0], weight_sd0, "batch full into split_dim=0"),
-            (results[1], weight_sd1, "batch full into split_dim=1"),
-        ]:
-            expected_bytes = expected.nelement() * expected.element_size()
-            assert result.data_bytes == expected_bytes, f"{context}: data_bytes mismatch"
-            actual_data = (ctypes.c_ubyte * expected_bytes).from_address(result.data_ptr)
-            expected_data = (ctypes.c_ubyte * expected_bytes).from_address(
-                expected.data_ptr()
-            )
-            assert bytes(actual_data) == bytes(expected_data), f"{context}: bytes mismatch"
-    finally:
-        store.unregister_buffer(ptr0, size0)
-        store.unregister_buffer(ptr1, size1)
-
-
 def test_batch_get_cross_tp_reconstruction(store, tenant):
     """batch_get with cross-TP: writer TP=2, reader TP=4."""
     full_weight = generate_weight([128, 64], seed=62)
@@ -1437,13 +1375,6 @@ def main():
 
     print("\n  --- Batch into buffer ---")
     run_test("batch get into tp", test_batch_get_into_tp, store, allocator, tenant)
-    run_test(
-        "batch get into full reconstruction",
-        test_batch_get_into_full_reconstruction,
-        store,
-        allocator,
-        tenant,
-    )
 
     print("\n  --- Auto-slicing validation ---")
     run_test("uniform shard validation", test_uniform_shard_validation, store, tenant)

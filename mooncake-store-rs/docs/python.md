@@ -811,7 +811,6 @@ If hugepage mode is requested, the host kernel must already have compatible huge
 - `batch_put_from_multi_buffers`
 - `batch_get_into`
 - `batch_get_into_multi_buffers`
-- tensor-parallel `_into` reads can reconstruct full or shard targets directly into registered buffers; full batch reconstruction shares route-query results and issues combined ranged reads when possible
 
 ## Cache Soft-Fail Semantics
 
