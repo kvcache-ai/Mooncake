@@ -208,6 +208,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            cold_backing: None,
         }
     }
 
@@ -232,6 +233,7 @@ mod tests {
                 tier: ReplicaTier::Nvme,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
