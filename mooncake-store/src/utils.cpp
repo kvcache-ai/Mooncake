@@ -327,11 +327,16 @@ void *allocate_buffer_numa_segments(size_t total_size,
     size_t region_size = align_up(total_size / n, page_size);
     size_t map_size = region_size * n;
 
-    // reserve contiguous VMA, no physical pages yet
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // reserve contiguous VMA; use hugepages if page_size indicates so
+    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (page_size != getpagesize()) {
+        get_hugepage_size_from_env(&flags);
+    }
+    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << map_size << ", errno=" << errno
+        LOG(ERROR) << "mmap failed (hugepage="
+                   << (page_size >= 2 * 1024 * 1024 ? "yes" : "no")
+                   << "), size=" << map_size << ", errno=" << errno
                    << " (" << strerror(errno) << ")";
         return nullptr;
     }
