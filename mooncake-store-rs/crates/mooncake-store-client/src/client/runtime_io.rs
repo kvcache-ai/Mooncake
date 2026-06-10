@@ -2001,6 +2001,87 @@ impl StoreClient {
         true
     }
 
+    fn scoped_object_key_for_ref(&self, object: &ObjectRef<'_>) -> (String, ObjectKey) {
+        let tenant = object.tenant.unwrap_or(self.default_tenant());
+        let object_id = LogicalObjectId::new(
+            NamespaceScope::with_defaults(Some(tenant), object.domain, object.object_set),
+            object.key,
+        );
+        (
+            tenant.to_string(),
+            mooncake_store_core::ObjectKey::from_logical_id(&object_id),
+        )
+    }
+
+    fn scoped_object_key_for_tenant(&self, tenant: &str, key: &str) -> ObjectKey {
+        let object_id =
+            LogicalObjectId::new(NamespaceScope::with_defaults(Some(tenant), None, None), key);
+        mooncake_store_core::ObjectKey::from_logical_id(&object_id)
+    }
+
+    fn resolve_readable_route(
+        &self,
+        tenant: &str,
+        logical_key: &str,
+        route: Option<ObjectRoute>,
+        local_segments: &BTreeSet<SegmentName>,
+        readable_runtimes: &BTreeSet<ClientRuntimeId>,
+    ) -> Result<ResolvedObject> {
+        let route = route.ok_or_else(|| {
+            StoreError::NotFound(format!("tenant={tenant} key={logical_key}"))
+        })?;
+        if route.state != RouteState::Active {
+            return Err(StoreError::NotFound(format!(
+                "tenant={tenant} key={logical_key} is not readable"
+            )));
+        }
+        let (replica, readable_for_route) = match Self::select_readable_replica(
+            &route,
+            &self.lease.runtime,
+            local_segments,
+            readable_runtimes,
+        ) {
+            Some(replica) => (replica, readable_runtimes.clone()),
+            None => {
+                let refreshed_readable = self.readable_runtime_set(true)?;
+                let replica = Self::select_readable_replica(
+                    &route,
+                    &self.lease.runtime,
+                    local_segments,
+                    &refreshed_readable,
+                )
+                .ok_or_else(|| {
+                    StoreError::NotFound(format!(
+                        "tenant={tenant} key={logical_key} has no readable replica owner"
+                    ))
+                })?;
+                (replica, refreshed_readable)
+            }
+        };
+        if route
+            .replicas
+            .iter()
+            .min_by_key(|candidate| candidate.priority)
+            .is_some_and(|primary| primary.owner != replica.owner)
+        {
+            self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
+        }
+        let fallback_replicas = Self::fallback_replicas_for_route(
+            &route,
+            &replica,
+            &self.lease.runtime,
+            local_segments,
+            &readable_for_route,
+        );
+        Ok(ResolvedObject {
+            tenant: tenant.to_string(),
+            key: logical_key.to_string(),
+            route,
+            replica,
+            fallback_replicas,
+        })
+    }
+
     fn resolve_objects(
         &self,
         objects: &[ObjectRef<'_>],
@@ -2010,21 +2091,7 @@ impl StoreClient {
         let result = (|| {
             let scoped = objects
                 .iter()
-                .map(|object| {
-                    let tenant = object.tenant.unwrap_or(self.default_tenant());
-                    let object_id = LogicalObjectId::new(
-                        NamespaceScope::with_defaults(
-                            Some(tenant),
-                            object.domain,
-                            object.object_set,
-                        ),
-                        object.key,
-                    );
-                    (
-                        tenant.to_string(),
-                        mooncake_store_core::ObjectKey::from_logical_id(&object_id),
-                    )
-                })
+                .map(|object| self.scoped_object_key_for_ref(object))
                 .collect::<Vec<_>>();
             let routes = self.route_ops().load_routes(
                 &scoped
@@ -2042,63 +2109,13 @@ impl StoreClient {
                 .zip(routes)
                 .enumerate()
             {
-                let item = (|| -> Result<ResolvedObject> {
-                    let route = route.ok_or_else(|| {
-                        StoreError::NotFound(format!("tenant={tenant} key={}", object.key))
-                    })?;
-                    if route.state != RouteState::Active {
-                        return Err(StoreError::NotFound(format!(
-                            "tenant={tenant} key={} is not readable",
-                            object.key
-                        )));
-                    }
-                    let (replica, readable_for_route) = match Self::select_readable_replica(
-                        &route,
-                        &self.lease.runtime,
-                        &local_segments,
-                        &readable_runtimes,
-                    ) {
-                        Some(replica) => (replica, readable_runtimes.clone()),
-                        None => {
-                            let refreshed_readable = self.readable_runtime_set(true)?;
-                            let replica = Self::select_readable_replica(
-                                &route,
-                                &self.lease.runtime,
-                                &local_segments,
-                                &refreshed_readable,
-                            )
-                            .ok_or_else(|| {
-                                StoreError::NotFound(format!(
-                                    "tenant={tenant} key={} has no readable replica owner",
-                                    object.key
-                                ))
-                            })?;
-                            (replica, refreshed_readable)
-                        }
-                    };
-                    if route
-                        .replicas
-                        .iter()
-                        .min_by_key(|candidate| candidate.priority)
-                        .is_some_and(|primary| primary.owner != replica.owner)
-                    {
-                        self.prune_unreadable_replicas_best_effort(&route, &readable_for_route);
-                    }
-                    let fallback_replicas = Self::fallback_replicas_for_route(
-                        &route,
-                        &replica,
-                        &self.lease.runtime,
-                        &local_segments,
-                        &readable_for_route,
-                    );
-                    Ok(ResolvedObject {
-                        tenant: tenant.to_string(),
-                        key: object.key.to_string(),
-                        route,
-                        replica,
-                        fallback_replicas,
-                    })
-                })();
+                let item = self.resolve_readable_route(
+                    &tenant,
+                    object.key,
+                    route,
+                    &local_segments,
+                    &readable_runtimes,
+                );
                 match item {
                     Ok(r) => {
                         resolved.push(r);
