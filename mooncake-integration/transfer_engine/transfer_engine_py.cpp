@@ -276,6 +276,7 @@ int TransferEnginePy::findClassId(size_t size) {
 int TransferEnginePy::doBuddyAllocate(int class_id) {
     if (class_id == kMaxClassId) {
         auto buffer = allocateRawBuffer(kDefaultBufferCapacity);
+        if (!buffer) return -1;
         buffer_list_.push_back(buffer);
         for (size_t offset = 0; offset < kDefaultBufferCapacity;
              offset += 1024ull * kSlabSizeKB[kMaxClassId])
