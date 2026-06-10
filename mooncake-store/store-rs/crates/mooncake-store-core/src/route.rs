@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::marker::PhantomData;
 
+use crate::cold_tier::ColdBackingRoute;
 use crate::compat::CompatibilityDescriptor;
 use crate::identity::{
     ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope, DEFAULT_DOMAIN,
@@ -128,6 +129,8 @@ pub struct ObjectRoute {
     pub state: RouteState,
     pub compatibility: CompatibilityDescriptor,
     pub replicas: Vec<ReplicaRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_backing: Option<ColdBackingRoute>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -685,7 +688,7 @@ where
     deserialize_vec_or_object(deserializer, "a segment target chunk array or an object")
 }
 
-fn deserialize_string_vec_or_object<'de, D>(
+pub(crate) fn deserialize_string_vec_or_object<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<String>, D::Error>
 where
@@ -1198,6 +1201,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            cold_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
@@ -1246,6 +1250,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
+            cold_backing: None,
         };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();

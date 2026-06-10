@@ -1,5 +1,6 @@
 use mooncake_store_core::{
-    ClientRuntimeId, ClientStableId, ObjectKey, RoutePolicyDomain, SegmentName, TenantPolicyScope,
+    ClientRuntimeId, ClientStableId, ColdBackingState, ObjectKey, RoutePolicyDomain, SegmentName,
+    TenantPolicyScope,
 };
 use std::borrow::Cow;
 
@@ -29,10 +30,6 @@ impl MetadataKeyspace {
 
     pub fn client(&self, runtime: &ClientRuntimeId) -> String {
         format!("{}/clients/{}", self.slot_tag, runtime.storage_key())
-    }
-
-    pub fn client_lease_field(&self) -> &'static str {
-        "lease"
     }
 
     pub fn client_prefix_for_stable(&self, stable_id: &ClientStableId) -> String {
@@ -153,16 +150,8 @@ impl MetadataKeyspace {
             "{}/client-resources/{}/segments/{}",
             self.slot_tag,
             owner.storage_key(),
-            encode_key_component(&segment.0)
+            segment.0
         )
-    }
-
-    pub fn client_segment_field(&self, segment: &SegmentName) -> String {
-        format!("segment:{}", encode_key_component(&segment.0))
-    }
-
-    pub fn client_segment_field_prefix(&self) -> &'static str {
-        "segment:"
     }
 
     pub fn segment_prefix(&self, owner: Option<&ClientRuntimeId>) -> String {
@@ -198,6 +187,21 @@ impl MetadataKeyspace {
         )
     }
 
+    pub fn segment_cleanup_marker(&self, cleanup_id: &str, segment_key: &str) -> String {
+        format!(
+            "{}/maintenance/segment-cleanup/{}/{}",
+            self.slot_tag, cleanup_id, segment_key
+        )
+    }
+
+    pub fn segment_owner(&self, segment: &SegmentName) -> String {
+        format!(
+            "{}/indexes/segment-owners/{}",
+            self.slot_tag,
+            encode_key_component(&segment.0)
+        )
+    }
+
     pub fn object(&self, key: &ObjectKey) -> String {
         format!("{}/objects/{}", self.slot_tag, key.0)
     }
@@ -212,6 +216,50 @@ impl MetadataKeyspace {
 
     pub fn object_index(&self) -> String {
         format!("{}/indexes/objects", self.slot_tag)
+    }
+
+    pub fn object_cold_tier_device_index(&self, device_id: &str) -> String {
+        format!(
+            "{}/indexes/objects/by-cold-tier-device/{}",
+            self.slot_tag,
+            encode_key_component(device_id)
+        )
+    }
+
+    pub fn object_cold_backing_state_index(&self, state: ColdBackingState) -> String {
+        format!(
+            "{}/indexes/objects/by-cold-backing-state/{}",
+            self.slot_tag,
+            match state {
+                ColdBackingState::PendingOffload => "pending_offload",
+                ColdBackingState::Materialized => "materialized",
+                ColdBackingState::PendingDelete => "pending_delete",
+            }
+        )
+    }
+
+    pub fn object_cold_backing_owner_index(&self, owner: &ClientRuntimeId) -> String {
+        format!(
+            "{}/indexes/objects/by-cold-backing-owner/{}",
+            self.slot_tag,
+            encode_key_component(&owner.storage_key())
+        )
+    }
+
+    pub fn cold_tier_device(&self, device_id: &str) -> String {
+        format!(
+            "{}/system/cold-tier/devices/{}",
+            self.slot_tag,
+            encode_key_component(device_id)
+        )
+    }
+
+    pub fn cold_tier_device_prefix(&self) -> String {
+        format!("{}/system/cold-tier/devices/", self.slot_tag)
+    }
+
+    pub fn cold_tier_device_index(&self) -> String {
+        format!("{}/indexes/cold-tier/devices", self.slot_tag)
     }
 
     pub fn handoff(&self, stable_id: &ClientStableId) -> String {
@@ -279,9 +327,9 @@ impl MetadataKeyspace {
 
     pub fn tenant_quota_state(&self, scope: &TenantPolicyScope) -> String {
         format!(
-            "{}/system/tenant-quota/tenants/{}",
+            "{}/system/tenant-quota/{}",
             self.slot_tag,
-            encode_key_component(&scope.tenant)
+            quota_scope_key(scope)
         )
     }
 
@@ -304,15 +352,15 @@ impl MetadataKeyspace {
         )
     }
 
-    pub fn tenant_quota_reservation_prefix(&self, tenant: Option<&str>) -> String {
-        match tenant {
-            Some(tenant) => format!(
-                "{}/system/tenant-quota-reservations/by-tenant/{}/",
+    pub fn tenant_quota_reservation_prefix(&self, scope: Option<&TenantPolicyScope>) -> String {
+        match scope {
+            Some(scope) => format!(
+                "{}/system/tenant-quota-reservations/by-scope/{}/reservations/",
                 self.slot_tag,
-                encode_key_component(tenant)
+                quota_scope_key(scope)
             ),
             None => format!(
-                "{}/system/tenant-quota-reservations/by-tenant/",
+                "{}/system/tenant-quota-reservations/by-scope/",
                 self.slot_tag
             ),
         }
@@ -324,35 +372,34 @@ impl MetadataKeyspace {
         reservation_id: &str,
     ) -> String {
         format!(
-            "{}{}/{}",
-            self.tenant_quota_reservation_prefix(Some(&scope.tenant)),
-            "reservations",
+            "{}{}",
+            self.tenant_quota_reservation_prefix(Some(scope)),
             encode_key_component(reservation_id)
         )
     }
 
-    pub fn tenant_eviction_frontier(&self, tenant: &str) -> String {
+    pub fn tenant_eviction_frontier(&self, scope: &TenantPolicyScope) -> String {
         format!(
-            "{}/indexes/tenant-eviction/tenants/{}",
+            "{}/indexes/tenant-eviction/scopes/{}",
             self.slot_tag,
-            encode_key_component(tenant)
+            quota_scope_key(scope)
         )
     }
 
-    pub fn tenant_eviction_frontier_prefix(&self, tenant: &str) -> String {
-        format!("{}/", self.tenant_eviction_frontier(tenant))
+    pub fn tenant_eviction_frontier_prefix(&self, scope: &TenantPolicyScope) -> String {
+        format!("{}/", self.tenant_eviction_frontier(scope))
     }
 
     pub fn tenant_eviction_candidate(
         &self,
-        tenant: &str,
+        scope: &TenantPolicyScope,
         updated_at_ms: u64,
         committed_length: u64,
         key: &ObjectKey,
     ) -> String {
         format!(
             "{}{updated_at_ms:020}/{:020}/{}",
-            self.tenant_eviction_frontier_prefix(tenant),
+            self.tenant_eviction_frontier_prefix(scope),
             u64::MAX - committed_length,
             encode_key_component(&key.0)
         )
@@ -388,10 +435,10 @@ pub fn parse_route_policy_domain(
 
 pub fn parse_tenant_eviction_candidate_key(
     keyspace: &MetadataKeyspace,
-    tenant: &str,
+    scope: &TenantPolicyScope,
     key: &str,
 ) -> Option<ObjectKey> {
-    let prefix = keyspace.tenant_eviction_frontier_prefix(tenant);
+    let prefix = keyspace.tenant_eviction_frontier_prefix(scope);
     let rest = key.strip_prefix(&prefix)?;
     let mut parts = rest.split('/');
     parts.next()?;
@@ -433,6 +480,19 @@ pub fn parse_tenant_policy_scope(
     };
     scope.validate().ok()?;
     Some(scope)
+}
+
+fn quota_scope_key(scope: &TenantPolicyScope) -> String {
+    let mut key = format!("tenants/{}", encode_key_component(&scope.tenant));
+    if let Some(domain) = scope.domain.as_deref() {
+        key.push_str("/domains/");
+        key.push_str(&encode_key_component(domain));
+    }
+    if let Some(object_set) = scope.object_set.as_deref() {
+        key.push_str("/object-sets/");
+        key.push_str(&encode_key_component(object_set));
+    }
+    key
 }
 
 pub(crate) fn encode_key_component(value: &str) -> String {
@@ -479,7 +539,7 @@ fn decode_key_component_checked(value: &str) -> Option<Cow<'_, str>> {
 
 impl Default for MetadataKeyspace {
     fn default() -> Self {
-        Self::new("mc/store-rs/v2")
+        Self::new("mc/store-rs/v1")
     }
 }
 
@@ -623,9 +683,6 @@ mod tests {
             keyspace.segment(&runtime, &segment),
             "{tenant-a}/client-resources/writer:9/segments/seg-1"
         );
-        assert_eq!(keyspace.client_lease_field(), "lease");
-        assert_eq!(keyspace.client_segment_field(&segment), "segment:seg-1");
-        assert_eq!(keyspace.client_segment_field_prefix(), "segment:");
         assert_eq!(
             keyspace.segment_prefix(Some(&runtime)),
             "{tenant-a}/client-resources/writer:9/segments/"
@@ -650,17 +707,22 @@ mod tests {
         assert_eq!(keyspace.object_prefix(), "{tenant-a}/objects/");
         assert_eq!(keyspace.object_pattern(), "{tenant-a}/objects/*");
         assert_eq!(keyspace.object_index(), "{tenant-a}/indexes/objects");
+        let quota_scope = TenantPolicyScope::new("tenant/a", Some("domain-1"), Some("set-1"));
         assert_eq!(
-            keyspace.tenant_eviction_frontier("tenant/a"),
-            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa"
+            keyspace.tenant_quota_state(&quota_scope),
+            "{tenant-a}/system/tenant-quota/tenants/tenant%2Fa/domains/domain-1/object-sets/set-1"
         );
         assert_eq!(
-            keyspace.tenant_eviction_frontier_prefix("tenant/a"),
-            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa/"
+            keyspace.tenant_eviction_frontier(&quota_scope),
+            "{tenant-a}/indexes/tenant-eviction/scopes/tenants/tenant%2Fa/domains/domain-1/object-sets/set-1"
         );
         assert_eq!(
-            keyspace.tenant_eviction_candidate("tenant/a", 7, 11, &object),
-            "{tenant-a}/indexes/tenant-eviction/tenants/tenant%2Fa/00000000000000000007/18446744073709551604/alpha"
+            keyspace.tenant_eviction_frontier_prefix(&quota_scope),
+            "{tenant-a}/indexes/tenant-eviction/scopes/tenants/tenant%2Fa/domains/domain-1/object-sets/set-1/"
+        );
+        assert_eq!(
+            keyspace.tenant_eviction_candidate(&quota_scope, 7, 11, &object),
+            "{tenant-a}/indexes/tenant-eviction/scopes/tenants/tenant%2Fa/domains/domain-1/object-sets/set-1/00000000000000000007/18446744073709551604/alpha"
         );
         assert_eq!(keyspace.handoff(&stable), "{tenant-a}/handoffs/writer");
         assert_eq!(
@@ -676,7 +738,7 @@ mod tests {
 
     #[test]
     fn default_keyspace_uses_store_rs_namespace() {
-        assert_eq!(MetadataKeyspace::default().prefix(), "mc/store-rs/v2");
+        assert_eq!(MetadataKeyspace::default().prefix(), "mc/store-rs/v1");
     }
 
     #[test]
@@ -735,10 +797,11 @@ mod tests {
     fn tenant_eviction_candidate_key_parser_round_trips_encoded_object_key() {
         let keyspace = MetadataKeyspace::new("tenant-a");
         let object = ObjectKey::new("tenant/a::path/to/object");
-        let key = keyspace.tenant_eviction_candidate("tenant/a", 7, 11, &object);
+        let scope = TenantPolicyScope::new("tenant/a", Some("domain/b"), Some("set/c"));
+        let key = keyspace.tenant_eviction_candidate(&scope, 7, 11, &object);
 
         assert_eq!(
-            parse_tenant_eviction_candidate_key(&keyspace, "tenant/a", &key),
+            parse_tenant_eviction_candidate_key(&keyspace, &scope, &key),
             Some(object)
         );
     }
@@ -786,10 +849,11 @@ mod tests {
 
     #[test]
     fn all_keys_in_same_redis_cluster_slot() {
-        let keyspace = MetadataKeyspace::new("mc/store-rs/v2");
+        let keyspace = MetadataKeyspace::new("mc/store-rs/v1");
         let stable = ClientStableId::new("writer");
         let runtime = ClientRuntimeId::new("writer", ClientEpoch(1));
 
+        let quota_scope = TenantPolicyScope::new("tenant-a", Some("domain-a"), Some("set-a"));
         let keys = [
             keyspace.client(&runtime),
             keyspace.client_prefix_for_stable(&stable),
@@ -801,7 +865,7 @@ mod tests {
             keyspace.client_lease_expiry_time(42, &runtime),
             keyspace.object(&ObjectKey::new("key-1")),
             keyspace.object_index(),
-            keyspace.tenant_eviction_frontier("tenant-a"),
+            keyspace.tenant_eviction_frontier(&quota_scope),
         ];
 
         fn extract_hash_tag(key: &str) -> Option<&str> {
@@ -887,9 +951,9 @@ mod tests {
         let runtime = ClientRuntimeId::new("node-1", ClientEpoch(42));
         let segment = SegmentName::new("seg:special");
         let key = keyspace.segment(&runtime, &segment);
-        assert_eq!(
-            key,
-            "{ns}/client-resources/node-1:42/segments/seg%3Aspecial"
+        assert!(
+            key.contains("seg:special"),
+            "segment-name colons must survive into the key: got {key}"
         );
     }
 

@@ -6,12 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-    HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
-    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
-    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
-    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
-    TenantQuotaReservationRequest, TenantQuotaState,
+    ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
+    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, MetadataBackend, ObjectKey,
+    ObjectRoute, Result, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
+    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
+    TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
+    TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
 };
 use parking_lot::{Mutex, MutexGuard};
 use redis::cmd;
@@ -19,17 +20,59 @@ use redis::{
     Commands, ConnectionInfo, ConnectionLike, IntoConnectionInfo, RedisConnectionInfo, Script,
 };
 
+use crate::cold_tier::cold_tier_device_matches_filter;
 use crate::keyspace::{
     parse_route_policy_domain, parse_tenant_eviction_candidate_key, parse_tenant_policy_scope,
 };
 use crate::segment_state::StoredSegmentState;
 use crate::MetadataKeyspace;
 
+const APPLY_COLD_TIER_USAGE_DELTA_SCRIPT: &str = r#"
+local key = KEYS[1]
+local used_delta = tonumber(ARGV[1])
+local reserved_delta = tonumber(ARGV[2])
+local updated_at_ms = tonumber(ARGV[3])
+
+local payload = redis.call('GET', key)
+if not payload then
+    return {0, ''}
+end
+local device = cjson.decode(payload)
+local tags = device['tags']
+local used = tonumber(device['used_bytes'] or 0) + used_delta
+local reserved = tonumber(device['reserved_bytes'] or 0) + reserved_delta
+if used < 0 or reserved < 0 then
+    return {1, payload}
+end
+device['used_bytes'] = used
+device['reserved_bytes'] = reserved
+device['updated_at_ms'] = updated_at_ms
+if tags and next(tags) == nil then
+    device['tags'] = cjson.empty_array
+end
+local next_payload = cjson.encode(device)
+redis.call('SET', key, next_payload)
+return {2, next_payload}
+"#;
+
 const CAS_OBJECT_ROUTE_SCRIPT: &str = r#"
 local key = KEYS[1]
+local index = KEYS[2]
+local old_device_index = KEYS[3]
+local old_state_index = KEYS[4]
+local old_owner_index = KEYS[5]
+local new_device_index = KEYS[6]
+local new_state_index = KEYS[7]
+local new_owner_index = KEYS[8]
 local expected = ARGV[1]
 local next_version = ARGV[2]
 local payload = ARGV[3]
+local has_old_device_index = ARGV[4]
+local has_old_state_index = ARGV[5]
+local has_old_owner_index = ARGV[6]
+local has_new_device_index = ARGV[7]
+local has_new_state_index = ARGV[8]
+local has_new_owner_index = ARGV[9]
 
 local current_payload = redis.call('HGET', key, 'payload')
 local current_version = redis.call('HGET', key, 'version')
@@ -44,21 +87,60 @@ else
     end
 end
 
+if has_old_device_index == '1' then redis.call('SREM', old_device_index, key) end
+if has_old_state_index == '1' then redis.call('SREM', old_state_index, key) end
+if has_old_owner_index == '1' then redis.call('SREM', old_owner_index, key) end
+
 if payload == '__delete__' then
     redis.call('DEL', key)
+    redis.call('SREM', index, key)
     return {1, ''}
 end
 
 redis.call('HSET', key, 'version', next_version, 'payload', payload)
+redis.call('SADD', index, key)
+if has_new_device_index == '1' then redis.call('SADD', new_device_index, key) end
+if has_new_state_index == '1' then redis.call('SADD', new_state_index, key) end
+if has_new_owner_index == '1' then redis.call('SADD', new_owner_index, key) end
 return {1, payload}
+"#;
+
+const DELETE_STALE_SEGMENT_WITH_MARKER_SCRIPT: &str = r#"
+local segment_key = KEYS[1]
+local marker_key = KEYS[2]
+local client_key = KEYS[3]
+local expected_owner = ARGV[1]
+local cleanup_id = ARGV[2]
+local expected_segment_key = ARGV[3]
+
+local marker_owner = redis.call('HGET', marker_key, 'owner')
+local marker_cleanup_id = redis.call('HGET', marker_key, 'cleanup_id')
+local marker_segment_key = redis.call('HGET', marker_key, 'segment_key')
+if marker_owner ~= expected_owner or marker_cleanup_id ~= cleanup_id or marker_segment_key ~= expected_segment_key then
+    return {-1, ''}
+end
+
+if redis.call('EXISTS', client_key) == 1 then
+    return {0, 'live'}
+end
+
+local current_owner = redis.call('HGET', segment_key, 'owner')
+if not current_owner then
+    return {0, 'missing'}
+end
+if current_owner ~= expected_owner then
+    return {0, current_owner}
+end
+
+redis.call('DEL', segment_key)
+return {1, expected_owner}
 "#;
 
 const RESERVE_SEGMENT_SCRIPT: &str = r#"
 local key = KEYS[1]
-local field = ARGV[1]
-local requested = tonumber(ARGV[2])
+local requested = tonumber(ARGV[1])
 
-local payload = redis.call('HGET', key, field)
+local payload = redis.call('HGET', key, 'state_json')
 if not payload then
     return {0, -1}
 end
@@ -118,17 +200,21 @@ state["announcement"] = announcement
 state["free_spans"] = free_spans
 
 local next_payload = cjson.encode(state)
-redis.call('HSET', key, field, next_payload)
+redis.call('HSET', key,
+    'state_json', next_payload,
+    'used_bytes', tostring(announcement["used_bytes"]),
+    'state', announcement["state"],
+    'alignment_bytes', tostring(announcement["alignment_bytes"] or 1),
+    'capacity_bytes', tostring(announcement["capacity_bytes"]))
 return {1, offset}
 "#;
 
 const RELEASE_SEGMENT_SCRIPT: &str = r#"
 local key = KEYS[1]
-local field = ARGV[1]
-local offset = tonumber(ARGV[2])
-local requested = tonumber(ARGV[3])
+local offset = tonumber(ARGV[1])
+local requested = tonumber(ARGV[2])
 
-local payload = redis.call('HGET', key, field)
+local payload = redis.call('HGET', key, 'state_json')
 if not payload then
     return {0, -1}
 end
@@ -206,7 +292,12 @@ state["announcement"] = announcement
 state["cursor_bytes"] = cursor
 state["free_spans"] = merged
 local next_payload = cjson.encode(state)
-redis.call('HSET', key, field, next_payload)
+redis.call('HSET', key,
+    'state_json', next_payload,
+    'used_bytes', tostring(announcement["used_bytes"]),
+    'state', announcement["state"],
+    'alignment_bytes', tostring(announcement["alignment_bytes"] or 1),
+    'capacity_bytes', tostring(announcement["capacity_bytes"]))
 return {1, used}
 "#;
 
@@ -283,20 +374,12 @@ local payload_template = ARGV[1]
 local ttl_ms = tonumber(ARGV[2])
 local expires_at_ms = tonumber(ARGV[3])
 local stable_id = ARGV[4]
-local lease_field = ARGV[5]
-
-local function refresh_auxiliary_ttl(key)
-    local current_ttl = redis.call('PTTL', key)
-    if current_ttl < ttl_ms then
-        redis.call('PEXPIRE', key, ttl_ms)
-    end
-end
 
 local active_max = 0
 local members = redis.call('SMEMBERS', by_stable_index)
 for _, member in ipairs(members) do
     local lease_key = lease_key_prefix .. tostring(member)
-    if redis.call('HGET', lease_key, lease_field) then
+    if redis.call('EXISTS', lease_key) == 1 then
         local candidate = tonumber(member)
         if candidate and candidate > active_max then
             active_max = candidate
@@ -325,13 +408,10 @@ lease['runtime']['epoch'] = new_epoch
 local payload = cjson.encode(lease)
 
 local lease_key = lease_key_prefix .. tostring(new_epoch)
-redis.call('HSET', lease_key, lease_field, payload)
-redis.call('PEXPIRE', lease_key, ttl_ms)
+redis.call('SET', lease_key, payload, 'PX', ttl_ms)
 redis.call('SADD', global_index, lease_key)
 redis.call('SADD', by_stable_index, tostring(new_epoch))
 redis.call('SET', hwm_key, tostring(new_epoch))
-refresh_auxiliary_ttl(by_stable_index)
-refresh_auxiliary_ttl(hwm_key)
 redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
 local runtime_key = stable_id .. ':' .. tostring(new_epoch)
 if lease['state'] == 'Active' then
@@ -355,26 +435,6 @@ local payload = ARGV[2]
 local ttl_ms = tonumber(ARGV[3])
 local expires_at_ms = tonumber(ARGV[4])
 local runtime_key = ARGV[5]
-local lease_field = ARGV[6]
-
-local function refresh_auxiliary_ttl(key)
-    local current_ttl = redis.call('PTTL', key)
-    if current_ttl < ttl_ms then
-        redis.call('PEXPIRE', key, ttl_ms)
-    end
-end
-
-local function publish_hwm(candidate_epoch)
-    local hwm_raw = redis.call('GET', hwm_key)
-    local hwm_value = 0
-    if hwm_raw then
-        hwm_value = tonumber(hwm_raw) or 0
-    end
-    if candidate_epoch > hwm_value then
-        redis.call('SET', hwm_key, tostring(candidate_epoch))
-    end
-    refresh_auxiliary_ttl(hwm_key)
-end
 
 local function update_stable_runtime_index()
     local lease = cjson.decode(payload)
@@ -385,13 +445,10 @@ local function update_stable_runtime_index()
     end
 end
 
-if redis.call('HGET', lease_key, lease_field) then
-    redis.call('HSET', lease_key, lease_field, payload)
-    redis.call('PEXPIRE', lease_key, ttl_ms)
+if redis.call('EXISTS', lease_key) == 1 then
+    redis.call('SET', lease_key, payload, 'PX', ttl_ms)
     redis.call('SADD', global_index, lease_key)
     redis.call('SADD', by_stable_index, tostring(new_epoch))
-    refresh_auxiliary_ttl(by_stable_index)
-    publish_hwm(new_epoch)
     redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
     update_stable_runtime_index()
     return {1, ''}
@@ -401,7 +458,7 @@ local active_max = 0
 local members = redis.call('SMEMBERS', by_stable_index)
 for _, member in ipairs(members) do
     local candidate_key = lease_key_prefix .. tostring(member)
-    if redis.call('HGET', candidate_key, lease_field) then
+    if redis.call('EXISTS', candidate_key) == 1 then
         local candidate = tonumber(member)
         if candidate and candidate > active_max then
             active_max = candidate
@@ -429,12 +486,10 @@ if new_epoch <= floor and not allow_reclaim then
     return {0, tostring(floor)}
 end
 
-redis.call('HSET', lease_key, lease_field, payload)
-redis.call('PEXPIRE', lease_key, ttl_ms)
+redis.call('SET', lease_key, payload, 'PX', ttl_ms)
 redis.call('SADD', global_index, lease_key)
 redis.call('SADD', by_stable_index, tostring(new_epoch))
-refresh_auxiliary_ttl(by_stable_index)
-publish_hwm(math.max(new_epoch, hwm_value))
+redis.call('SET', hwm_key, tostring(math.max(new_epoch, hwm_value)))
 redis.call('ZADD', expiry_index, expires_at_ms, lease_key)
 update_stable_runtime_index()
 return {1, ''}
@@ -446,9 +501,8 @@ local stable_key = KEYS[2]
 local next_state = ARGV[1]
 local runtime_key = ARGV[2]
 local now_ms = tonumber(ARGV[3])
-local lease_field = ARGV[4]
 
-local payload = redis.call('HGET', lease_key, lease_field)
+local payload = redis.call('GET', lease_key)
 if not payload then
     return {0, ''}
 end
@@ -462,9 +516,10 @@ if stable_ttl_ms < 1 then
     stable_ttl_ms = 1
 end
 
-redis.call('HSET', lease_key, lease_field, next_payload)
 if ttl_ms > 0 then
-    redis.call('PEXPIRE', lease_key, ttl_ms)
+    redis.call('SET', lease_key, next_payload, 'PX', ttl_ms)
+else
+    redis.call('SET', lease_key, next_payload)
 end
 if next_state == 'Active' then
     redis.call('SET', stable_key, runtime_key, 'PX', stable_ttl_ms)
@@ -1048,7 +1103,7 @@ impl RedisMetadataBackend {
         let connection_info = redis_connection_info(&config.url)?;
         let legacy_auth_connection_info = legacy_auth_connection_info(&connection_info);
         let route_namespace = format!(
-            "{}#{}",
+            "redis://{}#{}",
             redacted_route_namespace_source(&config.url),
             config.keyspace.prefix()
         );
@@ -1193,35 +1248,184 @@ impl RedisMetadataBackend {
         self.query_with_retry(operation, |connection| query(connection))
     }
 
+    fn load_object_routes_from_keys(
+        &self,
+        keys: &mut Vec<String>,
+        limit: Option<usize>,
+    ) -> Result<(Vec<ObjectRoute>, Vec<String>)> {
+        let entries = self.query_readonly("redis load object routes", |connection| {
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in keys.iter() {
+                let payload: Option<String> = redis::cmd("HGET")
+                    .arg(key.as_str())
+                    .arg("payload")
+                    .query(connection)?;
+                entries.push((key.clone(), payload));
+            }
+            Ok(entries)
+        })?;
+
+        let mut stale = Vec::new();
+        let mut live_keys = Vec::new();
+        let mut routes = Vec::new();
+        for (key, payload) in entries {
+            if let Some(payload) = payload {
+                live_keys.push(key);
+                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
+                if limit.is_some_and(|limit| routes.len() >= limit) {
+                    break;
+                }
+            } else {
+                stale.push(key);
+            }
+        }
+        if !stale.is_empty() {
+            let mut connection = self.connection("redis srem stale object index")?;
+            connection
+                .srem::<_, _, ()>(self.keyspace.object_index(), stale.clone())
+                .map_err(|error| metadata_error("redis srem stale object index", error))?;
+        }
+        *keys = live_keys.clone();
+        Ok((routes, live_keys))
+    }
+
+    fn cold_backing_filter_index(&self, filter: &ColdBackingRouteFilter) -> Option<String> {
+        if let Some(device_id) = filter.device_id.as_deref() {
+            return Some(self.keyspace.object_cold_tier_device_index(device_id));
+        }
+        if let Some(state) = filter.state {
+            return Some(self.keyspace.object_cold_backing_state_index(state));
+        }
+        filter
+            .owner
+            .as_ref()
+            .map(|owner| self.keyspace.object_cold_backing_owner_index(owner))
+    }
+
     fn cleanup_stale_segments_for_owner_storage_key(
         &self,
         owner_storage_key: &str,
     ) -> Result<RedisSegmentCleanupStats> {
+        let owner_index = self.keyspace.segment_index_for_owner_key(owner_storage_key);
+        let global_index = self.keyspace.segment_index(None);
         let mut connection = self.connection("redis cleanup stale segments")?;
-        let Some(owner) = ClientRuntimeId::from_storage_key(owner_storage_key) else {
-            return Ok(RedisSegmentCleanupStats::default());
-        };
-        let key = self.keyspace.client(&owner);
-        let field_prefix = self.keyspace.client_segment_field_prefix();
-        let entries: Vec<(String, String)> = redis::cmd("HGETALL")
-            .arg(&key)
-            .query(&mut connection)
-            .map_err(|error| metadata_error("redis hgetall client resources", error))?;
-        let segment_count = entries
-            .iter()
-            .filter(|(field, _)| field.starts_with(field_prefix))
-            .count();
-        if segment_count == 0 && entries.is_empty() {
+        let keys: Vec<String> = connection
+            .smembers(&owner_index)
+            .map_err(|error| metadata_error("redis smembers owner segment index", error))?;
+        if keys.is_empty() {
+            let _ = connection.del::<_, usize>(owner_index.as_str());
             return Ok(RedisSegmentCleanupStats::default());
         }
-        connection
-            .del::<_, ()>(&key)
-            .map_err(|error| metadata_error("redis del stale client resources", error))?;
-        Ok(RedisSegmentCleanupStats {
-            inspected_segment_keys: segment_count,
-            removed_segment_keys: segment_count,
+
+        let cleanup_id = format!("{}-{}", std::process::id(), now_ms());
+        let mut stats = RedisSegmentCleanupStats {
+            inspected_segment_keys: keys.len(),
             ..RedisSegmentCleanupStats::default()
-        })
+        };
+        let mut stale_global_entries = Vec::new();
+
+        for key in &keys {
+            let owner: Option<String> = redis::cmd("HGET")
+                .arg(key.as_str())
+                .arg("owner")
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis hget segment owner", error))?;
+            match owner {
+                Some(owner) if owner == owner_storage_key => {
+                    let Some((stable_id, epoch)) = owner.rsplit_once(':') else {
+                        return Err(StoreError::Metadata(format!(
+                            "redis cleanup stale segment: invalid owner storage key {owner}"
+                        )));
+                    };
+                    let epoch = epoch.parse::<u64>().map_err(|error| {
+                        StoreError::Metadata(format!(
+                            "redis cleanup stale segment: invalid owner epoch {owner}: {error}"
+                        ))
+                    })?;
+                    let client_key = self
+                        .keyspace
+                        .client(&ClientRuntimeId::new(stable_id, ClientEpoch(epoch)));
+                    let marker_key = self.keyspace.segment_cleanup_marker(&cleanup_id, key);
+                    connection
+                        .hset_multiple::<_, _, _, ()>(
+                            marker_key.as_str(),
+                            &[
+                                ("cleanup_id", cleanup_id.as_str()),
+                                ("segment_key", key.as_str()),
+                                ("owner", owner.as_str()),
+                            ],
+                        )
+                        .map_err(|error| {
+                            metadata_error("redis hset segment cleanup marker", error)
+                        })?;
+                    connection
+                        .expire::<_, ()>(marker_key.as_str(), 300)
+                        .map_err(|error| {
+                            metadata_error("redis expire segment cleanup marker", error)
+                        })?;
+
+                    let result: (i32, String) =
+                        Script::new(DELETE_STALE_SEGMENT_WITH_MARKER_SCRIPT)
+                            .key(key.as_str())
+                            .key(marker_key.as_str())
+                            .key(client_key.as_str())
+                            .arg(owner.as_str())
+                            .arg(cleanup_id.as_str())
+                            .arg(key.as_str())
+                            .invoke(&mut connection)
+                            .map_err(|error| {
+                                metadata_error("redis delete stale segment with marker", error)
+                            })?;
+                    connection
+                        .del::<_, ()>(marker_key.as_str())
+                        .map_err(|error| {
+                            metadata_error("redis del segment cleanup marker", error)
+                        })?;
+
+                    match result.0 {
+                        1 => {
+                            stale_global_entries.push(key.clone());
+                            stats.removed_segment_keys += 1;
+                        }
+                        0 => {}
+                        code => {
+                            return Err(StoreError::Metadata(format!(
+                                "redis delete stale segment with marker: unexpected status code {code}"
+                            )));
+                        }
+                    }
+                }
+                Some(_) => {
+                    connection
+                        .srem::<_, _, ()>(owner_index.as_str(), key.as_str())
+                        .map_err(|error| {
+                            metadata_error("redis srem mismatched owner segment index", error)
+                        })?;
+                    stats.stale_missing_segment_index_entries += 1;
+                }
+                None => {
+                    stale_global_entries.push(key.clone());
+                    stats.stale_missing_segment_index_entries += 1;
+                }
+            }
+        }
+
+        if !stale_global_entries.is_empty() {
+            stats.removed_segment_index_entries = connection
+                .srem(&global_index, stale_global_entries.clone())
+                .map_err(|error| metadata_error("redis srem stale segment index", error))?;
+            stats.removed_owner_segment_index_entries = connection
+                .srem(owner_index.as_str(), stale_global_entries)
+                .map_err(|error| metadata_error("redis srem stale owner segment index", error))?;
+        }
+
+        let remaining: usize = connection
+            .scard(owner_index.as_str())
+            .map_err(|error| metadata_error("redis scard owner segment index", error))?;
+        if remaining == 0 {
+            let _ = connection.del::<_, usize>(owner_index.as_str());
+        }
+        Ok(stats)
     }
 
     fn load_segment_state(
@@ -1230,14 +1434,13 @@ impl RedisMetadataBackend {
         owner: &ClientRuntimeId,
         segment: &SegmentName,
     ) -> Result<StoredSegmentState> {
-        let key = self.keyspace.client(owner);
-        let field = self.keyspace.client_segment_field(segment);
+        let key = self.keyspace.segment(owner, segment);
         let payload: Option<String> = redis::cmd("HGET")
             .arg(&key)
-            .arg(&field)
+            .arg("state_json")
             .query(connection)
             .map_err(|error| metadata_error("redis hget segment state", error))?;
-        let payload = payload.ok_or_else(|| StoreError::NotFound(format!("{key}:{field}")))?;
+        let payload = payload.ok_or(StoreError::NotFound(key))?;
         serde_json::from_str(&payload).map_err(json_error)
     }
 
@@ -1246,45 +1449,93 @@ impl RedisMetadataBackend {
         connection: &mut redis::Connection,
         state: &StoredSegmentState,
     ) -> Result<()> {
-        let key = self.keyspace.client(&state.announcement.owner);
-        let field = self
+        let key = self
             .keyspace
-            .client_segment_field(&state.announcement.segment_name);
+            .segment(&state.announcement.owner, &state.announcement.segment_name);
         let payload = serde_json::to_string(state).map_err(json_error)?;
+        let tags = serde_json::to_string(&state.announcement.tags).map_err(json_error)?;
         connection
-            .hset::<_, _, _, ()>(&key, field, payload)
+            .hset_multiple::<_, _, _, ()>(
+                &key,
+                &[
+                    ("owner", state.announcement.owner.storage_key()),
+                    ("segment_name", state.announcement.segment_name.0.clone()),
+                    (
+                        "capacity_bytes",
+                        state.announcement.capacity_bytes.to_string(),
+                    ),
+                    ("used_bytes", state.announcement.used_bytes.to_string()),
+                    ("state", format!("{:?}", state.announcement.state)),
+                    (
+                        "alignment_bytes",
+                        state.announcement.alignment_bytes.to_string(),
+                    ),
+                    ("tags_json", tags),
+                    ("state_json", payload),
+                ],
+            )
             .map_err(|error| metadata_error("redis hset segment state", error))?;
-        Ok(())
+        connection
+            .sadd::<_, _, ()>(self.keyspace.segment_index(None), key.as_str())
+            .map_err(|error| metadata_error("redis sadd segment index", error))?;
+        connection
+            .sadd::<_, _, ()>(
+                self.keyspace.segment_index(Some(&state.announcement.owner)),
+                key,
+            )
+            .map_err(|error| metadata_error("redis sadd owner segment index", error))
     }
 
     pub fn cleanup_stale_segments(&self) -> Result<RedisMetadataCleanupReport> {
-        let due_lease_keys = self.list_due_client_lease_expiries(now_ms(), 4096)?;
         let live_clients = self.list_live_clients()?;
-        let mut stats = RedisSegmentCleanupStats::default();
-        for lease_key in due_lease_keys {
-            let Some((stable_id, epoch)) = self.keyspace.parse_client_key(&lease_key) else {
-                let _ = self.remove_client_lease_expiry_entry(&lease_key);
-                stats.stale_missing_segment_index_entries =
-                    stats.stale_missing_segment_index_entries.saturating_add(1);
+        let live_runtime_keys = live_clients
+            .iter()
+            .map(|lease| lease.runtime.storage_key())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut connection = self.connection("redis cleanup stale segments")?;
+        let global_index = self.keyspace.segment_index(None);
+        let mut keys: Vec<String> = connection
+            .smembers(&global_index)
+            .map_err(|error| metadata_error("redis smembers segment index", error))?;
+        if keys.is_empty() {
+            keys = scan_keys(&mut connection, &self.keyspace.segment_pattern(None))?;
+        }
+
+        let mut stats = RedisSegmentCleanupStats {
+            inspected_segment_keys: keys.len(),
+            ..RedisSegmentCleanupStats::default()
+        };
+        let mut stale_owners = std::collections::BTreeSet::<String>::new();
+
+        for key in keys {
+            let owner: Option<String> = redis::cmd("HGET")
+                .arg(key.as_str())
+                .arg("owner")
+                .query(&mut connection)
+                .map_err(|error| metadata_error("redis hget segment owner", error))?;
+            let Some(owner) = owner else {
+                let removed: usize = connection
+                    .srem(&global_index, key.as_str())
+                    .map_err(|error| metadata_error("redis srem dangling segment index", error))?;
+                stats.removed_segment_index_entries += removed;
+                stats.stale_missing_segment_index_entries += 1;
                 continue;
             };
-            let owner = ClientRuntimeId::new(stable_id, ClientEpoch(epoch));
-            if matches!(
-                self.client_lease_liveness(&owner)?,
-                ClientLeaseLiveness::Live(_)
-            ) {
+            if live_runtime_keys.contains(&owner) {
                 continue;
             }
+            stale_owners.insert(owner);
+        }
+
+        for owner_storage_key in stale_owners {
             let owner_stats =
-                self.cleanup_stale_segments_for_owner_storage_key(&owner.storage_key())?;
-            stats.inspected_segment_keys += owner_stats.inspected_segment_keys;
+                self.cleanup_stale_segments_for_owner_storage_key(&owner_storage_key)?;
             stats.removed_segment_keys += owner_stats.removed_segment_keys;
             stats.removed_segment_index_entries += owner_stats.removed_segment_index_entries;
             stats.removed_owner_segment_index_entries +=
                 owner_stats.removed_owner_segment_index_entries;
             stats.stale_missing_segment_index_entries +=
                 owner_stats.stale_missing_segment_index_entries;
-            let _ = self.remove_client_lease_expiry_entry(&lease_key);
         }
 
         Ok(RedisMetadataCleanupReport {
@@ -1314,12 +1565,9 @@ impl RedisMetadataBackend {
 
     pub fn client_lease_liveness(&self, runtime: &ClientRuntimeId) -> Result<ClientLeaseLiveness> {
         let key = self.keyspace.client(runtime);
-        let payload: Option<String> =
-            self.query_readonly("redis get client lease", |connection| {
-                redis::cmd("HGET")
-                    .arg(key.as_str())
-                    .arg(self.keyspace.client_lease_field())
-                    .query(connection)
+        let payload: Option<String> = self
+            .query_readonly("redis get client lease", |connection| {
+                connection.get(key.as_str())
             })?;
         let Some(payload) = payload else {
             return Ok(ClientLeaseLiveness::Missing);
@@ -1506,6 +1754,30 @@ fn legacy_tenant_policy_keys(
     Ok(keys)
 }
 
+fn route_matches_cold_backing_filter(route: &ObjectRoute, filter: &ColdBackingRouteFilter) -> bool {
+    let Some(backing) = route.cold_backing.as_ref() else {
+        return false;
+    };
+    if filter
+        .device_id
+        .as_ref()
+        .is_some_and(|device_id| backing.cold_tier_id != *device_id)
+    {
+        return false;
+    }
+    if filter.state.is_some_and(|state| backing.state != state) {
+        return false;
+    }
+    if filter
+        .owner
+        .as_ref()
+        .is_some_and(|owner| backing.owner != *owner)
+    {
+        return false;
+    }
+    true
+}
+
 impl MetadataBackend for RedisMetadataBackend {
     fn route_namespace(&self) -> String {
         self.route_namespace.clone()
@@ -1560,7 +1832,6 @@ impl MetadataBackend for RedisMetadataBackend {
                 .arg(ttl_ms.to_string())
                 .arg(lease.expires_at_ms.to_string())
                 .arg(lease.runtime.storage_key())
-                .arg(self.keyspace.client_lease_field())
                 .invoke::<(i32, String)>(connection)?;
             Ok(result)
         })?;
@@ -1596,7 +1867,6 @@ impl MetadataBackend for RedisMetadataBackend {
                     .arg(ttl_ms.to_string())
                     .arg(template.expires_at_ms.to_string())
                     .arg(stable_id.0.as_str())
-                    .arg(self.keyspace.client_lease_field())
                     .invoke::<String>(connection)?;
                 Ok(assigned_epoch)
             })?;
@@ -1633,7 +1903,6 @@ impl MetadataBackend for RedisMetadataBackend {
                     .arg(next_state)
                     .arg(runtime.storage_key())
                     .arg(now_ms().to_string())
-                    .arg(self.keyspace.client_lease_field())
                     .invoke(connection)?;
                 Ok(result)
             })?;
@@ -1645,12 +1914,9 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn get_client_lease(&self, runtime: &ClientRuntimeId) -> Result<Option<ClientLease>> {
         let key = self.keyspace.client(runtime);
-        let payload: Option<String> =
-            self.query_readonly("redis get client lease by runtime", |connection| {
-                redis::cmd("HGET")
-                    .arg(&key)
-                    .arg(self.keyspace.client_lease_field())
-                    .query(connection)
+        let payload: Option<String> = self
+            .query_readonly("redis get client lease by runtime", |connection| {
+                connection.get(&key)
             })?;
         let lease = payload
             .map(|payload| serde_json::from_str::<ClientLease>(&payload).map_err(json_error))
@@ -1676,12 +1942,9 @@ impl MetadataBackend for RedisMetadataBackend {
             )));
         };
         let key = self.keyspace.client(&runtime);
-        let payload: Option<String> =
-            self.query_readonly("redis get client lease by stable runtime", |connection| {
-                redis::cmd("HGET")
-                    .arg(&key)
-                    .arg(self.keyspace.client_lease_field())
-                    .query(connection)
+        let payload: Option<String> = self
+            .query_readonly("redis get client lease by stable runtime", |connection| {
+                connection.get(&key)
             })?;
         let lease = payload
             .map(|payload| serde_json::from_str::<ClientLease>(&payload).map_err(json_error))
@@ -1713,15 +1976,8 @@ impl MetadataBackend for RedisMetadataBackend {
             if keys.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut pipe = redis::pipe();
-            for key in &keys {
-                pipe.cmd("HGET")
-                    .arg(key)
-                    .arg(self.keyspace.client_lease_field());
-            }
-            let payloads: Vec<Option<String>> = pipe.query(connection)?;
-            let entries = keys.iter().cloned().zip(payloads).collect::<Vec<_>>();
-            Ok(entries)
+            let payloads: Vec<Option<String>> = redis::cmd("MGET").arg(&keys).query(connection)?;
+            Ok(keys.iter().cloned().zip(payloads).collect::<Vec<_>>())
         })?;
         let now = now_ms();
         let mut stale = Vec::new();
@@ -1794,34 +2050,49 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn publish_segment(&self, segment: &SegmentAnnouncement) -> Result<()> {
         self.query_idempotent_write("redis publish segment", |connection| {
-            let key = self.keyspace.client(&segment.owner);
-            let field = self.keyspace.client_segment_field(&segment.segment_name);
-            let lease_payload: Option<String> = redis::cmd("HGET")
-                .arg(&key)
-                .arg(self.keyspace.client_lease_field())
-                .query(connection)?;
-            if lease_payload.is_none() {
-                return Err(redis::RedisError::from((
-                    redis::ErrorKind::TypeError,
-                    "segment owner lease is not live",
-                )));
+            let key = self.keyspace.segment(&segment.owner, &segment.segment_name);
+            let owner_key = self.keyspace.segment_owner(&segment.segment_name);
+            let existing_owner: Option<String> = connection.get(&owner_key)?;
+            if let Some(existing_owner) = existing_owner.as_ref() {
+                let Some(runtime) = ClientRuntimeId::from_storage_key(existing_owner) else {
+                    return Err(store_error_to_redis_error(StoreError::Metadata(format!(
+                        "invalid runtime storage key in segment owner index: {existing_owner}"
+                    ))));
+                };
+                if runtime != segment.owner {
+                    return Err(store_error_to_redis_error(StoreError::Conflict(format!(
+                        "segment {} is already owned by live runtime {}",
+                        segment.segment_name.0, runtime
+                    ))));
+                }
             }
-            let current_payload: Option<String> =
-                redis::cmd("HGET").arg(&key).arg(&field).query(connection)?;
+            let current_payload: Option<String> = redis::cmd("HGET")
+                .arg(&key)
+                .arg("state_json")
+                .query(connection)?;
             let mut state = match current_payload.as_ref() {
                 Some(payload) => serde_json::from_str::<StoredSegmentState>(payload)
                     .map_err(|error| store_error_to_redis_error(json_error(error)))?,
                 None => StoredSegmentState::new(segment.clone()),
             };
             state.merge_announcement(segment);
-            redis::cmd("WATCH").arg(&key).query::<()>(connection)?;
-            let watched_lease: Option<String> = redis::cmd("HGET")
+            redis::cmd("WATCH")
                 .arg(&key)
-                .arg(self.keyspace.client_lease_field())
+                .arg(&owner_key)
+                .query::<()>(connection)?;
+            let watched_owner: Option<String> = connection.get(&owner_key)?;
+            if watched_owner != existing_owner {
+                redis::cmd("UNWATCH").query::<()>(connection)?;
+                return Err(redis::RedisError::from((
+                    redis::ErrorKind::BusyLoadingError,
+                    "segment owner changed during publish",
+                )));
+            }
+            let watched_payload: Option<String> = redis::cmd("HGET")
+                .arg(&key)
+                .arg("state_json")
                 .query(connection)?;
-            let watched_payload: Option<String> =
-                redis::cmd("HGET").arg(&key).arg(&field).query(connection)?;
-            if watched_lease != lease_payload || watched_payload != current_payload {
+            if watched_payload != current_payload {
                 redis::cmd("UNWATCH").query::<()>(connection)?;
                 return Err(redis::RedisError::from((
                     redis::ErrorKind::BusyLoadingError,
@@ -1830,19 +2101,54 @@ impl MetadataBackend for RedisMetadataBackend {
             }
             let mut pipe = redis::pipe();
             pipe.atomic();
-            pipe.cmd("HSET").arg(&key).arg(&field).arg(
-                serde_json::to_string(&state)
-                    .map_err(|error| store_error_to_redis_error(json_error(error)))?,
-            );
+            pipe.cmd("HSET")
+                .arg(&key)
+                .arg("owner")
+                .arg(segment.owner.storage_key())
+                .arg("segment_name")
+                .arg(&segment.segment_name.0)
+                .arg("used_bytes")
+                .arg(state.announcement.used_bytes.to_string())
+                .arg("capacity_bytes")
+                .arg(state.announcement.capacity_bytes.to_string())
+                .arg("state")
+                .arg(format!("{:?}", state.announcement.state))
+                .arg("alignment_bytes")
+                .arg(state.announcement.alignment_bytes.to_string())
+                .arg("state_json")
+                .arg(
+                    serde_json::to_string(&state)
+                        .map_err(|error| store_error_to_redis_error(json_error(error)))?,
+                );
+            pipe.cmd("SADD")
+                .arg(self.keyspace.segment_index(None))
+                .arg(key.as_str());
+            pipe.cmd("SADD")
+                .arg(self.keyspace.segment_index(Some(&segment.owner)))
+                .arg(key.as_str());
+            pipe.cmd("SET")
+                .arg(&owner_key)
+                .arg(segment.owner.storage_key());
             pipe.query::<()>(connection)
         })
     }
 
     fn unpublish_segment(&self, owner: &ClientRuntimeId, segment: &SegmentName) -> Result<()> {
-        let key = self.keyspace.client(owner);
-        let field = self.keyspace.client_segment_field(segment);
+        let key = self.keyspace.segment(owner, segment);
+        let owner_key = self.keyspace.segment_owner(segment);
         self.query_idempotent_write("redis unpublish segment", |connection| {
-            connection.hdel::<_, _, ()>(&key, field.as_str())
+            let indexed_owner: Option<String> = connection.get(&owner_key)?;
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            pipe.del(&key).ignore();
+            if indexed_owner.as_deref() == Some(owner.storage_key().as_str()) {
+                pipe.del(&owner_key).ignore();
+            }
+            pipe.srem(self.keyspace.segment_index(None), key.as_str())
+                .ignore();
+            pipe.srem(self.keyspace.segment_index(Some(owner)), key.as_str())
+                .ignore();
+            pipe.query::<()>(connection)
         })
     }
 
@@ -1851,11 +2157,13 @@ impl MetadataBackend for RedisMetadataBackend {
         owner: &ClientRuntimeId,
         segment: &SegmentName,
     ) -> Result<Option<SegmentAnnouncement>> {
-        let key = self.keyspace.client(owner);
-        let field = self.keyspace.client_segment_field(segment);
-        let payload: Option<String> = self
-            .query_readonly("redis get segment by owner and name", |connection| {
-                redis::cmd("HGET").arg(&key).arg(&field).query(connection)
+        let key = self.keyspace.segment(owner, segment);
+        let payload: Option<String> =
+            self.query_readonly("redis get segment by owner and name", |connection| {
+                redis::cmd("HGET")
+                    .arg(&key)
+                    .arg("state_json")
+                    .query(connection)
             })?;
         payload
             .map(|payload| {
@@ -1867,27 +2175,43 @@ impl MetadataBackend for RedisMetadataBackend {
     }
 
     fn list_segments(&self, owner: Option<&ClientRuntimeId>) -> Result<Vec<SegmentAnnouncement>> {
-        if owner.is_none() {
-            let mut segments = Vec::new();
-            for lease in self.list_live_clients()? {
-                segments.extend(self.list_segments(Some(&lease.runtime))?);
+        let index = self.keyspace.segment_index(owner);
+        let keys = self.query_readonly("redis list segments", |connection| {
+            let mut keys: Vec<String> = connection.smembers(&index)?;
+            if keys.is_empty() {
+                keys = redis::cmd("KEYS")
+                    .arg(self.keyspace.segment_pattern(owner))
+                    .query(connection)?;
             }
-            return Ok(segments);
-        }
-        let owner = owner.expect("owner checked above");
-        let key = self.keyspace.client(owner);
-        let field_prefix = self.keyspace.client_segment_field_prefix();
-        let entries: Vec<(String, String)> = self
-            .query_readonly("redis list segments", |connection| {
-                redis::cmd("HGETALL").arg(&key).query(connection)
-            })?;
+            Ok(keys)
+        })?;
+        let entries = self.query_readonly("redis fetch segment states", |connection| {
+            let mut entries = Vec::with_capacity(keys.len());
+            for key in &keys {
+                let payload: Option<String> = redis::cmd("HGET")
+                    .arg(key.as_str())
+                    .arg("state_json")
+                    .query(connection)?;
+                entries.push((key.clone(), payload));
+            }
+            Ok(entries)
+        })?;
+        let mut stale = Vec::new();
         let mut segments = Vec::with_capacity(entries.len());
-        for (field, payload) in entries {
-            if field.starts_with(field_prefix) {
+        for (key, payload) in entries {
+            if let Some(payload) = payload {
                 let state =
                     serde_json::from_str::<StoredSegmentState>(&payload).map_err(json_error)?;
                 segments.push(state.announcement);
+            } else {
+                stale.push(key);
             }
+        }
+        if !stale.is_empty() {
+            let mut connection = self.connection("redis srem stale segment index")?;
+            connection
+                .srem::<_, _, ()>(&index, stale)
+                .map_err(|error| metadata_error("redis srem stale segment index", error))?;
         }
         Ok(segments)
     }
@@ -1915,11 +2239,9 @@ impl MetadataBackend for RedisMetadataBackend {
         length_bytes: u64,
     ) -> Result<SegmentReservation> {
         let mut connection = self.connection("redis reserve segment")?;
-        let key = self.keyspace.client(owner);
-        let field = self.keyspace.client_segment_field(segment);
+        let key = self.keyspace.segment(owner, segment);
         let result = Script::new(RESERVE_SEGMENT_SCRIPT)
             .key(&key)
-            .arg(field)
             .arg(length_bytes)
             .invoke::<(i32, i64)>(&mut connection)
             .map_err(|error| metadata_error("redis reserve segment", error))?;
@@ -1950,11 +2272,9 @@ impl MetadataBackend for RedisMetadataBackend {
         length_bytes: u64,
     ) -> Result<()> {
         let mut connection = self.connection("redis release segment")?;
-        let key = self.keyspace.client(owner);
-        let field = self.keyspace.client_segment_field(segment);
+        let key = self.keyspace.segment(owner, segment);
         let result = Script::new(RELEASE_SEGMENT_SCRIPT)
             .key(&key)
-            .arg(field)
             .arg(offset_bytes)
             .arg(length_bytes)
             .invoke::<(i32, i64)>(&mut connection)
@@ -1985,52 +2305,82 @@ impl MetadataBackend for RedisMetadataBackend {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>> {
         let index = self.keyspace.object_index();
-        let (entries, backfill_index) =
-            self.query_readonly("redis list object routes", |connection| {
-                let mut keys: Vec<String> = connection.smembers(&index)?;
-                let mut backfill_index = false;
-                if keys.is_empty() {
-                    keys = redis::cmd("KEYS")
-                        .arg(self.keyspace.object_pattern())
-                        .query(connection)?;
-                    backfill_index = !keys.is_empty();
-                }
-
-                let mut entries = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let payload: Option<String> = redis::cmd("HGET")
-                        .arg(key.as_str())
-                        .arg("payload")
-                        .query(connection)?;
-                    entries.push((key, payload));
-                }
-                Ok((entries, backfill_index))
-            })?;
-
-        let mut stale = Vec::new();
-        let mut live_keys = Vec::new();
-        let mut routes = Vec::with_capacity(entries.len());
-        for (key, payload) in entries {
-            if let Some(payload) = payload {
-                live_keys.push(key);
-                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
-            } else {
-                stale.push(key);
+        let mut index_empty = false;
+        let mut keys = self.query_readonly("redis list object routes", |connection| {
+            let mut keys: Vec<String> = connection.smembers(&index)?;
+            if keys.is_empty() {
+                index_empty = true;
+                keys = redis::cmd("KEYS")
+                    .arg(self.keyspace.object_pattern())
+                    .query(connection)?;
             }
-        }
-        if backfill_index && !live_keys.is_empty() {
+            Ok(keys)
+        })?;
+        let (routes, _live_keys) = self.load_object_routes_from_keys(&mut keys, None)?;
+        if !keys.is_empty() {
             let mut connection = self.connection("redis sadd legacy object index")?;
             connection
-                .sadd::<_, _, ()>(&index, live_keys)
+                .sadd::<_, _, ()>(&index, keys.clone())
                 .map_err(|error| metadata_error("redis sadd legacy object index", error))?;
         }
-        if !stale.is_empty() {
-            let mut connection = self.connection("redis srem stale object index")?;
-            connection
-                .srem::<_, _, ()>(&index, stale)
-                .map_err(|error| metadata_error("redis srem stale object index", error))?;
-        }
         Ok(routes)
+    }
+
+    fn list_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        let Some(index) = self.cold_backing_filter_index(filter) else {
+            return MetadataBackend::list_object_routes_by_cold_backing(self, filter);
+        };
+        let mut keys = self
+            .query_readonly("redis list object routes by cold backing", |connection| {
+                connection.smembers::<_, Vec<String>>(&index)
+            })?;
+        let original_keys = keys.clone();
+        let (mut routes, live_keys) = self.load_object_routes_from_keys(&mut keys, filter.limit)?;
+        let stale_keys = original_keys
+            .into_iter()
+            .filter(|key| !keys.contains(key))
+            .collect::<Vec<_>>();
+        if !stale_keys.is_empty() {
+            let mut connection = self.connection("redis prune stale cold backing route index")?;
+            connection
+                .srem::<_, _, ()>(&index, stale_keys)
+                .map_err(|error| metadata_error("redis srem cold backing route index", error))?;
+        }
+        if keys.is_empty() || routes.is_empty() {
+            let all_routes = self.list_object_routes()?;
+            routes = all_routes
+                .into_iter()
+                .filter(|route| route_matches_cold_backing_filter(route, filter))
+                .take(filter.limit.unwrap_or(usize::MAX))
+                .collect();
+            if !routes.is_empty() {
+                let index_keys = routes
+                    .iter()
+                    .map(|route| self.keyspace.object(&route.key))
+                    .collect::<Vec<_>>();
+                let mut connection = self.connection("redis backfill cold backing route index")?;
+                connection
+                    .sadd::<_, _, ()>(&index, index_keys)
+                    .map_err(|error| {
+                        metadata_error("redis sadd cold backing route index", error)
+                    })?;
+            }
+            return Ok(routes);
+        }
+        if !live_keys.is_empty() {
+            let mut connection = self.connection("redis refresh cold backing route index")?;
+            connection
+                .sadd::<_, _, ()>(&index, live_keys)
+                .map_err(|error| metadata_error("redis sadd cold backing route index", error))?;
+        }
+        Ok(routes
+            .into_iter()
+            .filter(|route| route_matches_cold_backing_filter(route, filter))
+            .take(filter.limit.unwrap_or(usize::MAX))
+            .collect())
     }
 
     fn compare_and_swap_object_route(
@@ -2045,8 +2395,55 @@ impl MetadataBackend for RedisMetadataBackend {
             .transpose()?;
         let next_version = next.map(|route| route.version.0).unwrap_or_default();
         let object_key = self.keyspace.object(key);
+        let current = self.get_object_route(key)?;
+        let old_device_index = current
+            .as_ref()
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| {
+                self.keyspace
+                    .object_cold_tier_device_index(&backing.cold_tier_id)
+            })
+            .unwrap_or_default();
+        let old_state_index = current
+            .as_ref()
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| self.keyspace.object_cold_backing_state_index(backing.state))
+            .unwrap_or_default();
+        let old_owner_index = current
+            .as_ref()
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| {
+                self.keyspace
+                    .object_cold_backing_owner_index(&backing.owner)
+            })
+            .unwrap_or_default();
+        let new_device_index = next
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| {
+                self.keyspace
+                    .object_cold_tier_device_index(&backing.cold_tier_id)
+            })
+            .unwrap_or_default();
+        let new_state_index = next
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| self.keyspace.object_cold_backing_state_index(backing.state))
+            .unwrap_or_default();
+        let new_owner_index = next
+            .and_then(|route| route.cold_backing.as_ref())
+            .map(|backing| {
+                self.keyspace
+                    .object_cold_backing_owner_index(&backing.owner)
+            })
+            .unwrap_or_default();
         let current_payload = Script::new(CAS_OBJECT_ROUTE_SCRIPT)
             .key(&object_key)
+            .key(self.keyspace.object_index())
+            .key(old_device_index.as_str())
+            .key(old_state_index.as_str())
+            .key(old_owner_index.as_str())
+            .key(new_device_index.as_str())
+            .key(new_state_index.as_str())
+            .key(new_owner_index.as_str())
             .arg(
                 expected
                     .map(|version| version.0.to_string())
@@ -2054,21 +2451,24 @@ impl MetadataBackend for RedisMetadataBackend {
             )
             .arg(next_version.to_string())
             .arg(payload.clone().unwrap_or_else(|| "__delete__".to_string()))
+            .arg(if old_device_index.is_empty() {
+                "0"
+            } else {
+                "1"
+            })
+            .arg(if old_state_index.is_empty() { "0" } else { "1" })
+            .arg(if old_owner_index.is_empty() { "0" } else { "1" })
+            .arg(if new_device_index.is_empty() {
+                "0"
+            } else {
+                "1"
+            })
+            .arg(if new_state_index.is_empty() { "0" } else { "1" })
+            .arg(if new_owner_index.is_empty() { "0" } else { "1" })
             .invoke::<(i32, String)>(&mut connection)
             .map_err(|error| metadata_error("redis cas object route", error))?;
-        if current_payload.0 == 1 {
-            if next.is_some() {
-                connection
-                    .sadd::<_, _, ()>(self.keyspace.object_index(), object_key)
-                    .map_err(|error| metadata_error("redis sadd object index", error))?;
-            } else {
-                connection
-                    .srem::<_, _, ()>(self.keyspace.object_index(), object_key)
-                    .map_err(|error| metadata_error("redis srem object index", error))?;
-            }
-        }
 
-        let current = if current_payload.1.is_empty() {
+        let current: Option<ObjectRoute> = if current_payload.1.is_empty() {
             None
         } else {
             Some(serde_json::from_str(&current_payload.1).map_err(json_error)?)
@@ -2078,6 +2478,148 @@ impl MetadataBackend for RedisMetadataBackend {
             current,
             version_floor: None,
         })
+    }
+
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        let key = self.keyspace.cold_tier_device(&device.device_id);
+        let payload = serde_json::to_string(device).map_err(json_error)?;
+        let mut connection = self.connection("redis create cold tier device")?;
+        let inserted: bool = connection
+            .set_nx(key.as_str(), payload.as_str())
+            .map_err(|error| metadata_error("redis setnx cold tier device", error))?;
+        if inserted {
+            connection
+                .sadd::<_, _, ()>(self.keyspace.cold_tier_device_index(), key)
+                .map_err(|error| metadata_error("redis sadd cold tier device index", error))?;
+            return Ok(ColdTierPutDeviceResult::Created(device.clone()));
+        }
+        let payload: String = connection
+            .get(key.as_str())
+            .map_err(|error| metadata_error("redis get existing cold tier device", error))?;
+        Ok(ColdTierPutDeviceResult::Existing(
+            serde_json::from_str(&payload).map_err(json_error)?,
+        ))
+    }
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        let key = self.keyspace.cold_tier_device(device_id);
+        let mut connection = self.connection("redis get cold tier device")?;
+        let payload: Option<String> = connection
+            .get(key)
+            .map_err(|error| metadata_error("redis get cold tier device", error))?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(json_error))
+            .transpose()
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        let index = self.keyspace.cold_tier_device_index();
+        let prefix = self.keyspace.cold_tier_device_prefix();
+        let mut connection = self.connection("redis list cold tier devices")?;
+        let mut keys: Vec<String> = connection
+            .smembers(&index)
+            .map_err(|error| metadata_error("redis smembers cold tier device index", error))?;
+        if keys.is_empty() {
+            keys = scan_keys(&mut connection, &format!("{}*", prefix))?;
+            if !keys.is_empty() {
+                connection
+                    .sadd::<_, _, ()>(&index, keys.clone())
+                    .map_err(|error| metadata_error("redis sadd cold tier device index", error))?;
+            }
+        }
+        let mut stale = Vec::new();
+        let mut devices = Vec::new();
+        for key in keys {
+            let payload: Option<String> = connection
+                .get(&key)
+                .map_err(|error| metadata_error("redis get cold tier device list entry", error))?;
+            let Some(payload) = payload else {
+                stale.push(key);
+                continue;
+            };
+            let device: ColdTierDeviceRecord =
+                serde_json::from_str(&payload).map_err(json_error)?;
+            if cold_tier_device_matches_filter(&device, filter) {
+                devices.push(device);
+            }
+        }
+        if !stale.is_empty() {
+            connection
+                .srem::<_, _, ()>(&index, stale)
+                .map_err(|error| {
+                    metadata_error("redis srem stale cold tier device index", error)
+                })?;
+        }
+        devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        Ok(devices)
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        let key = self.keyspace.cold_tier_device(device_id);
+        let mut connection = self.connection("redis update cold tier device")?;
+        let payload: Option<String> = connection
+            .get(&key)
+            .map_err(|error| metadata_error("redis get cold tier device for update", error))?;
+        let Some(payload) = payload else {
+            return Err(StoreError::NotFound(format!(
+                "cold tier device {device_id} not found"
+            )));
+        };
+        let mut device: ColdTierDeviceRecord =
+            serde_json::from_str(&payload).map_err(json_error)?;
+        if let Some(expected) = update.expected_updated_at_ms {
+            if device.updated_at_ms != expected {
+                return Err(StoreError::Conflict(format!(
+                    "cold tier device {device_id} changed concurrently"
+                )));
+            }
+        }
+        update.apply(&mut device);
+        let payload = serde_json::to_string(&device).map_err(json_error)?;
+        connection
+            .set::<_, _, ()>(key, payload)
+            .map_err(|error| metadata_error("redis set cold tier device", error))?;
+        Ok(device)
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        let key = self.keyspace.cold_tier_device(device_id);
+        let script = Script::new(APPLY_COLD_TIER_USAGE_DELTA_SCRIPT);
+        let mut connection = self.connection("redis apply cold tier usage delta")?;
+        let response: (u8, String) = script
+            .key(key)
+            .arg(delta.used_bytes)
+            .arg(delta.reserved_bytes)
+            .arg(updated_at_ms)
+            .invoke(&mut connection)
+            .map_err(|error| metadata_error("redis apply cold tier usage delta", error))?;
+        match response.0 {
+            0 => Err(StoreError::NotFound(format!(
+                "cold tier device {device_id} not found"
+            ))),
+            1 => Err(StoreError::InvalidState(format!(
+                "cold tier device {device_id} usage delta would make accounting negative"
+            ))),
+            2 => serde_json::from_str(&response.1).map_err(json_error),
+            status => Err(StoreError::Transport(format!(
+                "unexpected redis cold tier usage delta status {status}"
+            ))),
+        }
     }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
@@ -2402,7 +2944,7 @@ impl MetadataBackend for RedisMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Option<TenantQuotaState>> {
-        let scope = root_scope(scope)?;
+        let scope = quota_scope(scope)?;
         let mut connection = self.connection("redis get tenant quota state")?;
         let key = self.keyspace.tenant_quota_state(&scope);
         let payload: Option<String> = connection
@@ -2458,13 +3000,13 @@ impl MetadataBackend for RedisMetadataBackend {
         scope: &TenantPolicyScope,
         limit: usize,
     ) -> Result<Vec<TenantObjectAccounting>> {
-        let scope = root_scope(scope)?;
+        let scope = quota_scope(scope)?;
         let read_limit = limit.min(EVICTION_FRONTIER_LIMIT);
         if read_limit == 0 {
             return Ok(Vec::new());
         }
         let mut connection = self.connection("redis list tenant eviction frontier")?;
-        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope.tenant);
+        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope);
         let members: Vec<String> = cmd("ZRANGE")
             .arg(&frontier_key)
             .arg(0)
@@ -2473,8 +3015,7 @@ impl MetadataBackend for RedisMetadataBackend {
             .map_err(|error| metadata_error("redis list tenant eviction frontier", error))?;
         let mut candidates = Vec::new();
         for member in members {
-            let Some(key) =
-                parse_tenant_eviction_candidate_key(&self.keyspace, &scope.tenant, &member)
+            let Some(key) = parse_tenant_eviction_candidate_key(&self.keyspace, &scope, &member)
             else {
                 continue;
             };
@@ -2508,11 +3049,9 @@ impl MetadataBackend for RedisMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Vec<TenantQuotaReservation>> {
-        let scope = root_scope(scope)?;
+        let scope = quota_scope(scope)?;
         let mut connection = self.connection("redis list tenant quota reservations")?;
-        let index_prefix = self
-            .keyspace
-            .tenant_quota_reservation_prefix(Some(&scope.tenant));
+        let index_prefix = self.keyspace.tenant_quota_reservation_prefix(Some(&scope));
         let index_keys = scan_keys(&mut connection, &format!("{}*", index_prefix))?;
         let mut reservations = Vec::new();
         for index_key in index_keys {
@@ -2556,7 +3095,7 @@ impl MetadataBackend for RedisMetadataBackend {
         request: &TenantQuotaReservationRequest,
     ) -> Result<TenantQuotaReservationOutcome> {
         request.validate()?;
-        let scope = root_scope(&request.scope)?;
+        let scope = quota_scope(&request.scope)?;
         let mut normalized = request.clone();
         normalized.scope = scope.clone();
         let mut connection = self.connection("redis reserve tenant quota")?;
@@ -2694,18 +3233,18 @@ impl MetadataBackend for RedisMetadataBackend {
             &reservation_payload,
             "redis finalize tenant quota prefetch",
         )?;
-        let scope = root_scope(&reservation.scope)?;
+        let scope = quota_scope(&reservation.scope)?;
         let quota_key = self.keyspace.tenant_quota_state(&scope);
         let object_key = self.keyspace.tenant_object_accounting(&reservation.key);
         let reservation_index_key = self
             .keyspace
             .tenant_quota_reservation_index(&scope, &request.reservation_id);
-        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope.tenant);
+        let frontier_key = self.keyspace.tenant_eviction_frontier(&scope);
         let old_frontier_member = self
             .get_tenant_object_accounting(&reservation.key)?
             .map(|object| {
                 self.keyspace.tenant_eviction_candidate(
-                    &scope.tenant,
+                    &scope,
                     object.updated_at_ms,
                     object.committed_length,
                     &object.key,
@@ -2714,7 +3253,7 @@ impl MetadataBackend for RedisMetadataBackend {
             .unwrap_or_else(|| "__none__".to_string());
         let new_frontier_member = if request.state == TenantObjectAccountingState::Active {
             self.keyspace.tenant_eviction_candidate(
-                &scope.tenant,
+                &scope,
                 request.updated_at_ms,
                 request
                     .committed_length
@@ -2827,7 +3366,7 @@ impl MetadataBackend for RedisMetadataBackend {
             &reservation_payload,
             "redis abort tenant quota prefetch",
         )?;
-        let scope = root_scope(&reservation.scope)?;
+        let scope = quota_scope(&reservation.scope)?;
         let quota_key = self.keyspace.tenant_quota_state(&scope);
         let reservation_index_key = self
             .keyspace
@@ -3039,13 +3578,9 @@ fn parse_tenant_quota_reservation_payload(
     })
 }
 
-fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
-    scope.validate_root_only("tenant quota metadata")?;
-    Ok(TenantPolicyScope::new(
-        scope.tenant.clone(),
-        None::<String>,
-        None::<String>,
-    ))
+fn quota_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
+    scope.validate()?;
+    Ok(scope.clone())
 }
 
 fn version_conflict(
@@ -3086,7 +3621,8 @@ mod tests {
 
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
+        ClientStableId, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierTargetSpec,
+        ColdTierUsageDelta, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
         RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
         SegmentName, StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
@@ -3232,16 +3768,6 @@ mod tests {
         }
     }
 
-    fn active_lease_for(runtime: &ClientRuntimeId) -> ClientLease {
-        ClientLease {
-            runtime: runtime.clone(),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints: ClientEndpointSet::default(),
-            expires_at_ms: super::now_ms() + 60_000,
-        }
-    }
-
     fn sample_segment(state: SegmentLifecycleState) -> SegmentAnnouncement {
         SegmentAnnouncement {
             owner: sample_runtime(),
@@ -3254,6 +3780,43 @@ mod tests {
             state,
             alignment_bytes: 16,
             tags: vec!["dram".to_string()],
+        }
+    }
+
+    fn sample_cold_tier_device(device_id: &str) -> ColdTierDeviceRecord {
+        ColdTierDeviceRecord {
+            device_id: device_id.to_string(),
+            stable_id: "storage-a".to_string(),
+            epoch: Some(1),
+            cold_tier_id: device_id.to_string(),
+            kind: "ssd".to_string(),
+            target: ColdTierTargetSpec::Directory {
+                path: format!("/tmp/{device_id}"),
+            },
+            root_dir: None,
+            state: ColdTierDeviceState::Healthy,
+            capacity_bytes: Some(1024),
+            used_bytes: 0,
+            reserved_bytes: 0,
+            failure_count: 0,
+            last_error: None,
+            tags: Vec::new(),
+            updated_at_ms: 1,
+        }
+    }
+
+    fn sample_cold_backing(
+        device_id: &str,
+        state: mooncake_store_core::ColdBackingState,
+    ) -> mooncake_store_core::ColdBackingRoute {
+        mooncake_store_core::ColdBackingRoute {
+            owner: sample_runtime(),
+            cold_tier_id: device_id.to_string(),
+            object_locator: format!("{device_id}-locator"),
+            length: 12,
+            checksum: Some(7),
+            state,
+            replicas: Vec::new(),
         }
     }
 
@@ -3278,6 +3841,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
@@ -3561,7 +4125,7 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_allows_republish_after_previous_owner_unpublished() {
+    fn redis_backend_rejects_stale_segment_owner_index_on_publish() {
         let Some(server) = RedisTestServer::start() else {
             return;
         };
@@ -3573,12 +4137,6 @@ mod tests {
 
         let owner_a = ClientRuntimeId::new("writer-a", ClientEpoch(1));
         let owner_b = ClientRuntimeId::new("writer-b", ClientEpoch(1));
-        backend
-            .upsert_client_lease(&active_lease_for(&owner_a))
-            .expect("first owner lease should publish");
-        backend
-            .upsert_client_lease(&active_lease_for(&owner_b))
-            .expect("second owner lease should publish");
         let segment_name = SegmentName::new("shared-segment");
         let segment_a = SegmentAnnouncement {
             owner: owner_a.clone(),
@@ -3599,6 +4157,15 @@ mod tests {
             .unpublish_segment(&owner_a, &segment_name)
             .expect("first owner should unpublish");
 
+        let mut connection = redis::Client::open(server.url())
+            .expect("redis client should open")
+            .get_connection()
+            .expect("redis connection should open");
+        let owner_key = keyspace.segment_owner(&segment_name);
+        connection
+            .set::<_, _, ()>(&owner_key, owner_a.storage_key())
+            .expect("stale owner index should write");
+
         let segment_b = SegmentAnnouncement {
             owner: owner_b,
             segment_name,
@@ -3611,9 +4178,14 @@ mod tests {
             alignment_bytes: 16,
             tags: vec![],
         };
-        backend
+        let error = backend
             .publish_segment(&segment_b)
-            .expect("segment should publish under the new owner");
+            .expect_err("stale owner index should still block publish today");
+        assert!(matches!(
+            error,
+            StoreError::Metadata(message)
+                if message.contains("already owned by live runtime")
+        ));
     }
 
     #[test]
@@ -3628,9 +4200,6 @@ mod tests {
         .expect("redis backend should initialize");
 
         let mut segment = sample_segment(SegmentLifecycleState::Active);
-        backend
-            .upsert_client_lease(&active_lease_for(&segment.owner))
-            .expect("segment owner lease should publish");
         segment.tags.clear();
         segment.capacity_bytes = 1024;
         segment.alignment_bytes = 16;
@@ -3666,6 +4235,43 @@ mod tests {
     }
 
     #[test]
+    fn redis_backend_cold_tier_usage_delta_preserves_empty_tags() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url())
+                .keyspace(MetadataKeyspace::new("test/redis-cold-tier-empty-tags")),
+        )
+        .expect("redis backend should initialize");
+
+        let device = sample_cold_tier_device("cold-a");
+        backend
+            .put_cold_tier_device_if_absent(&device)
+            .expect("cold tier device should insert");
+
+        let updated = backend
+            .apply_cold_tier_usage_delta(
+                &device.device_id,
+                ColdTierUsageDelta {
+                    used_bytes: 13,
+                    reserved_bytes: 0,
+                },
+                2,
+            )
+            .expect("usage delta should deserialize after Lua roundtrip");
+        assert!(updated.tags.is_empty());
+        assert_eq!(updated.used_bytes, 13);
+
+        let devices = backend
+            .list_cold_tier_devices(&Default::default())
+            .expect("device listing should tolerate Lua roundtrip tags");
+        assert_eq!(devices.len(), 1);
+        assert!(devices[0].tags.is_empty());
+        assert_eq!(devices[0].used_bytes, 13);
+    }
+
+    #[test]
     fn redis_backend_backfills_and_prunes_client_index() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -3686,17 +4292,13 @@ mod tests {
             .get_connection()
             .expect("redis connection should succeed");
 
-        redis::cmd("HSET")
+        redis::cmd("SET")
             .arg(&client_key)
-            .arg(keyspace.client_lease_field())
             .arg(payload)
-            .query::<()>(&mut connection)
-            .expect("legacy client lease insert should succeed");
-        redis::cmd("PEXPIRE")
-            .arg(&client_key)
+            .arg("PX")
             .arg(60_000)
             .query::<()>(&mut connection)
-            .expect("client lease ttl should set");
+            .expect("legacy client lease insert should succeed");
 
         let listed = backend
             .list_live_clients()
@@ -3831,118 +4433,6 @@ mod tests {
     }
 
     #[test]
-    fn redis_backend_client_epoch_auxiliary_keys_expire_with_lease() {
-        let Some(server) = RedisTestServer::start() else {
-            return;
-        };
-        let keyspace = MetadataKeyspace::new("test/redis-client-epoch-aux-ttl");
-        let backend = RedisMetadataBackend::new(
-            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
-        )
-        .expect("redis backend should initialize");
-
-        let stable_id = ClientStableId::new("ttl-client");
-        let lease = ClientLease {
-            runtime: ClientRuntimeId::new(stable_id.0.clone(), ClientEpoch(7)),
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints: ClientEndpointSet::default(),
-            expires_at_ms: super::now_ms() + 300,
-        };
-        backend
-            .upsert_client_lease(&lease)
-            .expect("lease should publish");
-
-        let client = redis::Client::open(server.url()).expect("redis client should open");
-        let mut connection = client
-            .get_connection()
-            .expect("redis connection should succeed");
-        let hwm_key = keyspace.client_epoch_hwm(&stable_id);
-        let by_stable_key = keyspace.client_by_stable_index(&stable_id);
-        let hwm_ttl: i64 = redis::cmd("PTTL")
-            .arg(&hwm_key)
-            .query(&mut connection)
-            .expect("hwm ttl read should succeed");
-        let by_stable_ttl: i64 = redis::cmd("PTTL")
-            .arg(&by_stable_key)
-            .query(&mut connection)
-            .expect("by-stable ttl read should succeed");
-        assert!(hwm_ttl > 0, "hwm must be TTL-bound to client lease");
-        assert!(
-            by_stable_ttl > 0,
-            "by-stable epoch index must be TTL-bound to client lease"
-        );
-
-        std::thread::sleep(Duration::from_millis(650));
-
-        let hwm: Option<String> = connection
-            .get(&hwm_key)
-            .expect("expired hwm read should succeed");
-        let by_stable_exists: bool = connection
-            .exists(&by_stable_key)
-            .expect("expired by-stable existence read should succeed");
-        assert!(hwm.is_none(), "hwm should expire after the client lease");
-        assert!(
-            !by_stable_exists,
-            "by-stable epoch index should expire after the client lease"
-        );
-    }
-
-    #[test]
-    fn redis_backend_draining_heartbeat_extends_epoch_auxiliary_ttl() {
-        let Some(server) = RedisTestServer::start() else {
-            return;
-        };
-        let keyspace = MetadataKeyspace::new("test/redis-client-epoch-drain-ttl");
-        let backend = RedisMetadataBackend::new(
-            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
-        )
-        .expect("redis backend should initialize");
-
-        let stable_id = ClientStableId::new("drain-ttl-client");
-        let runtime = ClientRuntimeId::new(stable_id.0.clone(), ClientEpoch(3));
-        let mut lease = ClientLease {
-            runtime,
-            state: ClientLifecycleState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            endpoints: ClientEndpointSet::default(),
-            expires_at_ms: super::now_ms() + 300,
-        };
-        backend
-            .upsert_client_lease(&lease)
-            .expect("active lease should publish");
-
-        std::thread::sleep(Duration::from_millis(150));
-
-        lease.state = ClientLifecycleState::Draining;
-        lease.expires_at_ms = super::now_ms() + 1_200;
-        backend
-            .upsert_client_lease(&lease)
-            .expect("draining heartbeat should refresh lease");
-
-        let client = redis::Client::open(server.url()).expect("redis client should open");
-        let mut connection = client
-            .get_connection()
-            .expect("redis connection should succeed");
-        let hwm_ttl: i64 = redis::cmd("PTTL")
-            .arg(keyspace.client_epoch_hwm(&stable_id))
-            .query(&mut connection)
-            .expect("hwm ttl read should succeed");
-        let by_stable_ttl: i64 = redis::cmd("PTTL")
-            .arg(keyspace.client_by_stable_index(&stable_id))
-            .query(&mut connection)
-            .expect("by-stable ttl read should succeed");
-        assert!(
-            hwm_ttl > 800,
-            "draining heartbeat should extend hwm ttl, got {hwm_ttl}ms"
-        );
-        assert!(
-            by_stable_ttl > 800,
-            "draining heartbeat should extend by-stable ttl, got {by_stable_ttl}ms"
-        );
-    }
-
-    #[test]
     fn redis_backend_upsert_client_lease_cleans_by_stable_index_on_expiry() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -4042,6 +4532,77 @@ mod tests {
     }
 
     #[test]
+    fn redis_backend_indexes_cold_backing_routes() {
+        let Some(server) = RedisTestServer::start() else {
+            return;
+        };
+        let keyspace = MetadataKeyspace::new("test/redis-cold-route-index");
+        let backend = RedisMetadataBackend::new(
+            RedisMetadataConfig::new(server.url()).keyspace(keyspace.clone()),
+        )
+        .expect("redis backend should initialize");
+
+        let mut first = sample_route(1);
+        first.key = ObjectKey::new("cold-index-a");
+        first.cold_backing = Some(sample_cold_backing(
+            "device-a",
+            mooncake_store_core::ColdBackingState::Materialized,
+        ));
+        let mut second = sample_route(1);
+        second.key = ObjectKey::new("cold-index-b");
+        second.cold_backing = Some(sample_cold_backing(
+            "device-b",
+            mooncake_store_core::ColdBackingState::PendingDelete,
+        ));
+        backend
+            .compare_and_swap_object_route(&first.key, None, Some(&first))
+            .expect("first route create should succeed");
+        backend
+            .compare_and_swap_object_route(&second.key, None, Some(&second))
+            .expect("second route create should succeed");
+
+        let by_device = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some("device-a".to_string()),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            })
+            .expect("device index listing should succeed");
+        assert_eq!(by_device, vec![first.clone()]);
+        let by_state = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                state: Some(mooncake_store_core::ColdBackingState::PendingDelete),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            })
+            .expect("state index listing should succeed");
+        assert_eq!(by_state, vec![second.clone()]);
+
+        let mut updated = first.clone();
+        updated.version = updated.version.next();
+        updated.cold_backing = Some(sample_cold_backing(
+            "device-b",
+            mooncake_store_core::ColdBackingState::PendingDelete,
+        ));
+        backend
+            .compare_and_swap_object_route(&first.key, Some(first.version), Some(&updated))
+            .expect("route update should succeed");
+        let old_device = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                device_id: Some("device-a".to_string()),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            })
+            .expect("old device listing should succeed");
+        assert!(old_device.is_empty());
+        let pending_delete = backend
+            .list_object_routes_by_cold_backing(&mooncake_store_core::ColdBackingRouteFilter {
+                state: Some(mooncake_store_core::ColdBackingState::PendingDelete),
+                limit: Some(1),
+                ..mooncake_store_core::ColdBackingRouteFilter::default()
+            })
+            .expect("limited state listing should succeed");
+        assert_eq!(pending_delete.len(), 1);
+    }
+
+    #[test]
     fn redis_backend_backfills_and_prunes_object_index() {
         let Some(server) = RedisTestServer::start() else {
             return;
@@ -4061,6 +4622,10 @@ mod tests {
         let mut connection = client
             .get_connection()
             .expect("redis connection should succeed");
+        let indexed_after_create: Vec<String> = connection
+            .smembers(keyspace.object_index())
+            .expect("object index read after create should succeed");
+        assert_eq!(indexed_after_create, vec![keyspace.object(&route.key)]);
         connection
             .del::<_, ()>(keyspace.object_index())
             .expect("object index delete should succeed");
@@ -4075,9 +4640,17 @@ mod tests {
             .expect("object index read should succeed");
         assert_eq!(indexed, vec![keyspace.object(&route.key)]);
 
+        backend
+            .compare_and_swap_object_route(&route.key, Some(route.version), None)
+            .expect("route delete should succeed");
+        let indexed_after_delete: Vec<String> = connection
+            .smembers(keyspace.object_index())
+            .expect("object index read after CAS delete should succeed");
+        assert!(indexed_after_delete.is_empty());
+
         connection
-            .del::<_, ()>(keyspace.object(&route.key))
-            .expect("object route delete should succeed");
+            .sadd::<_, _, ()>(keyspace.object_index(), keyspace.object(&route.key))
+            .expect("stale object index seed should succeed");
 
         let listed = backend
             .list_object_routes()
@@ -4228,9 +4801,6 @@ mod tests {
             .expect("live segment publish should succeed");
 
         let dead_runtime = ClientRuntimeId::new("dead", ClientEpoch(8));
-        backend
-            .upsert_client_lease(&active_lease_for(&dead_runtime))
-            .expect("dead owner lease should publish before segment");
         let dead_segment = SegmentAnnouncement {
             owner: dead_runtime.clone(),
             segment_name: SegmentName::new("dead-segment"),
@@ -4246,23 +4816,12 @@ mod tests {
         backend
             .publish_segment(&dead_segment)
             .expect("dead segment publish should succeed");
-        let dead_key = keyspace.client(&dead_runtime);
-        let client = redis::Client::open(server.url()).expect("redis client should open");
-        let mut connection = client
-            .get_connection()
-            .expect("redis connection should succeed");
-        connection
-            .hdel::<_, _, ()>(&dead_key, keyspace.client_lease_field())
-            .expect("simulate missing lease while resource hash remains");
-        backend
-            .refresh_client_lease_expiry(&dead_runtime, super::now_ms().saturating_sub(1))
-            .expect("dead owner expiry should be indexed");
 
         let report = backend
             .cleanup_stale_segments()
             .expect("stale segment cleanup should succeed");
         assert_eq!(report.live_clients, 1);
-        assert_eq!(report.inspected_segment_keys, 1);
+        assert!(report.inspected_segment_keys >= 2);
         assert_eq!(report.removed_segment_keys, 1);
 
         let segments = backend
@@ -4270,9 +4829,29 @@ mod tests {
             .expect("segment listing after cleanup should succeed");
         assert_eq!(segments, vec![live_segment.clone()]);
 
-        assert!(!connection
-            .exists::<_, bool>(&dead_key)
-            .expect("dead resource hash existence should load"));
+        let client = redis::Client::open(server.url()).expect("redis client should open");
+        let mut connection = client
+            .get_connection()
+            .expect("redis connection should succeed");
+        let global_index: Vec<String> = connection
+            .smembers(keyspace.segment_index(None))
+            .expect("global segment index should load");
+        assert_eq!(
+            global_index,
+            vec![keyspace.segment(&live_segment.owner, &live_segment.segment_name)]
+        );
+        let dead_owner_index: Vec<String> = connection
+            .smembers(keyspace.segment_index(Some(&dead_runtime)))
+            .expect("dead owner index should load");
+        assert!(dead_owner_index.is_empty());
+        let cleanup_markers: Vec<String> = redis::cmd("KEYS")
+            .arg(format!(
+                "{{{}}}/maintenance/segment-cleanup/*",
+                keyspace.prefix()
+            ))
+            .query(&mut connection)
+            .expect("cleanup markers should scan");
+        assert!(cleanup_markers.is_empty());
     }
 
     #[test]
@@ -4288,12 +4867,6 @@ mod tests {
 
         let dead_runtime = ClientRuntimeId::new("dead-owner", ClientEpoch(2));
         let other_runtime = ClientRuntimeId::new("other-owner", ClientEpoch(3));
-        backend
-            .upsert_client_lease(&active_lease_for(&dead_runtime))
-            .expect("dead owner lease should publish before segment");
-        backend
-            .upsert_client_lease(&active_lease_for(&other_runtime))
-            .expect("other owner lease should publish before segment");
         let dead_segment = SegmentAnnouncement {
             owner: dead_runtime.clone(),
             segment_name: SegmentName::new("dead-segment"),
@@ -4331,7 +4904,7 @@ mod tests {
         assert_eq!(report.removed_segment_keys, 1);
 
         let remaining = backend
-            .list_segments(Some(&other_runtime))
+            .list_segments(None)
             .expect("segment listing after owner cleanup should succeed");
         assert_eq!(remaining, vec![other_segment.clone()]);
 
@@ -4339,15 +4912,17 @@ mod tests {
         let mut connection = client
             .get_connection()
             .expect("redis connection should succeed");
-        assert!(!connection
-            .exists::<_, bool>(keyspace.client(&dead_runtime))
-            .expect("dead resource hash existence should load"));
-        assert!(connection
-            .hexists::<_, _, bool>(
-                keyspace.client(&other_runtime),
-                keyspace.client_segment_field(&other_segment.segment_name),
-            )
-            .expect("other segment field should load"));
+        let dead_index: Vec<String> = connection
+            .smembers(keyspace.segment_index(Some(&dead_runtime)))
+            .expect("dead owner index should load");
+        assert!(dead_index.is_empty());
+        let other_index: Vec<String> = connection
+            .smembers(keyspace.segment_index(Some(&other_runtime)))
+            .expect("other owner index should load");
+        assert_eq!(
+            other_index,
+            vec![keyspace.segment(&other_runtime, &other_segment.segment_name)]
+        );
     }
 
     #[test]
@@ -5493,7 +6068,6 @@ mod tests {
         assert!(namespace.contains("127.0.0.1:6379/0"));
         assert!(namespace.contains("test/redacted"));
         assert!(!namespace.contains("user:secret"));
-        assert_eq!(namespace, "redis://127.0.0.1:6379/0#test/redacted");
         assert_eq!(
             redacted_route_namespace_source("redis://user:secret@127.0.0.1:6379/0"),
             "redis://127.0.0.1:6379/0".to_string()
@@ -5930,7 +6504,7 @@ mod tests {
         let payload: Option<String> = backend
             .connection("redis test inspect updated client lease")
             .expect("redis connection should succeed")
-            .hget(&key, backend.keyspace.client_lease_field())
+            .get(&key)
             .expect("updated lease lookup should succeed");
         let updated: ClientLease =
             serde_json::from_str(&payload.expect("updated lease should remain stored in redis"))
@@ -5951,9 +6525,6 @@ mod tests {
         .expect("redis backend");
 
         let owner = sample_runtime();
-        backend
-            .upsert_client_lease(&active_lease_for(&owner))
-            .unwrap();
         let segment_name = SegmentName::new("volatile-seg");
         let segment = SegmentAnnouncement {
             owner: owner.clone(),
@@ -5988,9 +6559,6 @@ mod tests {
         .expect("redis backend");
 
         let owner = sample_runtime();
-        backend
-            .upsert_client_lease(&active_lease_for(&owner))
-            .unwrap();
         let segment_name = SegmentName::new("drain-seg");
         let segment = SegmentAnnouncement {
             owner: owner.clone(),
@@ -6030,9 +6598,6 @@ mod tests {
         .expect("redis backend");
 
         let owner = sample_runtime();
-        backend
-            .upsert_client_lease(&active_lease_for(&owner))
-            .unwrap();
         backend
             .publish_segment(&SegmentAnnouncement {
                 owner: owner.clone(),

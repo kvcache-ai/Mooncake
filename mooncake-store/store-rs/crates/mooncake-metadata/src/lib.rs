@@ -1,3 +1,4 @@
+mod cold_tier;
 mod etcd_backend;
 mod in_memory;
 mod keyspace;

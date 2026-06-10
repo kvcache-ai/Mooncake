@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cold_tier::{apply_cold_tier_usage_delta_to_record, cold_tier_device_matches_filter};
 use crate::keyspace::{parse_route_policy_domain, parse_tenant_policy_scope};
 use crate::redis_backend::{ClientLeaseLiveness, RedisMetadataCleanupReport};
 use crate::segment_state::StoredSegmentState;
@@ -11,10 +12,11 @@ use etcd_client::{Client, Compare, CompareOp, GetOptions, Txn, TxnOp};
 use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
-    HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
-    StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
-    TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
+    ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate, ColdTierPutDeviceResult,
+    ColdTierUsageDelta, HandoffPlan, MetadataBackend, ObjectKey, ObjectRoute, Result, RoutePolicy,
+    RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
+    SegmentReservation, StoreError, TenantObjectAccounting, TenantObjectAccountingState,
+    TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
     TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
     TenantQuotaReservationRequest, TenantQuotaReservationState, TenantQuotaState,
 };
@@ -79,11 +81,11 @@ impl EtcdMetadataBackend {
 
     fn frontier_entries_for_candidate(
         &self,
-        tenant: &str,
+        scope: &TenantPolicyScope,
         candidate: &EvictionCandidate,
     ) -> (String, String) {
         let frontier_key = self.config.keyspace.tenant_eviction_candidate(
-            tenant,
+            scope,
             candidate.updated_at_ms,
             candidate.committed_length.0,
             &candidate.key,
@@ -97,7 +99,7 @@ impl EtcdMetadataBackend {
 
     fn frontier_entries_from_objects(
         &self,
-        tenant: &str,
+        scope: &TenantPolicyScope,
         objects: &[TenantObjectAccounting],
     ) -> Vec<(String, String)> {
         let mut frontier = objects
@@ -109,7 +111,7 @@ impl EtcdMetadataBackend {
         frontier.truncate(EVICTION_FRONTIER_LIMIT);
         frontier
             .into_iter()
-            .map(|candidate| self.frontier_entries_for_candidate(tenant, &candidate))
+            .map(|candidate| self.frontier_entries_for_candidate(scope, &candidate))
             .collect()
     }
 
@@ -1207,6 +1209,168 @@ impl MetadataBackend for EtcdMetadataBackend {
         })
     }
 
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        let key = self.config.keyspace.cold_tier_device(&device.device_id);
+        let payload = serde_json::to_string(device).map_err(json_error)?;
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .txn(
+                    Txn::new()
+                        .when([Compare::version(key.clone(), CompareOp::Equal, 0)])
+                        .and_then([TxnOp::put(key.clone(), payload, None)]),
+                )
+                .await
+                .map_err(etcd_error("etcd create cold tier device"))?;
+            if response.succeeded() {
+                return Ok(ColdTierPutDeviceResult::Created(device.clone()));
+            }
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get existing cold tier device"))?;
+            let existing = response.kvs().first().ok_or_else(|| {
+                StoreError::Conflict("cold tier device create raced with delete".to_string())
+            })?;
+            Ok(ColdTierPutDeviceResult::Existing(
+                serde_json::from_slice(existing.value()).map_err(json_error)?,
+            ))
+        })
+    }
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        let key = self.config.keyspace.cold_tier_device(device_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(key, None)
+                .await
+                .map_err(etcd_error("etcd get cold tier device"))?;
+            response
+                .kvs()
+                .first()
+                .map(|kv| serde_json::from_slice(kv.value()).map_err(json_error))
+                .transpose()
+        })
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        let prefix = self.config.keyspace.cold_tier_device_prefix();
+        self.block_on(async {
+            let mut client = self.client().await?;
+            let response = client
+                .get(prefix, Some(GetOptions::new().with_prefix()))
+                .await
+                .map_err(etcd_error("etcd list cold tier devices"))?;
+            let mut devices = Vec::with_capacity(response.kvs().len());
+            for kv in response.kvs() {
+                let device: ColdTierDeviceRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                if cold_tier_device_matches_filter(&device, filter) {
+                    devices.push(device);
+                }
+            }
+            devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+            Ok(devices)
+        })
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        let key = self.config.keyspace.cold_tier_device(device_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get cold tier device for update"))?;
+                let Some(kv) = response.kvs().first() else {
+                    return Err(StoreError::NotFound(format!(
+                        "cold tier device {device_id} not found"
+                    )));
+                };
+                let mut device: ColdTierDeviceRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                if let Some(expected) = update.expected_updated_at_ms {
+                    if device.updated_at_ms != expected {
+                        return Err(StoreError::Conflict(format!(
+                            "cold tier device {device_id} changed concurrently"
+                        )));
+                    }
+                }
+                update.clone().apply(&mut device);
+                let payload = serde_json::to_string(&device).map_err(json_error)?;
+                let txn_response = client
+                    .txn(
+                        Txn::new()
+                            .when([Compare::mod_revision(
+                                key.clone(),
+                                CompareOp::Equal,
+                                kv.mod_revision(),
+                            )])
+                            .and_then([TxnOp::put(key.clone(), payload, None)]),
+                    )
+                    .await
+                    .map_err(etcd_error("etcd update cold tier device"))?;
+                if txn_response.succeeded() {
+                    return Ok(device);
+                }
+            }
+        })
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        let key = self.config.keyspace.cold_tier_device(device_id);
+        self.block_on(async {
+            let mut client = self.client().await?;
+            loop {
+                let response = client
+                    .get(key.clone(), None)
+                    .await
+                    .map_err(etcd_error("etcd get cold tier device for usage delta"))?;
+                let Some(kv) = response.kvs().first() else {
+                    return Err(StoreError::NotFound(format!(
+                        "cold tier device {device_id} not found"
+                    )));
+                };
+                let mut device: ColdTierDeviceRecord =
+                    serde_json::from_slice(kv.value()).map_err(json_error)?;
+                apply_cold_tier_usage_delta_to_record(&mut device, &delta, updated_at_ms)?;
+                let payload = serde_json::to_string(&device).map_err(json_error)?;
+                let txn_response = client
+                    .txn(
+                        Txn::new()
+                            .when([Compare::mod_revision(
+                                key.clone(),
+                                CompareOp::Equal,
+                                kv.mod_revision(),
+                            )])
+                            .and_then([TxnOp::put(key.clone(), payload, None)]),
+                    )
+                    .await
+                    .map_err(etcd_error("etcd apply cold tier usage delta"))?;
+                if txn_response.succeeded() {
+                    return Ok(device);
+                }
+            }
+        })
+    }
+
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
         let key = self.config.keyspace.route_policy(domain);
         self.block_on(async {
@@ -1521,7 +1685,7 @@ impl MetadataBackend for EtcdMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Option<TenantQuotaState>> {
-        let scope = root_scope(scope)?;
+        let scope = quota_scope(scope)?;
         let key = self.config.keyspace.tenant_quota_state(&scope);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -1583,11 +1747,8 @@ impl MetadataBackend for EtcdMetadataBackend {
         scope: &TenantPolicyScope,
         limit: usize,
     ) -> Result<Vec<TenantObjectAccounting>> {
-        let scope = root_scope(scope)?;
-        let prefix = self
-            .config
-            .keyspace
-            .tenant_eviction_frontier_prefix(&scope.tenant);
+        let scope = quota_scope(scope)?;
+        let prefix = self.config.keyspace.tenant_eviction_frontier_prefix(&scope);
         let read_limit = limit.min(EVICTION_FRONTIER_LIMIT);
         if read_limit == 0 {
             return Ok(Vec::new());
@@ -1639,11 +1800,11 @@ impl MetadataBackend for EtcdMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Vec<TenantQuotaReservation>> {
-        let scope = root_scope(scope)?;
+        let scope = quota_scope(scope)?;
         let prefix = self
             .config
             .keyspace
-            .tenant_quota_reservation_prefix(Some(&scope.tenant));
+            .tenant_quota_reservation_prefix(Some(&scope));
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
@@ -1680,7 +1841,7 @@ impl MetadataBackend for EtcdMetadataBackend {
         request: &TenantQuotaReservationRequest,
     ) -> Result<TenantQuotaReservationOutcome> {
         request.validate()?;
-        let scope = root_scope(&request.scope)?;
+        let scope = quota_scope(&request.scope)?;
         let mut normalized = request.clone();
         normalized.scope = scope.clone();
         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
@@ -1968,7 +2129,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
                 match reservation.state {
                     TenantQuotaReservationState::Finalized => {
-                        let scope = root_scope(&reservation.scope)?;
+                        let scope = quota_scope(&reservation.scope)?;
                         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                         let quota_response = client
                             .get(quota_key, None)
@@ -2017,7 +2178,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     TenantQuotaReservationState::Pending => {}
                 }
 
-                let scope = root_scope(&reservation.scope)?;
+                let scope = quota_scope(&reservation.scope)?;
                 let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                 let object_key = self.config.keyspace.tenant_object_accounting(&reservation.key);
                 let object_response = client
@@ -2027,7 +2188,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let frontier_prefix = self
                     .config
                     .keyspace
-                    .tenant_eviction_frontier_prefix(&scope.tenant);
+                    .tenant_eviction_frontier_prefix(&scope);
                 let frontier_response = client
                     .get(frontier_prefix.clone(), Some(GetOptions::new().with_prefix()))
                     .await
@@ -2141,7 +2302,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     frontier_objects.push(object);
                 }
                 let frontier_entries =
-                    self.frontier_entries_from_objects(&scope.tenant, &frontier_objects);
+                    self.frontier_entries_from_objects(&scope, &frontier_objects);
                 let next_frontier_keys = frontier_entries
                     .iter()
                     .map(|(frontier_key, _)| frontier_key.clone())
@@ -2236,7 +2397,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
                 match reservation.state {
                     TenantQuotaReservationState::Aborted => {
-                        let scope = root_scope(&reservation.scope)?;
+                        let scope = quota_scope(&reservation.scope)?;
                         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                         let quota_response = client
                             .get(quota_key, None)
@@ -2266,7 +2427,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     TenantQuotaReservationState::Pending => {}
                 }
 
-                let scope = root_scope(&reservation.scope)?;
+                let scope = quota_scope(&reservation.scope)?;
                 let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                 let quota_response = client
                     .get(quota_key.clone(), None)
@@ -2385,13 +2546,9 @@ fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
 }
 
-fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
-    scope.validate_root_only("tenant quota metadata")?;
-    Ok(TenantPolicyScope::new(
-        scope.tenant.clone(),
-        None::<String>,
-        None::<String>,
-    ))
+fn quota_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
+    scope.validate()?;
+    Ok(scope.clone())
 }
 
 fn version_conflict(
@@ -2467,7 +2624,8 @@ mod tests {
 
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
+        ClientStableId, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierTargetSpec,
+        ColdTierUsageDelta, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
         TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
@@ -2565,6 +2723,28 @@ mod tests {
         ClientRuntimeId::new("writer", ClientEpoch(5))
     }
 
+    fn sample_cold_tier_device(device_id: &str) -> ColdTierDeviceRecord {
+        ColdTierDeviceRecord {
+            device_id: device_id.to_string(),
+            stable_id: "writer".to_string(),
+            epoch: Some(5),
+            cold_tier_id: device_id.to_string(),
+            kind: "ssd".to_string(),
+            target: ColdTierTargetSpec::Directory {
+                path: format!("/tmp/{device_id}"),
+            },
+            root_dir: Some(format!("/tmp/{device_id}")),
+            state: ColdTierDeviceState::Healthy,
+            capacity_bytes: Some(1024),
+            used_bytes: 0,
+            reserved_bytes: 0,
+            failure_count: 0,
+            last_error: None,
+            tags: Vec::new(),
+            updated_at_ms: 1,
+        }
+    }
+
     fn sample_lease(state: ClientLifecycleState) -> ClientLease {
         ClientLease {
             runtime: sample_runtime(),
@@ -2615,6 +2795,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
@@ -2773,6 +2954,60 @@ mod tests {
                 .expect("handoff get should succeed"),
             Some(handoff)
         );
+    }
+
+    #[test]
+    fn etcd_backend_applies_cold_usage_deltas_without_stale_timestamp_conflicts() {
+        let Some(server) = EtcdTestServer::start() else {
+            return;
+        };
+        let backend = EtcdMetadataBackend::from_config(
+            EtcdMetadataConfig::new([server.endpoint()])
+                .keyspace(MetadataKeyspace::new("test/etcd-cold-usage-delta")),
+        )
+        .expect("etcd backend should initialize");
+        let device = sample_cold_tier_device("etcd-delta");
+        backend
+            .put_cold_tier_device_if_absent(&device)
+            .expect("device seed should succeed");
+
+        let first = backend
+            .apply_cold_tier_usage_delta(
+                "etcd-delta",
+                ColdTierUsageDelta {
+                    used_bytes: 10,
+                    reserved_bytes: 4,
+                },
+                2,
+            )
+            .expect("first delta should apply");
+        assert_eq!(first.used_bytes, 10);
+        assert_eq!(first.reserved_bytes, 4);
+
+        let updated = backend
+            .update_cold_tier_device(
+                "etcd-delta",
+                mooncake_store_core::ColdTierDeviceUpdate {
+                    tags: Some(vec!["concurrent-update".to_string()]),
+                    ..mooncake_store_core::ColdTierDeviceUpdate::new(3)
+                },
+            )
+            .expect("unrelated concurrent update should succeed");
+        assert_eq!(updated.updated_at_ms, 3);
+
+        let second = backend
+            .apply_cold_tier_usage_delta(
+                "etcd-delta",
+                ColdTierUsageDelta {
+                    used_bytes: 5,
+                    reserved_bytes: -2,
+                },
+                4,
+            )
+            .expect("second delta should apply after timestamp changed");
+        assert_eq!(second.used_bytes, 15);
+        assert_eq!(second.reserved_bytes, 2);
+        assert_eq!(second.tags, vec!["concurrent-update".to_string()]);
     }
 
     #[test]
