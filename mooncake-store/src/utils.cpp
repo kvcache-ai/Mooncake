@@ -329,13 +329,17 @@ void *allocate_buffer_numa_segments(size_t total_size,
 
     // reserve contiguous VMA; use hugepages if page_size indicates so
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    if (page_size != getpagesize()) {
-        get_hugepage_size_from_env(&flags);
+    if (page_size == SZ_2MB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+    } else if (page_size == SZ_1GB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_1GB;
+    } else if (page_size != static_cast<size_t>(getpagesize())) {
+        flags |= MAP_HUGETLB;
     }
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
         LOG(ERROR) << "mmap failed (hugepage="
-                   << (page_size >= 2 * 1024 * 1024 ? "yes" : "no")
+                   << ((flags & MAP_HUGETLB) ? "yes" : "no")
                    << "), size=" << map_size << ", errno=" << errno
                    << " (" << strerror(errno) << ")";
         return nullptr;
