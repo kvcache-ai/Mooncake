@@ -39,6 +39,25 @@ impl<'a> ObjectRef<'a> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ReadQueryResultCache {
+    entries: HashMap<ObjectKey, Result<Option<ObjectRoute>>>,
+}
+
+impl ReadQueryResultCache {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.entries.extend(other.entries);
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NamespaceQuota {
     pub max_bytes: Option<u64>,

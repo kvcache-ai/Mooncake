@@ -66,6 +66,7 @@ Remote read behavior:
 - routed `batch_put_from` skips the pre-publish route preload on the accept-existing cache-write path when no tenant quota policy needs previous-route accounting; route CAS still resolves active conflicts and version-floor retries through the route authorities
 - Python compatibility `batch_put_from` reports best-effort per-key statuses produced by the Rust batch writer; route-CAS conflicts with an active published route are success, while true per-key write failures stay isolated to the affected item without replaying the batch serially in Python
 - Python compatibility registered-buffer batch restores also report best-effort per-key statuses; a route miss or dead storage owner for one entry does not poison other entries in the same restore batch
+- compatibility `get_into_ranges` accepts a request-scoped route-query cache from higher-level planners, so tensor reconstruction can reuse one batch route lookup across prefix reads and final range reads instead of resolving the same shard keys repeatedly
 - remote storage segment announcements publish explicit storage target chunks, and writers translate allocator segment offsets through those chunks instead of inferring storage from backend buffer ordering
 - local reads and drain migration translate the published replica transport target offset through the storage target map before copying from local storage; allocator segment offsets remain reclaim bookkeeping only
 - scratch buffers are registered for local transfer staging only and are not published as remote storage extents
@@ -104,6 +105,18 @@ Design boundary:
 - a miss falls back to the normal remote read path
 - values larger than the configured cache block size bypass the cache
 - metadata keyspace remains the authoritative read/write isolation boundary, and runtime coverage now includes a regression test that verifies the same object key can be written and read independently in separate keyspaces
+
+### Tensor parallel reconstruction
+
+The Python tensor-parallel read path reconstructs missing full or shard targets from stored shard objects when no direct object already matches the requested layout.
+
+What it provides:
+
+- manifest-guided shard discovery for writer partitions and tensor parallelism layouts
+- metadata-prefix reads for shard planning, so reconstruction can inspect dtype, shape, split dimension, and payload length without reading each full shard payload first
+- request-scoped route-query reuse between shard discovery and `get_into_ranges` data transfer
+- batch full `_into` reconstruction that combines multiple caller buffers into one ranged-read request where possible
+- contiguous range planning for split dimension `0` and strided range planning for non-leading split dimensions
 
 ## Routing
 

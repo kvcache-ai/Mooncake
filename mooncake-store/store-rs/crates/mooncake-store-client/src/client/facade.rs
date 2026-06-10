@@ -29,6 +29,11 @@ pub trait MooncakeCompatibilityFacade {
         logical_key: &str,
     ) -> Result<Option<ObjectRoute>>;
     fn query_route_by_object_id(&self, object_id: &LogicalObjectId) -> Result<Option<ObjectRoute>>;
+    fn batch_query_read_cache_in_tenant(
+        &self,
+        tenant: &str,
+        keys: &[&str],
+    ) -> Result<ReadQueryResultCache>;
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>>;
     fn list_reuse_candidates(&self, reuse: &mooncake_store_core::ReuseIdentity) -> Result<Vec<ObjectRoute>>;
     fn cas_route(
@@ -142,6 +147,24 @@ pub trait MooncakeCompatibilityFacade {
         all_dst_offsets: &[&[&[usize]]],
         all_src_offsets: &[&[&[usize]]],
         all_sizes: &[&[&[usize]]],
+    ) -> Vec<Vec<Vec<i64>>>;
+    /// Batch scatter-gather range read reusing fresh route-query results from
+    /// the same higher-level request.
+    ///
+    /// # Safety
+    /// Each pointer in `buffer_ptrs` must be valid for `buffer_sizes[i]` bytes
+    /// and the underlying memory must be registered for RDMA transfer.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn get_into_ranges_with_query_cache(
+        &self,
+        tenant: &str,
+        buffer_ptrs: &[*mut u8],
+        buffer_sizes: &[usize],
+        all_keys: &[&[&str]],
+        all_dst_offsets: &[&[&[usize]]],
+        all_src_offsets: &[&[&[usize]]],
+        all_sizes: &[&[&[usize]]],
+        query_cache: Option<&ReadQueryResultCache>,
     ) -> Vec<Vec<Vec<i64>>>;
 }
 
@@ -1034,6 +1057,36 @@ impl MooncakeCompatibilityFacade for StoreClient {
         result
     }
 
+    fn batch_query_read_cache_in_tenant(
+        &self,
+        tenant: &str,
+        keys: &[&str],
+    ) -> Result<ReadQueryResultCache> {
+        let tracker = OperationTracker::new("route_lookup_many")
+            .scope("route_lookup")
+            .attribute_u64("mooncake.item_count", keys.len() as u64);
+        let result = (|| {
+            let object_keys = keys
+                .iter()
+                .map(|key| {
+                    let object_id = LogicalObjectId::new(
+                        NamespaceScope::with_defaults(Some(tenant), None, None),
+                        *key,
+                    );
+                    ObjectKey::from_logical_id(&object_id)
+                })
+                .collect::<Vec<_>>();
+            let routes = self.route_ops().load_routes(&object_keys)?;
+            let mut cache = ReadQueryResultCache::default();
+            for (object_key, route) in object_keys.into_iter().zip(routes) {
+                cache.entries.insert(object_key, Ok(route));
+            }
+            Ok(cache)
+        })();
+        tracker.finish(&result, result.as_ref().map(|cache| cache.len()).unwrap_or(0) as u64);
+        result
+    }
+
     fn list_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         self.route_ops().list_routes_in_scope(scope)
     }
@@ -1750,6 +1803,29 @@ impl MooncakeCompatibilityFacade for StoreClient {
         all_src_offsets: &[&[&[usize]]],
         all_sizes: &[&[&[usize]]],
     ) -> Vec<Vec<Vec<i64>>> {
+        self.get_into_ranges_with_query_cache(
+            tenant,
+            buffer_ptrs,
+            buffer_sizes,
+            all_keys,
+            all_dst_offsets,
+            all_src_offsets,
+            all_sizes,
+            None,
+        )
+    }
+
+    unsafe fn get_into_ranges_with_query_cache(
+        &self,
+        tenant: &str,
+        buffer_ptrs: &[*mut u8],
+        buffer_sizes: &[usize],
+        all_keys: &[&[&str]],
+        all_dst_offsets: &[&[&[usize]]],
+        all_src_offsets: &[&[&[usize]]],
+        all_sizes: &[&[&[usize]]],
+        query_cache: Option<&ReadQueryResultCache>,
+    ) -> Vec<Vec<Vec<i64>>> {
         const RANGE_READ_ERROR: i64 = -1;
 
         let buffer_count = buffer_ptrs.len();
@@ -1762,6 +1838,26 @@ impl MooncakeCompatibilityFacade for StoreClient {
         .entered();
 
         let mut metadata_cache: HashMap<&str, Result<ResolvedObject>> = HashMap::new();
+        let local_segments = self.local_storage_segments();
+        let readable_runtimes = match self.readable_runtime_set(false) {
+            Ok(readable) => readable,
+            Err(_) => {
+                return (0..buffer_count)
+                    .map(|i| {
+                        let key_count = all_keys.get(i).map_or(1, |keys| keys.len().max(1));
+                        (0..key_count)
+                            .map(|j| {
+                                let fragment_count = all_dst_offsets
+                                    .get(i)
+                                    .and_then(|keys| keys.get(j))
+                                    .map_or(1, |fragments| fragments.len().max(1));
+                                vec![RANGE_READ_ERROR; fragment_count]
+                            })
+                            .collect()
+                    })
+                    .collect();
+            }
+        };
         let mut results: Vec<Vec<Vec<i64>>> = Vec::with_capacity(buffer_count);
 
         for i in 0..buffer_count {
@@ -1781,15 +1877,43 @@ impl MooncakeCompatibilityFacade for StoreClient {
                 }
 
                 let resolved = metadata_cache.entry(key).or_insert_with(|| {
-                    let object = ObjectRef::new(key).tenant(tenant);
-                    self.resolve_objects(std::slice::from_ref(&object))
-                        .and_then(|(mut v, _)| {
-                            v.pop().ok_or_else(|| {
-                                StoreError::NotFound(format!(
-                                    "tenant={tenant} key={key} could not be resolved"
-                                ))
-                            })
-                        })
+                    let object_key = self.scoped_object_key_for_tenant(tenant, key);
+                    if let Some(cached) =
+                        query_cache.and_then(|cache| cache.entries.get(&object_key))
+                    {
+                        match cached {
+                            Ok(route) => self.resolve_readable_route(
+                                tenant,
+                                key,
+                                route.clone(),
+                                &local_segments,
+                                &readable_runtimes,
+                            ),
+                            Err(error) => Err(error.clone()),
+                        }
+                    } else {
+                        let route =
+                            self.route_ops()
+                                .load_route(&object_key)
+                                .and_then(|route| {
+                                    self.resolve_readable_route(
+                                        tenant,
+                                        key,
+                                        route,
+                                        &local_segments,
+                                        &readable_runtimes,
+                                    )
+                                });
+                        if route.is_err() {
+                            warn!(
+                                runtime = %self.lease.runtime,
+                                tenant,
+                                key,
+                                "skipping unresolvable object in ranged read"
+                            );
+                        }
+                        route
+                    }
                 });
 
                 let resolved_obj = match resolved {
