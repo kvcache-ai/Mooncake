@@ -220,6 +220,9 @@ impl TensorMetadata {
     pub const WIRE_SIZE: usize = mem::size_of::<TensorMetadata>();
 
     /// Serialize to bytes (safe because of `#[repr(C)]`).
+    ///
+    /// The metadata wire format is the native C layout shared with Mooncake's
+    /// C++ tensor metadata; current deployments assume little-endian hosts.
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, Self::WIRE_SIZE) }
     }
@@ -237,10 +240,12 @@ impl TensorMetadata {
         if !metadata.validate(data.len()) {
             return None;
         }
+        let data_offset = usize::try_from(metadata.header.data_offset).ok()?;
+        let data_bytes = usize::try_from(metadata.header.data_bytes).ok()?;
 
         Some(ParsedTensorMetadata {
-            data_offset: metadata.header.data_offset as usize,
-            data_bytes: metadata.header.data_bytes as usize,
+            data_offset,
+            data_bytes,
             metadata,
         })
     }
@@ -263,10 +268,12 @@ impl TensorMetadata {
         if !metadata.validate_prefix() {
             return None;
         }
+        let data_offset = usize::try_from(metadata.header.data_offset).ok()?;
+        let data_bytes = usize::try_from(metadata.header.data_bytes).ok()?;
 
         Some(ParsedTensorMetadata {
-            data_offset: metadata.header.data_offset as usize,
-            data_bytes: metadata.header.data_bytes as usize,
+            data_offset,
+            data_bytes,
             metadata,
         })
     }
