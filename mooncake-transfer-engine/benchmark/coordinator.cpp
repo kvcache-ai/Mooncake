@@ -114,7 +114,7 @@ class CoordinatorService {
         size_t total_data = r.block_size * r.batch_size * r.total_samples;
         // total_duration_avg is accumulated across threads, so divide by
         // num_threads to get actual parallel execution time
-        double duration_sec = (r.total_duration_avg / r.num_threads) / 1e6;
+        double duration_sec = r.total_duration_avg / 1e6;
         return (total_data / 1e9) / duration_sec;
     }
 
