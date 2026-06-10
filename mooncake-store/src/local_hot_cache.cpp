@@ -145,6 +145,67 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
     }
 }
 
+bool LocalHotCache::RemoveHotKey(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    key_generation_[key]++;
+    drainDeferredTouches();
+
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return false;
+    }
+
+    HotMemBlock* block = *(it->second);
+    lru_queue_.erase(it->second);
+    key_to_lru_it_.erase(it);
+
+    block->key_.clear();
+    block->ref_count = 0;
+    block->accessed.store(false, std::memory_order_relaxed);
+    lru_queue_.push_back(block);
+
+    VLOG(2) << "Removed hot key: " << key << " from hot cache";
+    return true;
+}
+
+void LocalHotCache::Clear() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+
+    key_to_lru_it_.clear();
+    key_generation_.clear();
+    lru_queue_.clear();
+
+    for (auto& block : blocks_) {
+        block->key_.clear();
+        block->ref_count = 0;
+        block->accessed.store(false, std::memory_order_relaxed);
+        lru_queue_.push_back(block.get());
+    }
+}
+
+HotCachePutToken LocalHotCache::AcquirePutToken(const std::string& key) {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    HotCachePutToken token;
+    token.cache_epoch = cache_epoch_.load(std::memory_order_relaxed);
+    auto it = key_generation_.find(key);
+    token.key_generation = (it != key_generation_.end()) ? it->second : 0;
+    return token;
+}
+
+bool LocalHotCache::IsPutTokenValid(const std::string& key,
+                                    const HotCachePutToken& token) const {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    if (token.cache_epoch != cache_epoch_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    auto it = key_generation_.find(key);
+    const uint64_t current_gen =
+        (it != key_generation_.end()) ? it->second : 0;
+    return token.key_generation == current_gen;
+}
+
 bool LocalHotCache::TouchHotKey(const std::string& key) {
     std::shared_lock<std::shared_mutex> lk(lru_mutex_);
     auto it = key_to_lru_it_.find(key);
@@ -303,6 +364,7 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
     }
 
     // Try to get a free block (may evict from LRU tail)
+    HotCachePutToken token = hot_cache_->AcquirePutToken(key);
     HotMemBlock* block = hot_cache_->GetFreeBlock();
     if (!block) {
         LOG(ERROR) << "Hot cache is fully in-use, fail to get a free block: "
@@ -324,7 +386,7 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
     block->size = slice.size;
     block->key_ = key;  // Set key for insertion
 
-    HotCachePutTask task(key, slice, block, hot_cache_);
+    HotCachePutTask task(key, slice, block, hot_cache_, token);
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -367,6 +429,12 @@ void LocalHotCacheHandler::workerThread() {
         // Execute the task if we have one
         if (task.hot_cache && task.block) {
             try {
+                if (!task.hot_cache->IsPutTokenValid(task.key, task.token)) {
+                    VLOG(2) << "Put task cancelled (stale token): " << task.key;
+                    task.block->key_.clear();
+                    task.hot_cache->PutHotKey(task.block);
+                    continue;
+                }
                 // Insert the pre-filled block into LRU
                 if (task.hot_cache->PutHotKey(task.block)) {
                     VLOG(2) << "Put task completed: " << task.key;
