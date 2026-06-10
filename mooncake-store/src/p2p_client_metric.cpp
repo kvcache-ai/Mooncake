@@ -115,7 +115,7 @@ RpcHandlerMetric::RpcHandlerMetric(
                       rpc_name + " RPC latency for failed requests (us)",
                       kLatencyBucket, labels) {}
 
-void RpcHandlerMetric::serialize(std::string& str) const {
+void RpcHandlerMetric::serialize(std::string& str) {
     requests.serialize(str);
     hits.serialize(str);
     misses.serialize(str);
@@ -125,7 +125,7 @@ void RpcHandlerMetric::serialize(std::string& str) const {
 }
 
 std::string RpcHandlerMetric::summary_line(
-    const std::string& display_name) const {
+    const std::string& display_name) {
     std::stringstream ss;
     ss << display_name << ": " << requests.value() << " requests, "
        << hits.value() << " hits, " << misses.value() << " misses, "

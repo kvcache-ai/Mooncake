@@ -54,8 +54,8 @@ struct RpcHandlerMetric {
                      const std::string& rpc_name,
                      const std::map<std::string, std::string>& labels = {});
 
-    void serialize(std::string& str) const;
-    std::string summary_line(const std::string& display_name) const;
+    void serialize(std::string& str);
+    std::string summary_line(const std::string& display_name);
 };
 
 struct PeerRequestMetrics {
