@@ -245,8 +245,54 @@ impl TensorMetadata {
         })
     }
 
+    /// Validate and parse only the fixed metadata prefix.
+    ///
+    /// This is useful for read planners that need dtype, shape, and payload
+    /// length without fetching the full tensor object. It intentionally skips
+    /// the `data_offset + data_bytes <= total_length` check because the caller
+    /// only supplied the prefix.
+    pub fn parse_prefix(data: &[u8]) -> Option<ParsedTensorMetadata> {
+        if data.len() < Self::WIRE_SIZE {
+            return None;
+        }
+
+        // Safety: TensorMetadata is repr(C) with fixed layout, and we've checked size.
+        let metadata: TensorMetadata =
+            unsafe { std::ptr::read_unaligned(data.as_ptr() as *const TensorMetadata) };
+
+        if !metadata.validate_prefix() {
+            return None;
+        }
+
+        Some(ParsedTensorMetadata {
+            data_offset: metadata.header.data_offset as usize,
+            data_bytes: metadata.header.data_bytes as usize,
+            metadata,
+        })
+    }
+
     /// Validate metadata invariants.
     pub fn validate(&self, total_length: usize) -> bool {
+        if !self.validate_prefix() {
+            return false;
+        }
+        if self.header.data_offset as usize > total_length {
+            return false;
+        }
+        let end = self.header.data_offset.checked_add(self.header.data_bytes);
+        match end {
+            Some(e) => match usize::try_from(e) {
+                Ok(end) if end <= total_length => {}
+                _ => return false,
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// Validate fixed-prefix metadata invariants that do not require the object
+    /// payload length.
+    pub fn validate_prefix(&self) -> bool {
         if self.header.magic != TENSOR_OBJECT_MAGIC {
             return false;
         }
@@ -262,16 +308,20 @@ impl TensorMetadata {
         if TensorDtype::from_i32(self.header.dtype).is_none() {
             return false;
         }
-        if (self.header.data_offset as usize) < Self::WIRE_SIZE {
+        let Ok(data_offset) = usize::try_from(self.header.data_offset) else {
+            return false;
+        };
+        if data_offset < Self::WIRE_SIZE {
             return false;
         }
-        if self.header.data_offset as usize > total_length {
+        if usize::try_from(self.header.data_bytes).is_err()
+            || self
+                .header
+                .data_offset
+                .checked_add(self.header.data_bytes)
+                .is_none()
+        {
             return false;
-        }
-        let end = self.header.data_offset.checked_add(self.header.data_bytes);
-        match end {
-            Some(e) if e as usize <= total_length => {}
-            _ => return false,
         }
         if self.layout.axis_count as usize > MAX_LAYOUT_AXES {
             return false;
@@ -354,6 +404,21 @@ mod tests {
         assert!(TensorMetadata::parse(&bytes[..10]).is_none());
         // header says data extends beyond buffer
         assert!(TensorMetadata::parse(bytes).is_none()); // only 304 bytes, need 304+16=320
+    }
+
+    #[test]
+    fn test_parse_prefix_accepts_header_without_payload() {
+        let shape = [8, 16];
+        let data_bytes = 8 * 16 * 4;
+        let meta = TensorMetadata::build_full(TensorDtype::Float32 as i32, &shape, data_bytes);
+        let bytes = meta.as_bytes();
+
+        assert!(TensorMetadata::parse(bytes).is_none());
+
+        let parsed = TensorMetadata::parse_prefix(bytes).unwrap();
+        assert_eq!(parsed.metadata, meta);
+        assert_eq!(parsed.data_offset, TensorMetadata::WIRE_SIZE);
+        assert_eq!(parsed.data_bytes, data_bytes as usize);
     }
 
     #[test]

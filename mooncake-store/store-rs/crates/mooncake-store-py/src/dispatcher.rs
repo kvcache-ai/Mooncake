@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mooncake_store_client::{
     record_heartbeat_health, stable_phase_spread_ms, GetRequest, HealthChannel, HealthUpdate,
     MooncakeCompatibilityFacade, MultiBufferGetRequest, MultiBufferPutRequest, ObjectRef,
-    OperationTracker, ReplicationPolicy, StoreClient,
+    OperationTracker, ReadQueryResultCache, ReplicationPolicy, StoreClient,
 };
 use mooncake_store_core::{
     ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, HandoffKind, HandoffPlan,
@@ -678,6 +678,42 @@ impl StoreDispatcher {
         all_sizes: Vec<Vec<Vec<usize>>>,
         tenant: Option<String>,
     ) -> Result<Vec<Vec<Vec<i64>>>, StoreError> {
+        self.get_into_ranges_with_query_cache(
+            buffer_ptrs,
+            buffer_sizes,
+            all_keys,
+            all_dst_offsets,
+            all_src_offsets,
+            all_sizes,
+            tenant,
+            None,
+        )
+    }
+
+    pub fn batch_query_read_cache(
+        &self,
+        keys: Vec<String>,
+        tenant: Option<String>,
+    ) -> Result<ReadQueryResultCache, StoreError> {
+        let scope = self.object_scope(tenant);
+        self.run(move |client| {
+            let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+            client.batch_query_read_cache_in_tenant(&scope.tenant, &key_refs)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_into_ranges_with_query_cache(
+        &self,
+        buffer_ptrs: Vec<usize>,
+        buffer_sizes: Vec<usize>,
+        all_keys: Vec<Vec<String>>,
+        all_dst_offsets: Vec<Vec<Vec<usize>>>,
+        all_src_offsets: Vec<Vec<Vec<usize>>>,
+        all_sizes: Vec<Vec<Vec<usize>>>,
+        tenant: Option<String>,
+        query_cache: Option<ReadQueryResultCache>,
+    ) -> Result<Vec<Vec<Vec<i64>>>, StoreError> {
         let scope = self.object_scope(tenant);
         self.run(move |client| {
             Ok(execute_get_into_ranges(
@@ -689,6 +725,7 @@ impl StoreDispatcher {
                 &all_dst_offsets,
                 &all_src_offsets,
                 &all_sizes,
+                query_cache.as_ref(),
             ))
         })
     }
@@ -1549,10 +1586,8 @@ fn execute_batch_get_values_into(
         .collect::<Vec<_>>();
     match client.batch_get_into(requests.as_mut_slice()) {
         Ok(sizes) => {
-            for (((index, key, _, _), buffer), copied) in misses
-                .into_iter()
-                .zip(buffers.iter())
-                .zip(sizes.into_iter())
+            for (((index, key, _, _), buffer), copied) in
+                misses.into_iter().zip(buffers.iter()).zip(sizes)
             {
                 if copied == 0 {
                     continue;
@@ -1935,6 +1970,7 @@ fn execute_get_into_ranges(
     all_dst_offsets: &[Vec<Vec<usize>>],
     all_src_offsets: &[Vec<Vec<usize>>],
     all_sizes: &[Vec<Vec<usize>>],
+    query_cache: Option<&ReadQueryResultCache>,
 ) -> Vec<Vec<Vec<i64>>> {
     let buffer_count = buffer_ptrs.len();
     if buffer_count != buffer_sizes.len()
@@ -1973,7 +2009,7 @@ fn execute_get_into_ranges(
     let size_refs: Vec<&[&[usize]]> = size_slices.iter().map(|v| v.as_slice()).collect();
 
     unsafe {
-        client.get_into_ranges(
+        client.get_into_ranges_with_query_cache(
             &scope.tenant,
             &ptrs,
             buffer_sizes,
@@ -1981,6 +2017,7 @@ fn execute_get_into_ranges(
             &dst_refs,
             &src_refs,
             &size_refs,
+            query_cache,
         )
     }
 }
@@ -1994,77 +2031,95 @@ fn execute_get_into_ranges_rpc(
     let tenant = normalized_tenant(client, &request.tenant);
     let regions = regions.lock();
 
-    let mut buffer_results = Vec::with_capacity(request.buffers.len());
+    let mut buffer_ptrs = Vec::with_capacity(request.buffers.len());
+    let mut buffer_sizes = Vec::with_capacity(request.buffers.len());
+    let mut all_keys = Vec::with_capacity(request.buffers.len());
+    let mut all_dst_offsets = Vec::with_capacity(request.buffers.len());
+    let mut all_src_offsets = Vec::with_capacity(request.buffers.len());
+    let mut all_sizes = Vec::with_capacity(request.buffers.len());
+
     for buf_group in &request.buffers {
-        let buffer_ref = match buf_group.buffer.as_ref() {
-            Some(b) => b,
-            None => {
-                buffer_results.push(pb::BufferKeyResults {
-                    key_results: buf_group
-                        .keys
+        let (buffer_ptr, buffer_size) =
+            match buf_group.buffer.as_ref().and_then(|buffer_ref| {
+                resolve_shared_slice_mut(&regions, client_id, buffer_ref).ok()
+            }) {
+                Some(buffer_slice) => (buffer_slice.as_mut_ptr() as usize, buffer_slice.len()),
+                None => (0, 0),
+            };
+        buffer_ptrs.push(buffer_ptr);
+        buffer_sizes.push(buffer_size);
+        all_keys.push(
+            buf_group
+                .keys
+                .iter()
+                .map(|key_group| key_group.key.clone())
+                .collect::<Vec<_>>(),
+        );
+        all_dst_offsets.push(
+            buf_group
+                .keys
+                .iter()
+                .map(|key_group| {
+                    key_group
+                        .fragments
                         .iter()
-                        .map(|kg| pb::KeyFragmentResults {
-                            fragment_results: vec![RANGE_READ_ERROR; kg.fragments.len().max(1)],
-                        })
-                        .collect(),
-                });
-                continue;
-            }
-        };
-        let buffer_slice = match resolve_shared_slice_mut(&regions, client_id, buffer_ref) {
-            Ok(s) => s,
-            Err(_) => {
-                buffer_results.push(pb::BufferKeyResults {
-                    key_results: buf_group
-                        .keys
+                        .map(|fragment| fragment.dst_offset as usize)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        all_src_offsets.push(
+            buf_group
+                .keys
+                .iter()
+                .map(|key_group| {
+                    key_group
+                        .fragments
                         .iter()
-                        .map(|kg| pb::KeyFragmentResults {
-                            fragment_results: vec![RANGE_READ_ERROR; kg.fragments.len().max(1)],
-                        })
-                        .collect(),
-                });
-                continue;
-            }
-        };
-        let buffer_ptr = buffer_slice.as_mut_ptr();
-        let buffer_size = buffer_slice.len();
-
-        let mut key_results = Vec::with_capacity(buf_group.keys.len());
-        for key_group in &buf_group.keys {
-            let mut fragment_results = Vec::with_capacity(key_group.fragments.len());
-            for frag in &key_group.fragments {
-                let dst_offset = frag.dst_offset as usize;
-                let src_offset = frag.src_offset as usize;
-                let size = frag.size as usize;
-
-                if dst_offset
-                    .checked_add(size)
-                    .is_none_or(|end| end > buffer_size)
-                {
-                    fragment_results.push(RANGE_READ_ERROR);
-                    continue;
-                }
-
-                let result = unsafe {
-                    client.get_into_range(
-                        &tenant,
-                        &key_group.key,
-                        buffer_ptr,
-                        buffer_size,
-                        dst_offset,
-                        src_offset,
-                        size,
-                    )
-                };
-                match result {
-                    Ok(bytes_read) => fragment_results.push(bytes_read as i64),
-                    Err(_) => fragment_results.push(RANGE_READ_ERROR),
-                }
-            }
-            key_results.push(pb::KeyFragmentResults { fragment_results });
-        }
-        buffer_results.push(pb::BufferKeyResults { key_results });
+                        .map(|fragment| fragment.src_offset as usize)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        all_sizes.push(
+            buf_group
+                .keys
+                .iter()
+                .map(|key_group| {
+                    key_group
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.size as usize)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
     }
+    let scope = CompatObjectScope {
+        tenant,
+        domain: DEFAULT_DOMAIN.to_string(),
+        object_set: DEFAULT_OBJECT_SET.to_string(),
+    };
+    let results = execute_get_into_ranges(
+        client,
+        scope,
+        &buffer_ptrs,
+        &buffer_sizes,
+        &all_keys,
+        &all_dst_offsets,
+        &all_src_offsets,
+        &all_sizes,
+        None,
+    );
+    let buffer_results = results
+        .into_iter()
+        .map(|key_results| pb::BufferKeyResults {
+            key_results: key_results
+                .into_iter()
+                .map(|fragment_results| pb::KeyFragmentResults { fragment_results })
+                .collect(),
+        })
+        .collect();
     pb::GetIntoRangesReply { buffer_results }
 }
 

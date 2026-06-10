@@ -1136,11 +1136,7 @@ fn seconds_to_us(value: f64) -> u64 {
 }
 
 fn avg_us(total_us: u64, count: u64) -> u64 {
-    if count == 0 {
-        0
-    } else {
-        total_us / count
-    }
+    total_us.checked_div(count).unwrap_or(0)
 }
 
 #[cfg(test)]
