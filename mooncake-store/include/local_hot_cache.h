@@ -20,6 +20,15 @@
 namespace mooncake {
 
 /**
+ * @brief Token captured at async hot cache fill submission time.
+ * Invalidated when RemoveHotKey or Clear bumps generation/epoch.
+ */
+struct HotCachePutToken {
+    uint64_t cache_epoch = 0;
+    uint64_t key_generation = 0;
+};
+
+/**
  * @brief Memory block metadata for hot cache.
  */
 struct HotMemBlock {
@@ -90,6 +99,30 @@ class LocalHotCache {
      * @return true if key exists and was touched, false otherwise.
      */
     bool TouchHotKey(const std::string& key);
+
+    /**
+     * @brief Remove a key from the hot cache immediately.
+     * Bumps the key generation so in-flight async fills are invalidated.
+     * @param key The key to remove from cache.
+     * @return true if a published cache entry was removed, false otherwise.
+     */
+    bool RemoveHotKey(const std::string& key);
+
+    /**
+     * @brief Clear all hot cache entries and invalidate in-flight async fills.
+     */
+    void Clear();
+
+    /**
+     * @brief Capture the current put token for async hot cache fill validation.
+     */
+    HotCachePutToken AcquirePutToken(const std::string& key);
+
+    /**
+     * @brief Check whether an async put token is still valid.
+     */
+    bool IsPutTokenValid(const std::string& key,
+                         const HotCachePutToken& token) const;
 
     /**
      * @brief Get a free block for writing.
@@ -165,6 +198,9 @@ class LocalHotCache {
     // key -> iterator of lru_queue_
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>
         key_to_lru_it_ GUARDED_BY(lru_mutex_);
+    std::unordered_map<std::string, uint64_t> key_generation_
+        GUARDED_BY(lru_mutex_);
+    std::atomic<uint64_t> cache_epoch_{0};
 };
 
 /**
@@ -175,13 +211,19 @@ struct HotCachePutTask {
     HotMemBlock* block;  // Pointer to the allocated block
     size_t size;
     std::shared_ptr<LocalHotCache> hot_cache;
+    HotCachePutToken token;
 
     // Default constructor for empty task
     HotCachePutTask() : block(nullptr), size(0), hot_cache(nullptr) {}
 
     HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
-                    std::shared_ptr<LocalHotCache> cache)
-        : key(k), block(blk), size(slice.size), hot_cache(std::move(cache)) {
+                    std::shared_ptr<LocalHotCache> cache,
+                    HotCachePutToken put_token)
+        : key(k),
+          block(blk),
+          size(slice.size),
+          hot_cache(std::move(cache)),
+          token(put_token) {
         // No data copy here; memcpy is done by SubmitPutTask into block->addr.
     }
 };

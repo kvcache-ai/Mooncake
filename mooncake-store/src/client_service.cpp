@@ -1490,6 +1490,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         client_cfg.preferred_segment = local_hostname_;
     }
 
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result) {
@@ -1594,6 +1598,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     ReplicateConfig client_cfg = config;
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
+    }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
     }
 
     // Start upsert operation
@@ -1824,6 +1832,12 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
 
+    if (hot_cache_) {
+        for (const auto& op : ops) {
+            hot_cache_->RemoveHotKey(op.key);
+        }
+    }
+
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
 
@@ -1882,6 +1896,12 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+
+    if (hot_cache_) {
+        for (const auto& op : ops) {
+            hot_cache_->RemoveHotKey(op.key);
+        }
+    }
 
     for (const auto& op : ops) {
         keys.emplace_back(op.key);
@@ -2513,6 +2533,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
@@ -2520,6 +2544,11 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (!result) {
         return tl::unexpected(result.error());
     }
+
+    if (hot_cache_) {
+        hot_cache_->RemoveHotKey(key);
+    }
+
     return {};
 }
 
@@ -2532,6 +2561,9 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     if (!result) {
         return tl::unexpected(result.error());
     }
+    if (hot_cache_) {
+        hot_cache_->Clear();
+    }
     return result.value();
 }
 
@@ -2540,12 +2572,31 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     if (result && storage_backend_) {
         storage_backend_->RemoveAll();
     }
+    if (result && hot_cache_) {
+        hot_cache_->Clear();
+    }
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
-    return master_client_.BatchRemove(keys, force);
+    if (hot_cache_) {
+        for (const auto& key : keys) {
+            hot_cache_->RemoveHotKey(key);
+        }
+    }
+
+    auto results = master_client_.BatchRemove(keys, force);
+
+    if (hot_cache_) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i < results.size() && results[i].has_value()) {
+                hot_cache_->RemoveHotKey(keys[i]);
+            }
+        }
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> Client::EvictDiskReplica(
