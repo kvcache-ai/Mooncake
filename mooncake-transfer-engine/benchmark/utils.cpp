@@ -53,17 +53,9 @@ DEFINE_string(
     "tent only: per-request transport_hint. "
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
 
-// All-to-all multi-node configuration flags
-DEFINE_bool(enable_alltoall, false,
-            "Enable all-to-all multi-node testing mode");
-DEFINE_string(
-    test_id, "default-test",
-    "Unique identifier for this test run (must be same on all nodes)");
-DEFINE_int32(num_nodes, 1, "Total number of nodes in the test");
-DEFINE_int32(node_rank, 0,
-             "Rank of this node (0-based, must be unique per node)");
-DEFINE_int32(sync_timeout_sec, 120,
-             "Timeout for node synchronization (seconds)");
+DEFINE_string(coordinator, "", "Coordinator server address");
+DEFINE_int32(wait_timeout, 300,
+             "Timeout in seconds for waiting for all nodes to register (default: 300s)");
 
 namespace mooncake {
 namespace tent {
@@ -93,12 +85,8 @@ std::string XferBenchConfig::tent_transport_hint;
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
-// All-to-all multi-node configuration
-bool XferBenchConfig::enable_alltoall = false;
-std::string XferBenchConfig::test_id;
-int32_t XferBenchConfig::num_nodes = 1;
-int32_t XferBenchConfig::node_rank = 0;
-int32_t XferBenchConfig::sync_timeout_sec = 120;
+std::string XferBenchConfig::coordinator;
+int XferBenchConfig::wait_timeout = 300;
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
@@ -128,12 +116,8 @@ void XferBenchConfig::loadFromFlags() {
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
 
-    // All-to-all configuration
-    enable_alltoall = FLAGS_enable_alltoall;
-    test_id = FLAGS_test_id;
-    num_nodes = FLAGS_num_nodes;
-    node_rank = FLAGS_node_rank;
-    sync_timeout_sec = FLAGS_sync_timeout_sec;
+    coordinator = FLAGS_coordinator;
+    wait_timeout = FLAGS_wait_timeout;
 }
 
 double XferMetricStats::percentile(double p) const {
@@ -167,6 +151,22 @@ void printStatsHeader() {
     // clang-format on
 }
 
+void printStatsAllToAllHeader() {
+    // clang-format off
+    std::cout << std::left
+              << std::setw(5) << "Node"
+              << std::setw(14) << "BlkSize (B)"
+              << std::setw(8) << "Batch"
+              << std::setw(14) << "BW (GB/S)"
+              << std::setw(14) << "Avg Lat (us)"
+              << std::setw(14) << "Avg Tx (us)"
+              << std::setw(14) << "P99 Tx (us)"
+              << std::setw(14) << "P999 Tx (us)"
+              << std::endl;
+    std::cout << std::string(160, '-') << std::endl;
+    // clang-format on
+}
+
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads) {
     size_t total_data_transferred = 0;
@@ -181,6 +181,38 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     // Tabulate print with fixed width for each string
     // clang-format off
     std::cout << std::left << std::fixed << std::setprecision(6)
+              << std::setw(14) << block_size
+              << std::setw(8)  << batch_size
+              << std::setw(14) << throughput_gb
+              << std::setprecision(1)
+              << std::setw(14) << avg_latency
+              << std::setw(14) << stats.transfer_duration.avg()
+              << std::setw(14) << stats.transfer_duration.p99()
+              << std::setw(14) << stats.transfer_duration.p999()
+              << std::endl;
+    // clang-format on
+}
+
+void printStatsAllToAll(int node_rank, int total_nodes, size_t num_targets,
+                         size_t block_size, size_t batch_size,
+                         XferBenchStats& stats, int num_threads) {
+    size_t total_data_transferred = 0;
+    double avg_latency = 0, throughput_gb = 0;
+    auto num_ops = stats.transfer_duration.count();
+    double total_duration = stats.total_duration.avg();
+    total_data_transferred = ((block_size * batch_size) * num_ops);
+    avg_latency = (total_duration * num_threads / num_ops);
+    throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
+                     (total_duration / 1e6));  // In GB/Sec
+
+    // Calculate flows per node
+    size_t flows_per_node = num_targets * num_threads;
+
+    // Tabulate print with fixed width for each string
+    // clang-format off
+    std::cout << std::left << std::fixed << std::setprecision(6)
+              << "\033[36m" << std::setw(5) << ("[" + std::to_string(node_rank) + "/" +
+                                               std::to_string(total_nodes) + "]") << "\033[0m"
               << std::setw(14) << block_size
               << std::setw(8)  << batch_size
               << std::setw(14) << throughput_gb

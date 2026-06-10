@@ -46,3 +46,22 @@ endif()
 set_target_properties(
   tebench PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
                      INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")
+
+if(USE_TENT)
+  add_executable(coordinator coordinator.cpp)
+  target_compile_definitions(coordinator PUBLIC
+    BUILDING_COORDINATOR_SERVER)
+  target_include_directories(coordinator PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tent/include
+  )
+  target_link_libraries(coordinator PRIVATE
+    tent_link_group
+    gflags::gflags
+    glog::glog
+  )
+  # Set RPATH for the coordinator executable
+  set_target_properties(
+    coordinator PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE
+                       INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN/../../mooncake-common")
+endif()

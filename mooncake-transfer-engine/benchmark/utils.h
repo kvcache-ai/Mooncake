@@ -77,13 +77,8 @@ struct XferBenchConfig {
 
     static int local_gpu_id;
     static int target_gpu_id;
-
-    // All-to-all multi-node configuration
-    static bool enable_alltoall;
-    static std::string test_id;
-    static int32_t num_nodes;
-    static int32_t node_rank;
-    static int32_t sync_timeout_sec;
+    static std::string coordinator;
+    static int wait_timeout;  // Timeout in seconds for waiting for all nodes
 };
 
 struct XferMetricStats {
@@ -157,6 +152,13 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
+
+// Print statistics for all-to-all mode (includes node rank and target count)
+void printStatsAllToAll(int node_rank, int total_nodes, size_t num_targets,
+                        size_t block_size, size_t batch_size,
+                        XferBenchStats& stats, int num_threads);
+
+void printStatsAllToAllHeader();
 
 #ifdef USE_CUDA
 static inline bool isCudaMemory(void* ptr) {

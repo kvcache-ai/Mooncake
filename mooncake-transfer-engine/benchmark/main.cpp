@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "utils.h"
+#include "common.h"
 
 #include "bench_runner.h"
 #include "te_backend.h"
@@ -20,6 +21,7 @@
 #include "tent_backend.h"
 #include "tent/transfer_engine.h"
 #include "tent/common/types.h"
+#include "coordinator.h"
 #endif
 
 #include <thread>
@@ -110,72 +112,6 @@ static BenchmarkResult createResult(int node_rank, size_t block_size,
     result.transfer_duration_p99 = stats.transfer_duration.p99();
     result.transfer_duration_p999 = stats.transfer_duration.p999();
     return result;
-}
-
-/**
- * Send single result to rank 0
- */
-static void sendResultToRank0(TransferEngine* engine,
-                              const BenchmarkResult& result) {
-    // Use the target with rank 0's segment
-    std::string rank0_segment =
-        "tebench_alltoall_" + XferBenchConfig::test_id + "_node_0";
-
-    SegmentID rank0_handle;
-    auto status = engine->openSegment(rank0_handle, rank0_segment);
-    if (!status.ok()) {
-        LOG(WARNING) << "Failed to open rank 0 segment: " << status.ToString();
-        return;
-    }
-
-    Notification notifi{"benchmark_result", result.serialize()};
-    status = engine->sendNotification(rank0_handle, notifi);
-    if (!status.ok()) {
-        LOG(WARNING) << "Failed to send result: " << status.ToString();
-    }
-
-    engine->closeSegment(rank0_handle);
-}
-
-/**
- * Send all results to rank 0 in batch
- */
-static void sendAllResultsToRank0(TransferEngine* engine,
-                                  const std::vector<BenchmarkResult>& results) {
-    if (results.empty()) {
-        LOG(WARNING) << "No results to send";
-        return;
-    }
-
-    // Serialize all results into one message
-    std::ostringstream oss;
-    oss << results.size();
-    for (const auto& result : results) {
-        oss << "|" << result.serialize();
-    }
-
-    // Use the target with rank 0's segment
-    std::string rank0_segment =
-        "tebench_alltoall_" + XferBenchConfig::test_id + "_node_0";
-
-    SegmentID rank0_handle;
-    auto status = engine->openSegment(rank0_handle, rank0_segment);
-    if (!status.ok()) {
-        LOG(WARNING) << "Failed to open rank 0 segment for sending results: "
-                     << status.ToString();
-        return;
-    }
-
-    Notification notifi{"benchmark_results", oss.str()};
-    status = engine->sendNotification(rank0_handle, notifi);
-    if (!status.ok()) {
-        LOG(WARNING) << "Failed to send results to rank 0: "
-                     << status.ToString();
-    } else {
-        LOG(INFO) << "Sent " << results.size() << " test results to rank 0";
-    }
-
-    engine->closeSegment(rank0_handle);
 }
 
 /**
@@ -308,7 +244,6 @@ static void printSingleConfigAggregatedStats(
               << std::setw(14) << avg_transfer
               << std::setw(14) << p99_transfer
               << std::setw(14) << p999_transfer
-              << " (" << total_flows << " flows)"
               << std::endl;
     // clang-format on
 }
@@ -440,10 +375,8 @@ static XferBenchStats processBatchSizesAllToAll(BenchRunner& runner,
         return stats;
     }
 
-    if (XferBenchConfig::node_rank == 0) {
-        LOG(INFO) << "Running all-to-all test: " << num_threads << " threads, "
-                  << num_targets << " targets per thread";
-    }
+    LOG(INFO) << "Running all-to-all test: " << num_threads << " threads, "
+              << num_targets << " targets per thread";
 
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
@@ -524,55 +457,98 @@ static XferBenchStats processBatchSizesAllToAll(BenchRunner& runner,
     return stats;
 }
 
-/**
- * Generate segment names for all nodes
- */
-std::vector<std::string> generateSegmentNames(const std::string& test_id,
-                                              int num_nodes) {
-    std::vector<std::string> names;
-    for (int i = 0; i < num_nodes; ++i) {
-        names.push_back("tebench_alltoall_" + test_id + "_node_" +
-                        std::to_string(i));
-    }
-    return names;
+#ifdef USE_TENT
+// Helper function to get current time in nanoseconds
+static inline int64_t getCurrentTimeNs() {
+    auto ret = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(ret).count();
 }
 
 /**
- * Run all-to-all multi-node benchmark
+ * Run all-to-all benchmark using coordinator mode
+ * This uses a coordinator server for node discovery and result aggregation
+ * Node rank is automatically assigned by the coordinator
  */
-int runAllToAllBenchmark(BenchRunner& runner) {
-    LOG(INFO) << "=== All-to-All Multi-Node Benchmark ===";
-    LOG(INFO) << "Test ID: " << XferBenchConfig::test_id;
-    LOG(INFO) << "Num Nodes: " << XferBenchConfig::num_nodes;
-    LOG(INFO) << "Node Rank: " << XferBenchConfig::node_rank;
+int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
+    using namespace mooncake::bench;
 
-    if (XferBenchConfig::node_rank < 0 ||
-        XferBenchConfig::node_rank >= XferBenchConfig::num_nodes) {
-        LOG(ERROR) << "Invalid node_rank: " << XferBenchConfig::node_rank
-                   << " (must be 0-" << XferBenchConfig::num_nodes - 1 << ")";
+    LOG(INFO) << "=== All-to-All with Coordinator ===";
+    LOG(INFO) << "Coordinator: " << XferBenchConfig::coordinator;
+
+    // Get local segment name (IP:Port in P2P mode)
+    auto* tent_runner = dynamic_cast<TENTBenchRunner*>(&runner);
+    if (!tent_runner) {
+        LOG(ERROR) << "Coordinator mode requires TENT backend";
         return -1;
     }
 
-    // Generate all segment names
-    auto all_segments = generateSegmentNames(XferBenchConfig::test_id,
-                                             XferBenchConfig::num_nodes);
+    std::string my_segment_name = tent_runner->getSegmentName();
+    std::string my_hostname = mooncake::getHostname();
 
-    // Publish my segment (segment is already published during engine init)
-    std::string my_segment = all_segments[XferBenchConfig::node_rank];
-    runner.publishSegment(my_segment);
+    LOG(INFO) << "My segment name: " << my_segment_name;
+    LOG(INFO) << "My hostname: " << my_hostname;
 
-    // Determine target segments (all except my own)
-    std::vector<std::string> target_segments;
-    for (int i = 0; i < XferBenchConfig::num_nodes; ++i) {
-        if (i != XferBenchConfig::node_rank) {
-            target_segments.push_back(all_segments[i]);
-        }
+    // Connect to coordinator
+    auto client =
+        std::make_unique<CoordinatorClient>(XferBenchConfig::coordinator);
+    if (!client->Connect()) {
+        LOG(ERROR) << "Failed to connect to coordinator";
+        return -1;
     }
 
-    LOG(INFO) << "Connecting to " << target_segments.size()
-              << " target segments";
-    for (size_t i = 0; i < target_segments.size(); ++i) {
-        LOG(INFO) << "  Target " << i << ": " << target_segments[i];
+    // Register with coordinator (will be assigned a rank)
+    RegisterRequest reg_req;
+    reg_req.rpc_address = my_segment_name;
+    reg_req.hostname = my_hostname;
+
+    auto reg_result = client->RegisterNode(reg_req);
+    if (!reg_result.has_value()) {
+        LOG(ERROR) << "Failed to register with coordinator";
+        return -1;
+    }
+
+    // Get assigned rank and total nodes
+    int32_t my_rank = reg_result->assigned_rank;
+    int32_t total_nodes = reg_result->total_nodes;
+
+    LOG(INFO) << "Registered as node " << my_rank << " of " << total_nodes;
+
+    // Wait for all nodes with timeout
+    int wait_timeout = 300;  // 5 minutes default wait timeout
+    if (XferBenchConfig::wait_timeout > 0) {
+        wait_timeout = XferBenchConfig::wait_timeout;
+    }
+
+    auto nodes_result = client->WaitForAll(my_rank, wait_timeout);
+    if (!nodes_result.has_value()) {
+        auto error = nodes_result.error();
+        if (error == ErrorCode::TIMEOUT) {
+            LOG(ERROR) << "Timeout waiting for all nodes (waited "
+                       << wait_timeout << " seconds)";
+            LOG(ERROR) << "This usually means:";
+            LOG(ERROR) << "  1. Not all nodes have started - check that all "
+                       << total_nodes << " nodes are running";
+            LOG(ERROR) << "  2. Some nodes may have crashed - check their logs";
+            LOG(ERROR) << "  3. Network connectivity issues - check firewall "
+                          "and routing";
+        } else {
+            LOG(ERROR) << "Failed waiting for all nodes, error code: "
+                       << static_cast<int>(error);
+        }
+        return -1;
+    }
+
+    auto& all_nodes = nodes_result.value();
+    LOG(INFO) << "All nodes ready! Got " << all_nodes.size() << " nodes:";
+
+    // Build target segments list (all except my own)
+    std::vector<std::string> target_segments;
+    for (const auto& node : all_nodes) {
+        if (node.node_rank != my_rank) {
+            target_segments.push_back(node.rpc_address);
+            LOG(INFO) << "  - Node " << node.node_rank << ": "
+                      << node.rpc_address << " (" << node.hostname << ")";
+        }
     }
 
     if (target_segments.empty()) {
@@ -580,42 +556,24 @@ int runAllToAllBenchmark(BenchRunner& runner) {
         return 0;
     }
 
-    // Connect to ALL target segments with automatic synchronization
-    LOG(INFO) << "Starting barrier synchronization (timeout: "
-              << XferBenchConfig::sync_timeout_sec << "s)";
-    int rc = runner.connectToAllTargets(target_segments,
-                                        XferBenchConfig::sync_timeout_sec);
+    // Connect to all targets (skip sync since coordinator already handled it)
+    LOG(INFO) << "Connecting to " << target_segments.size() << " targets...";
+
+    // Use connectToAllTargets with 0 timeout to skip sync
+    int rc = runner.connectToAllTargets(target_segments, 0);
     if (rc != 0) {
-        LOG(ERROR) << "Failed to connect to all target segments";
+        LOG(ERROR) << "Failed to connect to targets";
         return rc;
     }
 
-    // Add a small synchronization delay to ensure all nodes have completed
-    // connections
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    LOG(INFO) << "Connected to all targets, starting tests...";
 
-#ifdef USE_TENT
-    if (XferBenchConfig::backend == "tent") {
-        auto* tent_runner = dynamic_cast<TENTBenchRunner*>(&runner);
-        if (tent_runner) {
-            // Access the engine through the runner
-            // Note: This would require exposing getEngine() in TENTBenchRunner
-            // For now, we'll skip notification and just have rank 0 display
-            // results
-            LOG(INFO) << "Running with TENT backend - results will be "
-                         "aggregated on rank 0";
-        }
-    }
-#endif
+    // Print header for local results
+    std::cout << "\n\033[32m===== Local Node Results (Node " << my_rank << "/"
+              << total_nodes << ") =====\033[0m" << std::endl;
+    printStatsAllToAllHeader();
 
-    // Print header on rank 0 before starting tests
-    if (XferBenchConfig::node_rank == 0) {
-        std::cout << "\n\033[32m===== All-to-All Aggregated Results ("
-                  << XferBenchConfig::num_nodes << " nodes) =====\033[0m"
-                  << std::endl;
-        printAggregatedHeader();
-    }
-
+    // Run tests
     bool interrupted = false;
 
     for (int num_threads = XferBenchConfig::start_num_threads;
@@ -631,12 +589,10 @@ int runAllToAllBenchmark(BenchRunner& runner) {
                  batch_size *= 2) {
                 if (block_size * batch_size * num_threads >
                     XferBenchConfig::total_buffer_size) {
-                    if (XferBenchConfig::node_rank == 0) {
-                        LOG(INFO) << "Skipped for block_size " << block_size
-                                  << " batch_size " << batch_size;
-                    }
+                    LOG(INFO) << "Skipped for block_size " << block_size
+                              << " batch_size " << batch_size;
                 } else {
-                    // Run the test and get statistics
+                    // Run the test
                     auto stats = processBatchSizesAllToAll(
                         runner, block_size, batch_size, num_threads);
 
@@ -645,131 +601,61 @@ int runAllToAllBenchmark(BenchRunner& runner) {
                         break;
                     }
 
-                    // Create result for this test configuration
-                    auto my_result = createResult(
-                        XferBenchConfig::node_rank, block_size, batch_size,
-                        num_threads, target_segments.size(), stats);
+                    // Report result to coordinator
+                    ResultReport report;
+                    report.node_rank = my_rank;
+                    report.num_threads = num_threads;
+                    report.block_size = block_size;
+                    report.batch_size = batch_size;
+                    report.total_samples = stats.transfer_duration.count();
+                    report.total_duration_avg = stats.total_duration.avg();
+                    report.transfer_duration_avg =
+                        stats.transfer_duration.avg();
+                    report.transfer_duration_min =
+                        stats.transfer_duration.min();
+                    report.transfer_duration_max =
+                        stats.transfer_duration.max();
+                    report.transfer_duration_p99 =
+                        stats.transfer_duration.p99();
+                    report.transfer_duration_p999 =
+                        stats.transfer_duration.p999();
 
-#ifdef USE_TENT
-                    // Collect and display aggregated results for this
-                    // configuration
-                    if (XferBenchConfig::node_rank == 0) {
-                        // Rank 0: collect results from all other nodes for this
-                        // config
-                        std::vector<BenchmarkResult> config_results;
-                        config_results.push_back(
-                            my_result);  // Add rank 0's result
+                    // Print local result immediately
+                    printStatsAllToAll(my_rank, total_nodes,
+                                       target_segments.size(), block_size,
+                                       batch_size, stats, num_threads);
 
-                        int expected_nodes = XferBenchConfig::num_nodes - 1;
-
-                        auto* tent_runner =
-                            dynamic_cast<TENTBenchRunner*>(&runner);
-                        if (tent_runner && tent_runner->getEngine()) {
-                            // Collect results from other nodes
-                            std::map<int, std::vector<BenchmarkResult>>
-                                node_results;
-
-                            // Wait for results from all other nodes
-                            auto start_time = std::chrono::steady_clock::now();
-                            int timeout_sec = 30;
-                            std::set<int> received_nodes;
-
-                            while ((int)received_nodes.size() <
-                                   expected_nodes) {
-                                auto now = std::chrono::steady_clock::now();
-                                auto elapsed =
-                                    std::chrono::duration_cast<
-                                        std::chrono::seconds>(now - start_time)
-                                        .count();
-
-                                if (elapsed >= timeout_sec) {
-                                    LOG(WARNING)
-                                        << "Timeout waiting for results. "
-                                           "Received from "
-                                        << received_nodes.size() << " of "
-                                        << expected_nodes << " nodes";
-                                    break;
-                                }
-
-                                std::vector<Notification> notifications;
-                                auto status =
-                                    tent_runner->getEngine()
-                                        ->receiveNotification(notifications);
-                                if (!status.ok()) {
-                                    std::this_thread::sleep_for(
-                                        std::chrono::milliseconds(50));
-                                    continue;
-                                }
-
-                                for (const auto& notif : notifications) {
-                                    if (notif.name == "benchmark_result") {
-                                        try {
-                                            auto result =
-                                                BenchmarkResult::deserialize(
-                                                    notif.msg);
-                                            node_results[result.node_rank]
-                                                .push_back(result);
-                                            received_nodes.insert(
-                                                result.node_rank);
-                                        } catch (const std::exception& e) {
-                                            LOG(WARNING)
-                                                << "Failed to deserialize "
-                                                   "result: "
-                                                << e.what();
-                                        }
-                                    }
-                                }
-
-                                if (notifications.empty()) {
-                                    std::this_thread::sleep_for(
-                                        std::chrono::milliseconds(20));
-                                }
-                            }
-
-                            // Add results from other nodes
-                            for (const auto& [node_rank, node_result_list] :
-                                 node_results) {
-                                for (const auto& result : node_result_list) {
-                                    config_results.push_back(result);
-                                }
-                            }
-
-                            // Print aggregated result for this configuration
-                            printSingleConfigAggregatedStats(
-                                config_results, XferBenchConfig::num_nodes);
-                        } else {
-                            LOG(WARNING) << "Failed to get TENT engine";
-                        }
-                    } else {
-                        // Other ranks: send result to rank 0 immediately
-                        auto* tent_runner =
-                            dynamic_cast<TENTBenchRunner*>(&runner);
-                        if (tent_runner && tent_runner->getEngine()) {
-                            sendResultToRank0(tent_runner->getEngine(),
-                                              my_result);
-                        }
+                    auto ack = client->ReportResult(report);
+                    if (!ack.has_value() || !ack->success) {
+                        LOG(WARNING) << "Failed to report result for config "
+                                     << "(threads=" << num_threads
+                                     << ", block=" << block_size
+                                     << ", batch=" << batch_size << ")";
                     }
-#else
-                    // Without TENT, rank 0 prints local result only
-                    if (XferBenchConfig::node_rank == 0) {
-                        std::vector<BenchmarkResult> local_results;
-                        local_results.push_back(my_result);
-                        printSingleConfigAggregatedStats(local_results, 1);
-                    }
-#endif
                 }
             }
         }
         runner.stopInitiator();
     }
 
-    if (XferBenchConfig::node_rank == 0) {
-        std::cout << "\033[32m" << std::string(160, '=') << "\033[0m"
-                  << std::endl;
+    LOG(INFO)
+        << "All tests complete. Results will be displayed by coordinator.";
+    LOG(INFO) << "Waiting for coordinator to exit...";
+
+    // Wait for coordinator to exit by pinging periodically
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        PingRequest req{my_rank};
+        auto result = client->Ping(req);
+        if (!result.has_value() || !result->alive) {
+            LOG(INFO) << "Coordinator has exited, shutting down.";
+            break;
+        }
     }
 
     return 0;
 }
+#endif  // USE_TENT
 
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
@@ -780,10 +666,11 @@ int main(int argc, char* argv[]) {
         "     Start target: ./tebench --seg_name=my_segment\n"
         "     Start initiator: ./tebench --target_seg_name=my_segment\n\n"
         "  2. All-to-All: Multi-node full mesh test\n"
-        "     ./tebench --enable_alltoall --test_id=mytest --num_nodes=4 "
-        "--node_rank=0\n"
-        "     (repeat on each node with different node_rank)\n\n"
-        "  All-to-all results are aggregated and displayed on rank 0 only.");
+        "     First start coordinator: ./coordinator --num_nodes=4\n"
+        "     Then on each node (all nodes use same command):\n"
+        "     ./tebench --coordinator=IP:PORT\n\n"
+        "  When --coordinator is set, all-to-all mode is automatically "
+        "enabled.");
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
@@ -803,14 +690,20 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // All-to-All multi-node mode
-    if (XferBenchConfig::enable_alltoall) {
+    // Coordinator mode (implies all-to-all)
+    if (!XferBenchConfig::coordinator.empty()) {
         if (XferBenchConfig::backend != "tent") {
-            LOG(ERROR)
-                << "All-to-all mode requires TENT backend (use --backend=tent)";
+            LOG(ERROR) << "Coordinator mode requires TENT backend (use "
+                          "--backend=tent)";
             return EXIT_FAILURE;
         }
-        return runAllToAllBenchmark(*runner);
+
+#ifdef USE_TENT
+        return runAllToAllBenchmarkWithCoordinator(*runner);
+#else
+        LOG(ERROR) << "Coordinator mode requires building with -DUSE_TENT=ON";
+        return EXIT_FAILURE;
+#endif
     }
 
     // Single-target mode (default)
