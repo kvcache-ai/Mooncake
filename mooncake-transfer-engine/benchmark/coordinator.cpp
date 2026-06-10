@@ -269,7 +269,7 @@ void CoordinatorService::PrintResults() {
                 // Since total_duration_avg is accumulated across threads,
                 // divide by num_threads to get actual execution time per run
                 double node_avg_lat =
-                    (r.total_duration_avg / r.num_threads) / r.total_samples;
+                    (r.total_duration_avg * r.num_threads) / r.total_samples;
                 total_lat += node_avg_lat;
                 // Avg Tx: single transfer time to one target (already correct)
                 total_tx += r.transfer_duration_avg;
