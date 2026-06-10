@@ -10,7 +10,7 @@ pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ExecutionFairness, GetRequest, HealthChannel,
     HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade, MultiBufferGetRequest,
     MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest, PutRequest,
-    ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use memory::LocalMemoryConfig;
