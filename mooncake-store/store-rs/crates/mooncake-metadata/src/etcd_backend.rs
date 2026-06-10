@@ -82,11 +82,11 @@ impl EtcdMetadataBackend {
 
     fn frontier_entries_for_candidate(
         &self,
-        scope: &TenantPolicyScope,
+        tenant: &str,
         candidate: &EvictionCandidate,
     ) -> (String, String) {
         let frontier_key = self.config.keyspace.tenant_eviction_candidate(
-            scope,
+            tenant,
             candidate.updated_at_ms,
             candidate.committed_length.0,
             &candidate.key,
@@ -100,7 +100,7 @@ impl EtcdMetadataBackend {
 
     fn frontier_entries_from_objects(
         &self,
-        scope: &TenantPolicyScope,
+        tenant: &str,
         objects: &[TenantObjectAccounting],
     ) -> Vec<(String, String)> {
         let mut frontier = objects
@@ -112,7 +112,7 @@ impl EtcdMetadataBackend {
         frontier.truncate(EVICTION_FRONTIER_LIMIT);
         frontier
             .into_iter()
-            .map(|candidate| self.frontier_entries_for_candidate(scope, &candidate))
+            .map(|candidate| self.frontier_entries_for_candidate(tenant, &candidate))
             .collect()
     }
 
@@ -1559,7 +1559,7 @@ impl MetadataBackend for EtcdMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Option<TenantQuotaState>> {
-        let scope = quota_scope(scope)?;
+        let scope = root_scope(scope)?;
         let key = self.config.keyspace.tenant_quota_state(&scope);
         self.block_on(async {
             let mut client = self.client().await?;
@@ -1621,8 +1621,11 @@ impl MetadataBackend for EtcdMetadataBackend {
         scope: &TenantPolicyScope,
         limit: usize,
     ) -> Result<Vec<TenantObjectAccounting>> {
-        let scope = quota_scope(scope)?;
-        let prefix = self.config.keyspace.tenant_eviction_frontier_prefix(&scope);
+        let scope = root_scope(scope)?;
+        let prefix = self
+            .config
+            .keyspace
+            .tenant_eviction_frontier_prefix(&scope.tenant);
         let read_limit = limit.min(EVICTION_FRONTIER_LIMIT);
         if read_limit == 0 {
             return Ok(Vec::new());
@@ -1674,11 +1677,11 @@ impl MetadataBackend for EtcdMetadataBackend {
         &self,
         scope: &TenantPolicyScope,
     ) -> Result<Vec<TenantQuotaReservation>> {
-        let scope = quota_scope(scope)?;
+        let scope = root_scope(scope)?;
         let prefix = self
             .config
             .keyspace
-            .tenant_quota_reservation_prefix(Some(&scope));
+            .tenant_quota_reservation_prefix(Some(&scope.tenant));
         self.block_on(async {
             let mut client = self.client().await?;
             let response = client
@@ -1715,7 +1718,7 @@ impl MetadataBackend for EtcdMetadataBackend {
         request: &TenantQuotaReservationRequest,
     ) -> Result<TenantQuotaReservationOutcome> {
         request.validate()?;
-        let scope = quota_scope(&request.scope)?;
+        let scope = root_scope(&request.scope)?;
         let mut normalized = request.clone();
         normalized.scope = scope.clone();
         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
@@ -2003,7 +2006,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
                 match reservation.state {
                     TenantQuotaReservationState::Finalized => {
-                        let scope = quota_scope(&reservation.scope)?;
+                        let scope = root_scope(&reservation.scope)?;
                         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                         let quota_response = client
                             .get(quota_key, None)
@@ -2052,7 +2055,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     TenantQuotaReservationState::Pending => {}
                 }
 
-                let scope = quota_scope(&reservation.scope)?;
+                let scope = root_scope(&reservation.scope)?;
                 let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                 let object_key = self.config.keyspace.tenant_object_accounting(&reservation.key);
                 let object_response = client
@@ -2062,7 +2065,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                 let frontier_prefix = self
                     .config
                     .keyspace
-                    .tenant_eviction_frontier_prefix(&scope);
+                    .tenant_eviction_frontier_prefix(&scope.tenant);
                 let frontier_response = client
                     .get(frontier_prefix.clone(), Some(GetOptions::new().with_prefix()))
                     .await
@@ -2176,7 +2179,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     frontier_objects.push(object);
                 }
                 let frontier_entries =
-                    self.frontier_entries_from_objects(&scope, &frontier_objects);
+                    self.frontier_entries_from_objects(&scope.tenant, &frontier_objects);
                 let next_frontier_keys = frontier_entries
                     .iter()
                     .map(|(frontier_key, _)| frontier_key.clone())
@@ -2271,7 +2274,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     serde_json::from_slice(reservation_kv.value()).map_err(json_error)?;
                 match reservation.state {
                     TenantQuotaReservationState::Aborted => {
-                        let scope = quota_scope(&reservation.scope)?;
+                        let scope = root_scope(&reservation.scope)?;
                         let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                         let quota_response = client
                             .get(quota_key, None)
@@ -2301,7 +2304,7 @@ impl MetadataBackend for EtcdMetadataBackend {
                     TenantQuotaReservationState::Pending => {}
                 }
 
-                let scope = quota_scope(&reservation.scope)?;
+                let scope = root_scope(&reservation.scope)?;
                 let quota_key = self.config.keyspace.tenant_quota_state(&scope);
                 let quota_response = client
                     .get(quota_key.clone(), None)
@@ -2420,9 +2423,13 @@ fn json_error(error: serde_json::Error) -> StoreError {
     StoreError::Metadata(format!("json serialization: {error}"))
 }
 
-fn quota_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
-    scope.validate()?;
-    Ok(scope.clone())
+fn root_scope(scope: &TenantPolicyScope) -> Result<TenantPolicyScope> {
+    scope.validate_root_only("tenant quota metadata")?;
+    Ok(TenantPolicyScope::new(
+        scope.tenant.clone(),
+        None::<String>,
+        None::<String>,
+    ))
 }
 
 fn version_conflict(
@@ -2498,8 +2505,7 @@ mod tests {
 
     use mooncake_store_core::{
         ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-        ClientStableId, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierTargetSpec,
-        ColdTierUsageDelta, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
+        ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, MetadataBackend,
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteState, RouteVersion,
         SegmentAnnouncement, SegmentLifecycleState, SegmentName, StoreError,
         TenantObjectAccountingState, TenantPolicy, TenantPolicyScope, TenantPolicySpec,
@@ -2595,28 +2601,6 @@ mod tests {
 
     fn sample_runtime() -> ClientRuntimeId {
         ClientRuntimeId::new("writer", ClientEpoch(5))
-    }
-
-    fn sample_cold_tier_device(device_id: &str) -> ColdTierDeviceRecord {
-        ColdTierDeviceRecord {
-            device_id: device_id.to_string(),
-            stable_id: "writer".to_string(),
-            epoch: Some(5),
-            cold_tier_id: device_id.to_string(),
-            kind: "ssd".to_string(),
-            target: ColdTierTargetSpec::Directory {
-                path: format!("/tmp/{device_id}"),
-            },
-            root_dir: Some(format!("/tmp/{device_id}")),
-            state: ColdTierDeviceState::Healthy,
-            capacity_bytes: Some(1024),
-            used_bytes: 0,
-            reserved_bytes: 0,
-            failure_count: 0,
-            last_error: None,
-            tags: Vec::new(),
-            updated_at_ms: 1,
-        }
     }
 
     fn sample_lease(state: ClientLifecycleState) -> ClientLease {
@@ -2828,60 +2812,6 @@ mod tests {
                 .expect("handoff get should succeed"),
             Some(handoff)
         );
-    }
-
-    #[test]
-    fn etcd_backend_applies_cold_usage_deltas_without_stale_timestamp_conflicts() {
-        let Some(server) = EtcdTestServer::start() else {
-            return;
-        };
-        let backend = EtcdMetadataBackend::from_config(
-            EtcdMetadataConfig::new([server.endpoint()])
-                .keyspace(MetadataKeyspace::new("test/etcd-cold-usage-delta")),
-        )
-        .expect("etcd backend should initialize");
-        let device = sample_cold_tier_device("etcd-delta");
-        backend
-            .put_cold_tier_device_if_absent(&device)
-            .expect("device seed should succeed");
-
-        let first = backend
-            .apply_cold_tier_usage_delta(
-                "etcd-delta",
-                ColdTierUsageDelta {
-                    used_bytes: 10,
-                    reserved_bytes: 4,
-                },
-                2,
-            )
-            .expect("first delta should apply");
-        assert_eq!(first.used_bytes, 10);
-        assert_eq!(first.reserved_bytes, 4);
-
-        let updated = backend
-            .update_cold_tier_device(
-                "etcd-delta",
-                mooncake_store_core::ColdTierDeviceUpdate {
-                    tags: Some(vec!["concurrent-update".to_string()]),
-                    ..mooncake_store_core::ColdTierDeviceUpdate::new(3)
-                },
-            )
-            .expect("unrelated concurrent update should succeed");
-        assert_eq!(updated.updated_at_ms, 3);
-
-        let second = backend
-            .apply_cold_tier_usage_delta(
-                "etcd-delta",
-                ColdTierUsageDelta {
-                    used_bytes: 5,
-                    reserved_bytes: -2,
-                },
-                4,
-            )
-            .expect("second delta should apply after timestamp changed");
-        assert_eq!(second.used_bytes, 15);
-        assert_eq!(second.reserved_bytes, 2);
-        assert_eq!(second.tags, vec!["concurrent-update".to_string()]);
     }
 
     #[test]

@@ -107,16 +107,33 @@ impl RedisMetadataBackend {
         let Some(index) = self.cold_backing_filter_index(filter) else {
             return MetadataBackend::list_object_routes_by_cold_backing(self, filter);
         };
-        let mut keys = self
+        let keys = self
             .query_readonly("redis list object routes by cold backing", |connection| {
                 connection.smembers::<_, Vec<String>>(&index)
             })?;
-        let original_keys = keys.clone();
-        let (mut routes, live_keys) = self.load_object_routes_from_keys(&mut keys, None)?;
-        let stale_keys = original_keys
-            .into_iter()
-            .filter(|key| !keys.contains(key))
-            .collect::<Vec<_>>();
+        let entries =
+            self.query_readonly("redis load cold backing object routes", |connection| {
+                let mut entries = Vec::with_capacity(keys.len());
+                for key in keys.iter() {
+                    let payload: Option<String> = redis::cmd("HGET")
+                        .arg(key.as_str())
+                        .arg("payload")
+                        .query(connection)?;
+                    entries.push((key.clone(), payload));
+                }
+                Ok(entries)
+            })?;
+        let mut stale_keys = Vec::new();
+        let mut live_keys = Vec::new();
+        let mut routes = Vec::new();
+        for (key, payload) in entries {
+            if let Some(payload) = payload {
+                live_keys.push(key);
+                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
+            } else {
+                stale_keys.push(key);
+            }
+        }
         if !stale_keys.is_empty() {
             let mut connection = self.connection("redis prune stale cold backing route index")?;
             connection
