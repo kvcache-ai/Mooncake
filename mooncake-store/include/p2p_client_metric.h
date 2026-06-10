@@ -4,7 +4,7 @@
 
 namespace mooncake {
 
-// Request metrics for Get/Put operations
+// Local Get/Put metrics (BatchPut / BatchGet).
 struct RequestMetric {
     // Get metrics
     ylt::metric::counter_t get_requests;
@@ -22,6 +22,17 @@ struct RequestMetric {
     ylt::metric::histogram_t put_latency_success;
     ylt::metric::histogram_t put_latency_failure;
 
+    // Outgoing rollback RPCs (initiator cleanup after transfer failure).
+    ylt::metric::counter_t write_revoke_requests;
+    ylt::metric::counter_t write_revoke_failures;
+    ylt::metric::histogram_t write_revoke_latency_success;
+    ylt::metric::histogram_t write_revoke_latency_failure;
+
+    ylt::metric::counter_t unpin_key_requests;
+    ylt::metric::counter_t unpin_key_failures;
+    ylt::metric::histogram_t unpin_key_latency_success;
+    ylt::metric::histogram_t unpin_key_latency_failure;
+
     explicit RequestMetric(
         const std::string& prefix,
         const std::map<std::string, std::string>& labels = {});
@@ -30,12 +41,43 @@ struct RequestMetric {
     std::string summary_metrics();
 };
 
-// P2P client metrics for local storage operations
+// Per-RPC metrics for peer incoming handlers.
+struct RpcHandlerMetric {
+    ylt::metric::counter_t requests;
+    ylt::metric::counter_t hits;
+    ylt::metric::counter_t misses;
+    ylt::metric::counter_t failures;
+    ylt::metric::histogram_t latency_success;
+    ylt::metric::histogram_t latency_failure;
+
+    RpcHandlerMetric(const std::string& metric_prefix,
+                     const std::string& rpc_name,
+                     const std::map<std::string, std::string>& labels = {});
+
+    void serialize(std::string& str);
+    std::string summary_line(const std::string& display_name);
+};
+
+struct PeerRequestMetrics {
+    RpcHandlerMetric read_remote_data;
+    RpcHandlerMetric write_remote_data;
+    RpcHandlerMetric prewrite;
+    RpcHandlerMetric write_commit;
+    RpcHandlerMetric write_revoke;
+    RpcHandlerMetric pin_key;
+    RpcHandlerMetric unpin_key;
+
+    explicit PeerRequestMetrics(
+        const std::string& prefix = "mooncake_p2p_peer",
+        const std::map<std::string, std::string>& labels = {});
+
+    void serialize(std::string& str);
+    std::string summary_metrics();
+};
+
 struct P2PClientMetric : public ClientMetric {
-    // Local request metrics (Get/Put)
     RequestMetric local_request;
-    // Peer request metrics (requests from other clients)
-    RequestMetric peer_request;
+    PeerRequestMetrics peer_request_metrics;
 
     /**
      * @brief Creates a P2PClientMetric instance based on environment variables

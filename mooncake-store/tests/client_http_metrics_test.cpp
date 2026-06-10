@@ -495,21 +495,30 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
     p2p_metrics->local_request.get_bytes.inc(20 * 1024 * 1024);  // 20 MB
     p2p_metrics->local_request.get_latency_success.observe(100);
 
-    // Peer Put metrics
-    p2p_metrics->peer_request.put_requests.inc(30);
-    p2p_metrics->peer_request.put_bytes.inc(15 * 1024 * 1024);  // 15 MB
-    p2p_metrics->peer_request.put_failures.inc(2);
-    p2p_metrics->peer_request.put_latency_success.observe(250);
-    p2p_metrics->peer_request.put_latency_failure.observe(350);
+    p2p_metrics->local_request.write_revoke_requests.inc(2);
+    p2p_metrics->local_request.write_revoke_failures.inc(1);
+    p2p_metrics->local_request.write_revoke_latency_success.observe(70);
+    p2p_metrics->local_request.unpin_key_requests.inc(4);
+    p2p_metrics->local_request.unpin_key_failures.inc(1);
+    p2p_metrics->local_request.unpin_key_latency_success.observe(55);
 
-    // Peer Get metrics
-    p2p_metrics->peer_request.get_requests.inc(200);
-    p2p_metrics->peer_request.get_hits.inc(150);
-    p2p_metrics->peer_request.get_misses.inc(40);
-    p2p_metrics->peer_request.get_failures.inc(10);
-    p2p_metrics->peer_request.get_bytes.inc(40 * 1024 * 1024);  // 40 MB
-    p2p_metrics->peer_request.get_latency_success.observe(120);
-    p2p_metrics->peer_request.get_latency_failure.observe(220);
+    // Peer per-RPC metrics (write: no bytes, aligned with local put minus
+    // bytes)
+    p2p_metrics->peer_request_metrics.write_remote_data.requests.inc(30);
+    p2p_metrics->peer_request_metrics.write_remote_data.failures.inc(2);
+    p2p_metrics->peer_request_metrics.write_remote_data.latency_success.observe(
+        250);
+    p2p_metrics->peer_request_metrics.write_remote_data.latency_failure.observe(
+        350);
+
+    p2p_metrics->peer_request_metrics.read_remote_data.requests.inc(200);
+    p2p_metrics->peer_request_metrics.read_remote_data.hits.inc(150);
+    p2p_metrics->peer_request_metrics.read_remote_data.misses.inc(40);
+    p2p_metrics->peer_request_metrics.read_remote_data.failures.inc(10);
+    p2p_metrics->peer_request_metrics.read_remote_data.latency_success.observe(
+        120);
+    p2p_metrics->peer_request_metrics.read_remote_data.latency_failure.observe(
+        180);
 
     // Create and start HTTP server
     coro_http::coro_http_server server(1, test_port);
@@ -556,68 +565,76 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
             resp.resp_body.find("mooncake_p2p_local_put_requests_total") !=
             std::string::npos)
             << "Metrics should contain local put requests metric";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_local_write_revoke_requests_total") !=
+                    std::string::npos)
+            << "Metrics should contain local write_revoke rollback requests";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_local_unpin_key_requests_total") !=
+                    std::string::npos)
+            << "Metrics should contain local unpin_key rollback requests";
 
-        // Check peer metrics are present
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_get_requests_total") !=
-            std::string::npos)
-            << "Metrics should contain peer get requests metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_hits_total") !=
+        // Check peer per-RPC metrics are present
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_requests_total") !=
                     std::string::npos)
-            << "Metrics should contain peer get hits metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_misses_total") !=
+            << "Metrics should contain peer read_remote_data requests";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_hits_total") !=
                     std::string::npos)
-            << "Metrics should contain peer get misses metric";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_get_failures_total") !=
-            std::string::npos)
-            << "Metrics should contain peer get failures metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_bytes_total") !=
+            << "Metrics should contain peer read_remote_data hits";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_misses_total") !=
                     std::string::npos)
-            << "Metrics should contain peer get bytes metric";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_get_latency_success_us") !=
-            std::string::npos)
-            << "Metrics should contain peer get latency success metric";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_get_latency_failure_us") !=
-            std::string::npos)
-            << "Metrics should contain peer get latency failure metric";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_put_requests_total") !=
-            std::string::npos)
-            << "Metrics should contain peer put requests metric";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_put_failures_total") !=
-            std::string::npos)
-            << "Metrics should contain peer put failures metric";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_put_bytes_total") !=
+            << "Metrics should contain peer read_remote_data misses";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_failures_total") !=
                     std::string::npos)
-            << "Metrics should contain peer put bytes metric";
+            << "Metrics should contain peer read_remote_data failures";
         EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_put_latency_success_us") !=
+            resp.resp_body.find(
+                "mooncake_p2p_peer_read_remote_data_latency_success_us") !=
             std::string::npos)
-            << "Metrics should contain peer put latency success metric";
+            << "Metrics should contain peer read_remote_data latency success";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_write_remote_data_requests_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer write_remote_data requests";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_write_remote_data_failures_total") !=
+                    std::string::npos)
+            << "Metrics should contain peer write_remote_data failures";
         EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_put_latency_failure_us") !=
+            resp.resp_body.find(
+                "mooncake_p2p_peer_write_remote_data_latency_success_us") !=
             std::string::npos)
-            << "Metrics should contain peer put latency failure metric";
+            << "Metrics should contain peer write_remote_data latency success";
+        EXPECT_TRUE(
+            resp.resp_body.find(
+                "mooncake_p2p_peer_write_remote_data_latency_failure_us") !=
+            std::string::npos)
+            << "Metrics should contain peer write_remote_data latency failure";
 
-        // Check actual values
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_get_requests_total") !=
-                std::string::npos &&
-            resp.resp_body.find("} 200\n") != std::string::npos)
-            << "Peer get requests should be 200";
-        EXPECT_TRUE(resp.resp_body.find("mooncake_p2p_peer_get_hits_total") !=
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_requests_total") !=
+                        std::string::npos &&
+                    resp.resp_body.find("} 200\n") != std::string::npos)
+            << "Peer read_remote_data requests should be 200";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_read_remote_data_hits_total") !=
                         std::string::npos &&
                     resp.resp_body.find("} 150\n") != std::string::npos)
-            << "Peer get hits should be 150";
-        EXPECT_TRUE(
-            resp.resp_body.find("mooncake_p2p_peer_put_requests_total") !=
-                std::string::npos &&
-            resp.resp_body.find("} 30\n") != std::string::npos)
-            << "Peer put requests should be 30";
+            << "Peer read_remote_data hits should be 150";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_write_remote_data_requests_total") !=
+                        std::string::npos &&
+                    resp.resp_body.find("} 30\n") != std::string::npos)
+            << "Peer write_remote_data requests should be 30";
+        EXPECT_TRUE(resp.resp_body.find(
+                        "mooncake_p2p_peer_write_remote_data_failures_total") !=
+                        std::string::npos &&
+                    resp.resp_body.find("} 2\n") != std::string::npos)
+            << "Peer write_remote_data failures should be 2";
     }
 
     // Test /metrics/summary endpoint for P2P peer metrics
@@ -642,19 +659,23 @@ TEST_F(ClientHttpMetricsTest, P2PClientPeerMetricsHttpEndpointsTest) {
         EXPECT_TRUE(resp.resp_body.find("80 hits") != std::string::npos)
             << "Summary should show 80 local get hits";
 
-        // Check peer metrics in summary
-        EXPECT_TRUE(resp.resp_body.find("200 requests") != std::string::npos)
-            << "Summary should show 200 peer get requests";
+        // Check peer per-RPC metrics in summary
+        EXPECT_TRUE(resp.resp_body.find("ReadRemoteData: 200 requests") !=
+                    std::string::npos)
+            << "Summary should show peer ReadRemoteData requests";
         EXPECT_TRUE(resp.resp_body.find("150 hits") != std::string::npos)
-            << "Summary should show 150 peer get hits";
-        EXPECT_TRUE(resp.resp_body.find("40 misses") != std::string::npos)
-            << "Summary should show 40 peer get misses";
-        EXPECT_TRUE(resp.resp_body.find("10 failures") != std::string::npos)
-            << "Summary should show 10 peer get failures";
-        EXPECT_TRUE(resp.resp_body.find("40.00 MB") != std::string::npos)
-            << "Summary should show 40.00 MB read for peer";
-        EXPECT_TRUE(resp.resp_body.find("15.00 MB") != std::string::npos)
-            << "Summary should show 15.00 MB written for peer";
+            << "Summary should show peer ReadRemoteData hits";
+        EXPECT_TRUE(resp.resp_body.find("WriteRemoteData: 30 requests") !=
+                    std::string::npos)
+            << "Summary should show peer WriteRemoteData requests";
+        EXPECT_TRUE(resp.resp_body.find("2 failures") != std::string::npos)
+            << "Summary should show peer WriteRemoteData failures";
+        EXPECT_TRUE(resp.resp_body.find("WriteRevoke rollback: 2 requests") !=
+                    std::string::npos)
+            << "Summary should show local WriteRevoke rollback requests";
+        EXPECT_TRUE(resp.resp_body.find("UnPinKey rollback: 4 requests") !=
+                    std::string::npos)
+            << "Summary should show local UnPinKey rollback requests";
     }
 
     server.stop();

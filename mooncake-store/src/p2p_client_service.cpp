@@ -882,7 +882,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                                             Transport::TransferRequest::WRITE);
                 };
                 write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
-                    peer, write_req, endpoint, &slices,
+                    peer, metrics_.get(), write_req, endpoint, &slices,
                     std::move(te_transfer)));
             } else {
                 write_ops.push_back(std::make_unique<RemoteReverseWriteOp>(
@@ -943,8 +943,8 @@ P2PClientService::RemoteForwardWriteOp::Dispatch() {
     }
     auto promise = std::make_shared<WritePromise>();
     auto future = promise->getFuture();
-    RemoteForwardWriteOp::RunForwardRemotePut(std::move(promise), peer_ptr,
-                                              te_transfer, write_req, slices)
+    RemoteForwardWriteOp::RunForwardRemotePut(
+        std::move(promise), peer_ptr, metrics, te_transfer, write_req, slices)
         .start([](auto&&) {});
     return FutureHandle<void>::Create(write_req, std::move(future));
 }
@@ -1522,8 +1522,12 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
         cleanup.read_operation_id = pin.value().read_operation_id;
+        Stopwatch rollback_sw;
         tl::expected<void, ErrorCode> cleanup_unpin;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            if (metrics_) {
+                metrics_->local_request.unpin_key_requests.inc();
+            }
             cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
             if (cleanup_unpin) {
                 break;
@@ -1537,6 +1541,16 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
                     << "AsyncUnPinKey retry after TE failure, key=" << req->key
                     << ", attempt=" << (attempt + 1)
                     << ", error=" << cleanup_unpin.error();
+            }
+        }
+        if (metrics_) {
+            if (cleanup_unpin) {
+                metrics_->local_request.unpin_key_latency_success.observe(
+                    rollback_sw.elapsed_us());
+            } else {
+                metrics_->local_request.unpin_key_failures.inc();
+                metrics_->local_request.unpin_key_latency_failure.observe(
+                    rollback_sw.elapsed_us());
             }
         }
         if (!cleanup_unpin) {
@@ -2046,8 +2060,8 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 async_simple::coro::Lazy<void>
 P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
     std::shared_ptr<WritePromise> promise, PeerClient* peer,
-    TeTransferFn te_transfer, std::shared_ptr<RemoteWriteRequest> write_req,
-    std::vector<Slice>* slices) {
+    P2PClientMetric* metrics, TeTransferFn te_transfer,
+    std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
     if (!peer || !te_transfer || !write_req || !slices) {
         promise->setValue(tl::expected<void, ErrorCode>(
             tl::unexpected(ErrorCode::INTERNAL_ERROR)));
@@ -2086,8 +2100,12 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         WriteRevokeRequest revoke_req;
         revoke_req.key = write_req->key;
         revoke_req.write_operation_id = pre.value().write_operation_id;
+        Stopwatch rollback_sw;
         tl::expected<void, ErrorCode> revoke_res;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
+            if (metrics) {
+                metrics->local_request.write_revoke_requests.inc();
+            }
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
             if (revoke_res) {
                 break;
@@ -2100,6 +2118,16 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
                 LOG(WARNING) << "AsyncWriteRevoke retry after TE failure, key="
                              << write_req->key << ", attempt=" << (attempt + 1)
                              << ", error=" << revoke_res.error();
+            }
+        }
+        if (metrics) {
+            if (revoke_res) {
+                metrics->local_request.write_revoke_latency_success.observe(
+                    rollback_sw.elapsed_us());
+            } else {
+                metrics->local_request.write_revoke_failures.inc();
+                metrics->local_request.write_revoke_latency_failure.observe(
+                    rollback_sw.elapsed_us());
             }
         }
         if (!revoke_res) {
