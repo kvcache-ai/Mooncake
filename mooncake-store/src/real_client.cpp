@@ -3113,37 +3113,8 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto query_result = client_->Query(key);
-    if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
-            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
-            return tl::unexpected(query_result.error());
-        }
-        LOG(ERROR) << "Query failed for key: " << key
-                   << " with error: " << toString(query_result.error());
-        return tl::unexpected(query_result.error());
-    }
-
-    const auto &replica_list = query_result.value().replicas;
-    if (replica_list.empty()) {
-        LOG(ERROR) << "Internal error: replica_list is empty";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Select best replica: prefer local MEMORY, then any MEMORY,
-    // then LOCAL_DISK, then DISK.
-    auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
-    if (!best_replica) {
-        LOG(ERROR) << "No usable replica for key: " << key;
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
-    }
-
-    auto query_value = std::move(query_result.value());
-    auto replica = *best_replica;
-    return RangedReadMetadata{.query_result = std::move(query_value),
-                              .replica = std::move(replica),
-                              .total_size = calculate_total_size(replica)};
+    return build_ranged_read_metadata_from_query_result(key,
+                                                        client_->Query(key));
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
@@ -3352,7 +3323,15 @@ RealClient::get_into_ranges_internal(
     const std::vector<size_t> *buffer_capacities,
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
         *prepared_results,
-    const std::vector<std::vector<std::vector<bool>>> *valid_fragments) {
+    const std::vector<std::vector<std::vector<bool>>> *valid_fragments,
+    const QueryResultCache *query_result_cache) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return build_ranged_read_internal_error_results(
+            buffers.size(), all_keys, all_dst_offsets,
+            ErrorCode::INVALID_PARAMS);
+    }
+
     const size_t buffer_count = buffers.size();
     PreparedRangedReadRequest prepared;
     if (prepared_results != nullptr && valid_fragments != nullptr) {
@@ -3395,6 +3374,27 @@ RealClient::get_into_ranges_internal(
 
     std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
         metadata_cache;
+    size_t key_count_hint = 0;
+    for (const auto &keys : all_keys) {
+        key_count_hint += keys.size();
+    }
+    metadata_cache.reserve(key_count_hint);
+    auto now = std::chrono::steady_clock::now();
+    if (query_result_cache != nullptr) {
+        for (const auto &[key, query_result] : *query_result_cache) {
+            if (!query_result) {
+                metadata_cache.emplace(key,
+                                       tl::unexpected(query_result.error()));
+                continue;
+            }
+            if (query_result->IsLeaseExpired(now)) {
+                continue;
+            }
+            metadata_cache.emplace(key,
+                                   build_ranged_read_metadata_from_query_result(
+                                       key, query_result));
+        }
+    }
 
     for (size_t i = 0; i < buffer_count; ++i) {
         const size_t key_count = prepared.results[i].size();
@@ -3404,9 +3404,16 @@ RealClient::get_into_ranges_internal(
         }
 
         for (size_t j = 0; j < key_count; ++j) {
-            auto [metadata_it, inserted] = metadata_cache.try_emplace(
-                all_keys[i][j], resolve_ranged_read_metadata(all_keys[i][j]));
-            (void)inserted;
+            auto metadata_it = metadata_cache.find(all_keys[i][j]);
+            if (metadata_it == metadata_cache.end()) {
+                metadata_it =
+                    metadata_cache
+                        .emplace(
+                            all_keys[i][j],
+                            build_ranged_read_metadata_from_query_result(
+                                all_keys[i][j], client_->Query(all_keys[i][j])))
+                        .first;
+            }
             auto &metadata_result = metadata_it->second;
 
             for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
@@ -3458,13 +3465,14 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
     const std::vector<std::vector<std::string>> &all_keys,
     const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_sizes) {
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const QueryResultCache *query_result_cache) {
     auto results =
         execute_timed_operation<std::vector<std::vector<std::vector<int64_t>>>>(
             [&]() {
-                return convert_ranged_read_results(
-                    get_into_ranges_internal(buffers, all_keys, all_dst_offsets,
-                                             all_src_offsets, all_sizes));
+                return convert_ranged_read_results(get_into_ranges_internal(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, nullptr, nullptr, nullptr, query_result_cache));
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -3473,6 +3481,49 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
                     sum_positive_ranges(ret), latency_us);
             });
     return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchQuery(keys);
+}
+
+tl::expected<RealClient::RangedReadMetadata, ErrorCode>
+RealClient::build_ranged_read_metadata_from_query_result(
+    const std::string &key, tl::expected<QueryResult, ErrorCode> query_result) {
+    if (!query_result) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            return tl::unexpected(query_result.error());
+        }
+        LOG(ERROR) << "Query failed for key: " << key
+                   << " with error: " << toString(query_result.error());
+        return tl::unexpected(query_result.error());
+    }
+
+    const auto &replica_list = query_result->replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto local_endpoints = client_->GetLocalEndpoints();
+    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    if (!best_replica) {
+        LOG(ERROR) << "No usable replica for key: " << key;
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
+    auto query_value = std::move(query_result.value());
+    auto replica = *best_replica;
+    return RangedReadMetadata{.query_result = std::move(query_value),
+                              .replica = std::move(replica),
+                              .total_size = calculate_total_size(replica)};
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -4258,6 +4309,8 @@ RealClient::get_into_ranges_shm_helper(
     const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
     int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
@@ -4301,10 +4354,13 @@ RealClient::get_into_ranges_shm_helper(
         return prepared.results;
     }
 
+    auto query_result_cache =
+        build_query_result_cache_from_cached_results(cached_query_results);
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
         all_sizes, &prepared.required_buffer_sizes, &prepared.results,
-        &prepared.valid_fragments);
+        &prepared.valid_fragments,
+        query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -5427,6 +5483,32 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
+    const std::vector<std::string> &keys) {
+    if (!client_) {
+        LOG(ERROR) << "batch_get_query_results: client not initialized";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::INVALID_PARAMS));
+    }
+    auto query_results = client_->BatchQuery(keys);
+    std::vector<CachedQueryResultResponse> cached_results;
+    cached_results.reserve(keys.size());
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Batch query response size mismatch in "
+                      "batch_get_query_results: expected "
+                   << keys.size() << ", got " << query_results.size() << ".";
+        return std::vector<CachedQueryResultResponse>(
+            keys.size(), CachedQueryResultResponse(ErrorCode::RPC_FAIL));
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto &query_result : query_results) {
+        cached_results.push_back(
+            to_cached_query_result_response(query_result, now));
+    }
+    return cached_results;
 }
 
 std::vector<std::string> RealClient::batch_replica_clear(

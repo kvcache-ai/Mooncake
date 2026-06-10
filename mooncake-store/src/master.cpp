@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -1136,6 +1137,32 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        return server.start();
+
+        static std::atomic<bool> shutdown_requested{false};
+        auto signal_handler = [](int /* signum */) {
+            shutdown_requested.store(true);
+        };
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+
+        int server_result = 0;
+        std::atomic<bool> server_done{false};
+        std::thread server_thread([&server, &server_result, &server_done]() {
+            server_result = server.start();
+            server_done.store(true);
+        });
+
+        while (!shutdown_requested.load() && !server_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        server.stop();
+        server_thread.join();
+
+        if (shutdown_requested.load()) {
+            LOG(INFO) << "Shutdown signal received, exiting gracefully";
+            return 0;
+        }
+        return server_result;
     }
 }

@@ -41,6 +41,20 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
 
+struct CachedQueryResultResponse {
+    bool success;
+    GetReplicaListResponse value;
+    ErrorCode error;
+
+    CachedQueryResultResponse()
+        : success(false), value(), error(ErrorCode::INVALID_PARAMS) {}
+    CachedQueryResultResponse(GetReplicaListResponse&& value_param)
+        : success(true), value(std::move(value_param)), error(ErrorCode::OK) {}
+    CachedQueryResultResponse(ErrorCode error_param)
+        : success(false), value(), error(error_param) {}
+};
+YLT_REFL(CachedQueryResultResponse, success, value, error);
+
 /**
  * @brief Response structure for GetStorageConfig operation
  */

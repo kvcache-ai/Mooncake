@@ -75,6 +75,32 @@ static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
 }};
 
+inline std::optional<size_t> TensorDtypeElementSize(int32_t dtype) {
+    switch (static_cast<TensorDtype>(dtype)) {
+        case TensorDtype::FLOAT64:
+        case TensorDtype::INT64:
+        case TensorDtype::UINT64:
+            return size_t{8};
+        case TensorDtype::FLOAT32:
+        case TensorDtype::INT32:
+        case TensorDtype::UINT32:
+            return size_t{4};
+        case TensorDtype::INT16:
+        case TensorDtype::UINT16:
+        case TensorDtype::FLOAT16:
+        case TensorDtype::BFLOAT16:
+            return size_t{2};
+        case TensorDtype::INT8:
+        case TensorDtype::UINT8:
+        case TensorDtype::BOOL:
+        case TensorDtype::FLOAT8_E4M3:
+        case TensorDtype::FLOAT8_E5M2:
+            return size_t{1};
+        default:
+            return std::nullopt;
+    }
+}
+
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;

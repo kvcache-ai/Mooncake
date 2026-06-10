@@ -1,4 +1,4 @@
-# Mooncake Store Deployment
+# Mooncake Store Deployment & Tuning Guide
 
 This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
@@ -276,14 +276,18 @@ curl -s http://<master_host>:9003/metrics/summary
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd-offload).
+- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
+- For detailed monitoring and observation see [Observability](../getting_started/observability)
 
 :::{toctree}
 :maxdepth: 1
 :hidden:
 
 ssd-offload
-../getting_started/plugin-usage/3FS-USRBIO-Plugin
+NvMe-Of SSD Pool<nvmf-ssd-deployment-guide>
+HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
+../getting_started/observability
 :::
 
 ---
