@@ -54,8 +54,9 @@ DEFINE_string(
     "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
 
 DEFINE_string(coordinator, "", "Coordinator server address");
-DEFINE_int32(wait_timeout, 300,
-             "Timeout in seconds for waiting for all nodes to register (default: 300s)");
+DEFINE_int32(
+    wait_timeout, 300,
+    "Timeout in seconds for waiting for all nodes to register (default: 300s)");
 
 namespace mooncake {
 namespace tent {
@@ -194,8 +195,8 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 }
 
 void printStatsAllToAll(int node_rank, int total_nodes, size_t num_targets,
-                         size_t block_size, size_t batch_size,
-                         XferBenchStats& stats, int num_threads) {
+                        size_t block_size, size_t batch_size,
+                        XferBenchStats& stats, int num_threads) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();

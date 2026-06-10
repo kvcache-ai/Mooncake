@@ -28,11 +28,8 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
-
-#ifdef BUILDING_COORDINATOR_SERVER
 #include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
-#endif
 
 namespace mooncake {
 namespace bench {
@@ -108,9 +105,16 @@ class CoordinatorService {
         int32_t num_nodes_reported = 0;
     };
 
+    // Calculate bandwidth in GB/s
+    // NOTE: total_duration_avg is the sum of execution times across all
+    // threads, NOT the actual parallel execution time. To get the correct
+    // parallel bandwidth, we divide by num_threads to get the actual wall-clock
+    // time.
     static double CalculateBandwidth(const ResultReport& r) {
         size_t total_data = r.block_size * r.batch_size * r.total_samples;
-        double duration_sec = r.total_duration_avg / 1e6;
+        // total_duration_avg is accumulated across threads, so divide by
+        // num_threads to get actual parallel execution time
+        double duration_sec = (r.total_duration_avg / r.num_threads) / 1e6;
         return (total_data / 1e9) / duration_sec;
     }
 
@@ -228,7 +232,8 @@ tl::expected<ResultAck, ErrorCode> CoordinatorService::Report(
     return resp;
 }
 
-tl::expected<PingResponse, ErrorCode> CoordinatorService::Ping(const PingRequest& req) {
+tl::expected<PingResponse, ErrorCode> CoordinatorService::Ping(
+    const PingRequest& req) {
     PingResponse resp{true};
     return resp;
 }
@@ -260,10 +265,13 @@ void CoordinatorService::PrintResults() {
 
             for (const auto& r : config_data.reports) {
                 total_bw += CalculateBandwidth(r);
-                // Avg Lat: system-level latency = total_duration * num_threads / total_samples
-                double node_avg_lat = r.total_duration_avg * r.num_threads / r.total_samples;
+                // Avg Lat: average wall-clock time per test run
+                // Since total_duration_avg is accumulated across threads,
+                // divide by num_threads to get actual execution time per run
+                double node_avg_lat =
+                    (r.total_duration_avg / r.num_threads) / r.total_samples;
                 total_lat += node_avg_lat;
-                // Avg Tx: single transfer time
+                // Avg Tx: single transfer time to one target (already correct)
                 total_tx += r.transfer_duration_avg;
                 total_p99 += r.transfer_duration_p99;
                 total_p999 += r.transfer_duration_p999;
@@ -278,8 +286,7 @@ void CoordinatorService::PrintResults() {
                       << std::setw(14) << (total_lat / num_nodes)
                       << std::setw(14) << (total_tx / num_nodes)
                       << std::setw(14) << (total_p99 / num_nodes)
-                      << std::setw(14) << (total_p999 / num_nodes) 
-                      << std::endl;
+                      << std::setw(14) << (total_p999 / num_nodes) << std::endl;
         }
     }
 
@@ -307,35 +314,22 @@ class CoordinatorServer {
     tl::expected<ResultAck, ErrorCode> ReportHandler(const ResultReport& req);
     tl::expected<PingResponse, ErrorCode> PingHandler(const PingRequest& req);
 
-#ifdef BUILDING_COORDINATOR_SERVER
     bool Start();
     void Stop();
     CoordinatorService& GetService() { return service_; }
-#endif
 
    private:
     CoordinatorService service_;
-#ifdef BUILDING_COORDINATOR_SERVER
     std::unique_ptr<coro_rpc::coro_rpc_server> rpc_server_;
     std::atomic<bool> running_{false};
-#endif
 };
 
 CoordinatorServer::CoordinatorServer(int32_t total_nodes, int port)
-    : service_(total_nodes)
-#ifdef BUILDING_COORDINATOR_SERVER
-      ,
+    : service_(total_nodes),
       rpc_server_(
-          std::make_unique<coro_rpc::coro_rpc_server>(1, port, "0.0.0.0"))
-#endif
-{
-}
+          std::make_unique<coro_rpc::coro_rpc_server>(1, port, "0.0.0.0")) {}
 
-CoordinatorServer::~CoordinatorServer() {
-#ifdef BUILDING_COORDINATOR_SERVER
-    Stop();
-#endif
-}
+CoordinatorServer::~CoordinatorServer() { Stop(); }
 
 tl::expected<RegisterResponse, ErrorCode> CoordinatorServer::RegisterHandler(
     const RegisterRequest& req) {
@@ -356,8 +350,6 @@ tl::expected<PingResponse, ErrorCode> CoordinatorServer::PingHandler(
     const PingRequest& req) {
     return service_.Ping(req);
 }
-
-#ifdef BUILDING_COORDINATOR_SERVER
 
 bool CoordinatorServer::Start() {
     rpc_server_->register_handler<&CoordinatorServer::RegisterHandler>(this);
@@ -399,8 +391,6 @@ void CoordinatorServer::Stop() {
         LOG(INFO) << "RPC server stopped";
     }
 }
-
-#endif  // BUILDING_COORDINATOR_SERVER
 
 //==============================================================================
 // CoordinatorClient Implementation
@@ -608,7 +598,7 @@ tl::expected<PingResponse, ErrorCode> CoordinatorClient::Ping(
 // Main Entry Point (server only)
 //==============================================================================
 
-#ifdef BUILDING_COORDINATOR_SERVER
+#ifdef COORDINATOR_ENTRYPOINT
 
 #include <gflags/gflags.h>
 #include <csignal>
@@ -667,8 +657,7 @@ int main(int argc, char* argv[]) {
 
     LOG(INFO) << "Coordinator running. Press Ctrl-C to stop.";
     while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
-
     return 0;
 }
 
-#endif  // BUILDING_COORDINATOR_SERVER
+#endif  // COORDINATOR_ENTRYPOINT

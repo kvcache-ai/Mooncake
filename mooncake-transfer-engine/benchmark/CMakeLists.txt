@@ -50,7 +50,7 @@ set_target_properties(
 if(USE_TENT)
   add_executable(coordinator coordinator.cpp)
   target_compile_definitions(coordinator PUBLIC
-    BUILDING_COORDINATOR_SERVER)
+    COORDINATOR_ENTRYPOINT)
   target_include_directories(coordinator PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../tent/include

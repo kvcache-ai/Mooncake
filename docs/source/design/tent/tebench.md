@@ -197,7 +197,7 @@ gpu_id + thread_id
 
 ## 6. All-to-All Multi-Node Testing
 
-`tebench` supports **all-to-all** testing for measuring aggregate bandwidth in multi-node clusters. In this mode, every node connects to all other nodes simultaneously, and results are aggregated across the cluster.
+`tebench` supports **all-to-all** testing for measuring aggregate bandwidth in multi-node clusters. In this mode, every node connects to all other nodes simultaneously, and results are aggregated across the cluster using a central coordinator.
 
 ### 6.1 When to Use All-to-All Mode
 
@@ -207,68 +207,148 @@ All-to-all testing is useful for:
 * **Network tuning** — identify bottlenecks before production deployment
 * **Scaling tests** — measure how performance changes with node count
 
-### 6.2 All-to-All Configuration
+### 6.2 All-to-All Configuration with Coordinator
+
+The all-to-all mode uses a **coordinator-based architecture** where a central coordinator server manages node registration and result aggregation.
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `--enable_alltoall` | Enable all-to-all mode | `true` |
-| `--test_id` | Unique identifier for the test run | `test_run_001` |
-| `--num_nodes` | Total number of nodes in the test | `4` |
-| `--node_rank` | This node's rank (0-based) | `0, 1, 2, 3` |
-| `--sync_timeout_sec` | Timeout for node synchronization (default: 120s) | `120` |
+| `--coordinator` | Coordinator server address (enables all-to-all mode) | `192.168.1.100:12345` |
+| `--backend` | Backend type (must be `tent`) | `tent` |
+| `--wait_timeout` | Timeout for waiting on all nodes (default: 300s) | `300` |
 
-> **Note**: All-to-all mode requires the **TENT backend** (`--backend=tent`).
+> **Note**: All-to-all mode requires the **TENT backend** (`--backend=tent`). When `--coordinator` is specified, all-to-all mode is automatically enabled.
 
 ### 6.3 Running an All-to-All Test
 
-On each node, start `tebench` with a unique `node_rank`:
+#### Step 1: Start the Coordinator Server
+
+On any machine (typically one of the test nodes or a dedicated coordinator node):
 
 ```bash
-# Node 0
-./tebench \
-  --backend=tent \
-  --enable_alltoall=true \
-  --test_id=my_test \
-  --num_nodes=4 \
-  --node_rank=0 \
-  --seg_type=DRAM \
-  --op_type=read
-
-# Node 1 (on different machine)
-./tebench \
-  --backend=tent \
-  --enable_alltoall=true \
-  --test_id=my_test \
-  --num_nodes=4 \
-  --node_rank=1 \
-  --seg_type=DRAM \
-  --op_type=read
-
-# Node 2
-./tebench ... --node_rank=2
-
-# Node 3
-./tebench ... --node_rank=3
+./coordinator --num_nodes=4 --port=12345
 ```
 
-The test automatically:
+The coordinator will:
+* Listen for node registrations
+* Assign unique ranks to each node
+* Broadcast the complete node list to all nodes once everyone is ready
+* Aggregate and display results from all nodes
 
-1. **Generates segment names** for all nodes (`tebench_alltoall_<test_id>_node_<rank>`)
-2. **Synchronizes** — waits for all nodes to be ready
-3. **Connects** each node to all other nodes
-4. **Runs tests** and aggregates results on rank 0
+#### Step 2: Start All Nodes
 
-### 6.4 All-to-All Output
+On **each node** in the test, run `tebench` with the coordinator address:
 
-Results on rank 0 show **aggregated metrics** across all nodes:
+```bash
+# On Node 1
+./tebench \
+  --coordinator=192.168.1.100:12345 \
+  --backend=tent \
+  --seg_type=DRAM \
+  --op_type=read \
+  --duration=5
+
+# On Node 2 (same command)
+./tebench \
+  --coordinator=192.168.1.100:12345 \
+  --backend=tent \
+  --seg_type=DRAM \
+  --op_type=read \
+  --duration=5
+
+# On Node 3 (same command)
+./tebench ... (same as above)
+
+# On Node 4 (same command)
+./tebench ... (same as above)
+```
+
+**Key points:**
+* **All nodes use the same command** — no need to manually assign ranks
+* The coordinator automatically assigns ranks based on registration order
+* Each node prints its assigned rank upon registration
+* The test waits for all nodes before starting
+
+#### Step 3: Monitor Test Progress
+
+During execution:
+
+1. **Local node results** are printed immediately after each test configuration:
+   ```text
+   ===== Local Node Results (Node 0/4) =====
+   BlkSize(B)  Batch  Threads  BW(GB/s)  ...
+   ```
+
+2. **Coordinator aggregates results** and displays cluster-wide statistics at the end:
+   ```text
+   ===== All-to-All Aggregated Results (4/4 nodes) =====
+   ```
+
+#### Step 4: Stop the Test
+
+* Press **Ctrl-C** on any `tebench` node to stop that node
+* The coordinator will detect the disconnect and print final results
+* Press **Ctrl-C** on the coordinator to shut it down
+
+### 6.4 Troubleshooting
+
+#### Timeout waiting for all nodes
+
+If you see:
+```
+Timeout waiting for all nodes (waited 300 seconds)
+```
+
+This usually means:
+1. Not all nodes have started — verify all `num_nodes` instances are running
+2. Some nodes crashed — check logs on each node
+3. Network connectivity issues — check firewall and routing
+
+#### Connection failures
+
+If nodes cannot connect:
+1. Verify the coordinator address is correct
+2. Check network reachability (ping, telnet)
+3. Ensure RDMA/network interfaces are properly configured
+
+### 6.5 All-to-All Output
+
+Results are displayed in two sections:
+
+#### Local Node Results
+
+Each node prints its own results immediately:
 
 ```text
-===== All-to-All Aggregated Results (4 nodes) =====
-BlkSize(B)  Batch  Thrd  Flows   BW(GB/s)  AvgLat(us)  AvgTx(us)  P99Tx(us)  P999Tx(us)
-      4096      8     1     12       48.2        2.1        1.8        3.2         4.1
+===== Local Node Results (Node 0/4) =====
+BlkSize(B)  Batch  Threads  Targets  BW(GB/s)  AvgLat(us)  AvgTx(us)  P99Tx(us)  P999Tx(us)
+     4096      8         1        3      12.1        2.1        1.8        3.2         4.1
+```
+
+#### Aggregated Cluster Results
+
+The coordinator displays cluster-wide statistics:
+
+```text
+===== All-to-All Aggregated Results (4/4 nodes) =====
+BlkSize (B)  Batch  Threads  Total BW (GB/S)  Avg Lat (us)  Avg Tx (us)  P99 Tx (us)  P999 Tx (us)
+        4096      8         1             48.2           2.1          1.8         3.2          4.1
 ```
 
 Where:
-* **Flows** = `num_threads × target_count × num_nodes` (total concurrent flows)
-* **BW** = Aggregate bandwidth across all nodes
-* **Latency** = Per-transfer latency (averaged across all nodes)
+* **Total BW** = Sum of bandwidth from all nodes (cluster aggregate throughput)
+* **Avg Lat** = Average wall-clock time per test run (across all nodes)
+* **Avg Tx** = Average per-transfer execution time (single transfer to one target)
+* **P99/P999 Tx** = Percentile latencies for individual transfers
+
+### 6.6 Performance Metrics Explained
+
+In all-to-all mode, the metrics have specific meanings:
+
+| Metric | Calculation | Description |
+|--------|-------------|-------------|
+| **Total BW** | Sum of all node bandwidths | Cluster aggregate throughput |
+| **Avg Lat** | Wall-clock time per sample | Average test execution time per run |
+| **Avg Tx** | Single transfer duration | Average time for one transfer to one target |
+
+> **Note**: These metrics account for the multi-threaded parallel execution model. Bandwidth is calculated based on actual wall-clock time (not accumulated thread time), ensuring accurate cluster-wide throughput measurement.
