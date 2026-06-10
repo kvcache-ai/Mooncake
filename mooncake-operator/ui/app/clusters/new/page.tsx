@@ -1,19 +1,54 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+
+const ADJECTIVES = [
+  'bold', 'calm', 'swift', 'keen', 'neat', 'pure', 'rare', 'safe',
+  'cool', 'fast', 'glad', 'kind', 'lucky', 'proud', 'bright', 'quiet',
+  'sharp', 'sunny', 'warm', 'wise', 'eager', 'gentle', 'happy', 'jolly',
+  'lively', 'noble', 'polite', 'sweet', 'zesty', 'brisk',
+]
+
+const NOUNS = [
+  'panda', 'tiger', 'eagle', 'lion', 'wolf', 'bear', 'hawk', 'deer',
+  'owl', 'fox', 'kite', 'orca', 'koala', 'otter', 'robin', 'swan',
+  'heron', 'elm', 'oak', 'pine', 'maple', 'cedar', 'willow', 'birch',
+]
+
+function randomName(): string {
+  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)]
+  const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)]
+  const num = Math.floor(Math.random() * 100)
+  return `${adj}-${noun}-${num}`
+}
 
 export default function NewClusterPage() {
   const [name, setName] = useState('')
   const [namespace, setNamespace] = useState('default')
-  const [image, setImage] = useState('mooncake-store:latest')
+  const [images, setImages] = useState<string[]>([])
+  const [image, setImage] = useState('')
+  const [imagesLoading, setImagesLoading] = useState(true)
   const [masterReplicas, setMasterReplicas] = useState(1)
   const [workerReplicas, setWorkerReplicas] = useState(2)
-  const [segmentSize, setSegmentSize] = useState('4Gi')
+  const [segmentSize, setSegmentSize] = useState('2Gi')
   const [haType, setHaType] = useState('k8s')
-  const [rdmaEnabled, setRdmaEnabled] = useState(true)
+  const [rdmaEnabled, setRdmaEnabled] = useState(false)
   const [gpuEnabled, setGpuEnabled] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setName(randomName())
+    fetch('/api/images')
+      .then(r => r.json())
+      .then(data => {
+        const imgs = data.images || []
+        setImages(imgs)
+        if (imgs.length > 0) setImage(imgs[0])
+        setImagesLoading(false)
+      })
+      .catch(() => setImagesLoading(false))
+  }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -108,17 +143,26 @@ export default function NewClusterPage() {
 
         <div>
           <label htmlFor="image" className="block text-sm font-medium text-gray-700">
-            Image
+            Image <span className="text-red-500">*</span>
           </label>
-          <input
-            type="text"
+          <select
             name="image"
             id="image"
             value={image}
             onChange={e => setImage(e.target.value)}
             className="mt-1 focus:ring-indigo-500 focus:border-indigo-500 block w-full shadow-sm sm:text-sm border-gray-300 rounded-md"
-            placeholder="mooncake-store:latest"
-          />
+            disabled={imagesLoading}
+          >
+            {imagesLoading ? (
+              <option>Loading images...</option>
+            ) : images.length === 0 ? (
+              <option value="">No mooncake-store images found on nodes</option>
+            ) : (
+              images.map(img => (
+                <option key={img} value={img}>{img}</option>
+              ))
+            )}
+          </select>
         </div>
 
         <div className="grid grid-cols-2 gap-4">

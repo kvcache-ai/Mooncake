@@ -213,22 +213,19 @@ segment = pod_ip + ':' + port
 cluster = os.environ.get('CLUSTER_NAME', '')
 namespace = os.environ.get('POD_NAMESPACE', '')
 
-# Discover leader master — only the leader has segment metadata in HA mode
-leader = ''
-for i in range(3):
-    try:
-        addr = '%s-master-%d.%s-master-headless.%s.svc' % (cluster, i, cluster, namespace)
-        r = urllib.request.urlopen('http://' + addr + ':9003/role', timeout=3)
-        role = r.read().decode().strip()
-        if role == 'leader':
-            leader = addr
-            break
-    except Exception:
-        continue
-if not leader:
-    leader = '%s-master.%s.svc' % (cluster, namespace)
+def discover_leader():
+    for i in range(3):
+        try:
+            addr = '%s-master-%d.%s-master-headless.%s.svc' % (cluster, i, cluster, namespace)
+            r = urllib.request.urlopen('http://' + addr + ':9003/role', timeout=3)
+            role = r.read().decode().strip()
+            if role == 'leader':
+                return addr
+        except Exception:
+            continue
+    return '%s-master.%s.svc' % (cluster, namespace)
 
-def get_lifecycle():
+def get_lifecycle(leader):
     try:
         req = urllib.request.Request(
             'http://' + leader + ':9003/api/v1/segments/status?segment=' + segment)
@@ -239,7 +236,8 @@ def get_lifecycle():
     except Exception:
         return ''
 
-lifecycle = get_lifecycle()
+leader = discover_leader()
+lifecycle = get_lifecycle(leader)
 if lifecycle == 'DRAINED':
     sys.exit(0)
 
@@ -247,7 +245,8 @@ timeout = 600
 interval = 5
 elapsed = 0
 while elapsed < timeout:
-    lifecycle = get_lifecycle()
+    leader = discover_leader()
+    lifecycle = get_lifecycle(leader)
     if lifecycle == 'DRAINED':
         sys.exit(0)
     time.sleep(interval)

@@ -299,6 +299,30 @@ async function handleApiRequest(req, res) {
     return jsonReply(res, 200, info)
   }
 
+  // GET /api/images — list available mooncake-store images from all nodes
+  if (url.pathname === '/api/images' && req.method === 'GET') {
+    try {
+      const nodesResult = await k8sRequest('/api/v1/nodes')
+      const images = new Set()
+      for (const node of (nodesResult?.items || [])) {
+        for (const image of (node.status?.images || [])) {
+          for (const name of (image.names || [])) {
+            // match both docker.io/mooncake/mooncake-store:* and mooncake-store:* etc.
+            if (name.includes('mooncake-store') || name.includes('mooncake/store')) {
+              // strip leading docker.io/ if present
+              const normalized = name.replace(/^docker\.io\//, '')
+              images.add(normalized)
+            }
+          }
+        }
+      }
+      const sorted = Array.from(images).sort()
+      return jsonReply(res, 200, { images: sorted })
+    } catch (e) {
+      return jsonReply(res, 500, { error: e.message })
+    }
+  }
+
   // GET /api/clusters
   if (url.pathname === '/api/clusters' && req.method === 'GET') {
     try {

@@ -1486,7 +1486,38 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 	}
 
 	r.drainJobsMu.Unlock()
-
+	
+	// Force-delete pods whose drain jobs have completed (status >= 3: SUCCEEDED/FAILED/CANCELED).
+	// This handles the case where the PreStop hook doesn't detect the DRAINED status and the
+	// pod remains stuck in Terminating after data migration completes.
+	r.drainJobsMu.Lock()
+	var completedUIDs []string
+	for uid, job := range r.drainJobs {
+		if job.Status >= 3 {
+			completedUIDs = append(completedUIDs, uid)
+		}
+	}
+	r.drainJobsMu.Unlock()
+	
+	for _, uid := range completedUIDs {
+		for _, tp := range terminatingPods {
+			if string(tp.UID) != uid {
+				continue
+			}
+			logger.Info("drain completed, force-deleting terminating pod", "pod", tp.Name)
+			zero := int64(0)
+			if err := r.Delete(ctx, &tp, &client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+				if !errors.IsNotFound(err) {
+					logger.Error(err, "failed to force-delete pod after drain", "pod", tp.Name)
+				}
+			} else {
+				r.Recorder.Event(mc, corev1.EventTypeNormal, "PodForceDeleted",
+					fmt.Sprintf("Force-deleted terminating pod %s after drain completed", tp.Name))
+			}
+			break
+		}
+	}
+	
 	// 3. Process the next terminating pod that doesn't have a tracked job
 	for _, pod := range terminatingPods {
 		r.drainJobsMu.Lock()
@@ -1511,8 +1542,17 @@ func (r *MooncakeClusterReconciler) reconcileTerminatingWorkers(
 				"pod", pod.Name, "segment", segmentName, "error", err)
 			// Don't skip — try to create drain job anyway
 		} else if lifecycle == "DRAINED" {
-			logger.Info("segment already drained, skipping drain",
+			logger.Info("segment already drained, force-deleting terminating pod",
 				"pod", pod.Name, "segment", segmentName)
+			zero := int64(0)
+			if err := r.Delete(ctx, &pod, &client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+				if !errors.IsNotFound(err) {
+					logger.Error(err, "failed to force-delete pod with drained segment", "pod", pod.Name)
+				}
+			} else {
+				r.Recorder.Event(mc, corev1.EventTypeNormal, "PodForceDeleted",
+					fmt.Sprintf("Force-deleted terminating pod %s with drained segment %s", pod.Name, segmentName))
+			}
 			continue
 		}
 

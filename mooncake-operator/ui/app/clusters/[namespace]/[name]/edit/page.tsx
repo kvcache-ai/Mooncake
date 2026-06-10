@@ -23,7 +23,9 @@ export default function EditClusterPage({
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState(false)
 
-  const [image, setImage] = useState('mooncake-store:latest')
+  const [image, setImage] = useState('')
+  const [images, setImages] = useState<string[]>([])
+  const [imagesLoading, setImagesLoading] = useState(true)
   const [masterReplicas, setMasterReplicas] = useState(1)
   const [workerReplicas, setWorkerReplicas] = useState(2)
   const [segmentSize, setSegmentSize] = useState('4Gi')
@@ -33,11 +35,17 @@ export default function EditClusterPage({
   const [configOverrides, setConfigOverrides] = useState('')
 
   useEffect(() => {
+    fetch('/api/images')
+      .then(r => r.json())
+      .then(data => setImages(data.images || []))
+      .catch(() => {})
+      .finally(() => setImagesLoading(false))
+
     fetch(`/api/clusters/${namespace}/${name}`)
       .then(r => r.json())
       .then(data => {
         const spec: ClusterSpec = data.cluster?.spec || {}
-        setImage(spec.image || 'mooncake-store:latest')
+        setImage(spec.image || '')
         setMasterReplicas(spec.master?.replicas ?? 1)
         setWorkerReplicas(spec.workers?.replicas ?? 0)
         setSegmentSize(spec.workers?.segmentSize || '4Gi')
@@ -129,9 +137,21 @@ export default function EditClusterPage({
 
       <form className="mt-6 space-y-6 bg-white shadow sm:rounded-lg p-6" onSubmit={handleSubmit}>
         <div>
-          <label htmlFor="image" className="block text-sm font-medium text-gray-700">Image</label>
-          <input type="text" id="image" value={image} onChange={e => setImage(e.target.value)}
-            className="mt-1 focus:ring-indigo-500 focus:border-indigo-500 block w-full shadow-sm sm:text-sm border-gray-300 rounded-md" />
+          <label htmlFor="image" className="block text-sm font-medium text-gray-700">Image <span className="text-red-500">*</span></label>
+          <select id="image" value={image} onChange={e => setImage(e.target.value)}
+            className="mt-1 focus:ring-indigo-500 focus:border-indigo-500 block w-full shadow-sm sm:text-sm border-gray-300 rounded-md"
+            disabled={imagesLoading}>
+            {imagesLoading ? (
+              <option>Loading images...</option>
+            ) : (
+              <>
+                <option value="">-- Select image --</option>
+                {images.map(img => (
+                  <option key={img} value={img}>{img}</option>
+                ))}
+              </>
+            )}
+          </select>
         </div>
 
         <div className="grid grid-cols-2 gap-4">

@@ -15,6 +15,7 @@ build/
 *.png
 *.jpg
 dist/
+!dist/*.whl
 .cache/
 third_party/
 3rdparty/
