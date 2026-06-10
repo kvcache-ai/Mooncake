@@ -1,3 +1,4 @@
+pub mod cold_tier;
 pub mod compat;
 pub mod error;
 pub mod hugepage;
@@ -7,6 +8,11 @@ pub mod lifecycle;
 pub mod route;
 pub mod traits;
 
+pub use cold_tier::{
+    ColdBackingReplica, ColdBackingRoute, ColdBackingRouteFilter, ColdBackingState,
+    ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceState, ColdTierDeviceUpdate,
+    ColdTierPutDeviceResult, ColdTierTarget, ColdTierTargetSpec, ColdTierUsageDelta,
+};
 pub use compat::CompatibilityDescriptor;
 pub use error::{Result, StoreError};
 pub use hugepage::{parse_hugepage_size, HugePageConfig};

@@ -1,3 +1,7 @@
+use crate::cold_tier::{
+    ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
+    ColdTierPutDeviceResult, ColdTierUsageDelta,
+};
 use crate::error::Result;
 use crate::identity::{
     ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity,
@@ -147,6 +151,46 @@ pub trait MetadataBackend: Send + Sync {
 
     fn list_object_routes(&self) -> Result<Vec<ObjectRoute>>;
 
+    /// Lists object routes with cold backing attributes.
+    ///
+    /// # Performance
+    /// The default implementation filters the full route set in memory and is
+    /// intended for tests or small datasets. Production backends should provide
+    /// an indexed implementation.
+    fn list_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::new();
+        for route in self.list_object_routes()? {
+            let Some(backing) = route.cold_backing.as_ref() else {
+                continue;
+            };
+            if filter
+                .device_id
+                .as_ref()
+                .is_some_and(|device_id| backing.cold_tier_id != *device_id)
+            {
+                continue;
+            }
+            if filter.state.is_some_and(|state| backing.state != state) {
+                continue;
+            }
+            if filter
+                .owner
+                .as_ref()
+                .is_some_and(|owner| backing.owner != *owner)
+            {
+                continue;
+            }
+            routes.push(route);
+            if filter.limit.is_some_and(|limit| routes.len() >= limit) {
+                break;
+            }
+        }
+        Ok(routes)
+    }
+
     /// Lists object routes in the given namespace scope.
     ///
     /// # Performance
@@ -193,6 +237,31 @@ pub trait MetadataBackend: Send + Sync {
         expected: Option<RouteVersion>,
         next: Option<&ObjectRoute>,
     ) -> Result<CasResult>;
+
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult>;
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>>;
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>>;
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord>;
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord>;
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>>;
 
@@ -471,6 +540,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
