@@ -4,13 +4,14 @@ use std::sync::{
 };
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, Result,
-    ReuseIdentity, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
-    TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
-    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
-    TenantQuotaReservationRequest, TenantQuotaState,
+    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate, ColdTierPutDeviceResult,
+    ColdTierUsageDelta, HandoffPlan, LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey,
+    ObjectRoute, Result, ReuseIdentity, RoutePolicy, RoutePolicyDomain, RouteVersion,
+    SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation, StoreError,
+    TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
+    TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +212,42 @@ impl MetadataBackend for CountingMetadataBackend {
             .fetch_add(1, Ordering::Relaxed);
         self.inner
             .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        self.inner.put_cold_tier_device_if_absent(device)
+    }
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        self.inner.get_cold_tier_device(device_id)
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        self.inner.list_cold_tier_devices(filter)
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.inner.update_cold_tier_device(device_id, update)
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.inner
+            .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
     }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {
@@ -511,6 +548,47 @@ impl MetadataBackend for FaultyMetadataBackend {
         self.check()?;
         self.inner
             .compare_and_swap_object_route(key, expected, next)
+    }
+
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        self.check()?;
+        self.inner.put_cold_tier_device_if_absent(device)
+    }
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        self.check()?;
+        self.inner.get_cold_tier_device(device_id)
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        self.check()?;
+        self.inner.list_cold_tier_devices(filter)
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.check()?;
+        self.inner.update_cold_tier_device(device_id, update)
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.check()?;
+        self.inner
+            .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
     }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>> {

@@ -582,6 +582,7 @@ mod state_store_tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            cold_backing: None,
         }
     }
 
@@ -972,6 +973,7 @@ impl StorageOwnerState {
                 state: route.state,
                 compatibility: route.compatibility.clone(),
                 replicas,
+                cold_backing: route.cold_backing.clone(),
             })
         };
 

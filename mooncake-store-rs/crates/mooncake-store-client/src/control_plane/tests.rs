@@ -935,6 +935,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
             tier: ReplicaTier::Dram,
             priority: 1,
         }],
+        cold_backing: None,
     }
 }
 
@@ -1598,6 +1599,8 @@ fn object_route_round_trip_preserves_namespace_fields() {
             tier: ReplicaTier::Dram,
             priority: 0,
         }],
+
+        cold_backing: None,
     };
 
     assert_eq!(

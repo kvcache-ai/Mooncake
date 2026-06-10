@@ -2,13 +2,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mooncake_store_core::{
-    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId, HandoffPlan,
-    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, Result,
-    ReuseIdentity, RoutePolicy, RoutePolicyDomain, RouteVersion, SegmentAnnouncement,
-    SegmentLifecycleState, SegmentName, SegmentReservation, StoreError, TenantObjectAccounting,
-    TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
-    TenantQuotaFinalizeRequest, TenantQuotaReservation, TenantQuotaReservationOutcome,
-    TenantQuotaReservationRequest, TenantQuotaState,
+    CasResult, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
+    ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
+    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, LogicalObjectId, MetadataBackend,
+    NamespaceScope, ObjectKey, ObjectRoute, Result, ReuseIdentity, RoutePolicy, RoutePolicyDomain,
+    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
+    StoreError, TenantObjectAccounting, TenantPolicy, TenantPolicyScope, TenantQuotaAbortOutcome,
+    TenantQuotaFinalizeOutcome, TenantQuotaFinalizeRequest, TenantQuotaReservation,
+    TenantQuotaReservationOutcome, TenantQuotaReservationRequest, TenantQuotaState,
 };
 
 use super::registry;
@@ -228,6 +229,15 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.observe("list_object_routes", || self.inner.list_object_routes())
     }
 
+    fn list_object_routes_by_cold_backing(
+        &self,
+        filter: &ColdBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.observe("list_object_routes_by_cold_backing", || {
+            self.inner.list_object_routes_by_cold_backing(filter)
+        })
+    }
+
     fn list_object_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         self.observe("list_object_routes_in_scope", || {
             self.inner.list_object_routes_in_scope(scope)
@@ -255,6 +265,52 @@ impl MetadataBackend for ObservedMetadataBackend {
         self.observe("compare_and_swap_object_route", || {
             self.inner
                 .compare_and_swap_object_route(key, expected, next)
+        })
+    }
+
+    fn put_cold_tier_device_if_absent(
+        &self,
+        device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        self.observe("put_cold_tier_device_if_absent", || {
+            self.inner.put_cold_tier_device_if_absent(device)
+        })
+    }
+
+    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        self.observe("get_cold_tier_device", || {
+            self.inner.get_cold_tier_device(device_id)
+        })
+    }
+
+    fn list_cold_tier_devices(
+        &self,
+        filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        self.observe("list_cold_tier_devices", || {
+            self.inner.list_cold_tier_devices(filter)
+        })
+    }
+
+    fn update_cold_tier_device(
+        &self,
+        device_id: &str,
+        update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.observe("update_cold_tier_device", || {
+            self.inner.update_cold_tier_device(device_id, update)
+        })
+    }
+
+    fn apply_cold_tier_usage_delta(
+        &self,
+        device_id: &str,
+        delta: ColdTierUsageDelta,
+        updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        self.observe("apply_cold_tier_usage_delta", || {
+            self.inner
+                .apply_cold_tier_usage_delta(device_id, delta, updated_at_ms)
         })
     }
 

@@ -3466,6 +3466,8 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
                 priority: 1,
             },
         ],
+
+        cold_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route_v1, &object_id);
     let published = inner
@@ -6077,6 +6079,8 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
             qos_tier: Some("default".to_string()),
             compatibility: reader.lease.compatibility.clone(),
             replicas: vec![replica.clone()],
+
+            cold_backing: None,
         },
         replica,
         fallback_replicas: VecDeque::new(),
@@ -8219,6 +8223,8 @@ fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
             tier: mooncake_store_core::ReplicaTier::Dram,
             priority: 0,
         }],
+
+        cold_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &object_id);
     inner
@@ -14238,6 +14244,8 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
             tier: mooncake_store_core::ReplicaTier::Dram,
             priority: 0,
         }],
+
+        cold_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &object_id);
     store
@@ -14737,6 +14745,8 @@ fn readable_replica_selection_prefers_local_survivor() {
                 priority: 1,
             },
         ],
+
+        cold_backing: None,
     };
 
     let local_segments = local.local_storage_segments();
@@ -15147,6 +15157,8 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         state: mooncake_store_core::RouteState::Active,
         compatibility: store_a.lease.compatibility.clone(),
         replicas: vec![bad_replica, good_replica],
+
+        cold_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &target_id);
     store_a
@@ -15687,6 +15699,8 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
             tier: mooncake_store_core::ReplicaTier::Dram,
             priority: 0,
         }],
+
+        cold_backing: None,
     };
     allocator.clear_pending_route(&pending_route, &owner);
     assert!(allocator.pending_allocations(now_ms()).is_empty());
@@ -15895,6 +15909,8 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
             tier: mooncake_store_core::ReplicaTier::Dram,
             priority: 0,
         }],
+
+        cold_backing: None,
     };
     allocator.clear_pending_route(&route, &owner);
     assert!(
