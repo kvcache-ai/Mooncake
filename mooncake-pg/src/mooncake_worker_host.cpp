@@ -185,15 +185,11 @@ MooncakeWorker::~MooncakeWorker() {
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    const std::shared_ptr<TransferGroupMeta>& meta,
-    const std::shared_ptr<ConnectionContext>& connection_ctx,
-    FailedRanks failed_ranks,
+    const std::shared_ptr<TransferGroupMeta>& meta, FailedRanks failed_ranks,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
         tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
         bufferToTensor) {
-    connection_ctx->waitUntilNewRanksConnected();
-
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
@@ -231,9 +227,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta.get();
         tasks_[taskId].failedRanksHost = failedRanksPtr;
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            state->currentPos, realSize);
+        tensorToBuffer((void*)meta->segmentInfos[meta->globalRank]
+                           .send_buffer[bufferOffset],
+                       state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
 
@@ -243,9 +239,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
             for (int i = 0; i < meta->size; ++i) {
                 meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
             }
-            bufferToTensor(
-                (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-                state->currentPos, realSize);
+            bufferToTensor((void*)meta->segmentInfos[meta->globalRank]
+                               .recv_buffer[bufferOffset],
+                           state->currentPos, realSize);
 
             state->currentPos += realSize;
 
@@ -266,14 +262,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
-    const std::shared_ptr<ConnectionContext>& connection_ctx,
     const at::cuda::CUDAStream& issue_stream, FailedRanks failed_ranks,
     const std::function<void(void* dst, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
                              const at::cuda::CUDAStream&)>& bufferToTensor) {
-    connection_ctx->waitUntilNewRanksConnected();
-
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
     at::cuda::CUDAStream enq_stream =
@@ -293,9 +286,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
         submitted_tasks.push_back(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
-        tensorToBuffer(
-            (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+        tensorToBuffer((void*)meta->segmentInfos[meta->globalRank]
+                           .send_buffer[bufferOffset],
+                       pos, realSize, enq_stream);
 
         hasCallback_[taskId] = false;
         launchEnqueueTaskKernel(
@@ -303,9 +296,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             meta.get(), tasks_device_, meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), failed_ranks.data(),
             taskId, enq_stream.stream());
-        bufferToTensor(
-            (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+        bufferToTensor((void*)meta->segmentInfos[meta->globalRank]
+                           .recv_buffer[bufferOffset],
+                       pos, realSize, enq_stream);
 
         ++cudaTaskCount;
         ++meta->taskCount;

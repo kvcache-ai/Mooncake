@@ -7,12 +7,13 @@
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
-#include <torch/csrc/distributed/c10d/Store.hpp>
 #else
 // MUSA device compilation: minimal includes to avoid mcc compiler crash
 #include <cstddef>
 #include <cstdint>
 #endif
+
+#include "control_plane/types.h"
 
 #include <cuda_alike.h>
 #include <transfer_engine.h>
@@ -28,36 +29,29 @@
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
 
-struct SegmentInfo {
-    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
-        warmup_buffer[2];
-    uint64_t p2p_credit_region;
-    uint64_t p2p_ack_region;
-};
+class MooncakeBackend;
 
 struct TransferGroupMeta {
-    int rank;
+    int rank;               // InGroupRank (PyTorch ProcessGroup rank)
+    GlobalRank globalRank;  // GlobalRank (index into segmentInfos[])
+    GlobalRank rank_order[kMaxNumRanks];  // InGroupRank -> GlobalRank mapping
     int size;        // capacity: number of slots allocated (incl. inactive)
     int activeSize;  // visible group size: number of ranks that participate
     int taskCount;
+    GroupId group_id = 0;
+    uint64_t epoch = 0;  // GroupView epoch, synced by control plane
     bool* activeRanks;
     bool* activeRanksDevice;
 #if !defined(__MUSA__)
     at::Tensor activeRanksTensor;
 #endif
-    bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
-#if !defined(__MUSA__)
-    c10::intrusive_ptr<::c10d::Store> store;
-#endif
-    int bufferBaseIndex;
-    int backendIndex;
-    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    SegmentInfo segmentInfos[kMaxNumRanks];
-    bool autoDeactivateOnFailure = true;
+    TransferMetadata::SegmentID
+        segmentIDs[kMaxNumRanks];  // synced by control plane
+    GroupEndpointInfo segmentInfos[kMaxNumRanks];
     const size_t* collectiveTimeoutUs = nullptr;
+    MooncakeBackend* backend = nullptr;  // for failure reporting / link check
 };
 
 #if defined(__CUDACC__) || defined(__MUSA__)
@@ -74,6 +68,7 @@ __global__
     BatchID batchID;
     void* transferGroupMeta;
     int* failedRanksHost = nullptr;
+    int* attemptedRanksHost = nullptr;  // per-op attempted bitmap
 };
 
 #if !defined(__MUSA__)
@@ -86,8 +81,6 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
                      int* failedRanks);
 void preloadReduceKernels();
 
-class ConnectionContext;
-
 class MooncakeWorker {
    public:
     explicit MooncakeWorker(int cuda_device_index = -1);
@@ -95,9 +88,7 @@ class MooncakeWorker {
 
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-        const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
-        FailedRanks failedRanks,
+        const std::shared_ptr<TransferGroupMeta>& meta, FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
             tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize)>&
@@ -106,7 +97,6 @@ class MooncakeWorker {
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
-        const std::shared_ptr<ConnectionContext>& connection_ctx,
         const at::cuda::CUDAStream& issue_stream, FailedRanks failedRanks,
         const std::function<void(void* dst, size_t pos, size_t realSize,
                                  const at::cuda::CUDAStream&)>& tensorToBuffer,
@@ -158,11 +148,7 @@ class MooncakeWorker {
 
 class MooncakeWorkerManager {
    public:
-    static MooncakeWorkerManager& GetInstance() {
-        // leaky singleton to avoid destructor fiasco problem
-        static MooncakeWorkerManager* manager = new MooncakeWorkerManager;
-        return *manager;
-    }
+    MooncakeWorkerManager() = default;
 
     std::shared_ptr<MooncakeWorker> GetCPUWorker();
     std::shared_ptr<MooncakeWorker> GetCUDAWorker(int cuda_device_index);

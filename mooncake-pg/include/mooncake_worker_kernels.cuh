@@ -1,9 +1,10 @@
 #ifndef MOONCAKE_WORKER_KERNELS_CUH
 #define MOONCAKE_WORKER_KERNELS_CUH
 
-// Include the main worker header for struct definitions (Task, SegmentInfo,
-// TransferGroupMeta). When compiled by mcc (__MUSA__ defined), the torch-
-// dependent parts are guarded out, making this safe for the MUSA compiler.
+// Include the main worker header for struct definitions (Task,
+// GroupEndpointInfo, TransferGroupMeta). When compiled by mcc (__MUSA__
+// defined), the torch-dependent parts are guarded out, making this safe
+// for the MUSA compiler.
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
