@@ -1073,23 +1073,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         client->transfer_engine_ = std::make_shared<TransferEngine>();
 #ifdef ENABLE_MULTI_PROTOCOL
         // Parse and validate protocol configuration
-        std::vector<std::string> protocols;
-        std::stringstream ss(protocol);
-        std::string item;
-        while (std::getline(ss, item, ',')) {
-            if (!item.empty()) {
-                protocols.push_back(item);
-            }
-        }
+        std::vector<std::string> protocols = parseProtocolList(protocol);
         if (protocols.size() > 1) {
             // Multi-protocol: validate and dispatch
-            bool has_cxl = std::find(protocols.begin(), protocols.end(),
-                                     "cxl") != protocols.end();
-            bool has_tcp = std::find(protocols.begin(), protocols.end(),
-                                     "tcp") != protocols.end();
-            bool has_rdma = std::find(protocols.begin(), protocols.end(),
-                                      "rdma") != protocols.end();
-            if (protocols.size() != 2 || !has_cxl || !(has_tcp || has_rdma)) {
+            if (!isValidMultiProtocol(protocols)) {
                 LOG(ERROR) << "Invalid multi-protocol configuration. Only "
                               "'cxl,tcp' or 'cxl,rdma' are allowed";
                 return std::nullopt;

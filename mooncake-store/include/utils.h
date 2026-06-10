@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <optional>
+#include <sstream>
+#include <vector>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
@@ -499,4 +501,31 @@ std::string GetEnvStringOr(const char* name, const std::string& default_value);
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+// Parse a comma-separated protocol string (e.g. "cxl,tcp") into a vector.
+[[nodiscard]] inline std::vector<std::string> parseProtocolList(
+    const std::string& protocol) {
+    std::vector<std::string> result;
+    std::stringstream ss(protocol);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) result.push_back(item);
+    }
+    return result;
+}
+
+// Return true if the protocol list is a valid multi-protocol config
+// (exactly cxl + tcp or cxl + rdma).
+[[nodiscard]] inline bool isValidMultiProtocol(
+    const std::vector<std::string>& protocols) {
+    if (protocols.size() != 2) return false;
+    bool has_cxl =
+        std::find(protocols.begin(), protocols.end(), "cxl") != protocols.end();
+    bool has_tcp =
+        std::find(protocols.begin(), protocols.end(), "tcp") != protocols.end();
+    bool has_rdma = std::find(protocols.begin(), protocols.end(), "rdma") !=
+                    protocols.end();
+    return has_cxl && (has_tcp || has_rdma);
+}
+
 }  // namespace mooncake

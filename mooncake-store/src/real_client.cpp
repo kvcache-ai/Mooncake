@@ -628,6 +628,63 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
+tl::expected<void, ErrorCode> RealClient::start_auxiliary_services(
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path) {
+    // Start IPC server to accept FD from dummy clients
+    if (!ipc_socket_path_.empty()) {
+        if (start_ipc_server() != 0) {
+            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
+    }
+    if (enable_ssd_offload && start_offload_rpc_server) {
+        // Use port 0 to let the OS auto-allocate an available port.
+        offload_rpc_server_ =
+            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_->async_start();
+        auto err = offload_rpc_server_->get_errc();
+        if (err) {
+            LOG(ERROR) << "Failed to start offload RPC server: "
+                       << err.message();
+            offload_rpc_server_.reset();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        offload_rpc_port_ = offload_rpc_server_->port();
+        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
+    }
+    if (enable_ssd_offload) {
+        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (!ssd_offload_path.empty()) {
+            file_storage_config.storage_filepath = ssd_offload_path;
+        }
+        file_storage_ = std::make_shared<FileStorage>(
+            file_storage_config, client_, this->local_rpc_addr,
+            client_->GetSsdMetricPtr());
+        auto init_result = file_storage_->Init();
+        if (!init_result) {
+            LOG(ERROR) << "file storage init failed with error: "
+                       << init_result.error();
+            return init_result;
+        }
+    }
+    client_requester_ = std::make_shared<ClientRequester>();
+    if (FLAGS_enable_http_server) {
+        if (start_http_server() != 0) {
+            LOG(ERROR) << "Failed to start HTTP server on port "
+                       << FLAGS_http_port;
+        }
+    }
+    return {};
+}
+
 // Multi-protocol setup implementation
 tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
@@ -855,64 +912,8 @@ tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
         }
     }
 
-    // Start IPC server to accept FD from dummy clients
-    if (!ipc_socket_path_.empty()) {
-        if (start_ipc_server() != 0) {
-            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
-    }
-    if (enable_ssd_offload && start_offload_rpc_server) {
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
-        offload_rpc_server_
-            ->register_handler<&RealClient::batch_get_offload_object>(this);
-        offload_rpc_server_
-            ->register_handler<&RealClient::release_offload_buffer>(this);
-        offload_rpc_server_->async_start();
-        auto err = offload_rpc_server_->get_errc();
-        if (err) {
-            LOG(ERROR) << "Failed to start offload RPC server: "
-                       << err.message();
-            offload_rpc_server_.reset();
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        offload_rpc_port_ = offload_rpc_server_->port();
-        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
-
-        std::string rpc_host = this->local_hostname;
-        auto pos = rpc_host.find(':');
-        if (pos != std::string::npos) {
-            rpc_host = rpc_host.substr(0, pos);
-        }
-        this->local_rpc_addr =
-            rpc_host + ":" + std::to_string(offload_rpc_port_);
-    }
-    if (enable_ssd_offload) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (!ssd_offload_path.empty()) {
-            file_storage_config.storage_filepath = ssd_offload_path;
-        }
-        file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
-        auto init_result = file_storage_->Init();
-        if (!init_result) {
-            LOG(ERROR) << "file storage init failed with error: "
-                       << init_result.error();
-            return init_result;
-        }
-    }
-    client_requester_ = std::make_shared<ClientRequester>();
-    if (FLAGS_enable_http_server) {
-        if (start_http_server() != 0) {
-            LOG(ERROR) << "Failed to start HTTP server on port "
-                       << FLAGS_http_port;
-        }
-    }
-
-    return {};
+    return start_auxiliary_services(enable_ssd_offload,
+                                    start_offload_rpc_server, ssd_offload_path);
 }
 #endif  // ENABLE_MULTI_PROTOCOL
 
@@ -929,28 +930,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
 #ifdef ENABLE_MULTI_PROTOCOL
     // Parse and validate protocol configuration
-    std::vector<std::string> parsed_protocols;
-    std::stringstream ss(protocol);
-    std::string item;
-    while (std::getline(ss, item, ',')) {
-        if (!item.empty()) {
-            parsed_protocols.push_back(item);
-        }
-    }
+    std::vector<std::string> parsed_protocols = parseProtocolList(protocol);
 
     if (parsed_protocols.size() == 2) {
         // Might be multi-protocol, validate
-        bool has_cxl =
-            std::find(parsed_protocols.begin(), parsed_protocols.end(),
-                      "cxl") != parsed_protocols.end();
-        bool has_tcp =
-            std::find(parsed_protocols.begin(), parsed_protocols.end(),
-                      "tcp") != parsed_protocols.end();
-        bool has_rdma =
-            std::find(parsed_protocols.begin(), parsed_protocols.end(),
-                      "rdma") != parsed_protocols.end();
-
-        if (has_cxl && (has_tcp || has_rdma)) {
+        if (isValidMultiProtocol(parsed_protocols)) {
             LOG(INFO) << "Multi-protocol configuration detected: " << protocol;
             return mp_setup_internal(
                 local_hostname, metadata_server, global_segment_size,
@@ -1214,62 +1198,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    // Start IPC server to accept FD from dummy clients
-    if (!ipc_socket_path_.empty()) {
-        if (start_ipc_server() != 0) {
-            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
-    }
-    if (enable_ssd_offload && start_offload_rpc_server) {
-        // Start RPC server for offload operations (batch_get / release_buffer).
-        // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
-        offload_rpc_server_
-            ->register_handler<&RealClient::batch_get_offload_object>(this);
-        offload_rpc_server_
-            ->register_handler<&RealClient::release_offload_buffer>(this);
-        offload_rpc_server_->async_start();
-        auto err = offload_rpc_server_->get_errc();
-        if (err) {
-            LOG(ERROR) << "Failed to start offload RPC server: "
-                       << err.message();
-            offload_rpc_server_.reset();
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        offload_rpc_port_ = offload_rpc_server_->port();
-        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
-
-        // Build local_rpc_addr from hostname + auto-allocated port
-        this->local_rpc_addr = buildHostNameWithPort(
-            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
-    }
-    if (enable_ssd_offload) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (!ssd_offload_path.empty()) {
-            file_storage_config.storage_filepath = ssd_offload_path;
-        }
-        file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
-        auto init_result = file_storage_->Init();
-        if (!init_result) {
-            LOG(ERROR) << "file storage init failed with error: "
-                       << init_result.error();
-            return init_result;
-        }
-    }
-    client_requester_ = std::make_shared<ClientRequester>();
-    if (FLAGS_enable_http_server) {
-        if (start_http_server() != 0) {
-            LOG(ERROR) << "Failed to start HTTP server on port "
-                       << FLAGS_http_port;
-        }
-    }
-
-    return {};
+    return start_auxiliary_services(enable_ssd_offload,
+                                    start_offload_rpc_server, ssd_offload_path);
 }
 
 int RealClient::setup_real(

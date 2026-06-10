@@ -894,6 +894,9 @@ class RealClient : public PyClient {
     int start_ipc_server();
     int stop_ipc_server();
     void ipc_server_func();
+    tl::expected<void, ErrorCode> start_auxiliary_services(
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path);
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server();

@@ -48,7 +48,8 @@ static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
     "mooncake_snapshot_save_backup";
 static const std::string SNAPSHOT_BACKUP_RESTORE_DIR =
     "mooncake_snapshot_restore_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION = "2.0.0";
+static const std::string SNAPSHOT_SERIALIZER_VERSION_LEGACY = "1.0.0";
 static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
@@ -4873,9 +4874,11 @@ bool MasterService::TryRestoreStateFromSnapshot(
                                 "', expected '" + SNAPSHOT_SERIALIZER_TYPE +
                                 "'");
         }
-        if (version != SNAPSHOT_SERIALIZER_VERSION) {
+        if (version != SNAPSHOT_SERIALIZER_VERSION &&
+            version != SNAPSHOT_SERIALIZER_VERSION_LEGACY) {
             return fail_restore("incompatible snapshot version '" + version +
                                 "', expected '" + SNAPSHOT_SERIALIZER_VERSION +
+                                "' or '" + SNAPSHOT_SERIALIZER_VERSION_LEGACY +
                                 "'");
         }
 
