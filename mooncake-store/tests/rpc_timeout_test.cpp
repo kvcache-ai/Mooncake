@@ -50,8 +50,8 @@ class BlackHoleServer {
             << "bind failed";
 
         socklen_t len = sizeof(addr);
-        EXPECT_EQ(
-            ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+        EXPECT_EQ(::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len),
+                  0);
         port_ = ntohs(addr.sin_port);
 
         // Backlog large enough that the kernel handshakes our single client.
@@ -64,9 +64,7 @@ class BlackHoleServer {
         }
     }
 
-    std::string address() const {
-        return "127.0.0.1:" + std::to_string(port_);
-    }
+    std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
 
    private:
     int fd_ = -1;
@@ -90,8 +88,8 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
     constexpr int kTimeoutMs = 500;
 
     // The constructor reads MC_RPC_TIMEOUT_MS, so it must be set beforehand.
-    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS",
-                       std::to_string(kTimeoutMs).c_str(), /*overwrite=*/1),
+    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", std::to_string(kTimeoutMs).c_str(),
+                       /*overwrite=*/1),
               0);
 
     BlackHoleServer server;
@@ -115,8 +113,8 @@ TEST(RpcTimeoutTest, RpcTimesOutAgainstUnresponsiveMaster) {
     // took effect (the built-in default would be ~30s).
     EXPECT_GE(elapsed, kTimeoutMs - 100)
         << "returned too early to be the configured timeout";
-    EXPECT_LT(elapsed, 5000)
-        << "did not honor MC_RPC_TIMEOUT_MS (default 30s timeout still active?)";
+    EXPECT_LT(elapsed, 5000) << "did not honor MC_RPC_TIMEOUT_MS (default 30s "
+                                "timeout still active?)";
 }
 
 }  // namespace mooncake
