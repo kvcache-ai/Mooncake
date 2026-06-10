@@ -1586,8 +1586,10 @@ fn execute_batch_get_values_into(
         .collect::<Vec<_>>();
     match client.batch_get_into(requests.as_mut_slice()) {
         Ok(sizes) => {
-            for (((index, key, _, _), buffer), copied) in
-                misses.into_iter().zip(buffers.iter()).zip(sizes)
+            for (((index, key, _, _), buffer), copied) in misses
+                .into_iter()
+                .zip(buffers.iter())
+                .zip(sizes.into_iter())
             {
                 if copied == 0 {
                     continue;
