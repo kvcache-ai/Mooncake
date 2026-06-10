@@ -1,6 +1,7 @@
 #include <mooncake_ep_buffer.h>
 #include <glog/logging.h>
 #include <sstream>
+#include <mooncake_ep_layout.cuh>
 #include <transfer_engine.h>
 
 namespace mooncake {
@@ -90,6 +91,20 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+
+    // Elastic workspace (DeepEP V2 port)
+    auto elastic_bytes = layout::WorkspaceLayout::get_num_bytes();
+    CUDA_CHECK(cudaMalloc(&elastic_workspace, elastic_bytes));
+    CUDA_CHECK(
+        cudaMemsetAsync(elastic_workspace, 0, elastic_bytes, comm_stream));
+
+    // Feature flags
+    if (const char* env = std::getenv("MC_EP_ELASTIC_DISPATCH")) {
+        use_elastic_dispatch_ = (std::string(env) == "1");
+    }
+    if (const char* env = std::getenv("MC_EP_ELASTIC_COMBINE")) {
+        use_elastic_combine_ = (std::string(env) == "1");
+    }
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
@@ -115,6 +130,7 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     p2p_transport_ = nullptr;
 
     if (workspace) cudaFree(workspace);
+    if (elastic_workspace) cudaFree(elastic_workspace);
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
@@ -214,9 +230,67 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
             timeout_ticks, phases);
     };
-    launcher(return_recv_hook
-                 ? LOW_LATENCY_SEND_PHASE
-                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+
+    // Elastic dispatch path (DeepEP V2 port)
+    if (use_elastic_dispatch_) {
+        // Allocate slot index buffer
+        auto dst_buffer_slot_idx = torch::empty(
+            {num_tokens, num_topk},
+            torch::dtype(torch::kInt32).device(x.device()));
+        auto psum_num_recv_tokens_per_rank = torch::zeros(
+            {num_ranks}, torch::dtype(torch::kInt32).device(x.device()));
+        auto psum_num_recv_tokens_per_expert = torch::zeros(
+            {num_local_experts},
+            torch::dtype(torch::kInt32).device(x.device()));
+
+        // Run deterministic prologue to pre-compute slot indices
+        mooncake::dispatch_deterministic_prologue(
+            topk_idx.data_ptr<int64_t>(),
+            dst_buffer_slot_idx.data_ptr<int>(),
+            num_tokens, hidden, num_topk, num_experts, rank, num_ranks,
+            num_max_dispatch_tokens_per_rank, elastic_workspace,
+            launch_stream);
+
+        // Run elastic dispatch kernel
+        mooncake::elastic_dispatch(
+            const_cast<void*>(x.data_ptr()),
+            topk_idx.data_ptr<int64_t>(),
+            nullptr,  // topk_weights (not needed for dispatch)
+            nullptr,  // copied_topk_idx
+            nullptr,  // cumulative_local_expert_recv_stats
+            psum_num_recv_tokens_per_rank.data_ptr<int>(),
+            psum_num_recv_tokens_per_expert.data_ptr<int>(),
+            dst_buffer_slot_idx.data_ptr<int>(),
+            num_tokens, hidden, num_topk, num_experts, rank, num_ranks,
+            num_max_dispatch_tokens_per_rank,
+            true,  // reuse_slot_indices
+            gdr_buffer, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr,
+            nvlink_avail, ipc_ptrs,
+            buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
+            gdr_buffer,  // buffer (communication buffer)
+            elastic_workspace, launch_stream, timeout_ticks);
+
+        // Run copy epilogue to unpack received tokens
+        mooncake::dispatch_copy_epilogue(
+            gdr_buffer, elastic_workspace,
+            psum_num_recv_tokens_per_rank.data_ptr<int>(),
+            psum_num_recv_tokens_per_expert.data_ptr<int>(),
+            packed_recv_x.data_ptr(),
+            nullptr,  // recv_sf (no SF packs)
+            nullptr,  // recv_topk_idx
+            nullptr,  // recv_topk_weights
+            packed_recv_src_info.data_ptr<int>(),
+            num_tokens, hidden,
+            0,  // num_sf_packs
+            0, 0,  // recv_sf strides
+            num_topk, num_experts, rank, num_ranks,
+            num_max_dispatch_tokens_per_rank, launch_stream);
+    } else {
+        launcher(return_recv_hook
+                     ? LOW_LATENCY_SEND_PHASE
+                     : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    }
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -332,9 +406,42 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy);
     };
-    launcher(return_recv_hook
-                 ? LOW_LATENCY_SEND_PHASE
-                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+
+    // Elastic combine path (DeepEP V2 port)
+    if (use_elastic_combine_) {
+        auto psum_num_recv_tokens_per_rank = torch::zeros(
+            {num_ranks}, torch::dtype(torch::kInt32).device(x.device()));
+
+        // Run elastic combine kernel
+        mooncake::elastic_combine(
+            const_cast<void*>(x.data_ptr()),
+            const_cast<float*>(topk_weights.data_ptr<float>()),
+            const_cast<int*>(src_info.data_ptr<int>()),
+            psum_num_recv_tokens_per_rank.data_ptr<int>(),
+            gdr_buffer, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr,
+            nvlink_avail, ipc_ptrs,
+            buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer,
+            gdr_buffer,  // buffer (communication buffer)
+            elastic_workspace,
+            num_combined_tokens, hidden, num_topk, num_experts, rank,
+            num_ranks, num_max_dispatch_tokens_per_rank,
+            launch_stream, timeout_ticks);
+
+        // Run reduce epilogue
+        mooncake::combine_reduce_epilogue(
+            combined_x.data_ptr(),
+            nullptr,  // combined_topk_weights
+            nullptr,  // combined_topk_idx
+            gdr_buffer,  // recv_buffer
+            nullptr, nullptr,  // bias_0, bias_1
+            num_combined_tokens, hidden, num_topk, num_experts, rank,
+            num_ranks, num_max_dispatch_tokens_per_rank, launch_stream);
+    } else {
+        launcher(return_recv_hook
+                     ? LOW_LATENCY_SEND_PHASE
+                     : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
+    }
 
     // Wait streams
     std::optional<EventHandle> event;

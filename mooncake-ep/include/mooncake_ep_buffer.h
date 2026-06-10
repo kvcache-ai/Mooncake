@@ -92,8 +92,16 @@ struct MooncakeEpBuffer {
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
 
-    // Workspace
+    // Workspace (existing: atomic counters for dispatch/combine)
     void* workspace = nullptr;
+
+    // Elastic workspace (DeepEP V2 port): barrier signals, notify reduction,
+    // rank/expert count buffers, atomic sender counter.
+    void* elastic_workspace = nullptr;
+
+    // Feature flags (gated by env vars)
+    bool use_elastic_dispatch_ = false;
+    bool use_elastic_combine_ = false;
 
    public:
     // If engine is provided, EP gets P2pTransport/RdmaTransport from it

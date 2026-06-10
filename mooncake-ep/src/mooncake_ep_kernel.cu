@@ -2,11 +2,17 @@
 
 #include <cstdio>
 
+#include <mooncake_ep_barrier.cuh>
+#include <mooncake_ep_combine_epilogue.cuh>
 #include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_dispatch_epilogue.cuh>
+#include <mooncake_ep_dispatch_prologue.cuh>
+#include <mooncake_ep_elastic_combine.cuh>
+#include <mooncake_ep_elastic_dispatch.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
-#include <transport/device/comm_device.cuh>
 #include <mooncake_ep_utils.cuh>
+#include <transport/device/comm_device.cuh>
 
 namespace mooncake {
 
@@ -602,6 +608,489 @@ LAUNCH_KERNEL(&cfg, combine_func, \
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
+}
+
+// =========================================================================
+// DeepEP V2 ported kernel launchers
+// =========================================================================
+
+void barrier(void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,
+             const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
+             int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+             void* workspace, int rank, int num_ranks, int num_sms,
+             cudaStream_t stream) {
+    constexpr int kNumThreads = 1024;
+    constexpr int64_t kNumTimeoutCycles = NUM_TIMEOUT_CYCLES;
+
+#define BARRIER_LAUNCH_CASE(nranks)                                        \
+    {                                                                      \
+        auto func = barrier::barrier_impl<kNumThreads, nranks,             \
+                                          kNumTimeoutCycles>;              \
+        LAUNCH_KERNEL(&cfg, func, mxa_buffer, raddrs, rkeys, qp_devctxs,  \
+                      nvlink_available, ipc_peer_ptrs,                     \
+                      rdma_send_signal_buffer, rdma_recv_signal_buffer,    \
+                      workspace, rank, num_ranks, num_sms);                \
+    }                                                                      \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    SWITCH_RANKS(BARRIER_LAUNCH_CASE);
+#undef BARRIER_LAUNCH_CASE
+}
+
+void dispatch_deterministic_prologue(
+    const int64_t* topk_idx, int* dst_buffer_slot_idx, int num_tokens,
+    int hidden, int num_topk, int num_experts, int rank, int num_ranks,
+    int num_max_dispatch_tokens_per_rank, void* workspace,
+    cudaStream_t stream) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumThreads = kNumWarps * 32;
+    const auto num_sms = cell_div(num_experts, 8);
+
+    // Shared memory: (1 + 2 * kNumWarps) * kNumRanks * sizeof(int)
+    const auto smem_bytes =
+        (1 + 2 * kNumWarps) * num_ranks * static_cast<int>(sizeof(int));
+
+#define PROLOGUE_LAUNCH_CASE(nranks)                                          \
+    {                                                                         \
+        auto func = dispatch_prologue::                                       \
+            dispatch_deterministic_prologue_impl<                             \
+                kNumWarps, nranks>;                                           \
+        cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes, stream,   \
+                                  nullptr, 0};                                \
+        cudaLaunchAttribute attr[1];                                          \
+        attr[0].id = cudaLaunchAttributeCooperative;                          \
+        attr[0].val.cooperative = 1;                                          \
+        cfg.attrs = attr;                                                     \
+        cfg.numAttrs = 1;                                                     \
+        LAUNCH_KERNEL(&cfg, func, topk_idx,                                   \
+                      reinterpret_cast<int*>(workspace), dst_buffer_slot_idx, \
+                      num_tokens, num_topk, num_experts,                      \
+                      num_max_dispatch_tokens_per_rank, rank, num_sms);       \
+    }                                                                         \
+    break
+
+    SWITCH_RANKS(PROLOGUE_LAUNCH_CASE);
+#undef PROLOGUE_LAUNCH_CASE
+}
+
+void dispatch_copy_epilogue(
+    void* buffer, void* workspace, int* psum_num_recv_tokens_per_rank,
+    int* psum_num_recv_tokens_per_expert, void* recv_x, void* recv_sf,
+    int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_src_metadata,
+    int num_recv_tokens, int hidden, int num_sf_packs,
+    int recv_sf_token_stride, int recv_sf_hidden_stride, int num_topk,
+    int num_experts, int rank, int num_ranks,
+    int num_max_dispatch_tokens_per_rank, cudaStream_t stream) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumThreads = kNumWarps * 32;
+    const auto num_sms = cell_div(num_experts, 8);
+
+    // Shared memory: one staging buffer per warp
+    const auto token_bytes =
+        align<int>(hidden * sizeof(nv_bfloat16), 16) +
+        align<int>(num_sf_packs * static_cast<int>(sizeof(float)), 16) +
+        align<int>(num_topk * (sizeof(int) + sizeof(float)) +
+                       (1 + num_topk) * static_cast<int>(sizeof(int)),
+                   16);
+    const auto smem_bytes = kNumWarps * token_bytes;
+
+#define EPILOGUE_LAUNCH_CASE(hidden_val)                                        \
+    {                                                                          \
+        constexpr int kHiddenBytes = (hidden_val) * sizeof(nv_bfloat16);      \
+        switch (num_ranks) {                                                   \
+            case 2: {                                                          \
+                auto func = dispatch_epilogue::                                \
+                    dispatch_copy_epilogue_impl<                               \
+                        false, kNumWarps, 2, kHiddenBytes>;                    \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, buffer, workspace,                   \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert, recv_x,         \
+                              recv_sf, recv_topk_idx, recv_topk_weights,       \
+                              recv_src_metadata, num_recv_tokens,              \
+                              num_sf_packs,                                    \
+                              recv_sf_token_stride, recv_sf_hidden_stride,     \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            case 4: {                                                          \
+                auto func = dispatch_epilogue::                                \
+                    dispatch_copy_epilogue_impl<                               \
+                        false, kNumWarps, 4, kHiddenBytes>;                    \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, buffer, workspace,                   \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert, recv_x,         \
+                              recv_sf, recv_topk_idx, recv_topk_weights,       \
+                              recv_src_metadata, num_recv_tokens,              \
+                              num_sf_packs,                                    \
+                              recv_sf_token_stride, recv_sf_hidden_stride,     \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            case 8: {                                                          \
+                auto func = dispatch_epilogue::                                \
+                    dispatch_copy_epilogue_impl<                               \
+                        false, kNumWarps, 8, kHiddenBytes>;                    \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, buffer, workspace,                   \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert, recv_x,         \
+                              recv_sf, recv_topk_idx, recv_topk_weights,       \
+                              recv_src_metadata, num_recv_tokens,              \
+                              num_sf_packs,                                    \
+                              recv_sf_token_stride, recv_sf_hidden_stride,     \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            default:                                                           \
+                EP_HOST_ASSERT(false && "Unsupported ranks");                  \
+        }                                                                      \
+    }                                                                          \
+    break
+
+    SWITCH_HIDDEN(EPILOGUE_LAUNCH_CASE);
+#undef EPILOGUE_LAUNCH_CASE
+}
+
+void combine_reduce_epilogue(
+    void* combined_x, float* combined_topk_weights,
+    int64_t* combined_topk_idx, void* recv_buffer, void* bias_0, void* bias_1,
+    int num_combined_tokens, int hidden, int num_topk, int num_experts,
+    int rank, int num_ranks, int num_max_dispatch_tokens_per_rank,
+    cudaStream_t stream) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumThreads = kNumWarps * 32;
+    const auto num_sms = cell_div(num_experts, 8);
+
+    // Shared memory: one staging buffer per warp
+    const auto smem_bytes = kNumWarps * align<int>(hidden * sizeof(nv_bfloat16), 16);
+
+#define COMBINE_EPILOGUE_LAUNCH_CASE(hidden_val)                                \
+    {                                                                          \
+        switch (num_ranks) {                                                   \
+            case 2: {                                                          \
+                auto func = combine_epilogue::                                 \
+                    combine_reduce_epilogue_impl<                              \
+                        false, false, kNumWarps, 2, hidden_val>;               \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, combined_x, combined_topk_weights,   \
+                              combined_topk_idx, recv_buffer, bias_0, bias_1,  \
+                              num_combined_tokens, num_topk, num_experts,      \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            case 4: {                                                          \
+                auto func = combine_epilogue::                                 \
+                    combine_reduce_epilogue_impl<                              \
+                        false, false, kNumWarps, 4, hidden_val>;               \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, combined_x, combined_topk_weights,   \
+                              combined_topk_idx, recv_buffer, bias_0, bias_1,  \
+                              num_combined_tokens, num_topk, num_experts,      \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            case 8: {                                                          \
+                auto func = combine_epilogue::                                 \
+                    combine_reduce_epilogue_impl<                              \
+                        false, false, kNumWarps, 8, hidden_val>;               \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, combined_x, combined_topk_weights,   \
+                              combined_topk_idx, recv_buffer, bias_0, bias_1,  \
+                              num_combined_tokens, num_topk, num_experts,      \
+                              num_max_dispatch_tokens_per_rank,                \
+                              rank, num_sms);                                  \
+            } break;                                                           \
+            default:                                                           \
+                EP_HOST_ASSERT(false && "Unsupported ranks");                  \
+        }                                                                      \
+    }                                                                          \
+    break
+
+    SWITCH_HIDDEN(COMBINE_EPILOGUE_LAUNCH_CASE);
+#undef COMBINE_EPILOGUE_LAUNCH_CASE
+}
+
+// =========================================================================
+// Elastic dispatch (DeepEP V2 style with notify warps)
+// =========================================================================
+
+void elastic_dispatch(
+    void* x, const int64_t* topk_idx, float* topk_weights,
+    int64_t* copied_topk_idx, int* cumulative_local_expert_recv_stats,
+    int* psum_num_recv_tokens_per_rank, int* psum_num_recv_tokens_per_expert,
+    int* dst_buffer_slot_idx, int num_tokens, int hidden, int num_topk,
+    int num_experts, int rank, int num_ranks,
+    int num_max_dispatch_tokens_per_rank, bool reuse_slot_indices,
+    void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,
+    const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
+    int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+    void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
+    void* buffer, void* workspace, cudaStream_t stream,
+    int64_t timeout_ticks) {
+    constexpr int kNumNotifyWarps = EP_NUM_NOTIFY_WARPS;
+    constexpr int kNumDispatchWarps = EP_NUM_DISPATCH_WARPS;
+    constexpr int kNumWarps = kNumNotifyWarps + kNumDispatchWarps;
+    constexpr int kNumThreads = kNumWarps * 32;
+    constexpr int kExpertAlignment = 1;
+    const auto num_sms = cell_div(num_experts, 8);
+
+    // Shared memory for notify warps
+    const auto smem_bytes =
+        align<int>(num_ranks + num_experts, kNumNotifyWarps * 32) *
+        static_cast<int>(sizeof(int));
+
+#define ELASTIC_DISPATCH_LAUNCH_CASE(hidden_val)                               \
+    {                                                                          \
+        constexpr int kHiddenBytes = (hidden_val) * sizeof(nv_bfloat16);       \
+        switch (num_ranks) {                                                   \
+            case 2: {                                                          \
+                auto func =                                                    \
+                    reuse_slot_indices                                         \
+                        ? elastic_dispatch::dispatch_impl<                     \
+                              true, kNumNotifyWarps, kNumDispatchWarps, 2,     \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>                              \
+                        : elastic_dispatch::dispatch_impl<                     \
+                              false, kNumNotifyWarps, kNumDispatchWarps, 2,    \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>;                             \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_idx, topk_weights,           \
+                              copied_topk_idx,                                 \
+                              cumulative_local_expert_recv_stats,              \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert,                 \
+                              dst_buffer_slot_idx, num_tokens,                 \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              mxa_buffer, raddrs, rkeys, qp_devctxs,           \
+                              nvlink_available, ipc_peer_ptrs,                 \
+                              rdma_send_signal_buffer,                         \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms);                             \
+            } break;                                                           \
+            case 4: {                                                          \
+                auto func =                                                    \
+                    reuse_slot_indices                                         \
+                        ? elastic_dispatch::dispatch_impl<                     \
+                              true, kNumNotifyWarps, kNumDispatchWarps, 4,     \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>                              \
+                        : elastic_dispatch::dispatch_impl<                     \
+                              false, kNumNotifyWarps, kNumDispatchWarps, 4,    \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>;                             \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_idx, topk_weights,           \
+                              copied_topk_idx,                                 \
+                              cumulative_local_expert_recv_stats,              \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert,                 \
+                              dst_buffer_slot_idx, num_tokens,                 \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              mxa_buffer, raddrs, rkeys, qp_devctxs,           \
+                              nvlink_available, ipc_peer_ptrs,                 \
+                              rdma_send_signal_buffer,                         \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms);                             \
+            } break;                                                           \
+            case 8: {                                                          \
+                auto func =                                                    \
+                    reuse_slot_indices                                         \
+                        ? elastic_dispatch::dispatch_impl<                     \
+                              true, kNumNotifyWarps, kNumDispatchWarps, 8,     \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>                              \
+                        : elastic_dispatch::dispatch_impl<                     \
+                              false, kNumNotifyWarps, kNumDispatchWarps, 8,    \
+                              kHiddenBytes, kExpertAlignment,                  \
+                              NUM_TIMEOUT_CYCLES>;                             \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_idx, topk_weights,           \
+                              copied_topk_idx,                                 \
+                              cumulative_local_expert_recv_stats,              \
+                              psum_num_recv_tokens_per_rank,                   \
+                              psum_num_recv_tokens_per_expert,                 \
+                              dst_buffer_slot_idx, num_tokens,                 \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank,                \
+                              mxa_buffer, raddrs, rkeys, qp_devctxs,           \
+                              nvlink_available, ipc_peer_ptrs,                 \
+                              rdma_send_signal_buffer,                         \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms);                             \
+            } break;                                                           \
+            default:                                                           \
+                EP_HOST_ASSERT(false && "Unsupported ranks");                  \
+        }                                                                      \
+    }                                                                          \
+    break
+
+    SWITCH_HIDDEN(ELASTIC_DISPATCH_LAUNCH_CASE);
+#undef ELASTIC_DISPATCH_LAUNCH_CASE
+}
+
+// =========================================================================
+// Elastic combine (DeepEP V2 style with barrier + local reduction)
+// =========================================================================
+
+void elastic_combine(
+    void* x, float* topk_weights, int* src_metadata,
+    int* psum_num_recv_tokens_per_rank,
+    void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,
+    const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
+    int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+    void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
+    void* buffer, void* workspace,
+    int num_reduced_tokens, int hidden, int num_topk, int num_experts,
+    int rank, int num_ranks, int num_max_dispatch_tokens_per_rank,
+    cudaStream_t stream, int64_t timeout_ticks) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumThreads = kNumWarps * 32;
+    const auto num_sms = cell_div(num_experts, 8);
+
+    // Shared memory: one staging buffer per warp
+    const auto smem_bytes =
+        kNumWarps * align<int>(hidden * sizeof(nv_bfloat16), 16);
+
+#define ELASTIC_COMBINE_LAUNCH_CASE(hidden_val)                                \
+    {                                                                          \
+        switch (num_ranks) {                                                   \
+            case 2: {                                                          \
+                auto func = elastic_combine::combine_impl<                     \
+                    kNumWarps, 2, hidden_val,                                  \
+                    NUM_TIMEOUT_CYCLES>;                                       \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_weights, src_metadata,       \
+                              psum_num_recv_tokens_per_rank, mxa_buffer,       \
+                              raddrs, rkeys, qp_devctxs, nvlink_available,     \
+                              ipc_peer_ptrs, rdma_send_signal_buffer,          \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms, num_reduced_tokens,          \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank);               \
+            } break;                                                           \
+            case 4: {                                                          \
+                auto func = elastic_combine::combine_impl<                     \
+                    kNumWarps, 4, hidden_val,                                  \
+                    NUM_TIMEOUT_CYCLES>;                                       \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_weights, src_metadata,       \
+                              psum_num_recv_tokens_per_rank, mxa_buffer,       \
+                              raddrs, rkeys, qp_devctxs, nvlink_available,     \
+                              ipc_peer_ptrs, rdma_send_signal_buffer,          \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms, num_reduced_tokens,          \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank);               \
+            } break;                                                           \
+            case 8: {                                                          \
+                auto func = elastic_combine::combine_impl<                     \
+                    kNumWarps, 8, hidden_val,                                  \
+                    NUM_TIMEOUT_CYCLES>;                                       \
+                cudaLaunchConfig_t cfg = {num_sms, kNumThreads, smem_bytes,    \
+                                          stream, nullptr, 0};                 \
+                cudaLaunchAttribute attr[1];                                   \
+                attr[0].id = cudaLaunchAttributeCooperative;                   \
+                attr[0].val.cooperative = 1;                                   \
+                cfg.attrs = attr;                                              \
+                cfg.numAttrs = 1;                                              \
+                LAUNCH_KERNEL(&cfg, func, x, topk_weights, src_metadata,       \
+                              psum_num_recv_tokens_per_rank, mxa_buffer,       \
+                              raddrs, rkeys, qp_devctxs, nvlink_available,     \
+                              ipc_peer_ptrs, rdma_send_signal_buffer,          \
+                              rdma_recv_signal_buffer, rdma_send_data_buffer,  \
+                              rdma_recv_data_buffer, buffer, workspace, rank,  \
+                              num_ranks, num_sms, num_reduced_tokens,          \
+                              num_topk, num_experts,                           \
+                              num_max_dispatch_tokens_per_rank);               \
+            } break;                                                           \
+            default:                                                           \
+                EP_HOST_ASSERT(false && "Unsupported ranks");                  \
+        }                                                                      \
+    }                                                                          \
+    break
+
+    SWITCH_HIDDEN(ELASTIC_COMBINE_LAUNCH_CASE);
+#undef ELASTIC_COMBINE_LAUNCH_CASE
 }
 
 } // namespace mooncake

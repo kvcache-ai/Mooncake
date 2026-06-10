@@ -535,4 +535,96 @@ __forceinline__ __device__ void barrier_device(int **task_fifo_ptrs, int head,
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
+// ---------------------------------------------------------------------------
+// DeepEP V2 ported helpers (adapted from deep_ep/common/math.cuh and ptx.cuh)
+// ---------------------------------------------------------------------------
+
+// Encode a positive value as negative for signaling (DeepEP convention).
+// decode: -value - 1; ready when decoded >= 0.
+template <typename dtype_t>
+__forceinline__ __device__ __host__ dtype_t encode_decode_positive(
+    const dtype_t& value) {
+    return -value - static_cast<dtype_t>(1);
+}
+
+template <typename dtype_t>
+__forceinline__ __device__ __host__ bool is_decoded_positive_ready(
+    const dtype_t& value) {
+    return value >= 0;
+}
+
+// Typed pointer arithmetic (device-side).
+template <typename dtype_t = void>
+__forceinline__ __device__ __host__ dtype_t* advance_ptr(void* ptr,
+                                                         const int64_t num_bytes) {
+    return reinterpret_cast<dtype_t*>(static_cast<int8_t*>(ptr) + num_bytes);
+}
+
+// Elect one active lane in the warp.  Returns true for exactly one lane.
+__forceinline__ __device__ bool elect_one_sync() {
+    const auto mask = __activemask();
+    return (mask & -mask) == (1u << (threadIdx.x % 32));
+}
+
+// Check whether `value` is unique among active lanes in this warp.
+__forceinline__ __device__ bool deduplicate(int value, int lane_id) {
+    const auto mask = __match_any_sync(__activemask(), value);
+    return (mask & -mask) == (1u << lane_id);
+}
+
+// Get mask of lanes that have the same value.
+__forceinline__ __device__ unsigned match(int value) {
+    return __match_any_sync(__activemask(), value);
+}
+
+// Get the lowest set bit index in a mask.
+__forceinline__ __device__ int get_master_lane_idx(unsigned mask) {
+    return __ffs(mask) - 1;
+}
+
+// Inclusive prefix sum within a warp.
+__forceinline__ __device__ int warp_inclusive_sum(int value, int lane_id) {
+    int sum = value;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        int tmp = __shfl_up_sync(0xffffffff, sum, offset);
+        if (lane_id >= offset) sum += tmp;
+    }
+    return sum;
+}
+
+// Broadcast a value from a specific lane.
+template <typename dtype_t>
+__forceinline__ __device__ dtype_t exchange(dtype_t& ptr, int src_lane_idx) {
+    EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
+    auto send_int_values = reinterpret_cast<int*>(&ptr);
+    int recv_int_values[sizeof(dtype_t) / sizeof(int)];
+#pragma unroll
+    for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
+        recv_int_values[i] =
+            __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+    return *reinterpret_cast<dtype_t*>(recv_int_values);
+}
+
+// Gather a predicate mask across the warp.
+__forceinline__ __device__ unsigned gather(bool pred) {
+    return __ballot_sync(__activemask(), pred);
+}
+
+// Predicated global load: returns 0 if condition is false.
+template <typename dtype_t>
+__forceinline__ __device__ dtype_t ldg_with_gez_pred(const dtype_t* ptr,
+                                                     bool condition) {
+    if (condition)
+        return *ptr;
+    return dtype_t{};
+}
+
+// BF16 accumulation helper: accumulate bf16x2 into float2.
+__forceinline__ __device__ void accumulate(float2& acc,
+                                           __nv_bfloat162 val) {
+    acc.x += __bfloat162float(val.x);
+    acc.y += __bfloat162float(val.y);
+}
+
 }  // namespace mooncake

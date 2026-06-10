@@ -16,6 +16,22 @@
 #define LOW_LATENCY_SEND_PHASE 1
 #define LOW_LATENCY_RECV_PHASE 2
 
+// Barrier tags (matching DeepEP V2 convention)
+#define EP_BARRIER_TAG_DISPATCH_0 2
+#define EP_BARRIER_TAG_DISPATCH_1 3
+#define EP_BARRIER_TAG_COMBINE_0 4
+#define EP_BARRIER_TAG_COMBINE_1 5
+#define EP_BARRIER_TAG_KERNEL_BARRIER 1
+
+// Workspace layout constants (adapted from DeepEP V2)
+#define EP_NUM_MAX_RANKS 32
+#define EP_NUM_MAX_EXPERTS 1024
+#define EP_NUM_MAX_EXPERTS_PER_RANK 256
+
+// Notify warp configuration
+#define EP_NUM_NOTIFY_WARPS 4
+#define EP_NUM_DISPATCH_WARPS 28  // Total warps - notify warps
+
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__
 #define __CUDA_ARCH__ 900  // NOLINT(*-reserved-identifier)
