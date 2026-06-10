@@ -1599,7 +1599,6 @@ fn object_route_round_trip_preserves_namespace_fields() {
             tier: ReplicaTier::Dram,
             priority: 0,
         }],
-
         cold_backing: None,
     };
 

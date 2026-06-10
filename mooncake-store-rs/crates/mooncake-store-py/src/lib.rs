@@ -3806,6 +3806,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 1,
             }],
+            cold_backing: None,
         }
     }
 
