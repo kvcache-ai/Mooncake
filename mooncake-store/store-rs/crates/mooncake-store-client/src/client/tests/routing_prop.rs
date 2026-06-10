@@ -51,6 +51,7 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
             tier: ReplicaTier::Dram,
             priority: 0,
         }],
+        cold_backing: None,
     }
 }
 

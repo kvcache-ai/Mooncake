@@ -240,28 +240,48 @@ pub trait MetadataBackend: Send + Sync {
 
     fn put_cold_tier_device_if_absent(
         &self,
-        device: &ColdTierDeviceRecord,
-    ) -> Result<ColdTierPutDeviceResult>;
+        _device: &ColdTierDeviceRecord,
+    ) -> Result<ColdTierPutDeviceResult> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support put_cold_tier_device_if_absent".to_string(),
+        ))
+    }
 
-    fn get_cold_tier_device(&self, device_id: &str) -> Result<Option<ColdTierDeviceRecord>>;
+    fn get_cold_tier_device(&self, _device_id: &str) -> Result<Option<ColdTierDeviceRecord>> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support get_cold_tier_device".to_string(),
+        ))
+    }
 
     fn list_cold_tier_devices(
         &self,
-        filter: &ColdTierDeviceFilter,
-    ) -> Result<Vec<ColdTierDeviceRecord>>;
+        _filter: &ColdTierDeviceFilter,
+    ) -> Result<Vec<ColdTierDeviceRecord>> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support list_cold_tier_devices".to_string(),
+        ))
+    }
 
     fn update_cold_tier_device(
         &self,
-        device_id: &str,
-        update: ColdTierDeviceUpdate,
-    ) -> Result<ColdTierDeviceRecord>;
+        _device_id: &str,
+        _update: ColdTierDeviceUpdate,
+    ) -> Result<ColdTierDeviceRecord> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support update_cold_tier_device".to_string(),
+        ))
+    }
 
     fn apply_cold_tier_usage_delta(
         &self,
-        device_id: &str,
-        delta: ColdTierUsageDelta,
-        updated_at_ms: u64,
-    ) -> Result<ColdTierDeviceRecord>;
+        _device_id: &str,
+        _delta: ColdTierUsageDelta,
+        _updated_at_ms: u64,
+    ) -> Result<ColdTierDeviceRecord> {
+        Err(crate::error::StoreError::Unsupported(
+            "metadata backend does not support apply_cold_tier_usage_delta".to_string(),
+        ))
+    }
 
     fn get_route_policy(&self, domain: &RoutePolicyDomain) -> Result<Option<RoutePolicy>>;
 

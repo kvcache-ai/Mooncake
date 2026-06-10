@@ -259,6 +259,7 @@ pub(super) fn try_object_route(route: pb::ObjectRoute) -> Result<ObjectRoute> {
             .into_iter()
             .map(try_replica_route)
             .collect::<Result<Vec<_>>>()?,
+        cold_backing: None,
     })
 }
 
