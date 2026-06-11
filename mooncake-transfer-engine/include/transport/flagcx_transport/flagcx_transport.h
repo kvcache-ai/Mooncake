@@ -91,6 +91,9 @@ class FlagCxTransport : public Transport {
 
     int allocateLocalSegment();
     int doSlice(Slice *slice);
+    // Issue a group of same-target, same-opcode slices as one multi-iov
+    // (multi-rail) transfer and mark each slice's completion.
+    void runSliceGroup(const std::vector<Slice *> &group);
 
     // Find the engine MR handle whose registered region fully contains
     // [addr, addr+length).  Returns false if the source is unregistered.
