@@ -1832,9 +1832,10 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     slice_lengths.reserve(ops.size());
 
     if (hot_cache_) {
-        for (const auto& op : ops) {
-            hot_cache_->RemoveHotKey(op.key);
-        }
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
     }
 
     for (const auto& op : ops) {
@@ -1897,9 +1898,10 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     slice_lengths.reserve(ops.size());
 
     if (hot_cache_) {
-        for (const auto& op : ops) {
-            hot_cache_->RemoveHotKey(op.key);
-        }
+        std::vector<std::string> hot_keys;
+        hot_keys.reserve(ops.size());
+        for (const auto& op : ops) hot_keys.emplace_back(op.key);
+        hot_cache_->RemoveHotKeys(hot_keys);
     }
 
     for (const auto& op : ops) {
@@ -2533,7 +2535,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
-        hot_cache_->RemoveHotKey(key);
+        hot_cache_->BumpKeyGeneration(key);
     }
 
     auto result = master_client_.Remove(key, force);
@@ -2553,6 +2555,10 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
@@ -2560,19 +2566,24 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
     if (!result) {
         return tl::unexpected(result.error());
     }
-    if (hot_cache_) {
-        hot_cache_->Clear();
+    if (result.value() > 0 && hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+        hot_cache_->RemoveHotKeysByRegex(str);
     }
     return result.value();
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
+    if (hot_cache_) {
+        hot_cache_->BumpCacheEpoch();
+    }
+
     auto result = master_client_.RemoveAll(force);
     if (result && storage_backend_) {
         storage_backend_->RemoveAll();
     }
-    if (result && hot_cache_) {
-        hot_cache_->Clear();
+    if (result && result.value() > 0 && hot_cache_) {
+        hot_cache_->RemoveAllHotKeys();
     }
     return result;
 }
@@ -2580,18 +2591,21 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
     if (hot_cache_) {
-        for (const auto& key : keys) {
-            hot_cache_->RemoveHotKey(key);
-        }
+        hot_cache_->BumpKeyGenerations(keys);
     }
 
     auto results = master_client_.BatchRemove(keys, force);
 
     if (hot_cache_) {
+        std::vector<std::string> removed_keys;
+        removed_keys.reserve(std::min(keys.size(), results.size()));
         for (size_t i = 0; i < keys.size(); ++i) {
             if (i < results.size() && results[i].has_value()) {
-                hot_cache_->RemoveHotKey(keys[i]);
+                removed_keys.emplace_back(keys[i]);
             }
+        }
+        if (!removed_keys.empty()) {
+            hot_cache_->RemoveHotKeys(removed_keys);
         }
     }
 
