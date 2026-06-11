@@ -26,6 +26,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/os.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -286,6 +287,11 @@ Status TransferEngineImpl::construct() {
     enable_auto_failover_on_poll_ =
         conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
+
+    // Configure RDMA failure tracking
+    rdma_failure_threshold_ = conf_->get("rdma_failure_threshold", 3);
+    int time_window_sec = conf_->get("rdma_failure_time_window_sec", 60);
+    rdma_failure_time_window_ns_ = time_window_sec * 1000000000ULL;
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -1190,7 +1196,18 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
 SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
                                                      int transport_index,
                                                      bool invalidate_on_fail) {
-    auto result = getTransportType(req, transport_index);
+    // Skip RDMA if failure threshold exceeded and within time window
+    int adjusted_index = transport_index;
+    if (transport_index == 0 && rdma_failure_threshold_ > 0 &&
+        rdma_failure_count_ >= rdma_failure_threshold_) {
+        uint64_t current_ns = getCurrentTimeInNano();
+        if ((current_ns - rdma_failure_window_start_ns_) <= rdma_failure_time_window_ns_) {
+            // Bypass RDMA by incrementing transport index
+            adjusted_index = 1;
+        }
+    }
+
+    auto result = getTransportType(req, adjusted_index);
     if (result.transport == UNSPEC && invalidate_on_fail) {
         metadata_->segmentManager().invalidateRemote(req.target_id);
         result = getTransportType(req, transport_index);
@@ -1395,6 +1412,34 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
               << " -> " << transportTypeName(type) << " (attempt "
               << task.failover_count << "/" << max_failover_attempts_ << ")";
     TENT_RECORD_TRANSPORT_FAILOVER();
+
+    // Track RDMA failures
+    if (prev_type == RDMA) {
+        uint64_t current_ns = getCurrentTimeInNano();
+        // Reset counter if time window has passed
+        if (rdma_failure_count_ > 0 &&
+            (current_ns - rdma_failure_window_start_ns_) > rdma_failure_time_window_ns_) {
+            rdma_failure_count_ = 0;
+            rdma_failure_window_start_ns_ = 0;
+            LOG(INFO) << "RDMA failure counter reset";
+        }
+        // Initialize window start time on first failure
+        if (rdma_failure_count_ == 0) {
+            rdma_failure_window_start_ns_ = current_ns;
+        }
+        rdma_failure_count_++;
+
+        LOG(WARNING) << "RDMA failure detected (count: "
+                     << rdma_failure_count_ << "/"
+                     << rdma_failure_threshold_ << ")";
+
+        if (rdma_failure_threshold_ > 0 &&
+            rdma_failure_count_ >= rdma_failure_threshold_) {
+            LOG(WARNING) << "RDMA failure threshold exceeded ("
+                         << rdma_failure_count_
+                         << " failures), will bypass RDMA for 1 minute";
+        }
+    }
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])

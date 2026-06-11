@@ -28,6 +28,11 @@
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/common/utils/os.h"
+#include "tent/common/utils/random.h"
+
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
 #include "tent/common/utils/string_builder.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
@@ -394,6 +399,12 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         peer_lid = peer_desc.local_lid;
     }
 
+    // Check if peer returned valid QP list (empty means peer is in transition)
+    if (qp_num.empty()) {
+        return mooncake::tent::Status::InternalError(
+            "Peer returned empty QP list, endpoint may be in transition, retry later" LOC_MARK);
+    }
+
     if (peer_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
@@ -444,44 +455,90 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 
 Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                             BootstrapDesc& local_desc) {
-    RWSpinlock::WriteGuard guard(lock_);
-    if (status_.load(std::memory_order_relaxed) == EP_READY) {
-        // Idempotency check: if the incoming bootstrap is from the same peer
-        // and carries the same peer QP list as the established connection,
-        // this is a duplicate request (e.g. from a concurrent connect() on
-        // the initiator that released its lock during Phase 2). Re-using the
-        // existing connection is safe and avoids resetting QPs that may
-        // already have in-flight RDMA operations.
-        auto incoming_peer_server =
-            getServerNameFromNicPath(peer_desc.local_nic_path);
-        auto incoming_peer_nic =
-            getNicNameFromNicPath(peer_desc.local_nic_path);
-        if (incoming_peer_server == peer_server_name_ &&
-            incoming_peer_nic == peer_nic_name_ &&
-            peer_desc.qp_num == peer_qp_num_list_) {
-            LOG(INFO) << "Endpoint already established with " << peer_nic_name_
-                      << " of " << peer_server_name_
-                      << " (duplicate bootstrap, reusing connection)";
-            auto& transport = context_->transport_;
-            local_desc.local_nic_path =
-                MakeNicPath(transport.rdma_server_name_, context_->name());
-            local_desc.peer_nic_path = peer_desc.local_nic_path;
-            local_desc.qp_num = qpNum();
-            local_desc.local_lid = context_->lid();
-            local_desc.local_gid = context_->gid();
-            local_desc.notify_qp_num = notifyQpNum();
-            return mooncake::tent::Status::OK();
+    // First pass: check if we need random backoff before acquiring lock
+    auto incoming_peer_server = getServerNameFromNicPath(peer_desc.local_nic_path);
+    auto incoming_peer_nic = getNicNameFromNicPath(peer_desc.local_nic_path);
+
+    bool need_backoff = false;
+    {
+        RWSpinlock::ReadGuard read_guard(lock_);
+        auto current_status = status_.load(std::memory_order_relaxed);
+        // Only check for backoff if EP is READY (peer info is initialized)
+        if (current_status == EP_READY) {
+            if (incoming_peer_server == peer_server_name_ &&
+                incoming_peer_nic == peer_nic_name_ &&
+                peer_desc.qp_num != peer_qp_num_list_) {
+                need_backoff = true;
+            }
         }
-        // Endpoint already connected to a different peer - reject the request
-        // instead of resetting. Endpoints have unidirectional lifecycle and
-        // are never reset or reused. The caller should create a new endpoint.
-        LOG(ERROR)
-            << "Endpoint already established with " << peer_nic_name_ << " of "
-            << peer_server_name_
-            << ", cannot accept new connection (unidirectional lifecycle)";
-        return mooncake::tent::Status::InternalError(
-            "Endpoint already connected to different peer" LOC_MARK);
     }
+
+    // Random backoff: 0-200ms to avoid synchronized retries
+    if (need_backoff) {
+        usleep(SimpleRandom::Get().next(200000));
+    }
+
+    // Main logic with write lock
+    bool need_remove_ep = false;
+    {
+        RWSpinlock::WriteGuard guard(lock_);
+        if (status_.load(std::memory_order_relaxed) == EP_READY) {
+            // Idempotency check: if the incoming bootstrap is from the same peer
+            // and carries the same peer QP list as the established connection,
+            // this is a duplicate request (e.g. from a concurrent connect() on
+            // the initiator that released its lock during Phase 2). Re-using the
+            // existing connection is safe and avoids resetting QPs that may
+            // already have in-flight RDMA operations.
+            if (incoming_peer_server == peer_server_name_ &&
+                incoming_peer_nic == peer_nic_name_ &&
+                peer_desc.qp_num == peer_qp_num_list_) {
+                LOG(INFO) << "Endpoint already established with " << peer_nic_name_
+                          << " of " << peer_server_name_
+                          << " (duplicate bootstrap, reusing connection)";
+                auto& transport = context_->transport_;
+                local_desc.local_nic_path =
+                    MakeNicPath(transport.rdma_server_name_, context_->name());
+                local_desc.peer_nic_path = peer_desc.local_nic_path;
+                local_desc.qp_num = qpNum();
+                local_desc.local_lid = context_->lid();
+                local_desc.local_gid = context_->gid();
+                local_desc.notify_qp_num = notifyQpNum();
+                return mooncake::tent::Status::OK();
+            }
+
+            // If the incoming request is from the same peer but with different QPs,
+            // it means the peer has recreated its endpoint.
+            if (incoming_peer_server == peer_server_name_ &&
+                incoming_peer_nic == peer_nic_name_) {
+                status_.store(EP_DESTROYING, std::memory_order_release);
+                destroy_start_time_ = getCurrentTimeInNano();
+                need_remove_ep = true;
+            } else {
+                // Fill local_desc before returning error
+                auto& transport = context_->transport_;
+                local_desc.local_nic_path =
+                    MakeNicPath(transport.rdma_server_name_, context_->name());
+                local_desc.local_lid = context_->lid();
+                local_desc.local_gid = context_->gid();
+                return mooncake::tent::Status::InternalError(
+                    "Endpoint already connected to different peer" LOC_MARK);
+            }
+        }
+    }
+
+    // Remove from endpoint store outside of lock to avoid potential deadlock
+    if (need_remove_ep) {
+        context_->endpointStore()->remove(this);
+        // Fill local_desc before returning error so peer can retry properly
+        auto& transport = context_->transport_;
+        local_desc.local_nic_path =
+            MakeNicPath(transport.rdma_server_name_, context_->name());
+        local_desc.local_lid = context_->lid();
+        local_desc.local_gid = context_->gid();
+        return mooncake::tent::Status::InternalError(
+            "Peer endpoint recreated, need new connection" LOC_MARK);
+    }
+
     if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
         LOG(ERROR) << "Endpoint not in handshaking state: "
                    << statusToString(status_.load(std::memory_order_relaxed));
@@ -844,6 +901,62 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         LOG(ERROR) << ss.str();
         if (reply_msg) *reply_msg = ss.str();
         return -1;
+    }
+
+    const auto& config = context_->transport_.config();
+    if (config->get("transports/rdma/mlx5_qp_lag_port_balance", false)) {
+#ifdef USE_MLX5DV
+        uint8_t n = context_->numLagPorts();
+        if (n > 1) {
+            uint8_t target = (uint8_t)(qp_index % n) + 1;
+            int lag_ret = mlx5dv_modify_qp_lag_port(qp, target);
+            if (lag_ret) {
+                LOG_FIRST_N(WARNING, 4)
+                    << "[RDMA] mlx5dv_modify_qp_lag_port failed"
+                    << " (qp_index=" << qp_index
+                    << ", target_port=" << (int)target
+                    << "): " << strerror(lag_ret);
+            } else {
+                uint8_t cfg = 0, active = 0;
+                if (mlx5dv_query_qp_lag_port(qp, &cfg, &active) == 0) {
+                    VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                           << " lag_port cfg=" << (int)cfg
+                           << " active=" << (int)active;
+                } else {
+                    LOG_FIRST_N(WARNING, 4)
+                        << "[RDMA] mlx5dv_query_qp_lag_port failed"
+                        << " (qp_index=" << qp_index << ")";
+                }
+            }
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_LAG_PORT_BALANCE is set but binary was not built "
+               "with USE_MLX5DV; ignoring";
+#endif
+    }
+
+    // Optional: override the RoCEv2 UDP source port to spread QPs across
+    // different ECMP/LAG paths
+    auto udp_sports =
+        config->getArray<uint16_t>("transports/rdma/mlx5_qp_udp_sports");
+    if (!udp_sports.empty()) {
+#ifdef USE_MLX5DV
+        uint16_t sport = udp_sports[qp_index % udp_sports.size()];
+        int sp_ret = mlx5dv_modify_qp_udp_sport(qp, sport);
+        if (sp_ret) {
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] mlx5dv_modify_qp_udp_sport failed (qp_index="
+                << qp_index << ", sport=" << sport << "): " << strerror(sp_ret);
+        } else {
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                   << " udp_sport=" << sport;
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_UDP_SPORTS is set but binary was not built with "
+               "USE_MLX5DV; ignoring";
+#endif
     }
 
     return 0;

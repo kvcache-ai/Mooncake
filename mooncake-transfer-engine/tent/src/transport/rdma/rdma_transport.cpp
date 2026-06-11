@@ -566,7 +566,7 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name)) {
         std::stringstream ss;
         ss << "No device found in local segment: " << local_nic_name;
-        LOG(ERROR) << ss.str();
+        LOG(WARNING) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
     }
@@ -575,7 +575,7 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     if (context->status() == RdmaContext::DEVICE_DISABLED) {
         std::stringstream ss;
         ss << "Device is down: " << peer_desc.local_nic_path;
-        LOG(ERROR) << ss.str();
+        LOG(WARNING) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
     }
@@ -584,13 +584,13 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     if (!endpoint) {
         std::stringstream ss;
         ss << "Cannot allocate endpoint: " << peer_desc.local_nic_path;
-        LOG(ERROR) << ss.str();
+        LOG(WARNING) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
     }
     auto status = endpoint->accept(peer_desc, local_desc);
     if (!status.ok()) {
-        LOG(ERROR) << status.ToString();
+        LOG(WARNING) << status.ToString();
         local_desc.reply_msg = status.ToString();
         return -1;
     }

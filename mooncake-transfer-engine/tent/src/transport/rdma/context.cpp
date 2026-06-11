@@ -431,9 +431,19 @@ int RdmaContext::enable() {
         status_ = DEVICE_ENABLED;
     }
 
+#ifdef USE_MLX5DV
+    // Query MLX5 LAG port information for LAG balancing support
+    mlx5dv_context dv_ctx = {};
+    dv_ctx.comp_mask = MLX5DV_CONTEXT_MASK_NUM_LAG_PORTS;
+    if (mlx5dv_query_device(native_context_, &dv_ctx) == 0) {
+        num_lag_ports_ = dv_ctx.num_lag_ports;
+    }
+#endif
+
     if (params_->verbose) {
         LOG(INFO) << "Context " << device_name_ << " is enabled: "
-                  << "LID " << lid_ << ", GID [" << gid_index_ << "] " << gid();
+                  << "LID " << lid_ << ", GID [" << gid_index_ << "] " << gid()
+                  << ", num_lag_ports: " << (int)num_lag_ports_;
     }
     return 0;
 }

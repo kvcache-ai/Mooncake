@@ -19,6 +19,10 @@
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
 
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -108,6 +112,8 @@ class RdmaContext {
 
     int eventFd() const { return event_fd_; }
 
+    uint8_t numLagPorts() const { return num_lag_ports_; }
+
     RdmaCQ *cq(int index);
 
     int cqCount() const { return params_->device.num_cq_list; }
@@ -142,6 +148,7 @@ class RdmaContext {
     uint16_t lid_ = 0;
     int gid_index_ = -1;
     ibv_gid gid_;
+    uint8_t num_lag_ports_ = 0;  // 0/1 = not in LAG; ≥2 = LAG active
 
     std::mutex mr_set_mutex_;
     std::unordered_set<ibv_mr *> mr_set_;
