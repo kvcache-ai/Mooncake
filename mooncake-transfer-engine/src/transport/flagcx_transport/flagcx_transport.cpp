@@ -9,14 +9,14 @@
 #include "transport/flagcx_transport/flagcx_transport.h"
 
 #include <glog/logging.h>
-#include <unistd.h>
 
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <fstream>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -24,24 +24,10 @@
 
 namespace mooncake {
 
-namespace {
-
-int getEnvInt(const char *name, int def) {
-    const char *v = std::getenv(name);
-    return v ? std::atoi(v) : def;
-}
-
-const char *getEnvStr(const char *name, const char *def) {
-    const char *v = std::getenv(name);
-    return v ? v : def;
-}
-
-}  // namespace
-
 FlagCxTransport::FlagCxTransport() {}
 
 FlagCxTransport::~FlagCxTransport() {
-    // Stop and join worker first; any in-flight slices fail.
+    // Stop and join the worker first; any in-flight slices fail.
     {
         std::lock_guard<std::mutex> lk(queue_mu_);
         running_.store(false);
@@ -51,13 +37,16 @@ FlagCxTransport::~FlagCxTransport() {
     for (auto *s : io_queue_) s->markFailed();
     io_queue_.clear();
 
-    if (comm_) {
-        flagcxCommDestroy(comm_);
-        comm_ = nullptr;
-    }
-    if (window_) {
-        std::free(window_);
-        window_ = nullptr;
+    if (engine_) {
+        // Deregister everything still registered, then tear the engine down.
+        {
+            std::lock_guard<std::mutex> lk(reg_mu_);
+            for (auto &r : regs_) flagcxP2pEngineMrDestroy(engine_, r.mr);
+            regs_.clear();
+        }
+        flagcxP2pEngineStopAccept(engine_);
+        flagcxP2pEngineDestroy(engine_);
+        engine_ = nullptr;
     }
     if (metadata_) metadata_->removeSegmentDesc(local_server_name_);
 }
@@ -69,47 +58,39 @@ int FlagCxTransport::install(std::string &local_server_name,
     local_server_name_ = local_server_name;
     metadata_ = meta;
 
-    nranks_ = getEnvInt("MC_FLAGCX_NRANKS", 2);
-    rank_ = getEnvInt("MC_FLAGCX_RANK", -1);
-    if (rank_ < 0 || rank_ >= nranks_) {
-        LOG(ERROR) << "FlagCxTransport: invalid MC_FLAGCX_RANK=" << rank_
-                   << " (MC_FLAGCX_NRANKS=" << nranks_ << ")";
-        return -1;
-    }
-    size_t window_mb = static_cast<size_t>(
-        getEnvInt("MC_FLAGCX_WINDOW_SIZE_MB", 64));
-    window_size_ = window_mb * 1024ULL * 1024ULL;
-
-    LOG(INFO) << "FlagCxTransport: rank=" << rank_ << "/" << nranks_
-              << " window=" << window_size_ << "B";
-
-    flagcxUniqueId id_storage;
-    flagcxUniqueId_t id = &id_storage;
-    if (flagcxGetUniqueId(&id) != flagcxSuccess) {
-        LOG(ERROR) << "flagcxGetUniqueId failed";
-        return -1;
-    }
-    if (bootstrapUniqueId(&id) != 0) return -1;
-
-    if (flagcxCommInitRank(&comm_, nranks_, id, rank_) != flagcxSuccess) {
-        LOG(ERROR) << "flagcxCommInitRank failed";
+    engine_ = flagcxP2pEngineCreate();
+    if (!engine_) {
+        LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineCreate failed";
         return -1;
     }
 
-    window_ = std::aligned_alloc(4096, window_size_);
-    if (!window_) {
-        LOG(ERROR) << "FlagCxTransport: window aligned_alloc failed";
+    // Bring up the accept daemon so peers can RDMA into our registered
+    // regions.  Idempotent; safe even though buffers register later.
+    if (flagcxP2pEngineStartRpcServer(engine_) != 0) {
+        LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineStartRpcServer failed";
         return -1;
     }
-    std::memset(window_, 0, window_size_);
 
-    auto reg = flagcxOneSideRegister(comm_, window_, window_size_);
-    if (reg != flagcxSuccess) {
-        LOG(ERROR) << "flagcxOneSideRegister rc=" << reg
-                   << " (net adaptor may not be RDMA-capable; "
-                   << "set FLAGCX_NET=IBRC or FLAGCX_NET=UCX)";
+    // The engine metadata string is "ip:rdma_port?gpu_index?notif_port";
+    // the leading "ip:rdma_port" doubles as the GetConn session id, and
+    // rdma_port == the RPC/handshake port (flagcxP2pEngineGetRpcPort).
+    char *meta_str = nullptr;
+    if (flagcxP2pEngineGetMetadata(engine_, &meta_str) != 0 || !meta_str) {
+        LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineGetMetadata failed";
         return -1;
     }
+    std::string md(meta_str);
+    std::free(meta_str);
+    auto q = md.find('?');
+    flagcx_endpoint_ = (q == std::string::npos) ? md : md.substr(0, q);
+    if (flagcx_endpoint_.empty()) {
+        LOG(ERROR) << "FlagCxTransport: empty flagcx endpoint from metadata '"
+                   << md << "'";
+        return -1;
+    }
+
+    LOG(INFO) << "FlagCxTransport: engine up, endpoint=" << flagcx_endpoint_
+              << " (rpc_port=" << flagcxP2pEngineGetRpcPort(engine_) << ")";
 
     if (allocateLocalSegment() != 0) return -1;
 
@@ -127,7 +108,7 @@ void FlagCxTransport::ioWorker() {
             queue_cv_.wait(lk, [this] {
                 return !io_queue_.empty() || !running_.load();
             });
-            if (io_queue_.empty()) return;  // running_ is false and queue drained
+            if (io_queue_.empty()) return;  // running_ false and queue drained
             slice = io_queue_.front();
             io_queue_.pop_front();
         }
@@ -136,41 +117,6 @@ void FlagCxTransport::ioWorker() {
         else
             slice->markFailed();
     }
-}
-
-int FlagCxTransport::bootstrapUniqueId(flagcxUniqueId_t *id) {
-    static const char kDefault[] = "/home/zhangzuoyuan/.mc_flagcx_uid";
-    const char *path = getEnvStr("MC_FLAGCX_UID_PATH", kDefault);
-    if (rank_ == 0) {
-        // Stale leftover from a previous run will confuse later ranks.
-        std::remove(path);
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            LOG(ERROR) << "FlagCxTransport: cannot write uid file " << path;
-            return -1;
-        }
-        out.write(reinterpret_cast<const char *>(*id),
-                  sizeof(flagcxUniqueId));
-        out.close();
-        LOG(INFO) << "FlagCxTransport: rank 0 published uid to " << path;
-        return 0;
-    }
-    // Non-zero ranks: poll for the file (~10 min budget).
-    for (int i = 0; i < 600; ++i) {
-        std::ifstream in(path, std::ios::binary);
-        if (in) {
-            in.read(reinterpret_cast<char *>(*id), sizeof(flagcxUniqueId));
-            if (in.gcount() ==
-                static_cast<std::streamsize>(sizeof(flagcxUniqueId))) {
-                LOG(INFO) << "FlagCxTransport: rank " << rank_
-                          << " loaded uid from " << path;
-                return 0;
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    LOG(ERROR) << "FlagCxTransport: timed out waiting for uid file " << path;
-    return -1;
 }
 
 int FlagCxTransport::allocateLocalSegment() {
@@ -183,6 +129,11 @@ int FlagCxTransport::allocateLocalSegment() {
 #else
     desc->protocol = "flagcx";
 #endif
+    // Advertise the flagcx RPC/handshake endpoint ("ip:rpc_port"); peers
+    // read it back from the segment descriptor to open a connection.  The
+    // RDMA-reachable endpoint legitimately differs from the TCP-routable
+    // segment name, which is exactly what rdma_server_name is meant for.
+    desc->rdma_server_name = flagcx_endpoint_;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return metadata_->updateLocalSegmentDesc();
@@ -194,15 +145,16 @@ int FlagCxTransport::registerLocalMemory(void *addr, size_t length,
                                          bool update_metadata) {
     (void)location;
     (void)remote_accessible;
-    size_t offset = window_used_.fetch_add(length);
-    if (offset + length > window_size_) {
-        LOG(ERROR) << "FlagCxTransport: registerLocalMemory exceeds window "
-                   << (offset + length) << " > " << window_size_;
+    FlagcxP2pMr mr = 0;
+    if (flagcxP2pEngineReg(engine_, reinterpret_cast<uintptr_t>(addr), length,
+                           mr) != 0) {
+        LOG(ERROR) << "FlagCxTransport: flagcxP2pEngineReg failed addr=" << addr
+                   << " len=" << length;
         return -1;
     }
     {
         std::lock_guard<std::mutex> lk(reg_mu_);
-        regs_.push_back({addr, length, offset});
+        regs_.push_back({addr, length, mr});
     }
     BufferDesc buf_desc;
     buf_desc.name = local_server_name_;
@@ -219,6 +171,7 @@ int FlagCxTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
         std::lock_guard<std::mutex> lk(reg_mu_);
         for (auto it = regs_.begin(); it != regs_.end(); ++it) {
             if (it->addr == addr) {
+                if (engine_) flagcxP2pEngineMrDestroy(engine_, it->mr);
                 regs_.erase(it);
                 break;
             }
@@ -228,8 +181,7 @@ int FlagCxTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 }
 
 int FlagCxTransport::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list,
-    const std::string &location) {
+    const std::vector<BufferEntry> &buffer_list, const std::string &location) {
     for (const auto &b : buffer_list)
         registerLocalMemory(b.addr, b.length, location, true, false);
     return metadata_->updateLocalSegmentDesc();
@@ -241,84 +193,99 @@ int FlagCxTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
-bool FlagCxTransport::resolveOffset(void *addr, size_t length,
-                                    size_t &offset_out) {
+bool FlagCxTransport::resolveLocalMr(void *addr, size_t length,
+                                     FlagcxP2pMr &mr_out) {
     std::lock_guard<std::mutex> lk(reg_mu_);
     for (const auto &r : regs_) {
         char *base = reinterpret_cast<char *>(r.addr);
         char *hit = reinterpret_cast<char *>(addr);
         if (hit >= base && hit + length <= base + r.length) {
-            offset_out = r.offset + (hit - base);
+            mr_out = r.mr;
             return true;
         }
     }
     return false;
 }
 
-int FlagCxTransport::peerRankForSegment(SegmentID target_id) {
-    (void)target_id;
-    return 1 - rank_;
+FlagcxP2pConn *FlagCxTransport::connForSegment(SegmentID target_id) {
+    auto desc = metadata_->getSegmentDescByID(target_id);
+    if (!desc) {
+        LOG(ERROR) << "FlagCxTransport: no segment desc for id " << target_id;
+        return nullptr;
+    }
+    if (desc->rdma_server_name.empty()) {
+        LOG(ERROR) << "FlagCxTransport: segment " << desc->name
+                   << " has no flagcx endpoint (rdma_server_name empty)";
+        return nullptr;
+    }
+    // The engine caches connections by session string, so calling this on
+    // every slice is cheap after the first handshake.
+    FlagcxP2pConn *conn =
+        flagcxP2pEngineGetConn(engine_, desc->rdma_server_name.c_str());
+    if (!conn) {
+        LOG(ERROR) << "FlagCxTransport: GetConn failed for "
+                   << desc->rdma_server_name;
+    }
+    return conn;
 }
 
 int FlagCxTransport::doSlice(Slice *slice) {
-    // Called only from ioWorker thread, no locking needed.
-    size_t src_offset = 0;
-    if (!resolveOffset(slice->source_addr, slice->length, src_offset)) {
+    // Runs only on the ioWorker thread; no extra locking required here.
+    FlagcxP2pMr local_mr = 0;
+    if (!resolveLocalMr(slice->source_addr, slice->length, local_mr)) {
         LOG(ERROR) << "FlagCxTransport: source not registered "
                    << slice->source_addr;
         return -1;
     }
-    if (slice->opcode == TransferRequest::WRITE) {
-        std::memcpy(reinterpret_cast<char *>(window_) + src_offset,
-                    slice->source_addr, slice->length);
+
+    FlagcxP2pConn *conn = connForSegment(slice->target_id);
+    if (!conn) return -1;
+
+    // Resolve the remote rkey by absolute virtual address using the region
+    // table exchanged at handshake -- the FlagCX analogue of Mooncake's
+    // "look up rkey by dst_ptr".  dest_offset already carries the remote
+    // absolute VA (request.target_offset).
+    FlagcxP2pRdmaDesc desc;
+    if (flagcxP2pEngineMakeDesc(conn, slice->flagcx.dest_offset,
+                                static_cast<uint32_t>(slice->length),
+                                &desc) != 0) {
+        LOG(ERROR) << "FlagCxTransport: MakeDesc failed for remote VA 0x"
+                   << std::hex << slice->flagcx.dest_offset << std::dec
+                   << " len=" << slice->length;
+        return -1;
     }
 
-    // Translate remote absolute address -> window offset.
-    // Assumes remote registered its buffers contiguously inside the
-    // staging window in segment desc order.
-    size_t dst_offset = slice->flagcx.dest_offset;
-    auto remote_desc = metadata_->getSegmentDescByID(slice->target_id);
-    if (remote_desc) {
-        size_t cursor = 0;
-        for (const auto &b : remote_desc->buffers) {
-            if (slice->flagcx.dest_offset >= b.addr &&
-                slice->flagcx.dest_offset + slice->length <=
-                    b.addr + b.length) {
-                dst_offset = cursor +
-                             (slice->flagcx.dest_offset - b.addr);
-                break;
-            }
-            cursor += b.length;
+    std::vector<FlagcxP2pMr> mrs{local_mr};
+    std::vector<void *> bufs{slice->source_addr};
+    std::vector<size_t> sizes{slice->length};
+    std::vector<FlagcxP2pRdmaDesc> descs{desc};
+
+    if (slice->opcode == TransferRequest::WRITE) {
+        // Blocking one-sided write; on return the data has landed in the
+        // peer's registered buffer (no separate signal/counter needed).
+        if (flagcxP2pEngineWriteVectorSync(conn, mrs, bufs, sizes, descs) !=
+            0) {
+            LOG(ERROR) << "FlagCxTransport: WriteVectorSync failed";
+            return -1;
         }
-    }
-
-    uint64_t before = 0;
-    flagcxReadCounter(comm_, &before);
-
-    int peer = peerRankForSegment(slice->target_id);
-    flagcxResult_t rc;
-    if (slice->opcode == TransferRequest::WRITE) {
-        rc = flagcxPut(comm_, peer, src_offset, dst_offset,
-                       slice->length, 0, 0);
     } else {
-        rc = flagcxGet(comm_, peer, dst_offset, src_offset,
-                       slice->length, 0, 0);
-    }
-    if (rc != flagcxSuccess) {
-        LOG(ERROR) << "FlagCxTransport: Put/Get rc=" << rc;
-        return -1;
-    }
-
-    rc = flagcxWaitCounter(comm_, before + 1);
-    if (rc != flagcxSuccess) {
-        LOG(ERROR) << "FlagCxTransport: WaitCounter rc=" << rc;
-        return -1;
-    }
-
-    if (slice->opcode == TransferRequest::READ) {
-        std::memcpy(slice->source_addr,
-                    reinterpret_cast<char *>(window_) + src_offset,
-                    slice->length);
+        uint64_t transfer_id = 0;
+        if (flagcxP2pEngineReadVector(conn, mrs, bufs, sizes, descs,
+                                      /*numIovs=*/1, &transfer_id) != 0) {
+            LOG(ERROR) << "FlagCxTransport: ReadVector failed";
+            return -1;
+        }
+        // Poll to completion with a generous deadline.
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!flagcxP2pEngineXferStatus(conn, transfer_id)) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                LOG(ERROR) << "FlagCxTransport: ReadVector timed out, tid="
+                           << transfer_id;
+                return -1;
+            }
+            std::this_thread::yield();
+        }
     }
     return 0;
 }
@@ -397,11 +364,10 @@ Status FlagCxTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
-    if (task.success_slice_count + task.failed_slice_count
-            == task.slice_count) {
-        status.s = task.failed_slice_count
-                       ? TransferStatusEnum::FAILED
-                       : TransferStatusEnum::COMPLETED;
+    if (task.success_slice_count + task.failed_slice_count ==
+        task.slice_count) {
+        status.s = task.failed_slice_count ? TransferStatusEnum::FAILED
+                                           : TransferStatusEnum::COMPLETED;
         task.is_finished = true;
     } else {
         status.s = TransferStatusEnum::WAITING;
