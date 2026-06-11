@@ -711,15 +711,16 @@ void MasterAdminServer::HandleBatchQueryKeys(
         return;
     }
 
-    auto keys_view = req.get_decode_query_value("keys");
+    auto keys_str = req.get_decode_query_value("keys");
     std::vector<std::string> keys;
-    if (!keys_view.empty()) {
-        std::string keys_str(keys_view);
-        std::string key;
-        std::istringstream iss(keys_str);
-        while (std::getline(iss, key, ',')) {
-            keys.push_back(std::move(key));
+    if (!keys_str.empty()) {
+        std::string_view sv(keys_str);
+        size_t pos = 0;
+        while ((pos = sv.find(',')) != std::string_view::npos) {
+            keys.emplace_back(sv.substr(0, pos));
+            sv.remove_prefix(pos + 1);
         }
+        keys.emplace_back(sv);
     }
 
     if (keys.empty()) {
