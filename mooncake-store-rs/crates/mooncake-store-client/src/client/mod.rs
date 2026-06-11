@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
+use std::ops::Deref;
 use std::ptr;
 use std::slice;
 use std::sync::{
@@ -9,14 +10,17 @@ use std::sync::{
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use mooncake_store_core::{
     CasResult, ClientEndpointSet, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId,
-    ClientStableId, CompatibilityDescriptor, HandoffKind, HandoffPlan, LogicalObjectId,
-    MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, Result,
-    RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy, RoutePolicyDomain, RouteState,
-    RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentTargetChunk,
-    StoreError, TenantObjectAccountingState, TenantPlacementPolicy, TenantPolicyScope,
-    TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
+    ClientStableId, ColdTierDeviceRecord, CompatibilityDescriptor, HandoffKind, HandoffPlan,
+    LogicalObjectId, MetadataBackend, NamespaceScope, ObjectKey, ObjectRoute, ReplicaRoute,
+    ReplicaTier, Result, RouteCasRequest, RouteControlMode, RouteDirectory, RoutePolicy,
+    RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
+    SegmentName, SegmentTargetChunk, StoreError, TenantObjectAccountingState,
+    TenantPlacementPolicy, TenantPolicyScope, TenantPolicySpec, TenantQuotaFinalizeRequest,
+    TenantQuotaPolicy, TenantQuotaReservationRequest,
 };
 use mooncake_store_route::{RouteHitReporter, RouteOperations};
 use mooncake_transport::{
@@ -89,12 +93,23 @@ struct TenantQuotaPolicyCacheEntry {
 }
 
 include!("types.rs");
+include!("cold_tier_types.rs");
 include!("builder.rs");
 include!("state_core.rs");
 include!("membership_sync.rs");
 include!("state_adapters.rs");
 include!("state_store.rs");
 include!("helpers.rs");
+
+/// Cold tier persistent storage backend abstraction.
+///
+/// Contains the `PersistentStorageBackend` trait, the LocalDir binary-only backend,
+/// `ColdTierBackendResolver`, target resolution, and mount/directory validation helpers.
+/// Consumers (offload, restore, GC) are added by later PRs.
+#[allow(dead_code)]
+#[path = "cold_tier_storage_backend.rs"]
+mod cold_tier_storage_backend;
+use cold_tier_storage_backend::*;
 
 pub struct StoreClient {
     metadata: Arc<dyn MetadataBackend>,

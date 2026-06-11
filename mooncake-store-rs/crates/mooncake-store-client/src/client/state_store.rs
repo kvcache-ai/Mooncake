@@ -787,12 +787,14 @@ impl StorageOwnerState {
         observer: ClientLease,
         route_directory: Arc<dyn RouteDirectory>,
         allocator: Arc<Mutex<LocalAllocatorState>>,
+        resolver: ColdTierBackendResolver,
     ) -> Self {
         Self {
             runtime,
             route_ops: RouteOperations::new(route_directory, observer),
             allocator,
             clock: Mutex::new(StorageClockState::default()),
+            resolver,
         }
     }
 

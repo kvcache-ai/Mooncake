@@ -327,6 +327,10 @@ struct StorageOwnerState {
     route_ops: RouteOperations,
     allocator: Arc<Mutex<LocalAllocatorState>>,
     clock: Mutex<StorageClockState>,
+    /// Cold tier backend resolver. Constructed at startup from configured targets.
+    /// Used by offload/restore paths added in later PRs.
+    #[allow(dead_code)]
+    resolver: ColdTierBackendResolver,
 }
 
 #[derive(Default)]
