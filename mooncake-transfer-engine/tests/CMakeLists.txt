@@ -43,6 +43,14 @@ if (UNIX AND NOT APPLE)
         "-Wl,--wrap=ibv_modify_qp"
         "-Wl,--wrap=ibv_query_gid"
         "-Wl,--wrap=_ibv_query_gid_ex")
+    # ibv_create_qp is wrapped only for non-eRDMA builds, where the
+    # DisconnectIssuesErrBeforeResetOnReconnect test tracks QP generations.
+    # The matching __wrap_ibv_create_qp is guarded by #ifndef CONFIG_ERDMA, so
+    # the flag must be gated identically or the link fails on an undefined wrap.
+    if (NOT USE_ERDMA)
+        target_link_options(rdma_endpoint_reestablish_test PRIVATE
+            "-Wl,--wrap=ibv_create_qp")
+    endif()
 endif()
 add_test(NAME rdma_endpoint_reestablish_test COMMAND rdma_endpoint_reestablish_test)
 set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")

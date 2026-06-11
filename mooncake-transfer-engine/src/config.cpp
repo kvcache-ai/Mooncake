@@ -284,6 +284,28 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
     }
 
+    const char* qp_drain_timeout_env = std::getenv("MC_QP_DRAIN_TIMEOUT_MS");
+    if (qp_drain_timeout_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0 and disable the drain-wait. 0 is a
+        // valid explicit "disable"; negative / out-of-range / garbage are
+        // rejected, preserving the default.
+        try {
+            int val = std::stoi(qp_drain_timeout_env);
+            if (val >= 0 && val < 65536) {
+                config.qp_drain_timeout_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_QP_DRAIN_TIMEOUT_MS, value "
+                             << qp_drain_timeout_env
+                             << " out of range (should be 0-65535)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_QP_DRAIN_TIMEOUT_MS environment value: "
+                         << qp_drain_timeout_env << ". Error: " << e.what();
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");

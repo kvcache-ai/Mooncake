@@ -105,5 +105,76 @@ TEST_F(PkeyIndexEnvTest, AutoGidRetriesRejectsOutOfRangeOverride) {
     EXPECT_EQ(config.auto_gid_max_retries, 5);
 }
 
+// MC_QP_DRAIN_TIMEOUT_MS bounds the wait for a disconnected endpoint's
+// outstanding WRs to flush before the next reconnect transitions its QPs back
+// through RESET. Unlike most knobs, 0 is a valid value (disables the wait), so
+// these cases pin down that 0 is accepted while garbage/negative/out-of-range
+// preserve the default -- a typo must not silently disable the safety wait.
+class QpDrainTimeoutEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS"); }
+};
+
+TEST_F(QpDrainTimeoutEnvTest, DefaultIsOneHundredWhenUnset) {
+    ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 100);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "50", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 50);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, ZeroIsAcceptedAndDisablesWait) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 100;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 0);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "65535", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 65535);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "65536", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 7);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 11);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 13;  // a typo must NOT silently disable
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 13);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 17);
+}
+
 }  // namespace
 }  // namespace mooncake

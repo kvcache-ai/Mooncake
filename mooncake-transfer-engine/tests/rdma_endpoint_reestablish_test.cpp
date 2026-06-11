@@ -89,6 +89,92 @@ struct RtrFaultInjectionState {
     std::unordered_map<std::string, std::vector<std::string>> rtr_gid_history;
 } g_rtr_fault_injection_state;
 
+// QP-state tracking and the DisconnectIssuesErrBeforeResetOnReconnect test
+// below are compiled only for non-eRDMA builds (USE_ERDMA=OFF). When
+// CONFIG_ERDMA is defined, RdmaEndPoint::resetConnection() reconnects via
+// reconstruct() (destroy+recreate QPs) rather than disconnectUnlocked(), so the
+// ERR-before-RESET state transition this asserts never occurs. See
+// RdmaEndPoint::resetConnection() and mooncake-common/common.cmake (USE_ERDMA).
+#ifndef CONFIG_ERDMA
+
+// Records QP state transitions to verify the disconnect ordering on reconnect:
+// a re-established endpoint must move its QP to IBV_QPS_ERR (flushing inflight
+// WRs to the CQ) BEFORE the reconnect drives the same QP back through
+// IBV_QPS_RESET. Resetting a connected QP directly, without first transitioning
+// to ERR, silently discards outstanding WRs (no CQE is generated for them).
+//
+// QPs are keyed by (pointer, generation). The generation is bumped each time a
+// pointer is handed out by ibv_create_qp, so a destroyed-then-reallocated QP
+// reusing the same address gets a fresh generation and is never conflated with
+// the QP that previously lived there. That makes the ERR-then-RESET signature
+// unambiguous: within a single generation it can only come from the
+// disconnect->reconnect path, never from beginDestroy() (which moves to ERR and
+// then destroys the QP, never RESET) nor from a fresh endpoint bring-up (which
+// starts at RESET and never sees ERR).
+struct QpStateTrackingState {
+    std::mutex mu;
+    bool enabled = false;
+    std::unordered_map<ibv_qp*, int> generation;
+    struct Event {
+        ibv_qp* qp;
+        int generation;
+        ibv_qp_state state;
+    };
+    std::vector<Event> events;
+} g_qp_state_tracking;
+
+void resetQpStateTracking() {
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    g_qp_state_tracking.enabled = false;
+    g_qp_state_tracking.generation.clear();
+    g_qp_state_tracking.events.clear();
+}
+
+void enableQpStateTracking() {
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    g_qp_state_tracking.enabled = true;
+}
+
+void recordQpCreate(ibv_qp* qp) {
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    ++g_qp_state_tracking.generation[qp];
+}
+
+void recordQpStateTransition(ibv_qp* qp, ibv_qp_state state) {
+    if (state != IBV_QPS_ERR && state != IBV_QPS_RESET) return;
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    if (!g_qp_state_tracking.enabled) return;
+    int gen = g_qp_state_tracking.generation[qp];
+    g_qp_state_tracking.events.push_back({qp, gen, state});
+}
+
+bool sawErrBeforeResetWithinGeneration() {
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    const auto& events = g_qp_state_tracking.events;
+    for (size_t i = 0; i < events.size(); ++i) {
+        if (events[i].state != IBV_QPS_ERR) continue;
+        for (size_t j = i + 1; j < events.size(); ++j) {
+            if (events[j].qp == events[i].qp &&
+                events[j].generation == events[i].generation &&
+                events[j].state == IBV_QPS_RESET) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+int countQpTransitions(ibv_qp_state state) {
+    std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
+    int count = 0;
+    for (const auto& event : g_qp_state_tracking.events) {
+        if (event.state == state) ++count;
+    }
+    return count;
+}
+
+#endif  // !CONFIG_ERDMA
+
 std::string formatGidBytes(const uint8_t* raw) {
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
@@ -274,6 +360,9 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
    protected:
     void SetUp() override {
         resetRtrFaultInjectionState();
+#ifndef CONFIG_ERDMA
+        resetQpStateTracking();
+#endif
         google::InitGoogleLogging("RDMAEndpointReestablishTest");
         FLAGS_logtostderr = true;
 
@@ -307,6 +396,9 @@ class RDMAEndpointReestablishTest : public ::testing::Test {
     void TearDown() override {
         google::ShutdownGoogleLogging();
         resetRtrFaultInjectionState();
+#ifndef CONFIG_ERDMA
+        resetQpStateTracking();
+#endif
     }
 
     void runEndpointReestablishScenario(const std::string& target_device,
@@ -431,6 +523,45 @@ TEST_F(RDMAEndpointReestablishTest,
         [&](const std::string& gid) { return gid != gid_history.front(); }));
 }
 
+// Covers the disconnect ordering on reconnect for non-eRDMA builds. When an
+// already-connected endpoint is re-established, disconnectUnlocked() must
+// transition its QP to IBV_QPS_ERR (so the HCA flushes outstanding WRs as
+// completions, which performPollCq drains through the normal failure path)
+// before the reconnect drives the same QP back through IBV_QPS_RESET. Resetting
+// the QP straight from a connected state drops inflight WRs without ever
+// generating a CQE. See disconnectUnlocked() in rdma_endpoint.cpp.
+//
+// Triggering the re-establish requires the restarted peer to reconnect under
+// the SAME nic_path with new QPs, which only happens when peer names are stable
+// across the restart -- i.e. a real metadata server. Under P2PHANDSHAKE every
+// restart gets a fresh random RPC port, so the endpoint is never reused and the
+// disconnect path is not exercised; skip in that case.
+#ifndef CONFIG_ERDMA
+TEST_F(RDMAEndpointReestablishTest, DisconnectIssuesErrBeforeResetOnReconnect) {
+    if (usesP2PHandshake(metadata_server)) {
+        GTEST_SKIP() << "Re-establish (and thus the ERR disconnect path) is not "
+                        "triggered under P2PHANDSHAKE; run with a metadata "
+                        "server (e.g. MC_METADATA_SERVER=http://host:port/"
+                        "metadata) and stable MC_*_SERVER_NAME to exercise it";
+    }
+
+    enableQpStateTracking();
+    runEndpointReestablishScenario(target_device_name, initiator_device_name);
+
+    // The reconnect must have flushed at least one QP through ERR. If the
+    // disconnect path reset QPs directly (no ERR transition) this would be zero.
+    EXPECT_GT(countQpTransitions(IBV_QPS_ERR), 0)
+        << "Expected the reconnect to flush QPs via IBV_QPS_ERR, but no ERR "
+           "transition was observed";
+
+    // The core invariant: within a single QP generation, ERR precedes RESET.
+    EXPECT_TRUE(sawErrBeforeResetWithinGeneration())
+        << "Expected a QP to be moved to IBV_QPS_ERR before being reset on "
+           "reconnect; the disconnect path must not RESET a connected QP "
+           "directly (that silently discards inflight WRs without CQEs)";
+}
+#endif  // !CONFIG_ERDMA
+
 }  // namespace
 
 extern "C" int __real__ibv_query_gid_ex(ibv_context* context, uint8_t port_num,
@@ -458,11 +589,32 @@ extern "C" int __wrap_ibv_query_gid(ibv_context* context, uint8_t port_num,
     return __real_ibv_query_gid(context, port_num, wrapped_gid_index, gid);
 }
 
+// Only wrapped for non-eRDMA builds; the linker --wrap flag is added in
+// CMakeLists.txt under the same USE_ERDMA guard.
+#ifndef CONFIG_ERDMA
+extern "C" struct ibv_qp* __real_ibv_create_qp(struct ibv_pd* pd,
+                                               struct ibv_qp_init_attr* attr);
+
+extern "C" struct ibv_qp* __wrap_ibv_create_qp(struct ibv_pd* pd,
+                                               struct ibv_qp_init_attr* attr) {
+    struct ibv_qp* qp = __real_ibv_create_qp(pd, attr);
+    if (qp != nullptr) {
+        recordQpCreate(qp);
+    }
+    return qp;
+}
+#endif  // !CONFIG_ERDMA
+
 extern "C" int __real_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask);
 
 extern "C" int __wrap_ibv_modify_qp(ibv_qp* qp, ibv_qp_attr* attr,
                                     int attr_mask) {
+#ifndef CONFIG_ERDMA
+    if (qp != nullptr && attr != nullptr && (attr_mask & IBV_QP_STATE)) {
+        recordQpStateTransition(qp, attr->qp_state);
+    }
+#endif  // !CONFIG_ERDMA
     if (qp != nullptr && attr != nullptr && attr->qp_state == IBV_QPS_RTR &&
         (attr_mask & IBV_QP_AV)) {
         const std::string device_name =

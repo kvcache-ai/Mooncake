@@ -655,24 +655,52 @@ int RdmaEndPoint::disconnectUnlocked() {
     auto curr_status = status_.load(std::memory_order_acquire);
     if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
 
+    // Why ERR instead of RESET: when a peer dies mid-transfer (e.g. a rolling
+    // restart) we may still have WRs posted to it. Transitioning the QP
+    // straight to RESET silently discards those outstanding WRs WITHOUT
+    // generating any CQE -- so their slices are never marked failed, the owning
+    // task never reaches a terminal state, and mooncake-store waits out its
+    // full per-batch deadline (~60s) for every poisoned batch while the vLLM
+    // recv queue backs up and wedges. That orphaning is the root cause this
+    // change targets.
+    //
+    // Moving the QP to ERR instead makes the local HCA flush every outstanding
+    // WR to the CQ as IBV_WC_WR_FLUSH_ERR. performPollCq then drains them
+    // through the normal completion path (markFailed) in milliseconds, which
+    // both terminates the slices (so the task fails fast and the caller can
+    // recompute) and decrements wr_depth_list_/cq_outstanding_ for us. This is
+    // the same flush-then-drain mechanism beginDestroy() already relies on.
+    //
+    // The next reconnect's drain-wait (drainWrDepthLocked) lets that flush
+    // finish before any RESET reuses these QPs; if it times out, the
+    // ERR-generated CQEs survive the RESET and still drain the counters as they
+    // are polled (doSetupConnection only logs the residual, never compensates).
     ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
+    attr.qp_state = IBV_QPS_ERR;
     int ret = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (curr_ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
-            ret = ERR_ENDPOINT;
+        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE) == 0) {
+            // Success: leave the counters alone; the flush CQEs will drain
+            // them via performPollCq.
+            continue;
         }
-        // After resetting QP, the wr_depth_list_ won't change
-        bool displayed = false;
+        PLOG(ERROR) << "Failed to modify QP to ERR, falling back to RESET";
+        ret = ERR_ENDPOINT;
+
+        // ERR failed, so no flush CQEs will be generated for this QP. Fall
+        // back to the legacy RESET transition and compensate the counters
+        // directly, since the discarded WRs will never produce completions.
+        ibv_qp_attr reset_attr;
+        memset(&reset_attr, 0, sizeof(reset_attr));
+        reset_attr.qp_state = IBV_QPS_RESET;
+        if (ibv_modify_qp(qp_list_[i], &reset_attr, IBV_QP_STATE)) {
+            // Both ERR and RESET failed; the QP may still be live and could
+            // yet generate completions, so leave the counters untouched.
+            PLOG(ERROR) << "Failed to modify QP to RESET after ERR failure";
+            continue;
+        }
         if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
-            }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
             wr_depth_list_[i] = 0;
         }
@@ -719,6 +747,18 @@ const std::string RdmaEndPoint::toString() const {
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
+    // Lock-free fast reject before contending for lock_. A reconnect may hold
+    // lock_ across a bounded drain-wait (drainWrDepthLocked); in the default
+    // single-CQ topology the worker that posts is also the only CQ poller, so
+    // blocking it here on lock_ would stall the very CQ drain the reconnect is
+    // waiting for. Bailing early when not CONNECTED keeps that poller free.
+    // The under-lock check below remains authoritative.
+    if (status_.load(std::memory_order_acquire) != CONNECTED) {
+        for (auto &slice : slice_list) failed_slice_list.push_back(slice);
+        slice_list.clear();
+        return 0;
+    }
+
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
@@ -848,11 +888,66 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
     return 0;
 }
 
+bool RdmaEndPoint::drainWrDepthLocked() {
+    // Safe to wait while holding lock_: wr_depth_list_ is decremented by
+    // performPollCq on a worker thread, which never takes lock_, so the drain
+    // makes progress under the lock. submitPostSend's lock-free pre-check keeps
+    // that poller from blocking on lock_ here (critical in the default 1-CQ
+    // topology, where the posting worker is also the only poller).
+    auto all_drained = [this]() {
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            if (__atomic_load_n(&wr_depth_list_[i], __ATOMIC_ACQUIRE) != 0)
+                return false;
+        }
+        return true;
+    };
+
+    if (all_drained()) return true;
+
+    const int timeout_ms = globalConfig().qp_drain_timeout_ms;
+    if (timeout_ms <= 0) return false;  // wait disabled
+
+    // Reuse the handshake-wait backoff: spin briefly, then sleep with
+    // exponential backoff. A peer that just died flushes its WRs within the
+    // RDMA retry window, so the common drain finishes in the spin phase.
+    const uint64_t deadline_ns =
+        getCurrentTimeInNano() + static_cast<uint64_t>(timeout_ms) * 1000000ull;
+    uint32_t spin_count = 0;
+    uint32_t sleep_us = kWaitExistingHandshakeInitialSleepUs;
+    while (!all_drained()) {
+        if (getCurrentTimeInNano() > deadline_ns) return false;
+        if (spin_count < kWaitExistingHandshakeSpinCount) {
+            PAUSE();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+            uint32_t next = sleep_us * 2;
+            sleep_us = next > kWaitExistingHandshakeMaxSleepUs
+                           ? kWaitExistingHandshakeMaxSleepUs
+                           : next;
+        }
+        ++spin_count;
+    }
+    return true;
+}
+
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
                                     std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
+    // If this endpoint was just disconnected (QPs in ERR), wait for its
+    // outstanding WRs to flush as CQEs and be polled before the per-QP
+    // "any state -> RESET" below. Skips instantly when nothing is outstanding
+    // (the fresh-endpoint case). A timeout here is not fatal: the ERR-generated
+    // flush CQEs survive the subsequent RESET and drain the counters as they
+    // are polled, so reuse remains correctly accounted.
+    if (!drainWrDepthLocked()) {
+        LOG(WARNING) << "Outstanding WRs did not drain within "
+                     << globalConfig().qp_drain_timeout_ms
+                     << " ms before reconnect, peer_nic_path="
+                     << peer_nic_path_;
+    }
+
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
@@ -915,6 +1010,25 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
             failure_info->sys_errno = errno;
         }
         return ERR_ENDPOINT;
+    }
+
+    // If this QP still shows outstanding WRs here, they are flush CQEs that a
+    // prior disconnectUnlocked (successful ERR transition) already generated
+    // but the drain-wait did not observe polled in time. Those CQEs survive
+    // the RESET above and will be polled normally, decrementing
+    // wr_depth_list_/cq_outstanding_ themselves -- each is the matching -1 for
+    // a +1 charged at post time. We therefore must NOT compensate here; doing
+    // so would zero out the +1 prematurely and double-count once the CQE
+    // drains. (The only place a discarded WR produces no CQE is the
+    // ERR-failure RESET fallback in disconnectUnlocked, which compensates
+    // there.) Log the residual purely as an observability signal for the rare
+    // drain-timeout path; it is 0 on the healthy path.
+    int residual = __atomic_load_n(&wr_depth_list_[qp_index], __ATOMIC_ACQUIRE);
+    if (residual > 0) {
+        LOG(WARNING) << "Reset QP with " << residual
+                     << " outstanding WR(s) pending flush-CQE drain, "
+                        "peer_nic_path="
+                     << peer_nic_path_;
     }
 
     // RESET -> INIT
