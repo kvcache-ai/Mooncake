@@ -14,6 +14,21 @@ function(add_store_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_store_test_with_custom_main name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name} PUBLIC
+        mooncake_store
+        transfer_engine
+        cachelib_memory_allocator
+        ${ETCD_WRAPPER_LIB}
+        glog
+        ibverbs
+        gtest
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
@@ -47,10 +62,10 @@ if(USE_ASCEND_CACHE_TIER)
 endif()
 add_store_test(data_manager_test data_manager_test.cpp)
 add_store_test(client_rpc_service_test client_rpc_service_test.cpp)
-add_store_test(peer_client_test peer_client_test.cpp)
+add_store_test_with_custom_main(peer_client_test peer_client_test.cpp)
 add_store_test(centralized_client_meta_test centralized_client_meta_test.cpp)
 add_store_test(p2p_master_service_test p2p_master_service_test.cpp)
-add_store_test(p2p_client_integration_test p2p_client_integration_test.cpp)
+add_store_test_with_custom_main(p2p_client_integration_test p2p_client_integration_test.cpp)
 add_store_test(p2p_client_http_endpoints_test p2p_client_http_endpoints_test.cpp)
 add_store_test(peer_client_perf_test peer_client_perf_test.cpp)
 add_store_test(scheduler_integration_test scheduler_integration_test.cpp)
