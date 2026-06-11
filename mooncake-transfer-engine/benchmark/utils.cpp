@@ -206,9 +206,6 @@ void printStatsAllToAll(int node_rank, int total_nodes, size_t num_targets,
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
 
-    // Calculate flows per node
-    size_t flows_per_node = num_targets * num_threads;
-
     // Tabulate print with fixed width for each string
     // clang-format off
     std::cout << std::left << std::fixed << std::setprecision(6)

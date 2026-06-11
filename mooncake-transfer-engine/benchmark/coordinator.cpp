@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "coordinator.h"
+#include "tent/common/utils/ip.h"
 
 #include <atomic>
 #include <chrono>
@@ -630,18 +631,21 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
 
-    // Configure glog to output INFO logs to stderr
-    FLAGS_stderrthreshold = google::GLOG_INFO;
-    FLAGS_minloglevel = 0;  // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
-    FLAGS_logtostderr = 1;  // Log to stderr instead of logfiles
+    // Get local IP address
+    std::string local_ip;
+    bool ipv6 = false;
+    auto status = mooncake::tent::discoverLocalIpAddress(local_ip, ipv6);
+    if (!status.ok()) {
+        LOG(WARNING) << "Failed to discover local IP: " << status.ToString();
+        local_ip = "IP_Address";
+    }
 
-    std::cout << "\033[32m===== Mooncake Benchmark Coordinator =====\033[0m"
-              << std::endl;
-    std::cout << "Port: " << mooncake::bench::FLAGS_port << std::endl;
-    std::cout << "Expected nodes: " << mooncake::bench::FLAGS_num_nodes
-              << std::endl;
-    std::cout << "\033[32m=========================================\033[0m"
-              << std::endl;
+    std::cout << "\033[33mCluster size: " << mooncake::bench::FLAGS_num_nodes
+              << std::endl
+              << "For each test node, run " << std::endl
+              << "  ./tebench --coordinator=" << local_ip << ":"
+              << mooncake::bench::FLAGS_port << std::endl
+              << "Press Ctrl-C to terminate\033[0m" << std::endl;
 
     auto coordinator = std::make_unique<mooncake::bench::CoordinatorServer>(
         mooncake::bench::FLAGS_num_nodes, mooncake::bench::FLAGS_port);
@@ -655,7 +659,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    LOG(INFO) << "Coordinator running. Press Ctrl-C to stop.";
     while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
     return 0;
 }
