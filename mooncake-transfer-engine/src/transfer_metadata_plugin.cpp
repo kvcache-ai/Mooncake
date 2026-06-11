@@ -991,22 +991,25 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             while (true) {
                 const int64_t remaining_ms =
                     deadline_ms - getCurrentTimeInMilli();
-                if (remaining_ms <= 0) {
+                // poll() returning 0 already means the timeout expired; an
+                // exhausted deadline (only reachable after EINTR) is the
+                // same condition.
+                int ret =
+                    remaining_ms <= 0 ? 0 : poll(&pfd, 1, (int)remaining_ms);
+                if (ret > 0) break;
+                if (ret == 0) {
                     errno = ETIMEDOUT;
                     PLOG(ERROR) << "SocketHandShakePlugin: connect() "
                                 << getNetworkAddress(addr->ai_addr);
                     close(conn_fd);
                     return ERR_SOCKET;
                 }
-                int ret = poll(&pfd, 1, (int)remaining_ms);
-                if (ret > 0) break;
-                if (ret < 0 && errno != EINTR) {
+                if (errno != EINTR) {
                     PLOG(ERROR) << "SocketHandShakePlugin: poll()";
                     close(conn_fd);
                     return ERR_SOCKET;
                 }
-                // ret == 0 (poll timeout) re-checks the deadline; EINTR
-                // retries with the remaining time.
+                // EINTR: retry with the remaining time.
             }
 
             int conn_err = 0;
