@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common.h"
@@ -100,22 +101,106 @@ int FlagCxTransport::install(std::string &local_server_name,
     return 0;
 }
 
+// Issue one batch of slices that all target the same segment and share an
+// opcode as a SINGLE multi-iov transfer. The engine fans the iovs out across
+// the conn's rails (NICs), so a deep batch keeps every NIC busy instead of one
+// block-at-a-time. Marks every slice success/fail.
+void FlagCxTransport::runSliceGroup(const std::vector<Slice *> &group) {
+    if (group.empty()) return;
+    bool ok = true;
+    FlagcxP2pConn *conn = connForSegment(group.front()->target_id);
+    const bool isWrite = group.front()->opcode == TransferRequest::WRITE;
+
+    std::vector<FlagcxP2pMr> mrs;
+    std::vector<void *> bufs;
+    std::vector<size_t> sizes;
+    std::vector<FlagcxP2pRdmaDesc> descs;
+    mrs.reserve(group.size());
+    bufs.reserve(group.size());
+    sizes.reserve(group.size());
+    descs.reserve(group.size());
+
+    if (conn == nullptr) ok = false;
+    for (Slice *s : group) {
+        if (!ok) break;
+        FlagcxP2pMr local_mr = 0;
+        if (!resolveLocalMr(s->source_addr, s->length, local_mr)) {
+            LOG(ERROR) << "FlagCxTransport: source not registered "
+                       << s->source_addr;
+            ok = false;
+            break;
+        }
+        FlagcxP2pRdmaDesc desc;
+        if (flagcxP2pEngineMakeDesc(conn, s->flagcx.dest_offset,
+                                    static_cast<uint32_t>(s->length),
+                                    &desc) != 0) {
+            LOG(ERROR) << "FlagCxTransport: MakeDesc failed for remote VA 0x"
+                       << std::hex << s->flagcx.dest_offset << std::dec;
+            ok = false;
+            break;
+        }
+        mrs.push_back(local_mr);
+        bufs.push_back(s->source_addr);
+        sizes.push_back(s->length);
+        descs.push_back(desc);
+    }
+
+    if (ok) {
+        if (isWrite) {
+            ok = flagcxP2pEngineWriteVectorSync(conn, mrs, bufs, sizes, descs) ==
+                 0;
+        } else {
+            uint64_t transfer_id = 0;
+            ok = flagcxP2pEngineReadVector(conn, mrs, bufs, sizes, descs,
+                                           static_cast<int>(group.size()),
+                                           &transfer_id) == 0;
+            if (ok) {
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(30);
+                while (!flagcxP2pEngineXferStatus(conn, transfer_id)) {
+                    if (std::chrono::steady_clock::now() > deadline) {
+                        LOG(ERROR) << "FlagCxTransport: ReadVector batch timeout";
+                        ok = false;
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+            }
+        }
+    }
+
+    for (Slice *s : group) {
+        if (ok)
+            s->markSuccess();
+        else
+            s->markFailed();
+    }
+}
+
 void FlagCxTransport::ioWorker() {
     while (true) {
-        Slice *slice = nullptr;
+        std::vector<Slice *> batch;
         {
             std::unique_lock<std::mutex> lk(queue_mu_);
             queue_cv_.wait(lk, [this] {
                 return !io_queue_.empty() || !running_.load();
             });
             if (io_queue_.empty()) return;  // running_ false and queue drained
-            slice = io_queue_.front();
-            io_queue_.pop_front();
+            // Drain everything currently queued so it can be coalesced into
+            // one multi-iov, multi-rail transfer per target.
+            batch.assign(io_queue_.begin(), io_queue_.end());
+            io_queue_.clear();
         }
-        if (doSlice(slice) == 0)
-            slice->markSuccess();
-        else
-            slice->markFailed();
+
+        // Group by (target_id, opcode); each group becomes one batched xfer.
+        std::unordered_map<uint64_t, std::vector<Slice *>> groups;
+        for (Slice *s : batch) {
+            const uint64_t key =
+                (static_cast<uint64_t>(s->target_id) << 1) |
+                (s->opcode == TransferRequest::WRITE ? 0u : 1u);
+            groups[key].push_back(s);
+        }
+        for (auto &kv : groups) runSliceGroup(kv.second);
     }
 }
 
