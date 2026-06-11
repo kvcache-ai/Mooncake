@@ -69,6 +69,14 @@ struct GlobalConfig {
     // kept small and capped at 1000ms. 0 disables the wait. Override via
     // MC_QP_DRAIN_TIMEOUT_MS.
     int qp_drain_timeout_ms = 50;
+    // Active-connect circuit-breaker. After an endpoint to a peer is torn down
+    // (path failure / QP fatal), pause active reconnection to that peer's
+    // address for this many milliseconds, so the (single) CQ poller is not
+    // blocked re-handshaking a likely-gone peer (a k8s rolling restart brings
+    // the pod back at a different podIP:port, so the old address is dead). The
+    // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
+    // Override via MC_CONN_PAUSE_TTL_MS.
+    int conn_pause_ttl_ms = 0;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;

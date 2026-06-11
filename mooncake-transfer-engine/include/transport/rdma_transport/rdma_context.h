@@ -37,6 +37,7 @@
 #include "common.h"
 #include "rdma_gid_probe.h"
 #include "rdma_transport.h"
+#include "transport/rdma_transport/connect_pause_tracker.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -126,6 +127,16 @@ class RdmaContext {
 
     int deleteEndpoint(const std::string &peer_nic_path);
     int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr);
+
+    // Active-connect circuit-breaker. After deleteEndpointByPtr tears an
+    // endpoint down, active reconnection to that peer's address is paused for
+    // globalConfig().conn_pause_ttl_ms so the CQ poller isn't blocked
+    // re-handshaking a likely-gone peer. Entries expire (lazily on
+    // isConnectPaused, and via pruneConnectPause from the monitor tick). All
+    // no-ops when the TTL is 0. Keyed by peer server name (the peer IP).
+    void pauseConnect(const std::string &peer_nic_path);
+    bool isConnectPaused(const std::string &peer_nic_path);
+    void pruneConnectPause();
 
     // Drain the endpoint store's waiting list. Safe to call on any thread;
     // intended to be invoked periodically from monitorWorker so reclaim is
@@ -244,6 +255,9 @@ class RdmaContext {
     std::vector<RdmaCq> cq_list_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
+
+    // Active-connect circuit-breaker (keyed by peer server name).
+    ConnectPauseTracker connect_pause_;
 
     std::vector<std::thread> background_thread_;
     std::atomic<bool> threads_running_;

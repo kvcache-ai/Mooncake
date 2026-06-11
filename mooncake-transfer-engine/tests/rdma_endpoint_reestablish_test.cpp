@@ -29,6 +29,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
@@ -122,6 +123,12 @@ struct QpStateTrackingState {
     };
     std::vector<Event> events;
 } g_qp_state_tracking;
+
+// When set, the wrapped ibv_query_qp reports IBV_QPS_RESET, exercising the
+// disconnectUnlocked() guard that skips the QP->ERR flush for an already-RESET
+// QP (RESET->ERR is illegal and returns EINVAL). Drives
+// SkipsErrFlushWhenQpReportedReset.
+std::atomic<bool> g_force_qp_state_reset{false};
 
 void resetQpStateTracking() {
     std::lock_guard<std::mutex> guard(g_qp_state_tracking.mu);
@@ -562,6 +569,35 @@ TEST_F(RDMAEndpointReestablishTest, DisconnectIssuesErrBeforeResetOnReconnect) {
            "reconnect; the disconnect path must not RESET a connected QP "
            "directly (that silently discards inflight WRs without CQEs)";
 }
+
+// Covers the disconnectUnlocked() guard that skips the QP->ERR flush when the
+// QP is already in RESET (RESET->ERR is illegal and returns EINVAL[22], the
+// log-flood the guard removes). With ibv_query_qp forced to report RESET, the
+// reconnect's disconnect must NOT attempt the ERR flush, so the reused QP
+// generation goes to RESET with no preceding ERR -- the ERR-before-RESET
+// signature that DisconnectIssuesErrBeforeResetOnReconnect asserts is absent.
+// (beginDestroy's ERR-then-destroy never produces ERR-before-RESET within a
+// generation, so it can't make this assertion pass spuriously.)
+TEST_F(RDMAEndpointReestablishTest, SkipsErrFlushWhenQpReportedReset) {
+    if (usesP2PHandshake(metadata_server)) {
+        GTEST_SKIP()
+            << "Re-establish (and thus the disconnect path) is not triggered "
+               "under P2PHANDSHAKE; run with a metadata server and stable "
+               "MC_*_SERVER_NAME to exercise it";
+    }
+
+    enableQpStateTracking();
+    // Make disconnectUnlocked()'s state query see RESET for the duration of the
+    // scenario so its guard skips the ERR flush.
+    g_force_qp_state_reset.store(true, std::memory_order_relaxed);
+    runEndpointReestablishScenario(target_device_name, initiator_device_name);
+    g_force_qp_state_reset.store(false, std::memory_order_relaxed);
+
+    EXPECT_FALSE(sawErrBeforeResetWithinGeneration())
+        << "Expected disconnectUnlocked to SKIP the QP->ERR flush when the QP "
+           "is reported RESET (the guard), so no ERR-before-RESET transition "
+           "should be recorded for the reused QP generation";
+}
 #endif  // !CONFIG_ERDMA
 
 }  // namespace
@@ -604,6 +640,23 @@ extern "C" struct ibv_qp* __wrap_ibv_create_qp(struct ibv_pd* pd,
         recordQpCreate(qp);
     }
     return qp;
+}
+
+// Wrapped (non-eRDMA only) so SkipsErrFlushWhenQpReportedReset can make
+// disconnectUnlocked()'s state query report RESET on demand. Delegates to the
+// real call and only overrides the reported state when the toggle is set, so
+// it is a no-op for every other caller and when the toggle is off.
+extern "C" int __real_ibv_query_qp(ibv_qp* qp, ibv_qp_attr* attr, int attr_mask,
+                                   ibv_qp_init_attr* init_attr);
+
+extern "C" int __wrap_ibv_query_qp(ibv_qp* qp, ibv_qp_attr* attr, int attr_mask,
+                                   ibv_qp_init_attr* init_attr) {
+    int rc = __real_ibv_query_qp(qp, attr, attr_mask, init_attr);
+    if (rc == 0 && attr != nullptr &&
+        g_force_qp_state_reset.load(std::memory_order_relaxed)) {
+        attr->qp_state = IBV_QPS_RESET;
+    }
+    return rc;
 }
 #endif  // !CONFIG_ERDMA
 

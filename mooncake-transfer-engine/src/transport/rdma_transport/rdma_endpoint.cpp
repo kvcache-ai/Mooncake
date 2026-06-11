@@ -311,6 +311,16 @@ int RdmaEndPoint::setupConnectionsByActive() {
             return doSetupConnection(context_.gid(), context_.lid(), qpNum());
         }
 
+        // Active-connect circuit-breaker: if we recently tore down an endpoint
+        // to this peer (path failure / QP fatal), skip the handshake for the
+        // configured pause window instead of blocking the (single) CQ poller on
+        // an RPC to a likely-gone peer. Fail fast; performPostSend then
+        // redispatches or fails the (not-yet-posted) slices. No-op when
+        // conn_pause_ttl_ms is 0.
+        if (context_.isConnectPaused(peer_nic_path_)) {
+            return ERR_ENDPOINT;
+        }
+
         // Only proceed with RPC if we are the first to transition from
         // UNCONNECTED. This prevents duplicate concurrent handshake attempts
         // from the same endpoint.
@@ -680,26 +690,47 @@ int RdmaEndPoint::disconnectUnlocked() {
     attr.qp_state = IBV_QPS_ERR;
     int ret = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE) == 0) {
-            // Success: leave the counters alone; the flush CQEs will drain
-            // them via performPollCq.
-            continue;
+        // RESET -> ERR is an illegal transition (the kernel rejects it with
+        // EINVAL), and a QP already in RESET holds no inflight WRs in hardware
+        // to flush. So query the current state first and only attempt the ERR
+        // flush from a state ERR is reachable from. A failed/aborted setup
+        // commonly leaves the QP in RESET; skipping the doomed ERR there avoids
+        // the EINVAL log flood (and the bogus reset error it propagates).
+        ibv_qp_attr cur_attr;
+        ibv_qp_init_attr cur_init_attr;
+        bool qp_in_reset = false;
+        if (ibv_query_qp(qp_list_[i], &cur_attr, IBV_QP_STATE, &cur_init_attr) ==
+            0) {
+            qp_in_reset = (cur_attr.qp_state == IBV_QPS_RESET);
         }
-        PLOG(ERROR) << "Failed to modify QP to ERR, falling back to RESET";
-        ret = ERR_ENDPOINT;
 
-        // ERR failed, so no flush CQEs will be generated for this QP. Fall
-        // back to the legacy RESET transition and compensate the counters
-        // directly, since the discarded WRs will never produce completions.
-        ibv_qp_attr reset_attr;
-        memset(&reset_attr, 0, sizeof(reset_attr));
-        reset_attr.qp_state = IBV_QPS_RESET;
-        if (ibv_modify_qp(qp_list_[i], &reset_attr, IBV_QP_STATE)) {
-            // Both ERR and RESET failed; the QP may still be live and could
-            // yet generate completions, so leave the counters untouched.
-            PLOG(ERROR) << "Failed to modify QP to RESET after ERR failure";
-            continue;
+        if (!qp_in_reset) {
+            if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE) == 0) {
+                // Success: leave the counters alone; the flush CQEs will drain
+                // them via performPollCq.
+                continue;
+            }
+            PLOG(ERROR) << "Failed to modify QP to ERR, falling back to RESET";
+            ret = ERR_ENDPOINT;
+
+            // ERR failed, so no flush CQEs will be generated for this QP. Fall
+            // back to the legacy RESET transition.
+            ibv_qp_attr reset_attr;
+            memset(&reset_attr, 0, sizeof(reset_attr));
+            reset_attr.qp_state = IBV_QPS_RESET;
+            if (ibv_modify_qp(qp_list_[i], &reset_attr, IBV_QP_STATE)) {
+                // Both ERR and RESET failed; the QP may still be live and could
+                // yet generate completions, so leave the counters untouched.
+                PLOG(ERROR) << "Failed to modify QP to RESET after ERR failure";
+                continue;
+            }
         }
+
+        // Reached either because the QP was already in RESET (no flush
+        // possible) or because ERR failed and we forced it to RESET. In both
+        // cases the discarded WRs will never produce a completion, so
+        // compensate the counters directly.
+        // TODO(orphan-fix): also markFailed the slices bound to these WRs.
         if (wr_depth_list_[i] != 0) {
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
             wr_depth_list_[i] = 0;

@@ -317,6 +317,28 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
+    if (conn_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0. 0 is a valid explicit "disable";
+        // negative / out-of-range / garbage are rejected, preserving the
+        // default.
+        try {
+            int val = std::stoi(conn_pause_ttl_env);
+            if (val >= 0 && val <= 600000) {
+                config.conn_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONN_PAUSE_TTL_MS, value "
+                             << conn_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
+                         << conn_pause_ttl_env << ". Error: " << e.what();
+        }
+    }
+
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
     if (log_dir_path) {
         google::InitGoogleLogging("mooncake-transfer-engine");

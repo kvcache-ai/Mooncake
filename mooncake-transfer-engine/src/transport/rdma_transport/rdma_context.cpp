@@ -160,6 +160,8 @@ std::string gidBytesToString(const uint8_t *raw) {
 RdmaContext::RdmaContext(RdmaTransport &engine, const std::string &device_name)
     : device_name_(device_name),
       engine_(engine),
+      connect_pause_(
+          [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }),
       next_comp_channel_index_(0),
       next_comp_vector_index_(0),
       next_cq_list_index_(0),
@@ -650,8 +652,31 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
 }
 
 int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    // Tearing an endpoint down (path failure / QP fatal) means this peer is
+    // failing; pause active reconnection to its address so the CQ poller isn't
+    // blocked re-handshaking a likely-gone peer. No-op when the TTL is 0.
+    if (endpoint_ptr) pauseConnect(endpoint_ptr->peerNicPath());
     return endpoint_store_->deleteEndpointByPtr(endpoint_ptr);
 }
+
+void RdmaContext::pauseConnect(const std::string &peer_nic_path) {
+    int ttl_ms = globalConfig().conn_pause_ttl_ms;
+    if (ttl_ms <= 0) return;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return;
+    uint64_t until =
+        getCurrentTimeInNano() + static_cast<uint64_t>(ttl_ms) * 1000000ull;
+    connect_pause_.pause(server_name, until);
+}
+
+bool RdmaContext::isConnectPaused(const std::string &peer_nic_path) {
+    if (globalConfig().conn_pause_ttl_ms <= 0) return false;  // disabled
+    auto server_name = getServerNameFromNicPath(peer_nic_path);
+    if (server_name.empty()) return false;
+    return connect_pause_.isPaused(server_name);
+}
+
+void RdmaContext::pruneConnectPause() { connect_pause_.prune(); }
 
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }
 
