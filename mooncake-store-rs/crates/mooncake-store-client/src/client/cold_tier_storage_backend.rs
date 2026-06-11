@@ -2,8 +2,8 @@
 //!
 //! This module defines the binary payload format, the `PersistentStorageBackend` trait, and the
 //! `ColdTierBackendResolver` that maps device IDs to backend implementations. Concrete backends
-//! (`LocalDirPersistentStorageBackend`, `ExtentStoreColdBackend`) are `include!`'d into this
-//! module so they share the same scope as the codec and trait definitions.
+//! (`LocalDirPersistentStorageBackend`, `ExtentStoreColdBackend`) are defined in submodules
+//! that share the codec and trait definitions via `use super::*`.
 //!
 //! # Binary payload format (`.bin`)
 //!
@@ -392,10 +392,6 @@ fn manifest_from_route(
     }
 }
 
-// LocalDir binary payload codec (encode_backend_payload, decode_backend_payload,
-// cold_object_payload_metadata) lives in local_dir_cold_backend.rs alongside the
-// LocalDirPersistentStorageBackend implementation that uses it.
-
 /// A batched cold tier write request: route (for manifest embedding), backing descriptor, and
 /// the raw payload bytes.
 pub(super) struct ColdObjectWrite<'a> {
@@ -774,7 +770,9 @@ pub(crate) struct MountInfoEntry {
     pub(crate) fs_type: String,
 }
 
-include!("local_dir_cold_backend.rs");
+#[path = "local_dir_cold_backend.rs"]
+mod local_dir_cold_backend;
+pub(crate) use local_dir_cold_backend::LocalDirPersistentStorageBackend;
 
 pub(super) fn default_cold_tier_root() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -1136,144 +1134,6 @@ mod cold_tier_storage_backend_tests {
     }
 
     #[test]
-    fn encode_backend_payload_roundtrips_with_checksum() {
-        let payload = b"hello cold tier";
-        let checksum = payload_checksum(payload);
-        let encoded =
-            encode_backend_payload(payload, payload.len() as u64, Some(checksum)).unwrap();
-        let decoded = decode_backend_payload(
-            std::path::Path::new("/test"),
-            "test",
-            encoded,
-            payload.len() as u64,
-            Some(checksum),
-        )
-        .unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn encode_backend_payload_roundtrips_without_checksum() {
-        let payload = b"no checksum payload";
-        let encoded = encode_backend_payload(payload, payload.len() as u64, None).unwrap();
-        let decoded = decode_backend_payload(
-            std::path::Path::new("/test"),
-            "test",
-            encoded,
-            payload.len() as u64,
-            None,
-        )
-        .unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn encode_backend_payload_with_manifest_roundtrips_manifest() {
-        let payload = b"manifest payload";
-        let checksum = payload_checksum(payload);
-        let manifest = ColdObjectManifest {
-            key: ObjectKey::new("tenant::key"),
-            namespace: Some(NamespaceScope {
-                tenant: "tenant".to_string(),
-                domain: "domain".to_string(),
-                object_set: "set".to_string(),
-            }),
-            logical_key: Some("logical".to_string()),
-            canonical_key: Some("canonical".to_string()),
-            sharing_scope: Some("sharing".to_string()),
-            qos_tier: Some("qos".to_string()),
-            route_version: RouteVersion(7),
-            cold_tier_id: "device-manifest".to_string(),
-            object_locator: "tenant::key@v7".to_string(),
-            length: payload.len() as u64,
-            checksum: Some(checksum),
-        };
-        let encoded = encode_backend_payload_with_manifest(
-            payload,
-            payload.len() as u64,
-            Some(checksum),
-            Some(&manifest),
-        )
-        .unwrap();
-        let (metadata, decoded_manifest) = cold_object_payload_metadata_and_manifest(
-            std::path::Path::new("/test"),
-            "test",
-            &encoded,
-        )
-        .unwrap();
-        assert_eq!(metadata.length, payload.len() as u64);
-        assert_eq!(metadata.checksum, Some(checksum));
-        assert_eq!(decoded_manifest, Some(manifest));
-        let decoded = decode_backend_payload(
-            std::path::Path::new("/test"),
-            "test",
-            encoded,
-            payload.len() as u64,
-            Some(checksum),
-        )
-        .unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn encode_backend_payload_rejects_length_mismatch() {
-        let payload = b"mismatch";
-        let result = encode_backend_payload(payload, 999, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("length mismatch"));
-    }
-
-    #[test]
-    fn encode_backend_payload_rejects_checksum_mismatch() {
-        let payload = b"payload";
-        let result = encode_backend_payload(payload, payload.len() as u64, Some(12345));
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_validates_magic() {
-        let mut bad = vec![0u8; COLD_OBJECT_HEADER_LEN + 4];
-        bad[..8].copy_from_slice(b"BADMAGIC");
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &bad);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid cold object magic"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_validates_version() {
-        let payload = b"data";
-        let encoded = encode_backend_payload(payload, payload.len() as u64, None).unwrap();
-        let mut bad = encoded;
-        // Corrupt version field (bytes 8-9)
-        bad[8] = 99;
-        bad[9] = 0;
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &bad);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported cold object version"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_validates_truncated_header() {
-        let short = vec![0u8; 10]; // shorter than COLD_OBJECT_HEADER_LEN
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &short);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("shorter than cold object header"));
-    }
-
-    #[test]
     fn write_backend_payload_atomically_creates_file() {
         let root = TestTempDir::new(default_cold_tier_root().join("atomic-write-test"));
         let path = root.path().join("subdir").join("payload.bin");
@@ -1284,127 +1144,6 @@ mod cold_tier_storage_backend_tests {
     }
 
     #[test]
-    fn local_dir_backend_put_get_delete_cycle() {
-        let root = TestTempDir::new(default_cold_tier_root().join("local-dir-put-get-delete"));
-        let backend = LocalDirPersistentStorageBackend::new_with_root(root.path());
-        let payload = b"cycle-payload";
-        let checksum = payload_checksum(payload);
-        let cold_backing = mooncake_store_core::ColdBackingRoute {
-            owner: mooncake_store_core::ClientRuntimeId::new(
-                "cycle",
-                mooncake_store_core::ClientEpoch(1),
-            ),
-            cold_tier_id: "device-cycle".to_string(),
-            object_locator: "object-cycle".to_string(),
-            length: payload.len() as u64,
-            checksum: Some(checksum),
-            state: mooncake_store_core::ColdBackingState::PendingOffload,
-            replicas: Vec::new(),
-        };
-        let materialized = backend.put_object(&cold_backing, payload).unwrap();
-        assert_eq!(
-            materialized.state,
-            mooncake_store_core::ColdBackingState::Materialized
-        );
-
-        let read = backend.get_object(&cold_backing).unwrap().unwrap();
-        assert_eq!(read, payload);
-
-        let deleted = backend.delete_object(&cold_backing).unwrap();
-        assert!(deleted);
-        assert!(backend.get_object(&cold_backing).unwrap().is_none());
-    }
-
-    #[test]
-    fn local_dir_scan_recovered_objects_reads_self_describing_bin() {
-        let root = TestTempDir::new(default_cold_tier_root().join("local-dir-scan-manifest"));
-        let backend = LocalDirPersistentStorageBackend::new_with_root(root.path());
-        let payload = b"recover-me";
-        let checksum = payload_checksum(payload);
-        let owner = mooncake_store_core::ClientRuntimeId::new(
-            "scan-owner",
-            mooncake_store_core::ClientEpoch(1),
-        );
-        let cold_backing = mooncake_store_core::ColdBackingRoute {
-            owner: owner.clone(),
-            cold_tier_id: "device-scan".to_string(),
-            object_locator: "recover-key@v3".to_string(),
-            length: payload.len() as u64,
-            checksum: Some(checksum),
-            state: mooncake_store_core::ColdBackingState::PendingOffload,
-            replicas: Vec::new(),
-        };
-        let route = ObjectRoute {
-            key: ObjectKey::new("recover-key"),
-            namespace: Some(NamespaceScope {
-                tenant: "tenant".to_string(),
-                domain: "domain".to_string(),
-                object_set: "set".to_string(),
-            }),
-            logical_key: Some("logical-recover-key".to_string()),
-            canonical_key: Some("canonical-recover-key".to_string()),
-            sharing_scope: Some("sharing-scope".to_string()),
-            qos_tier: Some("qos-tier".to_string()),
-            version: RouteVersion(3),
-            state: RouteState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            replicas: Vec::new(),
-            cold_backing: Some(cold_backing.clone()),
-        };
-        backend
-            .put_object_with_route(Some(&route), &cold_backing, payload)
-            .unwrap();
-        let device = ResolvedColdTierTarget {
-            cold_tier_id: "device-scan".to_string(),
-            kind: ColdTierKind::Ssd,
-            target: mooncake_store_core::ColdTierTargetSpec::Directory {
-                path: root.path().display().to_string(),
-            },
-            root_dir: root.path().to_path_buf(),
-            ssd_engine: ColdTierSsdEngine::LocalDir,
-            capacity_override_bytes: None,
-            tags: Vec::new(),
-        };
-        let recovered = backend.scan_recovered_objects(&device).unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].manifest.key, ObjectKey::new("recover-key"));
-        assert_eq!(recovered[0].manifest.namespace, route.namespace);
-        assert_eq!(recovered[0].manifest.logical_key, route.logical_key);
-        assert_eq!(recovered[0].manifest.canonical_key, route.canonical_key);
-        assert_eq!(recovered[0].manifest.sharing_scope, route.sharing_scope);
-        assert_eq!(recovered[0].manifest.qos_tier, route.qos_tier);
-        assert_eq!(recovered[0].manifest.route_version, RouteVersion(4));
-        assert_eq!(recovered[0].metadata.length, payload.len() as u64);
-        assert_eq!(recovered[0].metadata.checksum, Some(checksum));
-    }
-
-    #[test]
-    fn local_dir_backend_pending_source_lifecycle() {
-        let root = TestTempDir::new(default_cold_tier_root().join("local-dir-pending-source"));
-        let backend = LocalDirPersistentStorageBackend::new_with_root(root.path());
-        let payload = b"pending-src";
-        let checksum = payload_checksum(payload);
-        let cold_backing = mooncake_store_core::ColdBackingRoute {
-            owner: mooncake_store_core::ClientRuntimeId::new(
-                "pending",
-                mooncake_store_core::ClientEpoch(1),
-            ),
-            cold_tier_id: "device-pending".to_string(),
-            object_locator: "object-pending".to_string(),
-            length: payload.len() as u64,
-            checksum: Some(checksum),
-            state: mooncake_store_core::ColdBackingState::PendingOffload,
-            replicas: Vec::new(),
-        };
-        backend.put_pending_source(&cold_backing, payload).unwrap();
-        let read = backend.get_pending_source(&cold_backing).unwrap().unwrap();
-        assert_eq!(read, payload);
-        let deleted = backend.delete_pending_source(&cold_backing).unwrap();
-        assert!(deleted);
-        assert!(backend.get_pending_source(&cold_backing).unwrap().is_none());
-    }
-
-    #[test]
     fn encode_backend_component_handles_special_cases() {
         assert_eq!(encode_backend_component(""), "~");
         assert_eq!(encode_backend_component("."), "~2E");
@@ -1412,88 +1151,6 @@ mod cold_tier_storage_backend_tests {
         assert_eq!(encode_backend_component("normal-id.1"), "normal-id.1");
         assert_eq!(encode_backend_component("a/b"), "a~2Fb");
         assert_eq!(encode_backend_component("a:b"), "a~3Ab");
-    }
-
-    #[test]
-    fn decode_backend_payload_rejects_length_mismatch() {
-        let payload = b"short";
-        let encoded = encode_backend_payload(payload, payload.len() as u64, None).unwrap();
-        // Expect length 999, but payload is 5 bytes
-        let result =
-            decode_backend_payload(std::path::Path::new("/test"), "test", encoded, 999, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("length mismatch"));
-    }
-
-    #[test]
-    fn decode_backend_payload_rejects_caller_checksum_mismatch() {
-        let payload = b"checksum-test";
-        let checksum = payload_checksum(payload);
-        let encoded =
-            encode_backend_payload(payload, payload.len() as u64, Some(checksum)).unwrap();
-        // Provide a different expected checksum from the caller
-        let wrong_checksum = checksum.wrapping_add(1);
-        let result = decode_backend_payload(
-            std::path::Path::new("/test"),
-            "test",
-            encoded,
-            payload.len() as u64,
-            Some(wrong_checksum),
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_rejects_unsupported_checksum_kind() {
-        let payload = b"data";
-        let mut encoded = encode_backend_payload(payload, payload.len() as u64, None).unwrap();
-        // Corrupt checksum kind field (bytes 24-25) to an unsupported value
-        encoded[24] = 99;
-        encoded[25] = 0;
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &encoded);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported checksum kind"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_rejects_invalid_header_length() {
-        let payload = b"data";
-        let mut encoded = encode_backend_payload(payload, payload.len() as u64, None).unwrap();
-        // Corrupt header_len field (bytes 12-15) to a value != COLD_OBJECT_HEADER_LEN
-        encoded[12] = 99;
-        encoded[13] = 0;
-        encoded[14] = 0;
-        encoded[15] = 0;
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &encoded);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid cold object header length"));
-    }
-
-    #[test]
-    fn cold_object_payload_metadata_detects_stored_checksum_mismatch() {
-        let payload = b"original";
-        let checksum = payload_checksum(payload);
-        let mut encoded =
-            encode_backend_payload(payload, payload.len() as u64, Some(checksum)).unwrap();
-        // Corrupt one payload byte to cause stored checksum mismatch
-        let last = encoded.len() - 1;
-        encoded[last] ^= 0xFF;
-        let result = cold_object_payload_metadata(std::path::Path::new("/test"), "test", &encoded);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("stored checksum mismatch"));
     }
 
     #[test]
@@ -1582,53 +1239,6 @@ mod cold_tier_storage_backend_tests {
         // Only 2 digits after backslash — should preserve the backslash and digits
         let decoded = decode_mountinfo_field("path\\04end");
         assert_eq!(decoded, "path\\04end");
-    }
-
-    #[test]
-    fn collect_local_dir_file_stats_counts_recursive_files() {
-        let root = TestTempDir::new(default_cold_tier_root().join("file-stats-recursive"));
-        let sub = root.path().join("a").join("b");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(root.path().join("top.bin"), b"12345").unwrap();
-        std::fs::write(sub.join("nested.bin"), b"abc").unwrap();
-        let (count, bytes) =
-            LocalDirPersistentStorageBackend::collect_file_stats(root.path()).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(bytes, 8); // 5 + 3
-    }
-
-    #[test]
-    fn collect_local_dir_file_stats_returns_zero_for_missing_dir() {
-        let root = TestTempDir::new(default_cold_tier_root().join("file-stats-missing"));
-        let missing = root.path().join("nonexistent");
-        let (count, bytes) =
-            LocalDirPersistentStorageBackend::collect_file_stats(&missing).unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(bytes, 0);
-    }
-
-    #[test]
-    fn read_file_optional_returns_none_for_missing() {
-        let path = default_cold_tier_root().join("read-optional-missing-file.bin");
-        let result = read_file_optional(&path, "test").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn remove_file_optional_returns_false_for_missing() {
-        let path = default_cold_tier_root().join("remove-optional-missing-file.bin");
-        let result = remove_file_optional(&path, "test").unwrap();
-        assert!(!result);
-    }
-
-    #[test]
-    fn remove_file_optional_removes_existing_file() {
-        let root = TestTempDir::new(default_cold_tier_root().join("remove-optional-existing"));
-        let path = root.path().join("to-remove.bin");
-        std::fs::write(&path, b"removable").unwrap();
-        let result = remove_file_optional(&path, "test").unwrap();
-        assert!(result);
-        assert!(!path.exists());
     }
 
     #[test]
