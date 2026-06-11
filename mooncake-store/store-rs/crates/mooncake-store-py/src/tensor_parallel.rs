@@ -991,6 +991,9 @@ impl PyMooncakeDistributedStore {
                     }
                 }
                 BatchReadPlan::Full(k) => {
+                    // Preserve the existing compatibility behavior: a direct
+                    // full-object read is the fast path, and any miss or
+                    // soft-fail falls back to shard-based reconstruction.
                     if let Ok(result) =
                         self.get_tensor_into_internal(k, buffer_ptrs[i], sizes[i], tenant)
                     {
@@ -2121,6 +2124,9 @@ impl PyMooncakeDistributedStore {
         let mut all_sizes = Vec::with_capacity(plans.len());
         let mut expected = Vec::with_capacity(plans.len());
 
+        // Route-query caches are request-scoped. They are built while planning
+        // this batch and consumed immediately below; they must not be retained
+        // across API calls because route ownership can change.
         for mut plan in plans {
             if let Some(cache) = plan.query_cache.take() {
                 merged_query_cache.merge(cache);
