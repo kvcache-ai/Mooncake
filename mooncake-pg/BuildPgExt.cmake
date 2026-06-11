@@ -64,7 +64,7 @@ endif()
 if("${EP_TORCH_VERSIONS}" STREQUAL "")
   message(STATUS "[PG] Building with currently-installed PyTorch")
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
+    COMMAND ${CMAKE_COMMAND} -E env CUDA_HOME=/usr/local/cuda ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
     WORKING_DIRECTORY "${SOURCE_DIR}"
     RESULT_VARIABLE _ret
   )
@@ -77,7 +77,7 @@ else()
     install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[PG]")
 
     execute_process(
-      COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
+      COMMAND ${CMAKE_COMMAND} -E env CUDA_HOME=/usr/local/cuda ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
       WORKING_DIRECTORY "${SOURCE_DIR}"
       RESULT_VARIABLE _ret
     )
