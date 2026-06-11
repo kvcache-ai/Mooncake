@@ -402,7 +402,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
     // Check if peer returned valid QP list (empty means peer is in transition)
     if (qp_num.empty()) {
         return mooncake::tent::Status::InternalError(
-            "Peer returned empty QP list, endpoint may be in transition, retry later" LOC_MARK);
+            "Peer returned empty QP list, endpoint may be in transition, retry "
+            "later" LOC_MARK);
     }
 
     if (peer_gid.empty()) {
@@ -456,7 +457,8 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
 Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                             BootstrapDesc& local_desc) {
     // First pass: check if we need random backoff before acquiring lock
-    auto incoming_peer_server = getServerNameFromNicPath(peer_desc.local_nic_path);
+    auto incoming_peer_server =
+        getServerNameFromNicPath(peer_desc.local_nic_path);
     auto incoming_peer_nic = getNicNameFromNicPath(peer_desc.local_nic_path);
 
     bool need_backoff = false;
@@ -483,17 +485,17 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     {
         RWSpinlock::WriteGuard guard(lock_);
         if (status_.load(std::memory_order_relaxed) == EP_READY) {
-            // Idempotency check: if the incoming bootstrap is from the same peer
-            // and carries the same peer QP list as the established connection,
-            // this is a duplicate request (e.g. from a concurrent connect() on
-            // the initiator that released its lock during Phase 2). Re-using the
-            // existing connection is safe and avoids resetting QPs that may
-            // already have in-flight RDMA operations.
+            // Idempotency check: if the incoming bootstrap is from the same
+            // peer and carries the same peer QP list as the established
+            // connection, this is a duplicate request (e.g. from a concurrent
+            // connect() on the initiator that released its lock during Phase
+            // 2). Re-using the existing connection is safe and avoids resetting
+            // QPs that may already have in-flight RDMA operations.
             if (incoming_peer_server == peer_server_name_ &&
                 incoming_peer_nic == peer_nic_name_ &&
                 peer_desc.qp_num == peer_qp_num_list_) {
-                LOG(INFO) << "Endpoint already established with " << peer_nic_name_
-                          << " of " << peer_server_name_
+                LOG(INFO) << "Endpoint already established with "
+                          << peer_nic_name_ << " of " << peer_server_name_
                           << " (duplicate bootstrap, reusing connection)";
                 auto& transport = context_->transport_;
                 local_desc.local_nic_path =
@@ -506,8 +508,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                 return mooncake::tent::Status::OK();
             }
 
-            // If the incoming request is from the same peer but with different QPs,
-            // it means the peer has recreated its endpoint.
+            // If the incoming request is from the same peer but with different
+            // QPs, it means the peer has recreated its endpoint.
             if (incoming_peer_server == peer_server_name_ &&
                 incoming_peer_nic == peer_nic_name_) {
                 status_.store(EP_DESTROYING, std::memory_order_release);
@@ -919,9 +921,10 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
             } else {
                 uint8_t cfg = 0, active = 0;
                 if (mlx5dv_query_qp_lag_port(qp, &cfg, &active) == 0) {
-                    VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
-                           << " lag_port cfg=" << (int)cfg
-                           << " active=" << (int)active;
+                    VLOG(1)
+                        << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                        << " lag_port cfg=" << (int)cfg
+                        << " active=" << (int)active;
                 } else {
                     LOG_FIRST_N(WARNING, 4)
                         << "[RDMA] mlx5dv_query_qp_lag_port failed"
@@ -950,7 +953,7 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
                 << qp_index << ", sport=" << sport << "): " << strerror(sp_ret);
         } else {
             VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
-                   << " udp_sport=" << sport;
+                    << " udp_sport=" << sport;
         }
 #else
         LOG_FIRST_N(WARNING, 1)

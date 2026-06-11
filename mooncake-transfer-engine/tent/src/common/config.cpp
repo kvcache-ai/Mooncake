@@ -133,7 +133,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
             try {
                 int val = std::stoi(item);
                 if (val < 0 || val > 65535) {
-                    LOG(WARNING) << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
+                    LOG(WARNING)
+                        << "MC_MLX5_QP_UDP_SPORTS entry out of range: " << item;
                     ok = false;
                     break;
                 }
@@ -148,15 +149,18 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         if (ok && !ports.empty()) {
             config.set("transports/rdma/mlx5_qp_udp_sports", ports);
         } else if (!ok) {
-            LOG(WARNING) << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to parse errors";
+            LOG(WARNING)
+                << "Ignore MC_MLX5_QP_UDP_SPORTS entirely due to parse errors";
         }
     }
 
-    const char* mlx5_lag_balance_env = std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
+    const char* mlx5_lag_balance_env =
+        std::getenv("MC_MLX5_QP_LAG_PORT_BALANCE");
     if (mlx5_lag_balance_env && *mlx5_lag_balance_env) {
         bool val = parseBool(mlx5_lag_balance_env, false);
         config.set("transports/rdma/mlx5_qp_lag_port_balance", val);
-        LOG(INFO) << "MC_MLX5_QP_LAG_PORT_BALANCE = " << (val ? "true" : "false");
+        LOG(INFO) << "MC_MLX5_QP_LAG_PORT_BALANCE = "
+                  << (val ? "true" : "false");
     }
 
     return status;

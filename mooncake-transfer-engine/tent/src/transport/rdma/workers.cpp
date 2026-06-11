@@ -496,7 +496,8 @@ void Workers::asyncPollCq() {
                               << ", dest_addr: " << (void*)slice->target_addr
                               << ", length: " << slice->length
                               << ", local_nic: " << context->name()
-                              << ", remote_nic: " << (ep ? ep->peerNicName() : "unknown")
+                              << ", remote_nic: "
+                              << (ep ? ep->peerNicName() : "unknown")
                               << "): " << ibv_wc_status_str(wc[i].status);
                 }
                 slice->retry_count++;
@@ -796,7 +797,7 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                 getOrCreateRail(worker.rails, target.segment->machine_id);
             if (!rail.ready() || target.topo != rail.remote())
                 rail.load(source.topo, target.topo, /*rail_topo_json=*/"",
-                        transport_->conf_.get());
+                          transport_->conf_.get());
             reachable = rail.available(sdev, tdev);
         }
 

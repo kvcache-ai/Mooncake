@@ -1201,7 +1201,8 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
     if (transport_index == 0 && rdma_failure_threshold_ > 0 &&
         rdma_failure_count_ >= rdma_failure_threshold_) {
         uint64_t current_ns = getCurrentTimeInNano();
-        if ((current_ns - rdma_failure_window_start_ns_) <= rdma_failure_time_window_ns_) {
+        if ((current_ns - rdma_failure_window_start_ns_) <=
+            rdma_failure_time_window_ns_) {
             // Bypass RDMA by incrementing transport index
             adjusted_index = 1;
         }
@@ -1418,7 +1419,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         uint64_t current_ns = getCurrentTimeInNano();
         // Reset counter if time window has passed
         if (rdma_failure_count_ > 0 &&
-            (current_ns - rdma_failure_window_start_ns_) > rdma_failure_time_window_ns_) {
+            (current_ns - rdma_failure_window_start_ns_) >
+                rdma_failure_time_window_ns_) {
             rdma_failure_count_ = 0;
             rdma_failure_window_start_ns_ = 0;
             LOG(INFO) << "RDMA failure counter reset";
@@ -1429,9 +1431,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         }
         rdma_failure_count_++;
 
-        LOG(WARNING) << "RDMA failure detected (count: "
-                     << rdma_failure_count_ << "/"
-                     << rdma_failure_threshold_ << ")";
+        LOG(WARNING) << "RDMA failure detected (count: " << rdma_failure_count_
+                     << "/" << rdma_failure_threshold_ << ")";
 
         if (rdma_failure_threshold_ > 0 &&
             rdma_failure_count_ >= rdma_failure_threshold_) {
