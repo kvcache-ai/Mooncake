@@ -153,10 +153,10 @@ static void submitBatchMemcpy(const std::vector<Slice *> &slices,
         }
     }
 #elif CUDART_VERSION >= 12080
-    err = cudaMemcpyBatchAsync(
-        const_cast<void **>(dsts.data()), const_cast<void **>(srcs.data()),
-        mutable_sizes.data(), static_cast<size_t>(count), &attr, &attrs_idx,
-        1, &fail_idx, stream);
+    err = cudaMemcpyBatchAsync(const_cast<void **>(dsts.data()),
+                               const_cast<void **>(srcs.data()),
+                               mutable_sizes.data(), static_cast<size_t>(count),
+                               &attr, &attrs_idx, 1, &fail_idx, stream);
     if (err != cudaSuccess) {
         if (fail_idx < count) {
             LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMemcpyBatchAsync "
