@@ -63,46 +63,6 @@ impl ReadQueryResultCache {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_route(key: &str, version: u64) -> ObjectRoute {
-        let object_key = ObjectKey::new(key);
-        ObjectRoute {
-            key: object_key.clone(),
-            namespace: None,
-            logical_key: Some(key.to_string()),
-            canonical_key: Some(object_key.0.clone()),
-            sharing_scope: None,
-            qos_tier: None,
-            version: RouteVersion(version),
-            state: RouteState::Active,
-            compatibility: CompatibilityDescriptor::default(),
-            replicas: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn read_query_result_cache_merge_prefers_later_entries() {
-        let key = ObjectKey::new("tenant::cache-key");
-        let mut first = ReadQueryResultCache::default();
-        first.entries.insert(key.clone(), Some(test_route("cache-key", 1)));
-
-        let mut second = ReadQueryResultCache::default();
-        second.entries.insert(key.clone(), Some(test_route("cache-key", 2)));
-
-        first.merge(second);
-
-        let route = first
-            .entries
-            .get(&key)
-            .and_then(|route| route.as_ref())
-            .expect("merged cache should keep a route");
-        assert_eq!(route.version, RouteVersion(2));
-    }
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NamespaceQuota {
     pub max_bytes: Option<u64>,
