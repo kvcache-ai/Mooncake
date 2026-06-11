@@ -58,17 +58,6 @@ struct StorageSegmentObservation {
     mode: StorageSegmentNamingMode,
 }
 
-fn expected_storage_segment_naming_mode(transport_metadata_url: &str) -> StorageSegmentNamingMode {
-    if transport_metadata_url
-        .trim()
-        .eq_ignore_ascii_case("P2PHANDSHAKE")
-    {
-        StorageSegmentNamingMode::RpcAddressSegmentName
-    } else {
-        StorageSegmentNamingMode::LogicalSegmentName
-    }
-}
-
 fn observe_active_storage_segment_modes(
     live_clients: &[ClientLease],
 ) -> Vec<StorageSegmentObservation> {
@@ -134,19 +123,13 @@ fn validate_storage_segment_naming_consistency(
         .collect::<Vec<_>>()
         .join("; ");
 
+    // 只检查所有 daemon 是否使用统一的 segment naming 约定，
+    // 不再强制要求 naming mode 与 transport metadata mode 匹配。
+    // daemon 在 P2P 和 metadata-backed 模式下都使用逻辑 segment name，
+    // 实际通信依赖 rpc_address，与 segment name 格式无关。
     if distinct_modes.len() > 1 {
         return Err(format!(
-            "scratch-only bench refuses to start because active storage daemons in keyspace {keyspace_prefix} publish mixed segment naming modes under transport_metadata_url={transport_metadata_url}: {observed}. Restart every storage daemon and the bench with one transport metadata mode before benchmarking."
-        ));
-    }
-
-    let expected_mode = expected_storage_segment_naming_mode(transport_metadata_url);
-    let observed_mode = distinct_modes[0];
-    if observed_mode != expected_mode {
-        return Err(format!(
-            "scratch-only bench refuses to start because bench transport metadata expects {} in keyspace {keyspace_prefix}, but active storage daemons publish {} under transport_metadata_url={transport_metadata_url}: {observed}. Restart every storage daemon and the bench with one transport metadata mode before benchmarking.",
-            expected_mode.label(),
-            observed_mode.label(),
+            "scratch-only bench refuses to start because active storage daemons in keyspace {keyspace_prefix} publish mixed segment naming modes under transport_metadata_url={transport_metadata_url}: {observed}. Ensure all storage daemons use the same segment naming convention."
         ));
     }
 
@@ -966,15 +949,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_storage_candidates_rejects_cluster_mode_mismatch_for_p2p() {
+    fn ensure_storage_candidates_accepts_logical_segment_naming_in_p2p_mode() {
+        // daemon 在 P2P 模式下也使用逻辑 segment name，bench 应接受
         let metadata = InMemoryMetadataBackend::new();
         publish_storage_lease(&metadata, "storage-a", "segment-a", "192.168.1.10:17001");
 
-        let error = ensure_storage_candidates(&metadata, "mc/store-rs/test", "P2PHANDSHAKE")
-            .expect_err("named segments should not satisfy p2p bench startup")
-            .to_string();
-
-        assert!(error.contains("expects P2P-handshake rpc-address segment names"));
+        ensure_storage_candidates(&metadata, "mc/store-rs/test", "P2PHANDSHAKE")
+            .expect("logical segment names should be accepted in p2p mode");
     }
 
     #[test]
