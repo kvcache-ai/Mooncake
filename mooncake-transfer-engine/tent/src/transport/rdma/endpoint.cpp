@@ -512,8 +512,10 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             // QPs, it means the peer has recreated its endpoint.
             if (incoming_peer_server == peer_server_name_ &&
                 incoming_peer_nic == peer_nic_name_) {
-                status_.store(EP_DESTROYING, std::memory_order_release);
-                destroy_start_time_ = getCurrentTimeInNano();
+                // Call beginDestroyNoLock() directly to properly transition QPs
+                // to ERR state before remove() is called. This prevents the
+                // QPs from remaining in RTS state and causing hangs/leaks.
+                beginDestroyNoLock();
                 need_remove_ep = true;
             } else {
                 // Fill local_desc before returning error
