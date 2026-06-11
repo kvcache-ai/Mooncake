@@ -16,10 +16,12 @@
 
 #include <arpa/inet.h>
 #include <bits/stdint-uintn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <json/value.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 
 #include <random>
@@ -960,9 +962,74 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
+        // SO_RCVTIMEO does not apply to connect(). A blocking connect() to
+        // an unroutable address (e.g. a torn-down pod IP) stalls for the
+        // kernel's full SYN-retry cycle -- minutes -- and this runs on RDMA
+        // worker threads, where the stall also blocks CQ polling. Connect in
+        // non-blocking mode and bound the wait with poll().
+        int flags = fcntl(conn_fd, F_GETFL, 0);
+        if (flags == -1 || fcntl(conn_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(O_NONBLOCK)";
+            close(conn_fd);
+            return ERR_SOCKET;
+        }
+
         if (connect(conn_fd, addr->ai_addr, addr->ai_addrlen)) {
-            PLOG(ERROR) << "SocketHandShakePlugin: connect()"
-                        << getNetworkAddress(addr->ai_addr);
+            if (errno != EINPROGRESS) {
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+
+            const int64_t deadline_ms =
+                getCurrentTimeInMilli() +
+                globalConfig().handshake_connect_timeout * 1000;
+            struct pollfd pfd;
+            pfd.fd = conn_fd;
+            pfd.events = POLLOUT;
+            while (true) {
+                const int64_t remaining_ms =
+                    deadline_ms - getCurrentTimeInMilli();
+                if (remaining_ms <= 0) {
+                    errno = ETIMEDOUT;
+                    PLOG(ERROR) << "SocketHandShakePlugin: connect() "
+                                << getNetworkAddress(addr->ai_addr);
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                int ret = poll(&pfd, 1, (int)remaining_ms);
+                if (ret > 0) break;
+                if (ret < 0 && errno != EINTR) {
+                    PLOG(ERROR) << "SocketHandShakePlugin: poll()";
+                    close(conn_fd);
+                    return ERR_SOCKET;
+                }
+                // ret == 0 (poll timeout) re-checks the deadline; EINTR
+                // retries with the remaining time.
+            }
+
+            int conn_err = 0;
+            socklen_t err_len = sizeof(conn_err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &conn_err,
+                           &err_len)) {
+                PLOG(ERROR) << "SocketHandShakePlugin: getsockopt(SO_ERROR)";
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+            if (conn_err) {
+                errno = conn_err;
+                PLOG(ERROR) << "SocketHandShakePlugin: connect()"
+                            << getNetworkAddress(addr->ai_addr);
+                close(conn_fd);
+                return ERR_SOCKET;
+            }
+        }
+
+        // Restore blocking mode; the request/response exchange relies on
+        // blocking reads bounded by SO_RCVTIMEO.
+        if (fcntl(conn_fd, F_SETFL, flags) == -1) {
+            PLOG(ERROR) << "SocketHandShakePlugin: fcntl(restore flags)";
             close(conn_fd);
             return ERR_SOCKET;
         }
