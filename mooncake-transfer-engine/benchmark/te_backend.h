@@ -71,12 +71,28 @@ class TEBenchRunner : public BenchRunner {
                              uint64_t block_size, uint64_t batch_size,
                              OpCode opcode);
 
+    // Multi-target methods for all-to-all testing (not supported for TE
+    // backend)
+    int publishSegment(const std::string& segment_name) override;
+
+    int connectToAllTargets(const std::vector<std::string>& target_segments,
+                            int sync_timeout_sec = 120) override;
+
+    size_t getTargetCount() const override;
+
+    double runTransferToTarget(uint64_t local_addr, size_t target_idx,
+                               uint64_t block_size, uint64_t batch_size,
+                               OpCode opcode) override;
+
    private:
     int allocateBuffers();
 
     int freeBuffers();
 
     int runner(int thread_id);
+
+    static void* allocateMemoryPool(size_t size, int buffer_id, bool from_vram);
+    static void freeMemoryPool(void* addr, size_t size);
 
    private:
     std::unique_ptr<mooncake::TransferEngine> engine_;
@@ -89,7 +105,7 @@ class TEBenchRunner : public BenchRunner {
     std::mutex mtx_;
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
-    int pending_ = 0;
+    std::atomic<int> pending_{0};
 };
 
 }  // namespace tent

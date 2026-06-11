@@ -77,6 +77,8 @@ struct XferBenchConfig {
 
     static int local_gpu_id;
     static int target_gpu_id;
+    static std::string coordinator;
+    static int wait_timeout;  // Timeout in seconds for waiting for all nodes
 };
 
 struct XferMetricStats {
@@ -97,22 +99,22 @@ struct XferMetricStats {
         return sum / samples.size();
     }
 
-    double p90() { return percentile(90.0); }
+    double p90() const { return percentile(90.0); }
 
-    double p95() { return percentile(95.0); }
+    double p95() const { return percentile(95.0); }
 
-    double p99() { return percentile(99.0); }
+    double p99() const { return percentile(99.0); }
 
-    double p999() { return percentile(99.9); }
+    double p999() const { return percentile(99.9); }
 
     void add(double value) { samples.push_back(value); }
 
     void clear() { samples.clear(); }
 
-    size_t count() { return samples.size(); }
+    size_t count() const { return samples.size(); }
 
    private:
-    double percentile(double p);
+    double percentile(double p) const;
 
    private:
     std::vector<double> samples;
@@ -150,6 +152,13 @@ void printStatsHeader();
 
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
+
+// Print statistics for all-to-all mode (includes node rank and target count)
+void printStatsAllToAll(int node_rank, int total_nodes, size_t num_targets,
+                        size_t block_size, size_t batch_size,
+                        XferBenchStats& stats, int num_threads);
+
+void printStatsAllToAllHeader();
 
 #ifdef USE_CUDA
 static inline bool isCudaMemory(void* ptr) {
