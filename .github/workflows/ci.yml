@@ -327,6 +327,7 @@ jobs:
       BUILD_WITH_EP: "1"
       TORCH_CUDA_ARCH_LIST: "9.0"
       SCCACHE_GHA_ENABLED: "true"
+      CUDA_HOME: "/usr/local/cuda"
 
     steps:
     - uses: actions/checkout@v4
