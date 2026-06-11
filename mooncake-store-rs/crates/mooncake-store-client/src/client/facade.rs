@@ -1079,7 +1079,7 @@ impl MooncakeCompatibilityFacade for StoreClient {
             let routes = self.route_ops().load_routes(&object_keys)?;
             let mut cache = ReadQueryResultCache::default();
             for (object_key, route) in object_keys.into_iter().zip(routes) {
-                cache.entries.insert(object_key, Ok(route));
+                cache.entries.insert(object_key, route);
             }
             Ok(cache)
         })();
@@ -1881,16 +1881,13 @@ impl MooncakeCompatibilityFacade for StoreClient {
                     if let Some(cached) =
                         query_cache.and_then(|cache| cache.entries.get(&object_key))
                     {
-                        match cached {
-                            Ok(route) => self.resolve_readable_route(
-                                tenant,
-                                key,
-                                route.clone(),
-                                &local_segments,
-                                &readable_runtimes,
-                            ),
-                            Err(error) => Err(error.clone()),
-                        }
+                        self.resolve_readable_route(
+                            tenant,
+                            key,
+                            cached.clone(),
+                            &local_segments,
+                            &readable_runtimes,
+                        )
                     } else {
                         let route =
                             self.route_ops()
