@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <regex>
 #include <shared_mutex>
 #include <glog/logging.h>
 
@@ -145,12 +146,7 @@ void LocalHotCache::ReleaseHotKey(const std::string& key) {
     }
 }
 
-bool LocalHotCache::RemoveHotKey(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
-
-    key_generation_[key]++;
-    drainDeferredTouches();
-
+bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
     auto it = key_to_lru_it_.find(key);
     if (it == key_to_lru_it_.end()) {
         return false;
@@ -165,8 +161,107 @@ bool LocalHotCache::RemoveHotKey(const std::string& key) {
     block->accessed.store(false, std::memory_order_relaxed);
     lru_queue_.push_back(block);
 
-    VLOG(2) << "Removed hot key: " << key << " from hot cache";
     return true;
+}
+
+bool LocalHotCache::RemoveHotKey(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    key_generation_[key]++;
+    drainDeferredTouches();
+
+    const bool removed = removeHotKeyLocked(key);
+    if (removed) {
+        VLOG(2) << "Removed hot key: " << key << " from hot cache";
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveHotKeys(const std::vector<std::string>& keys) {
+    if (keys.empty()) {
+        return 0;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    drainDeferredTouches();
+
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        key_generation_[key]++;
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
+    std::regex pattern;
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "RemoveHotKeysByRegex: invalid pattern: " << regex_pattern
+                   << ", error: " << e.what();
+        return 0;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    drainDeferredTouches();
+
+    std::vector<std::string> matching_keys;
+    matching_keys.reserve(key_to_lru_it_.size());
+    for (const auto& [key, _] : key_to_lru_it_) {
+        if (std::regex_search(key, pattern)) {
+            matching_keys.emplace_back(key);
+        }
+    }
+
+    size_t removed = 0;
+    for (const auto& key : matching_keys) {
+        key_generation_[key]++;
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveAllHotKeys() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+
+    const size_t removed = key_to_lru_it_.size();
+    key_to_lru_it_.clear();
+    key_generation_.clear();
+    lru_queue_.clear();
+
+    for (auto& block : blocks_) {
+        block->key_.clear();
+        block->ref_count = 0;
+        block->accessed.store(false, std::memory_order_relaxed);
+        lru_queue_.push_back(block.get());
+    }
+    return removed;
+}
+
+void LocalHotCache::BumpKeyGeneration(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    key_generation_[key]++;
+}
+
+void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
+    if (keys.empty()) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    for (const auto& key : keys) {
+        key_generation_[key]++;
+    }
+}
+
+void LocalHotCache::BumpCacheEpoch() {
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void LocalHotCache::Clear() {
@@ -201,8 +296,7 @@ bool LocalHotCache::IsPutTokenValid(const std::string& key,
         return false;
     }
     auto it = key_generation_.find(key);
-    const uint64_t current_gen =
-        (it != key_generation_.end()) ? it->second : 0;
+    const uint64_t current_gen = (it != key_generation_.end()) ? it->second : 0;
     return token.key_generation == current_gen;
 }
 

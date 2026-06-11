@@ -187,10 +187,11 @@ class DummyClientGetBufferTest : public ::testing::Test {
 
     // Trigger hot-cache admission via DummyClient fallback reads (CMS threshold
     // default 2) but do NOT wait for async PutHotKey to publish.
-    void TriggerAdmissionWithoutWaiting(const std::string& key) {
+    void TriggerAdmissionWithoutWaiting(const std::string &key) {
         for (int i = 0; i < 2; ++i) {
             auto buf = dummy_client_->get_buffer(key);
-            ASSERT_NE(buf, nullptr) << "get_buffer failed while triggering admission";
+            ASSERT_NE(buf, nullptr)
+                << "get_buffer failed while triggering admission";
         }
     }
 
@@ -204,7 +205,8 @@ class DummyClientGetBufferTest : public ::testing::Test {
     std::optional<std::string> saved_hot_block_env_;
     std::optional<std::string> saved_hot_shm_env_;
 };
-TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterHotCacheRemoveShouldNotUseStaleHotCache) {
+TEST_F(DummyClientGetBufferTest,
+       RePutSameKeyAfterHotCacheRemoveShouldNotUseStaleHotCache) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 
     const std::string key = "reput_same_key_hotcache_regression";
@@ -220,7 +222,7 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterHotCacheRemoveShouldNotUseStal
         // Use a different payload each round. Distinct data makes stale hot
         // cache from a prior round show up as a data mismatch without crashing.
         // Fill with non-printable bytes (starting at 1) to avoid log noise.
-        const char fill = static_cast<char>(1 + (round % 250)); 
+        const char fill = static_cast<char>(1 + (round % 250));
         const std::string data(kPayloadSize, fill);
 
         // 1. Write the target key.
@@ -238,24 +240,25 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterHotCacheRemoveShouldNotUseStal
         auto hot_buf = dummy_client_->get_buffer(key);
         ASSERT_NE(hot_buf, nullptr) << "dummy get_buffer should succeed";
 
-        EXPECT_EQ(hot_buf->size(), data.size()) << "hot buffer size mismatch";  
+        EXPECT_EQ(hot_buf->size(), data.size()) << "hot buffer size mismatch";
 
         // Key assertion: pointer must be in the hot cache region.
         // If not, this round did not exercise the hot cache path.
         EXPECT_TRUE(dummy_client_->is_hot_cache_ptr(hot_buf->ptr()))
             << "warmed key should resolve via hot cache shm path";
 
-
         // 4. Verify hot cache contents match this round's payload.
         {
-            std::string got(static_cast<char*>(hot_buf->ptr()), hot_buf->size());
-            
+            std::string got(static_cast<char *>(hot_buf->ptr()),
+                            hot_buf->size());
+
             // Check size first, then compare byte-by-byte with std::equal.
             ASSERT_EQ(got.size(), data.size());
             bool is_equal = std::equal(got.begin(), got.end(), data.begin());
-            
+
             // Report mismatch without printing binary payload.
-            EXPECT_TRUE(is_equal) << "Data mismatch detected in hot cache, but text payload is hidden.";
+            EXPECT_TRUE(is_equal) << "Data mismatch detected in hot cache, but "
+                                     "text payload is hidden.";
         }
 
         // 5. Remove the target key.
@@ -266,37 +269,43 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterHotCacheRemoveShouldNotUseStal
 
         // 6. After remove, dummy get_buffer must not return stale hot cache.
         //
-        // A non-null buffer here means hot cache or metadata was not cleaned up.
+        // A non-null buffer here means hot cache or metadata was not cleaned
+        // up.
         auto after_remove_buf = dummy_client_->get_buffer(key);
         EXPECT_EQ(after_remove_buf, nullptr)
             << "dummy get_buffer should return nullptr after remove; "
             << "hot cache may still hold stale key";
     }
 }
-// ---- Regression: same key remove + re-put should not reuse stale hot-cache buffer ----
+// ---- Regression: same key remove + re-put should not reuse stale hot-cache
+// buffer ----
 //
 // Covers residual hot-cache state across repeated put/remove on the same key:
 // 1. Fixed key for read/write across rounds;
-// 2. After first put, RealClient::get_buffer warms admission_sketch_ to threshold;
+// 2. After first put, RealClient::get_buffer warms admission_sketch_ to
+// threshold;
 // 3. DummyClient::get_buffer should use hot cache shm zero-copy when admitted;
 // 4. remove the key;
 // 5. After remove, DummyClient::get_buffer must not read stale hot cache;
 // 6. Re-put new data for the same key (intended scenario in design comments);
 // 7. DummyClient::get_buffer must read new data, not leftover hot cache;
 // 8. Repeat for many rounds to catch hot-cache state leaking across cycles.
-TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindFailRound) {
+TEST_F(DummyClientGetBufferTest,
+       RePutSameKeyAfterRemoveWithoutWarmHotCacheFindFailRound) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 
     const std::string key = "reput_same_key_hotcache_regression";
 
     // Skip WarmHotCache to observe natural admission under load.
-    // Surfaces which round hits hot cache and whether remove leaves stale entries.
+    // Surfaces which round hits hot cache and whether remove leaves stale
+    // entries.
     constexpr int kRounds = 20;
 
     for (int round = 0; round < kRounds; ++round) {
         SCOPED_TRACE("round=" + std::to_string(round));
 
-        // Different payload each round; non-zero binary fill avoids log pollution.
+        // Different payload each round; non-zero binary fill avoids log
+        // pollution.
         const char fill = static_cast<char>(1 + (round % 250));
         const std::string data(kPayloadSize, fill);
 
@@ -319,20 +328,20 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindF
         if (hot_buf == nullptr) {
             std::cerr << "[round=" << round
                       << "] dummy get_buffer returned nullptr before remove; "
-                      << "hot cache may not be admitted yet."
-                      << std::endl;
+                      << "hot cache may not be admitted yet." << std::endl;
         } else {
-            const bool is_hot_ptr = dummy_client_->is_hot_cache_ptr(hot_buf->ptr());
+            const bool is_hot_ptr =
+                dummy_client_->is_hot_cache_ptr(hot_buf->ptr());
 
             std::cerr << "[round=" << round
                       << "] dummy get_buffer succeeded before remove; "
                       << "size=" << hot_buf->size()
-                      << ", is_hot_cache_ptr=" << is_hot_ptr
-                      << std::endl;
+                      << ", is_hot_cache_ptr=" << is_hot_ptr << std::endl;
 
             // 4. If a buffer was returned, verify contents strictly.
             //
-            // Failure here means stale data before remove (hot cache/metadata bug).
+            // Failure here means stale data before remove (hot cache/metadata
+            // bug).
             if (hot_buf->size() != data.size()) {
                 FAIL() << "FAILED at round=" << round
                        << ": buffer size mismatch before remove. "
@@ -340,10 +349,12 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindF
                        << ", expected=" << data.size();
             }
 
-            std::string got(static_cast<char*>(hot_buf->ptr()), hot_buf->size());
+            std::string got(static_cast<char *>(hot_buf->ptr()),
+                            hot_buf->size());
 
             // Byte-by-byte compare; do not print binary payload in logs.
-            const bool same_data = std::equal(got.begin(), got.end(), data.begin());
+            const bool same_data =
+                std::equal(got.begin(), got.end(), data.begin());
 
             if (!same_data) {
                 FAIL() << "FAILED at round=" << round
@@ -352,7 +363,8 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindF
             }
         }
 
-        // 5. Remove the target key (force=true avoids lease/task blocking remove).
+        // 5. Remove the target key (force=true avoids lease/task blocking
+        // remove).
         int remove_rc = real_client_->remove(key, true);
         ASSERT_EQ(remove_rc, 0) << "remove failed at round=" << round;
 
@@ -369,13 +381,13 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindF
             std::cerr << "[round=" << round
                       << "] dummy get_buffer still succeeded after remove; "
                       << "size=" << after_remove_buf->size()
-                      << ", is_hot_cache_ptr=" << is_hot_ptr
-                      << std::endl;
+                      << ", is_hot_cache_ptr=" << is_hot_ptr << std::endl;
 
-            FAIL() << "FAILED at round=" << round
-                   << ": dummy get_buffer should return nullptr after remove, "
-                   << "but got non-null buffer. "
-                   << "This strongly indicates stale hot cache / stale metadata.";
+            FAIL()
+                << "FAILED at round=" << round
+                << ": dummy get_buffer should return nullptr after remove, "
+                << "but got non-null buffer. "
+                << "This strongly indicates stale hot cache / stale metadata.";
         } else {
             std::cerr << "[round=" << round
                       << "] dummy get_buffer returned nullptr after remove."
@@ -385,7 +397,8 @@ TEST_F(DummyClientGetBufferTest, RePutSameKeyAfterRemoveWithoutWarmHotCacheFindF
 }
 
 // ---- Regression: a stable hot-cache entry must be invalidated by remove ----
-TEST_F(DummyClientGetBufferTest, StableHotCacheEntryShouldBeInvalidatedByRemove) {
+TEST_F(DummyClientGetBufferTest,
+       StableHotCacheEntryShouldBeInvalidatedByRemove) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 
     const std::string key = "stable_hot_cache_remove_invalidation";
@@ -405,7 +418,8 @@ TEST_F(DummyClientGetBufferTest, StableHotCacheEntryShouldBeInvalidatedByRemove)
         << "buffer should be in hot cache shm before remove";
 
     {
-        std::string got(static_cast<char*>(hot_buf_1->ptr()), hot_buf_1->size());
+        std::string got(static_cast<char *>(hot_buf_1->ptr()),
+                        hot_buf_1->size());
         ASSERT_EQ(got.size(), data.size());
         ASSERT_TRUE(std::equal(got.begin(), got.end(), data.begin()))
             << "hot cache data mismatch before remove";
@@ -420,7 +434,8 @@ TEST_F(DummyClientGetBufferTest, StableHotCacheEntryShouldBeInvalidatedByRemove)
         << "second hot cache buffer size mismatch before remove";
 
     {
-        std::string got(static_cast<char*>(hot_buf_2->ptr()), hot_buf_2->size());
+        std::string got(static_cast<char *>(hot_buf_2->ptr()),
+                        hot_buf_2->size());
         ASSERT_EQ(got.size(), data.size());
         ASSERT_TRUE(std::equal(got.begin(), got.end(), data.begin()))
             << "second hot cache data mismatch before remove";
@@ -442,11 +457,13 @@ TEST_F(DummyClientGetBufferTest, StableHotCacheEntryShouldBeInvalidatedByRemove)
     }
 }
 
-// ---- Diagnosis: removed key must not be resurrected by async hot-cache fill ----
+// ---- Diagnosis: removed key must not be resurrected by async hot-cache fill
+// ----
 //
 // Compare against pre-fix behavior:
 //   mooncake-store/tests/scripts/compare_hot_cache_fix.sh all
-TEST_F(DummyClientGetBufferTest, RemoveShouldNotBeResurrectedByAsyncHotCacheFill) {
+TEST_F(DummyClientGetBufferTest,
+       RemoveShouldNotBeResurrectedByAsyncHotCacheFill) {
     ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
 
     const std::string key = "async_fill_resurrect_removed_key";
@@ -472,8 +489,8 @@ TEST_F(DummyClientGetBufferTest, RemoveShouldNotBeResurrectedByAsyncHotCacheFill
         bool immediate_is_hot = false;
         size_t immediate_size = 0;
         if (immediate_non_null) {
-            immediate_is_hot =
-                dummy_client_->is_hot_cache_ptr(immediately_after_remove->ptr());
+            immediate_is_hot = dummy_client_->is_hot_cache_ptr(
+                immediately_after_remove->ptr());
             immediate_size = immediately_after_remove->size();
             std::cerr << "[round=" << round
                       << "] immediately after remove: NON_NULL"
@@ -499,8 +516,8 @@ TEST_F(DummyClientGetBufferTest, RemoveShouldNotBeResurrectedByAsyncHotCacheFill
                       << ", size=" << delayed_size
                       << ", is_hot_cache_ptr=" << delayed_is_hot << std::endl;
         } else {
-            std::cerr << "[round=" << round
-                      << "] delayed after remove: nullptr" << std::endl;
+            std::cerr << "[round=" << round << "] delayed after remove: nullptr"
+                      << std::endl;
         }
 
         if (immediate_non_null || delayed_non_null) {

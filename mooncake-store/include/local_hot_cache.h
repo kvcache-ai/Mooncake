@@ -21,7 +21,8 @@ namespace mooncake {
 
 /**
  * @brief Token captured at async hot cache fill submission time.
- * Invalidated when RemoveHotKey or Clear bumps generation/epoch.
+ * Invalidated when RemoveHotKey, BumpKeyGeneration, or Clear bumps
+ * generation/epoch.
  */
 struct HotCachePutToken {
     uint64_t cache_epoch = 0;
@@ -109,6 +110,41 @@ class LocalHotCache {
     bool RemoveHotKey(const std::string& key);
 
     /**
+     * @brief Remove a batch of keys from the hot cache under one lock.
+     * Bumps each key generation so in-flight async fills are invalidated.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveHotKeys(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Remove cached keys matching a regex from the hot cache.
+     * Bumps key generation for matching published entries.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveHotKeysByRegex(const std::string& regex_pattern);
+
+    /**
+     * @brief Remove every published hot cache entry and invalidate async fills.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveAllHotKeys();
+
+    /**
+     * @brief Invalidate in-flight async fills for a key without evicting it.
+     */
+    void BumpKeyGeneration(const std::string& key);
+
+    /**
+     * @brief Invalidate in-flight async fills for multiple keys.
+     */
+    void BumpKeyGenerations(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Invalidate all in-flight async fills without evicting entries.
+     */
+    void BumpCacheEpoch();
+
+    /**
      * @brief Clear all hot cache entries and invalidate in-flight async fills.
      */
     void Clear();
@@ -179,6 +215,7 @@ class LocalHotCache {
    private:
     // Drain deferred LRU touches: splice accessed blocks to front
     void drainDeferredTouches();
+    bool removeHotKeyLocked(const std::string& key);
 
     size_t block_size_;  // Actual block size used by this cache
 
