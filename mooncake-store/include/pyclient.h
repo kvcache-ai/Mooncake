@@ -1,10 +1,13 @@
 #pragma once
 
-#include <csignal>
 #include <atomic>
-#include <thread>
-#include <string>
+#include <chrono>
+#include <csignal>
+#include <map>
 #include <memory>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "client_service.h"
@@ -207,6 +210,12 @@ class ClientRequester {
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
+    // Request-scoped cache of fresh batch_query() results that can be reused by
+    // subsequent ranged reads in the same operation. Callers should not retain
+    // entries across independent requests.
+    using QueryResultCache =
+        std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
+
     virtual ~PyClient() = 0;
     virtual int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
@@ -238,12 +247,19 @@ class PyClient {
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
 
+    // query_result_cache is optional and is only used to reuse fresh
+    // batch_query() results for this read; callers still do not provide any
+    // replica-selection or ranged-read metadata directly.
     virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
         const std::vector<void *> &buffers,
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-        const std::vector<std::vector<std::vector<size_t>>> &all_sizes) = 0;
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) = 0;
+
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
@@ -357,5 +373,80 @@ class PyClient {
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
+
+inline uint64_t remaining_lease_ttl_ms(
+    const QueryResult &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (query_result.IsLeaseExpired(now)) {
+        return 0;
+    }
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result.lease_timeout - now)
+            .count());
+}
+
+inline CachedQueryResultResponse to_cached_query_result_response(
+    const tl::expected<QueryResult, ErrorCode> &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!query_result) {
+        return CachedQueryResultResponse(query_result.error());
+    }
+    if (query_result->IsLeaseExpired(now)) {
+        return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return CachedQueryResultResponse(GetReplicaListResponse(
+        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                         query_result->replicas.end()),
+        remaining_lease_ttl_ms(*query_result, now)));
+}
+
+inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
+    const CachedQueryResultResponse &cached_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!cached_result.success) {
+        return tl::make_unexpected(cached_result.error);
+    }
+    return QueryResult(
+        std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
+                                         cached_result.value.replicas.end()),
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
+}
+
+inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results) {
+    PyClient::QueryResultCache query_result_cache;
+    query_result_cache.reserve(cached_query_results.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, cached_result] : cached_query_results) {
+        auto query_result =
+            from_cached_query_result_response(cached_result, now);
+        if (!query_result || query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        query_result_cache.emplace(key, std::move(query_result));
+    }
+    return query_result_cache;
+}
+
+inline std::map<std::string, CachedQueryResultResponse>
+build_cached_query_results_from_query_result_cache(
+    const PyClient::QueryResultCache *query_result_cache) {
+    std::map<std::string, CachedQueryResultResponse> cached_query_results;
+    if (query_result_cache == nullptr) {
+        return cached_query_results;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, query_result] : *query_result_cache) {
+        if (query_result && query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        cached_query_results.emplace(
+            key, to_cached_query_result_response(query_result, now));
+    }
+    return cached_query_results;
+}
 
 }  // namespace mooncake

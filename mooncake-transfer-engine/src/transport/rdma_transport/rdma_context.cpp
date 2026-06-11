@@ -209,7 +209,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     }
 
     num_comp_channel_ = num_comp_channels;
-    comp_channel_ = new ibv_comp_channel *[num_comp_channels];
+    comp_channel_ = new ibv_comp_channel *[num_comp_channels]();
     for (size_t i = 0; i < num_comp_channels; ++i) {
         comp_channel_[i] = ibv_create_comp_channel(context_);
         if (!comp_channel_[i]) {
@@ -228,6 +228,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
     if (joinNonblockingPollList(event_fd_, context_->async_fd)) {
         LOG(ERROR) << "Failed to register context async fd to epoll";
         close(event_fd_);
+        event_fd_ = -1;
         return ERR_CONTEXT;
     }
 
@@ -236,6 +237,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
             LOG(ERROR) << "Failed to register completion channel " << i
                        << " to epoll";
             close(event_fd_);
+            event_fd_ = -1;
             return ERR_CONTEXT;
         }
 
@@ -248,6 +250,7 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
         if (!cq) {
             PLOG(ERROR) << "Failed to create completion queue";
             close(event_fd_);
+            event_fd_ = -1;
             return ERR_CONTEXT;
         }
         cq_list_[i].native = cq;
@@ -389,24 +392,13 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 #endif
         CUdeviceptr allocBase;
         size_t allocSize;
-#if defined(USE_MLU)
-        allocBase = (CUdeviceptr)addr;
-        result = cuPointerGetAttribute(
-            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
-#else
         result =
             cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
-#endif
         if (result != CUDA_SUCCESS) {
             const char *errStr;
             cuGetErrorString(result, &errStr);
-#if defined(USE_MLU)
-            LOG(ERROR) << "Failed to call cuPointerGetAttribute range size for "
-                       << (uintptr_t)addr << " cuda error=" << errStr;
-#else
             LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
                        << (uintptr_t)addr << " cuda error=" << errStr;
-#endif
 #if defined(USE_CUDA)
             cuDevicePrimaryCtxRelease(cuDev);
 #endif
@@ -655,6 +647,10 @@ int RdmaContext::disconnectAllEndpoints() {
 
 int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
+}
+
+int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
+    return endpoint_store_->deleteEndpointByPtr(endpoint_ptr);
 }
 
 void RdmaContext::reclaimEndpoints() { endpoint_store_->reclaimEndpoint(); }

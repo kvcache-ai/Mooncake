@@ -104,6 +104,8 @@ class TcpTransport : public Transport {
 
     void startTransfer(Slice *slice);
 
+    bool validateAddress(uint64_t addr, uint64_t size) const;
+
     const char *getName() const override { return "tcp"; }
 
    private:
