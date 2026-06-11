@@ -539,10 +539,11 @@ TEST_F(RDMAEndpointReestablishTest,
 #ifndef CONFIG_ERDMA
 TEST_F(RDMAEndpointReestablishTest, DisconnectIssuesErrBeforeResetOnReconnect) {
     if (usesP2PHandshake(metadata_server)) {
-        GTEST_SKIP() << "Re-establish (and thus the ERR disconnect path) is not "
-                        "triggered under P2PHANDSHAKE; run with a metadata "
-                        "server (e.g. MC_METADATA_SERVER=http://host:port/"
-                        "metadata) and stable MC_*_SERVER_NAME to exercise it";
+        GTEST_SKIP()
+            << "Re-establish (and thus the ERR disconnect path) is not "
+               "triggered under P2PHANDSHAKE; run with a metadata "
+               "server (e.g. MC_METADATA_SERVER=http://host:port/"
+               "metadata) and stable MC_*_SERVER_NAME to exercise it";
     }
 
     enableQpStateTracking();
