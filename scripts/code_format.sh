@@ -67,24 +67,37 @@ print_error() {
 
 # Find clang-format binary (require version 20)
 find_clang_format() {
-    if command -v clang-format-20 &> /dev/null; then
-        echo "clang-format-20"
-        return 0
-    else
-        {
-            print_error "clang-format-20 not found. This project requires clang-format version 20."
-            echo ""
-            print_info "Installation instructions for Ubuntu:"
-            echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
-            echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
-            echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
-            echo ""
-            print_info "Or use the LLVM installation script:"
-            echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
-            echo "  sudo apt-get install -y clang-format-20"
-        } >&2
-        return 1
-    fi
+    # Prefer clang-format-20, but also accept generic clang-format if it is version 20
+    local candidates=("clang-format-20" "clang-format")
+    for candidate in "${candidates[@]}"; do
+        if command -v "${candidate}" &> /dev/null; then
+            local version_out
+            version_out=$("${candidate}" --version 2>/dev/null)
+            if [[ "${version_out}" =~ version[[:space:]]+([0-9]+) ]] && [[ "${BASH_REMATCH[1]}" -eq 20 ]]; then
+                echo "${candidate}"
+                return 0
+            fi
+        fi
+    done
+
+    {
+        print_error "clang-format version 20 not found."
+        if command -v clang-format &> /dev/null; then
+            local current
+            current=$(clang-format --version 2>/dev/null | head -1)
+            print_warn "Found: ${current}"
+        fi
+        echo ""
+        print_info "Installation instructions for Ubuntu:"
+        echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
+        echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
+        echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
+        echo ""
+        print_info "Or use the LLVM installation script:"
+        echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
+        echo "  sudo apt-get install -y clang-format-20"
+    } >&2
+    return 1
 }
 
 # Parse command line arguments
@@ -117,28 +130,28 @@ parse_args() {
 # Get list of all C/C++ files in the project
 get_all_files() {
     cd "${PROJECT_ROOT}"
-    
+
     # Find all files, respecting .gitignore, then filter by FILE_EXTENSIONS
     local all_files
     all_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null || \
                 find . -type f | sed 's|^\./||')
-    
+
     # Filter by file extensions
     local result
     result=$(echo "${all_files}" | grep -E "${FILE_EXTENSIONS}" || true)
-    
+
     # Exclude specified directories
     for pattern in "${EXCLUDE_DIRS[@]}"; do
         result=$(echo "${result}" | grep -v "${pattern}" || true)
     done
-    
+
     echo "${result}"
 }
 
 # Get list of changed C/C++ files
 get_changed_files() {
     cd "${PROJECT_ROOT}"
-    
+
     # Get changed files compared to base branch
     local changed_files
     if git rev-parse --verify "${BASE_BRANCH}" &> /dev/null; then
@@ -150,15 +163,15 @@ get_changed_files() {
         changed_files=$(git diff --name-only "@{upstream}"...HEAD 2>/dev/null || \
                        git log --name-only --pretty=format: HEAD 2>/dev/null | sort -u || true)
     fi
-    
+
     # Filter C/C++ files and exclude specified directories
     local result
     result=$(echo "${changed_files}" | grep -E "${FILE_EXTENSIONS}" || true)
-    
+
     for pattern in "${EXCLUDE_DIRS[@]}"; do
         result=$(echo "${result}" | grep -v "${pattern}" || true)
     done
-    
+
     echo "${result}"
 }
 
@@ -168,7 +181,7 @@ format_files() {
     local clang_format="$2"
     local formatted_count=0
     local failed_count=0
-    
+
     if [[ -z "${files}" ]]; then
         if ${ALL_MODE}; then
             print_info "No C/C++ files found in the project."
@@ -177,7 +190,7 @@ format_files() {
         fi
         return 0
     fi
-    
+
     print_info "Using $(${clang_format} --version)"
     if ${ALL_MODE}; then
         print_info "Formatting all C/C++ files in the project"
@@ -185,7 +198,7 @@ format_files() {
         print_info "Comparing against: ${BASE_BRANCH}"
     fi
     echo ""
-    
+
     while IFS= read -r file; do
         if [[ -f "${PROJECT_ROOT}/${file}" ]]; then
             if ${CHECK_MODE}; then
@@ -215,7 +228,7 @@ format_files() {
             print_warn "File not found (deleted?): ${file}"
         fi
     done <<< "${files}"
-    
+
     echo ""
     if ${CHECK_MODE}; then
         if [[ ${failed_count} -gt 0 ]]; then
@@ -232,23 +245,23 @@ format_files() {
             return 1
         fi
     fi
-    
+
     return 0
 }
 
 # Main function
 main() {
     parse_args "$@"
-    
+
     print_info "Mooncake Code Format Script"
     echo ""
-    
+
     # Check for .clang-format file
     if [[ ! -f "${PROJECT_ROOT}/.clang-format" ]]; then
         print_error ".clang-format not found in project root"
         exit 1
     fi
-    
+
     # Find clang-format
     local clang_format
     if ! clang_format="$(find_clang_format)"; then
@@ -262,7 +275,7 @@ main() {
     else
         files=$(get_changed_files)
     fi
-    
+
     # Format files
     format_files "${files}" "${clang_format}"
 }
