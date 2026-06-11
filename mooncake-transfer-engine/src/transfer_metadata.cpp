@@ -462,6 +462,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     } else if (segmentJSON["protocol"] == "nccl") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -888,6 +889,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
     } else if (desc->protocol == "nccl") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
