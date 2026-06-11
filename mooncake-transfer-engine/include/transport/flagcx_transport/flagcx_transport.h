@@ -20,30 +20,38 @@
 #include <thread>
 #include <vector>
 
-#include <flagcx.h>
+#include <flagcx_p2p.h>
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
 
-// Minimal FlagCX-backed transport (proof of concept).
+// FlagCX-backed transport built on the FlagCX P2P engine API
+// (flagcx_p2p.h).  Unlike the earlier OneSide/collective proof of
+// concept, this version maps one-to-one onto Mooncake's per-SegmentID
+// point-to-point model:
 //
-// Model:
-//   - One static global FlagCX comm built at install() time.
-//     Bootstrap is via a shared filesystem file (MC_FLAGCX_UID_PATH).
-//   - One pre-registered staging window per node (MC_FLAGCX_WINDOW_SIZE_MB,
-//     default 64). registerLocalMemory() bump-allocates an offset inside
-//     the window for each user buffer.
-//   - Data path: WRITE -> flagcxPut, READ -> flagcxGet, then
-//     flagcxWaitCounter for completion. submitTransfer blocks per slice.
+//   - install() creates a single FlagcxP2pEngine and starts its RPC
+//     accept daemon.  The engine's "ip:rpc_port" handshake endpoint is
+//     advertised to peers via the segment descriptor (rdma_server_name).
+//   - registerLocalMemory() registers the *user* buffer directly with
+//     the engine (flagcxP2pEngineReg) -- no staging window, no copy.
+//     Incoming RDMA lands straight in the registered buffer.
+//   - The data path resolves a cached connection per target segment
+//     (flagcxP2pEngineGetConn), looks up the remote rkey by absolute
+//     virtual address (flagcxP2pEngineMakeDesc -- the FlagCX equivalent
+//     of Mooncake's "rkey by dst_ptr"), then issues a one-sided
+//     WriteVectorSync (WRITE) or ReadVector + XferStatus poll (READ).
 //
-// Required runtime env vars:
-//   MC_FLAGCX_NRANKS   (default 2)
-//   MC_FLAGCX_RANK     (no default; install() fails if unset/out-of-range)
-//   MC_FLAGCX_UID_PATH (default /home/$USER/.mc_flagcx_uid; must be on a
-//                       filesystem shared by all ranks)
-//   MC_FLAGCX_WINDOW_SIZE_MB (default 64)
+// A single I/O worker thread drains the slice queue so submitTransfer /
+// submitTransferTask stay non-blocking; completion is reported through
+// the usual TransferTask slice counters.
+//
+// Required runtime env: the FlagCX engine honours the standard FlagCX
+// knobs (FLAGCX_SOCKET_IFNAME selects the NIC the RPC endpoint binds /
+// advertises).  No MC_FLAGCX_RANK / NRANKS / UID file / window size are
+// needed anymore.
 class FlagCxTransport : public Transport {
    public:
     FlagCxTransport();
@@ -58,10 +66,6 @@ class FlagCxTransport : public Transport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
-
-    // PoC helper: expose staging window so demos can verify incoming data.
-    void *getWindow() const { return window_; }
-    size_t getWindowSize() const { return window_size_; }
 
    private:
     int install(std::string &local_server_name,
@@ -85,39 +89,39 @@ class FlagCxTransport : public Transport {
 
     const char *getName() const override { return "flagcx"; }
 
-    int bootstrapUniqueId(flagcxUniqueId_t *id);
     int allocateLocalSegment();
     int doSlice(Slice *slice);
 
-    // Translate a (user_addr, length) into a window offset.
-    bool resolveOffset(void *addr, size_t length, size_t &offset_out);
+    // Find the engine MR handle whose registered region fully contains
+    // [addr, addr+length).  Returns false if the source is unregistered.
+    bool resolveLocalMr(void *addr, size_t length, FlagcxP2pMr &mr_out);
 
-    // PoC: SegmentID -> peer rank. With nranks=2, peer = 1 - rank.
-    int peerRankForSegment(SegmentID target_id);
+    // Resolve (and lazily establish + cache) a connection to the engine
+    // serving `target_id`, using the flagcx endpoint published in that
+    // segment's descriptor.
+    FlagcxP2pConn *connForSegment(SegmentID target_id);
 
-    flagcxComm_t comm_ = nullptr;
-    int rank_ = -1;
-    int nranks_ = 0;
-
-    void *window_ = nullptr;
-    size_t window_size_ = 0;
-    std::atomic<size_t> window_used_{0};
+    FlagcxP2pEngine *engine_ = nullptr;
+    // "ip:rpc_port" handshake endpoint advertised to peers.
+    std::string flagcx_endpoint_;
 
     struct Reg {
         void *addr;
         size_t length;
-        size_t offset;
+        FlagcxP2pMr mr;
     };
     std::mutex reg_mu_;
+    std::vector<Reg> regs_;
+
     // Single-threaded I/O worker: all FlagCX ops happen in io_thread_.
-    // submitTransfer/Task pushes Slice* into io_queue_ and returns immediately.
+    // submitTransfer/Task pushes Slice* into io_queue_ and returns
+    // immediately.
     void ioWorker();
     std::thread io_thread_;
     std::atomic<bool> running_{false};
     std::mutex queue_mu_;
     std::condition_variable queue_cv_;
     std::deque<Slice *> io_queue_;
-    std::vector<Reg> regs_;
 };
 
 }  // namespace mooncake

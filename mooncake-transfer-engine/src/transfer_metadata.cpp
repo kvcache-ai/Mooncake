@@ -384,6 +384,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
     } else if (segmentJSON["protocol"] == "ascend") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
@@ -754,6 +755,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
                desc->protocol == "hip" || desc->protocol == "maca" ||
                desc->protocol == "ubshmem") {

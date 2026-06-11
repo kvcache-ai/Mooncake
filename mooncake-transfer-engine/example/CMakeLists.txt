@@ -62,11 +62,6 @@ if(USE_UBSHMEM)
   target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 endif()
 
-if(USE_FLAGCX)
-  add_executable(flagcx_demo ${WORKSPACE}/flagcx_demo.cpp)
-  target_link_libraries(flagcx_demo PUBLIC transfer_engine)
-endif()
-
 # Device Transport Example — two-rank P2P write + signal via Device API.
 # Requires 2 GPUs with P2P access.  Built but not registered with CTest
 # (manual execution only, like rdma_transport_test).
