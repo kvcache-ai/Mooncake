@@ -501,8 +501,10 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
     }
 
     static void TearDownTestSuite() {
-        admin_->Stop();
-        admin_.reset();
+        if (admin_) {
+            admin_->Stop();
+            admin_.reset();
+        }
         service_.reset();
     }
 
@@ -619,7 +621,7 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllSegmentsReturnsSegments) {
 
 TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
     auto resp = HttpGet("/get_segments_detail");
-    EXPECT_EQ(resp.http_status, 200);
+    ASSERT_EQ(resp.http_status, 200);
 
     HttpSegmentsDetailResponse parsed;
     struct_json::from_json(parsed, resp.body);
@@ -657,7 +659,7 @@ TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobSucceedsWithValidRequest)
 
 TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobFailsWithInvalidJson) {
     auto resp = HttpPostJson("/api/v1/drain_jobs", "not json");
-    EXPECT_EQ(resp.http_status, 400);
+    ASSERT_EQ(resp.http_status, 400);
 
     HttpErrorResponse parsed;
     struct_json::from_json(parsed, resp.body);
@@ -684,7 +686,7 @@ TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobReturnsCreatedJob) {
 
     std::string body = R"({"segments":[")" + seg + R"("]})";
     auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
-    EXPECT_EQ(create_resp.http_status, 200);
+    ASSERT_EQ(create_resp.http_status, 200);
 
     HttpCreateDrainJobResponse create_parsed;
     struct_json::from_json(create_parsed, create_resp.body);
