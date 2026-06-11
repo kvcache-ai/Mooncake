@@ -81,13 +81,12 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
 
-struct HttpBatchQueryResponse {
-    bool success{false};
-    std::string error;
-};
-YLT_REFL(HttpBatchQueryResponse, success, error);
-
 }  // namespace
+
+// =========================================================================
+// MasterAdminServerTest — lightweight tests without a shared service.
+// Each test that needs a server creates and destroys it within the test.
+// =========================================================================
 
 class MasterAdminServerTest : public ::testing::Test {
    protected:
@@ -120,59 +119,10 @@ class MasterAdminServerTest : public ::testing::Test {
                                   coro_http::req_content_type::json);
         return {result.status, std::string(result.resp_body)};
     }
-
-    // Create a MasterAdminServer with a mounted segment and a put key,
-    // return the port.
-    // If populate_data is true, mount a segment and put a key.
-    struct ServerWithData {
-        int port;
-        std::shared_ptr<WrappedMasterService> service;
-        Segment segment;
-        std::string key;
-    };
-
-    ServerWithData CreateServerWithData() {
-        WrappedMasterServiceConfig svc_config;
-        svc_config.default_kv_lease_ttl = 5000;
-        svc_config.enable_metric_reporting = false;
-        auto service = std::make_shared<WrappedMasterService>(svc_config);
-
-        Segment seg;
-        seg.id = generate_uuid();
-        seg.name = "admin_test_segment";
-        seg.base = 0x300000000;
-        seg.size = 8 * 1024 * 1024;
-        UUID client_id = generate_uuid();
-        (void)service->MountSegment(seg, client_id);
-
-        ReplicateConfig cfg;
-        cfg.replica_num = 1;
-        auto ps = service->PutStart(client_id, "admin_test_key", 1024, cfg);
-        if (ps.has_value()) {
-            (void)service->PutEnd(client_id, "admin_test_key",
-                                  ReplicaType::MEMORY);
-        }
-
-        int port = getFreeTcpPort();
-        auto admin = std::make_unique<MasterAdminServer>(
-            static_cast<uint16_t>(port), false);
-        admin->Start();
-        admin->SetRuntimeState(ha::MasterRuntimeState::kServing);
-        admin->SetServiceDelegate(service);
-        admin->SetServiceAvailable(true);
-
-        detached_admins_.push_back(std::move(admin));
-        return {port, service, seg, "admin_test_key"};
-    }
-
-    void TearDownAdminServer(MasterAdminServer* server) { server->Stop(); }
-
-    // Keep admin servers alive for the duration of each test.
-    std::vector<std::unique_ptr<MasterAdminServer>> detached_admins_;
 };
 
 // =========================================================================
-// Tests for endpoints that are always available (no service required)
+// Always-available endpoint tests
 // =========================================================================
 
 TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
@@ -377,11 +327,6 @@ TEST_F(MasterAdminServerTest, LeaderEndpointAfterClearingLeader) {
     admin.Stop();
 }
 
-// =========================================================================
-// Tests for endpoints that are always available but with various runtime
-// states (service not set)
-// =========================================================================
-
 TEST_F(MasterAdminServerTest, AllAlwaysAvailableEndpointsInStartingState) {
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);
@@ -462,10 +407,6 @@ TEST_F(MasterAdminServerTest, RoleWithAllStates) {
     admin.Stop();
 }
 
-// =========================================================================
-// Tests for endpoints that require an active service
-// =========================================================================
-
 TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     int port = getFreeTcpPort();
     MasterAdminServer admin(static_cast<uint16_t>(port), false);
@@ -520,51 +461,135 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     admin.Stop();
 }
 
+// =========================================================================
+// MasterAdminServerWithServiceTest — reuses a single server+service across
+// all tests via SetUpTestSuite / TearDownTestSuite for fast execution.
+// =========================================================================
+
+class MasterAdminServerWithServiceTest : public ::testing::Test {
+   protected:
+    struct HttpResponse {
+        int http_status;
+        std::string body;
+    };
+
+    static void SetUpTestSuite() {
+        google::InitGoogleLogging("MasterAdminServerWithServiceTest");
+        FLAGS_logtostderr = true;
+
+        WrappedMasterServiceConfig svc_config;
+        svc_config.default_kv_lease_ttl = 5000;
+        svc_config.enable_metric_reporting = false;
+        service_ = std::make_shared<WrappedMasterService>(svc_config);
+
+        segment_.id = generate_uuid();
+        segment_.name = "admin_test_segment";
+        segment_.base = 0x300000000;
+        segment_.size = 8 * 1024 * 1024;
+        UUID client_id = generate_uuid();
+        (void)service_->MountSegment(segment_, client_id);
+
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        auto ps = service_->PutStart(client_id, kDefaultKey, 1024, cfg);
+        if (ps.has_value()) {
+            (void)service_->PutEnd(client_id, kDefaultKey,
+                                   ReplicaType::MEMORY);
+        }
+
+        port_ = getFreeTcpPort();
+        admin_ = std::make_unique<MasterAdminServer>(
+            static_cast<uint16_t>(port_), false);
+        admin_->Start();
+        admin_->SetRuntimeState(ha::MasterRuntimeState::kServing);
+        admin_->SetServiceDelegate(service_);
+        admin_->SetServiceAvailable(true);
+    }
+
+    static void TearDownTestSuite() {
+        admin_->Stop();
+        admin_.reset();
+        service_.reset();
+        google::ShutdownGoogleLogging();
+    }
+
+    HttpResponse HttpGet(const std::string& path) {
+        coro_http::coro_http_client client;
+        auto result = client.get(BaseUrl() + path);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    HttpResponse HttpPostJson(const std::string& path,
+                              const std::string& body) {
+        coro_http::coro_http_client client;
+        auto result =
+            client.post(BaseUrl() + path, body, coro_http::req_content_type::json);
+        return {result.status, std::string(result.resp_body)};
+    }
+
+    static std::string BaseUrl() {
+        return "http://127.0.0.1:" + std::to_string(port_);
+    }
+
+    static std::shared_ptr<WrappedMasterService> service_;
+    static std::unique_ptr<MasterAdminServer> admin_;
+    static int port_;
+    static Segment segment_;
+    static constexpr const char* kDefaultKey = "admin_test_key";
+};
+
+std::shared_ptr<WrappedMasterService>
+    MasterAdminServerWithServiceTest::service_;
+std::unique_ptr<MasterAdminServer> MasterAdminServerWithServiceTest::admin_;
+int MasterAdminServerWithServiceTest::port_ = 0;
+Segment MasterAdminServerWithServiceTest::segment_;
+
 // -----------------------------------------------------------------------
 // GET /get_all_keys
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, GetAllKeysReturnsEmptyWhenNoKeys) {
-    auto sd = CreateServerWithData();
-    // Remove the key so there are none.
-    (void)sd.service->Remove(sd.key, "default");
-
-    auto resp = HttpGet(sd.port, "/get_all_keys");
+TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsKeys) {
+    auto resp = HttpGet("/get_all_keys");
     EXPECT_EQ(resp.http_status, 200);
-    EXPECT_TRUE(resp.body.empty() || resp.body == "\n");
+    EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, GetAllKeysReturnsKeys) {
-    auto sd = CreateServerWithData();
+TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsEmptyWhenNoKeys) {
+    // Use a unique key so removal doesn't affect other tests.
+    const std::string key = "ephemeral_empty_test_key";
+    UUID client_id = generate_uuid();
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto ps = service_->PutStart(client_id, key, 1024, cfg);
+    if (ps.has_value()) {
+        (void)service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    }
+    (void)service_->Remove(key, "default");
 
-    auto resp = HttpGet(sd.port, "/get_all_keys");
+    auto resp = HttpGet("/get_all_keys");
     EXPECT_EQ(resp.http_status, 200);
-    EXPECT_NE(resp.body.find(sd.key), std::string::npos);
+    // The default key is still present; only the ephemeral key was removed.
+    EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
+    EXPECT_EQ(resp.body.find(key), std::string::npos);
 }
 
 // -----------------------------------------------------------------------
 // GET /query_key
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, QueryKeyReturnsDataForExistingKey) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/query_key?key=" + sd.key);
+TEST_F(MasterAdminServerWithServiceTest, QueryKeyReturnsDataForExistingKey) {
+    auto resp = HttpGet("/query_key?key=" + std::string(kDefaultKey));
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"buffer_address_\""), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, QueryKeyReturns404ForNonexistentKey) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/query_key?key=nonexistent_key_xyz");
+TEST_F(MasterAdminServerWithServiceTest, QueryKeyReturns404ForNonexistentKey) {
+    auto resp = HttpGet("/query_key?key=nonexistent_key_xyz");
     EXPECT_EQ(resp.http_status, 404);
 }
 
-TEST_F(MasterAdminServerTest, QueryKeyWithoutKeyParamReturns404) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/query_key");
+TEST_F(MasterAdminServerWithServiceTest, QueryKeyWithoutKeyParamReturns404) {
+    auto resp = HttpGet("/query_key");
     EXPECT_EQ(resp.http_status, 404);
 }
 
@@ -572,21 +597,16 @@ TEST_F(MasterAdminServerTest, QueryKeyWithoutKeyParamReturns404) {
 // GET /query_segment
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, QuerySegmentReturnsDataForExistingSegment) {
-    auto sd = CreateServerWithData();
-
-    auto resp =
-        HttpGet(sd.port, "/query_segment?segment=" + sd.segment.name);
+TEST_F(MasterAdminServerWithServiceTest, QuerySegmentReturnsDataForExistingSegment) {
+    auto resp = HttpGet("/query_segment?segment=" + segment_.name);
     EXPECT_EQ(resp.http_status, 200);
-    EXPECT_NE(resp.body.find(sd.segment.name), std::string::npos);
+    EXPECT_NE(resp.body.find(segment_.name), std::string::npos);
     EXPECT_NE(resp.body.find("Used(bytes)"), std::string::npos);
     EXPECT_NE(resp.body.find("Capacity(bytes)"), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, QuerySegmentReturns500ForNonexistentSegment) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/query_segment?segment=nonexistent_seg");
+TEST_F(MasterAdminServerWithServiceTest, QuerySegmentReturns500ForNonexistentSegment) {
+    auto resp = HttpGet("/query_segment?segment=nonexistent_seg");
     EXPECT_EQ(resp.http_status, 500);
 }
 
@@ -594,28 +614,24 @@ TEST_F(MasterAdminServerTest, QuerySegmentReturns500ForNonexistentSegment) {
 // GET /get_all_segments
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, GetAllSegmentsReturnsSegments) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/get_all_segments");
+TEST_F(MasterAdminServerWithServiceTest, GetAllSegmentsReturnsSegments) {
+    auto resp = HttpGet("/get_all_segments");
     EXPECT_EQ(resp.http_status, 200);
-    EXPECT_NE(resp.body.find(sd.segment.name), std::string::npos);
+    EXPECT_NE(resp.body.find(segment_.name), std::string::npos);
 }
 
 // -----------------------------------------------------------------------
 // GET /get_segments_detail
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, GetSegmentsDetailReturnsDetailedInfo) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/get_segments_detail");
+TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
+    auto resp = HttpGet("/get_segments_detail");
     EXPECT_EQ(resp.http_status, 200);
 
     HttpSegmentsDetailResponse parsed;
     struct_json::from_json(parsed, resp.body);
     EXPECT_GT(parsed.total_segments, 0u);
-    EXPECT_NE(resp.body.find(sd.segment.name), std::string::npos);
+    EXPECT_NE(resp.body.find(segment_.name), std::string::npos);
     EXPECT_NE(resp.body.find("\"allocator_used_bytes\""), std::string::npos);
     EXPECT_NE(resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
@@ -625,11 +641,18 @@ TEST_F(MasterAdminServerTest, GetSegmentsDetailReturnsDetailedInfo) {
 // POST /api/v1/drain_jobs
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, CreateDrainJobSucceedsWithValidRequest) {
-    auto sd = CreateServerWithData();
+TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobSucceedsWithValidRequest) {
+    // Use a unique segment so subsequent drain tests are not blocked.
+    std::string seg = "drain_create_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0x600000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
 
-    std::string body = R"({"segments":[")" + sd.segment.name + R"("]})";
-    auto resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", body);
+    std::string body = R"({"segments":[")" + seg + R"("]})";
+    auto resp = HttpPostJson("/api/v1/drain_jobs", body);
     EXPECT_EQ(resp.http_status, 200);
 
     HttpCreateDrainJobResponse parsed;
@@ -639,10 +662,8 @@ TEST_F(MasterAdminServerTest, CreateDrainJobSucceedsWithValidRequest) {
     EXPECT_EQ(parsed.status, "CREATED");
 }
 
-TEST_F(MasterAdminServerTest, CreateDrainJobFailsWithInvalidJson) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", "not json");
+TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobFailsWithInvalidJson) {
+    auto resp = HttpPostJson("/api/v1/drain_jobs", "not json");
     EXPECT_EQ(resp.http_status, 400);
 
     HttpErrorResponse parsed;
@@ -650,10 +671,8 @@ TEST_F(MasterAdminServerTest, CreateDrainJobFailsWithInvalidJson) {
     EXPECT_FALSE(parsed.success);
 }
 
-TEST_F(MasterAdminServerTest, CreateDrainJobFailsWithEmptyBody) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", "{}");
+TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobFailsWithEmptyBody) {
+    auto resp = HttpPostJson("/api/v1/drain_jobs", "{}");
     EXPECT_NE(resp.http_status, 200);
 }
 
@@ -661,20 +680,25 @@ TEST_F(MasterAdminServerTest, CreateDrainJobFailsWithEmptyBody) {
 // GET /api/v1/drain_jobs/query
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, QueryDrainJobReturnsCreatedJob) {
-    auto sd = CreateServerWithData();
+TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobReturnsCreatedJob) {
+    std::string seg = "drain_query_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0x700000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
 
-    std::string body = R"({"segments":[")" + sd.segment.name + R"("]})";
-    auto create_resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", body);
+    std::string body = R"({"segments":[")" + seg + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
     EXPECT_EQ(create_resp.http_status, 200);
 
     HttpCreateDrainJobResponse create_parsed;
     struct_json::from_json(create_parsed, create_resp.body);
     ASSERT_FALSE(create_parsed.job_id.empty());
 
-    auto query_resp = HttpGet(sd.port,
-                              "/api/v1/drain_jobs/query?job_id=" +
-                                  create_parsed.job_id);
+    auto query_resp =
+        HttpGet("/api/v1/drain_jobs/query?job_id=" + create_parsed.job_id);
     EXPECT_EQ(query_resp.http_status, 200);
 
     HttpQueryDrainJobResponse query_parsed;
@@ -683,26 +707,20 @@ TEST_F(MasterAdminServerTest, QueryDrainJobReturnsCreatedJob) {
     EXPECT_EQ(query_parsed.job_id, create_parsed.job_id);
 }
 
-TEST_F(MasterAdminServerTest, QueryDrainJobFailsWithInvalidJobId) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/api/v1/drain_jobs/query?job_id=not-a-uuid");
+TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobFailsWithInvalidJobId) {
+    auto resp = HttpGet("/api/v1/drain_jobs/query?job_id=not-a-uuid");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, QueryDrainJobFailsWithMissingJobId) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/api/v1/drain_jobs/query");
+TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobFailsWithMissingJobId) {
+    auto resp = HttpGet("/api/v1/drain_jobs/query");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, QueryDrainJobFailsForNonexistentJob) {
-    auto sd = CreateServerWithData();
-
+TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobFailsForNonexistentJob) {
     auto resp =
-        HttpGet(sd.port, "/api/v1/drain_jobs/query?job_id=" +
-                             UuidToString(generate_uuid()));
+        HttpGet("/api/v1/drain_jobs/query?job_id=" +
+                UuidToString(generate_uuid()));
     EXPECT_EQ(resp.http_status, 404);
 }
 
@@ -710,11 +728,17 @@ TEST_F(MasterAdminServerTest, QueryDrainJobFailsForNonexistentJob) {
 // POST /api/v1/drain_jobs/cancel
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, CancelDrainJobSucceeds) {
-    auto sd = CreateServerWithData();
+TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobSucceeds) {
+    std::string seg = "drain_cancel_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0x800000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
 
-    std::string body = R"({"segments":[")" + sd.segment.name + R"("]})";
-    auto create_resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", body);
+    std::string body = R"({"segments":[")" + seg + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
     EXPECT_EQ(create_resp.http_status, 200);
 
     HttpCreateDrainJobResponse create_parsed;
@@ -722,8 +746,7 @@ TEST_F(MasterAdminServerTest, CancelDrainJobSucceeds) {
     ASSERT_FALSE(create_parsed.job_id.empty());
 
     auto cancel_resp =
-        HttpPostJson(sd.port,
-                     "/api/v1/drain_jobs/cancel?job_id=" + create_parsed.job_id,
+        HttpPostJson("/api/v1/drain_jobs/cancel?job_id=" + create_parsed.job_id,
                      "");
     EXPECT_EQ(cancel_resp.http_status, 200);
 
@@ -734,19 +757,13 @@ TEST_F(MasterAdminServerTest, CancelDrainJobSucceeds) {
     EXPECT_EQ(cancel_parsed.status, "CANCELED");
 }
 
-TEST_F(MasterAdminServerTest, CancelDrainJobFailsWithInvalidJobId) {
-    auto sd = CreateServerWithData();
-
-    auto resp =
-        HttpPostJson(sd.port,
-                     "/api/v1/drain_jobs/cancel?job_id=not-a-uuid", "");
+TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobFailsWithInvalidJobId) {
+    auto resp = HttpPostJson("/api/v1/drain_jobs/cancel?job_id=not-a-uuid", "");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, CancelDrainJobFailsWithMissingJobId) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpPostJson(sd.port, "/api/v1/drain_jobs/cancel", "");
+TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobFailsWithMissingJobId) {
+    auto resp = HttpPostJson("/api/v1/drain_jobs/cancel", "");
     EXPECT_EQ(resp.http_status, 400);
 }
 
@@ -754,32 +771,25 @@ TEST_F(MasterAdminServerTest, CancelDrainJobFailsWithMissingJobId) {
 // GET /api/v1/segments/status
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, SegmentStatusReturnsDataForExistingSegment) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port,
-                        "/api/v1/segments/status?segment=" + sd.segment.name);
+TEST_F(MasterAdminServerWithServiceTest, SegmentStatusReturnsDataForExistingSegment) {
+    auto resp = HttpGet("/api/v1/segments/status?segment=" + segment_.name);
     EXPECT_EQ(resp.http_status, 200);
 
     HttpSegmentStatusResponse parsed;
     struct_json::from_json(parsed, resp.body);
     EXPECT_TRUE(parsed.success);
-    EXPECT_EQ(parsed.segment, sd.segment.name);
+    EXPECT_EQ(parsed.segment, segment_.name);
     EXPECT_FALSE(parsed.status_name.empty());
 }
 
-TEST_F(MasterAdminServerTest, SegmentStatusFailsWithMissingSegment) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/api/v1/segments/status");
+TEST_F(MasterAdminServerWithServiceTest, SegmentStatusFailsWithMissingSegment) {
+    auto resp = HttpGet("/api/v1/segments/status");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, SegmentStatusReturnsErrorForNonexistentSegment) {
-    auto sd = CreateServerWithData();
-
-    auto resp =
-        HttpGet(sd.port, "/api/v1/segments/status?segment=no_such_segment");
+TEST_F(MasterAdminServerWithServiceTest,
+       SegmentStatusReturnsErrorForNonexistentSegment) {
+    auto resp = HttpGet("/api/v1/segments/status?segment=no_such_segment");
     EXPECT_NE(resp.http_status, 200);
 }
 
@@ -787,71 +797,102 @@ TEST_F(MasterAdminServerTest, SegmentStatusReturnsErrorForNonexistentSegment) {
 // GET /batch_query_keys
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysWithNoKeysParamReturns400) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/batch_query_keys");
+TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysWithNoKeysParamReturns400) {
+    auto resp = HttpGet("/batch_query_keys");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysWithEmptyKeysParamReturns400) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/batch_query_keys?keys=");
+TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysWithEmptyKeysParamReturns400) {
+    auto resp = HttpGet("/batch_query_keys?keys=");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsDataForExistingKey) {
-    auto sd = CreateServerWithData();
-
-    auto resp =
-        HttpGet(sd.port, "/batch_query_keys?keys=" + sd.key);
+TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysReturnsDataForExistingKey) {
+    auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey));
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
     EXPECT_NE(resp.body.find("\"data\":{"), std::string::npos);
-    EXPECT_NE(resp.body.find(sd.key), std::string::npos);
+    EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsErrorForNonexistentKey) {
-    auto sd = CreateServerWithData();
-
-    auto resp = HttpGet(sd.port, "/batch_query_keys?keys=nonexistent_key");
+TEST_F(MasterAdminServerWithServiceTest,
+       BatchQueryKeysReturnsErrorForNonexistentKey) {
+    auto resp = HttpGet("/batch_query_keys?keys=nonexistent_key");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
     EXPECT_NE(resp.body.find("\"ok\":false"), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysMultipleKeys) {
-    auto sd = CreateServerWithData();
-
-    // Add a second key
+TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysMultipleKeys) {
+    UUID client_id = generate_uuid();
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto client_id = generate_uuid();
-    auto ps = sd.service->PutStart(client_id, "second_key", 512, cfg);
+    auto ps = service_->PutStart(client_id, "second_key", 512, cfg);
     if (ps.has_value()) {
-        (void)sd.service->PutEnd(client_id, "second_key", ReplicaType::MEMORY);
+        (void)service_->PutEnd(client_id, "second_key", ReplicaType::MEMORY);
     }
 
-    auto resp = HttpGet(sd.port, "/batch_query_keys?keys=admin_test_key,second_key");
+    auto resp =
+        HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
+                ",second_key");
     EXPECT_EQ(resp.http_status, 200);
-    EXPECT_NE(resp.body.find("admin_test_key"), std::string::npos);
+    EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
     EXPECT_NE(resp.body.find("second_key"), std::string::npos);
 }
 
-TEST_F(MasterAdminServerTest, BatchQueryKeysWithExistingAndNonexistentKeys) {
-    auto sd = CreateServerWithData();
-
+TEST_F(MasterAdminServerWithServiceTest,
+       BatchQueryKeysWithExistingAndNonexistentKeys) {
     auto resp =
-        HttpGet(sd.port, "/batch_query_keys?keys=admin_test_key,nonexistent");
+        HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
+                ",nonexistent");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
     EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos);
     EXPECT_NE(resp.body.find("\"ok\":false"), std::string::npos);
 }
 
+TEST_F(MasterAdminServerWithServiceTest, DrainJobFullLifecycle) {
+    std::string seg = "drain_lifecycle_seg_" + UuidToString(generate_uuid());
+    Segment s;
+    s.id = generate_uuid();
+    s.name = seg;
+    s.base = 0x900000000;
+    s.size = 4 * 1024 * 1024;
+    (void)service_->MountSegment(s, generate_uuid());
+
+    std::string body = R"({"segments":[")" + seg + R"("]})";
+    auto create_resp = HttpPostJson("/api/v1/drain_jobs", body);
+    ASSERT_EQ(create_resp.http_status, 200);
+    HttpCreateDrainJobResponse create_parsed;
+    struct_json::from_json(create_parsed, create_resp.body);
+    ASSERT_TRUE(create_parsed.success);
+    std::string job_id = create_parsed.job_id;
+
+    auto query_resp =
+        HttpGet("/api/v1/drain_jobs/query?job_id=" + job_id);
+    EXPECT_EQ(query_resp.http_status, 200);
+    HttpQueryDrainJobResponse query_parsed;
+    struct_json::from_json(query_parsed, query_resp.body);
+    EXPECT_TRUE(query_parsed.success);
+    EXPECT_EQ(query_parsed.job_id, job_id);
+
+    auto cancel_resp =
+        HttpPostJson("/api/v1/drain_jobs/cancel?job_id=" + job_id, "");
+    EXPECT_EQ(cancel_resp.http_status, 200);
+    HttpCancelDrainJobResponse cancel_parsed;
+    struct_json::from_json(cancel_parsed, cancel_resp.body);
+    EXPECT_TRUE(cancel_parsed.success);
+    EXPECT_EQ(cancel_parsed.job_id, job_id);
+    EXPECT_EQ(cancel_parsed.status, "CANCELED");
+
+    query_resp = HttpGet("/api/v1/drain_jobs/query?job_id=" + job_id);
+    EXPECT_EQ(query_resp.http_status, 200);
+    struct_json::from_json(query_parsed, query_resp.body);
+    EXPECT_TRUE(query_parsed.success);
+}
+
 // =========================================================================
-// Tests for runtime state transitions and endpoint behavior
+// Destructive / isolated tests that must run on their own server instance.
 // =========================================================================
 
 TEST_F(MasterAdminServerTest, ServiceUnavailableAfterDelegateCleared) {
@@ -908,52 +949,6 @@ TEST_F(MasterAdminServerTest, ServiceUnavailableAfterSetServiceAvailableFalse) {
     admin.Stop();
 }
 
-// =========================================================================
-// End-to-end drain job flow test
-// =========================================================================
-
-TEST_F(MasterAdminServerTest, DrainJobFullLifecycle) {
-    auto sd = CreateServerWithData();
-
-    // 1. Create drain job
-    std::string body = R"({"segments":[")" + sd.segment.name + R"("]})";
-    auto create_resp = HttpPostJson(sd.port, "/api/v1/drain_jobs", body);
-    ASSERT_EQ(create_resp.http_status, 200);
-    HttpCreateDrainJobResponse create_parsed;
-    struct_json::from_json(create_parsed, create_resp.body);
-    ASSERT_TRUE(create_parsed.success);
-    std::string job_id = create_parsed.job_id;
-
-    // 2. Query the job
-    auto query_resp =
-        HttpGet(sd.port, "/api/v1/drain_jobs/query?job_id=" + job_id);
-    EXPECT_EQ(query_resp.http_status, 200);
-    HttpQueryDrainJobResponse query_parsed;
-    struct_json::from_json(query_parsed, query_resp.body);
-    EXPECT_TRUE(query_parsed.success);
-    EXPECT_EQ(query_parsed.job_id, job_id);
-
-    // 3. Cancel the job
-    auto cancel_resp =
-        HttpPostJson(sd.port, "/api/v1/drain_jobs/cancel?job_id=" + job_id, "");
-    EXPECT_EQ(cancel_resp.http_status, 200);
-    HttpCancelDrainJobResponse cancel_parsed;
-    struct_json::from_json(cancel_parsed, cancel_resp.body);
-    EXPECT_TRUE(cancel_parsed.success);
-    EXPECT_EQ(cancel_parsed.job_id, job_id);
-    EXPECT_EQ(cancel_parsed.status, "CANCELED");
-
-    // 4. Query after cancel - should succeed with updated status
-    query_resp = HttpGet(sd.port, "/api/v1/drain_jobs/query?job_id=" + job_id);
-    EXPECT_EQ(query_resp.http_status, 200);
-    struct_json::from_json(query_parsed, query_resp.body);
-    EXPECT_TRUE(query_parsed.success);
-}
-
-// =========================================================================
-// Multiple mounts and keys
-// =========================================================================
-
 TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     WrappedMasterServiceConfig svc_config;
     svc_config.default_kv_lease_ttl = 5000;
@@ -962,7 +957,6 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
 
     UUID client_id = generate_uuid();
 
-    // Mount two segments
     Segment seg1;
     seg1.id = generate_uuid();
     seg1.name = "seg_alpha";
@@ -977,7 +971,6 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     seg2.size = 4 * 1024 * 1024;
     ASSERT_TRUE(service->MountSegment(seg2, client_id).has_value());
 
-    // Put two keys
     ReplicateConfig cfg;
     cfg.replica_num = 1;
     auto ps1 = service->PutStart(client_id, "key_one", 1024, cfg);
@@ -996,19 +989,16 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     admin.SetServiceDelegate(service);
     admin.SetServiceAvailable(true);
 
-    // get_all_segments lists both
     auto seg_resp = HttpGet(port, "/get_all_segments");
     EXPECT_EQ(seg_resp.http_status, 200);
     EXPECT_NE(seg_resp.body.find("seg_alpha"), std::string::npos);
     EXPECT_NE(seg_resp.body.find("seg_beta"), std::string::npos);
 
-    // get_all_keys lists both
     auto keys_resp = HttpGet(port, "/get_all_keys");
     EXPECT_EQ(keys_resp.http_status, 200);
     EXPECT_NE(keys_resp.body.find("key_one"), std::string::npos);
     EXPECT_NE(keys_resp.body.find("key_two"), std::string::npos);
 
-    // query_segment for each
     auto q1 = HttpGet(port, "/query_segment?segment=seg_alpha");
     EXPECT_EQ(q1.http_status, 200);
     EXPECT_NE(q1.body.find("seg_alpha"), std::string::npos);
@@ -1017,7 +1007,6 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     EXPECT_EQ(q2.http_status, 200);
     EXPECT_NE(q2.body.find("seg_beta"), std::string::npos);
 
-    // segment status for each
     auto s1 = HttpGet(port, "/api/v1/segments/status?segment=seg_alpha");
     EXPECT_EQ(s1.http_status, 200);
     HttpSegmentStatusResponse parsed1;
@@ -1032,14 +1021,12 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     EXPECT_TRUE(parsed2.success);
     EXPECT_EQ(parsed2.segment, "seg_beta");
 
-    // get_segments_detail shows both
     auto detail_resp = HttpGet(port, "/get_segments_detail");
     EXPECT_EQ(detail_resp.http_status, 200);
     HttpSegmentsDetailResponse detail_parsed;
     struct_json::from_json(detail_parsed, detail_resp.body);
     EXPECT_EQ(detail_parsed.total_segments, 2u);
 
-    // batch_query_keys for both
     auto batch_resp = HttpGet(port, "/batch_query_keys?keys=key_one,key_two");
     EXPECT_EQ(batch_resp.http_status, 200);
     EXPECT_NE(batch_resp.body.find("key_one"), std::string::npos);
