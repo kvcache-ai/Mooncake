@@ -27,6 +27,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "tenant_quota.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
@@ -56,6 +57,7 @@ class SnapshotChildProcessTest;
 // standing up a full snapshot catalog + child-process harness, and
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
+class MasterServiceTenantQuotaTest;
 }  // namespace test
 
 /*
@@ -63,13 +65,15 @@ class PromotionOnHitTest;
  * Lock order: To avoid deadlocks, the following lock order should be followed:
  * 1. client_mutex_
  * 2. metadata_shards_[shard_idx_].mutex
- * 3. segment_mutex_
+ * 3. tenant_quota_shards_[shard_idx_].mutex
+ * 4. segment_mutex_
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::MasterServiceTenantQuotaTest;
 
    public:
     using NoFProbeFn =
@@ -84,6 +88,8 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+    std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshotForTesting(
+        const std::string& tenant_id) const;
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -864,6 +870,9 @@ class MasterService {
         const bool hard_pinned{false};          // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
+        uint64_t reserved_quota_charge_bytes{0};
+        uint64_t committed_quota_charge_bytes{0};
+        uint64_t pending_replaced_quota_charge_bytes{0};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -1189,6 +1198,14 @@ class MasterService {
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn);
 
+    static constexpr size_t kNumTenantQuotaShards = 1024;
+    struct TenantQuotaShard {
+        mutable std::mutex mutex;
+        std::unordered_map<std::string, TenantQuotaState> tenants
+            GUARDED_BY(mutex);
+    };
+    std::array<TenantQuotaShard, kNumTenantQuotaShards> tenant_quota_shards_;
+
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
     mutable std::unordered_set<std::string> groups_needing_lease_refresh_
@@ -1279,6 +1296,7 @@ class MasterService {
 
     size_t getMetadataShardIndex(const std::string& tenant_id,
                                  const std::string& key) const;
+    size_t getTenantQuotaShardIndex(const std::string& tenant_id) const;
     std::optional<std::string> GetGroupRoute(const std::string& tenant_id,
                                              const std::string& key) const;
     void RegisterGroupMember(TenantState& tenant_state,
@@ -1293,6 +1311,29 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const std::string& tenant_id);
+    enum class QuotaEraseMode {
+        kFull,
+        kPreserveOld,
+        kAbortOnly,
+    };
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const std::string& tenant_id, QuotaEraseMode quota_mode);
+    uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
+    uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
+                                        const ReplicateConfig& config) const;
+    tl::expected<void, ErrorCode> ReserveTenantQuota(
+        const std::string& tenant_id, uint64_t bytes);
+    void CommitTenantQuota(const std::string& tenant_id, uint64_t bytes);
+    void AbortTenantQuota(const std::string& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuota(const std::string& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuotaPartial(const std::string& tenant_id,
+                                   uint64_t bytes);
+    void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
+    void RecomputeTenantEffectiveQuotas();
+    void RebuildTenantQuotaUsageFromMetadata();
+    uint64_t GetTenantQuotaCapacityBytes();
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
@@ -1447,10 +1488,18 @@ class MasterService {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
+                const uint64_t before_charge =
+                    service_->CompletedMemoryQuotaCharge(it_->second);
                 service_->EraseReplicasWithCacheTotalAccounting(
                     it_->second, [](const Replica& replica) {
                         return replica.has_invalid_mem_handle();
                     });
+                const uint64_t after_charge =
+                    service_->CompletedMemoryQuotaCharge(it_->second);
+                if (before_charge > after_charge) {
+                    service_->ReleaseCommittedQuotaCharge(
+                        it_->second, before_charge - after_charge);
+                }
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
                     const bool had_processing =
@@ -1774,6 +1823,9 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
+    const bool enable_tenant_quota_;
+    const uint64_t default_tenant_quota_bytes_;
+    const uint64_t tenant_quota_pool_capacity_bytes_;
 
     bool use_disk_replica_{false};
 
