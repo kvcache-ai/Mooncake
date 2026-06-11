@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <sys/epoll.h>
 
@@ -182,7 +183,18 @@ class UbContext {
     virtual int openDevice(const std::string& device_name, uint8_t port,
                            int& eid_index) = 0;
 
-    virtual int poll(int num_entries, Transport::Slice** cr,
+    // Polls one JFC and processes the slices internally:
+    //   * Aggregates each completion's jetty depth into jetty_depth_set.
+    //   * Successful slices have markSuccess() called in place and are NOT
+    //     returned (they may be recycled by the submitting thread the
+    //     moment markSuccess() runs).
+    //   * Failed slices are returned in failed_slices[0..num_failed-1] for
+    //     the caller to apply retry / markFailed.
+    // Returns the total number of completions polled (>= 0), or a negative
+    // error code.
+    virtual int poll(int num_entries, Transport::Slice** failed_slices,
+                     int& num_failed,
+                     std::unordered_map<volatile int*, int>& jetty_depth_set,
                      int jfc_index = 0) = 0;
 
     virtual volatile int* outstandingCount(int jfc_index) = 0;
