@@ -338,8 +338,7 @@ TEST_F(MasterAdminServerTest, AllAlwaysAvailableEndpointsInStartingState) {
 
     auto health = HttpGet(port, "/health");
     EXPECT_EQ(health.http_status, 200);
-    EXPECT_NE(health.body.find("\"ha_state\":\"starting\""),
-              std::string::npos);
+    EXPECT_NE(health.body.find("\"ha_state\":\"starting\""), std::string::npos);
 
     auto role = HttpGet(port, "/role");
     EXPECT_EQ(role.http_status, 200);
@@ -450,9 +449,8 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
         HttpGet(port, "/api/v1/drain_jobs/query?job_id=" + valid_uuid);
     EXPECT_EQ(drain_query.http_status, 503);
 
-    auto drain_cancel =
-        HttpPostJson(port,
-                     "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
+    auto drain_cancel = HttpPostJson(
+        port, "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
     EXPECT_EQ(drain_cancel.http_status, 503);
 
     admin.Stop();
@@ -474,6 +472,8 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         WrappedMasterServiceConfig svc_config;
         svc_config.default_kv_lease_ttl = 5000;
         svc_config.enable_metric_reporting = false;
+        svc_config.client_live_ttl_sec =
+            3600;  // prevent client expiry in slow CI
         service_ = std::make_shared<WrappedMasterService>(svc_config);
 
         segment_.id = generate_uuid();
@@ -487,8 +487,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         cfg.replica_num = 1;
         auto ps = service_->PutStart(client_id, kDefaultKey, 1024, cfg);
         if (ps.has_value()) {
-            (void)service_->PutEnd(client_id, kDefaultKey,
-                                   ReplicaType::MEMORY);
+            (void)service_->PutEnd(client_id, kDefaultKey, ReplicaType::MEMORY);
         }
 
         port_ = getFreeTcpPort();
@@ -517,8 +516,8 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
     HttpResponse HttpPostJson(const std::string& path,
                               const std::string& body) {
         coro_http::coro_http_client client;
-        auto result =
-            client.post(BaseUrl() + path, body, coro_http::req_content_type::json);
+        auto result = client.post(BaseUrl() + path, body,
+                                  coro_http::req_content_type::json);
         return {result.status, std::string(result.resp_body)};
     }
 
@@ -592,7 +591,8 @@ TEST_F(MasterAdminServerWithServiceTest, QueryKeyWithoutKeyParamReturns404) {
 // GET /query_segment
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerWithServiceTest, QuerySegmentReturnsDataForExistingSegment) {
+TEST_F(MasterAdminServerWithServiceTest,
+       QuerySegmentReturnsDataForExistingSegment) {
     auto resp = HttpGet("/query_segment?segment=" + segment_.name);
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find(segment_.name), std::string::npos);
@@ -600,7 +600,8 @@ TEST_F(MasterAdminServerWithServiceTest, QuerySegmentReturnsDataForExistingSegme
     EXPECT_NE(resp.body.find("Capacity(bytes)"), std::string::npos);
 }
 
-TEST_F(MasterAdminServerWithServiceTest, QuerySegmentReturns500ForNonexistentSegment) {
+TEST_F(MasterAdminServerWithServiceTest,
+       QuerySegmentReturns500ForNonexistentSegment) {
     auto resp = HttpGet("/query_segment?segment=nonexistent_seg");
     EXPECT_EQ(resp.http_status, 500);
 }
@@ -636,7 +637,8 @@ TEST_F(MasterAdminServerWithServiceTest, GetSegmentsDetailReturnsDetailedInfo) {
 // POST /api/v1/drain_jobs
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobSucceedsWithValidRequest) {
+TEST_F(MasterAdminServerWithServiceTest,
+       CreateDrainJobSucceedsWithValidRequest) {
     // Use a unique segment so subsequent drain tests are not blocked.
     std::string seg = "drain_create_seg_" + UuidToString(generate_uuid());
     Segment s;
@@ -668,7 +670,7 @@ TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobFailsWithInvalidJson) {
 
 TEST_F(MasterAdminServerWithServiceTest, CreateDrainJobFailsWithEmptyBody) {
     auto resp = HttpPostJson("/api/v1/drain_jobs", "{}");
-    EXPECT_NE(resp.http_status, 200);
+    EXPECT_EQ(resp.http_status, 400);
 }
 
 // -----------------------------------------------------------------------
@@ -713,9 +715,8 @@ TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobFailsWithMissingJobId) {
 }
 
 TEST_F(MasterAdminServerWithServiceTest, QueryDrainJobFailsForNonexistentJob) {
-    auto resp =
-        HttpGet("/api/v1/drain_jobs/query?job_id=" +
-                UuidToString(generate_uuid()));
+    auto resp = HttpGet("/api/v1/drain_jobs/query?job_id=" +
+                        UuidToString(generate_uuid()));
     EXPECT_EQ(resp.http_status, 404);
 }
 
@@ -740,9 +741,8 @@ TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobSucceeds) {
     struct_json::from_json(create_parsed, create_resp.body);
     ASSERT_FALSE(create_parsed.job_id.empty());
 
-    auto cancel_resp =
-        HttpPostJson("/api/v1/drain_jobs/cancel?job_id=" + create_parsed.job_id,
-                     "");
+    auto cancel_resp = HttpPostJson(
+        "/api/v1/drain_jobs/cancel?job_id=" + create_parsed.job_id, "");
     EXPECT_EQ(cancel_resp.http_status, 200);
 
     HttpCancelDrainJobResponse cancel_parsed;
@@ -766,7 +766,8 @@ TEST_F(MasterAdminServerWithServiceTest, CancelDrainJobFailsWithMissingJobId) {
 // GET /api/v1/segments/status
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerWithServiceTest, SegmentStatusReturnsDataForExistingSegment) {
+TEST_F(MasterAdminServerWithServiceTest,
+       SegmentStatusReturnsDataForExistingSegment) {
     auto resp = HttpGet("/api/v1/segments/status?segment=" + segment_.name);
     EXPECT_EQ(resp.http_status, 200);
 
@@ -785,24 +786,27 @@ TEST_F(MasterAdminServerWithServiceTest, SegmentStatusFailsWithMissingSegment) {
 TEST_F(MasterAdminServerWithServiceTest,
        SegmentStatusReturnsErrorForNonexistentSegment) {
     auto resp = HttpGet("/api/v1/segments/status?segment=no_such_segment");
-    EXPECT_NE(resp.http_status, 200);
+    EXPECT_EQ(resp.http_status, 404);
 }
 
 // -----------------------------------------------------------------------
 // GET /batch_query_keys
 // -----------------------------------------------------------------------
 
-TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysWithNoKeysParamReturns400) {
+TEST_F(MasterAdminServerWithServiceTest,
+       BatchQueryKeysWithNoKeysParamReturns400) {
     auto resp = HttpGet("/batch_query_keys");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysWithEmptyKeysParamReturns400) {
+TEST_F(MasterAdminServerWithServiceTest,
+       BatchQueryKeysWithEmptyKeysParamReturns400) {
     auto resp = HttpGet("/batch_query_keys?keys=");
     EXPECT_EQ(resp.http_status, 400);
 }
 
-TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysReturnsDataForExistingKey) {
+TEST_F(MasterAdminServerWithServiceTest,
+       BatchQueryKeysReturnsDataForExistingKey) {
     auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey));
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
@@ -827,19 +831,19 @@ TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysMultipleKeys) {
         (void)service_->PutEnd(client_id, "second_key", ReplicaType::MEMORY);
     }
 
-    auto resp =
-        HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
-                ",second_key");
+    auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
+                        ",second_key");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
     EXPECT_NE(resp.body.find("second_key"), std::string::npos);
+
+    (void)service_->Remove("second_key", "default");
 }
 
 TEST_F(MasterAdminServerWithServiceTest,
        BatchQueryKeysWithExistingAndNonexistentKeys) {
-    auto resp =
-        HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
-                ",nonexistent");
+    auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
+                        ",nonexistent");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"success\":true"), std::string::npos);
     EXPECT_NE(resp.body.find("\"ok\":true"), std::string::npos);
@@ -863,8 +867,7 @@ TEST_F(MasterAdminServerWithServiceTest, DrainJobFullLifecycle) {
     ASSERT_TRUE(create_parsed.success);
     std::string job_id = create_parsed.job_id;
 
-    auto query_resp =
-        HttpGet("/api/v1/drain_jobs/query?job_id=" + job_id);
+    auto query_resp = HttpGet("/api/v1/drain_jobs/query?job_id=" + job_id);
     EXPECT_EQ(query_resp.http_status, 200);
     HttpQueryDrainJobResponse query_parsed;
     struct_json::from_json(query_parsed, query_resp.body);
@@ -910,8 +913,7 @@ TEST_F(MasterAdminServerTest, ServiceUnavailableAfterDelegateCleared) {
 
     resp = HttpGet(port, "/get_all_segments");
     EXPECT_EQ(resp.http_status, 503);
-    EXPECT_NE(resp.body.find("service plane is not active"),
-              std::string::npos);
+    EXPECT_NE(resp.body.find("service plane is not active"), std::string::npos);
 
     admin.Stop();
 }
