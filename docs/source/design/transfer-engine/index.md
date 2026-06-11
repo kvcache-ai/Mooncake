@@ -294,6 +294,11 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
+- `MC_RPC_META_CACHE_TTL_SEC` Set the Time-To-Live (TTL) for RPC metadata cache in seconds. Valid range: -1 to 86400 (24 hours). Default value is 60 seconds.
+  - **TTL > 0**: Cache entries expire after the specified seconds
+  - **TTL = 0**: Caching disabled, every RPC queries the metadata service
+  - **TTL = -1**: Permanent cache (no expiration)
+  When a replica's port changes (e.g., due to port conflicts or restarts), other clients will use the stale cached port until the TTL expires. Setting a shorter TTL (e.g., 5-10 seconds) can help recover faster from such scenarios, but may increase metadata service load
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
 - `MC_HANDSHAKE_MAX_LENGTH` The maximum handshake message length in bytes for P2P mode. Valid range: 1MB to 128MB. Default value is 1MB (1048576 bytes). Increase this value when using a single RDMA instance with many registered memory buffers (>10,000) to avoid handshake failures. Example: set to 10485760 for 10MB
 - `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.

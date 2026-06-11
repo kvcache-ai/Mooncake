@@ -127,6 +127,8 @@ class TransferMetadata {
         uint16_t barex_port;
 #endif
         int sockfd;  // local cache
+        int64_t cached_timestamp_us =
+            0;  // Cache timestamp in microseconds (for TTL)
     };
 
     struct HandShakeDesc {
