@@ -290,7 +290,7 @@ Status TransferEngineImpl::construct() {
 
     // Configure RDMA failure tracking
     rdma_failure_threshold_ = conf_->get("rdma_failure_threshold", 3);
-    int time_window_sec = conf_->get("rdma_failure_time_window_sec", 60);
+    int time_window_sec = conf_->get("rdma_failure_time_window_sec", 300);
     rdma_failure_time_window_ns_ = time_window_sec * 1000000000ULL;
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
