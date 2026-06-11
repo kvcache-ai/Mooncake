@@ -65,6 +65,7 @@ class Client {
     virtual ~Client();
 
     const UUID& getClientId() const { return client_id_; }
+    const std::string& tenant_id() const { return master_client_.tenant_id(); }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -145,6 +146,9 @@ class Client {
      */
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys,
+        const std::string& tenant_id);
 
     /**
      * @brief Batch clear KV cache for specified object keys on a specific
@@ -275,9 +279,15 @@ class Client {
      */
     tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
                                                    ReplicaType replica_type);
+    tl::expected<void, ErrorCode> EvictDiskReplica(const std::string& key,
+                                                   const std::string& tenant_id,
+                                                   ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const std::vector<std::string>& keys, ReplicaType replica_type);
+    std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
+        const std::vector<std::string>& keys, const std::string& tenant_id,
+        ReplicaType replica_type);
 
     /**
      * @brief Registers a memory segment to master for allocation
@@ -362,6 +372,9 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -373,6 +386,10 @@ class Client {
      * failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& tenant_id,
                                                  const std::string& source,
                                                  const std::string& target);
 
@@ -401,25 +418,25 @@ class Client {
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
      * segment.
-     * @param offloading_objects On return, contains a map from object key to
-     * size (in bytes) for all objects that require offload.
+     * @param offloading_objects On return, contains the tenant-scoped object
+     * tasks that require offload.
      */
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
-        std::unordered_map<std::string, int64_t>& offloading_objects);
+        std::vector<OffloadTaskItem>& offloading_objects);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for this
-     * client. Mirror of OffloadObjectHeartbeat. Returns key->size pairs the
+     * client. Mirror of OffloadObjectHeartbeat. Returns tenant-scoped tasks the
      * caller (FileStorage) must read from local SSD and stage as MEMORY
      * replicas via PromotionAllocStart + NotifyPromotionSuccess.
      */
     // Virtual to enable subclassing in unit tests.
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
-        std::unordered_map<std::string, int64_t>& promotion_objects);
+        std::vector<PromotionTaskItem>& promotion_objects);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -429,6 +446,10 @@ class Client {
     virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const std::string& key, uint64_t size,
                         const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const std::string& key, const std::string& tenant_id,
+                        uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
 
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
@@ -436,6 +457,8 @@ class Client {
      */
     virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Release master-side promotion task after a client-side failure
@@ -443,6 +466,8 @@ class Client {
      */
     virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Write `slices` into the memory replica described by
@@ -482,6 +507,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
@@ -848,6 +876,10 @@ class Client {
     tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& tenant_id,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
 
     /**
      * @brief Move an object's replica from source segment to target segment
@@ -857,6 +889,10 @@ class Client {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& tenant_id,
                                        const std::string& source,
                                        const std::string& target);
 

@@ -1040,15 +1040,18 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     const std::vector<std::vector<std::string>>& all_keys,
     const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
     const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>>& all_sizes) {
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache* query_result_cache) {
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
+    auto cached_query_results =
+        build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_rpc<&RealClient::get_into_ranges_shm_helper,
                    std::vector<std::vector<
                        std::vector<tl::expected<int64_t, ErrorCode>>>>>(
             dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
-            all_sizes, device_id_, client_id_);
+            all_sizes, cached_query_results, device_id_, client_id_);
 
     if (!internal_results) {
         LOG(ERROR) << "get_into_ranges RPC failed";
@@ -1061,6 +1064,39 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead, "get_into_ranges",
                               total_bytes, elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
+    const std::vector<std::string>& keys) {
+    auto cached_results =
+        invoke_rpc<&RealClient::batch_get_query_results,
+                   std::vector<CachedQueryResultResponse>>(keys);
+    if (!cached_results) {
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(cached_results.error()));
+    }
+    if (cached_results->size() != keys.size()) {
+        LOG(ERROR) << "BatchQuery response size mismatch: expected "
+                   << keys.size() << ", got " << cached_results->size();
+        return std::vector<tl::expected<QueryResult, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(keys.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& cached_result : *cached_results) {
+        if (!cached_result.success) {
+            results.emplace_back(tl::unexpected(cached_result.error));
+            continue;
+        }
+        results.emplace_back(QueryResult(
+            std::vector<Replica::Descriptor>(
+                cached_result.value.replicas.begin(),
+                cached_result.value.replicas.end()),
+            now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
     }
     return results;
 }

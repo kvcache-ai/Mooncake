@@ -7,7 +7,7 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
-#include <mooncake_ibgda/mlx5gda.h>
+#include <transport/device/ibgda/mlx5gda.h>
 #include <mooncake_ep_utils.cuh>
 
 namespace mooncake {

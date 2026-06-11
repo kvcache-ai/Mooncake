@@ -3,7 +3,13 @@ import os
 import tempfile
 import unittest
 
-from mooncake.mooncake_config import MooncakeConfig, DEFAULT_GLOBAL_SEGMENT_SIZE, DEFAULT_LOCAL_BUFFER_SIZE
+from mooncake.mooncake_config import (
+    MooncakeConfig,
+    DEFAULT_GLOBAL_SEGMENT_SIZE,
+    DEFAULT_LOCAL_BUFFER_SIZE,
+    _parse_segment_size,
+)
+
 
 class TestMooncakeConfig(unittest.TestCase):
     def setUp(self):
@@ -19,7 +25,9 @@ class TestMooncakeConfig(unittest.TestCase):
             "global_segment_size": 3355443200,
             "local_buffer_size": 1073741824,
             "protocol": "tcp",
-            "device_name": "eth0"
+            "device_name": "eth0",
+            "enable_ssd_offload": True,
+            "ssd_offload_path": "/nvme/mooncake_offload"
         }
 
     def tearDown(self):
@@ -42,6 +50,8 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.local_buffer_size, 1073741824)
         self.assertEqual(config.protocol, "tcp")
         self.assertEqual(config.device_name, "eth0")
+        self.assertEqual(config.enable_ssd_offload, True)
+        self.assertEqual(config.ssd_offload_path, "/nvme/mooncake_offload")
 
     def test_load_with_default_values(self):
         """Test loading configuration with default values"""
@@ -57,6 +67,8 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.local_buffer_size, DEFAULT_LOCAL_BUFFER_SIZE)
         self.assertEqual(config.protocol, "tcp")
         self.assertEqual(config.device_name, "")
+        self.assertEqual(config.enable_ssd_offload, False)
+        self.assertEqual(config.ssd_offload_path, "")
 
     def test_missing_required_field(self):
         """Test missing required field"""
@@ -93,6 +105,8 @@ class TestMooncakeConfig(unittest.TestCase):
         os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE'] = str(self.valid_config["global_segment_size"])
         os.environ['MOONCAKE_PROTOCOL'] = self.valid_config["protocol"]
         os.environ['MOONCAKE_DEVICE'] = self.valid_config["device_name"]
+        os.environ['MOONCAKE_OFFLOAD_ENABLED'] = str(self.valid_config["enable_ssd_offload"])
+        os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH'] = self.valid_config["ssd_offload_path"]
 
         try:
             config = MooncakeConfig.load_from_env()
@@ -102,6 +116,8 @@ class TestMooncakeConfig(unittest.TestCase):
             self.assertEqual(config.global_segment_size, self.valid_config["global_segment_size"])
             self.assertEqual(config.protocol, self.valid_config["protocol"])
             self.assertEqual(config.device_name, self.valid_config["device_name"])
+            self.assertEqual(config.enable_ssd_offload, self.valid_config["enable_ssd_offload"])
+            self.assertEqual(config.ssd_offload_path, self.valid_config["ssd_offload_path"])
 
         finally:
             # Clean up environment variable
@@ -111,12 +127,77 @@ class TestMooncakeConfig(unittest.TestCase):
             del os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE']
             del os.environ['MOONCAKE_PROTOCOL']
             del os.environ['MOONCAKE_DEVICE']
+            del os.environ['MOONCAKE_OFFLOAD_ENABLED']
+            del os.environ['MOONCAKE_OFFLOAD_FILE_STORAGE_PATH']
 
     def test_load_from_env_missing(self):
         """Test loading configuration from environment variable when not set"""
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
         self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
+
+
+class TestParseSegmentSize(unittest.TestCase):
+    def test_integer_passthrough(self):
+        self.assertEqual(_parse_segment_size(1024), 1024)
+        self.assertEqual(_parse_segment_size(0), 0)
+
+    def test_float_passthrough(self):
+        self.assertEqual(_parse_segment_size(1.5), 1)
+
+    def test_bytes_string(self):
+        self.assertEqual(_parse_segment_size("1024"), 1024)
+        self.assertEqual(_parse_segment_size("  2048  "), 2048)
+
+    def test_kb_suffix(self):
+        self.assertEqual(_parse_segment_size("1kb"), 1024)
+        self.assertEqual(_parse_segment_size("1KB"), 1024)
+        self.assertEqual(_parse_segment_size("512k"), 512 * 1024)
+        self.assertEqual(_parse_segment_size("1.5kb"), int(1.5 * 1024))
+
+    def test_mb_suffix(self):
+        self.assertEqual(_parse_segment_size("1mb"), 1024 ** 2)
+        self.assertEqual(_parse_segment_size("512MB"), 512 * 1024 ** 2)
+        self.assertEqual(_parse_segment_size("1m"), 1024 ** 2)
+
+    def test_gb_suffix(self):
+        self.assertEqual(_parse_segment_size("1gb"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("3GB"), 3 * 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1g"), 1024 ** 3)
+        self.assertEqual(_parse_segment_size("1.5gb"), int(1.5 * 1024 ** 3))
+
+    def test_tb_suffix(self):
+        self.assertEqual(_parse_segment_size("1tb"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1TB"), 1024 ** 4)
+        self.assertEqual(_parse_segment_size("1t"), 1024 ** 4)
+
+    def test_b_suffix(self):
+        self.assertEqual(_parse_segment_size("4096b"), 4096)
+        self.assertEqual(_parse_segment_size("4096B"), 4096)
+
+    def test_empty_string_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("")
+        with self.assertRaises(ValueError):
+            _parse_segment_size("   ")
+
+    def test_missing_number_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("gb")
+        with self.assertRaises(ValueError):
+            _parse_segment_size("mb")
+
+    def test_bare_float_string(self):
+        self.assertEqual(_parse_segment_size("1.5"), 1)
+        self.assertEqual(_parse_segment_size("1e9"), 1000000000)
+
+    def test_invalid_string_raises(self):
+        with self.assertRaises(ValueError):
+            _parse_segment_size("abc")
+
+    def test_whitespace_handling(self):
+        self.assertEqual(_parse_segment_size("  3 gb  "), 3 * 1024 ** 3)
+
 
 if __name__ == '__main__':
     unittest.main()
