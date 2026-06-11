@@ -136,7 +136,9 @@ endif()
 
 # Link Ascend ACL library if USE_ASCEND_DRAM_TIER is enabled
 if(USE_ASCEND_DRAM_TIER)
+  set(NEED_LINK_ASCEND FALSE)
   if(NOT ASCENDCL_LIB)
+    set(NEED_LINK_ASCEND TRUE)
     set(ASCEND_SEARCH_PATHS
         $ENV{ASCEND_HOME}/lib64
         /usr/local/Ascend/ascend-toolkit/latest/lib64
@@ -149,7 +151,7 @@ if(USE_ASCEND_DRAM_TIER)
     message(FATAL_ERROR "ascendcl library not found, USE_ASCEND_DRAM_TIER requires it")
   else()
     message(STATUS "Found ascendcl library for DRAM tier: ${ASCENDCL_LIB}")
-    if(NOT USE_ASCEND_CACHE_TIER)
+    if(NEED_LINK_ASCEND)
       target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
       set(ASCEND_INCLUDE_PATHS
           $ENV{ASCEND_HOME}/include

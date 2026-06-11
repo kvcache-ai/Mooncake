@@ -76,7 +76,7 @@ DramCacheTier::~DramCacheTier() {
 }
 
 tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
-                                                   TransferEngine* engine) {
+                                                  TransferEngine* engine) {
     backend_ = backend;
     if (engine != nullptr) engine_ = engine;
 
@@ -101,9 +101,8 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     memory_buffer_ = std::unique_ptr<char[], std::function<void(char*)>>(
-        static_cast<char*>(host_ptr), [](char* p) {
-            aclrtFreeHost(static_cast<void*>(p));
-        });
+        static_cast<char*>(host_ptr),
+        [](char* p) { aclrtFreeHost(static_cast<void*>(p)); });
     LOG(INFO) << "Allocated " << capacity_ << " bytes (ACL Host Pinned) "
               << "for DramCacheTier " << tier_id_;
 #else
