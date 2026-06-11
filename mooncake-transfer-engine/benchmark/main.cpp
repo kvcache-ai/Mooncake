@@ -200,7 +200,8 @@ static XferBenchStats processBatchSizesAllToAll(BenchRunner& runner,
     }
 
     LOG(INFO) << "Running all-to-all test: " << num_threads << " threads, "
-              << num_targets << " targets per thread";
+              << num_targets << " targets per thread, "
+              << "using random target selection";
 
     int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
@@ -223,44 +224,37 @@ static XferBenchStats processBatchSizesAllToAll(BenchRunner& runner,
         timer.reset();
         std::vector<double> transfer_duration;
         uint64_t total_transfers = 0;
-
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                for (size_t target_idx = 0; target_idx < num_targets;
-                     ++target_idx) {
-                    uint8_t pattern = 0;
-                    if (XferBenchConfig::check_consistency)
-                        pattern = fillData((void*)local_addr,
-                                           block_size * batch_size);
+                size_t target_idx = SimpleRandom::Get().next(num_targets);
+                uint8_t pattern = 0;
+                if (XferBenchConfig::check_consistency)
+                    pattern =
+                        fillData((void*)local_addr, block_size * batch_size);
 
-                    auto val = runner.runTransferToTarget(
-                        local_addr, target_idx, block_size, batch_size, WRITE);
-                    transfer_duration.push_back(val);
-                    total_transfers++;
+                auto val = runner.runTransferToTarget(
+                    local_addr, target_idx, block_size, batch_size, WRITE);
+                transfer_duration.push_back(val);
+                total_transfers++;
 
-                    fillData((void*)local_addr, block_size * batch_size);
-                    val = runner.runTransferToTarget(
-                        local_addr, target_idx, block_size, batch_size, READ);
-                    if (XferBenchConfig::check_consistency)
-                        verifyData((void*)local_addr, block_size * batch_size,
-                                   pattern);
-                    transfer_duration.push_back(val);
-                    total_transfers++;
-                }
+                fillData((void*)local_addr, block_size * batch_size);
+                val = runner.runTransferToTarget(local_addr, target_idx,
+                                                 block_size, batch_size, READ);
+                if (XferBenchConfig::check_consistency)
+                    verifyData((void*)local_addr, block_size * batch_size,
+                               pattern);
+                transfer_duration.push_back(val);
+                total_transfers++;
             }
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
-                // Round-robin through all targets for balanced all-to-all
-                // traffic
-                for (size_t target_idx = 0; target_idx < num_targets;
-                     ++target_idx) {
-                    auto val = runner.runTransferToTarget(
-                        local_addr, target_idx, block_size, batch_size, opcode);
-                    transfer_duration.push_back(val);
-                    total_transfers++;
-                }
+                size_t target_idx = SimpleRandom::Get().next(num_targets);
+                auto val = runner.runTransferToTarget(
+                    local_addr, target_idx, block_size, batch_size, opcode);
+                transfer_duration.push_back(val);
+                total_transfers++;
             }
         }
 
@@ -282,12 +276,6 @@ static XferBenchStats processBatchSizesAllToAll(BenchRunner& runner,
 }
 
 #ifdef USE_TENT
-// Helper function to get current time in nanoseconds
-static inline int64_t getCurrentTimeNs() {
-    auto ret = std::chrono::steady_clock::now().time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(ret).count();
-}
-
 /**
  * Run all-to-all benchmark using coordinator mode
  * This uses a coordinator server for node discovery and result aggregation
@@ -295,11 +283,6 @@ static inline int64_t getCurrentTimeNs() {
  */
 int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
     using namespace mooncake::bench;
-
-    LOG(INFO) << "=== All-to-All with Coordinator ===";
-    LOG(INFO) << "Coordinator: " << XferBenchConfig::coordinator;
-
-    // Get local segment name (IP:Port in P2P mode)
     auto* tent_runner = dynamic_cast<TENTBenchRunner*>(&runner);
     if (!tent_runner) {
         LOG(ERROR) << "Coordinator mode requires TENT backend";
@@ -309,10 +292,6 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
     std::string my_segment_name = tent_runner->getSegmentName();
     std::string my_hostname = mooncake::getHostname();
 
-    LOG(INFO) << "My segment name: " << my_segment_name;
-    LOG(INFO) << "My hostname: " << my_hostname;
-
-    // Connect to coordinator
     auto client =
         std::make_unique<CoordinatorClient>(XferBenchConfig::coordinator);
     if (!client->Connect()) {
@@ -334,8 +313,6 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
     // Get assigned rank and total nodes
     int32_t my_rank = reg_result->assigned_rank;
     int32_t total_nodes = reg_result->total_nodes;
-
-    LOG(INFO) << "Registered as node " << my_rank << " of " << total_nodes;
 
     // Wait for all nodes with timeout
     int wait_timeout = 300;  // 5 minutes default wait timeout
@@ -363,9 +340,6 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
     }
 
     auto& all_nodes = nodes_result.value();
-    LOG(INFO) << "All nodes ready! Got " << all_nodes.size() << " nodes:";
-
-    // Build target segments list (all except my own)
     std::vector<std::string> target_segments;
     for (const auto& node : all_nodes) {
         if (node.node_rank != my_rank) {
@@ -380,19 +354,12 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
         return 0;
     }
 
-    // Connect to all targets (skip sync since coordinator already handled it)
-    LOG(INFO) << "Connecting to " << target_segments.size() << " targets...";
-
-    // Use connectToAllTargets with 0 timeout to skip sync
     int rc = runner.connectToAllTargets(target_segments, wait_timeout);
     if (rc != 0) {
         LOG(ERROR) << "Failed to connect to targets";
         return rc;
     }
 
-    LOG(INFO) << "Connected to all targets, starting tests...";
-
-    // Print header for local results
     std::cout << "\n\033[32m===== Local Node Results (Node " << my_rank << "/"
               << total_nodes << ") =====\033[0m" << std::endl;
     printStatsAllToAllHeader();
@@ -416,7 +383,6 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
                     LOG(INFO) << "Skipped for block_size " << block_size
                               << " batch_size " << batch_size;
                 } else {
-                    // Run the test
                     auto stats = processBatchSizesAllToAll(
                         runner, block_size, batch_size, num_threads);
 
@@ -461,10 +427,6 @@ int runAllToAllBenchmarkWithCoordinator(BenchRunner& runner) {
         }
         runner.stopInitiator();
     }
-
-    LOG(INFO)
-        << "All tests complete. Results will be displayed by coordinator.";
-    LOG(INFO) << "Waiting for coordinator to exit...";
 
     // Wait for coordinator to exit by pinging periodically
     while (true) {
