@@ -1,15 +1,6 @@
 import os
 import re
 
-# Ensure CUDA_HOME is set before torch imports check it.
-# On systems where CUDA is installed via apt (e.g. arm64 runners),
-# CUDA_HOME may not be in the environment.
-if "CUDA_HOME" not in os.environ:
-    for candidate in ("/usr/local/cuda", "/opt/cuda"):
-        if os.path.isdir(candidate):
-            os.environ["CUDA_HOME"] = candidate
-            break
-
 from setuptools import setup
 import torch
 
