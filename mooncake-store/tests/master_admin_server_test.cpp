@@ -95,12 +95,9 @@ class MasterAdminServerTest : public ::testing::Test {
         std::string body;
     };
 
-    void SetUp() override {
-        google::InitGoogleLogging("MasterAdminServerTest");
-        FLAGS_logtostderr = true;
-    }
+    void SetUp() override {}
 
-    void TearDown() override { google::ShutdownGoogleLogging(); }
+    void TearDown() override {}
 
     static std::string BaseUrl(int port) {
         return "http://127.0.0.1:" + std::to_string(port);
@@ -474,9 +471,6 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
     };
 
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("MasterAdminServerWithServiceTest");
-        FLAGS_logtostderr = true;
-
         WrappedMasterServiceConfig svc_config;
         svc_config.default_kv_lease_ttl = 5000;
         svc_config.enable_metric_reporting = false;
@@ -500,7 +494,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         port_ = getFreeTcpPort();
         admin_ = std::make_unique<MasterAdminServer>(
             static_cast<uint16_t>(port_), false);
-        admin_->Start();
+        ASSERT_TRUE(admin_->Start());
         admin_->SetRuntimeState(ha::MasterRuntimeState::kServing);
         admin_->SetServiceDelegate(service_);
         admin_->SetServiceAvailable(true);
@@ -510,7 +504,6 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         admin_->Stop();
         admin_.reset();
         service_.reset();
-        google::ShutdownGoogleLogging();
     }
 
     HttpResponse HttpGet(const std::string& path) {
@@ -554,7 +547,7 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsKeys) {
     EXPECT_NE(resp.body.find(kDefaultKey), std::string::npos);
 }
 
-TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsEmptyWhenNoKeys) {
+TEST_F(MasterAdminServerWithServiceTest, GetAllKeysExcludesRemovedKey) {
     // Use a unique key so removal doesn't affect other tests.
     const std::string key = "ephemeral_empty_test_key";
     UUID client_id = generate_uuid();
@@ -1039,6 +1032,10 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
+    google::InitGoogleLogging(argv[0]);
+    FLAGS_logtostderr = true;
     ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+    int result = RUN_ALL_TESTS();
+    google::ShutdownGoogleLogging();
+    return result;
 }
