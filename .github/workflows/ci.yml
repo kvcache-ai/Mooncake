@@ -389,6 +389,7 @@ jobs:
 
     - name: Build project
       run: |
+        export CUDA_HOME=/usr/local/cuda
         export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         cmake --build .
