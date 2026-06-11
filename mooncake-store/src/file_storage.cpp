@@ -53,7 +53,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                "offset_allocator_storage_backend") {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     } else if (storage_backend_descriptor == "distributed_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kDistributed;
+        LOG(WARNING) << "distributed_storage_backend is no longer supported; "
+                        "falling back to bucket_storage_backend";
+        config.storage_backend_type = StorageBackendType::kBucket;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }
@@ -1029,11 +1031,6 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     int total_keys = 0;
     int total_batches = 0;
     int total_failures = 0;
-    // Reset the scan iterator so ScanMeta starts from the beginning.
-    // BucketStorageBackend uses cursor-based iteration (next_bucket_);
-    // after Init() completes the cursor is 0 and HasNext() returns false,
-    // which would make ScanMeta skip all buckets.
-    storage_backend_->ResetScanIterator();
     LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
                  "storage_backend_->ScanMeta()";
     auto scan_meta_result =
