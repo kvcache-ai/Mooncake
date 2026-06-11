@@ -126,7 +126,11 @@ MasterAdminServer::MasterAdminServer(uint16_t http_port,
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
 bool MasterAdminServer::Start() {
-    InitHttpServer();
+    if (started_.load()) {
+        return true;
+    }
+
+    RegisterHandler();
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
@@ -338,7 +342,7 @@ void MasterAdminServer::HandleHaStatus(coro_http::coro_http_request&,
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
-        auto key = req.get_query_value("key");
+        auto key = req.get_decode_query_value("key");
         auto get_result = service->GetReplicaList(std::string(key), "default");
         resp.add_header("Content-Type", "text/plain; version=0.0.4");
         if (get_result) {
@@ -480,7 +484,7 @@ void MasterAdminServer::HandleGetSegmentsDetail(
 void MasterAdminServer::HandleQuerySegment(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
-        auto segment = req.get_query_value("segment");
+        auto segment = req.get_decode_query_value("segment");
         resp.add_header("Content-Type", "text/plain; version=0.0.4");
         auto result = service->QuerySegmentForAdmin(std::string(segment));
         if (!result) {
@@ -707,7 +711,7 @@ void MasterAdminServer::HandleBatchQueryKeys(
         return;
     }
 
-    auto keys_view = req.get_query_value("keys");
+    auto keys_view = req.get_decode_query_value("keys");
     std::vector<std::string> keys;
     if (!keys_view.empty()) {
         std::string keys_str(keys_view);
@@ -757,7 +761,7 @@ void MasterAdminServer::HandleBatchQueryKeys(
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
-void MasterAdminServer::InitHttpServer() {
+void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
     http_server_.set_http_handler<GET>(

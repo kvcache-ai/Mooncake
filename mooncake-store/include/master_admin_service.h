@@ -90,7 +90,7 @@ class MasterAdminServer {
     void HandleBatchQueryKeys(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
 
-    void InitHttpServer();
+    void RegisterHandler();
 
     uint16_t http_port_;
     bool enable_metric_reporting_ = false;
