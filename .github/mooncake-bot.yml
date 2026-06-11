@@ -1,0 +1,17 @@
+# mooncake-bot configuration
+# Adjust these settings to control bot behavior without redeploying
+
+greeting:
+  issue: true
+  pr: true
+
+labels:
+  triage: "needs-triage"
+  reviewed: "needs-review"
+
+maintainers:
+  - stmatengss
+
+stale:
+  daysUntilStale: 60
+  daysUntilClose: 7
