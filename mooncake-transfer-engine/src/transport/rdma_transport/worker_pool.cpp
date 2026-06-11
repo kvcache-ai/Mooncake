@@ -417,6 +417,7 @@ void WorkerPool::transferWorker(int thread_id) {
 #ifndef USE_FAKE_POST_SEND
         performPollCq(thread_id);
 #endif
+        last_wait_ts = getCurrentTimeInNano();
     }
 }
 
