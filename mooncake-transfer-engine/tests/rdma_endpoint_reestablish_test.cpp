@@ -550,7 +550,8 @@ TEST_F(RDMAEndpointReestablishTest, DisconnectIssuesErrBeforeResetOnReconnect) {
     runEndpointReestablishScenario(target_device_name, initiator_device_name);
 
     // The reconnect must have flushed at least one QP through ERR. If the
-    // disconnect path reset QPs directly (no ERR transition) this would be zero.
+    // disconnect path reset QPs directly (no ERR transition) this would be
+    // zero.
     EXPECT_GT(countQpTransitions(IBV_QPS_ERR), 0)
         << "Expected the reconnect to flush QPs via IBV_QPS_ERR, but no ERR "
            "transition was observed";
