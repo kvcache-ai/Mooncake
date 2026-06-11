@@ -20,7 +20,7 @@ namespace mooncake {
 // On MNNVL clusters all GPUs support fabric mem handles, meaning
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA)
 static bool supportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
 
@@ -40,7 +40,7 @@ static bool supportFabricMem() {
     return true;
 }
 #else
-// MUSA does not support NVLink fabric memory handles.
+// MUSA and MACA do not use NVIDIA NVLink fabric memory handles here.
 static bool supportFabricMem() { return false; }
 #endif
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
@@ -433,7 +433,9 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             global_peerConnected_[globalPollingRank] = false;
             meta_->peerConnected[pollingRank] = false;
             meta_->activeRanks[pollingRank] = false;
-            meta_->activeRanksTensor[pollingRank] = 0;
+            if (meta_->activeRanksTensor.device().is_cpu()) {
+                meta_->activeRanksTensor[pollingRank] = 0;
+            }
 
             // Reset store
             try {
