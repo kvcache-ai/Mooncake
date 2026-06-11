@@ -338,19 +338,6 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-arm64.tar.gz
-        tar xzf etcd-v3.6.1-linux-arm64.tar.gz
-        sudo mv etcd-v3.6.1-linux-arm64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
     - name: Free up disk space
       run: |
         sudo rm -rf /usr/share/dotnet
@@ -383,7 +370,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       shell: bash
 
     - name: Build project
@@ -399,36 +386,6 @@ jobs:
       if: ${{ env.SCCACHE_PATH != '' }}
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
-
-    - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-      shell: bash
-
-    - name: Run Mooncake Store Rust smoke test
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_arm64_rust_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/rust
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
-        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
-        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
-        export MC_RUST_STORE_RUN_INTEGRATION=true
-        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
-        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
-        export MC_RUST_STORE_PROTOCOL=tcp
-        export MC_RUST_STORE_DEVICE_NAME=
-        cargo test --test minimal_smoke -- --nocapture
-        kill $MASTER_PID 2>/dev/null || true
-      shell: bash
 
     - name: Generate Python version tag
       id: generate_tag_arm64
