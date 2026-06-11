@@ -42,6 +42,7 @@ endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 option(USE_ASCEND_CACHE_TIER "Enable Ascend NPU cache tier support" OFF)
+option(USE_ASCEND_DRAM_TIER "Enable Ascend ACL Host memory for DRAM tier (aclrtMallocHost)" OFF)
 
 # Define ASIO macros before adding mooncake-asio subdirectory
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)

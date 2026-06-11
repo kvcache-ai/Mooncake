@@ -1,8 +1,13 @@
 #include <glog/logging.h>
-#include <numa.h>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+
+#ifdef USE_ASCEND_DRAM_TIER
+#include "acl/acl.h"
+#else
+#include <numa.h>
+#endif
 
 #include "tiered_cache/tiers/dram_tier.h"
 #include "utils.h"
@@ -72,13 +77,37 @@ DramCacheTier::~DramCacheTier() {
 
 tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
                                                   TransferEngine* engine) {
-    int node = -1;
-    std::string location;
-
     backend_ = backend;
     if (engine != nullptr) engine_ = engine;
 
-    // Allocate a contiguous memory block.
+#ifdef USE_ASCEND_DRAM_TIER
+    int current_device = -1;
+    aclError acl_ret = aclrtGetDevice(&current_device);
+    if (acl_ret != ACL_SUCCESS) {
+        LOG(ERROR) << "USE_ASCEND_DRAM_TIER enabled but no ACL Device Context "
+                   << "on current thread (aclrtGetDevice returned " << acl_ret
+                   << "). Ensure aclInit and aclrtSetDevice/aclrtCreateContext "
+                   << "have been called before DramCacheTier::Init().";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    LOG(INFO) << "ACL Device Context found (device " << current_device
+              << "), using aclrtMallocHost for DRAM tier " << tier_id_;
+
+    void* host_ptr = nullptr;
+    acl_ret = aclrtMallocHost(&host_ptr, capacity_);
+    if (acl_ret != ACL_SUCCESS || host_ptr == nullptr) {
+        LOG(ERROR) << "aclrtMallocHost failed for " << capacity_
+                   << " bytes, ACL error: " << acl_ret;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    memory_buffer_ = std::unique_ptr<char[], std::function<void(char*)>>(
+        static_cast<char*>(host_ptr),
+        [](char* p) { aclrtFreeHost(static_cast<void*>(p)); });
+    LOG(INFO) << "Allocated " << capacity_ << " bytes (ACL Host Pinned) "
+              << "for DramCacheTier " << tier_id_;
+#else
+    int node = -1;
+
     const bool use_hugepage = (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr);
     if (use_hugepage) {
         const size_t hugepage_size = get_hugepage_size_from_env();
@@ -157,15 +186,21 @@ tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
         LOG(INFO) << "Allocated " << capacity_ << " bytes for DramCacheTier "
                   << tier_id_;
     }
+#endif
     char* mem_ptr = memory_buffer_.get();
 
-    // Register this newly allocated memory with the TransferEngine.
+#ifdef USE_ASCEND_DRAM_TIER
+    std::string location = kWildcardLocation;
+#else
+    std::string location;
+    if (node != -1) {
+        location = "cpu:" + std::to_string(node);
+    } else {
+        location = kWildcardLocation;
+    }
+#endif
+
     if (engine_) {
-        if (node != -1) {
-            location = "cpu:" + std::to_string(node);
-        } else {
-            location = kWildcardLocation;
-        }
         int rc = engine_->registerLocalMemory(mem_ptr, capacity_, location);
         if (rc != 0) {
             LOG(ERROR) << "Failed to register memory with TransferEngine for "
