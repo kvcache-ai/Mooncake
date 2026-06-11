@@ -33,11 +33,13 @@ using ReplicaID = uint64_t;
 inline std::ostream& operator<<(std::ostream& os,
                                 const ReplicaType& replicaType) noexcept {
     static const std::unordered_map<ReplicaType, std::string_view>
-        replica_type_strings{{ReplicaType::MEMORY, "MEMORY"},
-                             {ReplicaType::DISK, "DISK"},
-                             {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
-                             {ReplicaType::NOF_SSD, "NOF_SSD"},
-                             {ReplicaType::ALL, "ALL"}};
+        replica_type_strings{
+            {ReplicaType::MEMORY, "MEMORY"},
+            {ReplicaType::DISK, "DISK"},
+            {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
+            {ReplicaType::NOF_SSD, "NOF_SSD"},
+            {ReplicaType::ALL, "ALL"},
+            {ReplicaType::DISTRIBUTED_DISK, "DISTRIBUTED_DISK"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -179,6 +181,12 @@ struct LocalDiskReplicaData {
     std::string transport_endpoint;
 };
 
+struct DistributedDiskReplicaData {
+    std::string file_path;
+    int64_t offset = 0;
+    uint64_t object_size = 0;
+};
+
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
@@ -200,6 +208,13 @@ struct LocalDiskDescriptor {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+};
+
+struct DistributedDiskDescriptor {
+    std::string file_path{};
+    int64_t offset = 0;
+    uint64_t object_size = 0;
+    YLT_REFL(DistributedDiskDescriptor, file_path, offset, object_size);
 };
 
 class Replica {
@@ -247,6 +262,17 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
+    // distributed disk replica constructor
+    Replica(std::string file_path, int64_t offset, uint64_t object_size,
+            ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(DistributedDiskReplicaData{std::move(file_path), offset,
+                                           object_size}),
+          status_(status),
+          refcnt_(0) {
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
         if (is_disk_replica()) {
@@ -255,6 +281,9 @@ class Replica {
         } else if (is_local_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<LocalDiskReplicaData>(data_).object_size);
+        } else if (is_distributed_disk_replica()) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                std::get<DistributedDiskReplicaData>(data_).object_size);
         }
     }
 
@@ -287,6 +316,9 @@ class Replica {
             } else if (is_local_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<LocalDiskReplicaData>(data_).object_size);
+            } else if (is_distributed_disk_replica()) {
+                MasterMetricManager::instance().dec_allocated_file_size(
+                    std::get<DistributedDiskReplicaData>(data_).object_size);
             }
         }
 
@@ -364,6 +396,15 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
+    [[nodiscard]] bool is_distributed_disk_replica() const {
+        return std::holds_alternative<DistributedDiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_distributed_disk_replica(
+        const Replica& replica) {
+        return replica.is_distributed_disk_replica();
+    }
+
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -408,6 +449,11 @@ class Replica {
             return disk_data.client_id;
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] const DistributedDiskReplicaData& get_distributed_disk_data()
+        const {
+        return std::get<DistributedDiskReplicaData>(data_);
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {
@@ -462,12 +508,15 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const DistributedDiskReplicaData&) const {
+            return ReplicaType::DISTRIBUTED_DISK;
+        }
     };
 
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, DistributedDiskDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -507,6 +556,16 @@ class Replica {
                 descriptor_variant);
         }
 
+        bool is_distributed_disk_replica() noexcept {
+            return std::holds_alternative<DistributedDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_distributed_disk_replica() const noexcept {
+            return std::holds_alternative<DistributedDiskDescriptor>(
+                descriptor_variant);
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc =
                     std::get_if<MemoryDescriptor>(&descriptor_variant)) {
@@ -535,6 +594,14 @@ class Replica {
                 return *desc;
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
+        }
+
+        DistributedDiskDescriptor& get_distributed_disk_descriptor() {
+            if (auto* desc = std::get_if<DistributedDiskDescriptor>(
+                    &descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DistributedDiskDescriptor");
         }
 
         const MemoryDescriptor& get_memory_descriptor() const {
@@ -566,6 +633,15 @@ class Replica {
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
         }
+
+        const DistributedDiskDescriptor& get_distributed_disk_descriptor()
+            const {
+            if (auto* desc = std::get_if<DistributedDiskDescriptor>(
+                    &descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected DistributedDiskDescriptor");
+        }
     };
 
    private:
@@ -573,7 +649,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData>
+                 LocalDiskReplicaData, DistributedDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -624,6 +700,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_distributed_disk_replica()) {
+        const auto& disk_data = std::get<DistributedDiskReplicaData>(data_);
+        DistributedDiskDescriptor distributed_disk_desc;
+        distributed_disk_desc.file_path = disk_data.file_path;
+        distributed_disk_desc.offset = disk_data.offset;
+        distributed_disk_desc.object_size = disk_data.object_size;
+        desc.descriptor_variant = std::move(distributed_disk_desc);
     }
 
     return desc;
@@ -674,6 +757,12 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
     } else if (replica.is_disk_replica()) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
+           << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_distributed_disk_replica()) {
+        const auto& disk_data =
+            std::get<DistributedDiskReplicaData>(replica.data_);
+        os << "type: DISTRIBUTED_DISK, file_path: " << disk_data.file_path
+           << ", offset: " << disk_data.offset
            << ", object_size: " << disk_data.object_size;
     }
 

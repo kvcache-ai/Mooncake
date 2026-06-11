@@ -19,11 +19,12 @@ namespace mooncake {
  * @brief Type of buffer allocator used in the system
  */
 enum class ReplicaType {
-    MEMORY,      // Memory replica
-    DISK,        // Disk replica
-    LOCAL_DISK,  // Local disk replica
-    NOF_SSD,     // Nvme-oF SSD replica
-    ALL,         // All memory and NoF replicas in put finalize path
+    MEMORY = 0,            // Memory replica
+    DISK = 1,              // Disk replica
+    LOCAL_DISK = 2,        // Local disk replica
+    NOF_SSD = 3,           // Nvme-oF SSD replica
+    ALL = 4,               // All memory and NoF replicas in put finalize path
+    DISTRIBUTED_DISK = 5,  // Distributed disk replica
 };
 
 // Constant for unknown free space in allocators that don't track it precisely

@@ -17,6 +17,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     rpc_service.cpp
+    storage/distributed/bitmap_page_allocator.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp

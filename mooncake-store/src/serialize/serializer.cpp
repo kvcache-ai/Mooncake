@@ -712,6 +712,22 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::DISTRIBUTED_DISK: {
+            const auto *distributed_data =
+                std::get_if<DistributedDiskReplicaData>(&replica.data_);
+            if (!distributed_data) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "serialize_msgpack Replica missing "
+                                       "DistributedDiskReplicaData"));
+            }
+            // Format: [file_path, offset, object_size]
+            packer.pack_array(3);
+            packer.pack(distributed_data->file_path);
+            packer.pack(static_cast<int64_t>(distributed_data->offset));
+            packer.pack(static_cast<uint64_t>(distributed_data->object_size));
+            break;
+        }
         default:
             // Unsupported replica type
             packer.pack(static_cast<int8_t>(255));
@@ -810,6 +826,24 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::DISTRIBUTED_DISK): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 3) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica DISTRIBUTED_DISK payload is "
+                    "not valid array[3]"));
+            }
+            auto *payload_items = payload.via.array.ptr;
+            std::string file_path = payload_items[0].as<std::string>();
+            int64_t offset = payload_items[1].as<int64_t>();
+            uint64_t object_size = payload_items[2].as<uint64_t>();
+
+            replica = std::make_shared<Replica>(std::move(file_path), offset,
+                                                object_size, status);
             break;
         }
         default:
