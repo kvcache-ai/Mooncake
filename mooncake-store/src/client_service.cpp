@@ -3905,7 +3905,7 @@ ErrorCode Client::InitLocalHotCache() {
             hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
             kWildcardLocation, true, true);
         if (rc != 0) {
-            MC_LOG(ERROR)
+            LOG(ERROR)
                 << "Failed to register local hot cache memory with transfer "
                    "engine, base="
                 << hot_cache_->GetBaseAddress()
@@ -3963,7 +3963,7 @@ void Client::UnregisterLocalHotCacheMemory() {
     int rc = transfer_engine_->unregisterLocalMemory(
         hot_cache_->GetBaseAddress(), true);
     if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
-        MC_LOG(ERROR)
+        LOG(ERROR)
             << "Failed to unregister local hot cache memory from transfer "
                "engine, base="
             << hot_cache_->GetBaseAddress()
