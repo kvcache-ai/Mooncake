@@ -62,12 +62,13 @@ struct GlobalConfig {
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
-    // Bounded wait (milliseconds) for a disconnected endpoint's outstanding
-    // WRs to drain (flush as CQEs) before the next reconnect transitions its
-    // QPs to RESET. Prevents re-orphaning still-in-flight WRs. 0 disables the
-    // wait (immediate post-RESET counter compensation). Override via
+    // Bounded spin (milliseconds, with lock_ held) for a disconnected
+    // endpoint's outstanding WRs to drain (flush as CQEs) before the next
+    // reconnect reuses/destroys its QPs, so in-flight WRs aren't re-orphaned.
+    // It busy-spins rather than sleeps because lock_ is a spinlock, so it is
+    // kept small and capped at 1000ms. 0 disables the wait. Override via
     // MC_QP_DRAIN_TIMEOUT_MS.
-    int qp_drain_timeout_ms = 100;
+    int qp_drain_timeout_ms = 50;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;

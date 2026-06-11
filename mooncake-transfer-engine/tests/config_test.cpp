@@ -105,47 +105,51 @@ TEST_F(PkeyIndexEnvTest, AutoGidRetriesRejectsOutOfRangeOverride) {
     EXPECT_EQ(config.auto_gid_max_retries, 5);
 }
 
-// MC_QP_DRAIN_TIMEOUT_MS bounds the wait for a disconnected endpoint's
-// outstanding WRs to flush before the next reconnect transitions its QPs back
-// through RESET. Unlike most knobs, 0 is a valid value (disables the wait), so
-// these cases pin down that 0 is accepted while garbage/negative/out-of-range
-// preserve the default -- a typo must not silently disable the safety wait.
+// MC_QP_DRAIN_TIMEOUT_MS bounds the spin for a disconnected endpoint's
+// outstanding WRs to flush before the next reconnect reuses/destroys its QPs.
+// Unlike most knobs, 0 is a valid value (disables the wait); the range is
+// capped at 1000ms because the drain spins with a spinlock held. These cases
+// pin down that 0 is accepted while garbage/negative/out-of-range/trailing
+// junk preserve the default -- a typo must not silently disable or mis-set the
+// safety wait.
 class QpDrainTimeoutEnvTest : public ::testing::Test {
    protected:
     void TearDown() override { ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS"); }
 };
 
-TEST_F(QpDrainTimeoutEnvTest, DefaultIsOneHundredWhenUnset) {
+TEST_F(QpDrainTimeoutEnvTest, DefaultIsFiftyWhenUnset) {
     ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS");
-    GlobalConfig config;
-    loadGlobalConfig(config);
-    EXPECT_EQ(config.qp_drain_timeout_ms, 100);
-}
-
-TEST_F(QpDrainTimeoutEnvTest, ValidOverrideIsApplied) {
-    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "50", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.qp_drain_timeout_ms, 50);
 }
 
+TEST_F(QpDrainTimeoutEnvTest, ValidOverrideIsApplied) {
+    // Use a value distinct from the default so the test fails if the override
+    // is silently ignored and the default is kept instead.
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "30", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 30);
+}
+
 TEST_F(QpDrainTimeoutEnvTest, ZeroIsAcceptedAndDisablesWait) {
     ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "0", 1), 0);
     GlobalConfig config;
-    config.qp_drain_timeout_ms = 100;  // sentinel must be overwritten by 0
+    config.qp_drain_timeout_ms = 50;  // sentinel must be overwritten by 0
     loadGlobalConfig(config);
     EXPECT_EQ(config.qp_drain_timeout_ms, 0);
 }
 
 TEST_F(QpDrainTimeoutEnvTest, MaxBoundaryIsApplied) {
-    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "65535", 1), 0);
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "1000", 1), 0);
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.qp_drain_timeout_ms, 65535);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 1000);
 }
 
 TEST_F(QpDrainTimeoutEnvTest, OutOfRangeIsIgnored) {
-    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "65536", 1), 0);
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "1001", 1), 0);
     GlobalConfig config;
     config.qp_drain_timeout_ms = 7;  // sentinel preserved when rejected
     loadGlobalConfig(config);

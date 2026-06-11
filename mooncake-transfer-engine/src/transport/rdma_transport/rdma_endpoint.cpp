@@ -889,11 +889,23 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 }
 
 bool RdmaEndPoint::drainWrDepthLocked() {
-    // Safe to wait while holding lock_: wr_depth_list_ is decremented by
-    // performPollCq on a worker thread, which never takes lock_, so the drain
-    // makes progress under the lock. submitPostSend's lock-free pre-check keeps
-    // that poller from blocking on lock_ here (critical in the default 1-CQ
-    // topology, where the posting worker is also the only poller).
+    // Called with lock_ (a ticket spinlock) held. wr_depth_list_ is decremented
+    // by performPollCq on a worker thread, which never takes lock_, so the
+    // drain makes progress while we hold the lock; submitPostSend's lock-free
+    // pre-check keeps that poller (the only poller in the default 1-CQ
+    // topology) from blocking on lock_ here.
+    //
+    // We busy-spin rather than sleep. Sleeping while holding a spinlock would
+    // force any other lock_ contender to burn a core spinning for the whole
+    // sleep (priority inversion / potential starvation). We also cannot release
+    // lock_ around a sleep: a concurrent reconnect could then acquire it and
+    // run deconstructLocked() -- which delete[]s wr_depth_list_ -- out from
+    // under this loop (use-after-free). So the wait is a short bounded spin
+    // (qp_drain_timeout_ms, capped at 1000ms; default 50ms). On the enabled
+    // non-eRDMA path it is best-effort anyway: the ERR-generated flush CQEs
+    // survive the subsequent RESET and still drain the counters as they are
+    // polled, so an early return only defers termination to the next poll
+    // cycle -- it does not orphan.
     auto all_drained = [this]() {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
             if (__atomic_load_n(&wr_depth_list_[i], __ATOMIC_ACQUIRE) != 0)
@@ -907,25 +919,11 @@ bool RdmaEndPoint::drainWrDepthLocked() {
     const int timeout_ms = globalConfig().qp_drain_timeout_ms;
     if (timeout_ms <= 0) return false;  // wait disabled
 
-    // Reuse the handshake-wait backoff: spin briefly, then sleep with
-    // exponential backoff. A peer that just died flushes its WRs within the
-    // RDMA retry window, so the common drain finishes in the spin phase.
     const uint64_t deadline_ns =
         getCurrentTimeInNano() + static_cast<uint64_t>(timeout_ms) * 1000000ull;
-    uint32_t spin_count = 0;
-    uint32_t sleep_us = kWaitExistingHandshakeInitialSleepUs;
     while (!all_drained()) {
         if (getCurrentTimeInNano() > deadline_ns) return false;
-        if (spin_count < kWaitExistingHandshakeSpinCount) {
-            PAUSE();
-        } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-            uint32_t next = sleep_us * 2;
-            sleep_us = next > kWaitExistingHandshakeMaxSleepUs
-                           ? kWaitExistingHandshakeMaxSleepUs
-                           : next;
-        }
-        ++spin_count;
+        PAUSE();
     }
     return true;
 }
@@ -984,7 +982,9 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
     }
 
     peer_qp_num_list_ = std::move(peer_qp_num_list);
-    status_.store(CONNECTED, std::memory_order_relaxed);
+    // Release so the lock-free acquire-load in submitPostSend() that observes
+    // CONNECTED also sees the fully-initialized peer_qp_num_list_ and QP state.
+    status_.store(CONNECTED, std::memory_order_release);
     return 0;
 }
 
