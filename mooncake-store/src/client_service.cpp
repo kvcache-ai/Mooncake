@@ -3908,8 +3908,8 @@ ErrorCode Client::InitLocalHotCache() {
             MC_LOG(ERROR)
                 << "Failed to register local hot cache memory with transfer "
                    "engine, base="
-                << hot_cache_->GetBaseAddress() << ", size="
-                << hot_cache_->GetTotalSize() << ", ret=" << rc;
+                << hot_cache_->GetBaseAddress()
+                << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
             hot_cache_.reset();
             hot_cache_handler_.reset();
             admission_sketch_.reset();
@@ -3966,8 +3966,8 @@ void Client::UnregisterLocalHotCacheMemory() {
         MC_LOG(ERROR)
             << "Failed to unregister local hot cache memory from transfer "
                "engine, base="
-            << hot_cache_->GetBaseAddress() << ", size="
-            << hot_cache_->GetTotalSize() << ", ret=" << rc;
+            << hot_cache_->GetBaseAddress()
+            << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
     }
     hot_cache_memory_registered_ = false;
 }
