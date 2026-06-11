@@ -132,6 +132,7 @@ pub struct StoreClientBuilder {
     namespace_quota: Option<NamespaceQuota>,
     execution_fairness: Option<ExecutionFairness>,
     bandwidth_shaping: Option<BandwidthShaping>,
+    cold_tier_targets: Vec<ColdTierTargetConfig>,
 }
 
 impl StoreClientBuilder {
@@ -158,6 +159,7 @@ impl StoreClientBuilder {
             namespace_quota: None,
             execution_fairness: None,
             bandwidth_shaping: None,
+            cold_tier_targets: Vec::new(),
         }
     }
 
@@ -290,6 +292,27 @@ impl StoreClientBuilder {
         self
     }
 
+    /// Configures a single startup cold tier device (replaces any previously configured targets).
+    ///
+    /// This resolves and enables the runtime's cold tier device during client build, matching the
+    /// Admin HTTP create/register/enable lifecycle for initial cluster bring-up. Use Admin HTTP
+    /// cold-tier device endpoints for runtime lifecycle changes after startup.
+    ///
+    /// For multiple devices, use [`cold_tier_targets`](Self::cold_tier_targets) instead.
+    pub fn cold_tier_target(mut self, cold_tier_target: ColdTierTargetConfig) -> Self {
+        self.cold_tier_targets = vec![cold_tier_target];
+        self
+    }
+
+    /// Configures startup cold tier devices (replaces any previously configured targets).
+    pub fn cold_tier_targets<I>(mut self, cold_tier_targets: I) -> Self
+    where
+        I: IntoIterator<Item = ColdTierTargetConfig>,
+    {
+        self.cold_tier_targets = cold_tier_targets.into_iter().collect();
+        self
+    }
+
     pub fn build(self, expires_at_ms: u64) -> Result<StoreClient> {
         if self.default_tenant.is_empty() {
             return Err(StoreError::InvalidState(
@@ -397,11 +420,44 @@ impl StoreClientBuilder {
             live_client_cache.clone(),
             suspect_runtime_cache.clone(),
         );
+        // Resolve cold tier targets and construct backends.
+        let resolved_cold_tier = self
+            .cold_tier_targets
+            .iter()
+            .map(resolve_cold_tier_target)
+            .collect::<Result<Vec<_>>>()?;
+        let default_cold_tier_id = resolved_cold_tier
+            .first()
+            .map(|r| r.cold_tier_id.clone())
+            .unwrap_or_else(|| runtime.stable_id.to_string());
+        let mut cold_tier_handles = BTreeMap::new();
+        for resolved in &resolved_cold_tier {
+            let backend: Arc<dyn PersistentStorageBackend> =
+                Arc::new(LocalDirPersistentStorageBackend::new_with_root(
+                    resolved.root_dir.clone(),
+                ));
+            cold_tier_handles.insert(resolved.cold_tier_id.clone(), backend);
+        }
+        cold_tier_handles
+            .entry(default_cold_tier_id.clone())
+            .or_insert_with(|| {
+                let fallback_root = default_cold_tier_root();
+                warn!(
+                    path = %fallback_root.display(),
+                    "no cold tier target configured for default device, using ephemeral PID-based path"
+                );
+                Arc::new(LocalDirPersistentStorageBackend::new_with_root(
+                    fallback_root,
+                ))
+            });
+        let cold_tier_resolver =
+            ColdTierBackendResolver::from_handles(default_cold_tier_id, cold_tier_handles);
         let storage_owner = Arc::new(StorageOwnerState::new(
             runtime.clone(),
             provisional_lease.clone(),
             route_directory.clone(),
             allocator.clone(),
+            cold_tier_resolver,
         ));
         let storage_adapter = Arc::new(LocalAllocatorAdapter {
             runtime: runtime.clone(),

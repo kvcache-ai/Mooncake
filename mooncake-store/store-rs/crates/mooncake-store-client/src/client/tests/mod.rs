@@ -26,9 +26,10 @@ use super::{
     control_bind_host, copy_into_region, effective_route_policy, encode_lifecycle_state,
     flatten_slices, now_ms, payload_checksum, record_success_metric, route_topk_from_tenant_spec,
     scatter_into_buffers, shared_suspect_runtime_cache, stable_debug_log_sample,
-    startup_prewarm_delay, AllocationSpan, LiveClientCache, LocalAllocatorAdapter,
-    LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim, ReplicaWriteTarget, ResolvedObject,
-    SegmentAllocator, StorageOwnerState, StoreState, SuspectRuntimeCache,
+    startup_prewarm_delay, AllocationSpan, ColdTierBackendResolver, LiveClientCache,
+    LocalAllocatorAdapter, LocalAllocatorState, LocalAuthorityAdapter, PendingReclaim,
+    ReplicaWriteTarget, ResolvedObject, SegmentAllocator, StorageOwnerState, StoreState,
+    SuspectRuntimeCache,
 };
 use crate::{
     control_plane::{
@@ -2496,6 +2497,7 @@ fn test_storage_owner_state(
         lease,
         route_directory,
         allocator,
+        ColdTierBackendResolver::from_handles(String::new(), BTreeMap::new()),
     ))
 }
 
