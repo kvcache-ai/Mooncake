@@ -218,6 +218,10 @@ mooncake-operator/mooncake-operator
 # Stripped binaries (build artifacts)
 *.stripped
 
+# Docker build support files (local build artifacts)
+/mooncake_master.bin
+/libk8s_lease_wrapper.bin
+
 # MacOS
 .DS_Store
 

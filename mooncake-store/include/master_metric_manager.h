@@ -123,6 +123,7 @@ class MasterMetricManager {
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
+    void reset_active_clients();
 
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);

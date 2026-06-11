@@ -170,6 +170,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
       enable_cxl_(config.enable_cxl) {
+    // Reset the active clients metric to 0. This is necessary because
+    // MasterMetricManager is a singleton that persists across MasterService
+    // recreations (HA leader transitions within the same process). Without
+    // this, the gauge accumulates stale client counts from previous service
+    // instances, causing the operator UI to report inflated client numbers.
+    MasterMetricManager::instance().reset_active_clients();
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto object_store_type =
@@ -5107,6 +5113,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_active_clients();
 }
 
 ha::SnapshotCatalogStore* MasterService::GetSnapshotCatalogStore() {
@@ -7096,11 +7103,19 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
 
     std::vector<DrainPlan> plans;
     plans.reserve(slots);
+
+    // Per-key sequential scheduling: track active keys across all source
+    // segments so we never schedule concurrent Move tasks for the same key.
+    // This avoids ReplicationTask conflicts when draining multiple segments
+    // that all hold replicas of the same key.
     std::unordered_set<std::string> active_unit_keys;
+    std::unordered_set<std::string> active_keys;
     for (const auto& [_, task] : job.active_tasks) {
         active_unit_keys.insert(task.unit_key);
+        active_keys.insert(task.tenant_id + ":" + task.key);
     }
 
+    std::unordered_set<std::string> keys_in_plan;
     std::unordered_set<std::string> blocked_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -7108,6 +7123,15 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             MetadataShardAccessorRO shard(this, i);
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 for (const auto& [key, metadata] : tenant_state.metadata) {
+                    // Skip if this key already has an in-flight Move task
+                    // (from any source segment) or is already planned in
+                    // this batch.
+                    const auto composite_key = tenant_id + ":" + key;
+                    if (active_keys.contains(composite_key) ||
+                        keys_in_plan.contains(composite_key)) {
+                        continue;
+                    }
+
                     for (const auto& source_segment : job.request.segments) {
                         const auto unit_key =
                             MakeDrainUnitKey(tenant_id, key, source_segment);
@@ -7142,6 +7166,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                         }
 
                         if (plans.size() < slots) {
+                            keys_in_plan.insert(composite_key);
                             plans.push_back({tenant_id, key, source_segment,
                                              *target, metadata.size, unit_key});
                         }

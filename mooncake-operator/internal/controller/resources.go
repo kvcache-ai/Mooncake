@@ -58,14 +58,28 @@ func (r *MooncakeClusterReconciler) buildMasterStatefulSet(mc *mooncakev1alpha1.
 							Name:            "master",
 							Image:           image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Command: []string{
-								"mooncake_master",
-								"--config_path=/etc/mooncake/master.json",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(
+									`cp /etc/mooncake/master.json /tmp/master.json && `+
+										`sed 's/}$/,"local_hostname":"'"${POD_IP}:%d"'"}/' `+
+										`/tmp/master.json > /tmp/patched.json && `+
+										`exec mooncake_master --config_path=/tmp/patched.json`,
+									mc.Spec.Master.RPCPort,
+								),
 							},
 							Env: []corev1.EnvVar{
 								{
 									Name:  "LD_LIBRARY_PATH",
 									Value: "/usr/local/lib/mooncake",
+								},
+								{
+									Name: "POD_IP",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "status.podIP",
+										},
+									},
 								},
 							},
 							Ports: []corev1.ContainerPort{

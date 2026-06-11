@@ -308,6 +308,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_address);
     default_config.GetString("rpc_interface", &master_config.rpc_interface,
                              FLAGS_rpc_interface);
+    default_config.GetString("local_hostname", &master_config.local_hostname,
+                             "");
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);

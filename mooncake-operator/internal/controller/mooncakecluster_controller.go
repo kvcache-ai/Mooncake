@@ -454,10 +454,11 @@ func (r *MooncakeClusterReconciler) reconcileMasterStatefulSet(ctx context.Conte
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.Template.Spec.Containers[0].Image = desired.Spec.Template.Spec.Containers[0].Image
 	existing.Spec.Template.Spec.Containers[0].ImagePullPolicy = desired.Spec.Template.Spec.Containers[0].ImagePullPolicy
-	existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
-	existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
-	existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
-	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
+		existing.Spec.Template.Spec.Containers[0].Command = desired.Spec.Template.Spec.Containers[0].Command
+		existing.Spec.Template.Spec.Containers[0].Args = desired.Spec.Template.Spec.Containers[0].Args
+		existing.Spec.Template.Spec.Containers[0].Env = desired.Spec.Template.Spec.Containers[0].Env
+		existing.Spec.Template.Spec.Containers[0].Resources = desired.Spec.Template.Spec.Containers[0].Resources
+		existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
 	return r.Patch(ctx, &existing, patchBase)
 }
 
@@ -474,6 +475,9 @@ func statefulSetSpecsEqual(a, b *appsv1.StatefulSetSpec) bool {
 		return false
 	}
 	if !stringSlicesEqual(ac.Command, bc.Command) {
+		if !stringSlicesEqual(ac.Args, bc.Args) {
+			return false
+		}
 		return false
 	}
 	if !envVarsEqual(ac.Env, bc.Env) {

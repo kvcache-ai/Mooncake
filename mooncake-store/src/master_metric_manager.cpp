@@ -817,6 +817,10 @@ int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
 }
 
+void MasterMetricManager::reset_active_clients() {
+    active_clients_.update(0);
+}
+
 // Store-observed cache reuse metrics
 void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
     mem_cache_hit_nums_.inc(val);
