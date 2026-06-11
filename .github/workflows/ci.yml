@@ -363,7 +363,8 @@ jobs:
         sudo dpkg -i cuda-keyring_1.1-1_all.deb
         sudo apt-get update
         sudo apt-get install -y cuda-toolkit-12-8
-        nvcc --version
+        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+        /usr/local/cuda/bin/nvcc --version
       shell: bash
 
     - name: Run sccache-cache
