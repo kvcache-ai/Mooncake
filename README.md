@@ -113,15 +113,22 @@ The core of Mooncake is the Transfer Engine (TE), a high-performance data transf
 
 ### Mooncake Store
 
-Mooncake Store is built on the Transfer Engine and provides distributed key/value caching. It is a distributed KVCache storage engine specialized for LLM inference. The goal of Mooncake Store is to store the reusable KV caches across various locations in an inference cluster. Mooncake Store has been supported in [SGLang's Hierarchical KV Caching](https://lmsys.org/blog/2025-09-10-sglang-hicache/), [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) and is now integrated with [LMCache](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmcache-integration.html) to provide enhanced KVCache management capabilities. See the [Mooncake Store guide](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html).
+Mooncake Store is a high-performance distributed key-value cache storage engine designed for LLM inference. Built on the Transfer Engine, it stores and manages reusable KV caches and model weights across inference clusters, with support for efficient object storage, replication, eviction, and high-bandwidth data transfer. See the [Mooncake Store guide](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html) for details.
 
-#### Highlights
+<details>
+<summary>Highlights</summary>
 
-- **High bandwidth utilization**: Mooncake Store supports large-object striping, parallel I/O, and end-to-end zero-copy data transfer, fully utilizing aggregated bandwidth across multiple NICs.
+- **High bandwidth utilization.** Mooncake Store supports large-object striping, parallel I/O, and end-to-end zero-copy data transfer, fully utilizing aggregated bandwidth across multiple NICs.
 
 - **Multi-tier cache hierarchy**. Mooncake Store supports a multi-level cache design across DRAM and SSD/NVMe, enabling larger cache capacity.
 
-- **Elastic and disaggregated storage**: Mooncake Store decouples KVCache storage from inference engines, allowing storage nodes to be dynamically added or removed while keeping cached data independent from engine restarts, upgrades, and scheduling decisions.
+- **Elastic and disaggregated storage.** Mooncake Store decouples KVCache storage from inference engines, allowing storage nodes to be dynamically added or removed while keeping cached data independent from engine restarts, upgrades, and scheduling decisions.
+
+- **Programmatic object management.** Mooncake Store allows applications to control object placement and lifecycle through per-object policies, including replica counts, preferred segments, soft pin, and hard pin. These controls help inference systems protect important KV caches and model weights while guiding replication, placement, and eviction behavior.
+
+- **Broad ecosystem adoption.** Broad ecosystem adoption. Mooncake Store is used across the LLM systems ecosystem as a high-performance distributed storage backend for KV caches, hidden states, and model weights. It supports integrations with [SGLang's Hierarchical KV Caching](https://lmsys.org/blog/2025-09-10-sglang-hicache/), [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html), and [LMCache](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmcache-integration.html), and has been adopted by systems such as [TorchSpec](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) and [TransferQueue](https://github.com/Ascend/TransferQueue) to decouple inference, training, and reinforcement-learning workloads through efficient state management and asynchronous data movement.
+
+</details>
 
 ### Elastic Expert Parallelism Support
 
@@ -221,6 +228,11 @@ pip install mooncake-transfer-engine-cuda13
 **For non-CUDA systems:**
 ```bash
 pip install mooncake-transfer-engine-non-cuda
+```
+
+**For NPU systems:**
+```bash
+pip install mooncake-transfer-engine-npu
 ```
 
 > [!IMPORTANT]
