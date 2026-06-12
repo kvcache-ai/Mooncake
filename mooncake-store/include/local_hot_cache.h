@@ -20,6 +20,16 @@
 namespace mooncake {
 
 /**
+ * @brief Token captured at async hot cache fill submission time.
+ * Invalidated when RemoveHotKey, BumpKeyGeneration, or Clear bumps
+ * generation/epoch.
+ */
+struct HotCachePutToken {
+    uint64_t cache_epoch = 0;
+    uint64_t key_generation = 0;
+};
+
+/**
  * @brief Memory block metadata for hot cache.
  */
 struct HotMemBlock {
@@ -92,6 +102,65 @@ class LocalHotCache {
     bool TouchHotKey(const std::string& key);
 
     /**
+     * @brief Remove a key from the hot cache immediately.
+     * Bumps the key generation so in-flight async fills are invalidated.
+     * @param key The key to remove from cache.
+     * @return true if a published cache entry was removed, false otherwise.
+     */
+    bool RemoveHotKey(const std::string& key);
+
+    /**
+     * @brief Remove a batch of keys from the hot cache under one lock.
+     * Bumps each key generation so in-flight async fills are invalidated.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveHotKeys(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Remove cached keys matching a regex from the hot cache.
+     * Bumps key generation for matching published entries.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveHotKeysByRegex(const std::string& regex_pattern);
+
+    /**
+     * @brief Remove every published hot cache entry and invalidate async fills.
+     * @return number of published cache entries removed.
+     */
+    size_t RemoveAllHotKeys();
+
+    /**
+     * @brief Invalidate in-flight async fills for a key without evicting it.
+     */
+    void BumpKeyGeneration(const std::string& key);
+
+    /**
+     * @brief Invalidate in-flight async fills for multiple keys.
+     */
+    void BumpKeyGenerations(const std::vector<std::string>& keys);
+
+    /**
+     * @brief Invalidate all in-flight async fills without evicting entries.
+     */
+    void BumpCacheEpoch();
+
+    /**
+     * @brief Clear all hot cache entries and invalidate in-flight async fills.
+     */
+    void Clear();
+
+    /**
+     * @brief Capture the current put token for async hot cache fill validation.
+     */
+    HotCachePutToken AcquirePutToken(const std::string& key);
+
+    /**
+     * @brief Check whether an async put token is still valid.
+     */
+    bool IsPutTokenValid(const std::string& key,
+                         const HotCachePutToken& token) const;
+
+    /**
      * @brief Get a free block for writing.
      * Detaches a block from the LRU tail (evicting if necessary) and returns
      * it. The returned block is owned by the caller and must be returned via
@@ -146,6 +215,7 @@ class LocalHotCache {
    private:
     // Drain deferred LRU touches: splice accessed blocks to front
     void drainDeferredTouches();
+    bool removeHotKeyLocked(const std::string& key);
 
     size_t block_size_;  // Actual block size used by this cache
 
@@ -165,6 +235,9 @@ class LocalHotCache {
     // key -> iterator of lru_queue_
     std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>
         key_to_lru_it_ GUARDED_BY(lru_mutex_);
+    std::unordered_map<std::string, uint64_t> key_generation_
+        GUARDED_BY(lru_mutex_);
+    std::atomic<uint64_t> cache_epoch_{0};
 };
 
 /**
@@ -175,13 +248,19 @@ struct HotCachePutTask {
     HotMemBlock* block;  // Pointer to the allocated block
     size_t size;
     std::shared_ptr<LocalHotCache> hot_cache;
+    HotCachePutToken token;
 
     // Default constructor for empty task
     HotCachePutTask() : block(nullptr), size(0), hot_cache(nullptr) {}
 
     HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
-                    std::shared_ptr<LocalHotCache> cache)
-        : key(k), block(blk), size(slice.size), hot_cache(std::move(cache)) {
+                    std::shared_ptr<LocalHotCache> cache,
+                    HotCachePutToken put_token)
+        : key(k),
+          block(blk),
+          size(slice.size),
+          hot_cache(std::move(cache)),
+          token(put_token) {
         // No data copy here; memcpy is done by SubmitPutTask into block->addr.
     }
 };
