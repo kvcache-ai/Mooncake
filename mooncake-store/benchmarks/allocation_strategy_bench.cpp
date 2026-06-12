@@ -397,6 +397,8 @@ static std::string strategyName(AllocationStrategyType type) {
             return "Random";
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return "FreeRatioFirst";
+        case AllocationStrategyType::SIZE_CLASS_AWARE:
+            return "SizeClassAware";
         default:
             return "Unknown";
     }
@@ -1058,6 +1060,7 @@ static void runFillupBenchmarks() {
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
+        AllocationStrategyType::SIZE_CLASS_AWARE,
     };
 
     std::cout
@@ -1121,7 +1124,8 @@ static void runScaleOutMatrix() {
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
-        AllocationStrategyType::FREE_RATIO_FIRST};
+        AllocationStrategyType::FREE_RATIO_FIRST,
+        AllocationStrategyType::SIZE_CLASS_AWARE};
 
     std::cout
         << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n"
@@ -1187,6 +1191,7 @@ static void runDsaMatrix() {
     std::vector<AllocationStrategyType> strategies = {
         AllocationStrategyType::RANDOM,
         AllocationStrategyType::FREE_RATIO_FIRST,
+        AllocationStrategyType::SIZE_CLASS_AWARE,
     };
 
     size_t seg_cap_mb = static_cast<size_t>(FLAGS_dsa_segment_capacity);

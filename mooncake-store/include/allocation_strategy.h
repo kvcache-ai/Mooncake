@@ -538,6 +538,300 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 };
 
+/**
+ * @brief Size-class-aware allocation strategy.
+ *
+ * Mixed KVCache-style workloads often contain many small metadata/indexer
+ * objects and fewer large KV blocks. If all requests simply chase the highest
+ * free ratio, small objects can consume the largest contiguous holes that later
+ * large objects need. This strategy keeps the public allocation API unchanged
+ * and uses only allocator-level observations:
+ *
+ * - small (<= 64 KiB): prefer the smallest largest-free-region that can still
+ *   fit the request. This packs small objects into already fragmented segments.
+ * - medium (<= 1 MiB): prefer moderate free ratio and smaller holes to balance
+ *   packing with load distribution.
+ * - large (> 1 MiB): prefer the largest contiguous free region, then free
+ *   ratio. This preserves large-object success under fragmentation.
+ *
+ * Replica placement remains best-effort and still avoids duplicate segments
+ * for replicas of the same slice.
+ */
+class SizeClassAwareAllocationStrategy : public RandomAllocationStrategy {
+   public:
+    SizeClassAwareAllocationStrategy() = default;
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& names = allocator_manager.getNames();
+        if (names.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+
+        // Fast path: when there is only one segment, size-class ranking cannot
+        // change placement. Match RandomAllocationStrategy and avoid segment
+        // metric collection/sorting overhead.
+        if (names.size() == 1) {
+            if (excluded_segments.contains(names[0])) {
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[0],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                return replicas;
+            }
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        std::set<std::string> used_segments;
+
+        for (const auto& preferred_segment : preferred_segments) {
+            if (excluded_segments.contains(preferred_segment) ||
+                used_segments.contains(preferred_segment)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(preferred_segment);
+                if (replicas.size() == replica_num) {
+                    return replicas;
+                }
+            }
+        }
+
+        std::vector<Candidate> candidates =
+            buildCandidates(allocator_manager, names, slice_length,
+                            replica_num - replicas.size(), excluded_segments,
+                            used_segments, generator);
+        sortCandidates(candidates, classify(slice_length));
+
+        for (const auto& candidate : candidates) {
+            if (replicas.size() >= replica_num) {
+                break;
+            }
+
+            const auto& name = names[candidate.name_idx];
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(name);
+            }
+        }
+
+        if (replicas.size() >= replica_num) {
+            return replicas;
+        }
+
+        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+        size_t fallback_idx = distribution(generator);
+        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        size_t try_count = 0;
+
+        while (replicas.size() < replica_num && try_count < max_retry) {
+            auto index = fallback_idx % names.size();
+            fallback_idx++;
+            try_count++;
+
+            if (excluded_segments.contains(names[index]) ||
+                used_segments.contains(names[index])) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(names[index]);
+            }
+        }
+
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    enum class SizeClass {
+        SMALL,
+        MEDIUM,
+        LARGE,
+    };
+
+    struct Candidate {
+        size_t name_idx;
+        double free_ratio;
+        size_t largest_free_region;
+    };
+
+    static constexpr size_t kSmallThreshold = 64 * 1024;
+    static constexpr size_t kMediumThreshold = 1024 * 1024;
+    static constexpr size_t kMaxRetryLimit = 100;
+    // Inspecting every segment on each allocation can dominate benchmark time
+    // on large clusters. Sampling keeps the strategy O(replica_num) while still
+    // giving each size class enough choices to avoid obvious fragmentation.
+    static constexpr size_t kCandidateMultiplier = 16;
+    static constexpr size_t kMinCandidateSample = 32;
+
+    SizeClass classify(size_t slice_length) const {
+        if (slice_length <= kSmallThreshold) {
+            return SizeClass::SMALL;
+        }
+        if (slice_length <= kMediumThreshold) {
+            return SizeClass::MEDIUM;
+        }
+        return SizeClass::LARGE;
+    }
+
+    std::vector<Candidate> buildCandidates(
+        const AllocatorManager& allocator_manager,
+        const std::vector<std::string>& names, size_t slice_length,
+        size_t remaining_replicas,
+        const std::set<std::string>& excluded_segments,
+        const std::set<std::string>& used_segments,
+        std::mt19937& generator) const {
+        std::vector<Candidate> candidates;
+        if (remaining_replicas == 0) return candidates;
+
+        const size_t sample_count =
+            std::min(std::max(kMinCandidateSample,
+                              kCandidateMultiplier * remaining_replicas),
+                     names.size());
+        candidates.reserve(sample_count);
+
+        std::uniform_int_distribution<size_t> start_dist(0, names.size() - 1);
+        size_t start_idx = start_dist(generator);
+
+        for (size_t i = 0; i < sample_count; ++i) {
+            size_t name_idx = (start_idx + i) % names.size();
+            const auto& name = names[name_idx];
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+
+            SegmentStats stats = getSegmentStats(allocator_manager, name);
+            if (!stats.valid || stats.largest_free_region < slice_length) {
+                continue;
+            }
+
+            candidates.push_back(
+                {name_idx, stats.free_ratio, stats.largest_free_region});
+        }
+
+        return candidates;
+    }
+
+    void sortCandidates(std::vector<Candidate>& candidates,
+                        SizeClass size_class) const {
+        switch (size_class) {
+            case SizeClass::SMALL:
+                std::sort(
+                    candidates.begin(), candidates.end(),
+                    [](const Candidate& a, const Candidate& b) {
+                        if (a.largest_free_region != b.largest_free_region) {
+                            return a.largest_free_region <
+                                   b.largest_free_region;
+                        }
+                        return a.free_ratio < b.free_ratio;
+                    });
+                break;
+            case SizeClass::MEDIUM:
+                std::sort(candidates.begin(), candidates.end(),
+                          [](const Candidate& a, const Candidate& b) {
+                              double a_score =
+                                  a.free_ratio /
+                                  static_cast<double>(a.largest_free_region);
+                              double b_score =
+                                  b.free_ratio /
+                                  static_cast<double>(b.largest_free_region);
+                              if (a_score != b_score) {
+                                  return a_score > b_score;
+                              }
+                              return a.free_ratio > b.free_ratio;
+                          });
+                break;
+            case SizeClass::LARGE:
+                std::sort(
+                    candidates.begin(), candidates.end(),
+                    [](const Candidate& a, const Candidate& b) {
+                        if (a.largest_free_region != b.largest_free_region) {
+                            return a.largest_free_region >
+                                   b.largest_free_region;
+                        }
+                        return a.free_ratio > b.free_ratio;
+                    });
+                break;
+        }
+    }
+
+    struct SegmentStats {
+        bool valid = false;
+        double free_ratio = 0.0;
+        size_t largest_free_region = 0;
+    };
+
+    SegmentStats getSegmentStats(const AllocatorManager& allocator_manager,
+                                 const std::string& name) const {
+        auto allocators = allocator_manager.getAllocators(name);
+        if (!allocators || allocators->empty()) return {};
+
+        size_t total_capacity = 0;
+        size_t total_free = 0;
+        size_t largest_free_region = 0;
+
+        for (const auto& alloc : *allocators) {
+            if (!alloc) continue;
+            const size_t capacity = alloc->capacity();
+            const size_t used = alloc->size();
+            if (used > capacity) continue;
+
+            total_capacity += capacity;
+            total_free += capacity - used;
+
+            size_t allocator_largest = alloc->getLargestFreeRegion();
+            if (allocator_largest == kAllocatorUnknownFreeSpace) {
+                allocator_largest = capacity - used;
+            }
+            largest_free_region =
+                std::max(largest_free_region, allocator_largest);
+        }
+
+        if (total_capacity == 0) return {};
+        return {
+            true,
+            static_cast<double>(total_free) /
+                static_cast<double>(total_capacity),
+            largest_free_region,
+        };
+    }
+};
+
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
@@ -609,6 +903,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<RandomAllocationStrategy>();
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
+        case AllocationStrategyType::SIZE_CLASS_AWARE:
+            return std::make_shared<SizeClassAwareAllocationStrategy>();
         case AllocationStrategyType::CXL:
             return std::make_shared<CxlAllocationStrategy>();
         default:
