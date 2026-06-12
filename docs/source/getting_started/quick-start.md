@@ -16,7 +16,13 @@ pip install mooncake-transfer-engine
 ```bash
 pip install mooncake-transfer-engine-non-cuda
 ```
+
 📦 **Package Details**: [https://pypi.org/project/mooncake-transfer-engine-non-cuda/](https://pypi.org/project/mooncake-transfer-engine-non-cuda/)
+
+**Additional dependencies for the examples below:**
+```bash
+pip install numpy pyzmq
+```
 
 > **Note**: The CUDA version includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+. The non-CUDA version is for environments without CUDA dependencies.
 
@@ -146,9 +152,9 @@ def main():
     # Register memory with Mooncake
     if PROTOCOL == "rdma":
         ret_value = client_engine.register_memory(client_ptr, client_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
+        if ret_value != 0:
+            print("Mooncake memory registration failed.")
+            raise RuntimeError("Mooncake memory registration failed.")
 
     print(f"Client initialized with session ID: {session_id}")
 
