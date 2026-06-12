@@ -163,28 +163,20 @@ Mooncake is deeply integrated into [SGLang](https://github.com/sgl-project/sglan
 
 </details>
 
-### vLLM Integration ([Guide v0.2](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllm-integration-v0.2.html))
+### vLLM Integration ([Guide](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/index.html))
 
-To optimize LLM inference, the vLLM community is working on supporting [disaggregated prefilling (PR 10502)](https://github.com/vllm-project/vllm/pull/10502). This feature allows separating the **prefill** phase from the **decode** phase in different processes. vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
+Mooncake integrates with vLLM to accelerate large language model serving through high-performance KV cache transfer and distributed KV cache storage. The integration supports both disaggregated prefill-decode serving and cross-instance KV cache sharing, helping vLLM deployments reduce TTFT, improve cache reuse, and scale more efficiently across multi-node inference clusters.
 
-We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer** [(PR 10884)](https://github.com/vllm-project/vllm/pull/10884). Transfer Engine provides simpler interfaces and more efficient use of RDMA devices.
+<details>
+<summary>Highlights</summary>
 
-We will soon release the new vLLM integration based on Mooncake Store, which supports xPyD prefill/decode disaggregation.
+- **Disaggregated prefill-decode serving**: Mooncake enables vLLM to split prefill and decode workloads across different nodes. Through MooncakeConnector, vLLM transfers KV cache blocks from prefill workers to decode workers using Mooncake’s high-performance transfer engine, allowing prefill and decode resources to scale independently while keeping cross-node KV transfer overhead low.
 
-**_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllm-integration-v0.2.html)) that is based on vLLM's main branch._**
+- **Distributed KV cache pooling and sharing**: [Mooncake Store extends vLLM](https://vllm.ai/blog/2026-05-06-mooncake-store) from isolated per-instance KV caches to a shared, cluster-level KV cache pool. Through MooncakeStoreConnector, multiple vLLM instances can store, retrieve, and reuse KV cache blocks based on hash-based prefix caching, reducing redundant prefill computation and improving cache efficiency for workloads with repeated prefixes, especially agentic and multi-turn serving scenarios.
 
-#### Performance
-By supporting Topology-Aware Path Selection and multi-card bandwidth aggregation, the mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
-In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy.
+* **vLLM-Omni stage communication**: Mooncake also integrates with [vLLM-Omni](https://github.com/vllm-project/vllm-omni) through `MooncakeTransferEngineConnector` and `MooncakeStoreConnector`, enabling efficient cross-node data exchange between vLLM-Omni stages.
 
-| Backend/Setting                                         | Output Token Throughput (tok/s) | Total Token Throughput (tok/s) | Mean TTFT (ms) | Median TTFT (ms) | P99 TTFT (ms)|
-|---------------------------------------------------------|---------------------------------|--------------------------------|----------------|------------------|---------------|
-| Transfer Engine (RDMA) | 12.06                           | 2042.74                        | 1056.76        | 635.00           | 4006.59       |
-| TCP  | 12.05                           | 2041.13                        | 1414.05        | 766.23          | 6035.36       |
-
-- Click [here](https://kvcache-ai.github.io/Mooncake/performance/vllm-benchmark-results-v0.2.html) to access detailed benchmark results.
-
-**More advanced features are coming soon, so stay tuned!**
+</details>
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 
