@@ -151,7 +151,7 @@ Mooncake is deeply integrated into [SGLang](https://github.com/sgl-project/sglan
 
 - **Elastic Expert Parallel**: Mooncake's collective communication backend and expert parallel kernels are integrated into SGLang to enable fault-tolerant expert parallel inference ([Elastic EP](https://www.lmsys.org/blog/2026-03-25-eep-partial-failure-tolerance/)).
 
-- **Cloud-Native SGLang HiCache Deployment with RBG**: The RBG + SGLang HiCache + Mooncake integration provides a role-based, out-of-the-box cloud-native deployment solution that is elastic, scalable, and optimized for high-performance inference workloads.
+- **Cloud-Native SGLang HiCache Deployment with RBG**: The [RBG](https://github.com/sgl-project/rbg) + SGLang HiCache + Mooncake integration provides a role-based, out-of-the-box cloud-native deployment solution that is elastic, scalable, and optimized for high-performance inference workloads.
 
 - **Encode-Prefill-Decode Disaggregation for Multimodal Serving**": SGLang introduces Encode-Prefill-Decode disaggregation with Mooncake as a transfer backend. This enables compute-intensive multimodal encoders, such as Vision Transformers, to be decoupled from language model workers while transferring large embeddings efficiently through Mooncake’s RDMA-based engine.
 
