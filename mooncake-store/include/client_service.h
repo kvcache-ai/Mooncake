@@ -702,6 +702,11 @@ class Client {
     ErrorCode InitLocalHotCache();
 
     /**
+     * @brief Unregister local hot cache backing memory from TransferEngine.
+     */
+    void UnregisterLocalHotCacheMemory();
+
+    /**
      * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
      * @return Cache size in bytes, or 0 if not set or invalid
      */
@@ -905,6 +910,7 @@ class Client {
     // Local hot cache and async handler
     std::shared_ptr<LocalHotCache> hot_cache_;
     std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
+    bool hot_cache_memory_registered_{false};
 
     // Frequency admission: only cache keys whose CMS count >= threshold
     std::unique_ptr<CountMinSketch> admission_sketch_;
