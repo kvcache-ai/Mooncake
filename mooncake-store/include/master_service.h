@@ -33,6 +33,7 @@
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
+#include "kv_event/kv_event_publisher.h"
 
 namespace mooncake {
 namespace ha {
@@ -258,6 +259,9 @@ class MasterService {
     auto BatchQueryIp(const std::vector<UUID>& client_ids) -> tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>;
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -1901,6 +1905,20 @@ class MasterService {
     std::mutex job_mutex_;
     std::unordered_map<UUID, std::shared_ptr<DrainJob>, boost::hash<UUID>>
         drain_jobs_ GUARDED_BY(job_mutex_);
+
+    std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+
+    static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
+    static std::string MediumForReplicaType(ReplicaType replica_type);
+    static std::string MediumForMetadata(const ObjectMetadata& metadata);
+    void PublishKvStored(const std::string& key, ReplicaType replica_type,
+                         const ObjectMetadata& metadata);
+    void PublishKvRemoved(const std::string& key,
+                          const ObjectMetadata& metadata);
+    void PublishKvRemoved(const std::string& key, const std::string& medium);
+    void PublishKvRemovedAfterEvict(const std::string& key,
+                                    uint64_t freed_bytes,
+                                    const ObjectMetadata& metadata);
 };
 
 }  // namespace mooncake

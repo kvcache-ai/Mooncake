@@ -50,6 +50,13 @@ fi
 
 CGO_LDFLAGS+=" -luring"
 
+# KV events publisher (optional; linked when libzmq is installed).
+if ldconfig -p 2>/dev/null | grep -q libzmq \
+    || [ -f /usr/lib/x86_64-linux-gnu/libzmq.so ] \
+    || [ -f /usr/lib/libzmq.so ]; then
+    CGO_LDFLAGS+=" -lzmq"
+fi
+
 if [ "$USE_ETCD" = "ON" ]; then
     if [ "$USE_ETCD_LEGACY" = "ON" ]; then
         CGO_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
