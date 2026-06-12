@@ -18,6 +18,13 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
+void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
+                    void* const* ipc_peer_ptrs, int* ack_buffer, int rank,
+                    int num_ranks, int epoch, cudaStream_t stream);
+
+void wait_phase_ack(int* ack_buffer, int rank, int num_ranks, int epoch,
+                    cudaStream_t stream, int64_t timeout_ticks);
+
 void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,

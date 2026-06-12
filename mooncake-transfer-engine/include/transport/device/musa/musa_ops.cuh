@@ -39,18 +39,21 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
 __device__ __forceinline__ void mc_st_release(const int* ptr, int val) {
     __threadfence_system();
     *const_cast<volatile int*>(ptr) = val;
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void mc_st_release_u32(const uint32_t* ptr,
                                                   uint32_t val) {
     __threadfence_system();
     *const_cast<volatile uint32_t*>(ptr) = val;
+    __threadfence_system();
 }
 
 __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,
                                                   uint64_t val) {
     __threadfence_system();
     *const_cast<volatile uint64_t*>(ptr) = val;
+    __threadfence_system();
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +61,9 @@ __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     __threadfence_system();
-    return atomicAdd(const_cast<int*>(ptr), val);
+    int ret = atomicAdd(const_cast<int*>(ptr), val);
+    __threadfence_system();
+    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +121,26 @@ __device__ __forceinline__ void mc_bar_sync(int /*bar_id*/,
 // launches, so SEND and RECV never share a kernel invocation.  No-op.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_grid_sync() {}
+
+// ---------------------------------------------------------------------------
+// System-level memory fence: MUSA requires explicit __threadfence_system()
+// for cross-GPU (MTLink) visibility.  CUDA hardware guarantees this without
+// explicit fences, so mc_fence() is a no-op there.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence() {
+    __threadfence_system();
+}
+
+// ---------------------------------------------------------------------------
+// Fence/barrier/fence: ensures all threads' writes are globally visible
+// before any thread proceeds.  On MUSA, __syncthreads() does NOT imply a
+// memory fence, so explicit fences are needed on both sides.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void mc_fence_barrier_fence() {
+    __threadfence_system();
+    __syncthreads();
+    __threadfence_system();
+}
 
 // ---------------------------------------------------------------------------
 // Byte-swap helpers — MUSA has no __byte_perm; implement manually.

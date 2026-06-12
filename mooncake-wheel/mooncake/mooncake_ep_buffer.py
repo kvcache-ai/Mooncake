@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
@@ -233,6 +234,20 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        # MUSA does not support cooperative grid sync, so the C++ runtime
+        # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
+        # a single cooperative kernel.  async_finish still returns a stream
+        # event, but it is not the CUDA single-kernel cooperative path.
+        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+            import warnings
+
+            warnings.warn(
+                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "event, not CUDA cooperative single-kernel async semantics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         if self._use_fallback:
             from mooncake.ep import get_active_ranks
 
@@ -315,6 +330,17 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        # Same MUSA split-kernel behavior as dispatch().
+        if os.getenv("MOONCAKE_EP_USE_MUSA") and async_finish:
+            import warnings
+
+            warnings.warn(
+                "MUSA async_finish uses split SEND/RECV kernels plus a stream "
+                "event, not CUDA cooperative single-kernel async semantics.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         (
             src_info,
             layout_range,

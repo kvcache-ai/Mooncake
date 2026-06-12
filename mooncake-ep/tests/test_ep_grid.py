@@ -180,10 +180,13 @@ def run_test_iteration(
     )
 
     torch.cuda.synchronize()
-    dist.barrier(group)
+    if fail_rank == -1:
+        dist.barrier(group)
 
 
 def worker(rank, world_size, config_dict):
+    import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
+
     # Device filter
     device_filter = [
         f
@@ -211,11 +214,12 @@ def worker(rank, world_size, config_dict):
         traceback.print_exc()
         raise
 
-    dist.destroy_process_group()
+    os._exit(0)
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
+        import torchada  # noqa: F401 — maps torch.cuda.* to torch.musa.* on MUSA
         self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
