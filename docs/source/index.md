@@ -133,6 +133,10 @@ design/unified-parallel-tensor-io
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
+<<<<<<< HEAD
+=======
+design/ssd-free-ratio-first-allocation
+>>>>>>> 46d5195d ( [Store] feat: Add SSD free-ratio-first allocation strategy)
 :::
 
 % API Documentation

@@ -86,6 +86,7 @@ struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
+    std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
         offloading_mutex_) offloading_objects;
     // Promotion-on-hit pending work for this client. Populated by master's
@@ -327,7 +328,7 @@ class ScopedAllocatorAccess {
  * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
  * LocalDiskOffloadingQueue usage
  */
-class ScopedLocalDiskSegmentAccess {
+class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
    public:
     explicit ScopedLocalDiskSegmentAccess(
         std::unordered_map<std::string, UUID>& client_by_name,
@@ -347,6 +348,9 @@ class ScopedLocalDiskSegmentAccess {
     getClientLocalDiskSegment() {
         return client_local_disk_segment_;
     }
+
+    int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
+    int64_t getSsdUsedBytes(const std::string& segment_name) const override;
 
    private:
     const std::unordered_map<std::string, UUID>&

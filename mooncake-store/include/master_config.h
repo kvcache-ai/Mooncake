@@ -451,12 +451,15 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::CXL;
         } else if (config.allocation_strategy == "random") {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
-                         << "Valid options are: random, free_ratio_first, cxl "
-                            "(case-sensitive)";
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
