@@ -57,24 +57,22 @@ Retrieve replica information for a specific key, including memory locations and 
 curl "http://localhost:8080/query_key?key=my_object"
 ```
 
-**Success Response**:
+**Success Response** (HTTP 200):
 ```json
 {
   "success": true,
   "data": [
     {
-      "buffer_descriptor": {
-        "size_": 1073741824,
-        "buffer_address_": 140732000000000,
-        "protocol_": "rdma",
-        "transport_endpoint_": "192.168.1.100:12345"
-      }
+      "size_": 1073741824,
+      "buffer_address_": 140732000000000,
+      "protocol_": "rdma",
+      "transport_endpoint_": "192.168.1.100:12345"
     }
   ]
 }
 ```
 
-**Error Response** (key not found):
+**Error Response** (key not found, HTTP 404):
 ```json
 {
   "success": false,
@@ -83,11 +81,11 @@ curl "http://localhost:8080/query_key?key=my_object"
 }
 ```
 
-**Error Response** (service unavailable):
+**Error Response** (service unavailable, HTTP 503):
 ```json
 {
   "success": false,
-  "error_code": 503,
+  "error_code": -1011,
   "error_message": "service plane is not active"
 }
 ```
