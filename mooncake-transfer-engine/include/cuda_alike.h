@@ -3,6 +3,8 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#elif defined(USE_TPU)
+#include "gpu_vendor/tpu.h"
 #elif defined(USE_HIP)
 #include "gpu_vendor/hip.h"
 #elif defined(USE_MUSA)
@@ -23,8 +25,9 @@
 #include <cuda_runtime.h>
 #endif
 
-#if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) && \
-    !defined(USE_UBSHMEM) && !defined(USE_MACA) && !defined(USE_SUNRISE)
+#if !defined(USE_TPU) && !defined(USE_HIP) && !defined(USE_MUSA) &&     \
+    !defined(USE_MLU) && !defined(USE_UBSHMEM) && !defined(USE_MACA) && \
+    !defined(USE_SUNRISE)
 #include <string>
 const static std::string GPU_PREFIX = "cuda:";
 #endif

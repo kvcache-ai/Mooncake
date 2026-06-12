@@ -118,10 +118,15 @@ if(USE_MLU)
   target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
+if(USE_TPU)
+  target_link_libraries(transfer_engine PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
 if(USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
                                                MPI::MPI)
 endif()
+
 
 if(USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)

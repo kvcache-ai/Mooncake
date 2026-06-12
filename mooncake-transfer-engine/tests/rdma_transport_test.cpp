@@ -48,13 +48,12 @@
 #include <cufile.h>
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_MLU) || defined(USE_MACA)
 
 #include <cassert>
 
-static void checkCudaError(cudaError_t result, const char *message) {
+static void checkCudaError(cudaError_t result, const char* message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
                    << cudaGetErrorString(result) << ")" << std::endl;
@@ -78,7 +77,7 @@ DEFINE_string(device_name, "mlx5_0",
 DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
 DEFINE_string(segment_id, "192.168.3.76", "Segment ID to access data");
-DEFINE_string(mem_backend, "auto", "Memory backend: auto|cpu|gpu|mlu");
+DEFINE_string(mem_backend, "auto", "Memory backend: auto|cpu|gpu|mlu|tpu");
 DEFINE_int32(device_id, -1, "Backend device ID");
 DEFINE_bool(use_wildcard_location, false,
             "Register memory with wildcard location");
@@ -100,35 +99,40 @@ std::string pickBackend() {
     }
 #if defined(USE_MLU)
     return "mlu";
-#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#elif defined(USE_TPU)
+    return FLAGS_use_vram ? "tpu" : "cpu";
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
     return FLAGS_use_vram ? "gpu" : "cpu";
 #else
     return "cpu";
 #endif
 }
 
-int pickDevId(const std::string &backend) {
+int pickDevId(const std::string& backend) {
     if (FLAGS_device_id >= 0) {
         return FLAGS_device_id;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
-    if (backend == "gpu") {
+#if defined(USE_TPU) || defined(USE_CUDA) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MACA)
+    if (backend == "gpu" || backend == "tpu") {
         return FLAGS_gpu_id;
     }
 #endif
     return 0;
 }
 
-bool usesDeviceMemory(const std::string &backend) { return backend != "cpu"; }
+bool usesDeviceMemory(const std::string& backend) { return backend != "cpu"; }
 
-void validateBackend(const std::string &backend) {
+void validateBackend(const std::string& backend) {
     if (backend == "cpu") {
         return;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
-    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_TPU)
+    if (backend == "tpu") {
+        return;
+    }
+#endif
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)
     if (backend == "gpu") {
         return;
     }
@@ -142,14 +146,14 @@ void validateBackend(const std::string &backend) {
     std::exit(EXIT_FAILURE);
 }
 
-std::string explicitLocation(const std::string &backend) {
+std::string explicitLocation(const std::string& backend) {
     if (backend == "cpu") {
         return "cpu:0";
     }
     return GPU_PREFIX + std::to_string(pickDevId(backend));
 }
 
-std::string registrationLocation(const std::string &backend) {
+std::string registrationLocation(const std::string& backend) {
     if (FLAGS_protocol != "rdma") {
         return "cpu:0";
     }
@@ -171,27 +175,25 @@ bool validateTransferSizes() {
     return true;
 }
 
-[[maybe_unused]] void setBackendDevice(const std::string &backend) {
+[[maybe_unused]] void setBackendDevice(const std::string& backend) {
     if (!usesDeviceMemory(backend)) {
         return;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MLU) || defined(USE_MACA)
     checkCudaError(cudaSetDevice(pickDevId(backend)), "Failed to set device");
 #else
     LOG(FATAL) << "Device memory backend is not available in this build";
 #endif
 }
 
-void *allocateMemoryPool(size_t size, int socket_id,
-                         const std::string &backend) {
+void* allocateMemoryPool(size_t size, int socket_id,
+                         const std::string& backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MLU) || defined(USE_MACA)
         setBackendDevice(backend);
-        void *d_buf = nullptr;
+        void* d_buf = nullptr;
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
         return d_buf;
@@ -203,11 +205,10 @@ void *allocateMemoryPool(size_t size, int socket_id,
     return numa_alloc_onnode(size, socket_id);
 }
 
-void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
+void freeMemoryPool(void* addr, size_t size, const std::string& backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MLU) || defined(USE_MACA)
         cudaFree(addr);
         return;
 #else
@@ -217,12 +218,11 @@ void freeMemoryPool(void *addr, size_t size, const std::string &backend) {
     numa_free(addr, size);
 }
 
-void copyFromHost(void *dst, const void *src, size_t size,
-                  const std::string &backend) {
+void copyFromHost(void* dst, const void* src, size_t size,
+                  const std::string& backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MLU) || defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice),
                        "Failed to copy host data to device");
         return;
@@ -233,12 +233,11 @@ void copyFromHost(void *dst, const void *src, size_t size,
     std::memcpy(dst, src, size);
 }
 
-void copyToHost(void *dst, const void *src, size_t size,
-                const std::string &backend) {
+void copyToHost(void* dst, const void* src, size_t size,
+                const std::string& backend) {
     if (usesDeviceMemory(backend)) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_TPU) || defined(USE_MUSA) || \
+    defined(USE_HIP) || defined(USE_MLU) || defined(USE_MACA)
         checkCudaError(cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost),
                        "Failed to copy device data to host");
         return;
@@ -249,7 +248,7 @@ void copyToHost(void *dst, const void *src, size_t size,
     std::memcpy(dst, src, size);
 }
 
-bool waitForTransfer(TransferEngine *engine, BatchID batch_id) {
+bool waitForTransfer(TransferEngine* engine, BatchID batch_id) {
     bool completed = false;
     TransferStatus status;
     while (!completed) {
@@ -265,8 +264,8 @@ bool waitForTransfer(TransferEngine *engine, BatchID batch_id) {
     return true;
 }
 
-int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
-                    void *addr, const std::string &backend) {
+int initiatorWorker(TransferEngine* engine, SegmentID segment_id, int thread_id,
+                    void* addr, const std::string& backend) {
     (void)thread_id;
     bindToSocket(0);
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
@@ -298,7 +297,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         TransferRequest entry;
         entry.opcode = TransferRequest::WRITE;
         entry.length = kDataLength;
-        entry.source = (uint8_t *)(addr);
+        entry.source = (uint8_t*)(addr);
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
         s = engine->submitTransfer(batch_id, {entry});
@@ -323,7 +322,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         TransferRequest entry;
         entry.opcode = TransferRequest::READ;
         entry.length = kDataLength;
-        entry.source = (uint8_t *)(addr) + kDataLength;
+        entry.source = (uint8_t*)(addr) + kDataLength;
         entry.target_id = segment_id;
         entry.target_offset = remote_base;
         s = engine->submitTransfer(batch_id, {entry});
@@ -340,7 +339,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
         }
     }
 
-    copyToHost(read_buf.get(), (uint8_t *)(addr) + kDataLength, kDataLength,
+    copyToHost(read_buf.get(), (uint8_t*)(addr) + kDataLength, kDataLength,
                backend);
     int ret = memcmp(write_buf.get(), read_buf.get(), kDataLength);
     LOG(INFO) << "Read Data: " << std::string(read_buf.get(), 16) << "...";
@@ -349,7 +348,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
     return ret == 0 ? 0 : EXIT_FAILURE;
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
+std::string formatDeviceNames(const std::string& device_names) {
     std::stringstream ss(device_names);
     std::string item;
     std::vector<std::string> tokens;
@@ -367,7 +366,7 @@ std::string formatDeviceNames(const std::string &device_names) {
     return formatted;
 }
 
-std::string loadNicPriorityMatrix(const std::string &backend) {
+std::string loadNicPriorityMatrix(const std::string& backend) {
     if (!FLAGS_nic_priority_matrix.empty()) {
         std::ifstream file(FLAGS_nic_priority_matrix);
         if (file.is_open()) {
@@ -391,11 +390,11 @@ std::string loadNicPriorityMatrix(const std::string &backend) {
     return matrix;
 }
 
-Transport *installTransport(TransferEngine *engine,
-                            const std::string &backend) {
+Transport* installTransport(TransferEngine* engine,
+                            const std::string& backend) {
     if (FLAGS_protocol == "rdma") {
         auto nic_priority_matrix = loadNicPriorityMatrix(backend);
-        void *args[2] = {const_cast<char *>(nic_priority_matrix.c_str()),
+        void* args[2] = {const_cast<char*>(nic_priority_matrix.c_str()),
                          nullptr};
         return engine->installTransport("rdma", args);
     }
@@ -429,10 +428,10 @@ int initiator() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
-    Transport *xport = installTransport(engine.get(), backend);
+    Transport* xport = installTransport(engine.get(), backend);
     LOG_ASSERT(xport);
 
-    void *addr = allocateMemoryPool(FLAGS_buffer_size, 0, backend);
+    void* addr = allocateMemoryPool(FLAGS_buffer_size, 0, backend);
     int rc = engine->registerLocalMemory(addr, FLAGS_buffer_size,
                                          registrationLocation(backend));
     LOG_ASSERT(!rc);
@@ -468,10 +467,10 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
-    auto *xport = installTransport(engine.get(), backend);
+    auto* xport = installTransport(engine.get(), backend);
     LOG_ASSERT(xport);
 
-    void *addr = allocateMemoryPool(FLAGS_buffer_size, 0, backend);
+    void* addr = allocateMemoryPool(FLAGS_buffer_size, 0, backend);
     int rc = engine->registerLocalMemory(addr, FLAGS_buffer_size,
                                          registrationLocation(backend));
     LOG_ASSERT(!rc);
@@ -485,7 +484,7 @@ int target() {
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
 
     if (FLAGS_mode == "initiator")

@@ -31,7 +31,7 @@
 #include "transport/transport.h"
 
 #include "cuda_alike.h"
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_TPU)
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
@@ -296,6 +296,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"tpu:0\": [[" +
            device_names +
            "], []], "
            " \"musa:0\": [[" +

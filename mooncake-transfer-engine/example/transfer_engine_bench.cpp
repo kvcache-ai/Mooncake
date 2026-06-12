@@ -36,7 +36,7 @@
 #endif
 
 #include "cuda_alike.h"
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_TPU)
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
@@ -136,7 +136,7 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on NPU " << gpu_id;
         checkAclError(aclrtSetDevice(gpu_id), "Failed to set device");
 #else
-        LOG(INFO) << "Allocating memory on GPU " << gpu_id;
+        LOG(INFO) << "Allocating memory on accelerator " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
         if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
@@ -313,12 +313,13 @@ static int determineBufferCount() {
         int gpu_num;
         LOG(INFO) << "VRAM is used";
         if (FLAGS_gpu_id == -1 && cudaGetDeviceCount(&gpu_num) == cudaSuccess) {
-            LOG(INFO) << "GPU ID is not specified, found " << gpu_num
-                      << " GPUs to use";
+            LOG(INFO) << "Device ID is not specified, found " << gpu_num
+                      << " accelerator devices to use";
             return gpu_num;
         } else {
-            LOG(INFO) << "GPU ID is specified or failed to get GPU count, use "
-                      << FLAGS_gpu_id << " GPU";
+            LOG(INFO)
+                << "Device ID is specified or failed to get device count, use "
+                << FLAGS_gpu_id << " accelerator";
             return 1;
         }
     }
@@ -476,6 +477,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"tpu:0\": [[" +
            device_names +
            "], []], "
            " \"musa:0\": [[" +

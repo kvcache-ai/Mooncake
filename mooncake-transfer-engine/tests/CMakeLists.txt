@@ -188,3 +188,28 @@ if (ENABLE_MULTI_PROTOCOL)
     target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest gtest_main)
     add_test(NAME mp_transport_test COMMAND mp_transport_test)
 endif()
+
+if (USE_TPU)
+    # Mock adapter shared library — simulates a single TPU device using CPU
+    # memory so the shim tests can run without real TPU hardware.
+    add_library(tpu_mock_adapter SHARED ${WORKSPACE}/tpu_mock_adapter.cpp)
+
+    # Test 1: shim behaviour with NO adapter present (safe to run in CI).
+    add_executable(tpu_adapter_no_tpu_test
+        ${WORKSPACE}/tpu_adapter_no_tpu_test.cpp)
+    target_include_directories(tpu_adapter_no_tpu_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    target_link_libraries(tpu_adapter_no_tpu_test PRIVATE gtest gtest_main dl)
+    add_test(NAME tpu_adapter_no_tpu_test COMMAND tpu_adapter_no_tpu_test)
+
+    # Test 2: shim call-through with mock adapter (no TPU hardware required).
+    add_executable(tpu_adapter_mock_test
+        ${WORKSPACE}/tpu_adapter_mock_test.cpp)
+    target_include_directories(tpu_adapter_mock_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    target_compile_definitions(tpu_adapter_mock_test PRIVATE
+        TPU_MOCK_ADAPTER_PATH="$<TARGET_FILE:tpu_mock_adapter>")
+    target_link_libraries(tpu_adapter_mock_test PRIVATE gtest gtest_main dl)
+    add_dependencies(tpu_adapter_mock_test tpu_mock_adapter)
+    add_test(NAME tpu_adapter_mock_test COMMAND tpu_adapter_mock_test)
+endif()
