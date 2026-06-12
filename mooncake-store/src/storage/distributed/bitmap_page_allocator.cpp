@@ -32,18 +32,34 @@ int64_t BitmapPageAllocator::Allocate(int64_t count) {
         return -1;
     }
 
-    for (int64_t scanned = 0; scanned < num_pages_; ++scanned) {
-        const int64_t start = (hint_ + scanned) % num_pages_;
-        if (start + count > num_pages_) {
-            continue;
+    auto find_in_range = [&](int64_t search_start,
+                             int64_t search_end) -> int64_t {
+        int64_t i = search_start;
+        while (i + count <= search_end) {
+            int64_t first_allocated = -1;
+            for (int64_t j = 0; j < count; ++j) {
+                if (IsAllocatedLocked(i + j)) {
+                    first_allocated = i + j;
+                    break;
+                }
+            }
+            if (first_allocated == -1) {
+                return i;
+            }
+            i = first_allocated + 1;
         }
-        if (!IsRangeFreeLocked(start, count)) {
-            continue;
-        }
+        return -1;
+    };
 
-        SetRangeLocked(start, count, true);
-        hint_ = (start + count) % num_pages_;
-        return start;
+    int64_t found = find_in_range(hint_, num_pages_);
+    if (found == -1 && hint_ > 0) {
+        found = find_in_range(0, hint_ + count - 1);
+    }
+
+    if (found != -1) {
+        SetRangeLocked(found, count, true);
+        hint_ = (found + count) % num_pages_;
+        return found;
     }
 
     return -1;
