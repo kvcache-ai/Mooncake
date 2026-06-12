@@ -23,7 +23,6 @@ def dequantize_fp8(x_fp8: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 def run_test_iteration(
     group: dist.ProcessGroup,
-    cpu_group: dist.ProcessGroup,
     rank: int,
     num_ranks: int,
     max_tokens: int,
@@ -91,7 +90,7 @@ def run_test_iteration(
     # 5s timeout if we simulate a failed rank
     timeout_us = 5 * 1_000_000 if fail_rank != -1 else -1
 
-    cpu_group.barrier()
+    dist.barrier(group)
 
     if rank == fail_rank:
         os._exit(0)
@@ -181,7 +180,7 @@ def run_test_iteration(
     )
 
     torch.cuda.synchronize()
-    dist.barrier(cpu_group)
+    dist.barrier(group)
 
 
 def worker(rank, world_size, config_dict):
@@ -200,12 +199,10 @@ def worker(rank, world_size, config_dict):
 
     dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
     group = dist.group.WORLD
-    cpu_group = dist.new_group(list(range(world_size)), backend="mooncake-cpu")
 
     try:
         run_test_iteration(
             group=group,
-            cpu_group=cpu_group,
             rank=rank,
             num_ranks=world_size,
             **config_dict,
