@@ -63,8 +63,12 @@ curl "http://localhost:8080/query_key?key=my_object"
   "success": true,
   "data": [
     {
-      "transport_endpoint_": "hostname:port",
-      "buffer_descriptor": {...}
+      "buffer_descriptor": {
+        "size_": 1073741824,
+        "buffer_address_": 140732000000000,
+        "protocol_": "rdma",
+        "transport_endpoint_": "192.168.1.100:12345"
+      }
     }
   ]
 }
