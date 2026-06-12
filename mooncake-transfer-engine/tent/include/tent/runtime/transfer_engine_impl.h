@@ -268,7 +268,7 @@ class TransferEngineImpl {
     std::atomic<int> rdma_failure_count_{0};
     std::atomic<uint64_t> rdma_failure_window_start_ns_{0};
     int rdma_failure_threshold_{3};
-    uint64_t rdma_failure_time_window_ns_{60000000000ULL};  // 60 seconds
+    uint64_t rdma_failure_time_window_ns_{300000000000ULL};  // 300 seconds (5 minutes)
 
     // Guards alive_batches_ and serializes pollTaskStatus /
     // updateTaskStatusAfterPoll / lazyFreeBatch against the optional

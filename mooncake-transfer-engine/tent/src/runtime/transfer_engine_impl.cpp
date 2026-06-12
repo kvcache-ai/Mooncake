@@ -1438,7 +1438,9 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
             rdma_failure_count_ >= rdma_failure_threshold_) {
             LOG(WARNING) << "RDMA failure threshold exceeded ("
                          << rdma_failure_count_
-                         << " failures), will bypass RDMA for 1 minute";
+                         << " failures), will bypass RDMA for "
+                         << (rdma_failure_time_window_ns_ / 1000000000ULL)
+                         << " seconds";
         }
     }
 
