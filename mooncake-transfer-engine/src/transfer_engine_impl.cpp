@@ -338,7 +338,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
         }
 
-#else
+#elif !defined(USE_SUNRISE)
+        // Sunrise classic installs its transport explicitly from tebench after
+        // benchmark-specific setup, so it skips the default auto transport
+        // path.
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {

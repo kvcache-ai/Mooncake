@@ -1,0 +1,6 @@
+if(USE_SUNRISE)
+  file(GLOB SUNRISE_LINK_TRANSPORT_SOURCES "*.cpp")
+  add_library(sunrise_link_transport OBJECT ${SUNRISE_LINK_TRANSPORT_SOURCES})
+  target_include_directories(sunrise_link_transport PUBLIC ${MC_TANGRT_ROOT}/include)
+  target_link_libraries(sunrise_link_transport PUBLIC glog::glog dl)
+endif()
