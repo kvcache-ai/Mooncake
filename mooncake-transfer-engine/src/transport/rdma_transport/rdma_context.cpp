@@ -654,9 +654,18 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
 int RdmaContext::deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) {
     // Tearing an endpoint down (path failure / QP fatal) means this peer is
     // failing; pause active reconnection to its address so the CQ poller isn't
-    // blocked re-handshaking a likely-gone peer. No-op when the TTL is 0.
-    if (endpoint_ptr) pauseConnect(endpoint_ptr->peerNicPath());
-    return endpoint_store_->deleteEndpointByPtr(endpoint_ptr);
+    // blocked re-handshaking a likely-gone peer.
+    //
+    // Resolve the peer path *inside* the store, under its lock: the raw pointer
+    // may already be freed (e.g. an IBV_EVENT_QP_FATAL racing endpoint
+    // destruction), so we must not dereference it here. The store only compares
+    // pointer identity and returns the path from the live map key, and we arm
+    // the pause only if the endpoint was actually found. No-op when TTL is 0.
+    std::string deleted_peer_nic_path;
+    int ret =
+        endpoint_store_->deleteEndpointByPtr(endpoint_ptr, &deleted_peer_nic_path);
+    if (!deleted_peer_nic_path.empty()) pauseConnect(deleted_peer_nic_path);
+    return ret;
 }
 
 void RdmaContext::pauseConnect(const std::string &peer_nic_path) {

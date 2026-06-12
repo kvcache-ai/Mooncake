@@ -303,13 +303,13 @@ void loadGlobalConfig(GlobalConfig& config) {
         // rejected, preserving the default.
         try {
             int val = std::stoi(qp_drain_timeout_env);
-            if (val >= 0 && val < 65536) {
+            if (val >= 0 && val <= 1000) {
                 config.qp_drain_timeout_ms = val;
             } else {
                 LOG(WARNING) << "Ignore value from environment variable "
                                 "MC_QP_DRAIN_TIMEOUT_MS, value "
                              << qp_drain_timeout_env
-                             << " out of range (should be 0-65535)";
+                             << " out of range (should be 0-1000)";
             }
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid MC_QP_DRAIN_TIMEOUT_MS environment value: "

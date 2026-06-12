@@ -92,8 +92,6 @@ class RdmaEndPoint {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
-    const std::string &peerNicPath() const { return peer_nic_path_; }
-
     // Interrupts the connection, which can be triggered by user or by internal
     // error. Use setupConnectionsByActive or setupConnectionsByPassive to
     // reconnect

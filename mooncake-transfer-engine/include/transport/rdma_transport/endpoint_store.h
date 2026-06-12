@@ -43,7 +43,15 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
-    virtual int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) = 0;
+    // Deletes the endpoint matching endpoint_ptr (by pointer identity, under
+    // the store lock -- the pointer is never dereferenced, so a stale/freed
+    // pointer is safe and simply does not match). If found and
+    // deleted_peer_nic_path is non-null, it is set to that endpoint's peer NIC
+    // path (read from the live map key) so callers can act on the path without
+    // touching the raw pointer.
+    virtual int deleteEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr,
+        std::string *deleted_peer_nic_path = nullptr) = 0;
     virtual void evictEndpoint() = 0;
     // Takes endpoint_map_lock_; caller must not hold it (RWSpinlock is
     // non-reentrant, so recursive acquisition deadlocks).
@@ -77,7 +85,9 @@ class FIFOEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
-    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) override;
+    int deleteEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr,
+        std::string *deleted_peer_nic_path = nullptr) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -117,7 +127,9 @@ class SIEVEEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
-    int deleteEndpointByPtr(const RdmaEndPoint *endpoint_ptr) override;
+    int deleteEndpointByPtr(
+        const RdmaEndPoint *endpoint_ptr,
+        std::string *deleted_peer_nic_path = nullptr) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
