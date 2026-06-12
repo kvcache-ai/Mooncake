@@ -20,7 +20,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
-void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
+void launch_combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
              void* cuda_counter_buffer, void* cuda_data_buffer, void* raddrs,
@@ -37,7 +37,7 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
 // --- DeepEP V2 ported kernels ---
 
 // Standalone barrier kernel (adapted from DeepEP V2 barrier.cuh).
-void barrier(void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,
+void launch_barrier(void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,
              const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* workspace, int rank, int num_ranks, int num_sms,
@@ -58,7 +58,7 @@ void dispatch_copy_epilogue(
     int num_recv_tokens, int hidden, int num_sf_packs,
     int recv_sf_token_stride, int recv_sf_hidden_stride, int num_topk,
     int num_experts, int rank, int num_ranks,
-    int num_max_dispatch_tokens_per_rank, cudaStream_t stream);
+    int num_max_dispatch_tokens_per_rank, bool use_fp8, cudaStream_t stream);
 
 // Combine reduce epilogue: post-combine reduction from buffer to output.
 void combine_reduce_epilogue(
@@ -69,7 +69,7 @@ void combine_reduce_epilogue(
     cudaStream_t stream);
 
 // Elastic dispatch (DeepEP V2 style with notify warps + deterministic slots).
-void elastic_dispatch(
+void launch_elastic_dispatch(
     void* x, const int64_t* topk_idx, float* topk_weights,
     int64_t* copied_topk_idx, int* cumulative_local_expert_recv_stats,
     int* psum_num_recv_tokens_per_rank, int* psum_num_recv_tokens_per_expert,
@@ -84,7 +84,7 @@ void elastic_dispatch(
     int64_t timeout_ticks);
 
 // Elastic combine (DeepEP V2 style with barrier + warp-cooperative copy).
-void elastic_combine(
+void launch_elastic_combine(
     void* x, float* topk_weights, int* src_metadata,
     int* psum_num_recv_tokens_per_rank,
     void* mxa_buffer, void* raddrs, void* rkeys, void* qp_devctxs,

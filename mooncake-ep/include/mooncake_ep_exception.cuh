@@ -42,6 +42,7 @@ class EPException : public std::exception {
 #endif
 
 #ifndef EP_DEVICE_ASSERT
+#ifdef __CUDA_ARCH__
 #define EP_DEVICE_ASSERT(cond)                                           \
     do {                                                                 \
         if (not(cond)) {                                                 \
@@ -50,4 +51,13 @@ class EPException : public std::exception {
             __trap();                                                    \
         }                                                                \
     } while (0)
+#else
+#define EP_DEVICE_ASSERT(cond)                                           \
+    do {                                                                 \
+        if (not(cond)) {                                                 \
+            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
+                   __LINE__, #cond);                                     \
+        }                                                                \
+    } while (0)
+#endif
 #endif

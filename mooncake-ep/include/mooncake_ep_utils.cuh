@@ -47,6 +47,8 @@ struct VecInt<16> {
     using vec_t = int4;
 };
 
+#ifdef __CUDACC__
+
 __device__ __forceinline__ void trap() { asm("trap;"); }
 
 __device__ __forceinline__ void memory_fence() {
@@ -416,6 +418,8 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
+#endif  // __CUDACC__
+
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
     return (a + b - 1) / b;
@@ -425,6 +429,8 @@ template <typename dtype_t>
 __host__ __device__ dtype_t align(dtype_t a, dtype_t b) {
     return cell_div<dtype_t>(a, b) * b;
 }
+
+#ifdef __CUDACC__
 
 __forceinline__ __device__ void get_channel_task_range(int num_tokens,
                                                        int num_sms, int sm_id,
@@ -535,6 +541,8 @@ __forceinline__ __device__ void barrier_device(int **task_fifo_ptrs, int head,
     timeout_check<kNumRanks>(task_fifo_ptrs, head, rank, 0, tag);
 }
 
+#endif  // __CUDACC__
+
 // ---------------------------------------------------------------------------
 // DeepEP V2 ported helpers (adapted from deep_ep/common/math.cuh and ptx.cuh)
 // ---------------------------------------------------------------------------
@@ -559,6 +567,8 @@ __forceinline__ __device__ __host__ dtype_t* advance_ptr(void* ptr,
                                                          const int64_t num_bytes) {
     return reinterpret_cast<dtype_t*>(static_cast<int8_t*>(ptr) + num_bytes);
 }
+
+#ifdef __CUDACC__
 
 // Elect one active lane in the warp.  Returns true for exactly one lane.
 __forceinline__ __device__ bool elect_one_sync() {
@@ -595,9 +605,9 @@ __forceinline__ __device__ int warp_inclusive_sum(int value, int lane_id) {
 
 // Broadcast a value from a specific lane.
 template <typename dtype_t>
-__forceinline__ __device__ dtype_t exchange(dtype_t& ptr, int src_lane_idx) {
+__forceinline__ __device__ dtype_t exchange(const dtype_t& ptr, int src_lane_idx) {
     EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
-    auto send_int_values = reinterpret_cast<int*>(&ptr);
+    auto send_int_values = reinterpret_cast<const int*>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
 #pragma unroll
     for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
@@ -611,11 +621,14 @@ __forceinline__ __device__ unsigned gather(bool pred) {
     return __ballot_sync(__activemask(), pred);
 }
 
-// Predicated global load: returns 0 if condition is false.
+// Predicated global load: returns 0 if slot_idx < 0.
+// Uses int instead of bool because callers pass topk_slot_idx values
+// where -1 means "no valid slot" — int(-1) would implicitly convert to
+// bool(true), causing invalid pointer dereference.
 template <typename dtype_t>
 __forceinline__ __device__ dtype_t ldg_with_gez_pred(const dtype_t* ptr,
-                                                     bool condition) {
-    if (condition)
+                                                     int slot_idx) {
+    if (slot_idx >= 0)
         return *ptr;
     return dtype_t{};
 }
@@ -626,5 +639,7 @@ __forceinline__ __device__ void accumulate(float2& acc,
     acc.x += __bfloat162float(val.x);
     acc.y += __bfloat162float(val.y);
 }
+
+#endif  // __CUDACC__
 
 }  // namespace mooncake

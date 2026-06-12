@@ -36,9 +36,13 @@ using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_st_na;
+using mooncake::device::mc_ld_generic;
+using mooncake::device::mc_st_generic;
 using mooncake::device::mc_ld_acquire;
+using mooncake::device::mc_ld_acquire_u64;
 using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
+using mooncake::device::mc_atomic_add_release_u64;
 
 template <bool kReuseSlotIndices, int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks, int kNumHiddenBytes,
@@ -97,15 +101,46 @@ dispatch_impl(
         num_ranks, MAX_QP_COUNT);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
+    // When deterministic slot indices are precomputed, the receiver can scan
+    // the full fixed [rank, max_tokens] region instead of relying on the V2
+    // notify-count exchange.  Clear the local receive token top-k metadata so
+    // unfilled slots are skipped by the copy epilogue.  This avoids an 8-rank
+    // fragility observed with many peers concurrently publishing the encoded
+    // notify counters into the same workspace region via CUDA IPC mappings.
+    if constexpr (kReuseSlotIndices) {
+        const auto clear_token_layout = layout::TokenLayout(
+            kNumHiddenBytes, 0, num_topk, true);
+        const auto clear_recv_buffer = layout::BufferLayout(
+            clear_token_layout, kNumRanks, num_max_tokens_per_rank, buffer);
+        const int total_topk_slots = kNumRanks * num_max_tokens_per_rank * num_topk;
+        for (int i = sm_idx * kNumThreads + thread_idx; i < total_topk_slots;
+             i += num_sms * kNumThreads) {
+            const int token_slot = i / num_topk;
+            const int topk_slot = i % num_topk;
+            clear_recv_buffer.get_token_buffer(token_slot, true)
+                .get_topk_idx_ptr()[topk_slot] = -1;
+        }
+        mc_grid_sync();
+    }
+
     // Barrier at start
     barrier::gpu_barrier<kNumRanks, kNumThreads, kNumTimeoutCycles,
-                         EP_BARRIER_TAG_DISPATCH_0, false, false>(
+                         EP_BARRIER_TAG_DISPATCH_0, false, true>(
         comm_ctx, workspace_layout, rank_idx, sm_idx, thread_idx, num_sms);
 
     // =====================================================================
     // Notify warps: count tokens, reduce, compute prefix sums
     // =====================================================================
     if (warp_idx < kNumNotifyWarps) {
+        if constexpr (kReuseSlotIndices) {
+            // Deterministic slot mode uses a fixed full-rank scan in the copy
+            // epilogue.  Publish cumulative max-token ranges and skip the
+            // cross-rank notify-count protocol.
+            if (sm_idx == 0 && warp_idx == 0 && lane_idx < kNumRanks) {
+                psum_num_recv_tokens_per_rank[lane_idx] =
+                    (lane_idx + 1) * num_max_tokens_per_rank;
+            }
+        } else {
         const int num_aligned_elems = num_smem_bytes_for_notify / sizeof(int);
         const auto rank_expert_count = advance_ptr<int>(smem, 0);
 
@@ -140,17 +175,21 @@ dispatch_impl(
         }
         mc_bar_sync(kNotifyBarrierIndex, kNumNotifyThreads);
 
-        // Full-grid reduction: each SM writes its count to global workspace
+        // Full-grid reduction: each SM writes its count to global workspace.
+        // Use two separate 32-bit atomic arrays (arrival counter + data sum)
+        // instead of a packed 64-bit atomic, to avoid 64-bit atomic issues.
+        const auto notify_arrival_ptr =
+            reinterpret_cast<int*>(
+                workspace_layout.get_notify_reduction_workspace_ptr());
+        const auto notify_data_ptr =
+            notify_arrival_ptr + EP_NUM_MAX_RANKS + EP_NUM_MAX_EXPERTS;
 #pragma unroll
         for (int i = thread_idx; i < kNumRanks + num_experts;
              i += kNumNotifyThreads) {
-            const int64_t counter =
-                (1ll << 32ll) | rank_expert_count[i];
-            mc_atomic_add_release(
-                reinterpret_cast<int*>(
-                    workspace_layout.get_notify_reduction_workspace_ptr() +
-                    i),
-                static_cast<int>(counter));
+            atomicAdd_system(notify_data_ptr + i, rank_expert_count[i]);
+            __threadfence_system();
+            atomicAdd_system(notify_arrival_ptr + i, 1);
+            __threadfence_system();
         }
 
         // SM 0 does the remaining work
@@ -161,13 +200,12 @@ dispatch_impl(
                  i += kNumNotifyThreads) {
                 barrier::timeout_while<kNumTimeoutCycles>(
                     true, [=](const bool& is_last_check) {
-                        const auto status = ld_volatile_global(
-                            workspace_layout
-                                .get_notify_reduction_workspace_ptr() +
-                            i);
-                        if ((status >> 32) == num_sms) {
-                            const auto encoded = encode_decode_positive(
-                                static_cast<int>(status & 0xffffffffll));
+                        const auto arrived =
+                            mc_ld_acquire(notify_arrival_ptr + i);
+                        if (arrived == num_sms) {
+                            const auto sum =
+                                mc_ld_acquire(notify_data_ptr + i);
+                            const auto encoded = encode_decode_positive(sum);
                             rank_expert_count[i] = encoded;
 
                             // Write to send buffer for peer access
@@ -176,20 +214,18 @@ dispatch_impl(
                                 encoded;
 
                             // Clean for next usage
-                            workspace_layout
-                                .get_notify_reduction_workspace_ptr()[i] = 0;
+                            notify_arrival_ptr[i] = 0;
+                            notify_data_ptr[i] = 0;
                             return true;
                         }
 
                         if (is_last_check) {
                             printf(
                                 "Mooncake EP notify (GPU reduction) timeout, "
-                                "rank: %d/%d, thread: %d, status: %d | %d, "
+                                "rank: %d/%d, thread: %d, arrived: %d, "
                                 "expected: %d\n",
                                 rank_idx, kNumRanks, thread_idx,
-                                static_cast<int>(status >> 32),
-                                static_cast<int>(status & 0xffffffff),
-                                num_sms);
+                                arrived, num_sms);
                         }
                         return false;
                     });
@@ -208,13 +244,13 @@ dispatch_impl(
                 } else {
                     void* peer_ptr = mc_route_put(
                         comm_ctx, i,
-                        const_cast<int*>(dst_rank_counter));
+                        reinterpret_cast<int*>(const_cast<int64_t*>(dst_rank_counter)));
                     if (peer_ptr != nullptr) {
                         mc_st_release(static_cast<int*>(peer_ptr),
                                       static_cast<int>(rank_count[i]));
                     } else {
                         mc_signal(comm_ctx, i, 0, 1,
-                                  const_cast<int*>(dst_rank_counter),
+                                  reinterpret_cast<int*>(const_cast<int64_t*>(dst_rank_counter)),
                                   static_cast<int>(rank_count[i]));
                     }
                 }
@@ -237,13 +273,13 @@ dispatch_impl(
                 } else {
                     void* peer_ptr = mc_route_put(
                         comm_ctx, dst_rank,
-                        const_cast<int*>(dst_expert_counter));
+                        reinterpret_cast<int*>(const_cast<int64_t*>(dst_expert_counter)));
                     if (peer_ptr != nullptr) {
                         mc_st_release(static_cast<int*>(peer_ptr),
                                       static_cast<int>(expert_count[i]));
                     } else {
                         mc_signal(comm_ctx, dst_rank, 0, 1,
-                                  const_cast<int*>(dst_expert_counter),
+                                  reinterpret_cast<int*>(const_cast<int64_t*>(dst_expert_counter)),
                                   static_cast<int>(expert_count[i]));
                     }
                 }
@@ -258,10 +294,11 @@ dispatch_impl(
                 barrier::timeout_while<kNumTimeoutCycles>(
                     [=](const bool& is_last_check) {
                         const auto count = static_cast<int>(
-                            ld_volatile_global(
-                                workspace_layout
-                                    .get_rank_expert_count_ptr<false>() +
-                                i));
+                            mc_ld_acquire_u64(
+                                reinterpret_cast<const uint64_t*>(
+                                    workspace_layout
+                                        .get_rank_expert_count_ptr<false>() +
+                                    i)));
                         const auto decoded =
                             encode_decode_positive(count);
                         if (is_decoded_positive_ready(decoded)) {
@@ -321,6 +358,7 @@ dispatch_impl(
                         num_experts_per_rank, 1);
             }
         }
+        }
     }
     // =====================================================================
     // Dispatch warps: copy data to remote buffers
@@ -359,7 +397,7 @@ dispatch_impl(
                     reinterpret_cast<int4*>(tma_buffer.get_hidden_ptr());
                 const int num_int4 = kNumHiddenBytes / sizeof(int4);
                 UNROLLED_WARP_COPY(4, lane_idx, num_int4, dst_ptr, src_ptr,
-                                   mc_ld_nc, mc_st_na);
+                                   mc_ld_nc, mc_st_generic);
             }
             __syncwarp();
 
@@ -423,14 +461,24 @@ dispatch_impl(
             }
             __syncwarp();
 
-            // Copy to remote buffer
-            if (stored_dst_slot_idx >= 0) {
+            // Copy to remote buffer.
+            // Original DeepEP V2: each lane independently issues a TMA
+            // store to its own destination.  Since UNROLLED_WARP_COPY
+            // requires all 32 lanes to cooperate on a single destination,
+            // we iterate over all valid (deduplicated) destinations and
+            // do one warp-cooperative copy per destination.
+            unsigned remaining = gather(stored_dst_slot_idx >= 0);
+            while (remaining) {
+                const int master_lane = __ffs(remaining) - 1;
+                const int cur_slot_idx = __shfl_sync(
+                    0xffffffff, stored_dst_slot_idx, master_lane);
+                const int cur_rank_idx = __shfl_sync(
+                    0xffffffff, stored_dst_rank_idx, master_lane);
                 const auto dst_ptr = recv_buffer
-                                         .get_token_buffer(
-                                             stored_dst_slot_idx)
+                                         .get_token_buffer(cur_slot_idx)
                                          .get_base_ptr();
                 void* write_dst =
-                    mc_route_put(comm_ctx, stored_dst_rank_idx, dst_ptr);
+                    mc_route_put(comm_ctx, cur_rank_idx, dst_ptr);
                 if (write_dst != nullptr) {
                     // P2P path: warp-cooperative copy
                     const auto src_int4_ptr =
@@ -441,7 +489,7 @@ dispatch_impl(
                     const int num_int4 =
                         token_layout.get_num_bytes() / sizeof(int4);
                     UNROLLED_WARP_COPY(4, lane_idx, num_int4, dst_int4_ptr,
-                                       src_int4_ptr, mc_ld_nc, mc_st_na);
+                                       src_int4_ptr, mc_ld_generic, mc_st_na);
                 } else {
                     // RDMA path: copy to send buffer then issue RDMA
                     auto send_buffer_ptr =
@@ -455,14 +503,15 @@ dispatch_impl(
                     const int num_int4 =
                         token_layout.get_num_bytes() / sizeof(int4);
                     UNROLLED_WARP_COPY(4, lane_idx, num_int4, buf_int4_ptr,
-                                       src_int4_ptr, mc_ld_nc, mc_st_na);
+                                       src_int4_ptr, mc_ld_generic, mc_st_na);
                     __syncwarp();
                     mc_rdma_put(comm_ctx,
-                                stored_dst_rank_idx % num_qp_per_rank,
-                                stored_dst_rank_idx, num_qp_per_rank,
+                                cur_rank_idx % num_qp_per_rank,
+                                cur_rank_idx, num_qp_per_rank,
                                 send_buffer_ptr, dst_ptr,
                                 token_layout.get_num_bytes(), lane_idx);
                 }
+                remaining ^= (1u << master_lane);
             }
         }
     }

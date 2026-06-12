@@ -32,7 +32,17 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxRanks = EP_NUM_MAX_RANKS;
     static constexpr int kNumMaxExperts = EP_NUM_MAX_EXPERTS;
     static constexpr int kNumMaxExpertsPerRank = EP_NUM_MAX_EXPERTS_PER_RANK;
-    static constexpr int64_t kNumBarrierSignalBytes = 16;
+    // Barrier storage:
+    //   - uint64_t counter
+    //   - two phases of per-source-rank int slots
+    //
+    // DeepEP V2 uses NCCL GIN symmetric memory plus remote RED atomics to
+    // accumulate a single counter per phase.  Mooncake's Device API currently
+    // routes P2P through CUDA IPC peer mappings, where ordinary stores work but
+    // remote atomics/reductions are not a safe portability assumption.  Use one
+    // slot per source rank so barrier signaling only needs release stores.
+    static constexpr int64_t kNumBarrierSignalBytes =
+        sizeof(uint64_t) + 2 * kNumMaxRanks * sizeof(int);
 
     __forceinline__ __device__ __host__ WorkspaceLayout(
         void* workspace, int num_ranks, int num_experts)
@@ -80,7 +90,14 @@ struct WorkspaceLayout {
 
     __forceinline__ __device__ __host__ int* get_barrier_signal_ptr(
         int phase) const {
-        return advance_ptr<int>(workspace, (2 + phase) * sizeof(int));
+        return advance_ptr<int>(workspace,
+                                sizeof(uint64_t) +
+                                    phase * kNumMaxRanks * sizeof(int));
+    }
+
+    __forceinline__ __device__ __host__ int* get_barrier_signal_slot_ptr(
+        int phase, int src_rank) const {
+        return get_barrier_signal_ptr(phase) + src_rank;
     }
 
     // --- Notify reduction workspace ---
@@ -150,7 +167,7 @@ struct TokenLayout {
     // Alignment granularity for buffer layout (no TMA, use 16B for LDG.128).
     static constexpr int kAlignBytes = 16;
 
-    int64_t get_num_bytes() const {
+    __forceinline__ __device__ __host__ int64_t get_num_bytes() const {
         return align<int64_t>(num_hidden_bytes, kAlignBytes) +
                align<int64_t>(num_sf_bytes, kAlignBytes) +
                align<int64_t>(num_metadata_bytes, kAlignBytes);

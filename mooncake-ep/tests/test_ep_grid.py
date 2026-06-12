@@ -35,6 +35,7 @@ def run_test_iteration(
     return_recv_hook: bool,
     use_fallback: bool,
     fail_rank: int,
+    cpu_group: dist.ProcessGroup = None,
 ):
     assert not (
         async_finish and return_recv_hook
@@ -82,7 +83,7 @@ def run_test_iteration(
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         max_tokens, hidden, num_ranks, num_experts
     )
-    buf = Buffer(group, num_ep_buffer_bytes)
+    buf = Buffer(group, num_ep_buffer_bytes, cpu_group=cpu_group)
 
     if use_fallback:
         buf._use_fallback = True
@@ -199,10 +200,12 @@ def worker(rank, world_size, config_dict):
 
     dist.init_process_group(backend="mooncake", rank=rank, world_size=world_size)
     group = dist.group.WORLD
+    cpu_group = dist.new_group(list(range(world_size)), backend="mooncake-cpu")
 
     try:
         run_test_iteration(
             group=group,
+            cpu_group=cpu_group,
             rank=rank,
             num_ranks=world_size,
             **config_dict,
@@ -215,10 +218,16 @@ def worker(rank, world_size, config_dict):
 
 
 class TestMooncakeEPBuffer(unittest.TestCase):
+    _next_master_port = 29500
+
     def setUp(self):
         self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = "29500"
+        # Each generated unittest creates and tears down a fresh process group.
+        # Use a unique rendezvous port per case so a just-destroyed Mooncake PG
+        # instance cannot be confused with the next spawned test's control path.
+        os.environ["MASTER_PORT"] = str(TestMooncakeEPBuffer._next_master_port)
+        TestMooncakeEPBuffer._next_master_port += 1
 
     def run_single_config(self, config_dict):
         mp.spawn(

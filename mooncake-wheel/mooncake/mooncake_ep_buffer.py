@@ -62,7 +62,8 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0,
+                 cpu_group: Optional[dist.ProcessGroup] = None):
         from mooncake import ep
 
         # Initialize the CPP runtime
@@ -70,7 +71,10 @@ class Buffer:
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
-        self.backend = self.group
+        self.backend = self.group._get_backend(torch.device("cuda"))
+        # cpu_group for IPC metadata exchange (mooncake-cpu backend).
+        # Falls back to self.group when not provided.
+        self.cpu_group = cpu_group if cpu_group is not None else group
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes
@@ -85,23 +89,31 @@ class Buffer:
     def connect(self, is_update: bool = False):
         from mooncake import ep
 
+        # Use CPU tensors for IPC metadata exchange when cpu_group is a
+        # mooncake-cpu backend (which doesn't support GPU tensors).
+        use_cpu = self.cpu_group is not self.group
+
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+            raddr = torch.tensor([raddr], dtype=torch.int64,
+                                 device="cpu" if use_cpu else "cuda")
             raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(raddrs, raddr, self.group)
+            dist.all_gather(raddrs, raddr, self.cpu_group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+            rkey = torch.tensor([rkey], dtype=torch.int32,
+                                device="cpu" if use_cpu else "cuda")
             rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
+                torch.empty(1, dtype=torch.int32,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(rkeys, rkey, self.group)
+            dist.all_gather(rkeys, rkey, self.cpu_group)
             rkeys = torch.cat(rkeys).tolist()
 
             all_to_all_size = ep.MAX_QP_COUNT // self.group_size
@@ -112,48 +124,56 @@ class Buffer:
             local_qpns = self.runtime.get_local_qpns()
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_qpns, dtype=torch.int32,
+                                 device="cpu" if use_cpu else "cuda").view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(all_to_all_size, dtype=torch.int32,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_qpns, local_qpns, self.group)
+            dist.all_to_all(remote_qpns, local_qpns, self.cpu_group)
             peer_qpns = [remote_qpns[r].tolist() for r in range(self.group_size)]
 
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
+                    torch.tensor(local_lids, dtype=torch.int32,
+                                 device="cpu" if use_cpu else "cuda").view(
                         -1, all_to_all_size
                     )
                 )
             )
             remote_lids = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(all_to_all_size, dtype=torch.int32,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_to_all(remote_lids, local_lids, self.group)
+            dist.all_to_all(remote_lids, local_lids, self.cpu_group)
             peer_lids = [remote_lids[r].tolist() for r in range(self.group_size)]
 
             (subnet_prefix, interface_id) = self.runtime.get_gid()
-            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64,
+                                           device="cpu" if use_cpu else "cuda")
             subnet_prefixes_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
+            dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.cpu_group)
             subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
 
-            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_id_t = torch.tensor([interface_id], dtype=torch.int64,
+                                          device="cpu" if use_cpu else "cuda")
             interface_ids_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(interface_ids_list, interface_id_t, self.group)
+            dist.all_gather(interface_ids_list, interface_id_t, self.cpu_group)
             interface_ids = torch.cat(interface_ids_list).tolist()
 
             from mooncake.ep import get_active_ranks
@@ -167,13 +187,15 @@ class Buffer:
             local_handle_ints = self.runtime.get_ipc_handle()
             # pybind11 converts std::vector<int32_t> to a list of integers
             local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
+                local_handle_ints, dtype=torch.int32,
+                device="cpu" if use_cpu else "cuda"
             )
             handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                torch.empty(len(local_handle_ints), dtype=torch.int32,
+                            device="cpu" if use_cpu else "cuda")
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
+            dist.all_gather(handles, local_handle_tensor, self.cpu_group)
             remote_handles = [h.tolist() for h in handles]
             from mooncake.ep import get_active_ranks
             active_ranks_mask = get_active_ranks(self.backend).tolist()

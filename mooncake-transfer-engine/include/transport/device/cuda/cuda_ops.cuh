@@ -57,6 +57,27 @@ __device__ __forceinline__ int mc_atomic_add_release(const int* ptr, int val) {
     return ret;
 }
 
+// Reduction add — release semantics, sys scope (no return value).
+// Uses PTX `red` instruction which is the correct primitive for cross-GPU
+// (NVLink) atomic adds.  The `atom` instruction may not work on peer memory.
+__device__ __forceinline__ void mc_red_add_release(const int* ptr, int val) {
+    asm volatile("red.release.sys.global.add.s32 [%0], %1;"
+                 :
+                 : "l"(ptr), "r"(val));
+}
+
+// 64-bit atomic add — release semantics, sys scope
+// Used by notify reduction in elastic dispatch kernel.
+__device__ __forceinline__ unsigned long long
+mc_atomic_add_release_u64(const unsigned long long* ptr,
+                          unsigned long long val) {
+    unsigned long long ret;
+    asm volatile("atom.add.release.sys.global.u64 %0, [%1], %2;"
+                 : "=l"(ret)
+                 : "l"(ptr), "l"(val));
+    return ret;
+}
+
 // ---------------------------------------------------------------------------
 // Non-coherent loads (read-only cache, no L1 alloc) — for bulk data reads
 // ---------------------------------------------------------------------------
@@ -98,6 +119,26 @@ __device__ __forceinline__ int64_t mc_ld_nc_s64(const int64_t* ptr) {
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_st_na(const int4* ptr, const int4& val) {
     asm volatile("st.global.L1::no_allocate.v4.s32 [%0], {%1,%2,%3,%4};"
+                 :
+                 : "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
+}
+
+// ---------------------------------------------------------------------------
+// Generic load/store (address-space-agnostic) — for shared memory access.
+// The PTX assembler infers the address space from the pointer type when
+// .global is omitted, so these work for both shared and global memory.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int4 mc_ld_generic(const int4* ptr) {
+    int4 ret;
+    asm volatile("ld.v4.s32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+                 : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ void mc_st_generic(const int4* ptr,
+                                               const int4& val) {
+    asm volatile("st.v4.s32 [%0], {%1,%2,%3,%4};"
                  :
                  : "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
 }

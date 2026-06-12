@@ -33,6 +33,8 @@ using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_st_na;
+using mooncake::device::mc_ld_generic;
+using mooncake::device::mc_st_generic;
 using mooncake::device::mc_ld_acquire;
 using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
@@ -94,24 +96,30 @@ combine_impl(
 
     // Barrier to ensure remote buffer is available
     barrier::gpu_barrier<kNumRanks, kNumThreads, kNumTimeoutCycles,
-                         EP_BARRIER_TAG_COMBINE_0, false, false>(
+                         EP_BARRIER_TAG_COMBINE_0, false, true>(
         comm_ctx, workspace_layout, rank_idx, sm_idx, thread_idx, num_sms);
 
-    // Write into remote buffers
-    int num_tokens_per_warp =
-        cell_div(num_reduced_tokens, num_sms * kNumWarps);
-    const int token_start_idx = num_tokens_per_warp * global_warp_idx;
-    const int token_end_idx =
-        min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
-    for (int i = token_start_idx; i < token_end_idx; ++i) {
-        // Read source metadata
-        const int metadata_stride = 2 + num_topk;
-        const int src_token_idx =
-            __ldg(src_metadata + i * metadata_stride) % num_max_tokens_per_rank;
+    // Write into remote buffers.
+    // Iterate over the packed layout: [num_local_experts, num_ranks * max_tokens].
+    const int num_experts_per_rank = num_experts / kNumRanks;
+    const int num_slots_per_expert = num_max_tokens_per_rank * kNumRanks;
+    const int total_slots = num_experts_per_rank * num_slots_per_expert;
+    int num_slots_per_warp = cell_div(total_slots, num_sms * kNumWarps);
+    const int slot_start_idx = num_slots_per_warp * global_warp_idx;
+    const int slot_end_idx =
+        min(slot_start_idx + num_slots_per_warp, total_slots);
+    for (int flat_idx = slot_start_idx; flat_idx < slot_end_idx; ++flat_idx) {
+        // Read source metadata (stride=2)
+        const int src_token_global_idx =
+            __ldg(src_metadata + flat_idx * 2);
+        if (src_token_global_idx < 0) continue;  // empty slot
+
         const int src_rank_topk_idx =
-            __ldg(src_metadata + i * metadata_stride + 1);
+            __ldg(src_metadata + flat_idx * 2 + 1);
         const int src_rank_idx = src_rank_topk_idx / num_topk;
         const int src_topk_idx = src_rank_topk_idx % num_topk;
+        const int src_token_idx =
+            src_token_global_idx % num_max_tokens_per_rank;
 
         // Determine destination: P2P or RDMA
         void* write_dst = mc_route_put(
@@ -133,16 +141,22 @@ combine_impl(
                 .get_token_buffer(src_token_idx);
         }();
 
-        // Load hidden data into shared memory
+        // Load hidden data from packed layout into shared memory
         {
             const auto src_ptr = reinterpret_cast<const int4*>(
-                advance_ptr(x, static_cast<int64_t>(i) * kNumHiddenBytes));
+                advance_ptr(x, static_cast<int64_t>(flat_idx) * kNumHiddenBytes));
             const auto dst_ptr =
                 reinterpret_cast<int4*>(tma_buffer.get_base_ptr());
             const int num_int4 = kNumHiddenBytes / sizeof(int4);
             UNROLLED_WARP_COPY(4, lane_idx, num_int4, dst_ptr, src_ptr,
-                               mc_ld_nc, mc_st_na);
+                               mc_ld_nc, mc_st_generic);
         }
+        __syncwarp();
+
+        // Do not apply top-k weights here.  For remote source tokens, the
+        // correct weights live on the source rank, not on this expert rank.
+        // The combine epilogue runs on the source rank and applies its local
+        // topk_weights while reducing the returned expert outputs.
         __syncwarp();
 
         // Write to destination
@@ -154,7 +168,7 @@ combine_impl(
                 reinterpret_cast<int4*>(master_token_buffer.get_base_ptr());
             const int num_int4 = kNumHiddenBytes / sizeof(int4);
             UNROLLED_WARP_COPY(4, lane_idx, num_int4, dst_int4_ptr,
-                               src_int4_ptr, mc_ld_nc, mc_st_na);
+                               src_int4_ptr, mc_ld_generic, mc_st_na);
         } else {
             // RDMA: copy to send buffer, then issue RDMA write
             const auto src_int4_ptr =
@@ -163,7 +177,7 @@ combine_impl(
                 reinterpret_cast<int4*>(master_token_buffer.get_base_ptr());
             const int num_int4 = kNumHiddenBytes / sizeof(int4);
             UNROLLED_WARP_COPY(4, lane_idx, num_int4, buf_int4_ptr,
-                               src_int4_ptr, mc_ld_nc, mc_st_na);
+                               src_int4_ptr, mc_ld_generic, mc_st_na);
             __syncwarp();
             mc_rdma_put(
                 comm_ctx, src_rank_idx % num_qp_per_rank, src_rank_idx,
@@ -176,8 +190,12 @@ combine_impl(
 
         // Write topk weights
         if (topk_weights != nullptr && lane_idx < num_topk) {
+            const int token_idx =
+                src_token_global_idx % num_max_tokens_per_rank;
+            const int topk_slot = src_rank_topk_idx % num_topk;
             const float value =
-                __ldg(topk_weights + (i * num_topk + lane_idx));
+                __ldg(topk_weights +
+                      static_cast<int64_t>(token_idx) * num_topk + topk_slot);
             master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
         }
         __syncwarp();

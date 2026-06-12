@@ -10,6 +10,7 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_event.h>
 #include <mooncake_ep_exception.cuh>
+#include <mooncake_ep_layout.cuh>
 #include <torch/torch.h>
 #include <transport/device/device_transport.h>
 
@@ -196,9 +197,16 @@ struct MooncakeEpBuffer {
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,
                                       int hidden, int num_ranks,
                                       int num_experts) {
+    // Elastic DeepEP V2 kernels keep their cross-rank workspace inside the
+    // peer-visible GDR buffer so mc_route_put()/mc_signal() can translate the
+    // local workspace address to a peer VA by offset from the GDR base.  Keep
+    // this space outside the legacy double-buffer region; otherwise 8-rank
+    // runs overwrite the tail of the RDMA/P2P token buffer and peer notify
+    // slots never become ready.
     return BufferPair(nullptr, num_max_dispatch_tokens_per_rank, hidden,
                       num_ranks, num_experts)
-        .total_bytes;
+               .total_bytes +
+           layout::WorkspaceLayout::get_num_bytes();
 }
 
 }  // namespace mooncake

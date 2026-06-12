@@ -66,25 +66,33 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
             ibgda_disabled_ = true;
         }
     } else {
-        // Read optional NIC whitelist from env var (same convention as PG
-        // tests).
-        std::vector<std::string> device_filter;
-        if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
-            std::string s(env);
-            std::istringstream ss(s);
-            std::string tok;
-            while (std::getline(ss, tok, ',')) {
-                if (!tok.empty()) device_filter.push_back(tok);
-            }
-        }
-        auto t = device::createIbgdaDeviceTransport(device_filter);
-        if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
-                              num_ranks, USE_QP_COUNT, comm_stream.stream())) {
-            owned_rdma_transport_ = std::move(t);
-            rdma_transport_ = owned_rdma_transport_.get();
-        } else {
+        // Allow explicit IBGDA disable via env var (P2P-only mode).
+        if (std::getenv("MOONCAKE_EP_DISABLE_IBGDA")) {
             ibgda_disabled_ = true;
-            LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
+            LOG(INFO) << "[EP] IBGDA disabled by MOONCAKE_EP_DISABLE_IBGDA, "
+                         "using P2P-only path";
+        } else {
+            // Read optional NIC whitelist from env var (same convention as PG
+            // tests).
+            std::vector<std::string> device_filter;
+            if (const char* env = std::getenv("MOONCAKE_EP_DEVICE_FILTER")) {
+                std::string s(env);
+                std::istringstream ss(s);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    if (!tok.empty()) device_filter.push_back(tok);
+                }
+            }
+            auto t = device::createIbgdaDeviceTransport(device_filter);
+            if (initRdmaTransport(t.get(), gdr_buffer, num_ep_buffer_bytes,
+                                  num_ranks, USE_QP_COUNT,
+                                  comm_stream.stream())) {
+                owned_rdma_transport_ = std::move(t);
+                rdma_transport_ = owned_rdma_transport_.get();
+            } else {
+                ibgda_disabled_ = true;
+                LOG(INFO) << "[EP] IBGDA unavailable, using P2P-only path";
+            }
         }
     }
 
@@ -92,9 +100,12 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
-    // Elastic workspace (DeepEP V2 port)
+    // Elastic workspace (DeepEP V2 port) — must be inside GDR buffer
+    // because the dispatch kernel uses mc_route_put/mc_signal which
+    // compute peer pointers relative to ctx.local_base (GDR buffer base).
     auto elastic_bytes = layout::WorkspaceLayout::get_num_bytes();
-    CUDA_CHECK(cudaMalloc(&elastic_workspace, elastic_bytes));
+    elastic_workspace = static_cast<char*>(gdr_buffer) +
+                        num_ep_buffer_bytes - elastic_bytes;
     CUDA_CHECK(
         cudaMemsetAsync(elastic_workspace, 0, elastic_bytes, comm_stream));
 
@@ -130,7 +141,7 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     p2p_transport_ = nullptr;
 
     if (workspace) cudaFree(workspace);
-    if (elastic_workspace) cudaFree(elastic_workspace);
+    // elastic_workspace is inside gdr_buffer, freed with the buffer
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
@@ -172,15 +183,24 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (not return_recv_hook) {
+        stream_wait(launch_stream, compute_stream);
+    } else if (use_elastic_dispatch_) {
+        // Elastic dispatch is eager even in hook mode, but hook mode launches on
+        // the caller stream.  The constructor initializes the peer-visible GDR
+        // workspace on comm_stream, so order the caller stream after it before
+        // the first cooperative barrier touches elastic_workspace.
+        stream_wait(launch_stream, comm_stream);
+    }
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty(
         {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank,
          hidden},
         x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
-    auto packed_recv_src_info = torch::empty(
-        {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank},
+    auto packed_recv_src_info = torch::full(
+        {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank * 2},
+        -1,
         torch::dtype(torch::kInt32).device(x.device()));
     auto packed_recv_layout_range =
         torch::empty({num_local_experts, num_ranks},
@@ -242,17 +262,22 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
         auto psum_num_recv_tokens_per_expert = torch::zeros(
             {num_local_experts},
             torch::dtype(torch::kInt32).device(x.device()));
+        const int num_elastic_sms = cell_div(num_experts, 8);
+        auto prologue_rank_count_buffer = torch::empty(
+            {num_elastic_sms, num_ranks},
+            torch::dtype(torch::kInt32).device(x.device()));
 
         // Run deterministic prologue to pre-compute slot indices
         mooncake::dispatch_deterministic_prologue(
             topk_idx.data_ptr<int64_t>(),
             dst_buffer_slot_idx.data_ptr<int>(),
             num_tokens, hidden, num_topk, num_experts, rank, num_ranks,
-            num_max_dispatch_tokens_per_rank, elastic_workspace,
+            num_max_dispatch_tokens_per_rank,
+            prologue_rank_count_buffer.data_ptr<int>(),
             launch_stream);
 
         // Run elastic dispatch kernel
-        mooncake::elastic_dispatch(
+        mooncake::launch_elastic_dispatch(
             const_cast<void*>(x.data_ptr()),
             topk_idx.data_ptr<int64_t>(),
             nullptr,  // topk_weights (not needed for dispatch)
@@ -271,21 +296,30 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             gdr_buffer,  // buffer (communication buffer)
             elastic_workspace, launch_stream, timeout_ticks);
 
+        // Sync to catch elastic dispatch errors before epilogue
+        CUDA_CHECK(cudaStreamSynchronize(launch_stream));
+
         // Run copy epilogue to unpack received tokens
         mooncake::dispatch_copy_epilogue(
             gdr_buffer, elastic_workspace,
             psum_num_recv_tokens_per_rank.data_ptr<int>(),
-            psum_num_recv_tokens_per_expert.data_ptr<int>(),
+            // Use the returned per-expert count tensor as the epilogue's
+            // atomic slot allocator.  The dispatch kernel fills
+            // psum_num_recv_tokens_per_expert with prefix sums; those are not
+            // valid per-expert local offsets for the packed output layout.
+            packed_recv_count.data_ptr<int>(),
             packed_recv_x.data_ptr(),
-            nullptr,  // recv_sf (no SF packs)
+            packed_recv_x_scales_ptr,
             nullptr,  // recv_topk_idx
             nullptr,  // recv_topk_weights
             packed_recv_src_info.data_ptr<int>(),
-            num_tokens, hidden,
-            0,  // num_sf_packs
-            0, 0,  // recv_sf strides
+            num_max_dispatch_tokens_per_rank * num_ranks, hidden,
+            use_fp8 ? num_scales : 0,
+            // Scale tensor layout is [local_expert, token, hidden/128]
+            // with strides [total_tokens * num_scales, 1, total_tokens].
+            1, num_ranks * num_max_dispatch_tokens_per_rank,
             num_topk, num_experts, rank, num_ranks,
-            num_max_dispatch_tokens_per_rank, launch_stream);
+            num_max_dispatch_tokens_per_rank, use_fp8, launch_stream);
     } else {
         launcher(return_recv_hook
                      ? LOW_LATENCY_SEND_PHASE
@@ -305,8 +339,17 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    if (return_recv_hook) {
+        if (use_elastic_dispatch_) {
+            // Elastic dispatch is not split into SEND/RECV phases in this
+            // port: prologue, main dispatch, and copy epilogue have already
+            // completed above.  Return a no-op hook to preserve Python API
+            // semantics without launching the legacy recv kernel.
+            recv_hook = []() {};
+        } else {
+            recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+        }
+    }
 
     // Return values
     return {packed_recv_x,
@@ -366,7 +409,12 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+    if (not return_recv_hook) {
+        stream_wait(launch_stream, compute_stream);
+    } else if (use_elastic_combine_) {
+        // See dispatch hook-mode ordering note above.
+        stream_wait(launch_stream, comm_stream);
+    }
 
     // Allocate output tensor
     torch::Tensor combined_x;
@@ -393,7 +441,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Kernel launch
     auto launcher = [=](int phases) {
-        mooncake::combine(
+        mooncake::launch_combine(
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
             buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
@@ -413,7 +461,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             {num_ranks}, torch::dtype(torch::kInt32).device(x.device()));
 
         // Run elastic combine kernel
-        mooncake::elastic_combine(
+        mooncake::launch_elastic_combine(
             const_cast<void*>(x.data_ptr()),
             const_cast<float*>(topk_weights.data_ptr<float>()),
             const_cast<int*>(src_info.data_ptr<int>()),
@@ -429,10 +477,12 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             launch_stream, timeout_ticks);
 
         // Run reduce epilogue
+        // Pass topk_idx as combined_topk_idx so the epilogue can determine
+        // which rank's buffer to read from for each token.
         mooncake::combine_reduce_epilogue(
             combined_x.data_ptr(),
-            nullptr,  // combined_topk_weights
-            nullptr,  // combined_topk_idx
+            const_cast<float*>(topk_weights.data_ptr<float>()),  // input weights
+            topk_idx.data_ptr<int64_t>(),  // combined_topk_idx
             gdr_buffer,  // recv_buffer
             nullptr, nullptr,  // bias_0, bias_1
             num_combined_tokens, hidden, num_topk, num_experts, rank,
@@ -456,8 +506,15 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-        recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+    if (return_recv_hook) {
+        if (use_elastic_combine_) {
+            // Elastic combine is executed eagerly above; do not launch the
+            // legacy recv phase from the hook path.
+            recv_hook = []() {};
+        } else {
+            recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
+        }
+    }
 
     // Return values
     return {combined_x, event, recv_hook};

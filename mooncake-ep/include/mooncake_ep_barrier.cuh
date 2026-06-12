@@ -68,10 +68,13 @@ __device__ __forceinline__ void timeout_while(const func_t& func,
 // Protocol (NVLink/P2P path, adapted from DeepEP nvlink_barrier_wo_local_sync):
 //   1. Only SM 0 participates in inter-rank signaling.
 //   2. Read barrier phase from workspace counter.
-//   3. Each thread signals one peer rank via mc_route_put → mc_atomic_add_release
-//      (P2P) or mc_signal (RDMA).
-//   4. Thread 0 polls local signal slot with mc_ld_acquire until all ranks
-//      have arrived.
+//   3. Each thread signals one peer rank by writing this rank's per-source
+//      slot in the peer workspace.  This intentionally uses release stores,
+//      not remote atomics: CUDA IPC peer mappings are reliable for ordinary
+//      P2P stores but are not a portable replacement for NCCL GIN symmetric
+//      remote RED atomics used by original DeepEP V2.
+//   4. Thread 0 polls all local per-source slots with mc_ld_acquire until all
+//      ranks have arrived.
 //   5. mc_grid_sync() at start and/or end for SM-level synchronization.
 // ---------------------------------------------------------------------------
 
@@ -99,50 +102,56 @@ __forceinline__ __device__ void gpu_barrier(
         static_cast<int>((*workspace.get_barrier_counter_ptr()) & 3);
     const int phase = status & 1, sign = status >> 1;
 
-    // Each thread signals one peer rank
+    // Each thread signals one peer rank.  Write a per-source slot so the
+    // protocol needs only ordinary P2P stores instead of peer atomics.
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (thread_idx < kNumRanks) {
         const auto peer_rank = thread_idx;
+        const int slot_value = sign ? 0 : 1;
+        auto* local_slot = workspace.get_barrier_signal_slot_ptr(
+            phase, rank_idx);
         if (peer_rank == rank_idx) {
-            // Self-signal: write directly to local buffer
-            mc_atomic_add_release(
-                workspace.get_barrier_signal_ptr(phase), sign ? -1 : 1);
+            // Self-signal: write directly to local slot
+            mc_st_release(local_slot, slot_value);
         } else {
             // Try P2P path first
-            void* peer_ptr = mc_route_put(
-                ctx, peer_rank, workspace.get_barrier_signal_ptr(phase));
+            void* peer_ptr = mc_route_put(ctx, peer_rank, local_slot);
             if (peer_ptr != nullptr) {
-                // P2P (NVLink): atomic add on peer memory
-                mc_atomic_add_release(static_cast<int*>(peer_ptr),
-                                      sign ? -1 : 1);
+                // P2P (NVLink): release store to this rank's slot in peer
+                // workspace.  No remote atomic required.
+                mc_st_release(static_cast<int*>(peer_ptr), slot_value);
             } else {
-                // RDMA path: use mc_signal
-                // Use channel 0, QP per rank = 1 for barrier traffic
-                mc_signal(ctx, peer_rank, 0, 1,
-                          workspace.get_barrier_signal_ptr(phase),
-                          sign ? -1 : 1);
+                // RDMA fallback is not expected for the current single-node
+                // elastic V2 path.  Keep the old signal path as a best-effort
+                // fallback, but P2P is the validated path for this barrier.
+                mc_signal(ctx, peer_rank, 0, 1, local_slot, slot_value);
             }
         }
     }
     __syncthreads();
 
     // Advance phase counter (only thread 0)
-    if (thread_idx == 0) atomicAdd(workspace.get_barrier_counter_ptr(), 1);
+    if (thread_idx == 0) atomicAdd(reinterpret_cast<unsigned long long*>(workspace.get_barrier_counter_ptr()), 1ull);
 
     // Wait for all ranks to arrive
-    const auto target = sign ? 0 : kNumRanks;
+    const auto target = sign ? 0 : 1;
     timeout_while<kNumTimeoutCycles>(
         thread_idx == 0, [=](const bool& is_last_check) {
-            const auto signal =
-                mc_ld_acquire(workspace.get_barrier_signal_ptr(phase));
-            if (signal == target) return true;
+            int ready_count = 0;
+#pragma unroll
+            for (int i = 0; i < kNumRanks; ++i) {
+                const auto signal = mc_ld_acquire(
+                    workspace.get_barrier_signal_slot_ptr(phase, i));
+                ready_count += (signal == target);
+            }
+            if (ready_count == kNumRanks) return true;
 
             if (is_last_check) {
                 printf(
                     "Mooncake EP barrier timeout, tag: %d, rank: %d, "
-                    "thread: %d, status: %d, signal: %d, phase: %d, "
+                    "thread: %d, status: %d, ready: %d, phase: %d, "
                     "target: %d, counter: %llu\n",
-                    kTag, rank_idx, thread_idx, status, signal, phase, target,
+                    kTag, rank_idx, thread_idx, status, ready_count, phase, target,
                     *workspace.get_barrier_counter_ptr());
             }
             return false;

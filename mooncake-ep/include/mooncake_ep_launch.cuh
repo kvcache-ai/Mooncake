@@ -5,7 +5,9 @@
 #ifndef SETUP_LAUNCH_CONFIG
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
     cudaLaunchConfig_t cfg = {                            \
-        (num_sms), (num_threads), 0, stream, nullptr, 0}; \
+        {(num_sms), 1, 1},                                \
+        {(num_threads), 1, 1},                            \
+        0, stream, nullptr, 0};                           \
     cudaLaunchAttribute attr[1];                          \
     attr[0].id = cudaLaunchAttributeCooperative;          \
     attr[0].val.cooperative = 1;                          \
@@ -20,6 +22,8 @@
 
 #define SWITCH_RANKS(case_macro)                           \
     switch (num_ranks) {                                   \
+        case 1:                                            \
+            case_macro(1);                                 \
         case 2:                                            \
             case_macro(2);                                 \
         case 4:                                            \
