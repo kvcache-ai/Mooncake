@@ -240,7 +240,7 @@ Submits an asynchronous write operation and returns immediately.
 - `transport_hint` (str, optional): TENT-only per-request transport pin. See the note above. Default `""` (policy-driven).
 
 **Returns:**
-- `int`: Batch ID for tracking the operation, or negative value on failure
+- `int`: Batch ID for tracking the operation, or 0 on failure
 
 #### transfer_check_status()
 
