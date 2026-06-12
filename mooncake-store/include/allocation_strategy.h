@@ -352,14 +352,16 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         const auto num_segs = ram_allocators.size();
         if (num_segs == 1) {
+            // Fast path for single segment
             return ram_allocators[0]->allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
         // allocations across all segments
         std::uniform_int_distribution<size_t> dist(0, num_segs - 1);
-        size_t seg_offset = dist(generator);
-        for (size_t i = 0; i < num_segs; i++) {
+        size_t seg_offset =
+            dist(generator);  // select a start segment to place replica
+        for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
             auto& allocator = ram_allocators[(i + seg_offset) % num_segs];
             if (auto buffer = allocator->allocate(slice_length)) {
                 return buffer;

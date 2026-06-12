@@ -874,10 +874,9 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     const MountedSegment &mounted_segment, MsgpackPacker &packer) {
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
-    // te_endpoint, protocol, status, has_buffer_allocator,
-    // buffer_allocator_data...]
+    // te_endpoint, status, has_buffer_allocator, buffer_allocator_data...]
 
-    packer.pack_array(9);
+    packer.pack_array(8);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -885,7 +884,6 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     packer.pack(static_cast<uint64_t>(mounted_segment.segment.base));
     packer.pack(static_cast<uint64_t>(mounted_segment.segment.size));
     packer.pack(mounted_segment.segment.te_endpoint);
-    packer.pack(mounted_segment.segment.protocol);
 
     // Serialize SegmentStatus
     packer.pack(static_cast<int16_t>(mounted_segment.status));
@@ -919,12 +917,7 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                                "state: not a msgpack array"));
     }
 
-    // 8-element: [id, name, base, size, te_endpoint, status, has_allocator,
-    // allocator] 9-element: [id, name, base, size, te_endpoint, protocol,
-    // status, has_allocator, allocator] protocol was added later; default to
-    // empty string when absent.
-    const auto seg_arr_size = obj.via.array.size;
-    if (seg_arr_size != 8 && seg_arr_size != 9) {
+    if (obj.via.array.size < 8) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize MountedSegment invalid array size"));
@@ -952,22 +945,15 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
             static_cast<size_t>(array[3].as<uint64_t>());
         mounted_segment.segment.te_endpoint = array[4].as<std::string>();
 
-        // protocol absent in 8-element format → default to empty string
-        const size_t status_index = (seg_arr_size == 9) ? 6 : 5;
-        if (seg_arr_size == 9) {
-            mounted_segment.segment.protocol = array[5].as<std::string>();
-        }
-
         // Deserialize SegmentStatus
         mounted_segment.status =
-            static_cast<SegmentStatus>(array[status_index].as<int16_t>());
+            static_cast<SegmentStatus>(array[5].as<int16_t>());
 
         // Deserialize BufferAllocator
-        bool has_buffer_allocator = array[status_index + 1].as<bool>();
+        bool has_buffer_allocator = array[6].as<bool>();
         if (has_buffer_allocator) {
             auto allocatorResult =
-                Serializer<OffsetBufferAllocator>::deserialize(
-                    array[status_index + 2]);
+                Serializer<OffsetBufferAllocator>::deserialize(array[7]);
             if (allocatorResult) {
                 mounted_segment.buf_allocator =
                     std::move(allocatorResult.value());
