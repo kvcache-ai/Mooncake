@@ -146,10 +146,11 @@ target_link_libraries(
          gtest_main
          pthread)
 if(STORE_USE_K8S_LEASE)
-  target_link_libraries(high_availability_test
-                        PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+  target_link_libraries(high_availability_test PRIVATE ${K8S_LEASE_WRAPPER_LIB})
 endif()
-if(STORE_USE_ETCD OR STORE_USE_REDIS OR STORE_USE_K8S_LEASE)
+if(STORE_USE_ETCD
+   OR STORE_USE_REDIS
+   OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 add_ha_test(ha_backend_availability_test
