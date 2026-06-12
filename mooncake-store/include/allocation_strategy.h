@@ -582,6 +582,25 @@ class SizeClassAwareAllocationStrategy : public RandomAllocationStrategy {
 
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
+
+        // Fast path: when there is only one segment, size-class ranking cannot
+        // change placement. Match RandomAllocationStrategy and avoid segment
+        // metric collection/sorting overhead.
+        if (names.size() == 1) {
+            if (excluded_segments.contains(names[0])) {
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[0],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                return replicas;
+            }
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
         std::set<std::string> used_segments;
 
         for (const auto& preferred_segment : preferred_segments) {
