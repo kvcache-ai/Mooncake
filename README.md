@@ -140,7 +140,7 @@ Mooncake establishes a full-stack, Tensor-oriented AI infrastructure where Tenso
 
 ### SGLang Integration ([Guide](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration/index.html))
 
-SGLang officially supports Mooncake Store as a [HiCache storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/). This integration enables scalable KV cache retention and high-performance access for large-scale LLM serving scenarios.
+Mooncake is deeply integrated into [SGLang](https://github.com/sgl-project/sglang/) as a high-performance communication and storage backend. These integrations enable efficient KV cache transfer in PD-disaggregated serving, scalable multi-level KV caching through HiCache, fault-tolerant expert-parallel inference, high-performance multimodal pipeline data movement, and fast RDMA-based weight synchronization for large-scale RL training. Together, Mooncake and SGLang provide a production-oriented foundation for building elastic, high-throughput, and resource-efficient LLM and multimodal serving systems.
 
 <details>
 <summary>Highlights</summary>
