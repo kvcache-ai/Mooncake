@@ -1,0 +1,168 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  name: mooncake
+---
+apiVersion: v1
+data:
+  master.yaml: |
+    rpc_port: 50051
+    rpc_thread_num: 4
+    rpc_address: "0.0.0.0"
+    rpc_conn_timeout_seconds: 0
+    rpc_enable_tcp_no_delay: true
+
+    enable_metric_reporting: true
+    metrics_port: 9003
+
+    enable_http_metadata_server: true
+    http_metadata_server_host: "0.0.0.0"
+    http_metadata_server_port: 8080
+
+    default_kv_lease_ttl: 5000
+    default_kv_soft_pin_ttl: 1800000
+    allow_evict_soft_pinned_objects: true
+    eviction_ratio: 0.05
+    eviction_high_watermark_ratio: 0.95
+
+    memory_allocator: "offset"
+    allocation_strategy: "random"
+
+    enable_snapshot: true
+    enable_snapshot_restore: true
+    snapshot_interval_seconds: 60
+    snapshot_retention_count: 3
+    snapshot_object_store_type: "local"
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  name: mooncake-master-config
+  namespace: mooncake
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  name: mooncake-master
+  namespace: mooncake
+spec:
+  ports:
+  - name: rpc
+    port: 50051
+    protocol: TCP
+    targetPort: rpc
+  - name: metadata
+    port: 8080
+    protocol: TCP
+    targetPort: metadata
+  - name: metrics
+    port: 9003
+    protocol: TCP
+    targetPort: metrics
+  selector:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  name: mooncake-master-snapshots
+  namespace: mooncake
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: master
+    app.kubernetes.io/name: mooncake-master
+    app.kubernetes.io/part-of: mooncake
+  name: mooncake-master
+  namespace: mooncake
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: master
+      app.kubernetes.io/name: mooncake-master
+      app.kubernetes.io/part-of: mooncake
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: master
+        app.kubernetes.io/name: mooncake-master
+        app.kubernetes.io/part-of: mooncake
+    spec:
+      containers:
+      - args:
+        - --config_path=/etc/mooncake/master.yaml
+        command:
+        - mooncake_master
+        env:
+        - name: MOONCAKE_SNAPSHOT_LOCAL_PATH
+          value: /data/snapshots
+        image: quay.io/grpereir/mooncake-master:test
+        livenessProbe:
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          tcpSocket:
+            port: rpc
+        name: mooncake-master
+        ports:
+        - containerPort: 50051
+          name: rpc
+          protocol: TCP
+        - containerPort: 9003
+          name: metrics
+          protocol: TCP
+        - containerPort: 8080
+          name: metadata
+          protocol: TCP
+        readinessProbe:
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          tcpSocket:
+            port: rpc
+        resources:
+          limits:
+            cpu: "4"
+            memory: 4Gi
+          requests:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /etc/mooncake
+          name: config
+          readOnly: true
+        - mountPath: /data/snapshots
+          name: snapshots
+      volumes:
+      - configMap:
+          name: mooncake-master-config
+        name: config
+      - name: snapshots
+        persistentVolumeClaim:
+          claimName: mooncake-master-snapshots
