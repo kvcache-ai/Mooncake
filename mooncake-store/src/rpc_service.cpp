@@ -485,7 +485,9 @@ void MasterAdminServer::InitHttpServer() {
 
             resp.set_status_and_content(
                 status_type::not_found,
-                std::string("{\"success\":false,\"error\":\"") +
+                std::string("{\"success\":false,\"error_code\":") +
+                    std::to_string(toInt(get_result.error())) +
+                    ",\"error_message\":\"" +
                     EscapeJson(toString(get_result.error())) + "\"}");
         });
 
