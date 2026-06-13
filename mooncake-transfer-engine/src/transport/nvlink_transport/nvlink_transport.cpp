@@ -449,6 +449,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         LOG(ERROR)
                             << "NvlinkTransport: cuMemAddressReserve failed: "
                             << result;
+                        cuMemRelease(handle);
                         return -1;
                     }
                     result = cuMemMap((CUdeviceptr)shm_addr, entry.length, 0,
@@ -456,6 +457,8 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR)
                             << "NvlinkTransport: cuMemMap failed: " << result;
+                        cuMemAddressFree((CUdeviceptr)shm_addr, entry.length);
+                        cuMemRelease(handle);
                         return -1;
                     }
 
@@ -475,6 +478,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
+                        cuMemUnmap((CUdeviceptr)shm_addr, entry.length);
+                        cuMemAddressFree((CUdeviceptr)shm_addr, entry.length);
+                        cuMemRelease(handle);
                         return -1;
                     }
                     OpenedShmEntry shm_entry;
