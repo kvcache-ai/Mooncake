@@ -626,8 +626,7 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
 
 static bool InjectLocalDiskReplica(MasterService& svc, const UUID& client_id,
                                    const std::string& segment_name,
-                                   int64_t value_size,
-                                   const std::string& key) {
+                                   int64_t value_size, const std::string& key) {
     StorageObjectMetadata meta;
     meta.bucket_id = 0;
     meta.offset = 0;
@@ -706,8 +705,8 @@ TEST_F(MasterMetricsTest,
 
     const std::string key = "mixed_hit_test_key";
     constexpr int64_t kValueSize = 4096;
-    ASSERT_TRUE(InjectLocalDiskReplica(svc, client_id, segment.name, kValueSize,
-                                       key));
+    ASSERT_TRUE(
+        InjectLocalDiskReplica(svc, client_id, segment.name, kValueSize, key));
 
     auto local_disk_get = svc.GetReplicaList(key, "default");
     ASSERT_TRUE(local_disk_get.has_value());
@@ -730,7 +729,7 @@ TEST_F(MasterMetricsTest,
     EXPECT_EQ(stats.at(CacheHitStat::MEMORY_HITS), base_memory_hits + 1);
     EXPECT_EQ(stats.at(CacheHitStat::SSD_HITS), base_ssd_hits + 1);
 
-    ASSERT_TRUE(svc.RemoveAll().has_value());
+    ASSERT_EQ(1, svc.RemoveAll(/*force=*/true));
 }
 
 // Verify that OffloadObjectHeartbeat updates total_file_capacity correctly,
