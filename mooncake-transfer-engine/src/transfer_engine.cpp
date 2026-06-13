@@ -71,6 +71,10 @@ int TransferEngine::closeSegment(SegmentHandle handle) {
     return impl_->closeSegment(handle);
 }
 
+int TransferEngine::unregisterRemoteSegment(SegmentID target_id) {
+    return impl_->unregisterRemoteSegment(target_id);
+}
+
 int TransferEngine::removeLocalSegment(const std::string& segment_name) {
     return impl_->removeLocalSegment(segment_name);
 }
@@ -367,6 +371,15 @@ int TransferEngine::closeSegment(SegmentHandle handle) {
         return (int)status.code();
     } else
         return impl_->closeSegment(handle);
+}
+
+int TransferEngine::unregisterRemoteSegment(SegmentID target_id) {
+    if (use_tent_) {
+        // The TENT MNNVL transport is a separate code path
+        // (mnnvl_transport.cpp); per-peer fabric release is not wired there.
+        return 0;
+    }
+    return impl_->unregisterRemoteSegment(target_id);
 }
 
 int TransferEngine::removeLocalSegment(const std::string& segment_name) {

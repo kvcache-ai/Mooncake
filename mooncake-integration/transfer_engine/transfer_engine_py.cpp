@@ -377,6 +377,33 @@ int TransferEnginePy::batchTransferSyncRead(
                              transport_hint);
 }
 
+int TransferEnginePy::releaseRemoteSegment(const char* target_hostname) {
+    // pybind11 passes nullptr for a Python None, and engine_ is null before
+    // init / after teardown; either would make the handle_map_ lookup below
+    // construct std::string(nullptr) or deref null. Nothing imported => nothing
+    // to release.
+    if (!engine_ || !target_hostname) return 0;
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto it = handle_map_.find(target_hostname);
+        // Not in the open-segment cache => this process never imported the
+        // peer, so it holds no mapping and there is nothing to release.
+        if (it == handle_map_.end()) return 0;
+        handle = it->second;
+        // Erase under the SAME lock, BEFORE unregister, so no concurrent
+        // transfer can still fetch this handle from the cache and start a copy
+        // into a mapping we are about to reclaim. Erasing first re-opens the
+        // segment cleanly on the next transfer (the peer re-registers with a
+        // fresh address on restart). In-flight transfers that already captured
+        // the handle are the caller's responsibility to drain, per
+        // unregisterRemoteSegment's contract.
+        handle_map_.erase(it);
+    }
+    return engine_->unregisterRemoteSegment(handle);
+}
+
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
@@ -1177,6 +1204,9 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("opcode"), py::arg("transport_hint") = "")
+            .def("release_remote_segment",
+                 &TransferEnginePy::releaseRemoteSegment,
+                 py::arg("target_hostname"))
 #ifdef USE_CUDA
             .def("transfer_write_on_cuda",
                  &TransferEnginePy::transferWriteOnCuda,

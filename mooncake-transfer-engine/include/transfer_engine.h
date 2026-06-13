@@ -94,6 +94,8 @@ class TransferEngine {
 
     int closeSegment(SegmentHandle handle);
 
+    int unregisterRemoteSegment(SegmentID target_id);
+
     int removeLocalSegment(const std::string& segment_name);
 
     int registerLocalMemory(void* addr, size_t length,

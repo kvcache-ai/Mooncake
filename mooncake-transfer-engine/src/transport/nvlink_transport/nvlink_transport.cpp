@@ -20,10 +20,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <memory>
+#include <thread>
 
 #include "common.h"
 #include "common/serialization.h"
@@ -132,7 +136,36 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     return true;
 }
 
-NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
+NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {
+    // TTL/lease eviction config. Reading env here keeps the reclaim path
+    // self-contained in the transport (no external control plane). TTL only
+    // needs to be well under the peer's restart time; default 120s, <=0
+    // disables.
+    const char *ttl = std::getenv("MOONCAKE_FABRIC_IMPORT_TTL");
+    if (ttl && *ttl)
+        import_ttl_s_ = std::atof(ttl);
+    else
+        import_ttl_s_ = 120.0;
+    const char *iv = std::getenv("MOONCAKE_FABRIC_EVICT_INTERVAL");
+    if (iv && *iv) {
+        double v = std::atof(iv);
+        // Ignore 0 / negative / garbage so a mistyped env can't turn the scan
+        // cadence into a busy-spin; keep the default 30s instead.
+        if (v > 0) evict_interval_s_ = v;
+    }
+    running_.store(true);
+    if (use_fabric_mem_ && import_ttl_s_ > 0) {
+        evict_thread_ = std::thread(&NvlinkTransport::evictLoop, this);
+        LOG(INFO) << "NvlinkTransport: idle-import evictor on (ttl "
+                  << import_ttl_s_ << "s, scan " << evict_interval_s_ << "s)";
+    } else if (use_fabric_mem_) {
+        // Surface the disabled case explicitly: a mistyped TTL (atof -> 0)
+        // silently turns reclaim off, which is hard to diagnose otherwise.
+        LOG(INFO) << "NvlinkTransport: idle-import evictor OFF (ttl "
+                  << import_ttl_s_
+                  << " <= 0); imported fabric segments held until process exit";
+    }
+}
 //     int num_devices = getNumDevices();
 //     if (globalConfig().trace) {
 //         LOG(INFO) << "NvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
@@ -160,17 +193,192 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 //     }
 // }
 
-NvlinkTransport::~NvlinkTransport() {
+bool NvlinkTransport::releaseImportedEntry(const OpenedShmEntry &entry) {
     if (use_fabric_mem_) {
-        for (auto &entry : remap_entries_) {
-            freePinnedLocalMemory(entry.second.shm_addr);
+        // Explicit teardown via the stored import handle. Deliberately NOT
+        // freePinnedLocalMemory: its cuMemRetainAllocationHandle does not work
+        // on an imported allocation and early-returns, leaving the mapping (and
+        // the exporter's pinned pages) in place. Order: unmap, free the VA,
+        // then release the import handle so the last importer reference is
+        // dropped.
+        bool ok = true;
+        CUresult r = cuMemUnmap((CUdeviceptr)entry.shm_addr, entry.length);
+        if (r != CUDA_SUCCESS) {
+            LOG(ERROR) << "NvlinkTransport: cuMemUnmap failed during release: "
+                       << r;
+            ok = false;
         }
-    } else {
-        for (auto &entry : remap_entries_) {
-            cudaIpcCloseMemHandle(entry.second.shm_addr);
+        r = cuMemAddressFree((CUdeviceptr)entry.shm_addr, entry.length);
+        if (r != CUDA_SUCCESS) {
+            LOG(ERROR)
+                << "NvlinkTransport: cuMemAddressFree failed during release: "
+                << r;
+            ok = false;
         }
+        r = cuMemRelease(entry.import_handle);
+        if (r != CUDA_SUCCESS) {
+            LOG(ERROR) << "NvlinkTransport: cuMemRelease(import_handle) failed "
+                          "during release: "
+                       << r;
+            ok = false;
+        }
+        return ok;
+    }
+    cudaError_t e = cudaIpcCloseMemHandle(entry.shm_addr);
+    if (e != cudaSuccess) {
+        LOG(ERROR)
+            << "NvlinkTransport: cudaIpcCloseMemHandle failed during release: "
+            << cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+NvlinkTransport::~NvlinkTransport() {
+    // Set running_ under evict_cv_mutex_ so the store is ordered against the
+    // evictor's wait predicate: otherwise a notify fired between the evictor's
+    // while-check and its wait_for is lost and join() blocks a full
+    // evict_interval_s_ before the timeout wakes it.
+    {
+        std::lock_guard<std::mutex> lk(evict_cv_mutex_);
+        running_.store(false);
+    }
+    evict_cv_.notify_all();
+    if (evict_thread_.joinable()) evict_thread_.join();
+    // cuMem* are context-bound and the destructing thread may not share the
+    // import context (same hazard the evictor handles); make it current first,
+    // else release fails with CUDA_ERROR_INVALID_CONTEXT and leaks the pages.
+    // Save and restore the caller's context: a destructor running on a user
+    // thread must not leave that thread pointed at the import context, or the
+    // thread's later CUDA calls land on the wrong context.
+    CUcontext ctx = worker_ctx_.load();
+    CUcontext prev_ctx = nullptr;
+    if (ctx) {
+        cuCtxGetCurrent(&prev_ctx);
+        cuCtxSetCurrent(ctx);
+    }
+    for (auto &entry : remap_entries_) {
+        releaseImportedEntry(entry.second);
     }
     remap_entries_.clear();
+    if (ctx) cuCtxSetCurrent(prev_ctx);
+}
+
+static inline int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+int NvlinkTransport::evictIdleSegments(double ttl_s) {
+    if (ttl_s <= 0) return 0;
+    const int64_t now_ns = steadyNowNs();
+    const int64_t ttl_ns = static_cast<int64_t>(ttl_s * 1e9);
+    std::vector<OpenedShmEntry> to_release;
+    {
+        // Under the write lock we only DECIDE (idle check) and DETACH (erase
+        // from remap_entries_); the blocking cuMem* teardown runs AFTER the
+        // lock is dropped. Holding a spinlock across blocking driver calls
+        // would make any thread contending for it busy-spin and burn a core.
+        // Safety without an in-lock unmap rests on two facts: (1) an entry is
+        // "idle" only if it had no write for > ttl_s, and relocate stamps
+        // last_active_ns BEFORE its synchronous copy, so any in-flight write
+        // looks fresh and is skipped here; (2) erasing the entry under the lock
+        // stops a concurrent relocate from re-using or re-importing it before
+        // we release. The lease lives in the entry, so it is reclaimed with it
+        // -- no separate map to scan.
+        RWSpinlock::WriteGuard lock_guard(remap_lock_);
+        for (auto it = remap_entries_.begin(); it != remap_entries_.end();) {
+            int64_t la =
+                it->second.last_active_ns.load(std::memory_order_relaxed);
+            // la == 0 -> imported but not yet stamped; treat as active.
+            bool idle = (la != 0) && (now_ns - la) > ttl_ns;
+            if (idle) {
+                to_release.push_back(it->second);
+                it = remap_entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Release outside the lock. The evictor thread already made worker_ctx_
+    // current (cuMem* are context-bound) before calling us.
+    int released = 0;
+    for (const auto &entry : to_release) {
+        if (releaseImportedEntry(entry)) ++released;
+    }
+    return released;
+}
+
+void NvlinkTransport::evictLoop() {
+    while (running_.load()) {
+        {
+            std::unique_lock<std::mutex> lk(evict_cv_mutex_);
+            evict_cv_.wait_for(lk,
+                               std::chrono::duration<double>(evict_interval_s_),
+                               [this] { return !running_.load(); });
+        }
+        if (!running_.load()) break;
+        CUcontext ctx = worker_ctx_.load();
+        if (!ctx) continue;  // nothing imported yet -> nothing to reclaim
+        // cuMem* are context-bound; a fresh std::thread has no current context.
+        CUresult cr = cuCtxSetCurrent(ctx);
+        if (cr != CUDA_SUCCESS) {
+            LOG(ERROR) << "NvlinkTransport: evictor cuCtxSetCurrent failed: "
+                       << cr;
+            continue;
+        }
+        int n = evictIdleSegments(import_ttl_s_);
+        if (n > 0)
+            LOG(INFO) << "NvlinkTransport: evictIdleSegments released " << n
+                      << " idle imported segment(s) (idle > " << import_ttl_s_
+                      << "s)";
+    }
+}
+
+int NvlinkTransport::unregisterRemoteSegment(SegmentID target_id) {
+    // Per-target version of the destructor. The caller is responsible for
+    // draining in-flight transfers to target_id (the mapping VA may already be
+    // captured by an in-flight RDMA write).
+    //
+    // Collect-then-release, like evictIdleSegments: under the write lock we
+    // only detach the matching entries from remap_entries_, then run the
+    // blocking cuMem* teardown OUTSIDE the lock so a thread contending for the
+    // spinlock never busy-spins across blocking driver calls. Erasing under the
+    // lock blocks a concurrent relocate from re-using / re-importing these
+    // mappings; the drain contract covers writes already in flight. released
+    // counts only entries whose backing pages were ACTUALLY reclaimed (all CUDA
+    // release calls succeeded), so it is the real reclaim count, not the number
+    // of cache entries erased.
+    std::vector<OpenedShmEntry> to_release;
+    {
+        RWSpinlock::WriteGuard lock_guard(remap_lock_);
+        for (auto it = remap_entries_.begin(); it != remap_entries_.end();) {
+            if (it->first.first == target_id) {
+                to_release.push_back(it->second);
+                it = remap_entries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (to_release.empty()) return 0;
+    // cuMem* are context-bound. Unlike the evictor, this runs on the caller's
+    // (manual-knob) thread, which may not have the import context current; make
+    // it current for the teardown and restore the caller's context after (same
+    // save/set/restore as the destructor).
+    CUcontext ctx = worker_ctx_.load();
+    CUcontext prev_ctx = nullptr;
+    if (ctx) {
+        cuCtxGetCurrent(&prev_ctx);
+        cuCtxSetCurrent(ctx);
+    }
+    int released = 0;
+    for (const auto &entry : to_release) {
+        if (releaseImportedEntry(entry)) ++released;
+    }
+    if (ctx) cuCtxSetCurrent(prev_ctx);
+    return released;
 }
 
 int NvlinkTransport::install(std::string &local_server_name,
@@ -397,10 +605,18 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             remap_lock_.lockShared();
-            if (remap_entries_.count(std::make_pair(target_id, entry.addr))) {
-                auto shm_addr =
-                    remap_entries_[std::make_pair(target_id, entry.addr)]
-                        .shm_addr;
+            auto cache_it =
+                remap_entries_.find(std::make_pair(target_id, entry.addr));
+            if (cache_it != remap_entries_.end()) {
+                // Refresh the lease before releasing remap_lock_ and before the
+                // caller's synchronous copy. A relaxed atomic store under the
+                // shared lock (the evictor reads it under the write lock); a
+                // target is evicted only after ttl_s with no write, and ttl_s
+                // is far larger than any single transfer, so an in-flight write
+                // always looks fresh here.
+                cache_it->second.last_active_ns.store(
+                    steadyNowNs(), std::memory_order_relaxed);
+                auto shm_addr = cache_it->second.shm_addr;
                 remap_lock_.unlockShared();
                 dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
                 return 0;
@@ -477,9 +693,25 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                    << result;
                         return -1;
                     }
+                    // Keep the imported handle alive for the mapping's lifetime
+                    // -- releaseImportedEntry drops it with cuMemRelease at
+                    // teardown. Releasing it here and relying on
+                    // cuMemRetainAllocationHandle (freePinnedLocalMemory) to
+                    // recover it later does NOT work on imported allocations:
+                    // the retain fails, unmap is skipped, and the exporter's
+                    // pages stay pinned. The handle ref does not affect writes.
+                    // Capture the context the mappings live in (valid here --
+                    // we just cuMemMap'd); the evictor/dtor make it current
+                    // before cuMemUnmap/cuMemRelease.
+                    if (worker_ctx_.load() == nullptr) {
+                        CUcontext cur = nullptr;
+                        if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur)
+                            worker_ctx_.store(cur);
+                    }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
                     shm_entry.length = entry.length;
+                    shm_entry.import_handle = handle;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else {
@@ -487,8 +719,13 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     return -1;
                 }
             }
-            auto shm_addr =
-                remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;
+            auto &mapped =
+                remap_entries_[std::make_pair(target_id, entry.addr)];
+            // Stamp the lease on the import path too (held under the write
+            // lock).
+            mapped.last_active_ns.store(steadyNowNs(),
+                                        std::memory_order_relaxed);
+            auto shm_addr = mapped.shm_addr;
             dest_addr = dest_addr - entry.addr + ((uint64_t)shm_addr);
             return 0;
         }
