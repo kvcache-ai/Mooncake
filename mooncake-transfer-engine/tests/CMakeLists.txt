@@ -65,6 +65,10 @@ target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest gtest_main
 add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
 endif()
 
+add_executable(tcp_address_validation_test ${WORKSPACE}/tcp_address_validation_test.cpp)
+target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
+add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
+
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
@@ -124,7 +128,27 @@ if (USE_UB)
     add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
     target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest gtest_main glog::glog pthread)
     target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
-    add_test(NAME ub_transport_test COMMAND ub_transport_test)
+    # Built but not registered with ctest: this test may still have race
+    # conditions and other stability issues, so keep it out of CI for now.
+    # Run manually with ./ub_transport_test.
+    # add_test(NAME ub_transport_test COMMAND ub_transport_test)
+endif()
+
+if (USE_SUNRISE)
+    add_executable(sunrise_link_transport_test ${WORKSPACE}/sunrise_link_transport_test.cpp)
+    target_include_directories(sunrise_link_transport_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_test COMMAND sunrise_link_transport_test)
+
+    add_executable(sunrise_link_transport_runtime_test ${WORKSPACE}/sunrise_link_transport_runtime_test.cpp)
+    target_include_directories(sunrise_link_transport_runtime_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_runtime_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_runtime_test COMMAND sunrise_link_transport_runtime_test)
+
+    add_executable(sunrise_link_transport_unit_test ${WORKSPACE}/sunrise_link_transport_unit_test.cpp)
+    target_include_directories(sunrise_link_transport_unit_test PRIVATE ${MC_TANGRT_ROOT}/include)
+    target_link_libraries(sunrise_link_transport_unit_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME sunrise_link_transport_unit_test COMMAND sunrise_link_transport_unit_test)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)

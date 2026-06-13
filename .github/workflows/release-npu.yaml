@@ -5,114 +5,47 @@ on:
     tags:
       - 'v*'
 
+env:
+  CANN_VERSION: "9.0.0"
+
 jobs:
   build:
-    if: ${{ github.repository == 'kvcache-ai/Mooncake' && !contains(github.ref_name, '-') }}
+    if: ${{ !contains(github.ref_name, '-') }}
 
-    runs-on: self-hosted
+    strategy:
+      max-parallel: 2
+      matrix:
+        arch: [aarch64, x86_64]
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        include:
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            cann_arch: aarch64
+          - arch: x86_64
+            runner: ubuntu-22.04
+            cann_arch: x86_64
+
+    runs-on: ${{ matrix.runner }}
 
     permissions:
       contents: write
-
-    strategy:
-      max-parallel: 1
-      matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13']
 
     env:
       BUILD_WITH_EP: "0"
       NPU_BUILD: "1"
 
-    container:
-      image: localhost:5000/mooncake-hixl-ci:v6-release
-
-      options: --privileged --user 0:0 --device /dev/davinci0 --device /dev/davinci1 --device /dev/davinci2 --device /dev/davinci3
-                    --device /dev/davinci4 --device /dev/davinci5 --device /dev/davinci6 --device /dev/davinci7
-                    --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc --ulimit nproc=65535:65535
-
-      volumes:
-        - /usr/local/dcmi:/usr/local/dcmi:ro
-        - /usr/local/Ascend/driver/:/usr/local/Ascend/driver/:ro
-        - /etc/ascend_install.info:/etc/ascend_install.info:ro
-        - /etc/hccn.conf:/etc/hccn.conf:ro
-
     steps:
-      - name: Configure GitHub fetch defaults
-        shell: bash
-        run: |
-          git config --global protocol.version 2
-          git config --global http.version HTTP/1.1
-          git config --global http.lowSpeedLimit 1024
-          git config --global http.lowSpeedTime 30
-
       - name: Checkout code
-        id: checkout_code
-        continue-on-error: true
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          persist-credentials: false
+          fetch-depth: 0
 
-      - name: Retry checkout via GitHub mirror
-        if: steps.checkout_code.outcome == 'failure'
-        shell: bash
-        env:
-          ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
-        run: |
-          set -euo pipefail
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-          if [ -z "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
-            echo "Checkout from GitHub failed and ASCEND_GITHUB_MIRROR_URLS is not set"
-            exit 1
-          fi
-
-          normalize_base() {
-            local base="$1"
-            base="${base#${base%%[![:space:]]*}}"
-            base="${base%${base##*[![:space:]]}}"
-            [ -n "$base" ] || return 1
-            [ "$base" != "https://github.com/" ] && base="${base%/}/"
-            printf '%s\n' "$base"
-          }
-
-          candidates=()
-          while IFS= read -r raw; do
-            base="$(normalize_base "$raw" || true)"
-            [ -n "$base" ] || continue
-            [ "$base" = "https://github.com/" ] && continue
-            candidates+=("$base")
-          done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
-
-          if [ ${#candidates[@]} -eq 0 ]; then
-            echo "Checkout from GitHub failed and no valid mirror candidates were configured"
-            exit 1
-          fi
-
-          workdir="${GITHUB_WORKSPACE}"
-          git config --global --add safe.directory "$workdir"
-
-          for base in "${candidates[@]}"; do
-            mirror_url="${base}https://github.com/${GITHUB_REPOSITORY}.git"
-            echo "Retrying checkout with ${mirror_url}"
-
-            find "$workdir" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-            git init "$workdir"
-            git -C "$workdir" remote add origin "$mirror_url"
-
-            if git -C "$workdir" fetch --depth=1 origin "${{ github.sha }}" && \
-               git -C "$workdir" checkout --force --detach FETCH_HEAD; then
-              echo "Mirror checkout succeeded via ${base}"
-              exit 0
-            fi
-
-            echo "Mirror checkout failed via ${base}"
-            rm -rf "$workdir/.git"
-          done
-
-          echo "Direct GitHub checkout failed and all mirror retries failed"
-          exit 1
-
-      - name: Use container Python ${{ matrix.python-version }}
+      - name: Set Python bin
         shell: bash
         run: |
           set -euo pipefail
@@ -121,58 +54,76 @@ jobs:
           "$PYTHON_BIN" -m pip --version
           echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
 
-      - name: Install dependencies
+      - name: Install CANN Toolkit
         shell: bash
-        env:
-          ASCEND_GITHUB_MIRROR_URLS: 'https://ghfast.top/'
         run: |
           set -euo pipefail
-          source /usr/local/Ascend/cann-9.0.0/set_env.sh
-          if command -v apt-get >/dev/null 2>&1; then
-            bash -x dependencies.sh -y
-          else
-            bash -x scripts/ascend/dependencies_openeuler.sh -y
-          fi
-          bash scripts/ascend/dependencies_ascend_installation.sh
+          CANN_URL="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${{ env.CANN_VERSION }}/Ascend-cann-toolkit_${{ env.CANN_VERSION }}_linux-${{ matrix.cann_arch }}.run"
+          echo "Downloading CANN ${{ env.CANN_VERSION }} from ${CANN_URL}"
+          wget -q --show-progress -O /tmp/cann_toolkit.run "${CANN_URL}"
+          chmod +x /tmp/cann_toolkit.run
+          sudo /tmp/cann_toolkit.run --install --install-for-all --install-path=/usr/local/Ascend --quiet
+          rm -f /tmp/cann_toolkit.run
+
+      - name: Build and install HIXL
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo ${PYTHON_BIN} -m pip install setuptools
+          cd /tmp
+          git clone https://gitcode.com/cann/hixl.git
+          cd hixl
+          bash build.sh -j$(nproc)
+          sudo ./build_out/cann-hixl_*.run --full --quiet --pylocal --install-path=/usr/local/Ascend
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
+          sudo bash -x dependencies.sh -y
+          sudo bash scripts/ascend/dependencies_ascend_installation.sh
           echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
-          echo "GOPROXY=https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct" >> "$GITHUB_ENV"
-          echo "GOSUMDB=sum.golang.google.cn" >> "$GITHUB_ENV"
-          /usr/local/go/bin/go env -w GOPROXY="https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct"
-          /usr/local/go/bin/go env -w GOSUMDB=sum.golang.google.cn
 
       - name: Configure project
         shell: bash
         run: |
-          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
           rm -rf build
           mkdir build
           cd build
           cmake_args=(
             -DUSE_ASCEND_DIRECT=ON
-            -DUSE_CUDA=OFF
-            -DWITH_EP=OFF
-            -DUSE_HTTP=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON
             -DBUILD_UNIT_TESTS=OFF
-            -DBUILD_EXAMPLES=ON
             -DCMAKE_BUILD_TYPE=Release
             -DPython3_EXECUTABLE="${PYTHON_BIN}"
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
+            -DCMAKE_SKIP_INSTALL_RPATH=ON
           )
           cmake .. "${cmake_args[@]}"
 
       - name: Build project
         shell: bash
-        env:
-          GOPROXY: 'https://goproxy.io|https://mirrors.aliyun.com/goproxy/|https://goproxy.cn|direct'
-          GOSUMDB: sum.golang.google.cn
         run: |
-          set -euo pipefail
-          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
           export PATH="/usr/local/go/bin:${PATH}"
           cd build
           cmake --build . -j"$(nproc)"
-          cmake --install .
+          sudo cmake --install .
 
       - name: Generate Python version tag
         id: generate_tag_release
@@ -183,14 +134,17 @@ jobs:
       - name: Build Python wheel
         shell: bash
         run: |
-          source /usr/local/Ascend/cann-9.0.0/set_env.sh
+          set -eo pipefail
+          export PYTHONPATH="${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          source /usr/local/Ascend/cann/set_env.sh
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           NPU_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          name: mooncake-wheel-npu-${{ matrix.arch }}-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
@@ -211,7 +165,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: mooncake-wheel/dist-all
-          pattern: mooncake-wheel-npu-py*
+          pattern: mooncake-wheel-npu-*
 
       - name: Prepare wheels for release
         run: |
@@ -226,6 +180,7 @@ jobs:
           files: mooncake-wheel/dist-release/*.whl
 
       - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/

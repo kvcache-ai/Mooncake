@@ -18,6 +18,15 @@ static MooncakeProcessContext g_ctx;
 
 static std::once_flag g_init_control_plane_once;
 
+#ifdef USE_MACA
+static void requireMacaHostTransport() {
+    TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
+                "MACA PG requires MC_MACA_HOST_TRANSPORT=1 so the transfer "
+                "engine uses a host transport.");
+}
+
+#endif
+
 static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
                                    int rank, int max_world_size) {
     std::call_once(g_init_control_plane_once, [&] {
@@ -26,6 +35,9 @@ static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
         // getWarmupRecvAddr().  These must be non-empty, so the engine and
         // LinkManager must be initialized BEFORE AgentHost starts.
         if (!g_ctx.engine_initialized) {
+#ifdef USE_MACA
+            requireMacaHostTransport();
+#endif
             g_ctx.engine->init(P2PHANDSHAKE, g_ctx.host_ip);
             g_ctx.engine_initialized = true;
         }

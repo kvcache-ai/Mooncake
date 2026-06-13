@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include "memory_location.h"
 #include "mooncake_worker.cuh"
@@ -138,6 +139,28 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
+#ifdef USE_MACA
+    } else {
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU send buffer"));
+
+            int rc = ctx_.engine->registerLocalMemory(send_buffer_[i],
+                                                      kBufferSize, location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+
+        for (size_t i = 0; i < 2; i++) {
+            cudaError_t err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            TORCH_CHECK(!err,
+                        c10::str("Failed to allocate MACA GPU recv buffer"));
+
+            int rc = ctx_.engine->registerLocalMemory(recv_buffer_[i],
+                                                      kBufferSize, location);
+            TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+        }
+#else
     } else {
         for (size_t i = 0; i < 2; i++) {
             cudaError_t err = cudaMalloc(&send_buffer_[i], kBufferSize);
@@ -156,6 +179,7 @@ MooncakeBackend::MooncakeBackend(
                                                       kBufferSize, location);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
+#endif
     }
 
     // Register CPU sync regions

@@ -70,7 +70,7 @@ git commit -m "chore: pre-commit autoupdate"
 
 If clang-format is missing, install it (Ubuntu example):
 ```bash
-sudo apt-get update && sudo apt-get install -y clang-format
+sudo apt-get update && sudo apt-get install -y clang-format-20
 ```
 
 You can temporarily skip hooks:

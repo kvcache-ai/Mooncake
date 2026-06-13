@@ -136,6 +136,9 @@ class TransferEngineImpl {
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
+        if (entries.empty()) {
+            return Status::InvalidArgument("entries must not be empty");
+        }
         auto target_id = entries[0].target_id;
         Status s = multi_transports_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
@@ -194,6 +197,9 @@ class TransferEngineImpl {
     Status mp_submitTransferWithNotify(
         BatchID batch_id, const std::vector<TransferRequest>& entries,
         TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+        if (entries.empty()) {
+            return Status::InvalidArgument("entries must not be empty");
+        }
         auto target_id = entries[0].target_id;
         Status s =
             multi_transports_->mp_submitTransfer(batch_id, entries, proto);
