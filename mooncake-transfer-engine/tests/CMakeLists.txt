@@ -171,6 +171,10 @@ add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME topology_test COMMAND topology_test)
 
+add_executable(pci_topology_test ${WORKSPACE}/pci_topology_test.cpp)
+target_link_libraries(pci_topology_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME pci_topology_test COMMAND pci_topology_test)
+
 add_executable(memory_location_test ${WORKSPACE}/memory_location_test.cpp)
 target_link_libraries(memory_location_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME memory_location_test COMMAND memory_location_test)
