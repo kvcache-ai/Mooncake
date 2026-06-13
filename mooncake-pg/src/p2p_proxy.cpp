@@ -354,7 +354,9 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
         resetPeerState(op_ctx.peer_rank_);
         meta_->peerConnected[op_ctx.peer_rank_] = false;
         meta_->activeRanks[op_ctx.peer_rank_] = false;
-        meta_->activeRanksTensor[op_ctx.peer_rank_] = 0;
+        if (meta_->activeRanksTensor.device().is_cpu()) {
+            meta_->activeRanksTensor[op_ctx.peer_rank_] = 0;
+        }
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

@@ -249,11 +249,13 @@ inline std::vector<uint8_t> BuildMetadataPayloadWithDeclaredReplicaCount(
 }
 
 inline ha::SnapshotDescriptor MakeTestSnapshotDescriptor(
+    const std::string& cluster_id = "",
     std::string_view snapshot_id = kDefaultTestSnapshotId,
     uint64_t last_included_seq = kDefaultTestSnapshotSeq,
     uint64_t producer_view_version = kDefaultTestProducerViewVersion,
     int64_t created_at_ms = kDefaultTestCreatedAtMs) {
     auto descriptor = ha::snapshot_catalog_store_detail::MakeSnapshotDescriptor(
+        ha::snapshot_catalog_store_detail::BuildSnapshotRoot(cluster_id),
         std::string(snapshot_id));
     descriptor.last_included_seq = last_included_seq;
     descriptor.producer_view_version = producer_view_version;
@@ -280,7 +282,8 @@ inline std::unique_ptr<ha::SnapshotCatalogStore> CreateCatalogStoreForTest(
     const std::string& cluster_id, const std::string& redis_endpoint) {
     if (param.catalog_store_type == "embedded") {
         return std::make_unique<
-            ha::backends::embedded::EmbeddedSnapshotCatalogStore>(object_store);
+            ha::backends::embedded::EmbeddedSnapshotCatalogStore>(object_store,
+                                                                  cluster_id);
     }
 
 #ifdef STORE_USE_REDIS

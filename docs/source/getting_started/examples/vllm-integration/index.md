@@ -12,6 +12,8 @@ Mooncake integrates with vLLM to accelerate large language model serving through
 | PD Disaggregation (KV transfer) | [Disaggregated Prefill-Decode](disagg-prefill-decode) | V1 ✅ / V0 ⚠️ |
 | KV Cache Storage & Sharing | [KV Cache Storage with MooncakeStore](kv-cache-storage) | V1 ✅ / V0 ⚠️ |
 
+For detailed benchmark coverage across these scenarios, see [vLLM Integration Performance Benchmarks](../../../performance/vllm/index).
+
 ```{admonition} New to Mooncake + vLLM?
 :class: tip
 Start with the V1 guides above. Legacy V0 documentation is available for existing deployments only.

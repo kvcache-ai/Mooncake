@@ -188,7 +188,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return tmp_dir() + "/mooncake_master_snapshot/" + snapshot_id + "/";
+        return tmp_dir() + "/" +
+               ha::snapshot_catalog_store_detail::BuildSnapshotRoot(
+                   DEFAULT_CLUSTER_ID) +
+               snapshot_id + "/";
     }
 
     // Get backup directory path
@@ -204,7 +207,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         ServiceStateSnapshot state;
 
         // === Basic State ===
-        auto keys_result = service->GetAllKeys();
+        auto keys_result = service->GetAllKeys("default");
         if (keys_result.has_value()) {
             state.all_keys = std::move(keys_result.value());
             std::sort(state.all_keys.begin(), state.all_keys.end());
@@ -217,7 +220,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         for (const auto& key : state.all_keys) {
-            auto replica_result = service->GetReplicaList(key);
+            auto replica_result = service->GetReplicaList(key, "default");
             if (replica_result.has_value()) {
                 state.replica_lists[key] = std::move(replica_result.value());
             }
@@ -529,8 +532,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         const std::string key = "snapshot_putstart_consistency_key";
         const uint64_t slice_length = 1024;
 
-        auto before = original->PutStart(client_id, key, slice_length, config);
-        auto after = restored->PutStart(client_id, key, slice_length, config);
+        auto before =
+            original->PutStart(client_id, key, "default", slice_length, config);
+        auto after =
+            restored->PutStart(client_id, key, "default", slice_length, config);
 
         ASSERT_EQ(before.has_value(), after.has_value())
             << "PutStart has_value mismatch between original and restored "

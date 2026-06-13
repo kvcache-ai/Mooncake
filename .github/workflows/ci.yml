@@ -123,6 +123,7 @@ jobs:
       shell: bash
 
     - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
@@ -652,6 +653,7 @@ jobs:
       shell: bash
 
     - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 

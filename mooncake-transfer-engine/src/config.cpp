@@ -158,7 +158,6 @@ void loadGlobalConfig(GlobalConfig& config) {
         else {
             LOG(ERROR) << "Ignore value from environment variable MC_MTU, it "
                           "should be 512|1024|2048|4096";
-            exit(EXIT_FAILURE);
         }
     }
 
@@ -244,13 +243,30 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* handshake_listen_backlog =
         std::getenv("MC_HANDSHAKE_LISTEN_BACKLOG");
     if (handshake_listen_backlog) {
-        int val = std::stoi(handshake_listen_backlog);
-        if (val > 0) {
-            config.handshake_listen_backlog = val;
-        } else {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "MC_HANDSHAKE_LISTEN_BACKLOG";
+        try {
+            int val = std::stoi(handshake_listen_backlog);
+            if (val > 0) {
+                config.handshake_listen_backlog = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_HANDSHAKE_LISTEN_BACKLOG";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_HANDSHAKE_LISTEN_BACKLOG environment "
+                            "value: "
+                         << handshake_listen_backlog << ". Error: " << e.what();
         }
+    }
+
+    const char* handshake_connect_timeout =
+        std::getenv("MC_HANDSHAKE_CONNECT_TIMEOUT");
+    if (handshake_connect_timeout) {
+        int val = atoi(handshake_connect_timeout);
+        if (val > 0 && val < 3600)
+            config.handshake_connect_timeout = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_HANDSHAKE_CONNECT_TIMEOUT";
     }
 
     const char* log_level = std::getenv("MC_LOG_LEVEL");

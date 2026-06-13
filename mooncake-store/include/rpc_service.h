@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -178,6 +179,9 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
+    tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+    GetSegmentsDetailForAdmin();
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
@@ -323,6 +327,7 @@ class MasterAdminServer {
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
+    std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};

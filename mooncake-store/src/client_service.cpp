@@ -384,8 +384,9 @@ Client::~Client() {
         }
     }
 
-    // Stop hot cache handler and hot cache
+    // Stop hot cache handler before unregistering/freeing its backing memory.
     hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
 }
 
@@ -3857,6 +3858,11 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 }
 
 ErrorCode Client::InitLocalHotCache() {
+    hot_cache_handler_.reset();
+    UnregisterLocalHotCacheMemory();
+    hot_cache_.reset();
+    admission_sketch_.reset();
+
     // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
     // set to a positive value; when enabled, default block size is 16MB and
     // thread_num is 2.
@@ -3867,9 +3873,6 @@ ErrorCode Client::InitLocalHotCache() {
     size_t total_cache = GetLocalHotCacheSizeFromEnv();
     if (total_cache == 0) {
         // Environment variable not set or invalid, disable cache
-        hot_cache_.reset();
-        hot_cache_handler_.reset();
-        admission_sketch_.reset();
         return ErrorCode::OK;
     }
 
@@ -3897,10 +3900,29 @@ ErrorCode Client::InitLocalHotCache() {
             admission_sketch_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
+
+        int rc = transfer_engine_->registerLocalMemory(
+            hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
+            kWildcardLocation, true, true);
+        if (rc != 0) {
+            LOG(ERROR)
+                << "Failed to register local hot cache memory with transfer "
+                   "engine, base="
+                << hot_cache_->GetBaseAddress()
+                << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+            hot_cache_.reset();
+            hot_cache_handler_.reset();
+            admission_sketch_.reset();
+            hot_cache_memory_registered_ = false;
+            return ErrorCode::INVALID_PARAMS;
+        }
+        hot_cache_memory_registered_ = true;
+
         LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
                   << ", block size=" << block_size
                   << ", block amount=" << hot_cache_->GetCacheSize()
-                  << ", shm=" << (use_shm ? "on" : "off");
+                  << ", shm=" << (use_shm ? "on" : "off")
+                  << ", transfer engine registered=on";
         // Create async handler with 2 worker threads
         hot_cache_handler_ =
             std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
@@ -3927,6 +3949,27 @@ ErrorCode Client::InitLocalHotCache() {
         }
     }
     return ErrorCode::OK;
+}
+
+void Client::UnregisterLocalHotCacheMemory() {
+    if (!(hot_cache_ && hot_cache_memory_registered_)) {
+        return;
+    }
+    if (!transfer_engine_) {
+        hot_cache_memory_registered_ = false;
+        return;
+    }
+
+    int rc = transfer_engine_->unregisterLocalMemory(
+        hot_cache_->GetBaseAddress(), true);
+    if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(ERROR)
+            << "Failed to unregister local hot cache memory from transfer "
+               "engine, base="
+            << hot_cache_->GetBaseAddress()
+            << ", size=" << hot_cache_->GetTotalSize() << ", ret=" << rc;
+    }
+    hot_cache_memory_registered_ = false;
 }
 
 void Client::ProcessSlicesAsync(const std::string& key,

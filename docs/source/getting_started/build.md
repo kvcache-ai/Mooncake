@@ -45,6 +45,24 @@ pip install mooncake-transfer-engine-non-cuda
    sudo make install
    ```
 
+**Build with NVMe-oF SSD Pool**
+
+To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
+Mooncake with `USE_NOF` enabled:
+
+```bash
+bash dependencies.sh --with-spdk
+
+mkdir build
+cd build
+cmake .. -DUSE_NOF=ON
+make -j
+sudo make install
+```
+
+`-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
+`-DUSE_NOF=OFF` or omit the option when the NVMe-oF SSD pool is not needed.
+
 ## Manual Build
 
 ### Recommended Version
@@ -77,7 +95,7 @@ pip install mooncake-transfer-engine-non-cuda
                        libhiredis-dev \
                        pkg-config \
                        patchelf
-    
+
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -272,5 +290,5 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
-- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: Enable Ascend Direct transport and HCCS support via the ADXL engine (**recommended**). 
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: Enable Ascend Direct transport and HCCS support via the ADXL engine (**recommended**).
 - `-DUSE_UBSHMEM=[ON|OFF]`: Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs.
