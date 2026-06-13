@@ -190,7 +190,7 @@ static inline uint8_t fillData(void* addr, size_t length) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
-        tangMemcpy(addr, ref_data.data(), length, tangMemcpyHostToDevice);
+        cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
         return seed;
     }
 #endif
@@ -219,7 +219,7 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
-        tangMemcpy(act_data.data(), addr, length, tangMemcpyDeviceToHost);
+        cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDeviceToHost);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

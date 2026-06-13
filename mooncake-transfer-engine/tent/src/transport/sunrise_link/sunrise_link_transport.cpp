@@ -57,7 +57,9 @@ static std::string TangRtSharedObjectPath(const char* soname) {
     const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
     std::string arch_dir =
         (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
-    return r + "/lib/" + arch_dir + "/" + soname;
+    std::string arch_path = r + "/lib/" + arch_dir + "/" + soname;
+    if (access(arch_path.c_str(), F_OK) == 0) return arch_path;
+    return r + "/lib/" + soname;
 }
 
 constexpr int kMaxPhytopoPorts = 10;

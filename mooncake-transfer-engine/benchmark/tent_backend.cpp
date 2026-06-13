@@ -57,9 +57,14 @@ std::shared_ptr<Config> loadConfig() {
     if (!XferBenchConfig::xport_type.empty()) {
         // Map of transport names to their config keys (handle name mismatches)
         std::unordered_map<std::string, std::string> transport_map = {
-            {"rdma", "rdma"},        {"tcp", "tcp"},     {"shm", "shm"},
+            {"rdma", "rdma"},
+            {"tcp", "tcp"},
+            {"shm", "shm"},
             {"iouring", "io_uring"},  // Note: iouring -> io_uring
-            {"gds", "gds"},          {"mnnvl", "mnnvl"}, {"nvlink", "nvlink"}};
+            {"gds", "gds"},
+            {"mnnvl", "mnnvl"},
+            {"nvlink", "nvlink"},
+            {"sunrise_link", "sunrise_link"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -84,6 +89,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "nvlink") return NVLINK;
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
+    if (xport_type == "sunrise_link") return SUNRISE_LINK;
     return UNSPEC;
 }
 
@@ -276,9 +282,9 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
 #elif defined(USE_SUNRISE)
 static inline int getGpuDeviceNumaID(int gpu_id) {
     char pci_bus_id[20];
-    auto err = tangDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
-    if (err != tangSuccess) {
-        LOG(WARNING) << "tangDeviceGetPCIBusId: " << tangGetErrorString(err);
+    auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), gpu_id);
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
     for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
