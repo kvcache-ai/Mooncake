@@ -50,13 +50,13 @@ static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
 //  Handle allocateMemory function pointer based on protocol
-void initMemoryAllocator(const char* protocol) {
+bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
-        return;
+        return true;
     }
-    g_protocol = protocol;
+    if (protocol == nullptr) protocol = "";
     if (strcmp(protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void* {
@@ -68,6 +68,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
 #ifdef USE_HIP
@@ -80,6 +81,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected HIP memory allocator";
 #else
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -93,12 +95,15 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
 #endif
     } else {
         allocateMemory = malloc;
         freeMemory = free;
         LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
     }
+    g_protocol = protocol;
+    return true;
 }
 
 TransferEnginePy::TransferEnginePy() {
@@ -169,8 +174,6 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
-    initMemoryAllocator(protocol);
-
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
@@ -181,11 +184,12 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
-    if (strcmp(protocol, "xgmi") == 0) {
+    if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }
+    if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
@@ -256,6 +260,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
+    if (allocateMemory == nullptr || freeMemory == nullptr) {
+        LOG(ERROR) << "Memory allocator is not initialized";
+        return nullptr;
+    }
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
