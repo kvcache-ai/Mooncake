@@ -354,7 +354,6 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
 void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     cleanupFailedRecvOp(op_ctx);
     op_ctx.failed_ranks_[op_ctx.peer_rank_] = 1;
-<<<<<<< HEAD
     // Reset P2P session state (epoch, lanes).
     resetPeerState(op_ctx.peer_rank_);
     // Report failure to control plane.
@@ -365,15 +364,6 @@ void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
         failed[op_ctx.peer_rank_] = 1;
         meta_->backend->getAgent().pushTransferObservation(
             meta_->group_id, std::move(attempted), std::move(failed), {});
-=======
-    if (meta_->autoDeactivateOnFailure) {
-        resetPeerState(op_ctx.peer_rank_);
-        meta_->peerConnected[op_ctx.peer_rank_] = false;
-        meta_->activeRanks[op_ctx.peer_rank_] = false;
-        if (meta_->activeRanksTensor.device().is_cpu()) {
-            meta_->activeRanksTensor[op_ctx.peer_rank_] = 0;
-        }
->>>>>>> pr/split_active_ranks_rebased
     }
     op_ctx.status_->store(OpStatus::kFailed, std::memory_order_release);
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "

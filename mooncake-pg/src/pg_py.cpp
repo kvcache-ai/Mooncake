@@ -181,14 +181,6 @@ void joinGroup(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     mooncakeBackend->joinGroup();
 }
 
-// ---- New APIs ----
-
-int64_t getGroupEpoch(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
-    auto mooncakeBackend =
-        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    return static_cast<int64_t>(mooncakeBackend->getGroupEpoch());
-}
-
 at::Tensor getFailedRanks(c10::intrusive_ptr<c10d::Work> work) {
     if (auto* w = dynamic_cast<MooncakeWorkCuda*>(work.get())) {
         return w->getFailedRanks();
@@ -247,8 +239,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deactivate_rank", &deactivateRank, py::arg("backend"),
           py::arg("ranks"));
     m.def("join_group", &joinGroup);
-    m.def("get_group_epoch", &getGroupEpoch, py::arg("backend"),
-          "Get the current GroupView epoch for the backend's group.");
     m.def("get_failed_ranks", &getFailedRanks, py::arg("work"));
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,

@@ -264,9 +264,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     at::Tensor getActiveRanksTensor() { return meta_->activeRanksTensor; }
 
-    // Returns the current GroupView epoch, synced by control plane.
-    uint64_t getGroupEpoch() const { return meta_ ? meta_->epoch : 0; }
-
     int getNumSyncedRanks() { return meta_ ? meta_->activeSize : 0; }
 
     void extendGroupSizeTo(int size);
