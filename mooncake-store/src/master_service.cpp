@@ -2555,12 +2555,23 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         // TODO: NoF SSD support (ranhaojia)
-        if (replica_list[0].is_memory_replica()) {
+        bool has_memory_replica = false;
+        bool has_ssd_replica = false;
+        for (const auto& replica : replica_list) {
+            if (replica.is_memory_replica()) {
+                has_memory_replica = true;
+                break;
+            }
+            if (replica.is_disk_replica() ||
+                replica.is_local_disk_replica()) {
+                has_ssd_replica = true;
+            }
+        }
+        if (has_memory_replica) {
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
             MasterMetricManager::instance().inc_mem_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
-        } else if (replica_list[0].is_local_disk_replica() ||
-                   replica_list[0].is_disk_replica()) {
+        } else if (has_ssd_replica) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
             MasterMetricManager::instance().inc_file_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
