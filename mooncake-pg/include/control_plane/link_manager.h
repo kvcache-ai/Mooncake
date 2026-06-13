@@ -20,10 +20,6 @@
 namespace mooncake {
 
 // PeerReadHandle  - lock-free handle returned by resolvePeer().
-//
-// Only contains L4-level info needed to construct a TransferRequest.
-// Worker combines this with GroupEndpointInfo from GroupView.
-
 struct PeerReadHandle {
     TransferMetadata::SegmentID target_id;
 };
@@ -43,14 +39,6 @@ struct TELinkEvent {
 //   1. Physical link lifecycle: openSegment, warmup handshake, closeSegment
 //   2. Low-frequency candidate probe for idle/inactive peers
 //   3. Lock-free worker read model: resolvePeer() / isGroupReady()
-//
-// Thread model:
-//   - Resource state (PeerLink[]) is protected by peers_mutex_.
-//   - Read model (PeerReadState[]) uses atomics; lock-free for worker threads.
-//   - A dedicated poller thread drives candidate probes and warmup state
-//     machine. It does NOT use SerializedExecutor because L4 operations
-//     (openSegment, RDMA warmup) may block.
-
 class LinkManager {
    public:
     LinkManager() = default;
@@ -96,13 +84,13 @@ class LinkManager {
     // Called by AgentHost from the executor thread.
     void setRankStates(const std::vector<uint8_t>& states);
 
-    // Check whether the L4 link to peer is up.  Returns a handle with the
+    // Check whether the TE link to peer is up.  Returns a handle with the
     // remote SegmentID on success.  Does NOT check RankState or endpoint
     // (endpoint is read directly from GroupView by the worker).
     std::optional<PeerReadHandle> resolvePeer(GlobalRank peer) const;
 
     // Check whether the peer is ready for group operations:
-    // RankState == HEALTHY && L4 link is up.
+    // RankState == HEALTHY && TE link is up.
     // Used by pg.get_peer_state().
     bool isRankReady(GlobalRank peer) const;
 
@@ -155,7 +143,7 @@ class LinkManager {
         std::atomic<uint64_t> version{0};        // incremented on every link
                                                  // state change; resolvePeer
                                                  // uses it to detect torn reads
-        std::atomic<uint8_t> link_connected{0};  // 1 = L4 link is up
+        std::atomic<uint8_t> link_connected{0};  // 1 = TE link is up
         std::atomic<TransferMetadata::SegmentID>
             target_id{};  // remote segment handle
     };

@@ -119,10 +119,6 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     // Two independent 2PC flows share the same ViewUpdate ACK path:
     //   1. Proposal 2PC (activate/deactivate) - keyed by propose_id
     //   2. Bootstrap 2PC (initial group readiness) - keyed by group_id
-    //
-    // Both flows broadcast a ViewUpdate to agents and wait for ACKs.
-    // The CoordinatorHost routes each ACK to the correct handler based on
-    // whether the push had a propose_id (proposal) or not (bootstrap).
 
     // Proposal 2PC (activate/deactivate).  Maps propose_id -> pending state.
     struct PendingProposal {
@@ -153,8 +149,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     //                    and have published endpoints)
     //   BootstrapSyncing -> Ready (when all active ranks have ACKed)
     //
-    // Called after every state-changing operation (handlePublishEndpoint,
-    // handleBootstrapAck, updateRankHealth).
+    // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
 
     bool isMutuallyConnected(GlobalRank a, GlobalRank b) const;
