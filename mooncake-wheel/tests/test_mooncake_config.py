@@ -199,5 +199,83 @@ class TestParseSegmentSize(unittest.TestCase):
         self.assertEqual(_parse_segment_size("  3 gb  "), 3 * 1024 ** 3)
 
 
+class TestMooncakeConfigValidation(unittest.TestCase):
+    """Tests for the field validation performed in MooncakeConfig.__post_init__."""
+
+    BASE_KWARGS = dict(
+        local_hostname="localhost",
+        metadata_server="localhost:8080",
+        global_segment_size=DEFAULT_GLOBAL_SEGMENT_SIZE,
+        local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
+        protocol="tcp",
+        device_name="",
+        master_server_address="localhost:8081",
+    )
+
+    def make(self, **overrides):
+        kwargs = dict(self.BASE_KWARGS)
+        kwargs.update(overrides)
+        return MooncakeConfig(**kwargs)
+
+    def test_valid_protocols_accepted(self):
+        for protocol in ["tcp", "rdma", "RDMA", "Tcp", "cxl", "ascend", "nvlink_intra"]:
+            with self.subTest(protocol=protocol):
+                config = self.make(protocol=protocol)
+                self.assertEqual(config.protocol, protocol)
+
+    def test_invalid_protocol_raises(self):
+        for protocol in ["rmda", "udp", "", "foo"]:
+            with self.subTest(protocol=protocol):
+                with self.assertRaises(ValueError) as cm:
+                    self.make(protocol=protocol)
+                self.assertIn("Invalid protocol", str(cm.exception))
+
+    def test_non_string_protocol_raises(self):
+        with self.assertRaises(ValueError):
+            self.make(protocol=None)
+
+    def test_zero_sizes_allowed(self):
+        # 0 is a documented sentinel (e.g. global_segment_size == 0 disables the
+        # store), so it must remain valid.
+        config = self.make(global_segment_size=0, local_buffer_size=0)
+        self.assertEqual(config.global_segment_size, 0)
+        self.assertEqual(config.local_buffer_size, 0)
+
+    def test_negative_sizes_raise(self):
+        with self.assertRaises(ValueError) as cm:
+            self.make(global_segment_size=-1)
+        self.assertIn("global_segment_size", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            self.make(local_buffer_size=-1024)
+        self.assertIn("local_buffer_size", str(cm.exception))
+
+    def test_empty_required_field_raises(self):
+        for field in ["local_hostname", "metadata_server", "master_server_address"]:
+            for bad in ["", "   "]:
+                with self.subTest(field=field, value=bad):
+                    with self.assertRaises(ValueError) as cm:
+                        self.make(**{field: bad})
+                    self.assertIn(field, str(cm.exception))
+
+    def test_from_file_rejects_invalid_protocol(self):
+        with open(self.config_path, "w") as f:
+            json.dump({
+                "local_hostname": "localhost",
+                "metadata_server": "localhost:8080",
+                "master_server_address": "localhost:8081",
+                "protocol": "rmda",  # typo
+            }, f)
+        with self.assertRaises(ValueError) as cm:
+            MooncakeConfig.from_file(self.config_path)
+        self.assertIn("Invalid protocol", str(cm.exception))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config_path = os.path.join(self._tmp.name, "config.json")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+
 if __name__ == '__main__':
     unittest.main()
