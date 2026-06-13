@@ -55,7 +55,7 @@ if(USE_SUNRISE)
 endif()
 
 # Set RPATH for finding libasio.so at runtime
-if(USE_SUNRISE)
+if(USE_SUNRISE AND MC_TANGRT_ROOT)
   set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
 else()
   set(TANGRT_RPATH "")

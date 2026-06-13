@@ -121,9 +121,12 @@ int TENTBenchRunner::allocateBuffers() {
         }
 #elif defined(USE_SUNRISE)
     } else if (seg_type == "VRAM") {
-        device_prefix = GPU_PREFIX.substr(0, GPU_PREFIX.size() - 1);
+        device_prefix = "cuda";
         int gpu_count = 0;
-        cudaGetDeviceCount(&gpu_count);
+        auto err = cudaGetDeviceCount(&gpu_count);
+        LOG_ASSERT(err == cudaSuccess && gpu_count > 0)
+            << "No Sunrise devices found or cudaGetDeviceCount failed: "
+            << cudaGetErrorString(err);
         start_idx = 0;
         num_buffers = gpu_count;
         if (XferBenchConfig::local_gpu_id != -1) {
