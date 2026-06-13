@@ -625,8 +625,7 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
 
 static bool InjectLocalDiskReplica(MasterService& svc, const UUID& client_id,
                                    const std::string& segment_name,
-                                   int64_t value_size,
-                                   const std::string& key) {
+                                   int64_t value_size, const std::string& key) {
     StorageObjectMetadata meta;
     meta.bucket_id = 0;
     meta.offset = 0;

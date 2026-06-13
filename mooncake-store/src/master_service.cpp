@@ -1343,8 +1343,7 @@ auto MasterService::GetReplicaList(const std::string& key,
                 has_memory_replica = true;
                 break;
             }
-            if (replica.is_disk_replica() ||
-                replica.is_local_disk_replica()) {
+            if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
                 has_ssd_replica = true;
             }
         }
