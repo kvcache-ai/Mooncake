@@ -75,6 +75,7 @@ struct XferBenchConfig {
     static std::string xport_type;
     static std::string backend;
     static bool notifi;
+    static std::string tent_transport_hint;
 
     static int local_gpu_id;
     static int target_gpu_id;

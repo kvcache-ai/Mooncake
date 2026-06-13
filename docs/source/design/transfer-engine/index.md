@@ -291,9 +291,11 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
+- `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
+- `MC_HANDSHAKE_CONNECT_TIMEOUT` Connect timeout in seconds for outbound handshake-port requests (QP handshake, probe, notify, metadata exchange), default value is 5. Bounds the stall when the peer address is unreachable; without it, a connect to an unroutable address (e.g. a removed node) blocks for the kernel's full TCP SYN retry cycle, which can take minutes
 - `MC_HANDSHAKE_MAX_LENGTH` The maximum handshake message length in bytes for P2P mode. Valid range: 1MB to 128MB. Default value is 1MB (1048576 bytes). Increase this value when using a single RDMA instance with many registered memory buffers (>10,000) to avoid handshake failures. Example: set to 10485760 for 10MB
 - `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.
 - `MC_REDIS_PASSWORD` The password for Redis storage plugin, only takes effect when Redis is specified as the metadata server. If not set, no authentication will be attempted to log in to the Redis.
@@ -311,14 +313,19 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
+- `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
 
 ## C++ API Reference
 
-::::{toctree}
+For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
+
+## Supported Protocols
+
+:::{toctree}
 :maxdepth: 1
 
-cpp-api
-::::
+../../getting_started/supported-protocols
+:::
 
 ## EFA Transport (AWS)
 

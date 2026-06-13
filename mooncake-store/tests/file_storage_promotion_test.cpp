@@ -30,12 +30,12 @@ class FakeClient : public Client {
                  /*labels=*/{}) {}
 
     // Drives the queue returned to the heartbeat caller.
-    std::unordered_map<std::string, int64_t> heartbeat_queue;
+    std::vector<PromotionTaskItem> heartbeat_queue;
     tl::expected<void, ErrorCode> heartbeat_result =
         tl::expected<void, ErrorCode>{};
 
     tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
-        std::unordered_map<std::string, int64_t>& promotion_objects) override {
+        std::vector<PromotionTaskItem>& promotion_objects) override {
         heartbeat_calls.fetch_add(1);
         if (!heartbeat_result.has_value()) {
             return tl::make_unexpected(heartbeat_result.error());
@@ -50,8 +50,8 @@ class FakeClient : public Client {
         promotion_objects.clear();
         while (promotion_objects.size() < kMaxPerHeartbeat &&
                !heartbeat_queue.empty()) {
-            auto node = heartbeat_queue.extract(heartbeat_queue.begin());
-            promotion_objects.insert(std::move(node));
+            promotion_objects.push_back(std::move(heartbeat_queue.back()));
+            heartbeat_queue.pop_back();
         }
         return {};
     }
@@ -65,6 +65,13 @@ class FakeClient : public Client {
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, uint64_t size,
         const std::vector<std::string>& preferred_segments) override {
+        return PromotionAllocStart(key, "default", size, preferred_segments);
+    }
+
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
+        const std::string& key, const std::string& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments) override {
+        (void)tenant_id;
         (void)size;
         (void)preferred_segments;
         alloc_calls.fetch_add(1);
@@ -99,6 +106,12 @@ class FakeClient : public Client {
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key) override {
+        return NotifyPromotionSuccess(key, "default");
+    }
+
+    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const std::string& key, const std::string& tenant_id) override {
+        (void)tenant_id;
         notify_calls.fetch_add(1);
         notify_keys.push_back(key);
         auto it = notify_overrides.find(key);
@@ -116,6 +129,12 @@ class FakeClient : public Client {
     // notify the master.
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key) override {
+        return NotifyPromotionFailure(key, "default");
+    }
+
+    tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const std::string& key, const std::string& tenant_id) override {
+        (void)tenant_id;
         notify_failure_calls.fetch_add(1);
         notify_failure_keys.push_back(key);
         return {};
@@ -185,7 +204,12 @@ class FileStoragePromotionTest : public ::testing::Test {
         tl::expected<void, ErrorCode> last_res{};
         while (!remaining.empty()) {
             std::string before = fake->last_alloc_key;
-            fake->heartbeat_queue = remaining;
+            fake->heartbeat_queue.clear();
+            fake->heartbeat_queue.reserve(remaining.size());
+            for (const auto& [key, size] : remaining) {
+                fake->heartbeat_queue.push_back(PromotionTaskItem{
+                    .tenant_id = "default", .key = key, .size = size});
+            }
             last_res = CallProcessPromotionTasks();
             if (!last_res.has_value()) return last_res;
             if (fake->last_alloc_key == before ||
@@ -231,7 +255,9 @@ TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
 
 // Non-positive size in queue: skip that key, continue.
 TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
-    fake->heartbeat_queue = {{"k_bad", 0}, {"k_good", 1024}};
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k_bad", .size = 0},
+        {.tenant_id = "default", .key = "k_good", .size = 1024}};
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
     // Only k_good should reach AllocStart.
@@ -255,7 +281,8 @@ TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
 // BatchLoad failure (SSD file missing): no PromotionWrite, no Notify.
 // Master-side reaper handles the orphaned PROCESSING replica.
 TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
-    fake->heartbeat_queue = {{"k_missing", 1024}};
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k_missing", .size = 1024}};
     // Default alloc succeeds; BatchLoad will fail because there's no file
     // at data_path/k_missing for the storage backend to read.
     auto res = CallProcessPromotionTasks();
@@ -270,7 +297,8 @@ TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
 
 // PromotionWrite failure: no Notify.
 TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
-    fake->heartbeat_queue = {{"k_te_fail", 1024}};
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k_te_fail", .size = 1024}};
     fake->default_write_result = ErrorCode::TRANSFER_FAIL;
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());
@@ -313,7 +341,8 @@ TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
 // put_start_release_timeout_sec_ (~10 min default), turning a transient
 // DRAM-pressure spike into a sustained outage of promotion_queue_limit_.
 TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
-    fake->heartbeat_queue = {{"k_alloc_fail", 1024}};
+    fake->heartbeat_queue = {
+        {.tenant_id = "default", .key = "k_alloc_fail", .size = 1024}};
     fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
     auto res = CallProcessPromotionTasks();
     EXPECT_TRUE(res.has_value());

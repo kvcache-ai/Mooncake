@@ -86,10 +86,12 @@ class MasterServiceTest : public ::testing::Test {
         config.replica_num = 1;
         config.preferred_segment = segment_name;
 
-        auto put_start = service.PutStart(client_id, key, slice_length, config);
+        auto put_start =
+            service.PutStart(client_id, key, "default", slice_length, config);
         EXPECT_TRUE(put_start.has_value());
         EXPECT_TRUE(
-            service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                .has_value());
         return key;
     }
 
@@ -112,12 +114,14 @@ class MasterServiceTest : public ::testing::Test {
                             const std::string& key,
                             const ReplicateConfig& config,
                             uint64_t slice_length = 1024) const {
-        auto put_start = service.PutStart(client_id, key, slice_length, config);
+        auto put_start =
+            service.PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start.has_value())
             << "PutStart failed for key=" << key
             << ", error=" << toString(put_start.error());
         ASSERT_TRUE(
-            service.PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                .has_value());
     }
 
     bool ExecutePendingMoveTasks(MasterService& service,
@@ -137,10 +141,13 @@ class MasterServiceTest : public ::testing::Test {
             ReplicaMovePayload payload;
             struct_json::from_json(payload, assignment.payload);
 
-            auto move_start = service.MoveStart(client_id, payload.key,
-                                                payload.source, payload.target);
+            auto move_start =
+                service.MoveStart(client_id, payload.key, payload.tenant_id,
+                                  payload.source, payload.target);
             EXPECT_TRUE(move_start.has_value());
-            EXPECT_TRUE(service.MoveEnd(client_id, payload.key).has_value());
+            EXPECT_TRUE(
+                service.MoveEnd(client_id, payload.key, payload.tenant_id)
+                    .has_value());
 
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
@@ -199,6 +206,27 @@ class MasterServiceTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
+    const auto scoped =
+        MakeTenantScopedStorageKey("tenant:with:colon", "path/key:with:colon");
+    EXPECT_NE(scoped.find('\0'), std::string::npos);
+
+    auto [tenant_id, key] = ParseTenantScopedStorageKey(scoped);
+    EXPECT_EQ(tenant_id, "tenant:with:colon");
+    EXPECT_EQ(key, "path/key:with:colon");
+
+    auto [default_tenant, default_key] = ParseTenantScopedStorageKey("raw_key");
+    EXPECT_EQ(default_tenant, "default");
+    EXPECT_EQ(default_key, "raw_key");
+
+    std::string legacy = "legacy_tenant";
+    legacy.push_back('\0');
+    legacy.append("legacy_key");
+    auto [legacy_tenant, legacy_key] = ParseTenantScopedStorageKey(legacy);
+    EXPECT_EQ(legacy_tenant, "legacy_tenant");
+    EXPECT_EQ(legacy_key, "legacy_key");
+}
+
 std::string GenerateKeyForSegment(const UUID& client_id,
                                   const std::unique_ptr<MasterService>& service,
                                   const std::string& segment_name) {
@@ -209,14 +237,14 @@ std::string GenerateKeyForSegment(const UUID& client_id,
         std::vector<Replica::Descriptor> replica_list;
 
         // Check if the key already exists.
-        auto exist_result = service->ExistKey(key);
+        auto exist_result = service->ExistKey(key, "default");
         if (exist_result.has_value() && exist_result.value()) {
             continue;  // Retry if the key already exists
         }
 
         // Attempt to put the key.
-        auto put_result =
-            service->PutStart(client_id, key, {1024}, {.replica_num = 1});
+        auto put_result = service->PutStart(client_id, key, "default", {1024},
+                                            {.replica_num = 1});
         if (put_result.has_value()) {
             replica_list = std::move(put_result.value());
         }
@@ -231,7 +259,7 @@ std::string GenerateKeyForSegment(const UUID& client_id,
                                      std::to_string(static_cast<int>(code)));
         }
         auto put_end_result =
-            service->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             throw std::runtime_error("PutEnd failed");
         }
@@ -241,7 +269,7 @@ std::string GenerateKeyForSegment(const UUID& client_id,
             return key;
         }
         // Clean up failed attempt
-        auto remove_result = service->Remove(key);
+        auto remove_result = service->Remove(key, "default");
         if (!remove_result.has_value()) {
             // Ignore cleanup failure
         }
@@ -455,20 +483,22 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     // Test invalid replica config
     config.replica_num = 0;
     config.nof_replica_num = 0;
-    auto put_result1 = service_->PutStart(client_id, key, 1024, config);
+    auto put_result1 =
+        service_->PutStart(client_id, key, "default", 1024, config);
     EXPECT_FALSE(put_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
 
     // Test zero slice_length
     config.replica_num = 1;
-    auto put_result2 = service_->PutStart(client_id, key, 0, config);
+    auto put_result2 = service_->PutStart(client_id, key, "default", 0, config);
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 
     // Test prefer_alloc_in_same_node with nof replicas
     config.nof_replica_num = 1;
     config.prefer_alloc_in_same_node = true;
-    auto put_result3 = service_->PutStart(client_id, key, 1024, config);
+    auto put_result3 =
+        service_->PutStart(client_id, key, "default", 1024, config);
     EXPECT_FALSE(put_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result3.error());
 }
@@ -485,14 +515,15 @@ TEST_F(MasterServiceTest, PutEndAllCompletesMemoryAndNoFReplicas) {
     config.replica_num = 1;
     config.nof_replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, "test_key_all", 1024, config);
+        service_->PutStart(client_id, "test_key_all", "default", 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
 
-    auto put_end_result =
-        service_->PutEnd(client_id, "test_key_all", ReplicaType::ALL);
+    auto put_end_result = service_->PutEnd(client_id, "test_key_all", "default",
+                                           ReplicaType::ALL);
     ASSERT_TRUE(put_end_result.has_value());
 
-    auto get_replica_result = service_->GetReplicaList("test_key_all");
+    auto get_replica_result =
+        service_->GetReplicaList("test_key_all", "default");
     ASSERT_TRUE(get_replica_result.has_value());
 
     bool has_complete_memory = false;
@@ -522,25 +553,27 @@ TEST_F(MasterServiceTest, PutEndMemoryDoesNotCompleteNoFReplica) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.nof_replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(client_id, "test_key_split", 1024, config);
+    auto put_start_result = service_->PutStart(client_id, "test_key_split",
+                                               "default", 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
 
-    auto put_end_result =
-        service_->PutEnd(client_id, "test_key_split", ReplicaType::MEMORY);
+    auto put_end_result = service_->PutEnd(client_id, "test_key_split",
+                                           "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    auto get_replica_result = service_->GetReplicaList("test_key_split");
+    auto get_replica_result =
+        service_->GetReplicaList("test_key_split", "default");
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(get_replica_result->replicas.size(), 1u);
     EXPECT_TRUE(get_replica_result->replicas[0].is_memory_replica());
     EXPECT_EQ(get_replica_result->replicas[0].status, ReplicaStatus::COMPLETE);
 
-    auto put_revoke_result =
-        service_->PutRevoke(client_id, "test_key_split", ReplicaType::NOF_SSD);
+    auto put_revoke_result = service_->PutRevoke(
+        client_id, "test_key_split", "default", ReplicaType::NOF_SSD);
     ASSERT_TRUE(put_revoke_result.has_value());
 
-    auto final_replica_result = service_->GetReplicaList("test_key_split");
+    auto final_replica_result =
+        service_->GetReplicaList("test_key_split", "default");
     ASSERT_TRUE(final_replica_result.has_value());
     ASSERT_EQ(final_replica_result->replicas.size(), 1u);
     EXPECT_TRUE(final_replica_result->replicas[0].is_memory_replica());
@@ -556,8 +589,8 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.nof_replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(client_id, "test_key_one_plus_one", 1024, config);
+    auto put_start_result = service_->PutStart(
+        client_id, "test_key_one_plus_one", "default", 1024, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(put_start_result->size(), 1u);
     EXPECT_TRUE(put_start_result->front().is_memory_replica());
@@ -573,25 +606,26 @@ TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     config.replica_num = 1;
 
     config.group_ids = std::vector<std::string>{};
-    auto empty_group_ids =
-        service_->PutStart(client_id, "empty_group_ids", 1024, config);
+    auto empty_group_ids = service_->PutStart(client_id, "empty_group_ids",
+                                              "default", 1024, config);
     EXPECT_FALSE(empty_group_ids.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, empty_group_ids.error());
 
     config.group_ids = std::vector<std::string>{"g0", "g1"};
-    auto too_many_group_ids =
-        service_->PutStart(client_id, "too_many_group_ids", 1024, config);
+    auto too_many_group_ids = service_->PutStart(
+        client_id, "too_many_group_ids", "default", 1024, config);
     EXPECT_FALSE(too_many_group_ids.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, too_many_group_ids.error());
 
     config.group_ids = std::vector<std::string>{""};
-    auto ungrouped =
-        service_->PutStart(client_id, "explicit_ungrouped", 1024, config);
+    auto ungrouped = service_->PutStart(client_id, "explicit_ungrouped",
+                                        "default", 1024, config);
     ASSERT_TRUE(ungrouped.has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, "explicit_ungrouped", ReplicaType::MEMORY)
-            .has_value());
-    auto exists = service_->ExistKey("explicit_ungrouped");
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, "explicit_ungrouped", "default",
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto exists = service_->ExistKey("explicit_ungrouped", "default");
     ASSERT_TRUE(exists.has_value());
     EXPECT_TRUE(exists.value());
 }
@@ -609,13 +643,13 @@ TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
 
     PutCompletedObject(*service_, client_id, key, config);
 
-    auto exists = service_->ExistKey(key);
+    auto exists = service_->ExistKey(key, "default");
     ASSERT_TRUE(exists.has_value());
     EXPECT_TRUE(exists.value());
-    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
 
-    ASSERT_TRUE(service_->Remove(key, /*force=*/true).has_value());
-    auto exists_after_remove = service_->ExistKey(key);
+    ASSERT_TRUE(service_->Remove(key, "default", /*force=*/true).has_value());
+    auto exists_after_remove = service_->ExistKey(key, "default");
     ASSERT_TRUE(exists_after_remove.has_value());
     EXPECT_FALSE(exists_after_remove.value());
 }
@@ -662,6 +696,67 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
     EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+    const std::string tenant_a = "tenant_get_all_keys_a";
+    const std::string shared_key = "shared_listing_key";
+    const std::string default_only_key = "default_listing_key";
+    const std::string tenant_only_key = "tenant_listing_key";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service_->PutStart(client_id, shared_key, "default", 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, shared_key, "default", ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, default_only_key, "default", 1024, config)
+            .has_value());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, default_only_key, "default",
+                             ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, shared_key, tenant_a, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(client_id, shared_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutStart(client_id, tenant_only_key, tenant_a, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client_id, tenant_only_key, tenant_a, ReplicaType::MEMORY)
+            .has_value());
+
+    auto default_keys = service_->GetAllKeys("default");
+    ASSERT_TRUE(default_keys.has_value());
+    EXPECT_NE(std::find(default_keys->begin(), default_keys->end(), shared_key),
+              default_keys->end());
+    EXPECT_NE(
+        std::find(default_keys->begin(), default_keys->end(), default_only_key),
+        default_keys->end());
+    EXPECT_EQ(
+        std::find(default_keys->begin(), default_keys->end(), tenant_only_key),
+        default_keys->end());
+
+    auto tenant_keys = service_->GetAllKeys(tenant_a);
+    ASSERT_TRUE(tenant_keys.has_value());
+    EXPECT_NE(std::find(tenant_keys->begin(), tenant_keys->end(), shared_key),
+              tenant_keys->end());
+    EXPECT_NE(
+        std::find(tenant_keys->begin(), tenant_keys->end(), tenant_only_key),
+        tenant_keys->end());
+    EXPECT_EQ(
+        std::find(tenant_keys->begin(), tenant_keys->end(), default_only_key),
+        tenant_keys->end());
 }
 
 TEST_F(MasterServiceTest,
@@ -810,16 +905,18 @@ TEST_F(MasterServiceTest, ExpiredGroupedPutCanBeReplacedByUngroupedPut) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, 1024, grouped_config).has_value());
+        service_->PutStart(client_id, key, "default", 1024, grouped_config)
+            .has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
     ReplicateConfig ungrouped_config;
     ungrouped_config.replica_num = 1;
-    auto put_start = service_->PutStart(client_id, key, 1024, ungrouped_config);
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, ungrouped_config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->ExistKey(key, "default").value_or(false));
 }
 
 TEST_F(MasterServiceTest, BatchRemoveUnregistersGroupedRoute) {
@@ -834,15 +931,15 @@ TEST_F(MasterServiceTest, BatchRemoveUnregistersGroupedRoute) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
     PutCompletedObject(*service_, client_id, key, grouped_config);
 
-    auto remove_results =
-        service_->BatchRemove(std::vector<std::string>{key}, /*force=*/true);
+    auto remove_results = service_->BatchRemove(std::vector<std::string>{key},
+                                                "default", /*force=*/true);
     ASSERT_EQ(remove_results.size(), 1u);
     ASSERT_TRUE(remove_results[0].has_value());
 
     ReplicateConfig ungrouped_config;
     ungrouped_config.replica_num = 1;
     PutCompletedObject(*service_, client_id, key, ungrouped_config);
-    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
 }
 
 TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
@@ -857,15 +954,16 @@ TEST_F(MasterServiceTest, RemoveByRegexUnregistersGroupedRoute) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
     PutCompletedObject(*service_, client_id, key, grouped_config);
 
-    auto removed = service_->RemoveByRegex("^regex_remove_grouped_route$",
-                                           /*force=*/true);
+    auto removed =
+        service_->RemoveByRegex("^regex_remove_grouped_route$", "default",
+                                /*force=*/true);
     ASSERT_TRUE(removed.has_value());
     EXPECT_EQ(removed.value(), 1);
 
     ReplicateConfig ungrouped_config;
     ungrouped_config.replica_num = 1;
     PutCompletedObject(*service_, client_id, key, ungrouped_config);
-    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
 }
 
 TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
@@ -887,22 +985,22 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
     PutCompletedObject(*service_, client_id, key_a, config_a);
     PutCompletedObject(*service_, client_id, key_b, config_b);
 
-    auto exists = service_->ExistKey(key_a);
+    auto exists = service_->ExistKey(key_a, "default");
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
-    exists = service_->ExistKey(key_a);
+    exists = service_->ExistKey(key_a, "default");
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    auto remove_group_peer = service_->Remove(key_b);
+    auto remove_group_peer = service_->Remove(key_b, "default");
     ASSERT_FALSE(remove_group_peer.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_group_peer.error());
 
-    EXPECT_TRUE(service_->Remove(key_a, /*force=*/true).has_value());
-    EXPECT_TRUE(service_->Remove(key_b, /*force=*/true).has_value());
+    EXPECT_TRUE(service_->Remove(key_a, "default", /*force=*/true).has_value());
+    EXPECT_TRUE(service_->Remove(key_b, "default", /*force=*/true).has_value());
 }
 
 TEST_F(MasterServiceTest,
@@ -922,22 +1020,22 @@ TEST_F(MasterServiceTest,
     config.group_ids = std::vector<std::string>{group_id};
 
     PutCompletedObject(*service_, client_id, key_a, config);
-    ASSERT_TRUE(service_->ExistKey(key_a).value_or(false));
+    ASSERT_TRUE(service_->ExistKey(key_a, "default").value_or(false));
 
     PutCompletedObject(*service_, client_id, key_b, config);
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
-    auto exists = service_->ExistKey(key_a);
+    auto exists = service_->ExistKey(key_a, "default");
     ASSERT_TRUE(exists.has_value());
     ASSERT_TRUE(exists.value());
     std::this_thread::sleep_for(std::chrono::milliseconds(390));
 
-    auto remove_group_peer = service_->Remove(key_b);
+    auto remove_group_peer = service_->Remove(key_b, "default");
     ASSERT_FALSE(remove_group_peer.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_group_peer.error());
 
-    EXPECT_TRUE(service_->Remove(key_a, /*force=*/true).has_value());
-    EXPECT_TRUE(service_->Remove(key_b, /*force=*/true).has_value());
+    EXPECT_TRUE(service_->Remove(key_a, "default", /*force=*/true).has_value());
+    EXPECT_TRUE(service_->Remove(key_b, "default", /*force=*/true).has_value());
 }
 
 TEST_F(MasterServiceTest, RemoveGroupedMemberPreservesOtherMembers) {
@@ -955,15 +1053,15 @@ TEST_F(MasterServiceTest, RemoveGroupedMemberPreservesOtherMembers) {
     PutCompletedObject(*service_, client_id, key_a, config);
     PutCompletedObject(*service_, client_id, key_b, config);
 
-    ASSERT_TRUE(service_->Remove(key_a, /*force=*/true).has_value());
+    ASSERT_TRUE(service_->Remove(key_a, "default", /*force=*/true).has_value());
 
-    auto removed_exists = service_->ExistKey(key_a);
+    auto removed_exists = service_->ExistKey(key_a, "default");
     ASSERT_TRUE(removed_exists.has_value());
     EXPECT_FALSE(removed_exists.value());
-    EXPECT_TRUE(service_->GetReplicaList(key_b).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key_b, "default").has_value());
 
-    ASSERT_TRUE(service_->Remove(key_b, /*force=*/true).has_value());
-    auto group_empty = service_->ExistKey(key_b);
+    ASSERT_TRUE(service_->Remove(key_b, "default", /*force=*/true).has_value());
+    auto group_empty = service_->ExistKey(key_b, "default");
     ASSERT_TRUE(group_empty.has_value());
     EXPECT_FALSE(group_empty.value());
 }
@@ -983,28 +1081,29 @@ TEST_F(MasterServiceTest, UpsertPreservesGroupMembership) {
 
     ReplicateConfig unset_group_config;
     unset_group_config.replica_num = 1;
-    auto preserve_result =
-        service_->UpsertStart(client_id, key, 1024, unset_group_config);
+    auto preserve_result = service_->UpsertStart(client_id, key, "default",
+                                                 1024, unset_group_config);
     ASSERT_TRUE(preserve_result.has_value())
         << "Unset group_ids should preserve existing group membership";
     ASSERT_TRUE(
-        service_->UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+        service_->UpsertEnd(client_id, key, "default", ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
 
     ReplicateConfig different_group_config;
     different_group_config.replica_num = 1;
     different_group_config.group_ids =
         std::vector<std::string>{FindGroupIdOnDifferentShard(key + "_other")};
-    auto different_group_result =
-        service_->UpsertStart(client_id, key, 1024, different_group_config);
+    auto different_group_result = service_->UpsertStart(
+        client_id, key, "default", 1024, different_group_config);
     ASSERT_FALSE(different_group_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, different_group_result.error());
 
     ReplicateConfig explicit_ungrouped_config;
     explicit_ungrouped_config.replica_num = 1;
     explicit_ungrouped_config.group_ids = std::vector<std::string>{""};
-    auto explicit_ungrouped_result =
-        service_->UpsertStart(client_id, key, 1024, explicit_ungrouped_config);
+    auto explicit_ungrouped_result = service_->UpsertStart(
+        client_id, key, "default", 1024, explicit_ungrouped_config);
     ASSERT_FALSE(explicit_ungrouped_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, explicit_ungrouped_result.error());
 }
@@ -1021,17 +1120,19 @@ TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, 1024, grouped_config).has_value());
+        service_->PutStart(client_id, key, "default", 1024, grouped_config)
+            .has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
 
     ReplicateConfig ungrouped_config;
     ungrouped_config.replica_num = 1;
-    auto upsert_start =
-        service_->UpsertStart(client_id, key, 1024, ungrouped_config);
+    auto upsert_start = service_->UpsertStart(client_id, key, "default", 1024,
+                                              ungrouped_config);
     ASSERT_TRUE(upsert_start.has_value()) << toString(upsert_start.error());
     ASSERT_TRUE(
-        service_->UpsertEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(service_->ExistKey(key).value_or(false));
+        service_->UpsertEnd(client_id, key, "default", ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_TRUE(service_->ExistKey(key, "default").value_or(false));
 }
 
 TEST_F(MasterServiceTest, UpsertRejectsExistingUngroupedToGrouped) {
@@ -1049,11 +1150,11 @@ TEST_F(MasterServiceTest, UpsertRejectsExistingUngroupedToGrouped) {
     grouped_config.group_ids =
         std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
     auto upsert_start =
-        service_->UpsertStart(client_id, key, 2048, grouped_config);
+        service_->UpsertStart(client_id, key, "default", 2048, grouped_config);
     ASSERT_FALSE(upsert_start.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, upsert_start.error());
 
-    EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+    EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
 }
 
 TEST_F(MasterServiceTest,
@@ -1084,15 +1185,16 @@ TEST_F(MasterServiceTest,
 
         ReplicateConfig trigger_config;
         trigger_config.replica_num = 1;
-        auto trigger_result = service_->PutStart(
-            client_id, "trigger_grouped_eviction", kObjectSize, trigger_config);
+        auto trigger_result =
+            service_->PutStart(client_id, "trigger_grouped_eviction", "default",
+                               kObjectSize, trigger_config);
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        EXPECT_FALSE(service_->ExistKey(evict_key_a).value_or(true));
-        EXPECT_FALSE(service_->ExistKey(evict_key_b).value_or(true));
+        EXPECT_FALSE(service_->ExistKey(evict_key_a, "default").value_or(true));
+        EXPECT_FALSE(service_->ExistKey(evict_key_b, "default").value_or(true));
     }
 
     {
@@ -1114,7 +1216,7 @@ TEST_F(MasterServiceTest,
         PutCompletedObject(*service_, client_id, leased_key_b, leased_config,
                            kObjectSize);
 
-        auto exists = service_->ExistKey(leased_key_a);
+        auto exists = service_->ExistKey(leased_key_a, "default");
         ASSERT_TRUE(exists.has_value());
         ASSERT_TRUE(exists.value());
 
@@ -1122,14 +1224,16 @@ TEST_F(MasterServiceTest,
         trigger_config.replica_num = 1;
         auto trigger_result =
             service_->PutStart(client_id, "trigger_leased_group_eviction",
-                               kObjectSize, trigger_config);
+                               "default", kObjectSize, trigger_config);
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        EXPECT_TRUE(service_->GetReplicaList(leased_key_a).has_value());
-        EXPECT_TRUE(service_->GetReplicaList(leased_key_b).has_value());
+        EXPECT_TRUE(
+            service_->GetReplicaList(leased_key_a, "default").has_value());
+        EXPECT_TRUE(
+            service_->GetReplicaList(leased_key_b, "default").has_value());
     }
 }
 
@@ -1161,15 +1265,17 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
     trigger_config.replica_num = 1;
     auto trigger_result =
         service_->PutStart(client_id, "trigger_mixed_safety_group_eviction",
-                           kObjectSize, trigger_config);
+                           "default", kObjectSize, trigger_config);
     ASSERT_FALSE(trigger_result.has_value());
     EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    EXPECT_FALSE(service_->ExistKey(safe_key).value_or(true));
-    EXPECT_TRUE(service_->GetReplicaList(hard_pinned_key).has_value());
-    EXPECT_TRUE(service_->Remove(hard_pinned_key, /*force=*/true).has_value());
+    EXPECT_FALSE(service_->ExistKey(safe_key, "default").value_or(true));
+    EXPECT_TRUE(
+        service_->GetReplicaList(hard_pinned_key, "default").has_value());
+    EXPECT_TRUE(service_->Remove(hard_pinned_key, "default", /*force=*/true)
+                    .has_value());
 }
 
 TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
@@ -1190,26 +1296,27 @@ TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
         std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
                                  FindGroupIdOnDifferentShard(keys[2])};
 
-    auto results = service_->BatchUpsertStart(client_id, keys, sizes, config);
+    auto results =
+        service_->BatchUpsertStart(client_id, keys, "default", sizes, config);
     ASSERT_EQ(results.size(), keys.size());
     for (const auto& result : results) {
         ASSERT_TRUE(result.has_value());
     }
 
-    auto end_results = service_->BatchUpsertEnd(client_id, keys);
+    auto end_results = service_->BatchUpsertEnd(client_id, keys, "default");
     ASSERT_EQ(end_results.size(), keys.size());
     for (const auto& result : end_results) {
         ASSERT_TRUE(result.has_value());
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(service_->GetReplicaList(key).has_value());
+        EXPECT_TRUE(service_->GetReplicaList(key, "default").has_value());
     }
 
     ReplicateConfig invalid_config = config;
     invalid_config.group_ids = std::vector<std::string>{"only_one"};
-    auto invalid_results =
-        service_->BatchUpsertStart(client_id, keys, sizes, invalid_config);
+    auto invalid_results = service_->BatchUpsertStart(
+        client_id, keys, "default", sizes, invalid_config);
     ASSERT_EQ(invalid_results.size(), keys.size());
     for (const auto& result : invalid_results) {
         ASSERT_FALSE(result.has_value());
@@ -1253,7 +1360,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
 
     for (const auto& key : keys) {
-        EXPECT_TRUE(service_.GetReplicaList(key).has_value());
+        EXPECT_TRUE(service_.GetReplicaList(key, "default").has_value());
     }
 
     ReplicateConfig invalid_config = config;
@@ -1289,38 +1396,39 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     config.replica_num = 1;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
     EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
 
     // During put, Get/Remove should fail
-    auto get_replica_result = service_->GetReplicaList(key);
+    auto get_replica_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_replica_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_replica_result.error());
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
 
     // PutEnd should fail if the client_id does not match.
-    auto put_end_fail_result =
-        service_->PutEnd(invalid_client_id, key, ReplicaType::MEMORY);
+    auto put_end_fail_result = service_->PutEnd(invalid_client_id, key,
+                                                "default", ReplicaType::MEMORY);
     EXPECT_FALSE(put_end_fail_result.has_value());
     EXPECT_EQ(put_end_fail_result.error(), ErrorCode::ILLEGAL_CLIENT);
 
     // PutRevoke should fail if the client_id does not match.
-    auto put_revoke_fail_result =
-        service_->PutRevoke(invalid_client_id, key, ReplicaType::MEMORY);
+    auto put_revoke_fail_result = service_->PutRevoke(
+        invalid_client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_FALSE(put_revoke_fail_result.has_value());
     EXPECT_EQ(put_revoke_fail_result.error(), ErrorCode::ILLEGAL_CLIENT);
 
     // Test PutEnd
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Verify replica list after PutEnd
-    auto final_get_result = service_->GetReplicaList(key);
+    auto final_get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(final_get_result.has_value());
     replica_list = final_get_result.value().replicas;
     EXPECT_EQ(1, replica_list.size());
@@ -1347,8 +1455,8 @@ TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
     ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
                     .has_value());
 
-    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
-    EXPECT_FALSE(service_->ExistKey(key).value());
+    EXPECT_FALSE(service_->GetReplicaList(key, "default").has_value());
+    EXPECT_FALSE(service_->ExistKey(key, "default").value());
     EXPECT_TRUE(service_->ExistKey(key, tenant_a).value());
     EXPECT_TRUE(service_->ExistKey(key, tenant_b).value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
@@ -1372,9 +1480,10 @@ TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service_->PutStart(client_id, key, 1024, config).has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->PutStart(client_id, key, "default", 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
     ASSERT_TRUE(
         service_->PutStart(client_id, key, tenant_a, 1024, config).has_value());
     ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_a, ReplicaType::MEMORY)
@@ -1384,15 +1493,16 @@ TEST_F(MasterServiceTest, RegexOperationsAreTenantScoped) {
     ASSERT_TRUE(service_->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY)
                     .has_value());
 
-    auto default_matches = service_->GetReplicaListByRegex("^regex_shared");
+    auto default_matches =
+        service_->GetReplicaListByRegex("^regex_shared", "default");
     ASSERT_TRUE(default_matches.has_value());
     EXPECT_EQ(default_matches->size(), 1);
 
     auto remove_default =
-        service_->RemoveByRegex("^regex_shared", /*force=*/true);
+        service_->RemoveByRegex("^regex_shared", "default", /*force=*/true);
     ASSERT_TRUE(remove_default.has_value());
     EXPECT_EQ(remove_default.value(), 1);
-    EXPECT_FALSE(service_->GetReplicaList(key).has_value());
+    EXPECT_FALSE(service_->GetReplicaList(key, "default").has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_a).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
 
@@ -1443,7 +1553,7 @@ TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
     }
 
     for (const auto& key : keys) {
-        EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+        EXPECT_FALSE(svc->GetReplicaList(key, "default").has_value());
         EXPECT_TRUE(svc->GetReplicaList(key, tenant_a).has_value());
         EXPECT_TRUE(svc->GetReplicaList(key, tenant_b).has_value());
     }
@@ -1470,9 +1580,11 @@ TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(svc->PutStart(client_id, shared_key, 1024, config).has_value());
+    ASSERT_TRUE(svc->PutStart(client_id, shared_key, "default", 1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        svc->PutEnd(client_id, shared_key, ReplicaType::MEMORY).has_value());
+        svc->PutEnd(client_id, shared_key, "default", ReplicaType::MEMORY)
+            .has_value());
     ASSERT_TRUE(svc->PutStart(client_id, shared_key, tenant_a, 1024, config)
                     .has_value());
     ASSERT_TRUE(
@@ -1488,15 +1600,15 @@ TEST_F(MasterServiceTest, TenantBatchRemoveAndRemoveAllAreScoped) {
     ASSERT_EQ(remove_a.size(), 1u);
     ASSERT_TRUE(remove_a[0].has_value());
     EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_a).has_value());
-    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key, "default").has_value());
     EXPECT_TRUE(svc->GetReplicaList(shared_key, tenant_b).has_value());
 
     EXPECT_EQ(svc->RemoveAll(tenant_b, /*force=*/true), 1);
     EXPECT_FALSE(svc->GetReplicaList(shared_key, tenant_b).has_value());
-    EXPECT_TRUE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_TRUE(svc->GetReplicaList(shared_key, "default").has_value());
 
     EXPECT_EQ(svc->RemoveAll(/*force=*/true), 1);
-    EXPECT_FALSE(svc->GetReplicaList(shared_key).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(shared_key, "default").has_value());
 }
 
 TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
@@ -1511,8 +1623,10 @@ TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(svc->PutStart(client_id, key, 1024, config).has_value());
-    ASSERT_TRUE(svc->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(
+        svc->PutStart(client_id, key, "default", 1024, config).has_value());
+    ASSERT_TRUE(svc->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
     ASSERT_TRUE(
         svc->PutStart(client_id, key, tenant_a, 1024, config).has_value());
     ASSERT_TRUE(
@@ -1523,7 +1637,7 @@ TEST_F(MasterServiceTest, LegacyRemoveAllRemovesAllTenants) {
         svc->PutEnd(client_id, key, tenant_b, ReplicaType::MEMORY).has_value());
 
     EXPECT_EQ(svc->RemoveAll(/*force=*/true), 3);
-    EXPECT_FALSE(svc->GetReplicaList(key).has_value());
+    EXPECT_FALSE(svc->GetReplicaList(key, "default").has_value());
     EXPECT_FALSE(svc->GetReplicaList(key, tenant_a).has_value());
     EXPECT_FALSE(svc->GetReplicaList(key, tenant_b).has_value());
     EXPECT_EQ(svc->RemoveAll(/*force=*/true), 0);
@@ -1554,7 +1668,7 @@ TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     config.preferred_segment = preferred_segment;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(1, replica_list.size());
@@ -1564,7 +1678,8 @@ TEST_F(MasterServiceTest, PutWithPreferredSegment) {
               mem_desc.buffer_descriptor.transport_endpoint_);
 
     // Complete the Put operation
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 }
 
@@ -1592,7 +1707,7 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
     config.preferred_segments = preferred_segments;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(2, replica_list.size());
@@ -1607,7 +1722,8 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
     EXPECT_TRUE(used_segments.find("segment_1") != used_segments.end());
 
     // Complete the Put operation
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 }
 
@@ -1634,23 +1750,24 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     int random_number = dis(gen);
     config.replica_num = random_number;
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
     EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
     // During put, Get/Remove should fail
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
     // Test PutEnd
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
     // Verify replica list after PutEnd
-    auto get_result2 = service_->GetReplicaList(key);
+    auto get_result2 = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result2.has_value());
     replica_list = get_result2.value().replicas;
     EXPECT_EQ(random_number, replica_list.size());
@@ -1667,7 +1784,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
-    auto get_result = service_->GetReplicaList(".*non_existent.*");
+    auto get_result = service_->GetReplicaList(".*non_existent.*", "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 
@@ -1680,19 +1797,19 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, value_length, config);
+            service_->PutStart(client_id, key, "default", value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
 
     // Test getting existing key
-    auto get_result2 = service_->GetReplicaListByRegex("^test_key");
+    auto get_result2 = service_->GetReplicaListByRegex("^test_key", "default");
     EXPECT_TRUE(get_result2.has_value());
     auto replica_list_local = get_result2.value();
     EXPECT_EQ(10, replica_list_local.size());
@@ -1705,13 +1822,14 @@ void put_object(MasterService& service, const UUID& client_id,
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service.PutStart(client_id, key, value_length, config);
+        service.PutStart(client_id, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value())
         << "Failed to PutStart for key: " << key;
-    auto put_end_result = service.PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value())
         << "Failed to PutEnd for key: " << key;
-    auto exist_result = service.ExistKey(key);
+    auto exist_result = service.ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value())
         << "Key does not exist after put: " << key;
 }
@@ -1755,7 +1873,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 
     // Test 3.1: Simple prefix matching
     {
-        auto result = service_->GetReplicaListByRegex("^test_key_");
+        auto result = service_->GetReplicaListByRegex("^test_key_", "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(),
                   3);  // Matches test_key_01, test_key_02, test_key_10
@@ -1763,7 +1881,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 
     // Test 3.2: Matching with a wildcard for any number
     {
-        auto result = service_->GetReplicaListByRegex("^test_key_\\d+$");
+        auto result =
+            service_->GetReplicaListByRegex("^test_key_\\d+$", "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(), 3);
     }
@@ -1771,8 +1890,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     // Test 3.3: Matching a specific pattern with wildcards
     {
         // Matches "data_part_1_chunk_a" and "data_part_2_chunk_b"
-        auto result =
-            service_->GetReplicaListByRegex("^data_part_\\d_chunk_.$");
+        auto result = service_->GetReplicaListByRegex("^data_part_\\d_chunk_.$",
+                                                      "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(), 2);
     }
@@ -1780,7 +1899,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     // Test 3.4: Matching keys containing a specific substring
     {
         // Matches all keys with "key" in them
-        auto result = service_->GetReplicaListByRegex("key");
+        auto result = service_->GetReplicaListByRegex("key", "default");
         ASSERT_TRUE(result.has_value());
         // Expected: test_key_01, test_key_02, test_key_10,
         //           prod_key_alpha, prod_key_beta,
@@ -1792,7 +1911,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     // Test 3.5: Matching based on file-like paths
     {
         // Match all .log files
-        auto result = service_->GetReplicaListByRegex("\\.log$");
+        auto result = service_->GetReplicaListByRegex("\\.log$", "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(), 1);
         EXPECT_EQ(result.value().begin()->first, "logs/app-2025-08-13.log");
@@ -1801,7 +1920,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     // Test 3.6: OR condition using |
     {
         // Match keys starting with "prod" OR ending with "json"
-        auto result = service_->GetReplicaListByRegex("^prod|\\.json$");
+        auto result =
+            service_->GetReplicaListByRegex("^prod|\\.json$", "default");
         ASSERT_TRUE(result.has_value());
         // Expected: prod_key_alpha, prod_key_beta, config/user/settings.json
         EXPECT_EQ(result.value().size(), 3);
@@ -1809,7 +1929,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 
     // Test 3.7: Regex that should not match anything
     {
-        auto result = service_->GetReplicaListByRegex("^non_existent_prefix_");
+        auto result =
+            service_->GetReplicaListByRegex("^non_existent_prefix_", "default");
         // This should succeed but return an empty map.
         ASSERT_TRUE(result.has_value());
         EXPECT_TRUE(result.value().empty());
@@ -1817,7 +1938,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 
     // Test 3.8: Exact match regex
     {
-        auto result = service_->GetReplicaListByRegex("^short$");
+        auto result = service_->GetReplicaListByRegex("^short$", "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value().size(), 1);
         EXPECT_EQ(result.value().begin()->first, "short");
@@ -1825,8 +1946,8 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 
     // Test 3.9: Initial test for non-existent key (as a sanity check)
     {
-        auto get_result =
-            service_->GetReplicaListByRegex(".*absolutely_non_existent.*");
+        auto get_result = service_->GetReplicaListByRegex(
+            ".*absolutely_non_existent.*", "default");
         // Depending on implementation, this could return an empty map or an
         // error. Let's assume it returns an empty map for a valid regex with no
         // matches.
@@ -1839,7 +1960,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
-    auto get_result = service_->GetReplicaList("non_existent");
+    auto get_result = service_->GetReplicaList("non_existent", "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 
@@ -1850,13 +1971,14 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test getting existing key
-    auto get_result2 = service_->GetReplicaList(key);
+    auto get_result2 = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result2.has_value());
     auto replica_list_local = get_result2.value().replicas;
     EXPECT_FALSE(replica_list_local.empty());
@@ -1872,22 +1994,23 @@ TEST_F(MasterServiceTest, RemoveObject) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test removing the object
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result.has_value());
 
     // Verify object is removed
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 
     // Test removing non-existent object
-    auto remove_result2 = service_->Remove("non_existent");
+    auto remove_result2 = service_->Remove("non_existent", "default");
     EXPECT_FALSE(remove_result2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result2.error());
 }
@@ -1906,18 +2029,18 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, value_length, config);
+            service_->PutStart(client_id, key, "default", value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
 
         // Test removing the object
-        auto remove_result = service_->Remove(key);
+        auto remove_result = service_->Remove(key, "default");
         EXPECT_TRUE(remove_result.has_value());
 
         // Verify object is removed
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         EXPECT_FALSE(get_result.has_value());
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
@@ -1938,23 +2061,23 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, value_length, config);
+            service_->PutStart(client_id, key, "default", value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto res = service_->RemoveByRegex("^test_key");
+    auto res = service_->RemoveByRegex("^test_key", "default");
     ASSERT_TRUE(res.has_value());
     ASSERT_EQ(10, res.value());
     times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value());
     }
@@ -1981,8 +2104,8 @@ TEST_F(MasterServiceTest, CopyStart) {
     UUID client_id = generate_uuid();
 
     // Test Case 1: CopyStart a non-existent key, should fail.
-    auto copy_result = service_->CopyStart(client_id, "non_existent_key",
-                                           "segment_1", {"segment_2"});
+    auto copy_result = service_->CopyStart(
+        client_id, "non_existent_key", "default", "segment_1", {"segment_2"});
     EXPECT_FALSE(copy_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result.error());
 
@@ -1995,22 +2118,23 @@ TEST_F(MasterServiceTest, CopyStart) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
 
     // Test Case 2: CopyStart to segment_2 and segment_3, should fail because
     // the only replica is not completed.
-    copy_result = service_->CopyStart(client_id, key, "segment_1",
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
                                       {"segment_2", "segment_3"});
     EXPECT_FALSE(copy_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, copy_result.error());
 
     // PutEnd the object.
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test Case 3: CopyStart to segment_2 and segment_3, should success.
-    copy_result = service_->CopyStart(client_id, key, "segment_1",
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
                                       {"segment_2", "segment_3"});
     EXPECT_TRUE(copy_result.has_value());
     auto copy_response = copy_result.value();
@@ -2019,40 +2143,41 @@ TEST_F(MasterServiceTest, CopyStart) {
     EXPECT_EQ(2, copy_response.targets.size());
 
     // Test Case 4: Try remove the object, should fail because it is copying.
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
 
     // Test Case 5: CopyStart to segment_4, should fail because there is an
     // ongoing copy task.
-    copy_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_4"});
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
+                                      {"segment_4"});
     EXPECT_FALSE(copy_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, copy_result.error());
 
     // Test Case 6: CopyEnd, should success and the object now has 3 replicas.
-    auto copy_end_result = service_->CopyEnd(client_id, key);
+    auto copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_TRUE(copy_end_result.has_value());
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(3, get_result.value().replicas.size());
 
     // Test Case 7: Copy from a non-existent replica to segment_3 and
     // segment_4, should fail.
-    copy_result = service_->CopyStart(client_id, key, "non_existent_segment",
-                                      {"segment_3", "segment_4"});
+    copy_result =
+        service_->CopyStart(client_id, key, "default", "non_existent_segment",
+                            {"segment_3", "segment_4"});
     EXPECT_FALSE(copy_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, copy_result.error());
 
     // Test Case 8: Copy to segment_4 and a non-existent segment, should fail.
-    copy_result = service_->CopyStart(client_id, key, "segment_1",
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
                                       {"segment_4", "non_existent_segment"});
     EXPECT_FALSE(copy_result.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, copy_result.error());
 
     // Test Case 9: Copy to segment_3 and segment_4, should skip segment_3 and
     // successfully copy to segment_4.
-    copy_result = service_->CopyStart(client_id, key, "segment_1",
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
                                       {"segment_3", "segment_4"});
     EXPECT_TRUE(copy_result.has_value());
     copy_response = copy_result.value();
@@ -2065,16 +2190,16 @@ TEST_F(MasterServiceTest, CopyStart) {
                                .buffer_descriptor.transport_endpoint_);
 
     // End the copy operation to clean up state
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_TRUE(copy_end_result.has_value());
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(4, get_result.value().replicas.size());
 
     // Test Case 10: Copy to segment_4 again, should skip because it's already
     // used.
-    copy_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_4"});
+    copy_result = service_->CopyStart(client_id, key, "default", "segment_1",
+                                      {"segment_4"});
     EXPECT_TRUE(copy_result.has_value());
     copy_response = copy_result.value();
     EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
@@ -2087,19 +2212,19 @@ TEST_F(MasterServiceTest, CopyStart) {
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
 
     // Test Case 11: Try remove the object, should fail because it is copying.
-    remove_result = service_->Remove(key);
+    remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, remove_result.error());
 
     // Clean up the copy operation
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_TRUE(copy_end_result.has_value());
 
     // Wait for the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
 
     // Test Case 12: Try remove the object, should success.
-    remove_result = service_->Remove(key);
+    remove_result = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result.has_value());
 }
 
@@ -2119,7 +2244,8 @@ TEST_F(MasterServiceTest, CopyEnd) {
     UUID invalid_client_id = generate_uuid();
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
-    auto copy_end_result = service_->CopyEnd(client_id, "non_existent_key");
+    auto copy_end_result =
+        service_->CopyEnd(client_id, "non_existent_key", "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_end_result.error());
 
@@ -2131,45 +2257,46 @@ TEST_F(MasterServiceTest, CopyEnd) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test Case 2: CopyEnd the object, should fail because there is no ongoing
     // copy task.
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, copy_end_result.error());
 
     // CopyStart the object to segment_2
-    auto copy_start_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    auto copy_start_result = service_->CopyStart(client_id, key, "default",
+                                                 "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_start_result.has_value());
 
     // Test Case 3: CopyEnd with an invalid client id, should fail.
-    copy_end_result = service_->CopyEnd(invalid_client_id, key);
+    copy_end_result = service_->CopyEnd(invalid_client_id, key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, copy_end_result.error());
 
     // Test Case 4: MoveEnd the object, should fail because the ongoing task is
     // Copy.
-    auto move_end_result = service_->MoveEnd(client_id, key);
+    auto move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_end_result.error());
 
     // Test Case 5: CopyEnd, should success.
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_TRUE(copy_end_result.has_value());
 
     // Verify we now have 2 replicas
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(2, get_result.value().replicas.size());
 
     // CopyStart the object from segment_1 to segment_3, then unmount segment_1
-    copy_start_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_3"});
+    copy_start_result = service_->CopyStart(client_id, key, "default",
+                                            "segment_1", {"segment_3"});
     ASSERT_TRUE(copy_start_result.has_value());
 
     // Unmount segment_1 to simulate source gone
@@ -2179,10 +2306,10 @@ TEST_F(MasterServiceTest, CopyEnd) {
 
     // Test Case 6: CopyEnd, should fail because the source is gone, the object
     // should have only 1 replica from segment_2.
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, copy_end_result.error());
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     auto& replicas = get_result.value().replicas;
     EXPECT_EQ(1, replicas.size());
@@ -2191,8 +2318,8 @@ TEST_F(MasterServiceTest, CopyEnd) {
                                .buffer_descriptor.transport_endpoint_);
 
     // CopyStart the object from segment_2 to segment_3, then unmount segment_3
-    copy_start_result =
-        service_->CopyStart(client_id, key, "segment_2", {"segment_3"});
+    copy_start_result = service_->CopyStart(client_id, key, "default",
+                                            "segment_2", {"segment_3"});
     ASSERT_TRUE(copy_start_result.has_value());
 
     // Unmount segment_3 to simulate target gone
@@ -2202,10 +2329,10 @@ TEST_F(MasterServiceTest, CopyEnd) {
 
     // Test Case 7: CopyEnd, should fail because the target is gone, the object
     // should have only 1 replica from segment_2.
-    copy_end_result = service_->CopyEnd(client_id, key);
+    copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, copy_end_result.error());
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     replicas = get_result.value().replicas;
     EXPECT_EQ(1, replicas.size());
@@ -2229,7 +2356,7 @@ TEST_F(MasterServiceTest, CopyRevoke) {
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result =
-        service_->CopyRevoke(client_id, "non_existent_key");
+        service_->CopyRevoke(client_id, "non_existent_key", "default");
     EXPECT_FALSE(copy_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_revoke_result.error());
 
@@ -2241,47 +2368,49 @@ TEST_F(MasterServiceTest, CopyRevoke) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test Case 2: CopyRevoke the object, should fail because there is no
     // ongoing copy task.
-    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    copy_revoke_result = service_->CopyRevoke(client_id, key, "default");
     EXPECT_FALSE(copy_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
               copy_revoke_result.error());
 
     // CopyStart the object to segment_2
-    auto copy_start_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    auto copy_start_result = service_->CopyStart(client_id, key, "default",
+                                                 "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_start_result.has_value());
 
     // Test Case 3: CopyRevoke with an invalid client id, should fail.
-    copy_revoke_result = service_->CopyRevoke(invalid_client_id, key);
+    copy_revoke_result =
+        service_->CopyRevoke(invalid_client_id, key, "default");
     EXPECT_FALSE(copy_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, copy_revoke_result.error());
 
     // Test Case 4: MoveRevoke the object, should fail because the ongoing task
     // is Copy.
-    auto move_revoke_result = service_->MoveRevoke(client_id, key);
+    auto move_revoke_result = service_->MoveRevoke(client_id, key, "default");
     EXPECT_FALSE(move_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_revoke_result.error());
 
     // Test Case 5: CopyRevoke, should success.
-    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    copy_revoke_result = service_->CopyRevoke(client_id, key, "default");
     EXPECT_TRUE(copy_revoke_result.has_value());
 
     // Verify we still have 1 replica (the copy was revoked)
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
 
     // CopyStart the object from segment_1 to segment_2 again, then unmount
     // segment_1
-    copy_start_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    copy_start_result = service_->CopyStart(client_id, key, "default",
+                                            "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_start_result.has_value());
 
     // Unmount segment_1 to simulate source gone
@@ -2291,11 +2420,11 @@ TEST_F(MasterServiceTest, CopyRevoke) {
 
     // Test Case 6: CopyRevoke, should success even though the source is gone,
     // the object should be erased too.
-    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    copy_revoke_result = service_->CopyRevoke(client_id, key, "default");
     EXPECT_TRUE(copy_revoke_result.has_value());
 
     // Verify the object has been removed.
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
 }
 
@@ -2318,8 +2447,8 @@ TEST_F(MasterServiceTest, MoveStart) {
     UUID client_id = generate_uuid();
 
     // Test Case 1: MoveStart a non-existent key, should fail.
-    auto move_start_result = service_->MoveStart(client_id, "non_existent_key",
-                                                 "segment_1", "segment_2");
+    auto move_start_result = service_->MoveStart(
+        client_id, "non_existent_key", "default", "segment_1", "segment_2");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_start_result.error());
 
@@ -2331,36 +2460,37 @@ TEST_F(MasterServiceTest, MoveStart) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
 
     // Test Case 2: MoveStart the object, should fail because the only replica
     // is not completed.
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_1", "segment_2");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
 
     // PutEnd the object.
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Copy the object to segment_3.
-    auto copy_start_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_3"});
+    auto copy_start_result = service_->CopyStart(client_id, key, "default",
+                                                 "segment_1", {"segment_3"});
     ASSERT_TRUE(copy_start_result.has_value());
-    auto copy_end_result = service_->CopyEnd(client_id, key);
+    auto copy_end_result = service_->CopyEnd(client_id, key, "default");
     ASSERT_TRUE(copy_end_result.has_value());
 
     // Test Case 3: MoveStart with source and target be the same, should fail.
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_1");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_1", "segment_1");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(move_start_result.error(), ErrorCode::INVALID_PARAMS);
 
     // Test Case 4: MoveStart to segment_2, should succeed.
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_1", "segment_2");
     EXPECT_TRUE(move_start_result.has_value());
     auto move_response = move_start_result.value();
     EXPECT_EQ("segment_1", move_response.source.get_memory_descriptor()
@@ -2371,44 +2501,44 @@ TEST_F(MasterServiceTest, MoveStart) {
                                .buffer_descriptor.transport_endpoint_);
 
     // Test Case 5: Try remove the object, should fail because it is moving.
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
 
     // Test Case 6: MoveStart again, should fail because there is an ongoing
     // move task.
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_3");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_1", "segment_3");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK,
               move_start_result.error());
 
     // Test Case 7: MoveEnd, should succeed and the object now has 2 replicas
     // from segment_2 and segment_3
-    auto move_end_result = service_->MoveEnd(client_id, key);
+    auto move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_TRUE(move_end_result.has_value());
 
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     auto& replicas = get_result.value().replicas;
     EXPECT_EQ(2, replicas.size());
 
     // Test Case 8: Move from a non-existent replica to segment_1, should fail.
     move_start_result = service_->MoveStart(
-        client_id, key, "non_existent_segment", "segment_1");
+        client_id, key, "default", "non_existent_segment", "segment_1");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
 
     // Test Case 8.5: Move to a non-existent target segment, should fail.
-    move_start_result = service_->MoveStart(client_id, key, "segment_2",
-                                            "non_existent_segment");
+    move_start_result = service_->MoveStart(
+        client_id, key, "default", "segment_2", "non_existent_segment");
     EXPECT_FALSE(move_start_result.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, move_start_result.error());
 
     // Test Case 9: Move to an already existing segment, should succeed but
     // return nullopt.
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_2", "segment_3");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_2", "segment_3");
     EXPECT_TRUE(move_start_result.has_value());
     move_response = move_start_result.value();
     EXPECT_EQ("segment_2", move_response.source.get_memory_descriptor()
@@ -2417,16 +2547,16 @@ TEST_F(MasterServiceTest, MoveStart) {
 
     // Test Case 10: Try remove the object, should fail because it is moving.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
-    remove_result = service_->Remove(key);
+    remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, remove_result.error());
 
     // End the move.
-    move_end_result = service_->MoveEnd(client_id, key);
+    move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_TRUE(move_end_result.has_value());
 
     // Now the object should have only 1 replica on segment_3.
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     replicas = get_result.value().replicas;
     EXPECT_EQ(1, replicas.size());
@@ -2436,7 +2566,7 @@ TEST_F(MasterServiceTest, MoveStart) {
 
     // Test Case 11: Try remove the object, should succeed after lease expires.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
-    remove_result = service_->Remove(key);
+    remove_result = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result.has_value());
 }
 
@@ -2454,7 +2584,8 @@ TEST_F(MasterServiceTest, MoveEnd) {
     UUID invalid_client_id = generate_uuid();
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
-    auto move_end_result = service_->MoveEnd(client_id, "non_existent_key");
+    auto move_end_result =
+        service_->MoveEnd(client_id, "non_existent_key", "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_end_result.error());
 
@@ -2466,46 +2597,47 @@ TEST_F(MasterServiceTest, MoveEnd) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test Case 2: MoveEnd the object, should fail because there is no ongoing
     // move task.
-    move_end_result = service_->MoveEnd(client_id, key);
+    move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, move_end_result.error());
 
     // MoveStart the object to segment_2
-    auto move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    auto move_start_result = service_->MoveStart(client_id, key, "default",
+                                                 "segment_1", "segment_2");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Test Case 3: MoveEnd with an invalid client id, should fail.
-    move_end_result = service_->MoveEnd(invalid_client_id, key);
+    move_end_result = service_->MoveEnd(invalid_client_id, key, "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, move_end_result.error());
 
     // Test Case 4: CopyEnd the object, should fail because the ongoing task is
     // Move.
-    auto copy_end_result = service_->CopyEnd(client_id, key);
+    auto copy_end_result = service_->CopyEnd(client_id, key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_end_result.error());
 
     // Test Case 5: MoveEnd, should success.
-    move_end_result = service_->MoveEnd(client_id, key);
+    move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_TRUE(move_end_result.has_value());
 
     // Verify we still have 1 replica (the move was successful)
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(1, get_result.value().replicas.size());
 
     // MoveStart the object from segment_2 to segment_1 again, then unmount
     // segment_2
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_2", "segment_1");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_2", "segment_1");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Unmount segment_2 to simulate source gone
@@ -2514,7 +2646,7 @@ TEST_F(MasterServiceTest, MoveEnd) {
     ASSERT_TRUE(unmount_result.has_value());
 
     // Test Case 6: MoveEnd, should fail because the source is gone.
-    move_end_result = service_->MoveEnd(client_id, key);
+    move_end_result = service_->MoveEnd(client_id, key, "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
 }
@@ -2533,7 +2665,7 @@ TEST_F(MasterServiceTest, MoveRevoke) {
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result =
-        service_->MoveRevoke(client_id, "non_existent_key");
+        service_->MoveRevoke(client_id, "non_existent_key", "default");
     EXPECT_FALSE(move_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_revoke_result.error());
 
@@ -2545,40 +2677,42 @@ TEST_F(MasterServiceTest, MoveRevoke) {
     config.preferred_segment = "segment_1";
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test Case 2: MoveRevoke the object, should fail because there is no
     // ongoing move task.
-    move_revoke_result = service_->MoveRevoke(client_id, key);
+    move_revoke_result = service_->MoveRevoke(client_id, key, "default");
     EXPECT_FALSE(move_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
               move_revoke_result.error());
 
     // MoveStart the object from segment_1 to segment_2
-    auto move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    auto move_start_result = service_->MoveStart(client_id, key, "default",
+                                                 "segment_1", "segment_2");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Test Case 3: MoveRevoke with an invalid client id, should fail.
-    move_revoke_result = service_->MoveRevoke(invalid_client_id, key);
+    move_revoke_result =
+        service_->MoveRevoke(invalid_client_id, key, "default");
     EXPECT_FALSE(move_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, move_revoke_result.error());
 
     // Test Case 4: CopyRevoke the object, should fail because the ongoing task
     // is Move.
-    auto copy_revoke_result = service_->CopyRevoke(client_id, key);
+    auto copy_revoke_result = service_->CopyRevoke(client_id, key, "default");
     EXPECT_FALSE(copy_revoke_result.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_revoke_result.error());
 
     // Test Case 5: MoveRevoke, should succeed.
-    move_revoke_result = service_->MoveRevoke(client_id, key);
+    move_revoke_result = service_->MoveRevoke(client_id, key, "default");
     EXPECT_TRUE(move_revoke_result.has_value());
 
     // Verify we still have 1 replica (the move was revoked)
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_TRUE(get_result.has_value());
     auto& replicas = get_result.value().replicas;
     EXPECT_EQ(1, replicas.size());
@@ -2588,8 +2722,8 @@ TEST_F(MasterServiceTest, MoveRevoke) {
 
     // MoveStart the object from segment_1 to segment_2 again, then unmount
     // segment_1
-    move_start_result =
-        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    move_start_result = service_->MoveStart(client_id, key, "default",
+                                            "segment_1", "segment_2");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Unmount segment_1 to simulate source gone
@@ -2598,11 +2732,11 @@ TEST_F(MasterServiceTest, MoveRevoke) {
     ASSERT_TRUE(unmount_result.has_value());
 
     // Test Case 6: MoveRevoke, should succeed even though the source is gone.
-    move_revoke_result = service_->MoveRevoke(client_id, key);
+    move_revoke_result = service_->MoveRevoke(client_id, key, "default");
     EXPECT_TRUE(move_revoke_result.has_value());
 
     // The object should be erased as there is no replica left.
-    get_result = service_->GetReplicaList(key);
+    get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
 }
 
@@ -2634,26 +2768,27 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     config.preferred_segment = "segment_1";
 
     // Put two objects for move and copy tests.
-    auto put_start_result =
-        service_->PutStart(client_id, copy_key, slice_length, config);
+    auto put_start_result = service_->PutStart(client_id, copy_key, "default",
+                                               slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, copy_key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, copy_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    put_start_result =
-        service_->PutStart(client_id, move_key, slice_length, config);
+    put_start_result = service_->PutStart(client_id, move_key, "default",
+                                          slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    put_end_result = service_->PutEnd(client_id, move_key, ReplicaType::MEMORY);
+    put_end_result =
+        service_->PutEnd(client_id, move_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Start copy and move operations.
-    auto copy_start_result =
-        service_->CopyStart(client_id, copy_key, "segment_1", {"segment_2"});
+    auto copy_start_result = service_->CopyStart(client_id, copy_key, "default",
+                                                 "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_start_result.has_value());
 
-    auto move_start_result =
-        service_->MoveStart(client_id, move_key, "segment_1", "segment_2");
+    auto move_start_result = service_->MoveStart(client_id, move_key, "default",
+                                                 "segment_1", "segment_2");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Put more objects to trigger eviction. Do not prefer any segments.
@@ -2661,10 +2796,10 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
         std::string key = "test_key_" + std::to_string(i);
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         if (put_start_result.has_value()) {
-            auto put_end_result =
-                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            auto put_end_result = service_->PutEnd(client_id, key, "default",
+                                                   ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
         } else {
             // wait for eviction to work
@@ -2678,10 +2813,10 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
     ASSERT_TRUE(remove_all_result > 0);
 
     // Try end copy and move operations, should success.
-    auto copy_end_result = service_->CopyEnd(client_id, copy_key);
+    auto copy_end_result = service_->CopyEnd(client_id, copy_key, "default");
     EXPECT_TRUE(copy_end_result.has_value());
 
-    auto move_end_result = service_->MoveEnd(client_id, move_key);
+    auto move_end_result = service_->MoveEnd(client_id, move_key, "default");
     EXPECT_TRUE(move_end_result.has_value());
 }
 
@@ -2718,26 +2853,27 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     config.preferred_segment = "segment_1";
 
     // Put two objects for move and copy tests.
-    auto put_start_result =
-        service_->PutStart(client_id, copy_key, slice_length, config);
+    auto put_start_result = service_->PutStart(client_id, copy_key, "default",
+                                               slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, copy_key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, copy_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
-    put_start_result =
-        service_->PutStart(client_id, move_key, slice_length, config);
+    put_start_result = service_->PutStart(client_id, move_key, "default",
+                                          slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    put_end_result = service_->PutEnd(client_id, move_key, ReplicaType::MEMORY);
+    put_end_result =
+        service_->PutEnd(client_id, move_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Start copy and move operations.
-    auto copy_start_result =
-        service_->CopyStart(client_id, copy_key, "segment_1", {"segment_2"});
+    auto copy_start_result = service_->CopyStart(client_id, copy_key, "default",
+                                                 "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_start_result.has_value());
 
-    auto move_start_result =
-        service_->MoveStart(client_id, move_key, "segment_1", "segment_2");
+    auto move_start_result = service_->MoveStart(client_id, move_key, "default",
+                                                 "segment_1", "segment_2");
     ASSERT_TRUE(move_start_result.has_value());
 
     // Wait for the operations timeout.
@@ -2748,10 +2884,10 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
     for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
         std::string key = "test_key_" + std::to_string(i);
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         if (put_start_result.has_value()) {
-            auto put_end_result =
-                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            auto put_end_result = service_->PutEnd(client_id, key, "default",
+                                                   ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
         } else {
             // wait for eviction to work
@@ -2761,11 +2897,11 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
 
     // Try end copy and move operations, should fail because the objects are
     // evicted.
-    auto copy_end_result = service_->CopyEnd(client_id, copy_key);
+    auto copy_end_result = service_->CopyEnd(client_id, copy_key, "default");
     EXPECT_FALSE(copy_end_result.has_value());
     EXPECT_EQ(copy_end_result.error(), ErrorCode::OBJECT_NOT_FOUND);
 
-    auto move_end_result = service_->MoveEnd(client_id, move_key);
+    auto move_end_result = service_->MoveEnd(client_id, move_key, "default");
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(move_end_result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -2811,7 +2947,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         populate_store();
 
         // Action: Remove keys starting with "test_key_"
-        auto remove_result = service_->RemoveByRegex("^test_key_");
+        auto remove_result = service_->RemoveByRegex("^test_key_", "default");
         ASSERT_TRUE(remove_result.has_value());
         EXPECT_EQ(remove_result.value(), 3);  // Should remove 3 keys
 
@@ -2819,7 +2955,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         std::vector<std::string> deleted_keys = {"test_key_01", "test_key_02",
                                                  "test_key_10"};
         for (const auto& key : deleted_keys) {
-            auto exist_result = service_->ExistKey(key);
+            auto exist_result = service_->ExistKey(key, "default");
             ASSERT_TRUE(exist_result.has_value());
             EXPECT_FALSE(exist_result.value())
                 << "Key " << key << " should have been deleted.";
@@ -2828,7 +2964,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         std::vector<std::string> remaining_keys = {
             "prod_key_alpha", "short", "test-key-extra"};  // Sample a few
         for (const auto& key : remaining_keys) {
-            auto exist_result = service_->ExistKey(key);
+            auto exist_result = service_->ExistKey(key, "default");
             ASSERT_TRUE(exist_result.has_value());
             EXPECT_TRUE(exist_result.value())
                 << "Key " << key << " should NOT have been deleted.";
@@ -2851,12 +2987,12 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         size_t total_keys = 13;  // Count from the keys_to_put vector
 
         // Action: Remove all keys
-        auto remove_result = service_->RemoveByRegex(".*");
+        auto remove_result = service_->RemoveByRegex(".*", "default");
         ASSERT_TRUE(remove_result.has_value());
         EXPECT_EQ(remove_result.value(), total_keys);
 
         // Verification: Check that no keys remain
-        auto get_all_result = service_->GetReplicaListByRegex(".*");
+        auto get_all_result = service_->GetReplicaListByRegex(".*", "default");
         ASSERT_TRUE(get_all_result.has_value());
         EXPECT_TRUE(get_all_result.value().empty());
     }
@@ -2876,12 +3012,13 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         size_t total_keys_before_remove = 13;
 
         // Action: Attempt to remove using a pattern that matches nothing
-        auto remove_result = service_->RemoveByRegex("^nonexistent-pattern-");
+        auto remove_result =
+            service_->RemoveByRegex("^nonexistent-pattern-", "default");
         ASSERT_TRUE(remove_result.has_value());
         EXPECT_EQ(remove_result.value(), 0);  // Should remove 0 keys
 
         // Verification: Check that all keys still exist
-        auto get_all_result = service_->GetReplicaListByRegex(".*");
+        auto get_all_result = service_->GetReplicaListByRegex(".*", "default");
         ASSERT_TRUE(get_all_result.has_value());
         EXPECT_EQ(get_all_result.value().size(), total_keys_before_remove);
     }
@@ -2899,7 +3036,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         populate_store();
 
         // Action: Remove all keys that contain a slash '/' OR end with a number
-        auto remove_result = service_->RemoveByRegex("/|\\d$");
+        auto remove_result = service_->RemoveByRegex("/|\\d$", "default");
         ASSERT_TRUE(remove_result.has_value());
         // Matches: "config/user/settings.json", "logs/app-2025-08-13.log",
         //          "test_key_01", "test_key_02", "test_key_10"
@@ -2924,23 +3061,25 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         populate_store();
 
         // Action: Remove all keys that contain "chunk" OR "config"
-        auto remove_result = service_->RemoveByRegex("chunk|config");
+        auto remove_result = service_->RemoveByRegex("chunk|config", "default");
         ASSERT_TRUE(remove_result.has_value());
         // Matches: "data_part_1_chunk_a", "data_part_2_chunk_b",
         // "config/user/settings.json"
         EXPECT_EQ(remove_result.value(), 3);
 
         // Verification
-        auto exist_result_chunk = service_->ExistKey("data_part_1_chunk_a");
+        auto exist_result_chunk =
+            service_->ExistKey("data_part_1_chunk_a", "default");
         ASSERT_TRUE(exist_result_chunk.has_value());
         EXPECT_FALSE(exist_result_chunk.value());
 
         auto exist_result_config =
-            service_->ExistKey("config/user/settings.json");
+            service_->ExistKey("config/user/settings.json", "default");
         ASSERT_TRUE(exist_result_config.has_value());
         EXPECT_FALSE(exist_result_config.value());
 
-        auto exist_result_untouched = service_->ExistKey("prod_key_alpha");
+        auto exist_result_untouched =
+            service_->ExistKey("prod_key_alpha", "default");
         ASSERT_TRUE(exist_result_untouched.has_value());
         EXPECT_TRUE(exist_result_untouched.value());
     }
@@ -2961,12 +3100,12 @@ TEST_F(MasterServiceTest, RemoveAll) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, value_length, config);
+            service_->PutStart(client_id, key, "default", value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
     }
     // wait for all the lease to expire
@@ -2975,7 +3114,7 @@ TEST_F(MasterServiceTest, RemoveAll) {
     times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value());
     }
@@ -3010,7 +3149,7 @@ TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
 
     // Test PutStart with multiple slices and replicas
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
 
@@ -3026,16 +3165,17 @@ TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
     }
 
     // Test GetReplicaList during processing (should fail)
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     // Complete the put operation
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Test GetReplicaList after completion
-    auto get_result2 = service_->GetReplicaList(key);
+    auto get_result2 = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result2.has_value());
     auto retrieved_replicas = get_result2.value().replicas;
     ASSERT_EQ(num_replicas, retrieved_replicas.size());
@@ -3069,13 +3209,14 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Create the object
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Verify object exists
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     auto retrieved_replicas = get_result.value().replicas;
     ASSERT_EQ(1, retrieved_replicas.size());
@@ -3086,7 +3227,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Try to get the object - it should be automatically removed since the
     // replica is invalid
-    auto get_result2 = service_->GetReplicaList(key);
+    auto get_result2 = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result2.error());
 
@@ -3097,14 +3238,14 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     // Create another object
     std::string key2 = "another_segment_object";
     auto put_start_result2 =
-        service_->PutStart(client_id, key2, slice_length, config);
+        service_->PutStart(client_id, key2, "default", slice_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 =
-        service_->PutEnd(client_id, key2, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key2, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
 
     // Verify we can get it
-    auto get_result3 = service_->GetReplicaList(key2);
+    auto get_result3 = service_->GetReplicaList(key2, "default");
     ASSERT_TRUE(get_result3.has_value());
 
     // Unmount the segment
@@ -3112,7 +3253,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     ASSERT_TRUE(unmount_result2.has_value());
 
     // Try to remove the object that should already be cleaned up
-    auto remove_result = service_->Remove(key2);
+    auto remove_result = service_->Remove(key2, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, remove_result.error());
 }
@@ -3144,11 +3285,11 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
                 config.replica_num = 1;
                 std::vector<Replica::Descriptor> replica_list;
 
-                auto put_start_result =
-                    service_->PutStart(client_id, key, slice_length, config);
+                auto put_start_result = service_->PutStart(
+                    client_id, key, "default", slice_length, config);
                 if (put_start_result.has_value()) {
-                    auto put_end_result =
-                        service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+                    auto put_end_result = service_->PutEnd(
+                        client_id, key, "default", ReplicaType::MEMORY);
                     if (put_end_result.has_value()) {
                         success_writes++;
                     }
@@ -3214,10 +3355,10 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         config.replica_num = 1;
 
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
     }
 
@@ -3230,7 +3371,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
         readers.emplace_back([&]() {
             for (int j = 0; j < num_objects; ++j) {
                 std::string key = "pre_key_" + std::to_string(j);
-                auto get_result = service_->GetReplicaList(key);
+                auto get_result = service_->GetReplicaList(key, "default");
                 if (get_result.has_value()) {
                     success_reads++;
                 }
@@ -3271,7 +3412,7 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     // Verify all objects were removed
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         EXPECT_FALSE(get_result.has_value());
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
@@ -3295,10 +3436,10 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
         config.replica_num = 1;
 
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
     }
 
@@ -3325,7 +3466,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     // Verify all objects were removed
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         EXPECT_FALSE(get_result.has_value());
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
@@ -3362,23 +3503,23 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     // Umount will remove all objects in the segment, include the key1
     ASSERT_EQ(1, service_->GetKeyCount());
     // Verify objects in segment1 is gone
-    auto get_result1 = service_->GetReplicaList(key1);
+    auto get_result1 = service_->GetReplicaList(key1, "default");
     ASSERT_FALSE(get_result1.has_value());
     ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
 
     // Verify objects in segment2 is still there
-    auto get_result2 = service_->GetReplicaList(key2);
+    auto get_result2 = service_->GetReplicaList(key2, "default");
     ASSERT_TRUE(get_result2.has_value());
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result =
-        service_->PutStart(client_id, key1, slice_length, config);
+        service_->PutStart(client_id, key1, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     auto put_end_result =
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
-    auto get_result3 = service_->GetReplicaList(key1);
+    auto get_result3 = service_->GetReplicaList(key1, "default");
     ASSERT_TRUE(get_result3.has_value());
     auto retrieved = get_result3.value();
     ASSERT_EQ(replica_list[0]
@@ -3411,14 +3552,14 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     config.replica_num = 2;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(2u, put_start_result->size());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
 
     // Verify two replicas exist and they are on distinct segments
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
     auto replicas = get_result.value().replicas;
     ASSERT_EQ(2u, replicas.size());
@@ -3436,7 +3577,7 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     ASSERT_TRUE(service_->UnmountSegment(segment1.id, client_id).has_value());
 
     // Key should still be readable via the remaining replica
-    auto get_after_unmount = service_->GetReplicaList(key);
+    auto get_after_unmount = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_after_unmount.has_value())
         << "Object should remain accessible with surviving replica";
 }
@@ -3486,7 +3627,7 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
 
     // Verify all keys are gone
     for (const auto& key : keys) {
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         EXPECT_FALSE(get_result.has_value());
         EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
     }
@@ -3517,75 +3658,76 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
     // Verify lease is granted on ExistsKey
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
-    auto remove_result = service_->Remove(key);
+    auto remove_result = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result.error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result2 = service_->Remove(key);
+    auto remove_result2 = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result2.has_value());
 
     // Verify lease is extended on successive ExistsKey
     auto put_start_result2 =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 =
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
-    auto exist_result2 = service_->ExistKey(key);
+    auto exist_result2 = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result2.has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto exist_result3 = service_->ExistKey(key);
+    auto exist_result3 = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result3.has_value());
-    auto remove_result3 = service_->Remove(key);
+    auto remove_result3 = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result3.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result3.error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result4 = service_->Remove(key);
+    auto remove_result4 = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result4.has_value());
 
     // Verify lease is granted on GetReplicaList
     auto put_start_result3 =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result3 =
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
-    auto remove_result5 = service_->Remove(key);
+    auto remove_result5 = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result5.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result5.error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result6 = service_->Remove(key);
+    auto remove_result6 = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result6.has_value());
 
     // Verify lease is extended on successive GetReplicaList
     auto put_start_result4 =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result4 =
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result4.has_value());
-    auto get_result2 = service_->GetReplicaList(key);
+    auto get_result2 = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result2.has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto get_result3 = service_->GetReplicaList(key);
+    auto get_result3 = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result3.has_value());
-    auto remove_result7 = service_->Remove(key);
+    auto remove_result7 = service_->Remove(key, "default");
     EXPECT_FALSE(remove_result7.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result7.error());
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    auto remove_result8 = service_->Remove(key);
+    auto remove_result8 = service_->Remove(key, "default");
     EXPECT_TRUE(remove_result8.has_value());
 
     // Verify object is removed
-    auto get_result4 = service_->GetReplicaList(key);
+    auto get_result4 = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result4.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result4.error());
 }
@@ -3604,20 +3746,20 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         if (i >= 5) {
-            auto exist_result = service_->ExistKey(key);
+            auto exist_result = service_->ExistKey(key, "default");
             ASSERT_TRUE(exist_result.has_value());
         }
     }
     ASSERT_EQ(5, service_->RemoveAll());
     for (int i = 0; i < 5; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_FALSE(exist_result.value());
     }
     // wait for all the lease to expire
@@ -3625,7 +3767,7 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     ASSERT_EQ(5, service_->RemoveAll());
     for (int i = 5; i < 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_FALSE(exist_result.value());
     }
 }
@@ -3656,10 +3798,10 @@ TEST_F(MasterServiceTest, EvictObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         if (put_start_result.has_value()) {
-            auto put_end_result =
-                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            auto put_end_result = service_->PutEnd(client_id, key, "default",
+                                                   ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
             success_puts++;
         } else {
@@ -3696,13 +3838,13 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         if (put_start_result.has_value()) {
-            auto put_end_result =
-                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            auto put_end_result = service_->PutEnd(client_id, key, "default",
+                                                   ReplicaType::MEMORY);
             ASSERT_TRUE(put_end_result.has_value());
             // the object is leased
-            auto get_result = service_->GetReplicaList(key);
+            auto get_result = service_->GetReplicaList(key, "default");
             ASSERT_TRUE(get_result.has_value());
             leased_keys.push_back(key);
             success_puts++;
@@ -3716,7 +3858,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     // All leased objects should be accessible
     for (const auto& key : leased_keys) {
-        auto get_result = service_->GetReplicaList(key);
+        auto get_result = service_->GetReplicaList(key, "default");
         ASSERT_TRUE(get_result.has_value());
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
@@ -3750,16 +3892,18 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
 
     // Verify soft pin does not block remove
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
-    EXPECT_TRUE(service_->Remove(key).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(service_->Remove(key, "default").has_value());
 
     // Verify soft pin does not block RemoveAll
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_length, config).has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+        service_->PutStart(client_id, key, "default", slice_length, config)
+            .has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
     EXPECT_EQ(1, service_->RemoveAll());
 }
 
@@ -3797,11 +3941,12 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             soft_pin_config.with_soft_pin = true;
 
             ASSERT_TRUE(service_
-                            ->PutStart(client_id, pin_key, slice_length,
-                                       soft_pin_config)
+                            ->PutStart(client_id, pin_key, "default",
+                                       slice_length, soft_pin_config)
                             .has_value());
             ASSERT_TRUE(
-                service_->PutEnd(client_id, pin_key, ReplicaType::MEMORY)
+                service_
+                    ->PutEnd(client_id, pin_key, "default", ReplicaType::MEMORY)
                     .has_value());
         }
 
@@ -3812,10 +3957,12 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
             uint64_t slice_length = value_size;
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(client_id, key, slice_length, config)
+            if (service_
+                    ->PutStart(client_id, key, "default", slice_length, config)
                     .has_value()) {
                 ASSERT_TRUE(
-                    service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                    service_
+                        ->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
                         .has_value());
             } else {
                 failed_puts++;
@@ -3828,7 +3975,8 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
         // pin_key should still be accessible
         for (int i = 0; i < 2; i++) {
             std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key).has_value());
+            ASSERT_TRUE(
+                service_->GetReplicaList(pin_key, "default").has_value());
         }
 
         // wait for the lease to expire
@@ -3867,10 +4015,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(client_id, key, slice_length, config)
+        if (service_->PutStart(client_id, key, "default", slice_length, config)
                 .has_value()) {
-            ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
-                            .has_value());
+            ASSERT_TRUE(
+                service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
             success_puts++;
         } else {
             // wait for eviction to work
@@ -3919,10 +4068,11 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_->PutStart(client_id, pin_key, slice_length,
-                                           soft_pin_config));
+            ASSERT_TRUE(service_->PutStart(client_id, pin_key, "default",
+                                           slice_length, soft_pin_config));
             ASSERT_TRUE(
-                service_->PutEnd(client_id, pin_key, ReplicaType::MEMORY)
+                service_
+                    ->PutEnd(client_id, pin_key, "default", ReplicaType::MEMORY)
                     .has_value());
         }
 
@@ -3932,7 +4082,8 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         // Get the pin_key to extend the soft pin
         for (int i = 0; i < 2; i++) {
             std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key).has_value());
+            ASSERT_TRUE(
+                service_->GetReplicaList(pin_key, "default").has_value());
         }
 
         // Fill the segment to trigger eviction
@@ -3942,10 +4093,12 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
             uint64_t slice_length = value_size;
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(client_id, key, slice_length, config)
+            if (service_
+                    ->PutStart(client_id, key, "default", slice_length, config)
                     .has_value()) {
                 ASSERT_TRUE(
-                    service_->PutEnd(client_id, key, ReplicaType::MEMORY)
+                    service_
+                        ->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
                         .has_value());
             } else {
                 failed_puts++;
@@ -3959,7 +4112,8 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         // pin_key should still be accessible
         for (int i = 0; i < 2; i++) {
             std::string pin_key = "pin_key" + std::to_string(i);
-            ASSERT_TRUE(service_->GetReplicaList(pin_key).has_value());
+            ASSERT_TRUE(
+                service_->GetReplicaList(pin_key, "default").has_value());
         }
 
         // wait for the lease to expire
@@ -4000,10 +4154,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(client_id, key, slice_length, config)
+        if (service_->PutStart(client_id, key, "default", slice_length, config)
                 .has_value()) {
-            ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
-                            .has_value());
+            ASSERT_TRUE(
+                service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
             success_keys.push_back(key);
         } else {
             // wait for eviction to work
@@ -4013,7 +4168,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     ASSERT_LE(success_keys.size(), 17);
     // All soft pinned objects should be accessible
     for (const auto& key : success_keys) {
-        ASSERT_TRUE(service_->GetReplicaList(key).has_value());
+        ASSERT_TRUE(service_->GetReplicaList(key, "default").has_value());
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     service_->RemoveAll();
@@ -4039,7 +4194,7 @@ TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     config.replica_num = 10;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replica_list_local = put_start_result.value();
     ASSERT_EQ(config.replica_num, replica_list_local.size());
@@ -4055,8 +4210,8 @@ TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     EXPECT_EQ(segment_names.size(), config.replica_num)
         << "Duplicate segment found";
 
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
 }
 
 TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
@@ -4077,7 +4232,7 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     config.replica_num = 2;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replicas = put_start_result.value();
 
@@ -4109,23 +4264,23 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
         ReplicateConfig config;
         config.replica_num = 1;
         uint64_t slice_length = value_size;
-        auto put_start_result =
-            service_->PutStart(client_id, test_keys[i], slice_length, config);
+        auto put_start_result = service_->PutStart(
+            client_id, test_keys[i], "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
-        auto put_end_result =
-            service_->PutEnd(client_id, test_keys[i], ReplicaType::MEMORY);
+        auto put_end_result = service_->PutEnd(client_id, test_keys[i],
+                                               "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
     }
 
     // Test individual ExistKey calls to verify the underlying functionality
     for (int i = 0; i < test_object_num; ++i) {
-        auto exist_result = service_->ExistKey(test_keys[i]);
+        auto exist_result = service_->ExistKey(test_keys[i], "default");
         EXPECT_TRUE(exist_result.value());
     }
 
     // Tets batch
     test_keys.push_back("non_existent_key");
-    auto exist_resp = service_->BatchExistKey(test_keys);
+    auto exist_resp = service_->BatchExistKey(test_keys, "default");
     for (int i = 0; i < test_object_num; ++i) {
         ASSERT_TRUE(exist_resp[i].value());
     }
@@ -4419,7 +4574,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_1, should success.
     auto put_start_result =
-        service_->PutStart(client_id, key_1, slice_length, config);
+        service_->PutStart(client_id, key_1, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4429,7 +4584,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_1 again, should fail because the key exists.
     put_start_result =
-        service_->PutStart(client_id, key_1, slice_length, config);
+        service_->PutStart(client_id, key_1, "default", slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -4445,7 +4600,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_1 again, should success because the old one has expired and will
     // be discarded by this put.
     put_start_result =
-        service_->PutStart(client_id, key_1, slice_length, config);
+        service_->PutStart(client_id, key_1, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4455,17 +4610,17 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Complete key_1.
     auto put_end_result =
-        service_->PutEnd(client_id, key_1, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key_1, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Protect key_1 from eviction.
-    auto get_result = service_->GetReplicaList(key_1);
+    auto get_result = service_->GetReplicaList(key_1, "default");
     EXPECT_TRUE(get_result.has_value());
 
     // Put key_2, should fail because the key_1 occupied 12MB (6MB processing,
     // 6MB discarded but not yet released) on each segment.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_length, config);
+        service_->PutStart(client_id, key_2, "default", slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -4478,7 +4633,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
-        auto get_result = service_->GetReplicaList(key_1);
+        auto get_result = service_->GetReplicaList(key_1, "default");
         EXPECT_TRUE(get_result.has_value());
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -4486,7 +4641,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should success because the discarded replica has been
     // released.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_length, config);
+        service_->PutStart(client_id, key_2, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4501,7 +4656,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
-        auto get_result = service_->GetReplicaList(key_1);
+        auto get_result = service_->GetReplicaList(key_1, "default");
         EXPECT_TRUE(get_result.has_value());
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -4509,7 +4664,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should fail because eviction has not been triggered. And
     // this PutStart should trigger the eviction.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_length, config);
+        service_->PutStart(client_id, key_2, "default", slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -4519,7 +4674,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should success because the previous one has been
     // discarded and released.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_length, config);
+        service_->PutStart(client_id, key_2, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -4528,7 +4683,8 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Complete key_2.
-    put_end_result = service_->PutEnd(client_id, key_2, ReplicaType::MEMORY);
+    put_end_result =
+        service_->PutEnd(client_id, key_2, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 }
 
@@ -4598,8 +4754,11 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 
     keys.clear();
@@ -4615,8 +4774,11 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
     ASSERT_EQ(res->size(), keys.size());
     for (auto& key : keys) {
-        ASSERT_TRUE(res.value().find(key) != res.value().end());
-        ASSERT_EQ(res.value().find(key)->second, 1024);
+        auto it = std::find_if(
+            res->begin(), res->end(),
+            [&key](const OffloadTaskItem& task) { return task.key == key; });
+        ASSERT_TRUE(it != res->end());
+        ASSERT_EQ(it->size, 1024);
     }
 }
 
@@ -4639,16 +4801,16 @@ TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, value_length, config);
+            service_->PutStart(client_id, key, "default", value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
     }
 
     // Verify objects exist
     for (const auto& key : keys) {
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_TRUE(exist_result.value());
     }
@@ -4665,7 +4827,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
 
     // Verify objects are removed
     for (const auto& key : keys) {
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value())
             << "Key " << key << " should be removed";
@@ -4696,9 +4858,10 @@ TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
     config.preferred_segment =
         segment_name;  // Ensure object is placed on segment1
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // 4. Wait for lease to expire and verify it's actually expired
@@ -4736,7 +4899,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
     const auto& cleared_keys = clear_result.value();
     ASSERT_EQ(1u, cleared_keys.size()) << "Key should be cleared";
 
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     ASSERT_FALSE(exist_result.value())
         << "Key should be removed after being cleared.";
@@ -4757,13 +4920,14 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, value_length, config);
+        service_->PutStart(client_id, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Grant a lease by calling GetReplicaList (similar to normal usage)
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(get_result.has_value());
 
     // Try to clear immediately (lease should still be active)
@@ -4777,7 +4941,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
         << "No keys should be cleared when lease is active";
 
     // Verify object still exists
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
@@ -4798,10 +4962,10 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithDifferentClientId) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id1, key, value_length, config);
+        service_->PutStart(client_id1, key, "default", value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id1, key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id1, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Wait for lease to expire
@@ -4818,7 +4982,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithDifferentClientId) {
         << "No keys should be cleared for different client_id";
 
     // Verify object still exists
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     ASSERT_TRUE(exist_result.value()) << "Key should still exist";
 }
@@ -4873,11 +5037,11 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithEmptyStringKeys) {
     uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(client_id, valid_key, value_length, config);
+    auto put_start_result = service_->PutStart(client_id, valid_key, "default",
+                                               value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, valid_key, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, valid_key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Wait for lease to expire
@@ -4915,22 +5079,25 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
 
     // Create key1 and key2 with client_id1
     auto put_start1 =
-        service_->PutStart(client_id1, key1, value_length, config);
+        service_->PutStart(client_id1, key1, "default", value_length, config);
     ASSERT_TRUE(put_start1.has_value());
-    auto put_end1 = service_->PutEnd(client_id1, key1, ReplicaType::MEMORY);
+    auto put_end1 =
+        service_->PutEnd(client_id1, key1, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end1.has_value());
 
     auto put_start2 =
-        service_->PutStart(client_id1, key2, value_length, config);
+        service_->PutStart(client_id1, key2, "default", value_length, config);
     ASSERT_TRUE(put_start2.has_value());
-    auto put_end2 = service_->PutEnd(client_id1, key2, ReplicaType::MEMORY);
+    auto put_end2 =
+        service_->PutEnd(client_id1, key2, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end2.has_value());
 
     // Create key3 with client_id2
     auto put_start3 =
-        service_->PutStart(client_id2, key3, value_length, config);
+        service_->PutStart(client_id2, key3, "default", value_length, config);
     ASSERT_TRUE(put_start3.has_value());
-    auto put_end3 = service_->PutEnd(client_id2, key3, ReplicaType::MEMORY);
+    auto put_end3 =
+        service_->PutEnd(client_id2, key3, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end3.has_value());
 
     // Wait for lease to expire
@@ -4948,16 +5115,16 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
         << "Only keys belonging to client_id1 should be cleared";
 
     // Verify key1 and key2 are cleared
-    auto exist1 = service_->ExistKey(key1);
+    auto exist1 = service_->ExistKey(key1, "default");
     ASSERT_TRUE(exist1.has_value());
     ASSERT_FALSE(exist1.value()) << "key1 should be cleared";
 
-    auto exist2 = service_->ExistKey(key2);
+    auto exist2 = service_->ExistKey(key2, "default");
     ASSERT_TRUE(exist2.has_value());
     ASSERT_FALSE(exist2.value()) << "key2 should be cleared";
 
     // Verify key3 still exists (different client_id)
-    auto exist3 = service_->ExistKey(key3);
+    auto exist3 = service_->ExistKey(key3, "default");
     ASSERT_TRUE(exist3.has_value());
     ASSERT_TRUE(exist3.value())
         << "key3 should still exist (different client_id)";
@@ -4993,15 +5160,15 @@ TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
     auto put_start_result =
-        service_->PutStart(client_id, key1, slice_length, config);
+        service_->PutStart(client_id, key1, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Copy key1 to "segment_1" and "segment_2"
     auto copy_result =
-        service_->CreateCopyTask(key1, {"segment_1", "segment_2"});
+        service_->CreateCopyTask(key1, "default", {"segment_1", "segment_2"});
     EXPECT_TRUE(copy_result.has_value());
 
     // verify the copy task is created and assigned to the client who executed
@@ -5012,18 +5179,19 @@ TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
 
     // Copy with empty targets should fail
-    auto copy_result1 = service_->CreateCopyTask(key1, {});
+    auto copy_result1 = service_->CreateCopyTask(key1, "default", {});
     EXPECT_FALSE(copy_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result1.error());
 
     // Copy not exist key should fail
     auto copy_result2 =
-        service_->CreateCopyTask("not_exist_key", {"segment_1"});
+        service_->CreateCopyTask("not_exist_key", "default", {"segment_1"});
     EXPECT_FALSE(copy_result2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result2.error());
 
     // Copy to segment that not mounted should fail
-    auto copy_result3 = service_->CreateCopyTask(key1, {"not_mounted_segment"});
+    auto copy_result3 =
+        service_->CreateCopyTask(key1, "default", {"not_mounted_segment"});
     EXPECT_FALSE(copy_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
 }
@@ -5058,14 +5226,15 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
     auto put_start_result =
-        service_->PutStart(client_id, key1, slice_length, config);
+        service_->PutStart(client_id, key1, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Move key1 from "segment_0" to "segment_1"
-    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
+    auto move_result =
+        service_->CreateMoveTask(key1, "default", "segment_0", "segment_1");
     EXPECT_TRUE(move_result.has_value());
 
     // Verify the move task is created and assigned to the client owning the
@@ -5076,32 +5245,32 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
 
     // Move non-existent key should fail
-    auto move_result1 =
-        service_->CreateMoveTask("not_exist_key", "segment_0", "segment_1");
+    auto move_result1 = service_->CreateMoveTask("not_exist_key", "default",
+                                                 "segment_0", "segment_1");
     EXPECT_FALSE(move_result1.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_result1.error());
 
     // Move to segment that is same as source should fail
     auto move_result_same =
-        service_->CreateMoveTask(key1, "segment_1", "segment_1");
+        service_->CreateMoveTask(key1, "default", "segment_1", "segment_1");
     EXPECT_FALSE(move_result_same.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result_same.error());
 
     // Move to segment that is not mounted should fail
-    auto move_result2 =
-        service_->CreateMoveTask(key1, "segment_0", "not_mounted_segment");
+    auto move_result2 = service_->CreateMoveTask(key1, "default", "segment_0",
+                                                 "not_mounted_segment");
     EXPECT_FALSE(move_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result2.error());
 
     // Move from segment that does not have the replica should fail
     auto move_result3 =
-        service_->CreateMoveTask(key1, "segment_2", "segment_1");
+        service_->CreateMoveTask(key1, "default", "segment_2", "segment_1");
     EXPECT_FALSE(move_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result3.error());
 
     // Move from segment that is not mounted should fail
-    auto move_result4 =
-        service_->CreateMoveTask(key1, "not_mounted_segment", "segment_1");
+    auto move_result4 = service_->CreateMoveTask(
+        key1, "default", "not_mounted_segment", "segment_1");
     EXPECT_FALSE(move_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
 }
@@ -5136,14 +5305,15 @@ TEST_F(MasterServiceTest, QueryTaskTest) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
     auto put_start_result =
-        service_->PutStart(client_id, key1, slice_length, config);
+        service_->PutStart(client_id, key1, "default", slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     auto put_end_result =
-        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+        service_->PutEnd(client_id, key1, "default", ReplicaType::MEMORY);
     EXPECT_TRUE(put_end_result.has_value());
 
     // Move key1 from "segment_0" to "segment_1"
-    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
+    auto move_result =
+        service_->CreateMoveTask(key1, "default", "segment_0", "segment_1");
     EXPECT_TRUE(move_result.has_value());
 
     // Query non-existent task should fail
@@ -5183,18 +5353,21 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
+    ASSERT_TRUE(service_
+                    ->PutStart(put_client_id, key, "default",
+                               /*slice_length=*/1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+        service_->PutEnd(put_client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
     // Create two tasks; both should be assigned to the client owning source
     // segment_0.
-    auto copy_task_id = service_->CreateCopyTask(key, {"segment_1"});
+    auto copy_task_id = service_->CreateCopyTask(key, "default", {"segment_1"});
     ASSERT_TRUE(copy_task_id.has_value());
 
-    auto move_task_id = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    auto move_task_id =
+        service_->CreateMoveTask(key, "default", "segment_0", "segment_1");
     ASSERT_TRUE(move_task_id.has_value());
 
     // Fetch from client_0 should get both tasks (order not guaranteed).
@@ -5228,6 +5401,81 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
     EXPECT_TRUE(fetch0_again->empty());
 }
 
+TEST_F(MasterServiceTest, TenantTasksCarryTenantInPayload) {
+    auto service = std::make_unique<MasterService>();
+    const auto ctx0 = PrepareSimpleSegment(*service, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "tenant_task_key";
+    const std::string tenant_id = "tenant_for_async_task";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(service
+                    ->PutStart(put_client_id, key, tenant_id,
+                               /*slice_length=*/1024, config)
+                    .has_value());
+    ASSERT_TRUE(
+        service->PutEnd(put_client_id, key, tenant_id, ReplicaType::MEMORY)
+            .has_value());
+
+    auto copy_task_id = service->CreateCopyTask(key, tenant_id, {"segment_1"});
+    ASSERT_TRUE(copy_task_id.has_value());
+    auto move_task_id =
+        service->CreateMoveTask(key, tenant_id, "segment_0", "segment_1");
+    ASSERT_TRUE(move_task_id.has_value());
+
+    auto fetched = service->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 2u);
+
+    bool saw_copy = false;
+    bool saw_move = false;
+    for (const auto& assignment : *fetched) {
+        if (assignment.id == copy_task_id.value()) {
+            ReplicaCopyPayload payload;
+            struct_json::from_json(payload, assignment.payload);
+            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.key, key);
+            saw_copy = true;
+        } else if (assignment.id == move_task_id.value()) {
+            ReplicaMovePayload payload;
+            struct_json::from_json(payload, assignment.payload);
+            EXPECT_EQ(payload.tenant_id, tenant_id);
+            EXPECT_EQ(payload.key, key);
+            saw_move = true;
+        }
+    }
+    EXPECT_TRUE(saw_copy);
+    EXPECT_TRUE(saw_move);
+}
+
+TEST_F(MasterServiceTest, LegacyTaskPayloadDefaultsTenant) {
+    ReplicaCopyPayload copy_payload;
+    struct_json::from_json(
+        copy_payload,
+        R"({"key":"legacy_copy_key","source":"segment_0","targets":["segment_1"]})");
+    EXPECT_EQ(copy_payload.tenant_id, "default");
+    EXPECT_EQ(copy_payload.key, "legacy_copy_key");
+    EXPECT_EQ(copy_payload.source, "segment_0");
+    ASSERT_EQ(copy_payload.targets.size(), 1u);
+    EXPECT_EQ(copy_payload.targets[0], "segment_1");
+
+    ReplicaMovePayload move_payload;
+    struct_json::from_json(
+        move_payload,
+        R"({"key":"legacy_move_key","source":"segment_0","target":"segment_1"})");
+    EXPECT_EQ(move_payload.tenant_id, "default");
+    EXPECT_EQ(move_payload.key, "legacy_move_key");
+    EXPECT_EQ(move_payload.source, "segment_0");
+    EXPECT_EQ(move_payload.target, "segment_1");
+}
+
 TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
@@ -5243,15 +5491,18 @@ TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
+    ASSERT_TRUE(service_
+                    ->PutStart(put_client_id, key, "default",
+                               /*slice_length=*/1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+        service_->PutEnd(put_client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
-    auto t1 = service_->CreateCopyTask(key, {"segment_1"});
+    auto t1 = service_->CreateCopyTask(key, "default", {"segment_1"});
     ASSERT_TRUE(t1.has_value());
-    auto t2 = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    auto t2 =
+        service_->CreateMoveTask(key, "default", "segment_0", "segment_1");
     ASSERT_TRUE(t2.has_value());
 
     auto fetch_first = service_->FetchTasks(ctx0.client_id, /*batch_size=*/1);
@@ -5292,14 +5543,16 @@ TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
+    ASSERT_TRUE(service_
+                    ->PutStart(put_client_id, key, "default",
+                               /*slice_length=*/1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+        service_->PutEnd(put_client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
     // Create a task assigned to client owning segment_0.
-    auto task_id_res = service_->CreateCopyTask(key, {"segment_1"});
+    auto task_id_res = service_->CreateCopyTask(key, "default", {"segment_1"});
     ASSERT_TRUE(task_id_res.has_value());
     const UUID task_id = task_id_res.value();
 
@@ -5348,13 +5601,16 @@ TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
     config.replica_num = 1;
     config.preferred_segment = "segment_0";
 
+    ASSERT_TRUE(service_
+                    ->PutStart(put_client_id, key, "default",
+                               /*slice_length=*/1024, config)
+                    .has_value());
     ASSERT_TRUE(
-        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+        service_->PutEnd(put_client_id, key, "default", ReplicaType::MEMORY)
             .has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
-    auto task_id_res = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    auto task_id_res =
+        service_->CreateMoveTask(key, "default", "segment_0", "segment_1");
     ASSERT_TRUE(task_id_res.has_value());
     const UUID task_id = task_id_res.value();
 
@@ -5418,7 +5674,7 @@ TEST_F(MasterServiceTest,
     config.preferred_segment = "segment_0";
 
     auto put_result = service_->PutStart(
-        ctx0.client_id, "drain_skip_allocation_key", 1024, config);
+        ctx0.client_id, "drain_skip_allocation_key", "default", 1024, config);
     ASSERT_TRUE(put_result.has_value());
     ASSERT_EQ(put_result->size(), 1u);
     EXPECT_EQ(put_result->front()
@@ -5427,7 +5683,7 @@ TEST_F(MasterServiceTest,
               "segment_1");
     ASSERT_TRUE(service_
                     ->PutEnd(ctx0.client_id, "drain_skip_allocation_key",
-                             ReplicaType::MEMORY)
+                             "default", ReplicaType::MEMORY)
                     .has_value());
 }
 
@@ -5471,7 +5727,7 @@ TEST_F(MasterServiceTest, DrainJobSchedulesMoveTaskAndConvergesToDrained) {
     ASSERT_TRUE(segment_status.has_value());
     EXPECT_EQ(segment_status.value(), SegmentStatus::DRAINED);
 
-    auto replicas = service_->GetReplicaList(key);
+    auto replicas = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(replicas.has_value());
     std::unordered_set<std::string> segment_names;
     for (const auto& replica : replicas->replicas) {
@@ -5603,27 +5859,28 @@ TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
-    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end_result =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
 
     // Verify object exists
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     ASSERT_TRUE(exist_result.value());
 
     // Normal remove should fail because object has active lease
-    auto remove_result_no_force = service_->Remove(key, false);
+    auto remove_result_no_force = service_->Remove(key, "default", false);
     EXPECT_FALSE(remove_result_no_force.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result_no_force.error());
 
     // Force remove should succeed even with active lease
-    auto remove_result_force = service_->Remove(key, true);
+    auto remove_result_force = service_->Remove(key, "default", true);
     EXPECT_TRUE(remove_result_force.has_value());
 
     // Verify object is removed
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
@@ -5646,13 +5903,13 @@ TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         // Grant lease by reading the object
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_TRUE(exist_result.value());
     }
@@ -5660,28 +5917,28 @@ TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
     // Normal RemoveByRegex should remove 0 because all objects have active
     // leases
     auto remove_result_no_force =
-        service_->RemoveByRegex("^force_regex_key_", false);
+        service_->RemoveByRegex("^force_regex_key_", "default", false);
     ASSERT_TRUE(remove_result_no_force.has_value());
     EXPECT_EQ(0, remove_result_no_force.value());
 
     // All objects should still exist
     for (int i = 0; i < 5; ++i) {
         std::string key = "force_regex_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_TRUE(exist_result.value());
     }
 
     // Force RemoveByRegex should remove all 5 objects
     auto remove_result_force =
-        service_->RemoveByRegex("^force_regex_key_", true);
+        service_->RemoveByRegex("^force_regex_key_", "default", true);
     ASSERT_TRUE(remove_result_force.has_value());
     EXPECT_EQ(5, remove_result_force.value());
 
     // All objects should be removed
     for (int i = 0; i < 5; ++i) {
         std::string key = "force_regex_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value());
     }
@@ -5705,13 +5962,13 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_length, config);
+            service_->PutStart(client_id, key, "default", slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         ASSERT_TRUE(put_end_result.has_value());
         // Grant lease by reading the object
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_TRUE(exist_result.value());
     }
@@ -5722,7 +5979,7 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
     // All objects should still exist
     for (int i = 0; i < 10; ++i) {
         std::string key = "force_all_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_TRUE(exist_result.value());
     }
@@ -5733,7 +5990,7 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
     // All objects should be removed
     for (int i = 0; i < 10; ++i) {
         std::string key = "force_all_key_" + std::to_string(i);
-        auto exist_result = service_->ExistKey(key);
+        auto exist_result = service_->ExistKey(key, "default");
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value());
     }
@@ -5752,23 +6009,24 @@ TEST_F(MasterServiceTest, UpsertNewKey) {
     config.replica_num = 1;
 
     auto upsert_result =
-        service_->UpsertStart(client_id, key, slice_length, config);
+        service_->UpsertStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
     auto replicas = upsert_result.value();
     EXPECT_EQ(1, replicas.size());
     EXPECT_EQ(ReplicaStatus::PROCESSING, replicas[0].status);
 
     // During upsert, GetReplicaList should return not ready
-    auto get_result = service_->GetReplicaList(key);
+    auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_result.error());
 
     // UpsertEnd completes the operation
-    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    auto end_result =
+        service_->UpsertEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(end_result.has_value());
 
     // Verify replica is COMPLETE
-    auto final_result = service_->GetReplicaList(key);
+    auto final_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(1, final_result.value().replicas.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
@@ -5786,16 +6044,18 @@ TEST_F(MasterServiceTest, UpsertSameSize) {
     config.replica_num = 1;
 
     // First: PutStart + PutEnd to create the object
-    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    auto put_result =
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
     auto original_replicas = put_result.value();
-    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // UpsertStart with same size — should reuse buffers
     const UUID new_client_id = generate_uuid();
-    auto upsert_result =
-        service_->UpsertStart(new_client_id, key, slice_length, config);
+    auto upsert_result = service_->UpsertStart(new_client_id, key, "default",
+                                               slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
     auto upsert_replicas = upsert_result.value();
     EXPECT_EQ(1, upsert_replicas.size());
@@ -5811,11 +6071,11 @@ TEST_F(MasterServiceTest, UpsertSameSize) {
 
     // UpsertEnd with the new client_id
     auto end_result =
-        service_->UpsertEnd(new_client_id, key, ReplicaType::MEMORY);
+        service_->UpsertEnd(new_client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(end_result.has_value());
 
     // Verify replica is COMPLETE again
-    auto final_result = service_->GetReplicaList(key);
+    auto final_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
 }
@@ -5834,23 +6094,26 @@ TEST_F(MasterServiceTest, UpsertSameSizeRefreshesMetadata) {
 
     // Create object with client_a
     auto put_result =
-        service_->PutStart(client_id_a, key, slice_length, config);
+        service_->PutStart(client_id_a, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id_a, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id_a, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // UpsertStart with client_b
-    auto upsert_result =
-        service_->UpsertStart(client_id_b, key, slice_length, config);
+    auto upsert_result = service_->UpsertStart(client_id_b, key, "default",
+                                               slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
 
     // UpsertEnd with client_a should fail (client_id was refreshed to client_b)
-    auto end_fail = service_->UpsertEnd(client_id_a, key, ReplicaType::MEMORY);
+    auto end_fail =
+        service_->UpsertEnd(client_id_a, key, "default", ReplicaType::MEMORY);
     EXPECT_FALSE(end_fail.has_value());
     EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, end_fail.error());
 
     // UpsertEnd with client_b should succeed
-    auto end_ok = service_->UpsertEnd(client_id_b, key, ReplicaType::MEMORY);
+    auto end_ok =
+        service_->UpsertEnd(client_id_b, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(end_ok.has_value());
 }
 
@@ -5867,15 +6130,17 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
     config.replica_num = 1;
 
     // Create object with original_size
-    auto put_result = service_->PutStart(client_id, key, original_size, config);
+    auto put_result =
+        service_->PutStart(client_id, key, "default", original_size, config);
     ASSERT_TRUE(put_result.has_value());
     auto original_replicas = put_result.value();
-    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // UpsertStart with different size
     auto upsert_result =
-        service_->UpsertStart(client_id, key, new_size, config);
+        service_->UpsertStart(client_id, key, "default", new_size, config);
     ASSERT_TRUE(upsert_result.has_value());
     auto new_replicas = upsert_result.value();
     EXPECT_EQ(1, new_replicas.size());
@@ -5890,11 +6155,12 @@ TEST_F(MasterServiceTest, UpsertDifferentSize) {
                   .buffer_descriptor.buffer_address_);
 
     // UpsertEnd
-    auto end_result = service_->UpsertEnd(client_id, key, ReplicaType::MEMORY);
+    auto end_result =
+        service_->UpsertEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(end_result.has_value());
 
     // Verify the object is complete
-    auto final_result = service_->GetReplicaList(key);
+    auto final_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
 }
@@ -5920,19 +6186,21 @@ TEST_F(MasterServiceTest, UpsertConflictReplicationTask) {
     config.preferred_segment = "segment_1";
 
     // Create object
-    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    auto put_result =
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // Start a Copy
-    auto copy_result =
-        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    auto copy_result = service_->CopyStart(client_id, key, "default",
+                                           "segment_1", {"segment_2"});
     ASSERT_TRUE(copy_result.has_value());
 
     // UpsertStart should fail with OBJECT_HAS_REPLICATION_TASK
     auto upsert_result =
-        service_->UpsertStart(client_id, key, slice_length, config);
+        service_->UpsertStart(client_id, key, "default", slice_length, config);
     EXPECT_FALSE(upsert_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, upsert_result.error());
 }
@@ -5951,27 +6219,30 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressPut) {
     config.replica_num = 1;
 
     // Client A starts a Put but doesn't finish
-    auto put_result = service_->PutStart(client_a, key, slice_length, config);
+    auto put_result =
+        service_->PutStart(client_a, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
 
     // Client B upserts the same key — should preempt client A
     auto upsert_result =
-        service_->UpsertStart(client_b, key, slice_length, config);
+        service_->UpsertStart(client_b, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
     auto upsert_replicas = upsert_result.value();
     EXPECT_EQ(1, upsert_replicas.size());
     EXPECT_EQ(ReplicaStatus::PROCESSING, upsert_replicas[0].status);
 
     // Client A's PutEnd should fail
-    auto put_end_a = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
+    auto put_end_a =
+        service_->PutEnd(client_a, key, "default", ReplicaType::MEMORY);
     EXPECT_FALSE(put_end_a.has_value());
 
     // Client B's UpsertEnd should succeed
-    auto upsert_end = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    auto upsert_end =
+        service_->UpsertEnd(client_b, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(upsert_end.has_value());
 
     // Verify final state
-    auto final_result = service_->GetReplicaList(key);
+    auto final_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
 }
@@ -5989,16 +6260,16 @@ TEST_F(MasterServiceTest, UpsertRevoke) {
 
     // UpsertStart (Case A — new key)
     auto upsert_result =
-        service_->UpsertStart(client_id, key, slice_length, config);
+        service_->UpsertStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
 
     // UpsertRevoke
     auto revoke_result =
-        service_->UpsertRevoke(client_id, key, ReplicaType::MEMORY);
+        service_->UpsertRevoke(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(revoke_result.has_value());
 
     // Key should be gone
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     EXPECT_FALSE(exist_result.value());
 }
@@ -6015,24 +6286,26 @@ TEST_F(MasterServiceTest, UpsertInPlaceThenRevoke) {
     config.replica_num = 1;
 
     // Create object first
-    auto put_result = service_->PutStart(client_id, key, slice_length, config);
+    auto put_result =
+        service_->PutStart(client_id, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // UpsertStart in-place (same size)
     const UUID new_client = generate_uuid();
     auto upsert_result =
-        service_->UpsertStart(new_client, key, slice_length, config);
+        service_->UpsertStart(new_client, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_result.has_value());
 
     // UpsertRevoke — replicas are PROCESSING, should be erased
     auto revoke_result =
-        service_->UpsertRevoke(new_client, key, ReplicaType::MEMORY);
+        service_->UpsertRevoke(new_client, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(revoke_result.has_value());
 
     // Key should be gone (no valid replicas left)
-    auto exist_result = service_->ExistKey(key);
+    auto exist_result = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value());
     EXPECT_FALSE(exist_result.value());
 }
@@ -6047,23 +6320,25 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     config.replica_num = 1;
 
     // Create key_1 with size 1024
-    auto put_result = service_->PutStart(client_id, "key_1", 1024, config);
+    auto put_result =
+        service_->PutStart(client_id, "key_1", "default", 1024, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, "key_1", ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, "key_1", "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // BatchUpsertStart: key_1 (same size), key_2 (new)
     std::vector<std::string> keys = {"key_1", "key_2"};
     std::vector<uint64_t> slice_lengths = {1024, 2048};
 
-    auto results =
-        service_->BatchUpsertStart(client_id, keys, slice_lengths, config);
+    auto results = service_->BatchUpsertStart(client_id, keys, "default",
+                                              slice_lengths, config);
     ASSERT_EQ(2, results.size());
     EXPECT_TRUE(results[0].has_value());  // key_1: Case B (in-place)
     EXPECT_TRUE(results[1].has_value());  // key_2: Case A (new)
 
     // Complete both
-    auto end_results = service_->BatchUpsertEnd(client_id, keys);
+    auto end_results = service_->BatchUpsertEnd(client_id, keys, "default");
     ASSERT_EQ(2, end_results.size());
     EXPECT_TRUE(end_results[0].has_value());
     EXPECT_TRUE(end_results[1].has_value());
@@ -6085,36 +6360,42 @@ TEST_F(MasterServiceTest, UpsertPreemptsInProgressUpsert) {
     config.replica_num = 1;
 
     // Step 1: Create the object via Put
-    auto put_result = service_->PutStart(client_a, key, slice_length, config);
+    auto put_result =
+        service_->PutStart(client_a, key, "default", slice_length, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_a, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_a, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // Step 2: Client B starts in-place upsert (Case B) — marks COMPLETE →
     // PROCESSING
-    auto upsert_b = service_->UpsertStart(client_b, key, slice_length, config);
+    auto upsert_b =
+        service_->UpsertStart(client_b, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_b.has_value());
 
     // Key should be unreadable now (all replicas are PROCESSING)
-    auto get_mid = service_->GetReplicaList(key);
+    auto get_mid = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_mid.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_mid.error());
 
     // Step 3: Client C upserts the same key — preempts Client B
-    auto upsert_c = service_->UpsertStart(client_c, key, slice_length, config);
+    auto upsert_c =
+        service_->UpsertStart(client_c, key, "default", slice_length, config);
     ASSERT_TRUE(upsert_c.has_value());
     EXPECT_EQ(1, upsert_c.value().size());
 
     // Step 4: Client B's UpsertEnd should fail (preempted)
-    auto end_b = service_->UpsertEnd(client_b, key, ReplicaType::MEMORY);
+    auto end_b =
+        service_->UpsertEnd(client_b, key, "default", ReplicaType::MEMORY);
     EXPECT_FALSE(end_b.has_value());
 
     // Step 5: Client C's UpsertEnd should succeed
-    auto end_c = service_->UpsertEnd(client_c, key, ReplicaType::MEMORY);
+    auto end_c =
+        service_->UpsertEnd(client_c, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(end_c.has_value());
 
     // Final verification
-    auto final_result = service_->GetReplicaList(key);
+    auto final_result = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(final_result.has_value());
     EXPECT_EQ(1, final_result.value().replicas.size());
     EXPECT_EQ(ReplicaStatus::COMPLETE, final_result.value().replicas[0].status);
@@ -6135,29 +6416,31 @@ TEST_F(MasterServiceTest, UpsertDifferentSizeThenRevoke) {
     config.replica_num = 1;
 
     // Create object with original size
-    auto put_result = service_->PutStart(client_id, key, original_size, config);
+    auto put_result =
+        service_->PutStart(client_id, key, "default", original_size, config);
     ASSERT_TRUE(put_result.has_value());
-    auto put_end = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    auto put_end =
+        service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
     // Verify the key exists
-    auto exist_before = service_->ExistKey(key);
+    auto exist_before = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_before.has_value());
     EXPECT_TRUE(exist_before.value());
 
     // UpsertStart with different size (Case C) — old replicas discarded,
     // new replicas allocated
     auto upsert_result =
-        service_->UpsertStart(client_id, key, new_size, config);
+        service_->UpsertStart(client_id, key, "default", new_size, config);
     ASSERT_TRUE(upsert_result.has_value());
 
     // Revoke — erase the newly allocated PROCESSING replicas
     auto revoke_result =
-        service_->UpsertRevoke(client_id, key, ReplicaType::MEMORY);
+        service_->UpsertRevoke(client_id, key, "default", ReplicaType::MEMORY);
     ASSERT_TRUE(revoke_result.has_value());
 
     // Key should be gone (old replicas in discarded, new replicas erased)
-    auto exist_after = service_->ExistKey(key);
+    auto exist_after = service_->ExistKey(key, "default");
     ASSERT_TRUE(exist_after.has_value());
     EXPECT_FALSE(exist_after.value());
 }
@@ -6185,12 +6468,13 @@ TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_hard_pin = true;
-        auto result =
-            service_->PutStart(client_id, "pinned_model", value_size, config);
+        auto result = service_->PutStart(client_id, "pinned_model", "default",
+                                         value_size, config);
         ASSERT_TRUE(result.has_value());
-        ASSERT_TRUE(
-            service_->PutEnd(client_id, "pinned_model", ReplicaType::MEMORY)
-                .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, "pinned_model", "default",
+                                 ReplicaType::MEMORY)
+                        .has_value());
     }
 
     // Fill remaining space with normal objects to trigger eviction
@@ -6198,9 +6482,10 @@ TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
         std::string key = "filler_" + std::to_string(i);
         ReplicateConfig config;
         config.replica_num = 1;
-        auto result = service_->PutStart(client_id, key, value_size, config);
+        auto result =
+            service_->PutStart(client_id, key, "default", value_size, config);
         if (result.has_value()) {
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         }
     }
 
@@ -6208,14 +6493,15 @@ TEST_F(MasterServiceTest, HardPinObjectNotEvicted) {
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
 
     // Hard-pinned object must still be there
-    auto get_result = service_->GetReplicaList("pinned_model");
+    auto get_result = service_->GetReplicaList("pinned_model", "default");
     ASSERT_TRUE(get_result.has_value())
         << "Hard-pinned object was evicted, but it should never be";
 
     // Explicit Remove should still work on hard-pinned objects
-    auto remove_result = service_->Remove("pinned_model", /*force=*/true);
+    auto remove_result =
+        service_->Remove("pinned_model", "default", /*force=*/true);
     ASSERT_TRUE(remove_result.has_value());
-    auto exist_result = service_->ExistKey("pinned_model");
+    auto exist_result = service_->ExistKey("pinned_model", "default");
     ASSERT_TRUE(exist_result.has_value());
     ASSERT_FALSE(exist_result.value());
 
@@ -6249,12 +6535,14 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_hard_pin = true;
-        ASSERT_TRUE(
-            service_->PutStart(client_id, "hard_pinned", value_size, config)
-                .has_value());
-        ASSERT_TRUE(
-            service_->PutEnd(client_id, "hard_pinned", ReplicaType::MEMORY)
-                .has_value());
+        ASSERT_TRUE(service_
+                        ->PutStart(client_id, "hard_pinned", "default",
+                                   value_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, "hard_pinned", "default",
+                                 ReplicaType::MEMORY)
+                        .has_value());
     }
 
     // Put a soft-pinned object
@@ -6262,12 +6550,14 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        ASSERT_TRUE(
-            service_->PutStart(client_id, "soft_pinned", value_size, config)
-                .has_value());
-        ASSERT_TRUE(
-            service_->PutEnd(client_id, "soft_pinned", ReplicaType::MEMORY)
-                .has_value());
+        ASSERT_TRUE(service_
+                        ->PutStart(client_id, "soft_pinned", "default",
+                                   value_size, config)
+                        .has_value());
+        ASSERT_TRUE(service_
+                        ->PutEnd(client_id, "soft_pinned", "default",
+                                 ReplicaType::MEMORY)
+                        .has_value());
     }
 
     // Fill the rest
@@ -6275,9 +6565,10 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
         std::string key = "normal_" + std::to_string(i);
         ReplicateConfig config;
         config.replica_num = 1;
-        auto result = service_->PutStart(client_id, key, value_size, config);
+        auto result =
+            service_->PutStart(client_id, key, "default", value_size, config);
         if (result.has_value()) {
-            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY);
         }
     }
 
@@ -6285,7 +6576,7 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 500));
 
     // Hard-pinned always survives
-    ASSERT_TRUE(service_->GetReplicaList("hard_pinned").has_value())
+    ASSERT_TRUE(service_->GetReplicaList("hard_pinned", "default").has_value())
         << "Hard-pinned object was evicted";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
@@ -6308,22 +6599,27 @@ TEST_F(MasterServiceTest, HardPinDefaultIsFalse) {
     ReplicateConfig config;
     config.replica_num = 1;
     ASSERT_TRUE(
-        service_->PutStart(client_id, "normal_key", 1024, config).has_value());
-    ASSERT_TRUE(service_->PutEnd(client_id, "normal_key", ReplicaType::MEMORY)
-                    .has_value());
+        service_->PutStart(client_id, "normal_key", "default", 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_
+            ->PutEnd(client_id, "normal_key", "default", ReplicaType::MEMORY)
+            .has_value());
 
     // Put with hard_pin
     ReplicateConfig hp_config;
     hp_config.replica_num = 1;
     hp_config.with_hard_pin = true;
     ASSERT_TRUE(
-        service_->PutStart(client_id, "hp_key", 1024, hp_config).has_value());
+        service_->PutStart(client_id, "hp_key", "default", 1024, hp_config)
+            .has_value());
     ASSERT_TRUE(
-        service_->PutEnd(client_id, "hp_key", ReplicaType::MEMORY).has_value());
+        service_->PutEnd(client_id, "hp_key", "default", ReplicaType::MEMORY)
+            .has_value());
 
     // Both should exist
-    ASSERT_TRUE(service_->GetReplicaList("normal_key").has_value());
-    ASSERT_TRUE(service_->GetReplicaList("hp_key").has_value());
+    ASSERT_TRUE(service_->GetReplicaList("normal_key", "default").has_value());
+    ASSERT_TRUE(service_->GetReplicaList("hp_key", "default").has_value());
 
     service_->RemoveAll();
 }
@@ -6511,10 +6807,11 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
     config.replica_num = 1;
     config.preferred_segment = segment1.name;
 
-    auto put_start = service_->PutStart(client_id, key, 1024, config);
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, config);
     ASSERT_TRUE(put_start.has_value());
-    ASSERT_TRUE(
-        service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
 
     // Graceful unmount segment1
     ASSERT_TRUE(service_->GracefulUnmountSegment(segment1.id, client_id, 1000)
@@ -6527,7 +6824,7 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
 
     // Existing replicas on the graceful segment should remain readable during
     // the grace window.
-    auto existing_replicas = service_->GetReplicaList(key);
+    auto existing_replicas = service_->GetReplicaList(key, "default");
     ASSERT_TRUE(existing_replicas.has_value());
     ASSERT_EQ(existing_replicas->replicas.size(), 1u);
     EXPECT_EQ(existing_replicas->replicas[0]
@@ -6545,7 +6842,8 @@ TEST_F(MasterServiceTest, GracefulUnmountSegment_PreventAllocation) {
     ReplicateConfig config2;
     config2.replica_num = 1;
 
-    auto put_start2 = service_->PutStart(client_id, key2, 1024, config2);
+    auto put_start2 =
+        service_->PutStart(client_id, key2, "default", 1024, config2);
     ASSERT_TRUE(put_start2.has_value());
     auto replicas = put_start2.value();
     ASSERT_EQ(replicas.size(), 1u);

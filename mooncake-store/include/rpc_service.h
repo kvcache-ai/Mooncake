@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <string>
 #include <boost/functional/hash.hpp>
 #include <cstdint>
@@ -178,35 +179,41 @@ class WrappedMasterService {
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
 
+    tl::expected<std::vector<MasterService::SegmentDetailInfo>, ErrorCode>
+    GetSegmentsDetailForAdmin();
+
     tl::expected<std::pair<uint64_t, uint64_t>, ErrorCode> QuerySegmentForAdmin(
         const std::string& segment);
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
-    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     // Promotion-on-hit RPCs.
-    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const UUID& client_id, const std::string& key, uint64_t size,
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
         const std::vector<std::string>& preferred_segments);
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
-        const UUID& client_id, const std::string& key);
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
-        const UUID& client_id, const std::string& key);
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
@@ -220,9 +227,11 @@ class WrappedMasterService {
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
     tl::expected<UUID, ErrorCode> CreateCopyTask(
-        const std::string& key, const std::vector<std::string>& targets);
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
 
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& tenant_id,
                                                  const std::string& source,
                                                  const std::string& target);
 
@@ -236,32 +245,38 @@ class WrappedMasterService {
 
     tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment,
+        const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
-                                          const std::string& key);
+                                          const std::string& key,
+                                          const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
-                                             const std::string& key);
+                                             const std::string& key,
+                                             const std::string& tenant_id);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
-        const std::string& src_segment, const std::string& tgt_segment);
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::string& tgt_segment);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
-                                          const std::string& key);
+                                          const std::string& key,
+                                          const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
-                                             const std::string& key);
+                                             const std::string& key,
+                                             const std::string& tenant_id);
 
     tl::expected<void, ErrorCode> EvictDiskReplica(const UUID& client_id,
                                                    const std::string& key,
+                                                   const std::string& tenant_id,
                                                    ReplicaType replica_type);
 
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
-        ReplicaType replica_type);
+        const std::string& tenant_id, ReplicaType replica_type);
 
    private:
     MasterService master_service_;
@@ -312,6 +327,7 @@ class MasterAdminServer {
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
+    std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};

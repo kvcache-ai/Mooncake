@@ -17,6 +17,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
+#include "tent/runtime/transport_selector.h"
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -210,6 +211,8 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
+    transport_hint_ = TransportSelector::parseTransportType(
+        XferBenchConfig::tent_transport_hint);
     allocateBuffers();
 }
 
@@ -367,6 +370,7 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
+        entry.transport_hint = transport_hint_;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

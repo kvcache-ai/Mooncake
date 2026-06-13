@@ -39,11 +39,10 @@ setup(
                 "src/ep_py.cpp",
                 "src/mooncake_ep_buffer.cpp",
                 "src/mooncake_ep_kernel.cu",
-                "src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0", "-DUSE_CUDA"],
+                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0", "-DUSE_CUDA"],
             },
             libraries=cuda_libraries,
             library_dirs=cuda_library_dirs,

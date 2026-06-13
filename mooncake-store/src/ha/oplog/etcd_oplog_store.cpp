@@ -38,8 +38,10 @@ ErrorCode EtcdOpLogStore::Init() {
     // This avoids "key not found" errors when querying the latest sequence ID.
     // Important: Only initialize if the key doesn't exist to avoid overwriting
     // existing data.
-    // Skip for read-only instances to avoid unnecessary etcd writes.
-    if (enable_batch_write_ && !cluster_id_.empty()) {
+    // Note: We allow any instance (reader or writer) to ensure the key exists,
+    // because snapshot resolution depends on it regardless of the HA role.
+    // The Create call uses CAS semantics so concurrent initializers are safe.
+    if (!cluster_id_.empty()) {
         std::string latest_key = BuildLatestKey();
         std::string existing_value;
         EtcdRevisionId revision_id;

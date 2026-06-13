@@ -47,7 +47,7 @@ class EPException : public std::exception {
         if (not(cond)) {                                                 \
             printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
                    __LINE__, #cond);                                     \
-            asm("trap;");                                                \
+            __trap();                                                    \
         }                                                                \
     } while (0)
 #endif

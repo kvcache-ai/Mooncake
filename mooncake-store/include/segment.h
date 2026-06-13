@@ -86,14 +86,14 @@ struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
-    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-        offloading_objects;
+    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
+        offloading_mutex_) offloading_objects;
     // Promotion-on-hit pending work for this client. Populated by master's
     // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
     // client. Drained by PromotionObjectHeartbeat. Same locking as
     // offloading_objects (offloading_mutex_).
-    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-        promotion_objects;
+    std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
+        offloading_mutex_) promotion_objects;
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 

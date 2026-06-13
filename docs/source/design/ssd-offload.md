@@ -6,6 +6,8 @@ Mooncake Store supports offloading KV cache objects from distributed memory to l
 
 SSD offload is implemented as a background subsystem within the **real client** process. It is transparent to the application: a `Put` that would otherwise be evicted from memory is persisted to disk, and a `Get` that finds no memory replica automatically falls back to reading from SSD.
 
+For multi-turn conversation benchmark results, see [Mooncake SSD Offload Benchmark](../performance/ssd-offload-benchmark-results.md).
+
 ---
 
 ## Architecture

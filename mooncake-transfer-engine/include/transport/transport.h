@@ -35,6 +35,8 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -64,6 +66,8 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
     };
 
     enum TransferStatusEnum {
@@ -124,6 +128,7 @@ class Transport {
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
                 uint64_t dest_addr;

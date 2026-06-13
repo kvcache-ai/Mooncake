@@ -57,14 +57,22 @@ void HttpMetadataServer::init_server() {
             std::string body(req.get_body());
             {
                 std::lock_guard<std::mutex> lock(store_mutex_);
-                if (key.find("rpc_meta") != std::string::npos &&
-                    store_.find(std::string(key)) != store_.end()) {
-                    resp.set_status_and_content(
-                        status_type::bad_request,
-                        "Duplicate rpc_meta key not allowed");
-                    return;
+                std::string key_str(key);
+                if (key_str.find("rpc_meta") != std::string::npos) {
+                    auto it = store_.find(key_str);
+                    if (it != store_.end()) {
+                        if (it->second == body) {
+                            resp.set_status_and_content(status_type::ok,
+                                                        "metadata unchanged");
+                            return;
+                        }
+                        resp.set_status_and_content(
+                            status_type::bad_request,
+                            "Duplicate rpc_meta key not allowed");
+                        return;
+                    }
                 }
-                store_[std::string(key)] = body;
+                store_[std::move(key_str)] = body;
             }
 
             resp.set_status_and_content(status_type::ok, "metadata updated");
