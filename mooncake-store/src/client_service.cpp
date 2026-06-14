@@ -393,7 +393,15 @@ Client::~Client() {
 static std::optional<bool> get_auto_discover() {
     const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
     if (ev_ad) {
-        int iv = std::stoi(ev_ad);
+        char* end = nullptr;
+        errno = 0;
+        long iv = std::strtol(ev_ad, &end, 10);
+        if (errno != 0 || end == ev_ad || *end != '\0') {
+            LOG(WARNING)
+                << "invalid MC_MS_AUTO_DISC value: " << ev_ad
+                << ", should be 0 or 1, using default: auto discovery not set";
+            return std::nullopt;
+        }
         if (iv == 1) {
             LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
             return true;
@@ -2668,8 +2676,8 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
+        int rc = transfer_engine_->registerLocalMemory(
+            const_cast<void*>(buffer), size, location, true, true);
         if (rc != 0) {
             LOG(ERROR) << "register_local_memory_failed base=" << buffer
                        << " size=" << size << ", error=" << rc;
