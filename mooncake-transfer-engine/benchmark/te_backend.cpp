@@ -291,7 +291,7 @@ void TEBenchRunner::pinThread(int thread_id) {
             (thread_id % static_cast<int>(pinned_buffer_list_.size()));
         auto err = cudaSetDevice(device_id);
         LOG_ASSERT(err == cudaSuccess)
-            << "tangSetDevice failed before getMemoryLocation: "
+            << "cudaSetDevice failed before getMemoryLocation: "
             << cudaGetErrorString(err) << " device_id=" << device_id;
     }
 #endif

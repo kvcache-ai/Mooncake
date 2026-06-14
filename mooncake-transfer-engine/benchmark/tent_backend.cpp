@@ -315,7 +315,7 @@ void TENTBenchRunner::pinThread(int thread_id) {
             (thread_id % static_cast<int>(pinned_buffer_list_.size()));
         auto err = cudaSetDevice(device_id);
         LOG_ASSERT(err == cudaSuccess)
-            << "tangSetDevice failed before getLocation: "
+            << "cudaSetDevice failed before getLocation: "
             << cudaGetErrorString(err) << " device_id=" << device_id;
         bindToSocket(getGpuDeviceNumaID(device_id));
         return;
