@@ -13,6 +13,7 @@
 
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/standby_controller.h"
+#include "master_admin_service.h"
 #include "rpc_service.h"
 
 namespace mooncake {
