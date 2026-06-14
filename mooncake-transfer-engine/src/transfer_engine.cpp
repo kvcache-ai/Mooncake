@@ -393,7 +393,8 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     if (use_tent_) {
-        auto status = impl_tent_->unregisterLocalMemory(addr);
+        auto status =
+            impl_tent_->unregisterLocalMemory(addr, 0, update_metadata);
         return (int)status.code();
     } else
         return impl_->unregisterLocalMemory(addr, update_metadata);
