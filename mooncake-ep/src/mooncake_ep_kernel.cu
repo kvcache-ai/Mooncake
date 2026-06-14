@@ -200,84 +200,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
-        if (all_ranks_p2p) {
-            // Fast path for all-P2P ranks: copy directly from x to each
-            // peer receive slot.  The original path first stages the full token
-            // into rdma_send_data_buffer with all 31 data warps and then uses a
-            // CTA barrier before each top-k warp copies the staged payload.  In
-            // P2P mode the staging buffer is unnecessary; each top-k warp can
-            // write its destination row directly and avoid the per-token
-            // __syncthreads() hot spot.
-            //
-            // For FP8 this intentionally duplicates BF16->FP8 conversion per
-            // top-k destination.  That may or may not beat staging; keep this
-            // path guarded by all-P2P so correctness falls back to the original
-            // staged path for IBGDA/RDMA.
-            const int direct_tokens_per_cta =
-                    (num_topk > 0 && num_topk * 3 <= num_warps - 1) ? 3 :
-                    ((num_topk > 0 && num_topk * 2 <= num_warps - 1) ? 2 : 1);
-            const int direct_token_group = num_topk > 0 ? warp_id / num_topk : 0;
-            const int direct_topk_idx = warp_id - direct_token_group * num_topk;
-            for (int token_idx = sm_id + direct_token_group * num_sms;
-                 direct_token_group < direct_tokens_per_cta && token_idx < num_tokens;
-                 token_idx += num_sms * direct_tokens_per_cta) {
-                const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
-                auto dst_expert_idx = static_cast<int>(__ldg(topk_idx + token_idx * num_topk + direct_topk_idx));
-                if (dst_expert_idx >= 0) {
-                    int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                    slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
-                    const auto dst_rank = dst_expert_idx / num_local_experts;
-                    const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
-                    const auto dst_ptr = reinterpret_cast<void*>(
-                        reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
-                        dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
-                        rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
-                        slot_idx * num_bytes_per_msg);
-                    void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
-                    EP_DEVICE_ASSERT(write_dst != nullptr);
-
-                    auto* dst_src_idx = reinterpret_cast<int*>(write_dst);
-                    if (lane_id == 0)
-                        dst_src_idx[0] = token_idx;
-
-                    if (kUseFP8) {
-                        auto dst_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(write_dst) + sizeof(int4));
-                        auto dst_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(dst_vec) + hidden_bytes);
-                        for (int i = lane_id; i < hidden_bf16_int4; i += 32) {
-                            auto int4_value = __ldg(x_int4 + i);
-                            auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
-                            float fp32_values[kNumElemsPerRead];
-                            float amax = kFP8Margin, scale, scale_inv;
-                            #pragma unroll
-                            for (int j = 0; j < kNumElemsPerRead; ++j) {
-                                fp32_values[j] = __bfloat162float(bf16_values[j]);
-                                amax = fmaxf(amax, fabsf(fp32_values[j]));
-                            }
-
-                            EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-                            amax = half_warp_reduce_max(amax), scale = kFP8Amax / amax, scale_inv = amax * kFP8AmaxInv;
-                            if (lane_id == 0 or lane_id == 16)
-                                dst_scales[i * kNumElemsPerRead / 128] = scale_inv;
-
-                            vec_t int2_value;
-                            auto fp8x2_values = reinterpret_cast<ep_fp8x2_storage_t*>(&int2_value);
-                            #pragma unroll
-                            for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                                float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
-                                fp8x2_values[j / 2] = ep_cvt_float2_to_fp8x2(fp32x2);
-                            }
-                            dst_vec[i] = int2_value;
-                        }
-                    } else {
-                        const auto dst_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(write_dst) + sizeof(int4));
-                        UNROLLED_WARP_COPY(8, lane_id, hidden_bf16_int4, dst_data, x_int4, mc_ld_nc, mc_st_na);
-                    }
-                    mc_fence();
-                    __syncwarp();
-                    lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
-                }
-            }
-        } else {
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = reinterpret_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(rdma_send_data_buffer) + token_idx * num_bytes_per_msg);
@@ -346,7 +268,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                     mc_fence();
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
+                    if (all_ranks_p2p) {
+                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_plain_int4, mc_st_plain_int4);
+                    } else {
+                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
+                    }
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
@@ -359,16 +285,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-        }
     } else if (warp_id == num_warps - 1) {
 #ifdef MOONCAKE_EP_USE_MUSA
-        // Participate in __syncthreads() barriers from warps 0-30.
+        // Participate in __syncthreads() barriers from data warps.
         // Each token iteration in the send loop above calls
-        // __syncthreads() once; warp 31 must match.
-        if (not all_ranks_p2p) {
-            for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
-                __syncthreads();
-            }
+        // __syncthreads() once; the count warp must match.
+        for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+            __syncthreads();
         }
 #endif
         EP_DEVICE_ASSERT(num_sms > 1);
