@@ -4,6 +4,8 @@
 #pragma once
 
 #include <chrono>
+#include <mutex>
+#include <queue>
 #include <thread>
 #include <algorithm>
 #include <cstdint>
@@ -181,6 +183,43 @@ class BackoffWaiter {
     uint32_t yield_count_{0};
     std::chrono::microseconds current_sleep_;
 };
+
+template <typename T>
+class ThreadSafeQueue {
+   public:
+    ThreadSafeQueue() = default;
+
+    void enqueue(T item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(std::move(item));
+    }
+
+    bool try_dequeue(T& item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return false;
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::queue<T> queue_;
+};
+
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
 }  // namespace mooncake
 
 #endif

@@ -1,7 +1,10 @@
+import os
 import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
+from mooncake import pg
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -123,6 +126,69 @@ def _multiple_senders_worker(
     ctx.record_result({"value": value})
 
 
+BROKEN_RANK = 1
+
+
+def _p2p_fault_detection_worker(
+    ctx: MooncakePGWorkerContext,
+    broken_exited,
+) -> None:
+    """P2P fault tolerance: 2 rounds of all-to-all.
+    Round 1: all healthy -> failedRanks = 0s.
+    Round 2: rank 1 exited -> peer's failedRanks[1] = 1
+    """
+
+    def p2p_all_to_all(ctx, device):
+        """All-to-all P2P send/recv. Returns work handles."""
+        ops = []
+        for p in range(ctx.world_size):
+            if p == ctx.rank:
+                continue
+            s = torch.tensor([ctx.rank], dtype=torch.int64, device=device)
+            r = torch.empty_like(s)
+            ops.append(dist.P2POp(op=dist.isend, tensor=s, peer=p))
+            ops.append(dist.P2POp(op=dist.irecv, tensor=r, peer=p))
+        return dist.batch_isend_irecv(ops)
+
+    device = ctx.init_group()
+
+    # Round 1: all healthy
+    works = p2p_all_to_all(ctx, device)
+    for w in works:
+        w.wait()
+    ctx.synchronize()
+    for w in works:
+        failed_ranks = pg.get_failed_ranks(w)
+        assert (
+            failed_ranks.cpu().tolist() == [0] * ctx.world_size
+        ), f"rank {ctx.rank} round 1: failed_ranks={failed_ranks.cpu().tolist()}"
+
+    if ctx.rank == BROKEN_RANK:
+        ctx.record_result({"role": "broken"})
+        broken_exited.set()
+        os._exit(0)
+
+    broken_exited.wait()
+
+    # Round 2: BROKEN_RANK is dead
+    works = p2p_all_to_all(ctx, device)
+    for w in works:
+        w.wait()
+
+    normal_failed_ranks = [0] * ctx.world_size
+    broken_peer_failed_ranks = [0] * ctx.world_size
+    broken_peer_failed_ranks[BROKEN_RANK] = 1
+    peers = [p for p in range(ctx.world_size) if p != ctx.rank]
+    for w, peer in zip(works, [p for p in peers for _ in range(2)]):
+        failed_ranks = pg.get_failed_ranks(w)
+        expected = (
+            broken_peer_failed_ranks if peer == BROKEN_RANK else normal_failed_ranks
+        )
+        assert failed_ranks.cpu().tolist() == expected
+
+    ctx.record_result({"role": "survivor"})
+
+
 class _P2PMixin:
     world_size = 4
 
@@ -149,6 +215,24 @@ class _P2PMixin:
         self.assert_all_ok(rows)
         rank1 = next(row for row in rows if row["rank"] == 1)
         self.assertEqual(rank1["value"], list(range(4)))
+
+    def test_p2p_fault_detection(self) -> None:
+        """Test P2P fault detection: failedRanks and activeRanks on P2P failure."""
+        spawn_ctx = mp.get_context("spawn")
+        broken_exited = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _p2p_fault_detection_worker,
+            broken_exited,
+            world_size=3,
+            nprocs=3,
+            timeout_s=60.0,
+        )
+
+        survivor_rows = [r for r in rows if r.get("role") == "survivor"]
+        broken_rows = [r for r in rows if r.get("role") == "broken"]
+        self.assertEqual(len(survivor_rows), 2)
+        self.assertGreaterEqual(len(broken_rows), 1)
 
     def test_multiple_senders_to_same_receiver(self) -> None:
         if self.world_size < 3:

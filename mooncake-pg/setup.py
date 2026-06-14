@@ -30,7 +30,7 @@ abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 current_dir = os.path.abspath(os.path.dirname(__file__))
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
-cxx_args = [abi_define, "-std=c++20", "-O3", "-g0"]
+cxx_args = [abi_define, "-std=c++20", "-O0", "-g"]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
@@ -86,7 +86,13 @@ setup(
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_host.cpp",
                 "src/mooncake_worker_thread.cpp",
-                "src/connection_poller.cpp",
+                "src/work_handles.cpp",
+                "src/control_plane/agent.cpp",
+                "src/control_plane/agent_host.cpp",
+                "src/control_plane/coordinator.cpp",
+                "src/control_plane/coordinator_host.cpp",
+                "src/control_plane/rpc_runtime.cpp",
+                "src/control_plane/link_manager.cpp",
             ],
             extra_compile_args={"cxx": cxx_args, "nvcc": device_args},
             libraries=cuda_libraries,
