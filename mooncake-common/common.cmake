@@ -43,8 +43,17 @@ endif()
 
 message(CMAKE_BUILD_TYPE ": ${CMAKE_BUILD_TYPE}")
 
-# Necessary if you are using Alibaba Cloud eRDMA
-add_definitions(-DCONFIG_ERDMA)
+# eRDMA QP-reconstruction workaround. Aliyun eRDMA cannot transition a QP from
+# RTS back to RTS, so reconnect must destroy+recreate QPs (RdmaEndPoint::
+# reconstruct) instead of the cheaper RESET state-transition path
+# (RdmaEndPoint::disconnectUnlocked). Standard RDMA (e.g. mlx5) does not need
+# this and benefits from the lighter path, which also exercises the
+# ERR-before-RESET flush in disconnectUnlocked. Default ON preserves historical
+# behavior; set -DUSE_ERDMA=OFF for standard-RDMA-only builds.
+option(USE_ERDMA "Enable Aliyun eRDMA QP-reconstruction workaround (CONFIG_ERDMA)" ON)
+if (USE_ERDMA)
+  add_definitions(-DCONFIG_ERDMA)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

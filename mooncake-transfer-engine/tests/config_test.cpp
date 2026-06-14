@@ -105,5 +105,152 @@ TEST_F(PkeyIndexEnvTest, AutoGidRetriesRejectsOutOfRangeOverride) {
     EXPECT_EQ(config.auto_gid_max_retries, 5);
 }
 
+// MC_QP_DRAIN_TIMEOUT_MS bounds the spin for a disconnected endpoint's
+// outstanding WRs to flush before the next reconnect reuses/destroys its QPs.
+// Unlike most knobs, 0 is a valid value (disables the wait); the range is
+// capped at 1000ms because the drain spins with a spinlock held. These cases
+// pin down that 0 is accepted while garbage/negative/out-of-range/trailing
+// junk preserve the default -- a typo must not silently disable the
+// safety wait.
+class QpDrainTimeoutEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS"); }
+};
+
+TEST_F(QpDrainTimeoutEnvTest, DefaultIsFiftyWhenUnset) {
+    ::unsetenv("MC_QP_DRAIN_TIMEOUT_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 50);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, ValidOverrideIsApplied) {
+    // Use a value distinct from the default so the test fails if the override
+    // is silently ignored and the default is kept instead.
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "30", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 30);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, ZeroIsAcceptedAndDisablesWait) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 50;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 0);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "1000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 1000);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "1001", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 7);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 11);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 13;  // a typo must NOT silently disable
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 13);
+}
+
+TEST_F(QpDrainTimeoutEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_QP_DRAIN_TIMEOUT_MS", "", 1), 0);
+    GlobalConfig config;
+    config.qp_drain_timeout_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.qp_drain_timeout_ms, 17);
+}
+
+// MC_CONN_PAUSE_TTL_MS arms the active-connect circuit-breaker: after an
+// endpoint to a peer is torn down, active reconnection to that peer's address
+// is paused for this many ms so the CQ poller isn't blocked re-handshaking a
+// gone peer. 0 disables (and is the default); the range is capped at 600000ms.
+// As with the other knobs, a typo / out-of-range value must preserve the
+// default rather than silently change behavior.
+class ConnPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONN_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ConnPauseTtlEnvTest, DefaultIsZeroWhenUnset) {
+    ::unsetenv("MC_CONN_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 5000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ZeroIsAcceptedAndDisables) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 600000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 7);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 11);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 13;  // a typo must NOT silently change behavior
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 13);
+}
+
+TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 17);
+}
+
 }  // namespace
 }  // namespace mooncake
