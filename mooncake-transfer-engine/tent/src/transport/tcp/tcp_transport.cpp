@@ -110,11 +110,16 @@ Status TcpTransport::install(std::string &local_segment_name,
 Status TcpTransport::uninstall() {
     if (installed_) {
         if (metadata_) metadata_->setNotifyCallback(nullptr);
-        shutting_down_.store(true, std::memory_order_release);
-        thread_pool_.reset();
+        drain();
         metadata_.reset();
         installed_ = false;
     }
+    return Status::OK();
+}
+
+Status TcpTransport::drain() {
+    shutting_down_.store(true, std::memory_order_release);
+    thread_pool_.reset();
     return Status::OK();
 }
 
@@ -152,6 +157,7 @@ Status TcpTransport::submitTransferTasks(
         tcp_batch->task_list.emplace_back();
         auto &task = tcp_batch->task_list.back();
         task.request = request;
+        task.terminal_sink = tcp_batch->sink;
         task.status_word.store(TransferStatusEnum::PENDING,
                                std::memory_order_release);
     }
@@ -211,6 +217,8 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
+    auto terminal_sink = task->terminal_sink;
+    if (terminal_sink) terminal_sink->notifyMaybeReady();
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {

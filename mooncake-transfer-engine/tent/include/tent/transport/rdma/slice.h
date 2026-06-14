@@ -58,6 +58,7 @@ struct RdmaTask {
 
     // Reference counting for UAF protection
     std::atomic<int> ref_count{0};
+    std::shared_ptr<BatchEventSink> terminal_sink;
 
     void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
     void deref() {
@@ -116,7 +117,11 @@ static inline void updateSliceStatus(RdmaSlice* slice,
                                           ? COMPLETED
                                           : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
-        __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
+        auto terminal_sink = task->terminal_sink;
+        if (__sync_bool_compare_and_swap(&task->status_word, PENDING,
+                                         final_st)) {
+            if (terminal_sink) terminal_sink->notifyMaybeReady();
+        }
     }
     task->deref();
 }

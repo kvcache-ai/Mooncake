@@ -28,6 +28,7 @@
 #include <string>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/control_plane.h"
 
@@ -42,6 +43,12 @@ struct Capabilities {
     bool gpu_to_file = false;
 };
 
+struct BatchEventSink {
+    virtual ~BatchEventSink() = default;
+    virtual void notifyMaybeReady() noexcept = 0;
+    virtual void close() noexcept = 0;
+};
+
 class Transport {
    public:
     struct SubBatch {
@@ -49,6 +56,12 @@ class Transport {
         virtual ~SubBatch() {}
         virtual size_t size() const = 0;
         uint64_t device_mask;  // Device mask for transport selection
+        std::shared_ptr<BatchEventSink> sink;
+        BatchID batch_id = 0;
+        inline void notifyTerminal() noexcept {
+            auto s = sink;
+            if (s) s->notifyMaybeReady();
+        }
     };
 
     using SubBatchRef = SubBatch *;
@@ -66,6 +79,11 @@ class Transport {
     }
 
     virtual Status uninstall() { return Status::OK(); }
+
+    // Stop transport-owned async workers while keeping enough state alive for
+    // freeSubBatch(). Used by TransferEngineImpl teardown to quiesce terminal
+    // callbacks before SubBatch memory is reclaimed.
+    virtual Status drain() { return Status::OK(); }
 
     virtual const Capabilities capabilities() const { return caps; }
 

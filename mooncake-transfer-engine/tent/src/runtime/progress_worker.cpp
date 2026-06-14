@@ -42,20 +42,22 @@ void ProgressWorker::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
-void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id) {
+void ProgressWorker::notifyBatchMaybeReady(BatchID batch_id,
+                                           uint64_t generation) {
     if (!batch_id) return;
     if (!running_.load(std::memory_order_acquire)) return;
+    WorkItem item{batch_id, generation};
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!queued_.insert(batch_id).second) return;
-        order_.push_back(batch_id);
+        if (!queued_.insert(item).second) return;
+        order_.push_back(item);
     }
     cv_.notify_one();
 }
 
 void ProgressWorker::runner() {
     while (true) {
-        BatchID batch_id = 0;
+        WorkItem item;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] {
@@ -63,9 +65,9 @@ void ProgressWorker::runner() {
                        !order_.empty();
             });
             if (!running_.load(std::memory_order_acquire)) return;
-            batch_id = order_.front();
+            item = order_.front();
             order_.pop_front();
-            queued_.erase(batch_id);
+            queued_.erase(item);
         }
         // progressBatch acquires the engine's progress_mutex_ and silently
         // returns InvalidArgument if the batch was freed before we got here.
@@ -73,7 +75,7 @@ void ProgressWorker::runner() {
         // Terminal states leave the batch alone — freeBatch on the user
         // thread is responsible for reclamation.
         TransferStatus s;
-        (void)impl_->progressBatch(batch_id, s);
+        (void)impl_->progressBatchIfAlive(item.batch_id, item.generation, s);
     }
 }
 
