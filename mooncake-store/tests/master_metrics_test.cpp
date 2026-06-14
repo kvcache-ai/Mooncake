@@ -623,6 +623,21 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
     return key;
 }
 
+static bool InjectLocalDiskReplica(MasterService& svc, const UUID& client_id,
+                                   const std::string& segment_name,
+                                   int64_t value_size, const std::string& key) {
+    StorageObjectMetadata meta;
+    meta.bucket_id = 0;
+    meta.offset = 0;
+    meta.key_size = static_cast<int64_t>(key.size());
+    meta.data_size = value_size;
+    meta.transport_endpoint = segment_name;
+
+    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
+        .tenant_id = "default", .key = key, .size = value_size}};
+    return svc.NotifyOffloadSuccess(client_id, tasks, {meta}).has_value();
+}
+
 // Verify that creating a LocalDiskReplica (via NotifyOffloadSuccess) increments
 // file_allocated_size, and that removing the key decrements it back to zero.
 TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
@@ -657,6 +672,38 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     // After removing the key the LocalDiskReplica is destroyed; gauge resets.
     ASSERT_TRUE(svc.Remove(key, "default").has_value());
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
+}
+
+TEST_F(MasterMetricsTest, LocalDiskOnlyGetReplicaListCountsAsSsdHit) {
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    MasterService svc(config);
+
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(svc.MountLocalDiskSegment(client_id, true).has_value());
+
+    const auto base_stats = metrics.calculate_cache_stats();
+    const double base_memory_hits = base_stats.at(CacheHitStat::MEMORY_HITS);
+    const double base_ssd_hits = base_stats.at(CacheHitStat::SSD_HITS);
+
+    const std::string key = "ssd_hit_test_key";
+    constexpr int64_t kValueSize = 4096;
+    ASSERT_TRUE(InjectLocalDiskReplica(svc, client_id, "ssd_hit_test_segment",
+                                       kValueSize, key));
+
+    auto get_replica_result = svc.GetReplicaList(key, "default");
+    ASSERT_TRUE(get_replica_result.has_value());
+    ASSERT_EQ(get_replica_result->replicas.size(), 1);
+    ASSERT_TRUE(get_replica_result->replicas[0].is_local_disk_replica());
+
+    const auto stats = metrics.calculate_cache_stats();
+    EXPECT_EQ(stats.at(CacheHitStat::MEMORY_HITS), base_memory_hits);
+    EXPECT_EQ(stats.at(CacheHitStat::SSD_HITS), base_ssd_hits + 1);
+
+    ASSERT_TRUE(svc.Remove(key, "default", true).has_value());
 }
 
 // Verify that OffloadObjectHeartbeat updates total_file_capacity correctly,
