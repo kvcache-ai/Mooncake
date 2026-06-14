@@ -35,25 +35,40 @@ __device__ __forceinline__ uint64_t mc_ld_acquire_u64(const uint64_t* ptr) {
 
 // ---------------------------------------------------------------------------
 // Release stores
+//
+// Set MC_EP_MUSA_NO_ST_RELEASE=1 to make mc_st_release a plain store (for perf
+// experiments only — WILL break correctness due to missing cross-GPU fences).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_st_release(const int* ptr, int val) {
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
     *const_cast<volatile int*>(ptr) = val;
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
 }
 
 __device__ __forceinline__ void mc_st_release_u32(const uint32_t* ptr,
                                                   uint32_t val) {
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
     *const_cast<volatile uint32_t*>(ptr) = val;
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
 }
 
 __device__ __forceinline__ void mc_st_release_u64(const uint64_t* ptr,
                                                   uint64_t val) {
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
     *const_cast<volatile uint64_t*>(ptr) = val;
+#ifndef MC_EP_MUSA_NO_ST_RELEASE
     __threadfence_system();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -110,10 +125,15 @@ __device__ __forceinline__ void mc_st_na(const int4* ptr, const int4& val) {
 // Kernels that call mc_bar_sync from a subset of threads must ensure the
 // remaining threads call it the same number of times from another code path.
 // See mooncake_ep_kernel.cu for the warp-31 dispatch-send workaround.
+//
+// Set MC_EP_MUSA_NO_BAR_SYNC=1 to make mc_bar_sync a no-op on MUSA (for perf
+// experiments only — WILL break correctness due to missing warp-group sync).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_bar_sync(int /*bar_id*/,
                                             int /*num_threads*/) {
+#ifndef MC_EP_MUSA_NO_BAR_SYNC
     __syncthreads();
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -126,20 +146,30 @@ __device__ __forceinline__ void mc_grid_sync() {}
 // System-level memory fence: MUSA requires explicit __threadfence_system()
 // for cross-GPU (MTLink) visibility.  CUDA hardware guarantees this without
 // explicit fences, so mc_fence() is a no-op there.
+//
+// Set MC_EP_MUSA_NO_FENCE=1 to make mc_fence a no-op on MUSA (for perf
+// experiments only — may break correctness if MTLink needs explicit fences).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_fence() {
+#ifndef MC_EP_MUSA_NO_FENCE
     __threadfence_system();
+#endif
 }
 
 // ---------------------------------------------------------------------------
 // Fence/barrier/fence: ensures all threads' writes are globally visible
 // before any thread proceeds.  On MUSA, __syncthreads() does NOT imply a
 // memory fence, so explicit fences are needed on both sides.
+//
+// Set MC_EP_MUSA_NO_FBF=1 to make mc_fence_barrier_fence a no-op (for perf
+// experiments only — may break correctness).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_fence_barrier_fence() {
+#ifndef MC_EP_MUSA_NO_FBF
     __threadfence_system();
     __syncthreads();
     __threadfence_system();
+#endif
 }
 
 // ---------------------------------------------------------------------------

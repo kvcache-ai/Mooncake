@@ -164,30 +164,32 @@ class Buffer:
                 subnet_prefixes, interface_ids, active_ranks_mask
             )
 
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            from mooncake.ep import get_active_ranks
-            active_ranks_mask = get_active_ranks(self.backend).tolist()
-            self.runtime.sync_nvlink_ipc_handles(remote_handles,
-                                                 active_ranks_mask)
-        except Exception as e:
-            import warnings
+        if not self._use_fallback:
+            try:
+                local_handle_ints = self.runtime.get_ipc_handle()
+                # pybind11 converts std::vector<int32_t> to a list of integers
+                local_handle_tensor = torch.tensor(
+                    local_handle_ints, dtype=torch.int32, device="cuda"
+                )
+                handles = [
+                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                    for _ in range(self.group_size)
+                ]
+                dist.all_gather(handles, local_handle_tensor, self.group)
+                torch.cuda.synchronize()
+                remote_handles = [h.tolist() for h in handles]
+                from mooncake.ep import get_active_ranks
+                active_ranks_mask = get_active_ranks(self.backend).tolist()
+                self.runtime.sync_nvlink_ipc_handles(remote_handles,
+                                                     active_ranks_mask)
+            except Exception as e:
+                import warnings
 
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+                warnings.warn(
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         use_fast_path = False
         try:
