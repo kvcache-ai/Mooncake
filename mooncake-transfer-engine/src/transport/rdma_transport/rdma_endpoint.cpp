@@ -202,6 +202,10 @@ int RdmaEndPoint::destroyQP() { return deconstruct(); }
 
 void RdmaEndPoint::beginDestroy() {
     RWSpinlock::WriteGuard guard(lock_);
+    beginDestroyNoLock();
+}
+
+void RdmaEndPoint::beginDestroyNoLock() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
@@ -652,54 +656,27 @@ void RdmaEndPoint::disconnect() {
 }
 
 int RdmaEndPoint::disconnectUnlocked() {
-    auto curr_status = status_.load(std::memory_order_acquire);
-    if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
-
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = 0;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (curr_ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
-            ret = ERR_ENDPOINT;
-        }
-        // After resetting QP, the wr_depth_list_ won't change
-        bool displayed = false;
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
-            }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
-        }
-    }
+    // Use unified two-phase destruction framework.
+    // Endpoints have unidirectional lifecycle - once marked for destruction,
+    // they are never reused. The endpoint store will create a new endpoint
+    // for future connections.
+    beginDestroyNoLock();
     peer_qp_num_list_.clear();
-    status_.store(UNCONNECTED, std::memory_order_release);
-    return ret;
+    return 0;
 }
 
 int RdmaEndPoint::resetConnection(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
+    if (curr_status == DESTROYING || curr_status == DESTROYED) return 0;
     if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
 
-#ifdef CONFIG_ERDMA
-    int ret = reconstruct();
-#else
-    int ret = disconnectUnlocked();
-#endif
-
-    if (ret) {
-        LOG(ERROR) << "Failed to reset the endpoint (triggered by: " << reason
-                   << "): error=" << ret;
-    } else {
-        LOG(INFO) << "Successfully reset the endpoint (triggered by: " << reason
-                  << ").";
-    }
-    return ret;
+    // Use two-phase destruction to avoid silent WR loss
+    // Mark endpoint as destroying and transition QPs to ERR state
+    // so hardware flushes inflight WRs to CQ instead of silently dropping them.
+    beginDestroy();
+    LOG(INFO) << "Endpoint marked for destruction (triggered by: " << reason
+              << "), will be destroyed after outstanding WRs complete";
+    return 0;
 }
 
 const std::string RdmaEndPoint::toString() const {
