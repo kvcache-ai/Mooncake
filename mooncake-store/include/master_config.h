@@ -338,6 +338,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
     uint16_t http_port = 9003;
+    std::string http_host = "0.0.0.0";
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -408,6 +409,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        http_host = config.rpc_address;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;
@@ -497,6 +499,7 @@ class WrappedMasterServiceConfig {
             config.allow_evict_soft_pinned_objects;
         enable_metric_reporting = config.enable_metric_reporting;
         http_port = static_cast<uint16_t>(config.metrics_port);
+        http_host = config.rpc_address;
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         nof_eviction_ratio = config.nof_eviction_ratio;

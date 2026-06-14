@@ -466,7 +466,7 @@ int MasterServiceSupervisor::Start() {
 
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
-        config_.enable_metric_reporting);
+        config_.enable_metric_reporting, config_.rpc_address);
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
                    << config_.metrics_port;

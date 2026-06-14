@@ -284,7 +284,8 @@ class WrappedMasterService {
 
 class MasterAdminServer {
    public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
+                      const std::string& http_host = "0.0.0.0");
 
     ~MasterAdminServer();
 

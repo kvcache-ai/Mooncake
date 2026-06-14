@@ -8,6 +8,7 @@
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <ylt/util/tl/expected.hpp>
 
@@ -426,6 +427,18 @@ void* allocate_buffer_numa_segments(size_t total_size,
 void free_memory(const std::string& protocol, void* ptr);
 
 // Network utility functions
+
+/**
+ * @brief Strip brackets from IPv6 addresses
+ * @param addr Address string, e.g., "[2401:db00::1]"
+ * @return Address without brackets, e.g., "2401:db00::1"
+ */
+[[nodiscard]] inline std::string stripBrackets(std::string_view addr) {
+    if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']') {
+        return std::string(addr.substr(1, addr.size() - 2));
+    }
+    return std::string(addr);
+}
 
 /**
  * @brief Check if a TCP port is available for binding
