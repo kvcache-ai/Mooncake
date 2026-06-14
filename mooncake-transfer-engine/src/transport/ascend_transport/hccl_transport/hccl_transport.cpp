@@ -82,6 +82,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
             initiator_cond_.wait(lock);
         }
         if (!running_ && allReqQueues_[selfIdx].empty()) {
+            aclrtDestroyStream(stream);
             return;
         }
         auto start = std::chrono::high_resolution_clock::now();
@@ -219,6 +220,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                 (void)addOpfence;
                 (void)stop;
             }
+            break;
         }
 
         for (auto slice : slice_list) {
