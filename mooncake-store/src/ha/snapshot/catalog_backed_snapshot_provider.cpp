@@ -135,17 +135,20 @@ DeserializeStandbyObjectMetadata(
         // compatibility with MasterService::MetadataSerializer, which appends
         // them over time:
         //   data_type (positive int) appears before the replicas;
-        //   hard_pinned (bool) and group_id (str) trail them.
+        //   hard_pinned (bool), group_id (str), and agent_hints (array or nil)
+        //   trail them.
         //   v1: 7 + replica_count, no optional fields
         //   v2: 8 + replica_count, either data_type or hard_pinned
         //   v3: 9 + replica_count, data_type + hard_pinned or
         //       hard_pinned + group_id
         //   v4: 10 + replica_count, data_type + hard_pinned + group_id
+        //   v5: 11 + replica_count, data_type + hard_pinned + group_id +
+        //       agent_hints
         // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
         // replica_count from wrapping the bounds and slipping an out-of-bounds
         // index through.
         constexpr uint64_t kBaseFieldCount = 7;
-        constexpr uint64_t kMaxOptionalFieldCount = 3;
+        constexpr uint64_t kMaxOptionalFieldCount = 4;
         const uint64_t total_elements = object.via.array.size;
         const uint64_t min_elements = kBaseFieldCount + replica_count;
         if (total_elements < min_elements ||

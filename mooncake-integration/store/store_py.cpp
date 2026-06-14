@@ -1440,6 +1440,19 @@ class MooncakeStorePyWrapper {
                        << ")";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+        if (config.agent_hints.has_value()) {
+            const auto &hints = config.agent_hints.value();
+            if (!hints.IsValidReuseHint()) {
+                LOG(ERROR) << "reuse_hint_size=" << hints.reuse_hint.size()
+                           << ", error=invalid_agent_reuse_hint";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+            if (hints.cache_ttl_ms < 0) {
+                LOG(ERROR) << "cache_ttl_ms=" << hints.cache_ttl_ms
+                           << ", error=invalid_agent_cache_ttl";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
         return 0;
     }
 
@@ -1699,6 +1712,27 @@ PYBIND11_MODULE(store, m) {
         .value("GENERAL", ObjectDataType::GENERAL)
         .export_values();
 
+    py::class_<AgentHints>(m, "AgentHints")
+        .def(py::init<>())
+        .def_readwrite("workflow_id", &AgentHints::workflow_id)
+        .def_readwrite("agent_id", &AgentHints::agent_id)
+        .def_readwrite("step_id", &AgentHints::step_id)
+        .def_readwrite("step_index", &AgentHints::step_index)
+        .def_readwrite("total_steps", &AgentHints::total_steps)
+        .def_readwrite("parent_step_id", &AgentHints::parent_step_id)
+        .def_readwrite("children_step_ids", &AgentHints::children_step_ids)
+        .def_readwrite("tool_name", &AgentHints::tool_name)
+        .def_readwrite("expected_tool_duration_ms",
+                       &AgentHints::expected_tool_duration_ms)
+        .def_readwrite("cache_ttl_ms", &AgentHints::cache_ttl_ms)
+        .def_readwrite("shared_prefix_hash", &AgentHints::shared_prefix_hash)
+        .def_readwrite("reuse_hint", &AgentHints::reuse_hint)
+        .def("__str__", [](const AgentHints &hints) {
+            std::ostringstream oss;
+            oss << hints;
+            return oss.str();
+        });
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -1715,6 +1749,7 @@ PYBIND11_MODULE(store, m) {
                        &ReplicateConfig::prefer_alloc_in_same_node)
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
+        .def_readwrite("agent_hints", &ReplicateConfig::agent_hints)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

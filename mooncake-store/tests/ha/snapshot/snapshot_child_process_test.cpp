@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -192,6 +193,20 @@ class SnapshotChildProcessTest : public ::testing::Test {
             }
         }
         return false;
+    }
+
+    std::optional<AgentHints> AgentHintsInMetadata(const std::string& key) {
+        for (auto& shard : service_->metadata_shards_) {
+            SharedMutexLocker shard_lock(&shard.mutex, shared_lock_t{});
+            for (const auto& [tenant_id, tenant_state] : shard.tenants) {
+                auto it = tenant_state.metadata.find(key);
+                if (it == tenant_state.metadata.end()) {
+                    continue;
+                }
+                return it->second.GetAgentHints();
+            }
+        }
+        return std::nullopt;
     }
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
@@ -503,6 +518,80 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
 }
 
+TEST_F(SnapshotChildProcessTest, RestorePreservesAgentHintsMetadata) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "agent_hints_snapshot_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    const std::string key = "snapshot_agent_hints_key";
+    AgentHints hints;
+    hints.workflow_id = "wf-snapshot";
+    hints.agent_id = "planner";
+    hints.step_id = "step-1";
+    hints.step_index = 1;
+    hints.total_steps = 3;
+    hints.parent_step_id = "root";
+    hints.children_step_ids = {"step-2", "step-3"};
+    hints.tool_name = "search";
+    hints.expected_tool_duration_ms = 250;
+    hints.cache_ttl_ms = 60000;
+    hints.shared_prefix_hash = "prefix-hash";
+    hints.reuse_hint = "keep";
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    replicate_config.agent_hints = hints;
+
+    auto put_start =
+        service_->PutStart(client_id, key, "default", 1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(service_->PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+                    .has_value());
+
+    auto persist_result = CallPersistState("20240701_140000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    ASSERT_TRUE(service_->GetReplicaList(key, "default").has_value());
+    auto restored_hints = AgentHintsInMetadata(key);
+    ASSERT_TRUE(restored_hints.has_value());
+    EXPECT_EQ("wf-snapshot", restored_hints->workflow_id);
+    EXPECT_EQ("planner", restored_hints->agent_id);
+    EXPECT_EQ("step-1", restored_hints->step_id);
+    EXPECT_EQ(1, restored_hints->step_index);
+    EXPECT_EQ(3, restored_hints->total_steps);
+    EXPECT_EQ("root", restored_hints->parent_step_id);
+    EXPECT_EQ((std::vector<std::string>{"step-2", "step-3"}),
+              restored_hints->children_step_ids);
+    EXPECT_EQ("search", restored_hints->tool_name);
+    EXPECT_EQ(250, restored_hints->expected_tool_duration_ms);
+    EXPECT_EQ(60000, restored_hints->cache_ttl_ms);
+    EXPECT_EQ("prefix-hash", restored_hints->shared_prefix_hash);
+    EXPECT_EQ("keep", restored_hints->reuse_hint);
+}
+
 TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
@@ -529,31 +618,161 @@ TEST_F(SnapshotChildProcessTest,
     PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
                     kDefaultTestObjectSize);
 
-    auto compressed_shard =
-        zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
-                      shard_buffer.size(), 3);
-
-    msgpack::sbuffer root_buffer;
-    MsgpackPacker root_packer(&root_buffer);
-    root_packer.pack_map(3);
-    root_packer.pack(std::string("shards"));
-    root_packer.pack_map(1);
-    root_packer.pack(shard_idx);
-    root_packer.pack_bin(compressed_shard.size());
-    root_packer.pack_bin_body(
-        reinterpret_cast<const char*>(compressed_shard.data()),
-        compressed_shard.size());
-    root_packer.pack(std::string("discarded_replicas"));
-    root_packer.pack_array(0);
-    root_packer.pack(std::string("replica_next_id"));
-    root_packer.pack(uint64_t{10});
-
-    auto deserialize_result =
-        DeserializeMetadataForTest(ToByteVector(root_buffer));
+    auto deserialize_result = DeserializeMetadataForTest(
+        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
     EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializeMetadataWithoutAgentHintsKeepsHintsEmpty) {
+    CreateDefaultService();
+    const std::string key = "legacy_snapshot_no_agent_hints_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    // Previous writer shape: data_type + replica + hard_pinned + group_id,
+    // with no trailing agent_hints field.
+    shard_packer.pack_array(11);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+    shard_packer.pack(false);
+    shard_packer.pack(std::string("legacy-group"));
+
+    auto deserialize_result = DeserializeMetadataForTest(
+        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    EXPECT_TRUE(ObjectIsGroupedInMetadata(key, shard_idx));
+    EXPECT_FALSE(AgentHintsInMetadata(key).has_value());
+}
+
+TEST_F(SnapshotChildProcessTest,
+       DeserializeAgentHintsWithTrailingFieldsKeepsV1Fields) {
+    CreateDefaultService();
+    const std::string key = "future_agent_hints_snapshot_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(12);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+    shard_packer.pack(false);
+    shard_packer.pack(std::string("future-group"));
+
+    shard_packer.pack_array(13);
+    PackAgentHintsV1Fields(
+        shard_packer, "wf-future", "agent-future", "step-future", int64_t{4},
+        int64_t{9}, "parent-future",
+        std::vector<std::string>{"child-a", "child-b"}, "future-tool",
+        int64_t{321}, int64_t{654321}, "future-prefix", "keep");
+    shard_packer.pack(std::string("future-v2-field"));
+
+    auto deserialize_result = DeserializeMetadataForTest(
+        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+
+    auto restored_hints = AgentHintsInMetadata(key);
+    ASSERT_TRUE(restored_hints.has_value());
+    EXPECT_EQ("wf-future", restored_hints->workflow_id);
+    EXPECT_EQ("agent-future", restored_hints->agent_id);
+    EXPECT_EQ("step-future", restored_hints->step_id);
+    EXPECT_EQ(4, restored_hints->step_index);
+    EXPECT_EQ(9, restored_hints->total_steps);
+    EXPECT_EQ("parent-future", restored_hints->parent_step_id);
+    EXPECT_EQ((std::vector<std::string>{"child-a", "child-b"}),
+              restored_hints->children_step_ids);
+    EXPECT_EQ("future-tool", restored_hints->tool_name);
+    EXPECT_EQ(321, restored_hints->expected_tool_duration_ms);
+    EXPECT_EQ(654321, restored_hints->cache_ttl_ms);
+    EXPECT_EQ("future-prefix", restored_hints->shared_prefix_hash);
+    EXPECT_EQ("keep", restored_hints->reuse_hint);
+}
+
+TEST_F(SnapshotChildProcessTest, DeserializeMalformedAgentHintsSkipsEntry) {
+    CreateDefaultService();
+    const std::string key = "malformed_agent_hints_snapshot_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
+
+    msgpack::sbuffer shard_buffer;
+    MsgpackPacker shard_packer(&shard_buffer);
+    shard_packer.pack_map(1);
+    shard_packer.pack(std::string("metadata"));
+    shard_packer.pack_array(1);
+    shard_packer.pack_array(2);
+    shard_packer.pack(key);
+
+    shard_packer.pack_array(12);
+    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(kDefaultTestPutStartTimeMs);
+    shard_packer.pack(kDefaultTestObjectSize);
+    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+    shard_packer.pack(false);
+    shard_packer.pack(uint64_t{0});
+    shard_packer.pack(uint32_t{1});
+    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
+    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                    kDefaultTestObjectSize);
+    shard_packer.pack(false);
+    shard_packer.pack(std::string("malformed-group"));
+
+    shard_packer.pack_array(12);
+    shard_packer.pack(std::string("wf-malformed"));
+    shard_packer.pack(std::string("agent"));
+    shard_packer.pack(std::string("step"));
+    shard_packer.pack(int64_t{1});
+    shard_packer.pack(int64_t{1});
+    shard_packer.pack(std::string("parent"));
+    shard_packer.pack(std::vector<std::string>{"child"});
+    shard_packer.pack(std::string("tool"));
+    shard_packer.pack(int64_t{100});
+    shard_packer.pack(std::string("bad-ttl"));
+    shard_packer.pack(std::string("prefix"));
+    shard_packer.pack(std::string("keep"));
+
+    auto deserialize_result = DeserializeMetadataForTest(
+        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+    EXPECT_FALSE(service_->ExistKey(key, "default").value_or(true));
+    EXPECT_FALSE(AgentHintsInMetadata(key).has_value());
 }
 
 TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {

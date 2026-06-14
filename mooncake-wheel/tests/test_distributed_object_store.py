@@ -658,7 +658,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
     def test_replicate_config_creation_and_properties(self):
         """Test ReplicateConfig class creation and property access."""
-        from mooncake.store import ReplicateConfig
+        from mooncake.store import AgentHints, ReplicateConfig
         
         # Test default constructor
         config = ReplicateConfig()
@@ -679,6 +679,78 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         config_str = str(config)
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
+
+        hints = AgentHints()
+        self.assertEqual(hints.reuse_hint, "neutral")
+        self.assertEqual(hints.cache_ttl_ms, 0)
+        hints.workflow_id = "wf-sensitive"
+        hints.agent_id = "agent-sensitive"
+        hints.step_id = "step-sensitive"
+        hints.children_step_ids = ["child-a", "child-b"]
+        hints.cache_ttl_ms = 60000
+        hints.reuse_hint = "keep"
+        config.agent_hints = hints
+
+        hints_str = str(hints)
+        self.assertIn("workflow_id_set: 1", hints_str)
+        self.assertIn("children_step_count: 2", hints_str)
+        self.assertIn("reuse_hint: keep", hints_str)
+        self.assertNotIn("wf-sensitive", hints_str)
+        self.assertNotIn("agent-sensitive", hints_str)
+        self.assertNotIn("step-sensitive", hints_str)
+
+        config_str = str(config)
+        self.assertIn("agent_hints", config_str)
+        self.assertIn("workflow_id_set: 1", config_str)
+        self.assertNotIn("wf-sensitive", config_str)
+
+    def test_put_get_with_agent_hints_config(self):
+        """Test put/get succeeds when ReplicateConfig carries AgentHints."""
+        from mooncake.store import AgentHints, ReplicateConfig
+
+        hints = AgentHints()
+        hints.workflow_id = "wf-python"
+        hints.agent_id = "planner"
+        hints.step_id = "step-1"
+        hints.step_index = 1
+        hints.total_steps = 2
+        hints.children_step_ids = ["step-2"]
+        hints.tool_name = "search"
+        hints.expected_tool_duration_ms = 100
+        hints.cache_ttl_ms = 60000
+        hints.shared_prefix_hash = "prefix-hash"
+        hints.reuse_hint = "keep"
+
+        config = ReplicateConfig()
+        config.agent_hints = hints
+
+        key = f"agent_hints_put_get_{os.getpid()}"
+        value = b"agent hints payload"
+        self.assertEqual(self.store.put(key, value, config), 0)
+        self.assertEqual(self.store.get(key), value)
+        self.assertEqual(self.store.remove(key, force=True), 0)
+
+    def test_put_rejects_invalid_agent_hints_config(self):
+        """Test raw byte puts reject invalid AgentHints."""
+        from mooncake.store import AgentHints, ReplicateConfig
+
+        config = ReplicateConfig()
+        hints = AgentHints()
+        hints.reuse_hint = "maybe"
+        config.agent_hints = hints
+
+        invalid_reuse_key = f"agent_hints_bad_reuse_{os.getpid()}"
+        self.assertEqual(self.store.put(invalid_reuse_key, b"payload", config),
+                         -600)
+        self.assertEqual(self.store.get(invalid_reuse_key), b"")
+
+        hints.reuse_hint = "keep"
+        hints.cache_ttl_ms = -1
+        config.agent_hints = hints
+        invalid_ttl_key = f"agent_hints_bad_ttl_{os.getpid()}"
+        self.assertEqual(self.store.put(invalid_ttl_key, b"payload", config),
+                         -600)
+        self.assertEqual(self.store.get(invalid_ttl_key), b"")
 
     def test_batch_get_buffer_operations(self):
         """Test batch_get_buffer operations for multiple keys."""

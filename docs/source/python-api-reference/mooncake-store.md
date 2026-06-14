@@ -562,7 +562,7 @@ The `ReplicateConfig` class allows you to control data replication behavior when
 ### Class Definition
 
 ```python
-from mooncake.store import ReplicateConfig
+from mooncake.store import AgentHints, ReplicateConfig
 
 # Create a configuration instance
 config = ReplicateConfig()
@@ -653,6 +653,53 @@ config = ReplicateConfig()
 config.group_ids = ["session-a"]
 
 store.put("key-a", b"value-a", config)
+```
+
+#### agent_hints
+**Type:** `AgentHints | None`
+**Default:** `None`
+**Description:** Optionally annotates Store metadata with agent/workflow hints.
+This is a Store-side metadata and prototype retention path. It does not create a
+separate workflow scheduler and it does not automatically map `workflow_id` to
+`group_ids`.
+
+`AgentHints` fields:
+
+- `workflow_id`
+- `agent_id`
+- `step_id`
+- `step_index`
+- `total_steps`
+- `parent_step_id`
+- `children_step_ids`
+- `tool_name`
+- `expected_tool_duration_ms`
+- `cache_ttl_ms`
+- `shared_prefix_hash`
+- `reuse_hint`
+
+Only a small subset affects Store behavior today:
+
+- `reuse_hint = "keep"` requests soft-pin retention.
+- `cache_ttl_ms > 0` can extend the soft-pin timeout.
+- `workflow_id` and the other fields are persisted as metadata annotations.
+- `reuse_hint = "neutral"` and `reuse_hint = "discard"` do not add retention by themselves.
+
+```python
+from mooncake.store import AgentHints, ReplicateConfig
+
+hints = AgentHints()
+hints.workflow_id = "workflow-1"
+hints.agent_id = "planner"
+hints.step_id = "step-1"
+hints.children_step_ids = ["step-2"]
+hints.cache_ttl_ms = 60000
+hints.reuse_hint = "keep"
+
+config = ReplicateConfig()
+config.agent_hints = hints
+
+store.put("agent-cache-key", b"cached-prefix", config)
 ```
 
 ---

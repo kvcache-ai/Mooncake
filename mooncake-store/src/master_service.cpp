@@ -119,6 +119,101 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     return config.group_ids->at(key_index);
 }
 
+bool ConfigRequestsSoftPin(const ReplicateConfig& config) {
+    // AgentHints v1 reuses the existing soft-pin path; it does not add a
+    // separate agent-aware eviction policy.
+    return config.with_soft_pin || (config.agent_hints.has_value() &&
+                                    config.agent_hints->RequestsRetention());
+}
+
+constexpr uint32_t kAgentHintsV1FieldCount = 12;
+
+tl::expected<void, ErrorCode> ValidateAgentHints(
+    const ReplicateConfig& config) {
+    if (!config.agent_hints.has_value()) {
+        return {};
+    }
+    const auto& hints = config.agent_hints.value();
+    if (!hints.IsValidReuseHint()) {
+        LOG(ERROR) << "reuse_hint_size=" << hints.reuse_hint.size()
+                   << ", error=invalid_agent_reuse_hint";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (hints.cache_ttl_ms < 0) {
+        LOG(ERROR) << "cache_ttl_ms=" << hints.cache_ttl_ms
+                   << ", error=invalid_agent_cache_ttl";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
+}
+
+void PackAgentHints(const std::optional<AgentHints>& agent_hints,
+                    MsgpackPacker& packer) {
+    if (!agent_hints.has_value()) {
+        packer.pack_nil();
+        return;
+    }
+    const auto& hints = agent_hints.value();
+    packer.pack_array(kAgentHintsV1FieldCount);
+    packer.pack(hints.workflow_id);
+    packer.pack(hints.agent_id);
+    packer.pack(hints.step_id);
+    packer.pack(hints.step_index);
+    packer.pack(hints.total_steps);
+    packer.pack(hints.parent_step_id);
+    packer.pack(hints.children_step_ids);
+    packer.pack(hints.tool_name);
+    packer.pack(hints.expected_tool_duration_ms);
+    packer.pack(hints.cache_ttl_ms);
+    packer.pack(hints.shared_prefix_hash);
+    packer.pack(hints.reuse_hint);
+}
+
+tl::expected<std::optional<AgentHints>, SerializationError> UnpackAgentHints(
+    const msgpack::object& obj) {
+    if (obj.type == msgpack::type::NIL) {
+        return std::optional<AgentHints>{};
+    }
+    if (obj.type != msgpack::type::ARRAY ||
+        obj.via.array.size < kAgentHintsV1FieldCount) {
+        const std::string error_message =
+            "deserialize AgentHints: expected at least " +
+            std::to_string(kAgentHintsV1FieldCount) + "-element array or nil";
+        return tl::unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL, error_message));
+    }
+
+    // Read the v1 prefix only; later writer versions may append fields.
+    AgentHints hints;
+    try {
+        const msgpack::object* array = obj.via.array.ptr;
+        uint32_t index = 0;
+        hints.workflow_id = array[index++].as<std::string>();
+        hints.agent_id = array[index++].as<std::string>();
+        hints.step_id = array[index++].as<std::string>();
+        hints.step_index = array[index++].as<int64_t>();
+        hints.total_steps = array[index++].as<int64_t>();
+        hints.parent_step_id = array[index++].as<std::string>();
+        hints.children_step_ids = array[index++].as<std::vector<std::string>>();
+        hints.tool_name = array[index++].as<std::string>();
+        hints.expected_tool_duration_ms = array[index++].as<int64_t>();
+        hints.cache_ttl_ms = array[index++].as<int64_t>();
+        hints.shared_prefix_hash = array[index++].as<std::string>();
+        hints.reuse_hint = array[index++].as<std::string>();
+    } catch (const std::exception& e) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize AgentHints: " + std::string(e.what())));
+    }
+
+    if (!hints.IsValidReuseHint() || hints.cache_ttl_ms < 0) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize AgentHints: invalid reuse_hint or cache_ttl_ms"));
+    }
+    return std::optional<AgentHints>{std::move(hints)};
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -1520,8 +1615,9 @@ auto MasterService::AllocateAndInsertMetadata(
     auto [it, inserted] = tenant_state.metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin,
-                              config.data_type, group_id, tenant_id, key));
+                              ConfigRequestsSoftPin(config),
+                              config.with_hard_pin, config.data_type, group_id,
+                              tenant_id, key, config.agent_hints));
     if (!inserted) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -1569,6 +1665,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                    << ", max_size=" << kMaxSliceSize
                    << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto agent_hints_validation = ValidateAgentHints(config);
+    if (!agent_hints_validation) {
+        return tl::make_unexpected(agent_hints_validation.error());
     }
 
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
@@ -1911,6 +2011,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                    << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    auto agent_hints_validation = ValidateAgentHints(config);
+    if (!agent_hints_validation) {
+        return tl::make_unexpected(agent_hints_validation.error());
+    }
 
     VLOG(1) << "key=" << key << ", value_length=" << slice_length
             << ", config=" << config << ", action=upsert_start_begin";
@@ -2044,20 +2148,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 metadata.client_id = client_id;
                 metadata.put_start_time = now;
 
-                // Reconcile soft_pin state with the incoming config.
-                {
-                    SpinLocker locker(&metadata.lock);
-                    if (config.with_soft_pin && !metadata.soft_pin_timeout) {
-                        metadata.soft_pin_timeout.emplace();
-                        MasterMetricManager::instance().inc_soft_pin_key_count(
-                            1);
-                    } else if (!config.with_soft_pin &&
-                               metadata.soft_pin_timeout) {
-                        metadata.soft_pin_timeout.reset();
-                        MasterMetricManager::instance().dec_soft_pin_key_count(
-                            1);
-                    }
-                }
+                metadata.UpdateSoftPinAndAgentHints(
+                    ConfigRequestsSoftPin(config), config.agent_hints);
 
                 // Mark COMPLETE → PROCESSING so readers won't see stale data
                 // mid-transfer.  The key becomes unreadable until UpsertEnd.
@@ -6211,7 +6303,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
-                metadata_ptr->group_id, tenant_id, user_key));
+                metadata_ptr->group_id, tenant_id, user_key,
+                metadata_ptr->GetAgentHints()));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -6227,11 +6320,12 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id]
+    // replicas..., hard_pinned, group_id, agent_hints]
 
-    size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 11;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
-                             // replicas_count, data_type, hard_pinned, group_id
+                             // replicas_count, data_type, hard_pinned,
+                             // group_id, agent_hints
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -6285,6 +6379,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
+    PackAgentHints(metadata.GetAgentHints(), packer);
 
     return {};
 }
@@ -6337,12 +6432,15 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v1: 7 + replicas_count, no optional fields
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
-    //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
+    //       group_id
+    //   v4: 10 + replicas_count, data_type + hard_pinned + group_id
+    //   v5: 11 + replicas_count, data_type + hard_pinned + group_id +
+    //   agent_hints
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 3;
+    constexpr uint64_t kMaxOptionalFieldCount = 4;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -6392,6 +6490,15 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         group_id = array[index++].as<std::string>();
     }
 
+    std::optional<AgentHints> agent_hints;
+    if (index < obj.via.array.size) {
+        auto agent_hints_result = UnpackAgentHints(array[index++]);
+        if (!agent_hints_result) {
+            return tl::unexpected(agent_hints_result.error());
+        }
+        agent_hints = std::move(agent_hints_result.value());
+    }
+
     // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
@@ -6399,7 +6506,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
-        group_id);
+        group_id, "default", "", std::move(agent_hints));
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
