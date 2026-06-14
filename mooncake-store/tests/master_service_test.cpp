@@ -33,7 +33,7 @@ class MasterServiceTest : public ::testing::Test {
     };
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
-    static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
+    static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 128;
 
     Segment MakeSegment(std::string name = "test_segment",
                         size_t base = kDefaultSegmentBase,

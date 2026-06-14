@@ -265,7 +265,7 @@ GdsFileContext* GdsTransport::findFileContext(SegmentID target_id) {
 
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
-    const static size_t kMaxSliceSize = 16ull << 20;
+    const static size_t kMaxSliceSize = 64ull << 20;
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);

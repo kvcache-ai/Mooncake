@@ -65,7 +65,7 @@ class BufferAllocatorTest : public ::testing::Test {
 TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "1";
-        size_t size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+        size_t size = 1024 * 1024 * 128;  // 128MB (multiple of 64MB)
         auto allocator =
             CreateTestAllocator(segment_name, 0, size, allocator_type);
 
@@ -87,7 +87,7 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
 TEST_F(BufferAllocatorTest, AllocateMultiple) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "1";
-        size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+        size_t size = 1024 * 1024 * 128;  // 128MB (must be multiple of 64MB)
         auto allocator =
             CreateTestAllocator(segment_name, 0, size, allocator_type);
 
@@ -115,7 +115,7 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
 TEST_F(BufferAllocatorTest, AllocateTooLarge) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "3";
-        size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+        size_t size = 1024 * 1024 * 128;  // 128MB (must be multiple of 64MB)
 
         auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
                                              allocator_type);
@@ -132,7 +132,7 @@ TEST_F(BufferAllocatorTest, AllocateTooLarge) {
 TEST_F(BufferAllocatorTest, RepeatAllocateAndDeallocate) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "test";
-        size_t size = 1024 * 1024 * 16;  // 16MB (must be multiple of 4MB)
+        size_t size = 1024 * 1024 * 128;  // 128MB (must be multiple of 64MB)
         auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
                                              allocator_type);
 
@@ -151,7 +151,7 @@ TEST_F(BufferAllocatorTest, RepeatAllocateAndDeallocate) {
 TEST_F(BufferAllocatorTest, ParallelAllocation) {
     for (const auto& allocator_type : allocator_types_) {
         std::string segment_name = "test";
-        size_t size = 1024 * 1024 * 32;  // 32MB (must be multiple of 4MB)
+        size_t size = 1024 * 1024 * 128;  // 128MB (must be multiple of 64MB)
         auto allocator = CreateTestAllocator(segment_name, 0x20000000ULL, size,
                                              allocator_type);
 
@@ -219,7 +219,7 @@ class SimpleAllocatorTest : public ::testing::Test {
 
 // Test basic memory allocation and deallocation
 TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     // Test basic allocation
@@ -240,7 +240,7 @@ TEST_F(SimpleAllocatorTest, BasicAllocationAndDeallocation) {
 
 // Test multiple allocations and deallocations
 TEST_F(SimpleAllocatorTest, MultipleAllocations) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     std::vector<std::pair<void*, size_t>> allocations;
@@ -263,7 +263,7 @@ TEST_F(SimpleAllocatorTest, MultipleAllocations) {
 
 // Test allocation request larger than available space
 TEST_F(SimpleAllocatorTest, AllocationTooLarge) {
-    const size_t total_size = 1024 * 1024 * 16;  // 16MB
+    const size_t total_size = 1024 * 1024 * 128;  // 128MB
     SimpleAllocator allocator(total_size);
 
     void* ptr = allocator.allocate(total_size + 1);

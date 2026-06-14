@@ -200,9 +200,9 @@ class ClientIntegrationTest : public ::testing::Test {
         delete provider_client_sink;
 
         client_buffer_allocator_ =
-            std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
+            std::make_unique<SimpleAllocator>(512 * 1024 * 1024);
         auto register_result = test_client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), 128 * 1024 * 1024, "cpu:0",
+            client_buffer_allocator_->getBase(), 512 * 1024 * 1024, "cpu:0",
             false, false);
         if (!register_result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
@@ -1159,9 +1159,9 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
     ASSERT_TRUE(target_big != nullptr);
 
     // Mount segments for the extra clients
-    constexpr size_t kSegAlign = 16 * 1024 * 1024;  // 16MB alignment
-    const size_t kSmallSeg = kSegAlign;             // 16MB
-    const size_t kBigSeg = 8 * kSegAlign;           // 128MB
+    constexpr size_t kSegAlign = 128 * 1024 * 1024;  // 128MB alignment
+    const size_t kSmallSeg = kSegAlign;              // 128MB
+    const size_t kBigSeg = 4 * kSegAlign;            // 512MB
 
     void* small_seg_ptr = allocate_buffer_allocator_memory(kSmallSeg);
     ASSERT_NE(small_seg_ptr, nullptr);
@@ -1179,7 +1179,7 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
     const size_t kFillValueSize = 512 * 1024;  // 512KB
     auto fill_keys = FillSegmentUntilFull(
         test_client_, client_buffer_allocator_.get(), target_small_name,
-        kFillValueSize, /*num_keys=*/50);
+        kFillValueSize, /*num_keys=*/300);
 
     ASSERT_FALSE(fill_keys.empty())
         << "Failed to fill anything into target_small; test setup invalid";
@@ -1405,7 +1405,7 @@ class EvictionNotificationTest : public ::testing::Test {
         client_ = client_opt.value();
 
         // Mount segment so that PutStart can allocate memory replicas
-        constexpr size_t kSegSize = 64 * 1024 * 1024;  // 64MB
+        constexpr size_t kSegSize = 256 * 1024 * 1024;  // 256MB
         seg_ptr_ = allocate_buffer_allocator_memory(kSegSize);
         ASSERT_NE(seg_ptr_, nullptr);
         seg_size_ = kSegSize;
@@ -1414,9 +1414,9 @@ class EvictionNotificationTest : public ::testing::Test {
             << "MountSegment failed: " << toString(mount.error());
 
         // Register local memory for client-side buffers
-        alloc_ = std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+        alloc_ = std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
         auto reg = client_->RegisterLocalMemory(
-            alloc_->getBase(), 16 * 1024 * 1024, "cpu:0", false, false);
+            alloc_->getBase(), 128 * 1024 * 1024, "cpu:0", false, false);
         ASSERT_TRUE(reg.has_value())
             << "RegisterLocalMemory failed: " << toString(reg.error());
     }
@@ -1813,7 +1813,7 @@ TEST_F(ClientIntegrationTest, BatchUpsertMixed) {
 
 TEST_F(ClientIntegrationTest, MountSegmentAndGetIdAndUnmountSegmentById) {
     // Allocate a small buffer for this test
-    size_t test_size = 16 * 1024 * 1024;  // 16 MB
+    size_t test_size = 128 * 1024 * 1024;  // 128 MB
     void* test_buffer = allocate_buffer_allocator_memory(test_size);
     ASSERT_NE(test_buffer, nullptr);
 

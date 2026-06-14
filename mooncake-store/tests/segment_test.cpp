@@ -145,7 +145,7 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "test_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -170,7 +170,7 @@ TEST_F(SegmentTest, MountSegmentDuplicate) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "test_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -216,7 +216,7 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "test_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -259,7 +259,7 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "test_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -303,7 +303,7 @@ TEST_F(SegmentTest, SegmentLifecycleStatusControlsAllocation) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "status_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -352,7 +352,7 @@ TEST_F(SegmentTest, PrepareUnmountDrainedSegment) {
     Segment segment;
     segment.id = generate_uuid();
     segment.name = "drained_segment";
-    segment.size = 1024 * 1024 * 16;
+    segment.size = 1024 * 1024 * 128;
     segment.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -389,7 +389,7 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
     Segment segment_a;
     segment_a.id = generate_uuid();
     segment_a.name = "test_segment_a";
-    segment_a.size = 1024 * 1024 * 16;
+    segment_a.size = 1024 * 1024 * 128;
     segment_a.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -405,7 +405,7 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
     Segment segment_b;
     segment_b.id = generate_uuid();
     segment_b.name = "test_segment_b";
-    segment_b.size = 1024 * 1024 * 32;
+    segment_b.size = 1024 * 1024 * 128;
     segment_b.base = 0x200000000;
 
     // Remount both segments A and B
@@ -433,7 +433,7 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
     Segment segment_a;
     segment_a.id = generate_uuid();
     segment_a.name = "test_segment_a";
-    segment_a.size = 1024 * 1024 * 16;
+    segment_a.size = 1024 * 1024 * 128;
     segment_a.base = 0x100000000;
 
     UUID client_id = generate_uuid();
@@ -488,7 +488,7 @@ TEST_F(SegmentTest, QuerySegments) {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = "test_segment_" + std::to_string(i);
-        segment.size = 1024 * 1024 * 16;
+        segment.size = 1024 * 1024 * 128;
         segment.base =
             0x100000000 + (i * 0x100000000);  // Different base addresses
 

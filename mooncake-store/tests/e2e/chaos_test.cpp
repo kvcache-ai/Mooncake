@@ -178,7 +178,7 @@ TEST_F(ChaosTest, LeaderKilledFailover) {
 
     // Mount a segment
     void* buffer;
-    ASSERT_EQ(client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_EQ(client->Mount(1024 * 1024 * 64, buffer), ErrorCode::OK);
 
     // Put a key-value pair
     std::string key = "key";
@@ -211,7 +211,7 @@ TEST_F(ChaosTest, BackupMasterKilled) {
 
     // Mount a segment
     void* buffer;
-    ASSERT_EQ(client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_EQ(client->Mount(1024 * 1024 * 64, buffer), ErrorCode::OK);
 
     // Put a key-value pair
     std::string key = "key";
@@ -243,7 +243,7 @@ TEST_F(ChaosTest, AllMastersOtherThanOneBackedUpKilledFailover) {
 
     // Mount a segment
     void* buffer;
-    ASSERT_EQ(client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_EQ(client->Mount(1024 * 1024 * 64, buffer), ErrorCode::OK);
 
     // Kill all masters other than one backed up master
     bool find_one_backup = false;
@@ -280,7 +280,7 @@ TEST_F(ChaosTest, AllMastersKilledThenRestartFailover) {
 
     // Mount a segment
     void* buffer;
-    ASSERT_EQ(client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_EQ(client->Mount(1024 * 1024 * 64, buffer), ErrorCode::OK);
 
     // Kill all masters
     for (int i = 0; i < master_num; ++i) {
@@ -318,7 +318,7 @@ TEST_F(ChaosTest, ClientGracefulClose) {
 
     // Mount a segment
     void* buffer;
-    ASSERT_EQ(to_close_client->Mount(1024 * 1024 * 16, buffer), ErrorCode::OK);
+    ASSERT_EQ(to_close_client->Mount(1024 * 1024 * 64, buffer), ErrorCode::OK);
 
     // Put a key-value pair
     std::string key = "key";

@@ -61,7 +61,7 @@ class TestConfigDictSetup(unittest.TestCase):
         store = MooncakeDistributedStore()
         self.addCleanup(store.close)
 
-        retcode = store.setup(get_config_dict("16MB", "16 MB"))
+        retcode = store.setup(get_config_dict("128MB", "128 MB"))
         self.assertEqual(retcode, 0)
 
         test_data = b"test_config_dict_human_readable_value"
@@ -74,7 +74,7 @@ class TestConfigDictSetup(unittest.TestCase):
         store = MooncakeDistributedStore()
         self.addCleanup(store.close)
 
-        retcode = store.setup(get_config_dict("50%", "16MB"))
+        retcode = store.setup(get_config_dict("50%", "128MB"))
         self.assertNotEqual(retcode, 0)
 
 

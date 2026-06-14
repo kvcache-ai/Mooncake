@@ -196,9 +196,9 @@ class TcpLocalMemcpyAutoEnableTest : public ::testing::Test {
 
         runtime.client = client_opt.value();
         runtime.io_allocator =
-            std::make_unique<SimpleAllocator>(16 * 1024 * 1024);
+            std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
         auto reg = runtime.client->RegisterLocalMemory(
-            runtime.io_allocator->getBase(), 16 * 1024 * 1024, "cpu:0", false,
+            runtime.io_allocator->getBase(), 128 * 1024 * 1024, "cpu:0", false,
             false);
         EXPECT_TRUE(reg.has_value())
             << "RegisterLocalMemory failed: " << toString(reg.error());
