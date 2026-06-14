@@ -687,8 +687,11 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
     if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
 #ifdef ENABLE_MULTI_PROTOCOL
-    if (!desc->protocol.empty()) desc->protocol += ",";
-    desc->protocol += "tcp";
+    // Guard: don't append "tcp" if it's already registered in this desc.
+    if (desc->protocol.find("tcp") == std::string::npos) {
+        if (!desc->protocol.empty()) desc->protocol += ",";
+        desc->protocol += "tcp";
+    }
 #else
     desc->protocol = "tcp";
 #endif

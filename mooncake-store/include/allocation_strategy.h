@@ -338,10 +338,22 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return nullptr;
         }
 
-        const auto num_segs = allocators->size();
+        // Filter allocators to only include RAM storage level
+        std::vector<std::shared_ptr<BufferAllocatorBase>> ram_allocators;
+        for (const auto& allocator : *allocators) {
+            if (allocator->getStorageLevel() == StorageLevel::RAM) {
+                ram_allocators.push_back(allocator);
+            }
+        }
+
+        if (ram_allocators.empty()) {
+            return nullptr;
+        }
+
+        const auto num_segs = ram_allocators.size();
         if (num_segs == 1) {
             // Fast path for single segment
-            return (*allocators)[0]->allocate(slice_length);
+            return ram_allocators[0]->allocate(slice_length);
         }
 
         // Randomly select a start point to distribute
@@ -350,7 +362,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         size_t seg_offset =
             dist(generator);  // select a start segment to place replica
         for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
-            auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
+            auto& allocator = ram_allocators[(i + seg_offset) % num_segs];
             if (auto buffer = allocator->allocate(slice_length)) {
                 return buffer;
             }
@@ -538,67 +550,6 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 };
 
-class CxlAllocationStrategy : public AllocationStrategy {
-   public:
-    CxlAllocationStrategy() = default;
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const size_t replica_num = 1,
-        const std::vector<std::string>& preferred_segments =
-            std::vector<std::string>(),
-        const std::set<std::string>& excluded_segments =
-            std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override {
-        if (slice_length == 0 || replica_num == 0) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
-        if (preferred_segments.empty()) {
-            LOG(ERROR) << "Preferred_segments is empty.";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
-        const std::string& cxl_segment_name = preferred_segments[0];
-
-        VLOG(1) << "Do cxl allocate, overwritten segment=" << cxl_segment_name;
-
-        const auto cxl_allocators =
-            allocator_manager.getAllocators(cxl_segment_name);
-
-        if (cxl_allocators == nullptr || cxl_allocators->size() == 0) {
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-        std::shared_ptr<BufferAllocatorBase> cxl_allocator =
-            (*cxl_allocators)[0];
-        if (!cxl_allocator) {
-            LOG(ERROR) << "No CXL allocator in preferred_segment";
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        std::vector<Replica> replicas;
-        replicas.reserve(replica_num);
-
-        auto buffer = cxl_allocator->allocate(slice_length);
-        if (!buffer) {
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-
-        buffer->change_to_cxl(cxl_segment_name);
-        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING,
-                              replica_type);
-
-        VLOG(1) << "Successfully allocated " << replicas.size()
-                << " CXL replica.";
-        return replicas;
-    }
-
-    tl::expected<Replica, ErrorCode> AllocateFrom(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const std::string& segment_name) {
-        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
-};
-
 /**
  * @brief Factory function to create allocation strategy based on type
  */
@@ -609,8 +560,6 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
             return std::make_shared<RandomAllocationStrategy>();
         case AllocationStrategyType::FREE_RATIO_FIRST:
             return std::make_shared<FreeRatioFirstAllocationStrategy>();
-        case AllocationStrategyType::CXL:
-            return std::make_shared<CxlAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

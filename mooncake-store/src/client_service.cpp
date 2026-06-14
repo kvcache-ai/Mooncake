@@ -7,6 +7,7 @@
 
 #include <csignal>
 #include <algorithm>
+#include <unordered_map>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -20,6 +21,7 @@
 #endif
 #include <optional>
 #include <ranges>
+#include <sstream>
 #include <span>
 #include <sched.h>
 #include <thread>
@@ -813,6 +815,165 @@ ErrorCode Client::InitTransferEngine(
     return ErrorCode::OK;
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol version
+ErrorCode Client::InitMultiProtocolTransferEngine(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::vector<std::string>& protocols,
+    const std::optional<std::string>& device_names) {
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
+
+    bool auto_discover = false;
+    if (!use_tent) {
+        // Get auto_discover and filters from env (non-TENT only)
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            bool has_rdma = std::find(protocols.begin(), protocols.end(),
+                                      "rdma") != protocols.end();
+            if (has_rdma && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
+        }
+        transfer_engine_->setAutoDiscover(auto_discover);
+
+        // Honor filters when auto-discovery is enabled; otherwise warn once
+        if (auto_discover) {
+            LOG(INFO) << "Transfer engine auto discovery is enabled";
+            auto filters = get_auto_discover_filters();
+            transfer_engine_->setWhitelistFilters(std::move(filters));
+        } else {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
+                LOG(WARNING)
+                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                    << "ignoring whitelist: " << env_filters;
+            }
+        }
+    }
+
+    // Note: Multi-protocol mode (cxl,tcp or cxl,rdma) doesn't use
+    // ascend/ubshmem
+    auto [hostname, port] = parseHostNameWithPort(local_hostname);
+    int rc = transfer_engine_->init(metadata_connstring, local_hostname,
+                                    hostname, port);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // TENT mode: Skip manual transport installation - TENT handles this
+    // internally
+    if (use_tent) {
+        LOG(INFO)
+            << "Using TENT mode - transport configuration handled internally";
+        if (device_names.has_value()) {
+            LOG(INFO)
+                << "Note: device_names parameter is ignored in TENT mode. "
+                << "Configure devices via TENT config file or environment "
+                   "variables.";
+        }
+        return ErrorCode::OK;
+    }
+
+    for (const auto& proto : protocols) {
+        if (!auto_discover) {
+            LOG(INFO)
+                << "Transfer engine auto discovery is disabled for protocol: "
+                << proto;
+
+            Transport* transport = nullptr;
+
+            if (proto == "rdma") {
+                if (!device_names.has_value() || device_names->empty()) {
+                    LOG(ERROR)
+                        << "RDMA protocol requires device names when auto "
+                           "discovery is disabled";
+                    return ErrorCode::INVALID_PARAMS;
+                }
+
+                LOG(INFO) << "Using specified RDMA devices: "
+                          << device_names.value();
+
+                std::vector<std::string> devices =
+                    splitString(device_names.value(), ',', /*skip_empty=*/true);
+
+                // Manually discover topology with specified devices only
+                auto topology = transfer_engine_->getLocalTopology();
+                if (topology) {
+                    topology->discover(devices);
+                    LOG(INFO) << "Topology discovery complete with specified "
+                                 "devices. Found "
+                              << topology->getHcaList().size() << " HCAs";
+                }
+
+                transport = transfer_engine_->installTransport("rdma", nullptr);
+                if (!transport) {
+                    LOG(ERROR)
+                        << "Failed to install RDMA transport with specified "
+                           "devices";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (proto == "tcp") {
+                if (device_names.has_value()) {
+                    LOG(WARNING)
+                        << "TCP protocol does not use device names, ignoring";
+                }
+
+                try {
+                    transport =
+                        transfer_engine_->installTransport("tcp", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "tcp_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install TCP transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (proto == "cxl") {
+                if (device_names.has_value()) {
+                    LOG(WARNING) << "CXL protocol does not use device "
+                                    "names, ignoring";
+                }
+                try {
+                    transport =
+                        transfer_engine_->installTransport("cxl", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "cxl_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install CXL transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else {
+                LOG(ERROR) << "unsupported_protocol protocol=" << proto;
+                return ErrorCode::INVALID_PARAMS;
+            }
+        }
+    }
+
+    return ErrorCode::OK;
+}
+#endif
+
 void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
@@ -827,6 +988,11 @@ void Client::InitTransferSubmitter() {
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        transfer_submitter_->set_level_protocols(level_protocols_);
+    }
+#endif
 #endif
 }
 
@@ -906,8 +1072,28 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
+#ifdef ENABLE_MULTI_PROTOCOL
+        // Parse and validate protocol configuration
+        std::vector<std::string> protocols = parseProtocolList(protocol);
+        if (protocols.size() > 1) {
+            // Multi-protocol: validate and dispatch
+            if (!isValidMultiProtocol(protocols)) {
+                LOG(ERROR) << "Invalid multi-protocol configuration. Only "
+                              "'cxl,tcp' or 'cxl,rdma' are allowed";
+                return std::nullopt;
+            }
+            client->DispatchProtocols(protocols);
+            err = client->InitMultiProtocolTransferEngine(
+                local_hostname, metadata_connstring, protocols, device_names);
+        } else {
+            // Single-protocol: use string version
+            err = client->InitTransferEngine(
+                local_hostname, metadata_connstring, protocol, device_names);
+        }
+#else
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                          protocol, device_names);
+#endif
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;
@@ -1486,8 +1672,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicateConfig client_cfg = config;
-    if (protocol_ == "cxl") {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (client_cfg.preferred_storage_level == StorageLevel::CXL) {
         client_cfg.preferred_segment = local_hostname_;
+    } else
+#endif
+    {
+        if (protocol_ == "cxl") {
+            client_cfg.preferred_storage_level = StorageLevel::CXL;
+            client_cfg.preferred_segment = local_hostname_;
+        }
     }
 
     // Start put operation
@@ -2470,14 +2664,32 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     FinalizeBatchPut(ops);
     return CollectResults(ops);
 }
-
+#ifdef ENABLE_MULTI_PROTOCOL
+void Client::DispatchProtocols(const std::vector<std::string>& protocols) {
+    for (const auto& protocol : protocols) {
+        if (protocol == "tcp" || protocol == "rdma") {
+            level_protocols_[StorageLevel::RAM] = protocol;
+        } else if (protocol == "cxl") {
+            level_protocols_[StorageLevel::CXL] = protocol;
+        }
+    }
+}
+#endif
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     ReplicateConfig client_cfg = config;
-    if (protocol_ == "cxl") {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (client_cfg.preferred_storage_level == StorageLevel::CXL) {
         client_cfg.preferred_segment = local_hostname_;
+    } else
+#endif
+    {
+        if (protocol_ == "cxl") {
+            client_cfg.preferred_storage_level = StorageLevel::CXL;
+            client_cfg.preferred_segment = local_hostname_;
+        }
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     if (client_cfg.prefer_alloc_in_same_node) {
@@ -2603,17 +2815,37 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
-                      "engine ret is "
-                   << rc;
-        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::unordered_map<std::string,
+                           std::vector<TransferEngine::RegisteredBuffer>>
+            buffer_map;
+        buffer_map[it->second.protocol].emplace_back(
+            reinterpret_cast<void*>(it->second.base));
+        int rc = transfer_engine_->mp_unregisterLocalMemory(buffer_map);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                          "engine ret is "
+                       << rc;
+            if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         }
-        // Otherwise, the segment is already unregistered from transfer
-        // engine, we can continue
+    } else
+#endif
+    {
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(it->second.base));
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                          "engine ret is "
+                       << rc;
+            if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+                return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            // Otherwise, the segment is already unregistered from transfer
+            // engine, we can continue
+        }
     }
 
     mounted_segments_.erase(it);
@@ -2668,12 +2900,29 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
-        if (rc != 0) {
-            LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                       << " size=" << size << ", error=" << rc;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (level_protocols_.size() > 1) {
+            std::unordered_map<std::string,
+                               std::vector<TransferEngine::RegisteredBuffer>>
+                buffer_map;
+            buffer_map[protocol].emplace_back((void*)buffer, size, location,
+                                              true, true);
+            int rc = transfer_engine_->mp_registerLocalMemory(buffer_map);
+            if (rc != 0) {
+                LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << rc;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        } else
+#endif
+        {
+            int rc = transfer_engine_->registerLocalMemory(
+                (void*)buffer, size, location, true, true);
+            if (rc != 0) {
+                LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                           << " size=" << size << ", error=" << rc;
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
         }
 
         Segment segment;
@@ -2832,18 +3081,47 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
-    if (this->transfer_engine_->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata) != 0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::string proto = level_protocols_[StorageLevel::RAM];
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+            buffer_map;
+        buffer_map[proto].emplace_back(addr, length, location,
+                                       remote_accessible, update_metadata);
+        if (this->transfer_engine_->mp_registerLocalMemory(buffer_map) != 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } else
+#endif
+    {
+        if (this->transfer_engine_->registerLocalMemory(addr, length, location,
+                                                        remote_accessible,
+                                                        update_metadata) != 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
-        0) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (level_protocols_.size() > 1) {
+        std::string proto = level_protocols_[StorageLevel::RAM];
+        std::unordered_map<std::string, std::vector<RegisteredBuffer>>
+            buffer_map;
+        buffer_map[proto].emplace_back(addr, 0, kWildcardLocation, true,
+                                       update_metadata);
+        if (this->transfer_engine_->mp_unregisterLocalMemory(buffer_map) != 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } else
+#endif
+    {
+        if (this->transfer_engine_->unregisterLocalMemory(
+                addr, update_metadata) != 0) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     return {};
 }

@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 #include "real_client.h"
@@ -25,6 +26,7 @@
 #include "common.h"
 #include "config.h"
 #include "mutex.h"
+#include "replica.h"
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -625,6 +627,296 @@ tl::expected<void, ErrorCode> RealClient::setup_ascend_internal(
     return {};
 }
 
+tl::expected<void, ErrorCode> RealClient::start_auxiliary_services(
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path) {
+    // Start IPC server to accept FD from dummy clients
+    if (!ipc_socket_path_.empty()) {
+        if (start_ipc_server() != 0) {
+            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
+    }
+    if (enable_ssd_offload && start_offload_rpc_server) {
+        // Use port 0 to let the OS auto-allocate an available port.
+        offload_rpc_server_ =
+            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        offload_rpc_server_
+            ->register_handler<&RealClient::batch_get_offload_object>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::release_offload_buffer>(this);
+        offload_rpc_server_->async_start();
+        auto err = offload_rpc_server_->get_errc();
+        if (err) {
+            LOG(ERROR) << "Failed to start offload RPC server: "
+                       << err.message();
+            offload_rpc_server_.reset();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        offload_rpc_port_ = offload_rpc_server_->port();
+        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
+    }
+    if (enable_ssd_offload) {
+        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        if (!ssd_offload_path.empty()) {
+            file_storage_config.storage_filepath = ssd_offload_path;
+        }
+        file_storage_ = std::make_shared<FileStorage>(
+            file_storage_config, client_, this->local_rpc_addr,
+            client_->GetSsdMetricPtr());
+        auto init_result = file_storage_->Init();
+        if (!init_result) {
+            LOG(ERROR) << "file storage init failed with error: "
+                       << init_result.error();
+            return init_result;
+        }
+    }
+    client_requester_ = std::make_shared<ClientRequester>();
+    if (FLAGS_enable_http_server) {
+        if (start_http_server() != 0) {
+            LOG(ERROR) << "Failed to start HTTP server on port "
+                       << FLAGS_http_port;
+        }
+    }
+    return {};
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol setup implementation
+tl::expected<void, ErrorCode> RealClient::mp_setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path) {
+    const bool should_use_hugepage = use_hugepage_;
+
+    std::optional<std::string> device_name =
+        (rdma_devices.empty() ? std::nullopt
+                              : std::make_optional(rdma_devices));
+
+    // Validate required parameters
+    if (local_hostname.empty()) {
+        LOG(ERROR) << "local_hostname is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Check if hostname already contains a port
+    const std::string &hostname = local_hostname;
+    size_t colon_pos = hostname.find(':');
+    bool user_specified_port = (colon_pos != std::string::npos);
+
+    if (user_specified_port) {
+        this->local_hostname = local_hostname;
+        this->local_rpc_addr =
+            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+        auto client_opt = mooncake::Client::Create(
+            this->local_hostname, metadata_server, protocol, device_name,
+            master_server_addr, transfer_engine);
+        if (!client_opt) {
+            LOG(ERROR) << "Failed to create client";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        client_ = *client_opt;
+    } else {
+        const int kMaxRetries =
+            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        bool success = false;
+
+        for (int retry = 0; retry < kMaxRetries; ++retry) {
+            port_binder_ = std::make_unique<AutoPortBinder>();
+            int port = port_binder_->getPort();
+            if (port < 0) {
+                LOG(WARNING) << "Failed to bind available port, retry "
+                             << (retry + 1) << "/" << kMaxRetries;
+                port_binder_.reset();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            this->local_hostname = hostname + ":" + std::to_string(port);
+            this->local_rpc_addr =
+                hostname + ":" + std::to_string(local_rpc_port);
+            auto client_opt = mooncake::Client::Create(
+                this->local_hostname, metadata_server, protocol, device_name,
+                master_server_addr, transfer_engine);
+            if (client_opt) {
+                client_ = *client_opt;
+                success = true;
+                LOG(INFO) << "Successfully created client on port " << port
+                          << " after " << (retry + 1) << " attempt(s)";
+                break;
+            }
+
+            LOG(WARNING) << "Failed to create client on port " << port
+                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+            port_binder_.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!success) {
+            LOG(ERROR) << "Failed to create client after " << kMaxRetries
+                       << " retries";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    // Get level protocols for buffer allocator and memory registration
+    auto level_protocols = client_->GetLevelProtocols();
+    std::string ram_proto;
+    bool has_ram_level = false;
+
+    for (auto &level_protocol : level_protocols) {
+        if (level_protocol.first == StorageLevel::RAM) {
+            ram_proto = level_protocol.second;
+            has_ram_level = true;
+            break;
+        }
+    }
+
+    // Select protocol for ClientBufferAllocator (always use RAM protocol in
+    // multi-protocol mode)
+    std::string proto_to_use = ram_proto;
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        local_buffer_size, proto_to_use, should_use_hugepage);
+
+    // Register local memory for RAM level protocols (not for CXL)
+    bool should_register = local_buffer_size > 0 && has_ram_level;
+    if (should_register) {
+        LOG(INFO) << "Registering local memory: " << local_buffer_size
+                  << " bytes";
+        auto result = client_->RegisterLocalMemory(
+            client_buffer_allocator_->getBase(), local_buffer_size,
+            kWildcardLocation, false, true);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to register local memory: "
+                       << toString(result.error());
+            return tl::unexpected(result.error());
+        }
+    } else if (local_buffer_size > 0) {
+        LOG(INFO)
+            << "No RAM storage level found, skip registering local memory";
+    } else {
+        LOG(INFO) << "Local buffer size is 0, skip registering local memory";
+    }
+
+    // Mount segments by storage level
+    for (auto &level_protocol : level_protocols) {
+        if (level_protocol.first == StorageLevel::CXL) {
+            size_t cxl_dev_size = 0;
+            const char *env = std::getenv("MC_CXL_DEV_SIZE");
+            if (env) {
+                char *end = nullptr;
+                unsigned long long val = strtoull(env, &end, 10);
+                if (end != env && *end == '\0')
+                    cxl_dev_size = static_cast<size_t>(val);
+            } else {
+                LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            void *ptr = client_->GetBaseAddr();
+            LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                      << ptr;
+            auto mount_result =
+                client_->MountSegment(ptr, cxl_dev_size, level_protocol.second);
+            if (!mount_result.has_value()) {
+                LOG(ERROR) << "Failed to mount segment: "
+                           << toString(mount_result.error());
+                return tl::unexpected(mount_result.error());
+            }
+
+        } else if (level_protocol.first == StorageLevel::RAM) {
+            auto max_mr_size = globalConfig().max_mr_size;
+            uint64_t total_glbseg_size = global_segment_size;
+            uint64_t current_glbseg_size = 0;
+
+            std::vector<int> seg_numa_nodes;
+            if (!ipc_socket_path_.empty() && level_protocol.second == "rdma") {
+                seg_numa_nodes = client_->GetNicNumaNodes();
+                if (seg_numa_nodes.size() > 1) {
+                    std::string nodes_str;
+                    for (size_t i = 0; i < seg_numa_nodes.size(); ++i) {
+                        if (i) nodes_str += ",";
+                        nodes_str += std::to_string(seg_numa_nodes[i]);
+                    }
+                    LOG(INFO) << "NUMA-segmented mode: NIC NUMA nodes=["
+                              << nodes_str << "]";
+                } else {
+                    seg_numa_nodes.clear();
+                }
+            }
+
+            while (global_segment_size > 0) {
+                size_t segment_size =
+                    std::min(global_segment_size, max_mr_size);
+                global_segment_size -= segment_size;
+                current_glbseg_size += segment_size;
+                LOG(INFO) << "Mounting RAM segment: " << segment_size
+                          << " bytes, " << current_glbseg_size << " of "
+                          << total_glbseg_size;
+
+                size_t mapped_size = segment_size;
+                void *ptr = nullptr;
+                std::string seg_location = kWildcardLocation;
+
+                if (!seg_numa_nodes.empty()) {
+                    size_t page_sz = should_use_hugepage
+                                         ? get_hugepage_size_from_env()
+                                         : static_cast<size_t>(getpagesize());
+                    mapped_size =
+                        align_up(segment_size, page_sz * seg_numa_nodes.size());
+                    ptr = allocate_buffer_numa_segments(
+                        mapped_size, seg_numa_nodes, page_sz);
+                    seg_location =
+                        buildSegmentsLocation(page_sz, seg_numa_nodes);
+                } else if (should_use_hugepage) {
+                    mapped_size =
+                        align_up(segment_size, get_hugepage_size_from_env());
+                    ptr = allocate_buffer_mmap_memory(
+                        mapped_size, get_hugepage_size_from_env());
+                } else {
+                    ptr = allocate_buffer_allocator_memory(
+                        segment_size, level_protocol.second);
+                }
+
+                if (!ptr) {
+                    LOG(ERROR) << "Failed to allocate segment memory";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+
+                if (!seg_numa_nodes.empty() || should_use_hugepage) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    segment_ptrs_.emplace_back(ptr);
+                }
+
+                auto mount_result = client_->MountSegment(
+                    ptr, mapped_size, level_protocol.second, seg_location);
+                if (!mount_result.has_value()) {
+                    LOG(ERROR) << "Failed to mount segment: "
+                               << toString(mount_result.error());
+                    return tl::unexpected(mount_result.error());
+                }
+            }
+            if (total_glbseg_size == 0) {
+                LOG(INFO) << "Global segment size is 0, skip mounting segment";
+            }
+        }
+    }
+
+    return start_auxiliary_services(enable_ssd_offload,
+                                    start_offload_rpc_server, ssd_offload_path);
+}
+#endif  // ENABLE_MULTI_PROTOCOL
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
@@ -634,8 +926,38 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id) {
-    this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Parse and validate protocol configuration
+    std::vector<std::string> parsed_protocols = parseProtocolList(protocol);
+
+    if (parsed_protocols.size() == 2) {
+        // Might be multi-protocol, validate
+        if (isValidMultiProtocol(parsed_protocols)) {
+            LOG(INFO) << "Multi-protocol configuration detected: " << protocol;
+            return mp_setup_internal(
+                local_hostname, metadata_server, global_segment_size,
+                local_buffer_size, protocol, rdma_devices, master_server_addr,
+                transfer_engine, ipc_socket_path, local_rpc_port,
+                enable_ssd_offload, start_offload_rpc_server, ssd_offload_path);
+        } else {
+            LOG(ERROR) << "Invalid multi-protocol configuration: " << protocol
+                       << ". Only 'cxl,tcp' or 'cxl,rdma' are allowed";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } else if (parsed_protocols.size() > 2) {
+        LOG(ERROR) << "Invalid protocol configuration: " << protocol
+                   << ". Maximum 2 protocols allowed";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // parsed_protocols.size() == 1 or 0: treat as single-protocol
+    LOG(INFO) << "Single-protocol configuration: " << protocol
+              << ", using single-protocol logic";
+#endif
+
+    // ==================== SINGLE-PROTOCOL LOGIC ====================
+    this->protocol = protocol;
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
@@ -785,7 +1107,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (end != env && *end == '\0')
                 cxl_dev_size = static_cast<size_t>(val);
         } else {
-            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+            LOG(ERROR) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -884,62 +1206,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
-    // Start IPC server to accept FD from dummy clients
-    if (!ipc_socket_path_.empty()) {
-        if (start_ipc_server() != 0) {
-            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
-    }
-    if (enable_ssd_offload && start_offload_rpc_server) {
-        // Start RPC server for offload operations (batch_get / release_buffer).
-        // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
-        offload_rpc_server_
-            ->register_handler<&RealClient::batch_get_offload_object>(this);
-        offload_rpc_server_
-            ->register_handler<&RealClient::release_offload_buffer>(this);
-        offload_rpc_server_->async_start();
-        auto err = offload_rpc_server_->get_errc();
-        if (err) {
-            LOG(ERROR) << "Failed to start offload RPC server: "
-                       << err.message();
-            offload_rpc_server_.reset();
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        offload_rpc_port_ = offload_rpc_server_->port();
-        LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
-
-        // Build local_rpc_addr from hostname + auto-allocated port
-        this->local_rpc_addr = buildHostNameWithPort(
-            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
-    }
-    if (enable_ssd_offload) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (!ssd_offload_path.empty()) {
-            file_storage_config.storage_filepath = ssd_offload_path;
-        }
-        file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
-        auto init_result = file_storage_->Init();
-        if (!init_result) {
-            LOG(ERROR) << "file storage init failed with error: "
-                       << init_result.error();
-            return init_result;
-        }
-    }
-    client_requester_ = std::make_shared<ClientRequester>();
-    if (FLAGS_enable_http_server) {
-        if (start_http_server() != 0) {
-            LOG(ERROR) << "Failed to start HTTP server on port "
-                       << FLAGS_http_port;
-        }
-    }
-
-    return {};
+    return start_auxiliary_services(enable_ssd_offload,
+                                    start_offload_rpc_server, ssd_offload_path);
 }
 
 int RealClient::setup_real(
@@ -1097,14 +1365,44 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
-        protocol != "cxl") {
-        auto unregister_result = client_->unregisterLocalMemory(
-            client_buffer_allocator_->getBase(), true);
-        if (!unregister_result) {
-            LOG(WARNING)
-                << "Failed to unregister client local buffer on tear down: "
-                << toString(unregister_result.error());
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        auto level_protocols = client_->GetLevelProtocols();
+        if (level_protocols.size() > 1) {
+            // Multi-protocol: check if RAM level exists, then unregister
+            bool has_ram_level = false;
+            for (const auto &level_proto : level_protocols) {
+                if (level_proto.first == StorageLevel::RAM) {
+                    has_ram_level = true;
+                    break;
+                }
+            }
+            if (has_ram_level) {
+                auto unregister_result = client_->unregisterLocalMemory(
+                    client_buffer_allocator_->getBase(), true);
+                if (!unregister_result) {
+                    LOG(WARNING) << "Failed to unregister client local buffer "
+                                    "on tear down: "
+                                 << toString(unregister_result.error());
+                }
+            } else {
+                LOG(WARNING)
+                    << "No RAM storage level found, skip unregistering "
+                       "client local buffer";
+            }
+        } else
+#endif
+        {
+            // Single-protocol: check protocol is not "cxl"
+            if (protocol != "cxl") {
+                auto unregister_result = client_->unregisterLocalMemory(
+                    client_buffer_allocator_->getBase(), true);
+                if (!unregister_result) {
+                    LOG(WARNING) << "Failed to unregister client local buffer "
+                                    "on tear down: "
+                                 << toString(unregister_result.error());
+                }
+            }
         }
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         local_buffer_region_.reset();
